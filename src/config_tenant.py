@@ -130,6 +130,9 @@ class TenantTelephonyConfig(BaseModel):
     webhook_base_url: Optional[str] = None
     account_sid_env: Optional[str] = None
     auth_token_env: Optional[str] = None
+    # Raw SIP trunk (e.g. DiDLogic) host, e.g. "sip.didlogic.com". The trunk auth
+    # user/password reuse account_sid_env / auth_token_env (the per-tenant secrets).
+    sip_server: Optional[str] = None
     # Per-provider caller-IDs for the dev-console "place call" panel. The Telephony
     # dropdown picks the provider; this maps provider -> the number to dial *from*
     # (each provider needs its own owned number). e.g. {"twilio": "+1...", "exotel": "+91..."}.

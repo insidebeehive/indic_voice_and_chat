@@ -195,7 +195,7 @@ function setOptions(sel, values, selected) {
   for (const v of values) { const o = document.createElement("option"); o.value = v; o.textContent = v; if (v === selected) o.selected = true; sel.appendChild(o); }
 }
 // webconsole = browser test path (no real telephony / no cost); always offered.
-const TEL_FALLBACK = ["twilio", "exotel", "stringee", "infobip", "telnyx"];
+const TEL_FALLBACK = ["twilio", "exotel", "stringee", "infobip", "telnyx", "didlogic"];
 
 function fillModelsFor(kind) {
   const prov = $("sel_" + kind).value;

@@ -516,3 +516,83 @@ class _ExotelAgentBridge(ExotelMediaBridge):
             except Exception:  # noqa: BLE001 - never let analysis break teardown
                 log.exception("record outcome failed")
             await self._agent.handle_hangup()
+
+
+def make_sip_bridge_factory(
+    providers: TenantProviders,
+    script: VoiceBotScript = DEFAULT_DEMO_SCRIPT,
+    slots: SlotSchema = SlotSchema(),
+    *,
+    sip_call_factory=None,
+    session_store: SessionStore | None = None,
+):
+    """Build a SipMediaBridge per outbound SIP-trunk call (e.g. DiDLogic).
+
+    S2S only for now: the tenant must have ``pipeline.realtime`` configured.
+    The SIP user/password come from the tenant's encrypted telephony secrets
+    (account_sid_env / auth_token_env) and the host from ``telephony.sip_server``.
+    ``sip_call_factory`` places the INVITE — defaults to the pyVoIP implementation,
+    injectable for tests.
+    """
+    import uuid
+
+    from src.api.live_bridge_base import RECORD_TURN_SIGNAL
+    from src.api.sip_media_bridge import SipMediaBridge
+    from src.dialogue.prompts import build_s2s_system_instruction
+    from src.interfaces.realtime import RealtimeConfig
+    from src.providers.realtime.gemini_live import GeminiLiveSession
+    from src.providers.telephony.sip.transport import SipCallParams
+
+    async def _default_factory(params: SipCallParams):
+        from src.providers.telephony.sip.pyvoip_call import place_pyvoip_call
+        return await place_pyvoip_call(params)
+
+    place = sip_call_factory or _default_factory
+
+    async def factory(tenant: TenantContext, to_number: str, *, lead_data: dict | None = None):
+        rt = tenant.settings.pipeline.realtime
+        if rt is None or not getattr(rt, "provider", None):
+            raise RuntimeError(
+                "SIP outbound currently requires pipeline.mode=s2s (realtime config)")
+        tel = tenant.settings.pipeline.telephony
+        sip_user = tenant.secret(tel.account_sid_env) if tel.account_sid_env else None
+        sip_password = tenant.secret(tel.auth_token_env) if tel.auth_token_env else None
+        if not (sip_user and sip_password and tel.sip_server):
+            raise RuntimeError(
+                "DiDLogic SIP requires telephony account_sid+auth_token (SIP user/pass) "
+                "and telephony.sip_server")
+
+        llm = providers.get_llm(tenant)
+        engine = PipelineEngine(
+            providers.get_stt(tenant), llm, providers.get_tts(tenant),
+            PipelineConfig(stt=STTConfig(), llm=LLMConfig(), tts=TTSConfig(sample_rate=16000)))
+        store: SessionStore | None = None
+        if session_store is not None:
+            store = SessionStore(redis=session_store.redis, ttl_seconds=session_store.ttl,
+                                 tenant_id=tenant.id)
+        lead = lead_data or {}
+        session_id = f"call_{uuid.uuid4().hex[:12]}"
+        agent = VoiceBotAgent(
+            session=AgentSession(session_id=session_id, lead_data=lead),
+            state_machine=AgentStateMachine(), slot_schema=slots, script=script,
+            engine=engine, store=store)
+        key = tenant.secret(rt.api_key_env) if rt.api_key_env else None
+        config = RealtimeConfig(
+            model=rt.model, voice=rt.voice, language_code=rt.language_code,
+            system_instruction=build_s2s_system_instruction(script, slots, lead),
+            tools=[RECORD_TURN_SIGNAL])
+
+        async def connect(cfg: RealtimeConfig):
+            return await GeminiLiveSession.connect(cfg, api_key=key)
+
+        params = SipCallParams(
+            to_number=to_number, from_number=tel.from_number or "",
+            sip_user=sip_user, sip_password=sip_password, sip_server=tel.sip_server)
+        sip_call = await place(params)   # sends the INVITE
+        log.info("sip bridge built call", extra={
+            "tenant": tenant.slug, "to": to_number, "session_id": session_id})
+        return SipMediaBridge(
+            sip_call=sip_call, agent=agent, config=config, connect_session=connect,
+            llm=llm, tenant_timezone=getattr(tenant.settings, "timezone", "Asia/Kolkata"))
+
+    return factory

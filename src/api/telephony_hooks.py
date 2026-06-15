@@ -60,6 +60,20 @@ def set_stringee_bridge_factory(factory) -> None:
     _stringee_bridge_factory = factory
 
 
+# Outbound SIP-trunk (DiDLogic) bridge factory: async (tenant, to_number) -> SipMediaBridge.
+# Set during app startup; used by Call Lead for telephony provider "didlogic".
+_sip_bridge_factory: Callable | None = None
+
+
+def set_sip_bridge_factory(factory) -> None:
+    global _sip_bridge_factory
+    _sip_bridge_factory = factory
+
+
+def get_sip_bridge_factory():
+    return _sip_bridge_factory
+
+
 @router.post("/twilio/voice", response_class=Response)
 async def twilio_voice(
     request: Request,

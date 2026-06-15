@@ -46,6 +46,12 @@ voice = [
 embeddings = [
     "sentence-transformers>=2.7",
 ]
+sip = [
+    # Pure-Python SIP/RTP stack for outbound calls over a raw SIP trunk
+    # (e.g. DiDLogic). Only needed when a tenant's telephony provider is a SIP
+    # trunk; the rest of the app runs without it (lazy import).
+    "pyVoIP>=1.6.8",
+]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",

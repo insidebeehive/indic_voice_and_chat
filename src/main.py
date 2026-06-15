@@ -58,6 +58,7 @@ from src.bootstrap import (
     build_provider_registry,
     make_bridge_factory,
     make_exotel_bridge_factory,
+    make_sip_bridge_factory,
     make_stringee_bridge_factory,
 )
 from src.config import Settings, get_settings
@@ -163,6 +164,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             providers=providers, script=campaign.script, slots=campaign.slots,
         )
     )
+    telephony_hooks.set_sip_bridge_factory(
+        make_sip_bridge_factory(
+            providers=providers, script=campaign.script, slots=campaign.slots,
+            session_store=base_session_store,
+        )
+    )
     if dev_console_enabled():
         set_browser_bridge_factory(
             make_browser_bridge_factory(
@@ -184,6 +191,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         telephony_hooks.set_bridge_factory(None)
         telephony_hooks.set_exotel_bridge_factory(None)
         telephony_hooks.set_stringee_bridge_factory(None)
+        telephony_hooks.set_sip_bridge_factory(None)
         set_browser_bridge_factory(None)
         set_call_outcome_persister(None)
         await redis_client.aclose()

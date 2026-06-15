@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 
@@ -19,16 +20,79 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.call_store import count_active_calls, insert_call
+from src.api import telephony_hooks
+from src.api.call_store import count_active_calls, insert_call, record_outcome
 from src.api.deps import get_db_session
 from src.auth import TenantContext, current_tenant
 from src.interfaces.telephony import CallConfig
 from src.models.campaign import Campaign as DbCampaign
 from src.models.conversation import Conversation
+from src.models.database import get_sessionmaker
 from src.providers import get_telephony_provider
+from src.providers.telephony.sip.transport import SipError
 
 log = logging.getLogger(__name__)
 router = APIRouter(tags=["calls"])
+
+# Background SIP call tasks (held so they aren't garbage-collected mid-call).
+_sip_tasks: set = set()
+
+
+def _parse_iso(value):
+    if not value:
+        return None
+    try:
+        from datetime import datetime
+        return datetime.fromisoformat(value)
+    except (ValueError, TypeError):
+        return None
+
+
+async def _run_sip_call_task(bridge, call_id: str) -> None:
+    """Run an outbound SIP call's bridge to completion, then persist its outcome
+    + cost to the conversation row. Runs as a detached background task (Call Lead
+    returns the call_id immediately — the call is async)."""
+    try:
+        await bridge.run()
+    except Exception:  # noqa: BLE001
+        log.exception("sip call bridge crashed", extra={"call_id": call_id})
+    finally:
+        payload = getattr(bridge, "_outcome_payload", None) or {}
+        try:
+            async with get_sessionmaker()() as s:
+                await record_outcome(
+                    s, call_id, status="ended",
+                    outcome=payload.get("outcome"), summary=payload.get("summary"),
+                    notes=payload.get("notes"),
+                    callback_at=_parse_iso(payload.get("callback_datetime")))
+        except Exception:  # noqa: BLE001
+            log.exception("sip call finalize failed", extra={"call_id": call_id})
+
+
+async def _place_sip_call(session, tenant, campaign_id, req) -> "CallLeadResponse":
+    """Place an outbound call over a SIP trunk (DiDLogic) and run the agent."""
+    factory = telephony_hooks.get_sip_bridge_factory()
+    if factory is None:
+        raise HTTPException(status_code=503, detail="SIP bridge not initialized")
+    try:
+        bridge = await factory(tenant, req.to_number.strip())   # sends the INVITE
+    except SipError as e:
+        log.exception("sip call failed", extra={"tenant": tenant.slug})
+        raise HTTPException(status_code=502, detail=f"SIP call failed: {e}")
+    except Exception as e:  # noqa: BLE001 — e.g. missing creds / no realtime config
+        raise HTTPException(status_code=400, detail=f"SIP call setup failed: {e}")
+
+    call_id = f"call_{uuid.uuid4().hex[:16]}"
+    await insert_call(
+        session, call_id=call_id, tenant=tenant, provider_call_sid=call_id,
+        channel="telephony", campaign_id=campaign_id, lead_id=req.lead_id,
+        voice=req.voice, mode="s2s")   # SIP outbound runs the realtime (s2s) path
+    task = asyncio.create_task(_run_sip_call_task(bridge, call_id))
+    _sip_tasks.add(task)
+    task.add_done_callback(_sip_tasks.discard)
+    log.info("sip call lead placed", extra={
+        "tenant": tenant.slug, "campaign": campaign_id, "call_id": call_id})
+    return CallLeadResponse(call_id=call_id, status="in_progress", provider_call_sid=call_id)
 
 
 # --- Schemas ------------------------------------------------------------
@@ -93,6 +157,11 @@ async def call_lead(
         raise HTTPException(
             status_code=429,
             detail=f"max concurrent calls reached ({cap}); retry when a call ends")
+
+    # Raw SIP trunk (e.g. DiDLogic): no REST/WS — place the INVITE + run the agent
+    # over RTP in-process via the SIP bridge factory.
+    if provider == "didlogic":
+        return await _place_sip_call(session, tenant, campaign_id, req)
 
     from_number = req.from_number or (tel.outbound_from or {}).get(provider) or tel.from_number
     if not from_number:

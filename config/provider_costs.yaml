@@ -49,3 +49,4 @@ telephony:
   stringee: 0.010
   infobip: 0.012
   telnyx: 0.0035
+  didlogic: 0.006   # SIP trunk (wholesale termination) — tenant's own account

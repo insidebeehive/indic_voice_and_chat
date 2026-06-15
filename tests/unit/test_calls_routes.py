@@ -15,6 +15,7 @@ from src.auth.middleware import set_tenant_resolver
 from src.config_tenant import (
     TenantLLMConfig,
     TenantPipelineConfig,
+    TenantRealtimeConfig,
     TenantSettings,
     TenantSTTConfig,
     TenantTelephonyConfig,
@@ -189,6 +190,84 @@ async def test_call_lead_webconsole_returns_helpful_409(ctx) -> None:
     assert resp.status_code == 409
     assert "webconsole" in resp.json()["detail"]
     assert "/console" in resp.json()["detail"]
+
+
+async def test_call_lead_didlogic_sip_path(ctx, monkeypatch) -> None:
+    import asyncio
+
+    from src.api import telephony_hooks
+    client, sm = ctx
+    # the background finalize uses get_sessionmaker() directly — point it at the test DB
+    monkeypatch.setattr(calls, "get_sessionmaker", lambda: sm)
+
+    class _FakeBridge:
+        def __init__(self):
+            self.ran = False
+            self._outcome_payload = {"outcome": "interested", "summary": "ok", "notes": "n"}
+
+        async def run(self):
+            self.ran = True
+
+    fake_bridge = _FakeBridge()
+
+    async def fake_factory(tenant, to_number):
+        assert to_number == "+918618795697"
+        return fake_bridge
+
+    telephony_hooks.set_sip_bridge_factory(fake_factory)
+    register_tenant_for_test(
+        TenantSettings(
+            id="t_sip", slug="sip", name="SIP", max_concurrent_calls=2,
+            pipeline=TenantPipelineConfig(
+                mode="s2s",
+                realtime=TenantRealtimeConfig(provider="gemini_live", model="m", voice="Aoede"),
+                tts=TenantTTSConfig(provider="sarvam", voice_id="anushka"),
+                telephony=TenantTelephonyConfig(
+                    provider="didlogic", from_number="+15705255679",
+                    sip_server="sip.didlogic.com",
+                    account_sid_env="X_SIP_USER", auth_token_env="X_SIP_PASS"))),
+        plaintext_tokens=["sip-token"])
+    async with sm() as s:
+        s.add(Tenant(id="t_sip", slug="sip", name="SIP"))
+        s.add(DbCampaign(id="sipc", tenant_id="t_sip", name="S", status="active", config_yaml=""))
+        await s.commit()
+
+    try:
+        resp = await client.post(
+            "/campaigns/sipc/calls", json={"to_number": "+918618795697"},
+            headers={"Authorization": "Bearer sip-token"})
+        assert resp.status_code == 202
+        call_id = resp.json()["call_id"]
+        await asyncio.sleep(0.05)   # let the background SIP task run + finalize
+        assert fake_bridge.ran is True
+        async with sm() as s:
+            row = await s.get(Conversation, call_id)
+        assert row.telephony_provider == "didlogic"
+        assert row.mode == "s2s"
+        assert row.realtime_provider == "gemini_live"
+        assert row.outcome == "interested"      # finalized from the bridge's outcome
+    finally:
+        telephony_hooks.set_sip_bridge_factory(None)
+
+
+async def test_call_lead_didlogic_no_factory_503(ctx) -> None:
+    from src.api import telephony_hooks
+    client, sm = ctx
+    telephony_hooks.set_sip_bridge_factory(None)
+    register_tenant_for_test(
+        TenantSettings(
+            id="t_sip2", slug="sip2", name="SIP2",
+            pipeline=TenantPipelineConfig(
+                telephony=TenantTelephonyConfig(provider="didlogic"))),
+        plaintext_tokens=["sip2-token"])
+    async with sm() as s:
+        s.add(Tenant(id="t_sip2", slug="sip2", name="SIP2"))
+        s.add(DbCampaign(id="sipc2", tenant_id="t_sip2", name="S", status="active", config_yaml=""))
+        await s.commit()
+    resp = await client.post(
+        "/campaigns/sipc2/calls", json={"to_number": "+9118"},
+        headers={"Authorization": "Bearer sip2-token"})
+    assert resp.status_code == 503
 
 
 async def test_call_lead_requires_auth(ctx) -> None:

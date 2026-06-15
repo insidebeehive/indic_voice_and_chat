@@ -1,7 +1,25 @@
-# SIP trunk (DiDLogic) outbound integration — plan
+# SIP trunk (DiDLogic) outbound integration
 
-> Status: planned, not started. Scope: **outbound only**, provider **DiDLogic**.
-> Captured for a future, fresh implementation effort (after the API/DB restructure merges).
+> Status: **app-side implemented (pure-Python in-app transport), pending live
+> validation.** Scope: **outbound only**, provider **DiDLogic**.
+>
+> Implemented (this PR): a SIP transport seam (`src/providers/telephony/sip/transport.py`),
+> a pyVoIP-backed transport (`.../sip/pyvoip_call.py`, **UNVERIFIED — needs live
+> DiDLogic creds**), a `SipMediaBridge` (`src/api/sip_media_bridge.py`) running the
+> S2S agent over RTP, a `make_sip_bridge_factory` (bootstrap) wired in the lifespan,
+> and a Call Lead path for telephony provider `didlogic` (places the INVITE, runs
+> the agent as a background task, persists outcome + cost). `telephony.sip_server`
+> added to the tenant config; SIP user/pass reuse the encrypted
+> `account_sid`/`auth_token` secrets. Cost catalog + Admin UI include `didlogic`.
+> pyVoIP is an optional extra (`pip install -e .[sip]`).
+>
+> Remaining: install pyVoIP in the deploy image, register a DiDLogic tenant with
+> SIP creds, and live-test an outbound call (validate the pyVoIP API/RTP against
+> the installed version). The gateway alternative below stays the production-grade
+> option if the in-app pure-Python path proves too fragile.
+
+---
+## Original plan (gateway approach — kept for reference)
 
 ## Context
 We want to place **outbound** AI-agent calls through **DiDLogic**, a wholesale **SIP trunk +
