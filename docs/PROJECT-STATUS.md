@@ -1,6 +1,6 @@
 # Project Status
 
-**Last updated:** 2026-06-10
+**Last updated:** 2026-06-15
 
 Ground-truth status of what has actually been **built, validated, and worked on** —
 as opposed to what merely exists in the tree. Several modules were scaffolded during
@@ -16,16 +16,82 @@ campaign), tested through the browser dev console.
 
 | Area | Status |
 |---|---|
-| Voice core: STT / LLM / TTS | ✅ done & validated |
+| Voice core: STT / LLM / TTS (cascade) | ✅ done & validated |
+| **Speech-to-speech (Gemini Live)** | ✅ **selectable path, validated live (~1.4s first word)** |
 | Dev console (browser) + barge-in | ✅ done — primary surface |
 | Twilio / Exotel telephony (streaming) | ✅ media bridge done · barge-in ⬜ |
 | Stringee telephony (turn-based IVR) | 🟡 built, live-blocked on Stringee's side · barge-in ⬜ |
 | Telnyx / Infobip telephony | 🟡 auth scaffold only, media ⬜ |
-| Campaign orchestration | ✅ logic done · 🟡 live-call wiring not done |
-| **Telephony barge-in** | ⬜ **pending across all telephony** |
+| **API/DB multi-tenant platform (5 APIs)** | ✅ **built, deployed to prod** |
+| **Provider cost catalog + per-call billing** | ✅ **model-level, telephony-as-tentative** |
+| **Admin / Tenant / Backoffice consoles** | ✅ **built (browser UIs over the API)** |
+| **Production deploy (Northflank)** | ✅ **live, auto-deploy from `main`** |
+| **SIP trunk / DiDLogic (outbound)** | 🟡 built on a branch — pending live creds (not on `main`) |
+| Campaign orchestration | ✅ logic done; DB-backed create/end + per-lead Call Lead |
+| **Telephony barge-in** | ⬜ **pending across all telephony** (S2S path has native barge-in) |
 | **RAG / ChatBot** | ⬜ **untouched scaffold — not worked on** |
 | **Benchmarking** | ⬜ **very basic skeleton — much more to do** |
 | **Code-switching / multilingual** | ⬜ **not considered — Hindi-only today** |
+
+---
+
+## 🚀 Since 2026-06-10 — Speech-to-speech + the API/DB platform
+
+The work since the last report shifted from *latency experiments on the cascade* to
+two big additions: a **speech-to-speech path** that breaks the latency floor, and a
+**purely API-driven, DB-backed multi-tenant platform** (now deployed to production).
+
+### Speech-to-speech (Gemini Live)
+- **Selectable path beside the cascade** (`pipeline.mode: layered | s2s`): `GeminiLiveBridge`
+  (browser) and `TelephonyLiveBridge` (Twilio/Exotel media streams) speak end-to-end audio
+  in/out. Cascade stays the default + fallback. Validated live (multi-turn Hindi).
+- **Latency: ~1.4 s to first word** on `gemini-3.1-flash-live-preview` (1389 ms median, real-time
+  input), vs ~3.2 s for the cascade — Experiment 6 in the latency log. Brings **native barge-in /
+  turn-taking** for free. (Reply *playback* still runs long, ~7–12 s — a brevity-tuning follow-up.)
+- **Structured output / state in S2S:** Gemini Live emits **free-form audio, not JSON**. Control
+  comes from a **function/tool call** the model makes while speaking —
+  `record_turn_signal(action, updated_slots)` where `action ∈ {continue, clarify, transfer,
+  schedule_callback, send_info, close_positive, close_negative, end}`. So the cascade's JSON
+  envelope (`response_text` etc.) is **not** returned, but **slots, action, state machine, and
+  end-of-call outcome are preserved** — `apply_signal` (extracted from the cascade) is driven by
+  the tool call, and Live transcriptions feed the same outcome analysis.
+- Gotchas found: `session.receive()` is a **per-turn** generator (must loop), and a **text
+  kickoff breaks realtime-audio VAD** (v1 = user speaks first). Realtime-audio tokens are
+  pricier than text — cost is tracked per call (below).
+
+### API/DB-backed multi-tenant platform
+Replaced YAML-on-boot + in-memory state with real DB tables and a clean API surface. **The 5 APIs**:
+1. **Register Tenant** — `POST /api/v1/tenants` (admin): provider/model choices + Fernet-encrypted
+   telephony keys; returns the tenant's API token once.
+2. **Get Voice List** — `GET /api/v1/voices` (+ `GET /api/v1/providers` costs, `GET /api/v1/models`
+   variants): the selectable rosters.
+3. **Create Campaign** — `POST /api/v1/campaigns` (+ CSV lead upload).
+4. **Call Lead** — `POST /api/v1/campaigns/{id}/calls` (async, 202): outbound call for a lead,
+   concurrency-capped; returns `call_id`. `GET /api/v1/calls/{id}` polls status/outcome/cost.
+5. **End Campaign** — `POST /api/v1/campaigns/{id}/end`.
+   *(Admin backoffice: `GET /tenants`, `/tenants/{id}/analytics`, `/tenants/{id}/billing`.)*
+
+- **Schema namespacing:** all tables live under a configurable schema (**`voicebot`**) so we share
+  the existing Postgres DB; managed-Postgres URL normalization (`postgresql://…?sslmode=require`
+  → async + ssl).
+- **Per-tenant telephony keys encrypted at rest** (Fernet, `VOX_SECRET_KEY`); STT/LLM/TTS/S2S use
+  shared master keys.
+- **Provider cost catalog** — table `provider_costs` keyed `(kind, provider, model)`, **per-minute**
+  (USD/min), **model-level** for STT/LLM/TTS/S2S (e.g. gemini flash vs flash-lite vs pro),
+  per-provider for telephony. LLM/STT are token-priced upstream — modeled per-minute from typical
+  dialogue volume. **Per-call cost** = Σ(components × duration); **telephony excluded from the
+  platform total** (tenant's own trunk), shown as a *tentative* figure.
+- **Browser consoles** (thin UIs over the API, so using them exercises the API): `/admin` (register
+  with a live cost breakdown + cost editor), `/console` (campaigns/calls), `/admin/tenants`
+  (backoffice: tenant list + analytics + billing). **Webconsole/browser test calls are recorded +
+  billed** like real calls.
+- **Deployed to production** (Northflank, auto-deploy from `main`) — live and healthy on the
+  `voicebot` schema.
+
+### In flight (NOT on `main`)
+- **SIP trunk / DiDLogic outbound** — pure-Python (pyVoIP) in-app transport, S2S over RTP,
+  implemented + unit-tested on `feature/sip-didlogic-outbound`; **pending live DiDLogic creds**
+  before merge (see `docs/sip-didlogic-integration-plan.md`).
 
 ---
 
@@ -79,7 +145,12 @@ campaign), tested through the browser dev console.
 
 ## Notes on latency (context)
 
-The dominant per-turn cost is **LLM + TTS inference**, not STT or server placement
-(see `docs/latency-llm-stt-experiments.md`). Recent live medians (dev console, local):
-LLM TTFT ~2.1 s, first spoken word ~3.3 s, full turn ~6.4 s. STT is effectively free on
-the streaming path (overlapped with speech).
+The dominant per-turn cost in the **cascade** is **LLM + TTS inference**, not STT or server
+placement (see `docs/latency-llm-stt-experiments.md`). Cascade live medians (dev console, local):
+LLM TTFT ~2.1 s, first spoken word ~3.3 s, full turn ~6.4 s. STT is effectively free on the
+streaming path (overlapped with speech).
+
+**Speech-to-speech removes that floor** (Experiment 6): `gemini-3.1-flash-live-preview` reaches
+**~1.4 s to first word** (1389 ms median) vs ~3.2 s for the cascade — end-to-end audio, no
+serialized STT→LLM→TTS, with native barge-in. S2S is the architectural answer; the cascade
+remains the cheaper, more controllable default.
