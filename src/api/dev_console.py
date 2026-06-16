@@ -76,6 +76,49 @@ async def dev_voice_page() -> FileResponse:
     return FileResponse(_STATIC / "dev_console.html", media_type="text/html")
 
 
+@dev_router.get("/dev/voices")
+async def dev_voices(request: Request, tenant: str = "dev") -> dict:
+    """Voice options for the console's Voice dropdown, per mode — config-driven so
+    the list matches the active stack instead of a hardcoded one:
+
+    - ``layered`` (cascade): the configured TTS provider's voice roster.
+    - ``s2s`` (Gemini Live): the tenant's realtime ``allowed_voices``.
+    """
+    from src.auth.middleware import tenant_from_slug
+
+    try:
+        tctx = await tenant_from_slug(tenant)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=404, detail=f"unknown tenant: {e}")
+    p = tctx.settings.pipeline
+
+    # S2S: the tenant's allowed realtime voices (default = pipeline.realtime.voice).
+    rt = p.realtime
+    s2s_voices = list(rt.allowed_voices) if (rt and rt.allowed_voices) else []
+    s2s_default = (rt.voice if rt else "") or (s2s_voices[0] if s2s_voices else "")
+
+    # Layered: the configured TTS provider's roster (default = pipeline.tts.voice_id).
+    layered_default = p.tts.voice_id or ""
+    layered_voices: list[str] = []
+    providers = getattr(request.app.state, "providers", None)
+    if providers is not None:
+        try:
+            tts = providers.get_tts(tctx)
+            roster = tts.get_available_voices(p.tts.language or "hi-IN")
+            layered_voices = [v.get("voice_id") for v in roster if v.get("voice_id")]
+        except Exception:  # noqa: BLE001 - never block the page on a provider hiccup
+            log.warning("dev voices: could not list TTS voices", exc_info=True)
+    if layered_default and layered_default not in layered_voices:
+        layered_voices = [layered_default, *layered_voices]
+    if not layered_default and layered_voices:
+        layered_default = layered_voices[0]
+
+    return {
+        "layered": {"voices": layered_voices, "default": layered_default},
+        "s2s": {"voices": s2s_voices, "default": s2s_default},
+    }
+
+
 # --- Telephony control panel: place an outbound call + poll its status --------
 #
 # WebConsole runs in-browser (the WS routes above). The Telephony dropdown picks
@@ -345,6 +388,19 @@ def make_browser_bridge_factory(
         stt = providers.get_stt(tenant)
         llm = providers.get_llm(tenant)
         tts = providers.get_tts(tenant)
+        tts_language = tenant.settings.pipeline.tts.language or "hi-IN"
+        # Voice: ?voice= overrides the configured default (validated against the
+        # TTS provider's roster), so the console's Voice dropdown applies in
+        # layered mode just like it does for S2S.
+        tts_voice = tenant.settings.pipeline.tts.voice_id
+        sel_voice = ((getattr(websocket, "query_params", {}) or {}).get("voice") or "").strip()
+        if sel_voice:
+            try:
+                roster = {v.get("voice_id") for v in tts.get_available_voices(tts_language)}
+            except Exception:  # noqa: BLE001
+                roster = set()
+            if sel_voice in roster:
+                tts_voice = sel_voice
         pipeline_cfg = PipelineConfig(
             stt=STTConfig(language=tenant.settings.pipeline.stt.language or "hi-IN"),
             llm=LLMConfig(
@@ -353,8 +409,8 @@ def make_browser_bridge_factory(
                 response_format=tenant.settings.pipeline.llm.response_format or "json",
             ),
             tts=TTSConfig(
-                language=tenant.settings.pipeline.tts.language or "hi-IN",
-                voice_id=tenant.settings.pipeline.tts.voice_id,
+                language=tts_language,
+                voice_id=tts_voice,
                 sample_rate=16000,
             ),
         )
