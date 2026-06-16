@@ -67,6 +67,21 @@ async def test_interrupted_event():
     assert [e.type for e in events] == ["interrupted"]
 
 
+def test_speech_config_omits_language_code_when_unset():
+    # Native-audio Live models auto-switch language and reject an explicit code,
+    # so an unset language_code must NOT be pinned on the speech config.
+    from google.genai import types
+
+    from src.providers.realtime.gemini_live import _build_speech_config
+
+    sc = _build_speech_config(types, None, "Aoede")
+    assert not getattr(sc, "language_code", None)          # left unset
+    assert sc.voice_config is not None                     # voice still applied
+
+    sc2 = _build_speech_config(types, "hi-IN", None)
+    assert sc2.language_code == "hi-IN"                     # honored when given
+
+
 def test_to_tool_builds_function_declaration():
     from google.genai import types
     tool = _to_tool(types, RealtimeTool(

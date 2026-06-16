@@ -53,7 +53,11 @@ pipeline:
     model: gemini-3.1-flash-live-preview
     voice: Aoede
     allowed_voices: [Aoede, Kore, Leda]
-    language_code: hi-IN
+    # gemini-3.1-flash-live is a NATIVE-AUDIO model: it auto-detects + switches
+    # language naturally and doesn't accept an explicit language_code, so leave it
+    # null (language is steered via the system instruction). Set a code only for a
+    # half-cascade model that requires one.
+    language_code: null
     api_key_env: TENANT_DEV_GEMINI_KEY
 
   # Streaming STT for the dev console (Deepgram live). When present, the browser
