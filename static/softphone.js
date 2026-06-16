@@ -35,6 +35,14 @@
     : (typeof self !== "undefined") ? self
     : (typeof globalThis !== "undefined") ? globalThis : this;
 
+  // Default vendor SDK CDNs, used when the page neither pre-loads the SDK nor
+  // passes a *SdkUrl. Override via Softphone.create(tok, { stringeeSdkUrl, twilioSdkUrl })
+  // to pin a specific version.
+  const DEFAULT_SDK = {
+    stringee: "https://cdn.stringee.com/sdk/web/latest/stringee-web-sdk.min.js",
+    twilio: "https://sdk.twilio.com/js/voice/releases/2.11.2/twilio.min.js",
+  };
+
   function loadScript(url) {
     return new Promise(function (resolve, reject) {
       if (!url) return reject(new Error("no SDK url provided and SDK global not found"));
@@ -92,7 +100,7 @@
   async function buildTwilio(tok, opts, em) {
     let Device = (glob.Twilio && glob.Twilio.Device) || (glob.Device);
     if (!Device) {
-      await loadScript(opts.twilioSdkUrl);
+      await loadScript(opts.twilioSdkUrl || DEFAULT_SDK.twilio);
       Device = (glob.Twilio && glob.Twilio.Device) || glob.Device;
     }
     if (!Device) throw new Error("Twilio Voice SDK not found (set opts.twilioSdkUrl)");
@@ -135,7 +143,7 @@
 
   async function buildStringee(tok, opts, em) {
     if (!glob.StringeeClient || !glob.StringeeCall) {
-      await loadScript(opts.stringeeSdkUrl);
+      await loadScript(opts.stringeeSdkUrl || DEFAULT_SDK.stringee);
     }
     const StringeeClient = glob.StringeeClient, StringeeCall = glob.StringeeCall;
     if (!StringeeClient || !StringeeCall) {
