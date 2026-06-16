@@ -20,7 +20,16 @@ import logging
 from collections.abc import Callable
 
 import httpx
-from fastapi import APIRouter, Depends, Form, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    Form,
+    HTTPException,
+    Request,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.responses import JSONResponse, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -47,6 +56,18 @@ def set_softphone_providers(providers: object | None) -> None:
     """Register the per-tenant provider registry used by the recording webhook."""
     global _softphone_providers
     _softphone_providers = providers
+
+
+# Sessionmaker for the softphone answer's background logging task (it needs its
+# own session — the request's is closed once the fast response is sent). Defaults
+# to the process-wide sessionmaker; tests inject an in-memory one.
+_softphone_sessionmaker: object | None = None
+
+
+def set_softphone_sessionmaker(sessionmaker: object | None) -> None:
+    """Register the sessionmaker used by the answer webhook's background logger."""
+    global _softphone_sessionmaker
+    _softphone_sessionmaker = sessionmaker
 
 
 # Factory: takes (websocket, tenant_context) -> bridge instance with .run()
@@ -323,25 +344,52 @@ def _stringee_recording_url(data: dict) -> str | None:
     return None
 
 
-@router.api_route("/stringee/softphone-answer/{tenant_slug}", methods=["GET", "POST"])
-async def stringee_softphone_answer(
-    tenant_slug: str,
-    request: Request,
-    session: AsyncSession = Depends(get_db_session),
-):
-    """Stringee answer webhook for a browser-softphone call → connect SCCO.
+async def _log_softphone_call(tenant: TenantContext, provider_call_sid: str, to_number: str) -> None:
+    """Insert the manual-call row for a Stringee softphone call (background).
 
-    Logs the call as a manual conversation row (keyed by the Stringee call_id)
-    and returns an SCCO connecting the agent's client call to the lead from the
-    tenant's DID, with dual-channel recording.
+    Runs AFTER the answer response is sent so the DB write never adds latency to
+    Stringee's answer-URL fetch (a slow answer response is dropped as
+    REQUEST_ANSWER_URL_ERROR). Opens its own session — the request's is closed.
     """
     import uuid
 
     from sqlalchemy import select
 
     from src.api.call_store import insert_call
-    from src.api.telephony_stringee import softphone_connect_scco
     from src.models.conversation import Conversation
+    from src.models.database import get_sessionmaker
+
+    sessionmaker = _softphone_sessionmaker or get_sessionmaker()
+    try:
+        async with sessionmaker() as session:
+            existing = (await session.execute(
+                select(Conversation).where(Conversation.provider_call_sid == provider_call_sid)
+            )).scalar_one_or_none()
+            if existing is None:
+                row = await insert_call(
+                    session, call_id=f"call_{uuid.uuid4().hex[:16]}", tenant=tenant,
+                    provider_call_sid=provider_call_sid, channel="softphone", agent_type="human")
+                row.notes = f"manual softphone call → {to_number}"
+                await session.commit()
+    except Exception:  # noqa: BLE001 — logging must never break; the call already connected
+        log.exception("stringee softphone: manual-call logging failed", extra={
+            "call_sid": provider_call_sid})
+
+
+@router.api_route("/stringee/softphone-answer/{tenant_slug}", methods=["GET", "POST"])
+async def stringee_softphone_answer(
+    tenant_slug: str,
+    request: Request,
+    background_tasks: BackgroundTasks,
+    session: AsyncSession = Depends(get_db_session),
+):
+    """Stringee answer webhook for a browser-softphone call → connect SCCO.
+
+    Returns the SCCO **immediately** (Stringee's answer-URL fetch has a tight
+    timeout; a slow response is dropped). The manual-call row is logged in a
+    background task so the DB write doesn't block the response.
+    """
+    from src.api.telephony_stringee import softphone_connect_scco
 
     data = await _stringee_params(request)
     log.info("stringee softphone answer", extra={
@@ -364,16 +412,9 @@ async def stringee_softphone_answer(
         log.warning("stringee softphone answer: no destination; keys=%s", sorted(data.keys()))
         return Response(status_code=404)
 
+    # Log the manual call AFTER responding — never block Stringee's answer fetch.
     if call_id:
-        existing = (await session.execute(
-            select(Conversation).where(Conversation.provider_call_sid == call_id)
-        )).scalar_one_or_none()
-        if existing is None:
-            row = await insert_call(
-                session, call_id=f"call_{uuid.uuid4().hex[:16]}", tenant=tenant,
-                provider_call_sid=call_id, channel="softphone", agent_type="human")
-            row.notes = f"manual softphone call → {to_number}"
-            await session.commit()
+        background_tasks.add_task(_log_softphone_call, tenant, call_id, to_number)
 
     event_url = f"{_stringee_base(request)}/softphone-recording/{tenant_slug}"
     scco = softphone_connect_scco(
