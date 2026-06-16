@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Softphone test — browser → lead</title>
+<style>
+  :root { color-scheme: dark; }
+  body { font: 15px/1.5 system-ui, sans-serif; max-width: 640px; margin: 2rem auto;
+         padding: 0 1rem; background:#0b1220; color:#dbe7ff; }
+  h1 { font-size: 1.25rem; }
+  label { display:block; margin:.6rem 0 .15rem; color:#8a94a6; font-size:.85rem; }
+  input { width:100%; box-sizing:border-box; padding:.5rem; border-radius:6px;
+          border:1px solid #334155; background:#11213a; color:#dbe7ff; }
+  .row { display:flex; gap:.75rem; }
+  .row > div { flex:1; }
+  button { margin-top:1rem; padding:.6rem 1rem; border-radius:6px; border:0; cursor:pointer;
+           background:#2563eb; color:#fff; font-weight:600; }
+  button.ghost { background:#1c2740; color:#dbe7ff; }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+  #status { margin-top:1rem; font-weight:700; }
+  #log { margin-top:.5rem; background:#070d18; border:1px solid #1c2740; border-radius:6px;
+         padding:.6rem; height:180px; overflow:auto; font:12px/1.45 ui-monospace, monospace;
+         white-space:pre-wrap; }
+  .warn { background:#3a2a07; border:1px solid #7c5e1e; color:#fde68a; padding:.5rem .7rem;
+          border-radius:6px; font-size:.82rem; margin-top:1rem; }
+</style>
+</head>
+<body>
+  <h1>Softphone test — browser → lead</h1>
+  <p style="color:#8a94a6">Assumes the tenant is registered and the provider project is configured.
+  Provider (Twilio/Stringee) is decided by the tenant's config — this page doesn't care which.</p>
+
+  <div class="row">
+    <div><label>Our host (API base)</label><input id="base" /></div>
+    <div><label>Agent identity</label><input id="identity" value="agent-1" /></div>
+  </div>
+  <label>Tenant API token (Bearer)</label>
+  <input id="token" placeholder="vox_…" />
+  <label>Lead number (E.164)</label>
+  <input id="lead" placeholder="+918618795697" />
+  <div class="row">
+    <div><label>Stringee Web SDK URL (optional — auto-loaded)</label><input id="stringeeSdk" placeholder="https://cdn.stringee.com/sdk/web/latest/stringee-web-sdk.min.js" /></div>
+    <div><label>Twilio Voice SDK URL (optional)</label><input id="twilioSdk" placeholder="https://sdk.twilio.com/js/voice/releases/.../twilio.min.js" /></div>
+  </div>
+
+  <button id="call">Mint token &amp; call</button>
+  <button id="hangup" class="ghost" disabled>Hang up</button>
+
+  <div id="status">idle</div>
+  <div id="log"></div>
+
+  <div class="warn"><b>Test harness only.</b> A real CRM mints the token on its <i>backend</i>
+  (the tenant token must not live in the browser). This page mints in-browser purely so you can
+  test from one file.</div>
+
+<!-- our provider-agnostic helper (served by the app) -->
+<script src="/softphone.js"></script>
+<script>
+  const $ = (id) => document.getElementById(id);
+  $("base").value = window.location.origin;
+  let phone = null;
+
+  function log(msg) {
+    const el = $("log");
+    el.textContent += (typeof msg === "string" ? msg : JSON.stringify(msg)) + "\n";
+    el.scrollTop = el.scrollHeight;
+  }
+  function setStatus(s) { $("status").textContent = s; }
+
+  async function mintToken() {
+    const base = $("base").value.replace(/\/+$/, "");
+    const resp = await fetch(base + "/api/v1/softphone/token", {
+      method: "POST",
+      headers: { "Authorization": "Bearer " + $("token").value.trim(),
+                 "Content-Type": "application/json" },
+      body: JSON.stringify({ agent_identity: $("identity").value.trim() }),
+    });
+    if (!resp.ok) throw new Error("token mint failed: HTTP " + resp.status + " " + (await resp.text()));
+    return resp.json();
+  }
+
+  $("call").onclick = async () => {
+    $("call").disabled = true;
+    try {
+      setStatus("minting token…");
+      const tok = await mintToken();
+      log("token provider = " + tok.provider + ", identity = " + tok.identity);
+
+      setStatus("connecting SDK…");
+      phone = await Softphone.create(tok, {
+        stringeeSdkUrl: $("stringeeSdk").value.trim() || undefined,
+        twilioSdkUrl: $("twilioSdk").value.trim() || undefined,
+      });
+      phone.on("status", (s) => { setStatus(s); log("status: " + s);
+        if (s === "disconnected") { $("hangup").disabled = true; $("call").disabled = false; } });
+      phone.on("error", (e) => log("error: " + (e && (e.message || JSON.stringify(e)))));
+
+      setStatus("dialing…");
+      $("hangup").disabled = false;
+      await phone.dial($("lead").value.trim());
+    } catch (e) {
+      setStatus("error");
+      log("error: " + e.message);
+      $("call").disabled = false;
+    }
+  };
+
+  $("hangup").onclick = () => { if (phone) phone.hangup(); };
+</script>
+</body>
+</html>

@@ -250,6 +250,15 @@ async def softphone_helper() -> FileResponse:
         _STATIC_DIR / "softphone.js", media_type="application/javascript")
 
 
+@app.get("/softphone-test", include_in_schema=False)
+async def softphone_test_page() -> FileResponse:
+    """Single-page test harness: mint a token + place a browser call via softphone.js.
+
+    Test-only (it mints the token in the browser); a real CRM mints server-side.
+    """
+    return FileResponse(_STATIC_DIR / "softphone_test.html", media_type="text/html")
+
+
 @app.get("/health")
 async def health() -> dict:
     """Liveness + dependency probe + per-tenant provider routing."""
