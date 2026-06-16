@@ -319,13 +319,23 @@ async def stringee_softphone_answer(
     from src.api.call_store import insert_call
     from src.api.telephony_stringee import softphone_connect_scco
     from src.models.conversation import Conversation
+    from src.models.tenant import TenantPhoneNumber
 
     data = await _stringee_params(request)
     log.info("stringee softphone answer", extra={
         "tenant": tenant_slug, "method": request.method, "data": data})
     tenant = await tenant_from_slug(tenant_slug)
     tel = tenant.settings.pipeline.telephony
-    from_number = (tel.outbound_from or {}).get("stringee") or tel.from_number
+    # Caller-ID = the tenant's Stringee-registered number from tenant_phone_numbers
+    # (Stringee rejects the connect if `from` isn't a number it owns). This is the
+    # Stringee answer endpoint, so the provider is always "stringee". Fall back to
+    # the telephony config if no provider number is registered.
+    from_number = (await session.execute(
+        select(TenantPhoneNumber.phone_number).where(
+            TenantPhoneNumber.tenant_id == tenant.id,
+            TenantPhoneNumber.provider == "stringee",
+        ).limit(1)
+    )).scalars().first() or (tel.outbound_from or {}).get("stringee") or tel.from_number
     if not from_number:
         log.warning("stringee softphone: no caller-ID for tenant %s", tenant.slug)
         return Response(status_code=400)

@@ -204,6 +204,26 @@ async def test_stringee_answer_logs_manual_call_and_connects(ctx) -> None:
     assert row.tts_provider is None
 
 
+async def test_stringee_answer_caller_id_from_provider_number(ctx) -> None:
+    client, maker = ctx
+    # The tenant owns a Stringee number registered in tenant_phone_numbers; the
+    # connect SCCO `from` must be THAT number (Stringee rejects a `from` it
+    # doesn't own), not the generic telephony from_number.
+    from src.models.tenant import TenantPhoneNumber
+    async with maker() as s:
+        s.add(TenantPhoneNumber(
+            phone_number="918204268005", tenant_id="t1", provider="stringee"))
+        await s.commit()
+
+    resp = await client.post(
+        "/api/v1/telephony/stringee/softphone-answer/acme",
+        json={"call_id": "ST-PN", "from": "agent", "to": "+918618795697"})
+    assert resp.status_code == 200
+    scco = resp.json()
+    assert scco[0]["from"]["number"] == "918204268005"
+    assert scco[0]["from"]["type"] == "external"
+
+
 async def test_stringee_answer_reads_destination_from_custom(ctx) -> None:
     client, maker = ctx
     # Real Stringee app-to-phone behaviour (from the live debugger): the answer
