@@ -121,6 +121,14 @@
         <label>auth_token <input id="t_tok" placeholder="… (encrypted at rest)" /></label>
       </div>
 
+      <!-- browser softphone (human agent ↔ lead) — Twilio only for now -->
+      <h2 style="margin-top:1rem;">Browser softphone <small style="font-weight:400;color:#8a94a6;text-transform:none;">(human agent dials from the browser — Twilio)</small></h2>
+      <div class="grid">
+        <label>API Key SID <input id="t_apikey_sid" placeholder="SK… (encrypted at rest)" /></label>
+        <label>API Key Secret <input id="t_apikey_secret" placeholder="… (encrypted at rest)" /></label>
+        <label>TwiML App SID <input id="t_twiml_app" placeholder="AP… (Voice URL → /softphone-twiml/&lt;slug&gt;)" /></label>
+      </div>
+
       <button onclick="registerTenant()">POST /tenants</button>
       <button class="ghost sm" onclick="loadCatalog(); loadCosts()">reload catalog</button>
       <span class="hint">Telephony keys are encrypted; STT/LLM/TTS use shared master keys. The returned token goes to the tenant for /console.</span>
@@ -310,6 +318,10 @@ async function registerTenant() {
   if ($("t_slug").value.trim()) body.slug = $("t_slug").value.trim();
   if ($("t_sid").value.trim()) body.telephony.keys.account_sid = $("t_sid").value.trim();
   if ($("t_tok").value.trim()) body.telephony.keys.auth_token = $("t_tok").value.trim();
+  // browser softphone (Twilio) — only sent if filled in
+  if ($("t_apikey_sid").value.trim()) body.telephony.keys.api_key_sid = $("t_apikey_sid").value.trim();
+  if ($("t_apikey_secret").value.trim()) body.telephony.keys.api_key_secret = $("t_apikey_secret").value.trim();
+  if ($("t_twiml_app").value.trim()) body.telephony.keys.twiml_app_sid = $("t_twiml_app").value.trim();
   const r = await api("POST", "/api/v1/tenants", { body });
   show("t_out", r.json);
 }

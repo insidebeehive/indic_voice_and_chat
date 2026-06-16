@@ -12,6 +12,7 @@ from src.api import (
     conversations,
     knowledge,
     sessions,
+    softphone,
     telephony_hooks,
     tenants,
     webhooks_routes,
@@ -23,6 +24,7 @@ api_router.include_router(tenants.router)
 api_router.include_router(catalog.router)
 api_router.include_router(campaigns.router)
 api_router.include_router(calls.router)
+api_router.include_router(softphone.router)
 api_router.include_router(config_routes.router)
 api_router.include_router(conversations.router)
 api_router.include_router(knowledge.router)

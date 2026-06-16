@@ -248,3 +248,34 @@ def voice_twiml(stream_websocket_url: str) -> str:
         f'<Connect><Stream url="{stream_websocket_url}"/></Connect>'
         "</Response>"
     )
+
+
+def _xml_escape(value: str) -> str:
+    return (
+        value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
+
+
+def softphone_dial_twiml(*, to_number: str, caller_id: str, recording_callback_url: str) -> str:
+    """TwiML for the browser-softphone TwiML App Voice URL.
+
+    The human agent's browser (registered via the Voice JS SDK) is the parent
+    call; this dials the lead (``to_number``) from the tenant's caller-ID with
+    **dual-channel** recording so the agent and lead land on separate tracks.
+    When the recording is ready Twilio POSTs ``recording_callback_url`` →
+    transcribe → analyze → outcome.
+    """
+    to = _xml_escape(to_number)
+    cid = _xml_escape(caller_id)
+    cb = _xml_escape(recording_callback_url)
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        "<Response>"
+        f'<Dial callerId="{cid}" record="record-from-answer-dual"'
+        f' recordingStatusCallback="{cb}"'
+        ' recordingStatusCallbackEvent="completed">'
+        f"<Number>{to}</Number>"
+        "</Dial>"
+        "</Response>"
+    )
