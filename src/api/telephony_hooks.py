@@ -15,6 +15,7 @@ Inbound flow:
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Callable
 
@@ -329,7 +330,7 @@ async def stringee_softphone_answer(
         log.warning("stringee softphone: no caller-ID for tenant %s", tenant.slug)
         return Response(status_code=400)
     to_number = _stringee_number(data.get("to")) or _stringee_number(data.get("toNumber")) \
-        or _stringee_number(data.get("called"))
+        or _stringee_number(data.get("called")) or _stringee_custom_destination(data)
     call_id = str(data.get("call_id") or data.get("callId") or data.get("call_sid") or "")
     if not to_number:
         log.warning("stringee softphone answer: no destination; keys=%s", sorted(data.keys()))
@@ -520,6 +521,30 @@ def _stringee_number(value: object) -> str | None:
     if isinstance(value, dict):
         return value.get("number") or value.get("e164") or value.get("alias")
     return value if isinstance(value, str) else None
+
+
+def _stringee_custom_destination(data: dict) -> str | None:
+    """Pull the dialed number out of Stringee's ``customData``.
+
+    For an app-to-phone softphone call Stringee does **not** forward the SDK's
+    ``to`` to the answer webhook — it arrives empty with ``fromInternal=true``
+    (confirmed by the live call debugger). The browser instead carries the lead
+    number in ``customData``, delivered here as the ``custom`` param: usually a
+    JSON string like ``{"to": "+91…"}``, occasionally a bare number.
+    """
+    raw = data.get("custom") or data.get("customData") \
+        or data.get("customDataFromYourServer")
+    if not raw:
+        return None
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (ValueError, TypeError):
+            return _stringee_number(raw)  # a bare number string, not JSON
+    if isinstance(raw, dict):
+        return _stringee_number(
+            raw.get("to") or raw.get("toNumber") or raw.get("number"))
+    return None
 
 
 async def _stringee_params(request: Request) -> dict:
