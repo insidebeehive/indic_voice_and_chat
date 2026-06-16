@@ -87,6 +87,63 @@ async def test_register_requires_admin(ctx) -> None:
     assert (await client.post("/tenants", json=_body())).status_code == 401
 
 
+async def test_update_tenant_fixes_stringee_keys_and_resolver(ctx) -> None:
+    """PATCH updates telephony creds, re-encrypts secrets, and refreshes the
+    resolver so a corrected Stringee API Key SID takes effect immediately."""
+    import jwt
+
+    from src.auth.context import hash_api_token
+    from src.providers.telephony.softphone import mint_browser_credentials
+
+    client, resolver, _ = ctx
+    # register a Stringee tenant with a WRONG api key sid
+    body = _body(slug="dev")
+    body["telephony"] = {
+        "provider": "stringee",
+        "from_number": "+15705255679",
+        "keys": {"account_sid": "WRONG_SID", "auth_token": "old-secret"},
+    }
+    reg = (await client.post("/tenants", json=body, headers=ADMIN_HEADERS)).json()
+    token = reg["api_token"]
+    tid = reg["tenant_id"]
+
+    # the wrong sid is what the client token would carry
+    tctx = await resolver.resolve_by_token(hash_api_token(token))
+    creds = mint_browser_credentials(tctx, "agent-1")
+    assert jwt.decode(creds.token, options={"verify_signature": False})["iss"] == "WRONG_SID"
+
+    # PATCH to the correct Stringee API Key SID
+    resp = await client.patch(
+        f"/tenants/{tid}",
+        json={"telephony": {"keys": {"account_sid": "RIGHT_SID", "auth_token": "new-secret"}}},
+        headers=ADMIN_HEADERS)
+    assert resp.status_code == 200
+    out = resp.json()
+    assert out["telephony_provider"] == "stringee"
+    assert "account_sid_env" in out["telephony_creds_configured"]
+
+    # resolver now serves the corrected key → minted token carries RIGHT_SID
+    tctx2 = await resolver.resolve_by_token(hash_api_token(token))
+    creds2 = mint_browser_credentials(tctx2, "agent-1")
+    claims = jwt.decode(creds2.token, "new-secret", algorithms=["HS256"],
+                        options={"verify_exp": False})
+    assert claims["iss"] == "RIGHT_SID"
+
+
+async def test_update_tenant_status_and_404(ctx) -> None:
+    client, _, _ = ctx
+    tid = (await client.post(
+        "/tenants", json=_body(slug="acme"), headers=ADMIN_HEADERS)).json()["tenant_id"]
+    resp = await client.patch(
+        f"/tenants/{tid}", json={"status": "suspended"}, headers=ADMIN_HEADERS)
+    assert resp.status_code == 200 and resp.json()["status"] == "suspended"
+    # unknown tenant
+    assert (await client.patch(
+        "/tenants/nope", json={"status": "active"}, headers=ADMIN_HEADERS)).status_code == 404
+    # requires admin
+    assert (await client.patch(f"/tenants/{tid}", json={"status": "active"})).status_code == 401
+
+
 async def test_register_softphone_keys_mint_browser_token(ctx) -> None:
     """Registering Twilio softphone keys persists the *_env references and the
     resolver decrypts them so a browser AccessToken can be minted end-to-end."""
