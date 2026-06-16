@@ -115,6 +115,36 @@ def _layer_key_env(provider: Optional[str]) -> Optional[str]:
     return _MASTER_KEY_ENV.get(provider) if provider else None
 
 
+# Telephony credential logical-name → the TenantTelephonyConfig *_env field it sets.
+# account_sid/auth_token drive server dialing; the api_key_* / twiml_app_sid drive
+# the browser softphone (Twilio). Stringee reuses account_sid/auth_token.
+_TEL_KEY_ENV_FIELD = {
+    "account_sid": "account_sid_env", "sid": "account_sid_env",
+    "auth_token": "auth_token_env", "token": "auth_token_env",
+    "api_key_sid": "api_key_sid_env", "twilio_api_key_sid": "api_key_sid_env",
+    "api_key_secret": "api_key_secret_env", "twilio_api_key_secret": "api_key_secret_env",
+    "twiml_app_sid": "twiml_app_sid_env",
+}
+
+
+def _map_telephony_keys(slug: str, keys: dict[str, str]) -> tuple[list[tuple[str, str]], dict[str, str]]:
+    """Map provider key names to encrypted secret rows + the *_env fields they set.
+
+    Returns ``(secret_rows, env_fields)`` where ``secret_rows`` is ``[(env_name,
+    value)]`` to encrypt into ``tenant_secrets`` and ``env_fields`` is
+    ``{TenantTelephonyConfig field: env_name}`` (e.g. ``{"account_sid_env": "..."}``).
+    """
+    secret_rows: list[tuple[str, str]] = []
+    env_fields: dict[str, str] = {}
+    for logical, value in keys.items():
+        name = f"TENANT_{slug.upper().replace('-', '_')}_{logical.upper()}"
+        secret_rows.append((name, value))
+        field = _TEL_KEY_ENV_FIELD.get(logical)
+        if field:
+            env_fields[field] = name
+    return secret_rows, env_fields
+
+
 # --- Route --------------------------------------------------------------
 
 
@@ -137,30 +167,12 @@ async def register_tenant(
     # Telephony secrets keyed by synthetic names that pipeline_config references;
     # TenantContext.secret(<name>) finds them in the decrypted secrets dict.
     tel = req.telephony
-    sid_env = token_env = None
-    api_key_sid_env = api_key_secret_env = twiml_app_sid_env = None
-    secret_rows: list[tuple[str, str]] = []
-    if tel.keys:
-        if not crypto.has_key():
-            raise HTTPException(
-                status_code=503,
-                detail="VOX_SECRET_KEY is not set — cannot encrypt telephony keys",
-            )
-        for logical, value in tel.keys.items():
-            name = f"TENANT_{slug.upper().replace('-', '_')}_{logical.upper()}"
-            secret_rows.append((name, value))
-            if logical in ("account_sid", "sid"):
-                sid_env = name
-            elif logical in ("auth_token", "token"):
-                token_env = name
-            # Twilio browser softphone credentials (distinct from the server
-            # account_sid/auth_token used for outbound dialing).
-            elif logical in ("api_key_sid", "twilio_api_key_sid"):
-                api_key_sid_env = name
-            elif logical in ("api_key_secret", "twilio_api_key_secret"):
-                api_key_secret_env = name
-            elif logical in ("twiml_app_sid",):
-                twiml_app_sid_env = name
+    if tel.keys and not crypto.has_key():
+        raise HTTPException(
+            status_code=503,
+            detail="VOX_SECRET_KEY is not set — cannot encrypt telephony keys",
+        )
+    secret_rows, env_fields = _map_telephony_keys(slug, tel.keys)
 
     pipeline = TenantPipelineConfig(
         mode=req.mode,
@@ -194,11 +206,7 @@ async def register_tenant(
             provider=tel.provider,
             from_number=tel.from_number,
             webhook_base_url=tel.webhook_base_url,
-            account_sid_env=sid_env,
-            auth_token_env=token_env,
-            api_key_sid_env=api_key_sid_env,
-            api_key_secret_env=api_key_secret_env,
-            twiml_app_sid_env=twiml_app_sid_env,
+            **env_fields,
         ),
     )
 
@@ -230,6 +238,128 @@ async def register_tenant(
 
     log.info("registered tenant", extra={"tenant_id": tenant_id, "slug": slug})
     return RegisterTenantResponse(tenant_id=tenant_id, slug=slug, api_token=api_token)
+
+
+# --- Update tenant credentials/config (admin) ---------------------------
+
+
+class TelephonyUpdateIn(BaseModel):
+    """Partial telephony update — only the provided fields change. ``keys`` are
+    merged (upserted) into the tenant's existing encrypted secrets."""
+    provider: Optional[str] = None
+    from_number: Optional[str] = None
+    webhook_base_url: Optional[str] = None
+    keys: dict[str, str] = Field(default_factory=dict)
+    phone_numbers: Optional[list[str]] = None
+
+
+class UpdateTenantRequest(BaseModel):
+    status: Optional[str] = Field(default=None, pattern="^(active|suspended)$")
+    telephony: Optional[TelephonyUpdateIn] = None
+
+
+class UpdateTenantResponse(BaseModel):
+    tenant_id: str
+    slug: str
+    status: str
+    telephony_provider: Optional[str] = None
+    # Which telephony credential slots are now configured (names only, never
+    # values) — lets an admin confirm e.g. the Stringee account_sid is set.
+    telephony_creds_configured: list[str]
+
+
+async def _refresh_resolver(request: Request, tenant_id: str) -> None:
+    """Reload one tenant into the live resolver + drop its cached provider clients."""
+    resolver = getattr(request.app.state, "tenant_resolver", None)
+    if resolver is not None and hasattr(resolver, "refresh"):
+        await resolver.refresh(tenant_id)
+        if hasattr(request.app.state, "tenants"):
+            request.app.state.tenants = resolver.loaded_settings()
+    providers = getattr(request.app.state, "providers", None)
+    if providers is not None and hasattr(providers, "evict"):
+        providers.evict(tenant_id)
+
+
+@router.patch("/{tenant_id}", response_model=UpdateTenantResponse)
+async def update_tenant(
+    tenant_id: str,
+    req: UpdateTenantRequest,
+    request: Request,
+    session: AsyncSession = Depends(get_db_session),
+    _: None = Depends(require_admin),
+) -> UpdateTenantResponse:
+    """Update an existing tenant's telephony credentials/config or status (admin).
+
+    Telephony ``keys`` are encrypted and **merged** into the tenant's secrets
+    (existing names are overwritten, new ones added), and the matching ``*_env``
+    references are written into ``pipeline_config.telephony``. The live resolver
+    is refreshed so the change takes effect immediately — e.g. fixing a wrong
+    Stringee API Key SID without re-registering the tenant.
+    """
+    t = await _require_tenant(session, tenant_id)
+
+    if req.status is not None:
+        t.status = req.status
+
+    if req.telephony is not None:
+        tu = req.telephony
+        pc = dict(t.pipeline_config or {})
+        tel_cfg = dict(pc.get("telephony") or {})
+        if tu.provider is not None:
+            tel_cfg["provider"] = tu.provider
+        if tu.from_number is not None:
+            tel_cfg["from_number"] = tu.from_number
+        if tu.webhook_base_url is not None:
+            tel_cfg["webhook_base_url"] = tu.webhook_base_url
+
+        if tu.keys:
+            if not crypto.has_key():
+                raise HTTPException(
+                    status_code=503,
+                    detail="VOX_SECRET_KEY is not set — cannot encrypt telephony keys")
+            secret_rows, env_fields = _map_telephony_keys(t.slug, tu.keys)
+            for name, value in secret_rows:
+                existing = (await session.execute(
+                    select(TenantSecret).where(
+                        TenantSecret.tenant_id == tenant_id, TenantSecret.name == name)
+                )).scalar_one_or_none()
+                if existing is not None:
+                    existing.value_encrypted = crypto.encrypt(value)
+                else:
+                    session.add(TenantSecret(
+                        tenant_id=tenant_id, name=name,
+                        value_encrypted=crypto.encrypt(value)))
+            tel_cfg.update(env_fields)
+
+        pc["telephony"] = tel_cfg
+        t.pipeline_config = pc  # reassign (new object) so the JSON column is marked dirty
+
+        if tu.phone_numbers is not None:
+            for pn in (await session.execute(
+                select(TenantPhoneNumber).where(TenantPhoneNumber.tenant_id == tenant_id)
+            )).scalars().all():
+                await session.delete(pn)
+            for ph in tu.phone_numbers:
+                session.add(TenantPhoneNumber(
+                    phone_number=ph, tenant_id=tenant_id, provider=tel_cfg.get("provider")))
+
+    await session.commit()
+    await _refresh_resolver(request, tenant_id)
+    log.info("updated tenant", extra={"tenant_id": tenant_id})
+
+    pc = t.pipeline_config or {}
+    tel_cfg = pc.get("telephony") or {}
+    configured = [
+        field for field in (
+            "account_sid_env", "auth_token_env", "api_key_sid_env",
+            "api_key_secret_env", "twiml_app_sid_env")
+        if tel_cfg.get(field)
+    ]
+    return UpdateTenantResponse(
+        tenant_id=t.id, slug=t.slug, status=t.status,
+        telephony_provider=tel_cfg.get("provider"),
+        telephony_creds_configured=configured,
+    )
 
 
 # --- Backoffice: list tenants + per-tenant analytics & billing -----------
