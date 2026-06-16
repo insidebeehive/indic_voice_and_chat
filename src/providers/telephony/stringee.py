@@ -45,6 +45,27 @@ log = logging.getLogger(__name__)
 STRINGEE_BASE_URL = "https://api.stringee.com"
 
 
+def mint_server_token(api_key_sid: str, api_key_secret: str, *, ttl_seconds: int = 3600) -> str:
+    """Mint a Stringee server REST JWT (``rest_api: true``, ``cty`` header).
+
+    Standalone version of ``StringeeAdapter._make_access_token`` for callers that
+    only need a token (e.g. authenticating a recording download) without building
+    a full adapter. Same header/claim shape the REST API requires.
+    """
+    import jwt  # PyJWT
+
+    now = int(time.time())
+    payload = {
+        "jti": f"{api_key_sid}-{now}",
+        "iss": api_key_sid,
+        "exp": now + ttl_seconds,
+        "rest_api": True,
+    }
+    token = jwt.encode(
+        payload, api_key_secret, algorithm="HS256", headers={"cty": "stringee-api;v=1"})
+    return token.decode("ascii") if isinstance(token, bytes) else token
+
+
 def _bare_number(number: str) -> str:
     """Stringee requires bare digits — no leading '+' (E.164 with '+' is rejected
     as r:10 FROM/TO_NUMBER_INVALID_FORMAT). Strip a leading '+' and surrounding

@@ -109,6 +109,9 @@ async def ctx(monkeypatch):
     monkeypatch.setattr(
         telephony_hooks, "_download_twilio_recording",
         lambda url, sid, tok: _async_wav())
+    monkeypatch.setattr(
+        telephony_hooks, "_download_stringee_recording",
+        lambda url, tenant: _async_wav())
 
     app = FastAPI()
     app.include_router(telephony_hooks.router, prefix="/api/v1")
@@ -172,3 +175,57 @@ async def test_recording_callback_finalizes_same_outcome(ctx) -> None:
     assert "https://api.twilio.com/REC/abc" in row.notes
     assert row.status == "ended"
     assert row.duration_ms == 37_000
+
+
+async def test_stringee_answer_logs_manual_call_and_connects(ctx) -> None:
+    client, maker = ctx
+    resp = await client.post(
+        "/api/v1/telephony/stringee/softphone-answer/acme",
+        json={"call_id": "ST-1", "from": "agent-7", "to": "+918618795697"})
+    assert resp.status_code == 200
+    scco = resp.json()
+    assert scco[0]["action"] == "connect"
+    assert scco[0]["to"]["number"] == "+918618795697"
+    assert scco[0]["from"]["number"] == "+15550001111"
+    assert scco[0]["record"] == {"format": "wav", "channel": "two"}
+    assert "softphone-recording/acme" in scco[0]["eventUrl"]
+
+    async with maker() as s:
+        row = (await s.execute(
+            select(Conversation).where(Conversation.provider_call_sid == "ST-1")
+        )).scalar_one()
+    assert row.agent_type == "human"
+    assert row.channel == "softphone"
+    assert row.tts_provider is None
+
+
+async def test_stringee_recording_finalizes_same_outcome(ctx) -> None:
+    client, maker = ctx
+    await client.post(
+        "/api/v1/telephony/stringee/softphone-answer/acme",
+        json={"call_id": "ST-2", "from": "agent-1", "to": "+918618795697"})
+
+    resp = await client.post(
+        "/api/v1/telephony/stringee/softphone-recording/acme",
+        json={"call_id": "ST-2", "recordUrl": "https://rec.stringee/abc.wav",
+              "duration": "52"})
+    assert resp.status_code == 200
+
+    async with maker() as s:
+        row = (await s.execute(
+            select(Conversation).where(Conversation.provider_call_sid == "ST-2")
+        )).scalar_one()
+    assert row.outcome == LeadCallOutcome.INTERESTED.value
+    assert row.summary == "Lead is keen."
+    assert "https://rec.stringee/abc.wav" in row.notes
+    assert row.status == "ended"
+    assert row.duration_ms == 52_000
+
+
+async def test_stringee_recording_ignores_non_recording_event(ctx) -> None:
+    client, _ = ctx
+    # A call-progress event with no recording URL must just be acked (200), no 500.
+    resp = await client.post(
+        "/api/v1/telephony/stringee/softphone-recording/acme",
+        json={"call_id": "ST-3", "event": "RINGING"})
+    assert resp.status_code == 200

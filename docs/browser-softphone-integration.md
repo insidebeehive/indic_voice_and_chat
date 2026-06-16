@@ -60,6 +60,33 @@ The CRM embeds the provider's JS SDK and registers with the token:
 The SDK embedding and dialer UI are the CRM's work; we provide token-mint, dial
 routing, recording, and outcome.
 
+### Provider-agnostic option: `softphone.js`
+
+So the CRM's per-call browser code is identical regardless of provider, we ship a
+thin helper that wraps both SDKs behind one API. Served at
+`https://<our-host>/softphone.js`:
+
+```html
+<!-- load the provider SDK(s) you use, then our helper -->
+<script src="https://sdk.twilio.com/js/voice/releases/.../twilio.min.js"></script>
+<!-- or Stringee's web SDK -->
+<script src="https://<our-host>/softphone.js"></script>
+<script>
+  // tokenResponse = the JSON your backend got from POST /api/v1/softphone/token
+  const phone = await Softphone.create(tokenResponse);
+  phone.on("status", s => console.log(s));   // ringing|connected|disconnected|error
+  await phone.dial("+9118XXXXXXXX");          // the lead number
+  // phone.hangup();
+</script>
+```
+
+The provider branch (which SDK, how to register, how to dial) lives inside the
+helper. The CRM's code is the same whether the tenant is on Twilio or Stringee —
+the only switch is the `provider` field already in the token response. SDKs can
+also be auto-loaded by passing `{ twilioSdkUrl, stringeeSdkUrl }` to
+`Softphone.create(tokenResponse, opts)`. Normalized `status` values:
+`registering · ready · calling · ringing · connected · disconnected · error`.
+
 ## 3. Outcome (identical to AI calls)
 
 When the recording is ready the provider calls our recording webhook. We:
@@ -92,8 +119,29 @@ Create a Twilio **TwiML App** with its Voice URL set to:
 https://<our-host>/api/v1/telephony/twilio/softphone-twiml/<tenant-slug>
 ```
 
-(Stringee needs only its `account_sid` / `auth_token` — the client JWT reuses
-them.)
+### Stringee
+
+Register with `telephony.provider = "stringee"` and the project's
+`account_sid` / `auth_token` (the API Key SID / Secret) — the browser client JWT
+and the recording fetch both reuse them. Point the **Stringee project** at us
+(slug in the path → tenant routing):
+
+```
+Answer URL → https://<our-host>/api/v1/telephony/stringee/softphone-answer/<tenant-slug>
+Event URL  → https://<our-host>/api/v1/telephony/stringee/softphone-recording/<tenant-slug>
+```
+
+Flow: the agent's Web SDK call (client → PSTN) hits the **Answer URL**; we log
+the manual call and return a `connect` SCCO that bridges it to the lead from the
+tenant's DID with **dual-channel** recording (`channel: two`). When the recording
+is ready the **Event URL** delivers its URL → we fetch, split the two channels,
+transcribe, and run the same `analyze_call` → `record_outcome`. The recording
+webhook is tolerant of Stringee's field-name variations across versions.
+
+> Requires **call recording** to be enabled on the Stringee project, and the
+> `connect` recording delivered as **WAV** so we can split it with no
+> transcoding. If your Stringee version delivers MP3 or a single mixed track,
+> tell us — we'll add decoding / coarse role attribution.
 
 ## Coverage / limits
 
@@ -103,6 +151,7 @@ them.)
 - v1 transcribes the recording **post-call** (enough for outcome parity); live
   transcription during the call is a follow-up.
 - Billing: a manual call's platform cost is the transcription (STT) + analysis
-  (LLM); telephony stays the tenant's own trunk (shown tentative). The Stringee
-  recording → outcome webhook is wired the same way once Stringee live calls are
-  unblocked.
+  (LLM); telephony stays the tenant's own trunk (shown tentative).
+- Both Twilio and Stringee softphone paths (token → dial → record → outcome) are
+  implemented; end-to-end validation against a live Stringee/Twilio project is
+  still pending real credentials.

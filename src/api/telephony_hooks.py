@@ -281,6 +281,150 @@ async def twilio_softphone_recording(
     return Response(status_code=200)
 
 
+# --- Stringee browser softphone --------------------------------------------
+# A tenant points two project URLs at us (slug in the path → tenant routing):
+#   Answer URL → /telephony/stringee/softphone-answer/<slug>
+#   Event URL  → /telephony/stringee/softphone-recording/<slug>
+# The agent's Web SDK call (client → PSTN) hits the Answer URL; we connect it to
+# the lead with dual-channel recording, and the Event URL delivers the recording
+# URL → transcribe → analyze → same outcome as AI calls.
+
+
+def _stringee_recording_url(data: dict) -> str | None:
+    for key in ("recordUrl", "recording_url", "recordingUrl", "url", "link",
+                "fileUrl", "file_url"):
+        val = data.get(key)
+        if isinstance(val, str) and val:
+            return val
+    return None
+
+
+@router.api_route("/stringee/softphone-answer/{tenant_slug}", methods=["GET", "POST"])
+async def stringee_softphone_answer(
+    tenant_slug: str,
+    request: Request,
+    session: AsyncSession = Depends(get_db_session),
+):
+    """Stringee answer webhook for a browser-softphone call → connect SCCO.
+
+    Logs the call as a manual conversation row (keyed by the Stringee call_id)
+    and returns an SCCO connecting the agent's client call to the lead from the
+    tenant's DID, with dual-channel recording.
+    """
+    import uuid
+
+    from sqlalchemy import select
+
+    from src.api.call_store import insert_call
+    from src.api.telephony_stringee import softphone_connect_scco
+    from src.models.conversation import Conversation
+
+    data = await _stringee_params(request)
+    log.info("stringee softphone answer", extra={
+        "tenant": tenant_slug, "method": request.method, "data": data})
+    tenant = await tenant_from_slug(tenant_slug)
+    tel = tenant.settings.pipeline.telephony
+    from_number = (tel.outbound_from or {}).get("stringee") or tel.from_number
+    if not from_number:
+        log.warning("stringee softphone: no caller-ID for tenant %s", tenant.slug)
+        return Response(status_code=400)
+    to_number = _stringee_number(data.get("to")) or _stringee_number(data.get("toNumber")) \
+        or _stringee_number(data.get("called"))
+    call_id = str(data.get("call_id") or data.get("callId") or data.get("call_sid") or "")
+    if not to_number:
+        log.warning("stringee softphone answer: no destination; keys=%s", sorted(data.keys()))
+        return Response(status_code=404)
+
+    if call_id:
+        existing = (await session.execute(
+            select(Conversation).where(Conversation.provider_call_sid == call_id)
+        )).scalar_one_or_none()
+        if existing is None:
+            row = await insert_call(
+                session, call_id=f"call_{uuid.uuid4().hex[:16]}", tenant=tenant,
+                provider_call_sid=call_id, channel="softphone", agent_type="human")
+            row.notes = f"manual softphone call → {to_number}"
+            await session.commit()
+
+    event_url = f"{_stringee_base(request)}/softphone-recording/{tenant_slug}"
+    scco = softphone_connect_scco(
+        from_number=from_number, to_number=to_number, event_url=event_url)
+    return JSONResponse(scco)
+
+
+@router.api_route("/stringee/softphone-recording/{tenant_slug}", methods=["GET", "POST"])
+async def stringee_softphone_recording(
+    tenant_slug: str,
+    request: Request,
+    session: AsyncSession = Depends(get_db_session),
+):
+    """Stringee event webhook → on a recording URL, transcribe → analyze → outcome.
+
+    Tolerant of Stringee's field names (recording URL + call_id appear under
+    several keys across versions). Non-recording events are acknowledged 200.
+    """
+    from datetime import datetime, timezone
+
+    from src.analysis.manual_call import finalize_manual_call
+    from src.interfaces.stt import STTConfig
+    from src.pipeline.audio_utils import pcm16_to_wav, wav_split_stereo
+
+    data = await _stringee_params(request)
+    log.info("stringee softphone recording", extra={
+        "tenant": tenant_slug, "method": request.method, "data": data})
+    tenant = await tenant_from_slug(tenant_slug)
+    call_id = str(data.get("call_id") or data.get("callId") or data.get("call_sid") or "")
+    rec_url = _stringee_recording_url(data)
+    if not (call_id and rec_url):
+        return Response(status_code=200)   # not a recording event — ack and move on
+    if _softphone_providers is None:
+        log.warning("stringee softphone recording hit but provider registry unset")
+        return Response(status_code=503)
+
+    tel = tenant.settings.pipeline.telephony
+    try:
+        wav = await _download_stringee_recording(rec_url, tenant)
+        left, right, sr = wav_split_stereo(wav)
+    except Exception:  # noqa: BLE001 — a fetch/parse failure must not 500 Stringee
+        log.exception("stringee softphone recording fetch/split failed", extra={"call_id": call_id})
+        return Response(status_code=200)
+
+    # Dual-channel connect recording: ch1 = caller (agent), ch2 = callee (lead).
+    channels = [("assistant", pcm16_to_wav(left, sr)), ("user", pcm16_to_wav(right, sr))]
+    stt = _softphone_providers.get_stt(tenant)
+    llm = _softphone_providers.get_llm(tenant)
+    stt_config = STTConfig(language=tenant.settings.pipeline.stt.language, sample_rate=sr)
+    dur_raw = data.get("duration") or data.get("callDuration") or data.get("recordDuration")
+    dur_ms = int(float(dur_raw) * 1000) if dur_raw else None
+
+    row = await finalize_manual_call(
+        session, provider_call_sid=call_id, channels=channels,
+        stt=stt, stt_config=stt_config, llm=llm,
+        tenant_timezone=tenant.settings.timezone,
+        now=datetime.now(timezone.utc), duration_ms=dur_ms, recording_url=rec_url)
+    log.info("stringee softphone recording finalized", extra={
+        "tenant": tenant.slug, "call_id": call_id, "found": row is not None,
+        "outcome": getattr(row, "outcome", None)})
+    return Response(status_code=200)
+
+
+async def _download_stringee_recording(url: str, tenant: TenantContext) -> bytes:
+    """Fetch a Stringee recording, authenticating with a server token when the
+    tenant's Stringee keys are available (signed/public URLs work without it)."""
+    from src.providers.telephony.stringee import mint_server_token
+
+    tel = tenant.settings.pipeline.telephony
+    sid = tenant.secret(tel.account_sid_env) if tel.account_sid_env else None
+    secret = tenant.secret(tel.auth_token_env) if tel.auth_token_env else None
+    headers = {}
+    if sid and secret:
+        headers["X-STRINGEE-AUTH"] = mint_server_token(sid, secret)
+    async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=10.0)) as c:
+        resp = await c.get(url, headers=headers)
+        resp.raise_for_status()
+        return resp.content
+
+
 # --- Exotel webhook + WS ----------------------------------------------------
 
 
