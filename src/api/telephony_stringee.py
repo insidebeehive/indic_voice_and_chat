@@ -58,39 +58,35 @@ def closing_scco(*, audio_url: str) -> list[dict[str, Any]]:
 
 
 def softphone_connect_scco(
-    *, agent_user: str, to_number: str, event_url: str, record: bool = True,
+    *, caller_id: str, to_number: str, event_url: str, record: bool = True,
 ) -> list[dict[str, Any]]:
-    """Bridge a human agent's browser (Stringee app user) call to the lead (PSTN).
+    """Bridge a human agent's browser call to the lead (PSTN).
 
-    Per Stringee's app-to-phone ``connect`` SCCO:
-    - ``from`` is the agent's **app user** (``type: internal`` — the existing
-      client call leg to bridge), NOT a phone number. The PSTN caller-ID shown to
-      the lead is the Stringee project's configured outbound number.
-    - ``to`` is the lead (``type: external``).
-    - Recording is a **separate** ``record`` action placed BEFORE ``connect`` (a
-      ``record`` *field* inside connect is invalid → Stringee logs "Unknown" /
-      REQUEST_ANSWER_URL_ERROR), and ``peerToPeerCall`` must be ``false`` or the
-      call can't be recorded.
+    Matches a **known-working** Stringee app-to-phone SCCO (captured from a live
+    successful call → ``SCCO_PARSER_RESULT: OK``):
+    - a ``record`` action BEFORE ``connect`` — ``format: mp3``,
+      ``recordStereo: false``, ``record_type: 1`` (a ``record`` *field* inside
+      connect, or wav/``channel`` fields, are rejected → "Unknown").
+    - ``connect`` ``from`` is the **caller-ID number** (a Stringee-owned number,
+      ``type: internal``), ``to`` is the lead (``type: external``),
+      ``customData: "{}"``, ``peerToPeerCall: false``.
 
-    ``event_url`` receives call + recording events (incl. the recording URL).
+    ``event_url`` receives the recording event (incl. the recording URL).
     """
     actions: list[dict[str, Any]] = []
     if record:
-        # Dual-channel wav (agent on ch1, lead on ch2) so the recording webhook
-        # can split tracks for clean role attribution without transcoding.
         actions.append({
             "action": "record",
             "eventUrl": event_url,
-            "format": "wav",
-            "channel": "two",
+            "format": "mp3",
+            "recordStereo": False,
+            "record_type": 1,
         })
     actions.append({
         "action": "connect",
-        "from": {"type": "internal", "number": agent_user, "alias": agent_user},
-        "to": {"type": "external", "number": to_number, "alias": to_number},
-        "eventUrl": event_url,
-        "timeout": 45,
-        "maxConnectTime": -1,
+        "from": {"number": caller_id, "alias": caller_id, "type": "internal"},
+        "customData": "{}",
+        "to": {"number": to_number, "alias": to_number, "type": "external"},
         "peerToPeerCall": False,
     })
     return actions
