@@ -206,9 +206,9 @@ async def test_stringee_answer_logs_manual_call_and_connects(ctx) -> None:
     assert scco[0]["to"]["number"] == "+918618795697"
     assert scco[0]["to"]["type"] == "external"
     assert scco[0]["from"]["number"] == "+15550001111"
-    # Outbound caller-ID must be a Stringee-provisioned number → type "external";
-    # "internal" is for app users and makes Stringee reject the connect SCCO.
-    assert scco[0]["from"]["type"] == "external"
+    # App-to-phone: the Stringee-owned caller-ID is "internal" to Stringee; only
+    # the PSTN lead is "external". An "external" from is rejected (REQUEST_ANSWER_URL_ERROR).
+    assert scco[0]["from"]["type"] == "internal"
     assert scco[0]["record"] == {"format": "wav", "channel": "two"}
     assert "softphone-recording/acme" in scco[0]["eventUrl"]
 
@@ -238,7 +238,7 @@ async def test_stringee_answer_caller_id_from_provider_number(ctx) -> None:
     assert resp.status_code == 200
     scco = resp.json()
     assert scco[0]["from"]["number"] == "918204268005"
-    assert scco[0]["from"]["type"] == "external"
+    assert scco[0]["from"]["type"] == "internal"
 
 
 async def test_stringee_answer_reads_destination_from_custom(ctx) -> None:
