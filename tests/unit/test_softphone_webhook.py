@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import audioop
 import io
+import json
 import wave
 
 import pytest
@@ -197,6 +198,30 @@ async def test_stringee_answer_logs_manual_call_and_connects(ctx) -> None:
     assert row.agent_type == "human"
     assert row.channel == "softphone"
     assert row.tts_provider is None
+
+
+async def test_stringee_answer_reads_destination_from_custom(ctx) -> None:
+    client, maker = ctx
+    # Real Stringee app-to-phone behaviour (from the live debugger): the answer
+    # URL is fetched via GET with `to` EMPTY (fromInternal=true); the dialed lead
+    # number arrives in customData, delivered as the `custom` query param (a JSON
+    # string). The handler must still resolve the destination + connect.
+    resp = await client.get(
+        "/api/v1/telephony/stringee/softphone-answer/acme",
+        params={"from": "dev", "to": "", "fromInternal": "true", "userId": "dev",
+                "callId": "ST-CUSTOM-1", "custom": json.dumps({"to": "+918618795697"})})
+    assert resp.status_code == 200
+    scco = resp.json()
+    assert scco[0]["action"] == "connect"
+    assert scco[0]["to"]["number"] == "+918618795697"
+    assert scco[0]["from"]["number"] == "+15550001111"
+
+    async with maker() as s:
+        row = (await s.execute(
+            select(Conversation).where(Conversation.provider_call_sid == "ST-CUSTOM-1")
+        )).scalar_one()
+    assert row.agent_type == "human"
+    assert row.channel == "softphone"
 
 
 async def test_stringee_recording_finalizes_same_outcome(ctx) -> None:

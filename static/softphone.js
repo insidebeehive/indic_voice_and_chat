@@ -178,7 +178,11 @@
         // App-to-phone: from = the agent identity, to = the lead number.
         current = new StringeeCall(client, identity, to);
         current.isPhoneCall = true;
-        if (params && params.customData) current.customDataFromYourServer = params.customData;
+        // Stringee does NOT forward `to` to our Answer URL for app-to-phone calls
+        // (it arrives empty, fromInternal=true) — so carry the destination in
+        // customData, which Stringee delivers to the Answer URL as `custom`.
+        current.customDataFromYourServer =
+          (params && params.customData) || JSON.stringify({ to: to });
         wire(current);
         em.emit("status", "calling");
         return new Promise(function (resolve, reject) {
