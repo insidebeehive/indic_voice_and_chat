@@ -152,6 +152,23 @@ async def test_softphone_twiml_logs_manual_call_and_dials(ctx) -> None:
     assert row.telephony_provider == "twilio"
 
 
+async def test_twilio_softphone_caller_id_from_provider_number(ctx) -> None:
+    client, maker = ctx
+    # Symmetric to the Stringee path: the Twilio caller-ID is the tenant's number
+    # registered for provider "twilio" in tenant_phone_numbers, not from_number.
+    from src.models.tenant import TenantPhoneNumber
+    async with maker() as s:
+        s.add(TenantPhoneNumber(
+            phone_number="+15557654321", tenant_id="t1", provider="twilio"))
+        await s.commit()
+
+    resp = await client.post(
+        "/api/v1/telephony/twilio/softphone-twiml/acme",
+        data={"To": "+918618795697", "From": "client:a", "CallSid": "CA-PN"})
+    assert resp.status_code == 200
+    assert 'callerId="+15557654321"' in resp.text
+
+
 async def test_recording_callback_finalizes_same_outcome(ctx) -> None:
     client, maker = ctx
     # First log the manual call (as the dial TwiML would).
@@ -189,9 +206,9 @@ async def test_stringee_answer_logs_manual_call_and_connects(ctx) -> None:
     assert scco[0]["to"]["number"] == "+918618795697"
     assert scco[0]["to"]["type"] == "external"
     assert scco[0]["from"]["number"] == "+15550001111"
-    # Outbound caller-ID must be a Stringee-provisioned number → type "external";
-    # "internal" is for app users and makes Stringee reject the connect SCCO.
-    assert scco[0]["from"]["type"] == "external"
+    # App-to-phone: the Stringee-owned caller-ID is "internal" to Stringee; only
+    # the PSTN lead is "external". An "external" from is rejected (REQUEST_ANSWER_URL_ERROR).
+    assert scco[0]["from"]["type"] == "internal"
     assert scco[0]["record"] == {"format": "wav", "channel": "two"}
     assert "softphone-recording/acme" in scco[0]["eventUrl"]
 
@@ -221,7 +238,7 @@ async def test_stringee_answer_caller_id_from_provider_number(ctx) -> None:
     assert resp.status_code == 200
     scco = resp.json()
     assert scco[0]["from"]["number"] == "918204268005"
-    assert scco[0]["from"]["type"] == "external"
+    assert scco[0]["from"]["type"] == "internal"
 
 
 async def test_stringee_answer_reads_destination_from_custom(ctx) -> None:

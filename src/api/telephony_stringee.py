@@ -71,10 +71,12 @@ def softphone_connect_scco(
     """
     action: dict[str, Any] = {
         "action": "connect",
-        # Caller-ID is a Stringee-provisioned PSTN number → "external". "internal"
-        # is for app users; Stringee rejects the connect SCCO (REQUEST_ANSWER_URL_ERROR)
-        # if the outbound caller-ID is typed "internal".
-        "from": {"type": "external", "number": from_number, "alias": from_number},
+        # App-to-phone connect: the caller-ID is a Stringee-owned number (internal
+        # *to Stringee*) → type "internal"; the lead is a PSTN number outside
+        # Stringee → type "external". Per Stringee's app-to-phone SCCO spec; an
+        # "external" from (a number Stringee doesn't own) is rejected as Unknown →
+        # REQUEST_ANSWER_URL_ERROR.
+        "from": {"type": "internal", "number": from_number, "alias": from_number},
         "to": {"type": "external", "number": to_number, "alias": to_number},
         "eventUrl": event_url,
     }
