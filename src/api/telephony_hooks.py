@@ -165,6 +165,30 @@ def _forwarded_base(request: Request) -> str:
     return f"{scheme}://{base}/api/v1/telephony"
 
 
+async def _provider_caller_id(
+    session: AsyncSession, tenant: TenantContext, provider: str
+) -> str | None:
+    """Outbound caller-ID for a provider's softphone leg.
+
+    Prefers the tenant's number registered for ``provider`` in
+    ``tenant_phone_numbers`` — a number that provider actually owns / dials out
+    on (providers reject a caller-ID they don't own) — then falls back to the
+    telephony config's ``outbound_from[provider]`` and finally ``from_number``.
+    """
+    from sqlalchemy import select
+
+    from src.models.tenant import TenantPhoneNumber
+
+    owned = (await session.execute(
+        select(TenantPhoneNumber.phone_number).where(
+            TenantPhoneNumber.tenant_id == tenant.id,
+            TenantPhoneNumber.provider == provider,
+        ).limit(1)
+    )).scalars().first()
+    tel = tenant.settings.pipeline.telephony
+    return owned or (tel.outbound_from or {}).get(provider) or tel.from_number
+
+
 @router.post("/twilio/softphone-twiml/{tenant_slug}", response_class=Response)
 async def twilio_softphone_twiml(
     tenant_slug: str,
@@ -190,8 +214,7 @@ async def twilio_softphone_twiml(
     from src.models.conversation import Conversation
 
     tenant = await tenant_from_slug(tenant_slug)
-    tel = tenant.settings.pipeline.telephony
-    caller_id = (tel.outbound_from or {}).get("twilio") or tel.from_number
+    caller_id = await _provider_caller_id(session, tenant, "twilio")
     if not caller_id:
         raise HTTPException(status_code=400, detail="tenant has no Twilio caller-ID configured")
 
@@ -319,23 +342,15 @@ async def stringee_softphone_answer(
     from src.api.call_store import insert_call
     from src.api.telephony_stringee import softphone_connect_scco
     from src.models.conversation import Conversation
-    from src.models.tenant import TenantPhoneNumber
 
     data = await _stringee_params(request)
     log.info("stringee softphone answer", extra={
         "tenant": tenant_slug, "method": request.method, "data": data})
     tenant = await tenant_from_slug(tenant_slug)
-    tel = tenant.settings.pipeline.telephony
-    # Caller-ID = the tenant's Stringee-registered number from tenant_phone_numbers
-    # (Stringee rejects the connect if `from` isn't a number it owns). This is the
-    # Stringee answer endpoint, so the provider is always "stringee". Fall back to
-    # the telephony config if no provider number is registered.
-    from_number = (await session.execute(
-        select(TenantPhoneNumber.phone_number).where(
-            TenantPhoneNumber.tenant_id == tenant.id,
-            TenantPhoneNumber.provider == "stringee",
-        ).limit(1)
-    )).scalars().first() or (tel.outbound_from or {}).get("stringee") or tel.from_number
+    # Caller-ID = the tenant's Stringee-owned number (Stringee rejects the connect
+    # if `from` isn't a number it owns). This is the Stringee answer endpoint, so
+    # the provider is always "stringee".
+    from_number = await _provider_caller_id(session, tenant, "stringee")
     if not from_number:
         log.warning("stringee softphone: no caller-ID for tenant %s", tenant.slug)
         return Response(status_code=400)

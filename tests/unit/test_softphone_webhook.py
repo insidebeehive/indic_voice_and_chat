@@ -152,6 +152,23 @@ async def test_softphone_twiml_logs_manual_call_and_dials(ctx) -> None:
     assert row.telephony_provider == "twilio"
 
 
+async def test_twilio_softphone_caller_id_from_provider_number(ctx) -> None:
+    client, maker = ctx
+    # Symmetric to the Stringee path: the Twilio caller-ID is the tenant's number
+    # registered for provider "twilio" in tenant_phone_numbers, not from_number.
+    from src.models.tenant import TenantPhoneNumber
+    async with maker() as s:
+        s.add(TenantPhoneNumber(
+            phone_number="+15557654321", tenant_id="t1", provider="twilio"))
+        await s.commit()
+
+    resp = await client.post(
+        "/api/v1/telephony/twilio/softphone-twiml/acme",
+        data={"To": "+918618795697", "From": "client:a", "CallSid": "CA-PN"})
+    assert resp.status_code == 200
+    assert 'callerId="+15557654321"' in resp.text
+
+
 async def test_recording_callback_finalizes_same_outcome(ctx) -> None:
     client, maker = ctx
     # First log the manual call (as the dial TwiML would).
