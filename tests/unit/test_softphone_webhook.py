@@ -205,13 +205,14 @@ async def test_stringee_answer_logs_manual_call_and_connects(ctx) -> None:
     scco = resp.json()
     rec = next(a for a in scco if a["action"] == "record")
     conn = next(a for a in scco if a["action"] == "connect")
-    # record action must come BEFORE connect (a record field inside connect is
-    # invalid → Stringee logs "Unknown" / REQUEST_ANSWER_URL_ERROR).
+    # Matches the known-working Stringee SCCO: record action (mp3) BEFORE connect.
     assert scco.index(rec) < scco.index(conn)
-    assert rec["format"] == "wav" and rec["channel"] == "two"
+    assert rec["format"] == "mp3"
+    assert rec["recordStereo"] is False and rec["record_type"] == 1
     assert "softphone-recording/acme" in rec["eventUrl"]
-    # connect: from = the agent's app user (internal leg), to = the PSTN lead.
-    assert conn["from"] == {"type": "internal", "number": "agent-7", "alias": "agent-7"}
+    # connect: from = the caller-ID number (internal), bare (no "+"); to = lead.
+    assert conn["from"] == {
+        "number": "15550001111", "alias": "15550001111", "type": "internal"}
     assert conn["to"]["number"] == "+918618795697"
     assert conn["to"]["type"] == "external"
     assert conn["peerToPeerCall"] is False
@@ -223,15 +224,6 @@ async def test_stringee_answer_logs_manual_call_and_connects(ctx) -> None:
     assert row.agent_type == "human"
     assert row.channel == "softphone"
     assert row.tts_provider is None
-
-
-async def test_stringee_answer_requires_agent_user(ctx) -> None:
-    client, _ = ctx
-    # No userId/from in the answer request → no app-user leg to bridge → 400.
-    resp = await client.post(
-        "/api/v1/telephony/stringee/softphone-answer/acme",
-        json={"call_id": "ST-NU", "to": "+918618795697"})
-    assert resp.status_code == 400
 
 
 async def test_stringee_answer_reads_destination_from_custom(ctx) -> None:
@@ -248,7 +240,7 @@ async def test_stringee_answer_reads_destination_from_custom(ctx) -> None:
     scco = resp.json()
     conn = next(a for a in scco if a["action"] == "connect")
     assert conn["to"]["number"] == "+918618795697"
-    assert conn["from"]["number"] == "dev"  # the agent app user (userId)
+    assert conn["from"]["number"] == "15550001111"  # caller-ID number, bare
 
     async with maker() as s:
         row = (await s.execute(
