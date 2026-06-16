@@ -55,3 +55,28 @@ def closing_scco(*, audio_url: str) -> list[dict[str, Any]]:
         {"action": "play", "url": audio_url},
         {"action": "hangup"},
     ]
+
+
+def softphone_connect_scco(
+    *, from_number: str, to_number: str, event_url: str, record: bool = True,
+) -> list[dict[str, Any]]:
+    """Bridge a human agent's browser (Stringee client) call to the lead (PSTN).
+
+    Used by the browser-softphone answer webhook: the agent's Web SDK call is the
+    caller; this connects it to ``to_number`` from the tenant's DID
+    (``from_number`` = caller-ID) and records **dual-channel** (``channel: two``)
+    so the agent and lead land on separate tracks — clean role attribution for
+    the same transcribe→analyze outcome pipeline AI calls use. ``event_url``
+    receives call/recording events (incl. the recording URL when ready).
+    """
+    action: dict[str, Any] = {
+        "action": "connect",
+        "from": {"type": "internal", "number": from_number, "alias": from_number},
+        "to": {"type": "external", "number": to_number, "alias": to_number},
+        "eventUrl": event_url,
+    }
+    if record:
+        # channel "two" = stereo (caller on ch1, callee on ch2); wav so we can
+        # split it with the stdlib wave module (no transcoding needed).
+        action["record"] = {"format": "wav", "channel": "two"}
+    return [action]
