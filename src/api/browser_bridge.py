@@ -50,6 +50,13 @@ BARGE_SUSTAIN_MS = 450
 _STREAM_REOPEN_BACKOFF_S = 0.3
 _MAX_STREAM_REOPENS = 10
 
+# Languages the streaming STT (Deepgram nova-3) can transcribe — keyed by base
+# code. When the conversation's active language isn't in here (e.g. Malayalam,
+# Punjabi, Odia), the bridge drops the live stream and uses the batch path
+# (pipeline.stt — Sarvam saaras covers all 10 Indian languages). Update this if
+# the streaming model/provider changes.
+_STREAMING_LANGS = frozenset({"hi", "bn", "gu", "kn", "mr", "ta", "te", "en"})
+
 # Pre-recorded "breath" filler clips played the instant a user turn starts to
 # mask the silence before the reply. 16 kHz mono PCM16 (matching the bridge
 # rate); one is chosen at random per turn so it doesn't feel repetitive.
@@ -174,8 +181,9 @@ class BrowserVoiceBridge:
             await self._play_opening()
             log.info("browser bridge: opening done, entering listen loop")
 
-            # 2) Turn loop.
-            if self._stream_provider is not None:
+            # 2) Turn loop. Use the live stream only if it can transcribe the
+            # starting language; otherwise the batch path (Sarvam) handles it.
+            if self._stream_provider is not None and self._streaming_supports(self._stt_language()):
                 try:
                     from src.interfaces.stt import STTConfig
                     self._stream_language = self._stt_language()
@@ -364,6 +372,11 @@ class BrowserVoiceBridge:
         language). Deepgram wants a bare code (``hi``/``mr``)."""
         return getattr(self._agent, "active_language", None) or "hi"
 
+    def _streaming_supports(self, lang: str) -> bool:
+        """Whether the streaming STT can transcribe ``lang``. If not, the bridge
+        uses the batch path (Sarvam) instead of the live Deepgram stream."""
+        return (lang or "").strip().lower().split("-")[0] in _STREAMING_LANGS
+
     async def _maybe_reopen_stt_for_language(self) -> None:
         """If the conversation switched language this turn, close the STT stream
         so the consumer loop reopens it in the new language. Called right after a
@@ -390,6 +403,18 @@ class BrowserVoiceBridge:
         while not self._stopped and self._stream_session is not None:
             await self._consume_stream_events(self._stream_session)
             if self._stopped:
+                return
+            # The conversation switched to a language the live stream can't
+            # transcribe (e.g. Malayalam) → drop to the batch path (Sarvam covers
+            # it). The audio handler uses batch VAD once the session is None.
+            if not self._streaming_supports(self._stt_language()):
+                log.info("browser bridge: language not streamable; using batch STT",
+                         extra={"language": self._stt_language()})
+                try:
+                    await self._stream_session.aclose()
+                except Exception:  # noqa: BLE001
+                    pass
+                self._stream_session = None
                 return
             # events() returned. Either the caller's language changed (a deliberate
             # reopen, triggered post-turn — not a failure) or the upstream dropped.
