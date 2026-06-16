@@ -18,7 +18,7 @@ from typing import Any, AsyncIterator
 import httpx
 
 from src.interfaces.tts import ITTSProvider, TTSConfig, TTSResult
-from src.pipeline.text_normalize import apply_pronunciations, normalize_currency
+from src.pipeline.text_normalize import normalize_for_tts
 
 
 log = logging.getLogger(__name__)
@@ -84,9 +84,10 @@ class SarvamTTSAdapter(ITTSProvider):
 
     async def synthesize(self, text: str, config: TTSConfig) -> TTSResult:
         # Speak currency amounts (₹100 / Rs 100 -> "100 रुपये") and rewrite
-        # English/brand words Sarvam mispronounces into Devanagari.
-        text = normalize_currency(text)
-        text = apply_pronunciations(text)
+        # English/brand words Sarvam mispronounces into Devanagari — but only for
+        # Devanagari-script languages, so a switch to Telugu/Malayalam doesn't get
+        # the wrong script injected.
+        text = normalize_for_tts(text, config.language)
         body: dict[str, Any] = {
             "inputs": [text],
             "target_language_code": config.language,

@@ -33,7 +33,7 @@ import asyncio
 import json
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Awaitable, Callable, Optional
 
 from src.interfaces.llm import ILLMProvider, LLMConfig, LLMMessage
@@ -211,6 +211,8 @@ class PipelineEngine:
         history: list[LLMMessage],
         audio_sink: AudioSink,
         cancel_event: Optional[asyncio.Event] = None,
+        *,
+        language: Optional[str] = None,
     ) -> TurnResult:
         """Run one perception-reasoning-action cycle.
 
@@ -218,14 +220,19 @@ class PipelineEngine:
         prompt and prior turns. The caller is responsible for appending
         the new user turn before calling ``run_turn``... or not, it's fine
         either way: ``run_turn`` does NOT mutate ``history``.
+
+        ``language`` (when set) overrides the configured STT + TTS language for
+        this turn — the dialogue layer passes the conversation's active language
+        so STT transcribes and TTS speaks in the caller's current language.
         """
         cancel_event = cancel_event or asyncio.Event()
         metrics = TurnMetrics()
         t_overall = time.perf_counter()
 
         # --- STT ---------------------------------------------------------
+        stt_cfg = replace(self._config.stt, language=language) if language else self._config.stt
         t0 = time.perf_counter()
-        stt_result = await self._stt.transcribe(captured_audio, self._config.stt)
+        stt_result = await self._stt.transcribe(captured_audio, stt_cfg)
         metrics.stt_latency_ms = int((time.perf_counter() - t0) * 1000)
 
         # If STT returned nothing useful, exit early — caller decides what
@@ -251,6 +258,7 @@ class PipelineEngine:
             user_confidence=stt_result.confidence,
             stt_latency_ms=metrics.stt_latency_ms,
             t_overall=t_overall,
+            language=language,
         )
 
     async def run_turn_text(
@@ -264,13 +272,19 @@ class PipelineEngine:
         user_confidence: float = 1.0,
         stt_latency_ms: int = 0,
         t_overall: Optional[float] = None,
+        language: Optional[str] = None,
     ) -> TurnResult:
         """LLM->TTS for an already-transcribed user turn (no STT).
 
         Used by the streaming-STT path: Deepgram has already produced the
         transcript, so we skip STT entirely and run the LLM/TTS overlap.
+
+        ``language`` (when set) overrides the configured TTS language for this
+        turn — the conversation's active language, so the reply is spoken in the
+        caller's current language.
         """
         cancel_event = cancel_event or asyncio.Event()
+        tts_cfg = replace(self._config.tts, language=language) if language else self._config.tts
         if t_overall is None:
             t_overall = time.perf_counter()
         metrics = TurnMetrics()
@@ -299,7 +313,7 @@ class PipelineEngine:
                 if cancel_event.is_set():
                     continue
                 try:
-                    result = await self._tts.synthesize(sentence, self._config.tts)
+                    result = await self._tts.synthesize(sentence, tts_cfg)
                 except Exception:  # noqa: BLE001
                     continue
                 if cancel_event.is_set():

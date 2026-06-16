@@ -155,25 +155,26 @@ class VoiceBotScript:
 
 
 def _gender_directive(gender: str) -> Optional[str]:
-    """A grammatical-gender instruction for gendered languages (e.g. Hindi).
+    """A grammatical-gender instruction for gendered languages (Hindi, Marathi, …).
 
-    Hindi verbs/adjectives inflect for the speaker's gender, and the model
-    otherwise defaults to masculine — so a female agent says 'samajh sakta hoon'
-    (male) unless told. Returns None when gender is unset/unknown.
+    Many Indian languages inflect verbs/adjectives for the speaker's gender, and
+    the model otherwise defaults to masculine. Language-agnostic so it holds
+    after a language switch. Returns None when gender is unset/unknown.
     """
     g = (gender or "").strip().lower()
     if g in ("female", "f", "woman", "lady"):
         return (
-            "You are FEMALE. When speaking Hindi, ALWAYS use feminine grammatical "
-            "forms for yourself — e.g. 'main samajh sakti hoon', 'main kar rahi hoon', "
-            "'maine socha tha', 'main aayi hoon' — and NEVER the masculine forms "
-            "('sakta', 'raha', 'aaya'). Keep this consistent on every single turn."
+            "You are FEMALE. In any language that marks the speaker's gender (Hindi, "
+            "Marathi, etc.), ALWAYS use feminine grammatical forms for yourself and NEVER "
+            "masculine ones — keep this consistent on every single turn, in whatever "
+            "language you are speaking."
         )
     if g in ("male", "m", "man"):
         return (
-            "You are MALE. When speaking Hindi, ALWAYS use masculine grammatical forms "
-            "for yourself — e.g. 'main samajh sakta hoon', 'main kar raha hoon', "
-            "'main aaya hoon' — and never feminine forms. Keep this consistent every turn."
+            "You are MALE. In any language that marks the speaker's gender (Hindi, "
+            "Marathi, etc.), ALWAYS use masculine grammatical forms for yourself and never "
+            "feminine ones — keep this consistent every turn, in whatever language you are "
+            "speaking."
         )
     return None
 
@@ -206,14 +207,19 @@ def build_voicebot_system_prompt(
     if _gd:
         parts.append(_gd)
 
-    # Language policy. The reply is spoken by an Indic (e.g. Hindi) TTS that
-    # cannot pronounce Latin script, so response_text MUST be in the native
-    # script — romanized/English text comes out garbled ("drunk").
+    # Language policy. Dynamic, language-agnostic: start in the campaign default
+    # and switch to the caller's language when they use or request it. The reply
+    # is spoken by an Indic TTS that cannot pronounce Latin script, so
+    # response_text MUST be in the native script of whatever language is active.
     parts.append(
-        f"Speak in {script.language_default}. Write `response_text` ONLY in the native "
-        "script (Devanagari for Hindi) — never romanized/Latin. It is read aloud by a Hindi "
-        "TTS that garbles Latin script, so reply in warm natural Hindi even when the user "
-        "writes English/Hinglish. Match their formality. (Well-known brand names may stay as-is.)"
+        f"Language: start the call in {script.language_default}. If the caller speaks in — "
+        "or asks for — another language, briefly acknowledge and switch to that language for "
+        "the rest of the call (and switch again if they change). Write `response_text` in the "
+        "NATIVE SCRIPT of whichever language you are currently speaking (Devanagari for "
+        "Hindi/Marathi, etc.) — never romanized/Latin, because an Indic TTS reads it aloud and "
+        "garbles Latin script. Match the caller's formality; well-known brand names may stay "
+        "as-is. Set the `language` field to the base code of the language you are speaking this "
+        'turn (e.g. "hi", "mr", "te").'
     )
 
     # Customer-led behavior (fixed policy, generic over every campaign).

@@ -19,6 +19,7 @@ from typing import Any, Optional
 
 from src.agents.base import AgentSession, BaseAgent
 from src.agents.state_machine import AgentStateMachine, Event, State
+from src.dialogue.language import normalize_lang, resolve_active_language, to_bcp47
 from src.dialogue.prompts import VoiceBotScript, build_voicebot_system_prompt
 from src.dialogue.response_parser import VoiceBotResponse, parse_voicebot_response
 from src.dialogue.slots import SlotFiller, SlotSchema
@@ -74,6 +75,11 @@ class VoiceBotAgent(BaseAgent):
         self._script = script
         self._engine = engine
         self._extra_directives = extra_directives
+        # The conversation's active language. Starts at the campaign default and
+        # switches when the caller speaks/asks for another language (resolved each
+        # turn from the LLM-reported + STT-detected signals). Drives per-turn
+        # STT + TTS via the engine and the opening line.
+        self._active_language = normalize_lang(script.language_default) or "hi"
         self._system_prompt = build_voicebot_system_prompt(
             script=script,
             schema=slot_schema,
@@ -85,6 +91,12 @@ class VoiceBotAgent(BaseAgent):
     @property
     def system_prompt(self) -> str:
         return self._system_prompt
+
+    @property
+    def active_language(self) -> str:
+        """The conversation's current language (base code, e.g. 'hi'/'mr'). Starts
+        at the campaign default and switches when the caller changes language."""
+        return self._active_language
 
     def _history_window(self) -> list[LLMMessage]:
         """Bounded LLM context: the system prompt + the last MAX_HISTORY_TURNS
@@ -123,9 +135,7 @@ class VoiceBotAgent(BaseAgent):
         from src.interfaces.tts import TTSConfig as _TTSConfig
         try:
             tts_result = await self._engine._tts.synthesize(  # type: ignore[attr-defined]
-                rendered, _TTSConfig(language=self._script.language_default + "-IN"
-                                     if len(self._script.language_default) == 2
-                                     else self._script.language_default),
+                rendered, _TTSConfig(language=to_bcp47(self._active_language)),
             )
         except Exception:
             log.exception("opening synthesis failed; skipping")
@@ -164,6 +174,7 @@ class VoiceBotAgent(BaseAgent):
                     captured_audio=captured_audio,
                     history=self._history_window(),
                     audio_sink=audio_sink,
+                    language=to_bcp47(self._active_language),
                 ),
                 timeout=TURN_TIMEOUT_S,
             )
@@ -209,6 +220,14 @@ class VoiceBotAgent(BaseAgent):
             )
 
         response = parse_voicebot_response(pipeline_result.agent_text)
+        # Update the conversation's active language from this turn's signals (the
+        # LLM's explicitly-reported language wins; STT detection is the fallback).
+        # Takes effect from the next turn's STT/TTS.
+        self._active_language = resolve_active_language(
+            self._active_language,
+            stt_lang=pipeline_result.user_language,
+            llm_lang=(response.raw or {}).get("language"),
+        )
         await self.apply_signal(
             user_text=pipeline_result.user_text,
             agent_text=response.response_text,
@@ -304,6 +323,7 @@ class VoiceBotAgent(BaseAgent):
                     self._history_window(),
                     audio_sink,
                     cancel_event,
+                    language=to_bcp47(self._active_language),
                 ),
                 timeout=TURN_TIMEOUT_S,
             )
