@@ -131,11 +131,21 @@ class VoiceBotAgent(BaseAgent):
 
         # The TTS goes through the pipeline engine's TTS provider so the
         # adapter-level streaming + sample-rate handling stays consistent
-        # with the per-turn synthesis path.
+        # with the per-turn synthesis path. Reuse the engine's CONFIGURED TTS
+        # (voice_id, sample_rate, …) — only overriding the language — so the
+        # opening uses the SELECTED voice, not the provider default.
+        from dataclasses import replace as _replace
+
         from src.interfaces.tts import TTSConfig as _TTSConfig
+        base_tts = getattr(getattr(self._engine, "_config", None), "tts", None)
+        opening_lang = to_bcp47(self._active_language)
+        opening_tts = (
+            _replace(base_tts, language=opening_lang)
+            if base_tts is not None else _TTSConfig(language=opening_lang)
+        )
         try:
             tts_result = await self._engine._tts.synthesize(  # type: ignore[attr-defined]
-                rendered, _TTSConfig(language=to_bcp47(self._active_language)),
+                rendered, opening_tts,
             )
         except Exception:
             log.exception("opening synthesis failed; skipping")

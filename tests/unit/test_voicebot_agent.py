@@ -67,9 +67,11 @@ class _RaisingLLM(ILLMProvider):
 class _FakeTTS(ITTSProvider):
     def __init__(self) -> None:
         self.synthesized: list[str] = []
+        self.configs: list[TTSConfig] = []
 
     async def synthesize(self, text: str, config: TTSConfig) -> TTSResult:
         self.synthesized.append(text)
+        self.configs.append(config)
         return TTSResult(audio=text.encode(), duration_ms=10.0, sample_rate=16000)
 
     async def synthesize_stream(self, text_stream, config):
@@ -128,6 +130,30 @@ def _make_agent(engine, store=None) -> VoiceBotAgent:
 
 
 # --- Tests ---------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_opening_uses_configured_voice_not_provider_default() -> None:
+    """The opening line must be spoken with the SELECTED/configured TTS voice
+    (reusing the engine's TTS config), not a bare config that falls back to the
+    provider default — otherwise the greeting is in the wrong voice."""
+    stt = _FakeSTT(text="x")
+    llm = _FakeLLM({"response_text": "x", "language": "hi", "action": "continue"})
+    tts = _FakeTTS()
+    engine = PipelineEngine(
+        stt, llm, tts,
+        PipelineConfig(stt=STTConfig(), llm=LLMConfig(),
+                       tts=TTSConfig(voice_id="karun", language="hi-IN")),
+    )
+    agent = _make_agent(engine)
+
+    async def sink(_audio):
+        pass
+
+    await agent.play_opening(sink)   # script opening is "Namaste"
+    assert tts.synthesized == ["Namaste"]
+    assert tts.configs[0].voice_id == "karun"        # the configured voice, not the default
+    assert tts.configs[0].language == "hi-IN"        # active language preserved
 
 
 @pytest.mark.asyncio
