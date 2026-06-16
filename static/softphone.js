@@ -153,6 +153,10 @@
     em.emit("status", "registering");
     const client = new StringeeClient();
     const identity = tok.identity;
+    // App-to-phone: the call's `from` must be the caller-ID NUMBER (a Stringee
+    // number), not the agent identity — Stringee rejects a `from` that isn't a
+    // number. The token carries it as params.from_number.
+    const fromNumber = (tok.params && tok.params.from_number) || identity;
     await new Promise(function (resolve, reject) {
       client.on("authen", function (res) {
         // res.r === 0 → authenticated
@@ -175,8 +179,8 @@
     }
     return {
       dial: function (to, params) {
-        // App-to-phone: from = the agent identity, to = the lead number.
-        current = new StringeeCall(client, identity, to);
+        // App-to-phone: from = the caller-ID number, to = the lead number.
+        current = new StringeeCall(client, fromNumber, to);
         current.isPhoneCall = true;
         // Stringee does NOT forward `to` to our Answer URL for app-to-phone calls
         // (it arrives empty, fromInternal=true) — so carry the destination in the

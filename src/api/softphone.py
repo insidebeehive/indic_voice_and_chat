@@ -58,7 +58,16 @@ async def mint_softphone_token(
         raise HTTPException(status_code=400, detail=str(e))
     log.info("softphone token minted", extra={
         "tenant": tenant.slug, "provider": creds.provider, "identity": creds.identity})
+    params = dict(creds.params)
+    if creds.provider == "stringee":
+        # The browser must place the call FROM the caller-ID number (a Stringee
+        # number), not the agent identity — Stringee rejects an app-to-phone call
+        # whose `from` is a non-number user. Pass it through for softphone.js.
+        tel = tenant.settings.pipeline.telephony
+        caller_id = ((tel.outbound_from or {}).get("stringee") or tel.from_number or "").lstrip("+")
+        if caller_id:
+            params["from_number"] = caller_id
     return SoftphoneTokenResponse(
         provider=creds.provider, token=creds.token, identity=creds.identity,
-        ttl_seconds=creds.ttl_seconds, params=creds.params,
+        ttl_seconds=creds.ttl_seconds, params=params,
     )
