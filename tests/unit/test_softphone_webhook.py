@@ -226,6 +226,19 @@ async def test_stringee_answer_logs_manual_call_and_connects(ctx) -> None:
     assert row.tts_provider is None
 
 
+async def test_stringee_answer_from_uses_request_caller_id(ctx) -> None:
+    client, _ = ctx
+    # The browser places the call FROM the caller-ID number, so it arrives as the
+    # request's `from`; the SCCO connect `from` must echo that same number (keeps
+    # makeCall `from` == SCCO `from`, as in Stringee's working call).
+    resp = await client.post(
+        "/api/v1/telephony/stringee/softphone-answer/acme",
+        json={"call_id": "ST-CID", "from": "918204267969", "to": "918618795697"})
+    assert resp.status_code == 200
+    conn = next(a for a in resp.json() if a["action"] == "connect")
+    assert conn["from"]["number"] == "918204267969"
+
+
 async def test_stringee_answer_reads_destination_from_custom(ctx) -> None:
     client, maker = ctx
     # Real Stringee app-to-phone behaviour (from the live debugger): the answer

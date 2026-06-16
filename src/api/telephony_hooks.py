@@ -347,9 +347,13 @@ async def stringee_softphone_answer(
     log.info("stringee softphone answer", extra={
         "tenant": tenant_slug, "method": request.method, "data": data})
     tenant = await tenant_from_slug(tenant_slug)
-    # The connect `from` is the caller-ID NUMBER (a Stringee-owned number, type
-    # "internal"), bare (no "+") to match Stringee's working app-to-phone SCCO.
-    caller_id = (await _provider_caller_id(session, tenant, "stringee") or "").lstrip("+")
+    # The connect `from` is the caller-ID NUMBER (type "internal"), bare. The
+    # browser places the call FROM this number, so it arrives as the request's
+    # `from`; use it (keeps the makeCall `from` and the SCCO `from` identical, as
+    # in Stringee's working call). Fall back to the tenant's configured caller-ID.
+    req_from = str(data.get("from") or "").lstrip("+")
+    caller_id = req_from if req_from.isdigit() else \
+        (await _provider_caller_id(session, tenant, "stringee") or "").lstrip("+")
     if not caller_id:
         log.warning("stringee softphone: no caller-ID for tenant %s", tenant.slug)
         return Response(status_code=400)
