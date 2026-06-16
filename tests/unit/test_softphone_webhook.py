@@ -107,6 +107,7 @@ async def ctx(monkeypatch):
         plaintext_tokens=["tok"],
     )
     telephony_hooks.set_softphone_providers(_FakeProviders())
+    telephony_hooks.set_softphone_sessionmaker(maker)  # background manual-call logging
     monkeypatch.setattr(
         telephony_hooks, "_download_twilio_recording",
         lambda url, sid, tok: _async_wav())
@@ -121,6 +122,7 @@ async def ctx(monkeypatch):
     async with AsyncClient(transport=transport, base_url="http://test") as c:
         yield c, maker
     telephony_hooks.set_softphone_providers(None)
+    telephony_hooks.set_softphone_sessionmaker(None)
     set_tenant_resolver(None)
     await engine.dispose()
 
