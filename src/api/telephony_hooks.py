@@ -347,12 +347,13 @@ async def stringee_softphone_answer(
     log.info("stringee softphone answer", extra={
         "tenant": tenant_slug, "method": request.method, "data": data})
     tenant = await tenant_from_slug(tenant_slug)
-    # Caller-ID = the tenant's Stringee-owned number (Stringee rejects the connect
-    # if `from` isn't a number it owns). This is the Stringee answer endpoint, so
-    # the provider is always "stringee".
-    from_number = await _provider_caller_id(session, tenant, "stringee")
-    if not from_number:
-        log.warning("stringee softphone: no caller-ID for tenant %s", tenant.slug)
+    # The connect `from` is the agent's **app user** (the existing client leg to
+    # bridge), not a phone number — Stringee's answer request carries it as
+    # userId/from. The PSTN caller-ID shown to the lead is the Stringee project's
+    # outbound number (configured in the project), not set in the SCCO.
+    agent_user = str(data.get("userId") or data.get("from") or "").strip()
+    if not agent_user:
+        log.warning("stringee softphone: no agent user for tenant %s", tenant.slug)
         return Response(status_code=400)
     to_number = _stringee_number(data.get("to")) or _stringee_number(data.get("toNumber")) \
         or _stringee_number(data.get("called")) or _stringee_custom_destination(data)
@@ -374,7 +375,7 @@ async def stringee_softphone_answer(
 
     event_url = f"{_stringee_base(request)}/softphone-recording/{tenant_slug}"
     scco = softphone_connect_scco(
-        from_number=from_number, to_number=to_number, event_url=event_url)
+        agent_user=agent_user, to_number=to_number, event_url=event_url)
     return JSONResponse(scco)
 
 

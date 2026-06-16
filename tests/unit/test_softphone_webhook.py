@@ -199,18 +199,22 @@ async def test_stringee_answer_logs_manual_call_and_connects(ctx) -> None:
     client, maker = ctx
     resp = await client.post(
         "/api/v1/telephony/stringee/softphone-answer/acme",
-        json={"call_id": "ST-1", "from": "agent-7", "to": "+918618795697"})
+        json={"call_id": "ST-1", "userId": "agent-7", "from": "agent-7",
+              "to": "+918618795697"})
     assert resp.status_code == 200
     scco = resp.json()
-    assert scco[0]["action"] == "connect"
-    assert scco[0]["to"]["number"] == "+918618795697"
-    assert scco[0]["to"]["type"] == "external"
-    assert scco[0]["from"]["number"] == "+15550001111"
-    # App-to-phone: the Stringee-owned caller-ID is "internal" to Stringee; only
-    # the PSTN lead is "external". An "external" from is rejected (REQUEST_ANSWER_URL_ERROR).
-    assert scco[0]["from"]["type"] == "internal"
-    assert scco[0]["record"] == {"format": "wav", "channel": "two"}
-    assert "softphone-recording/acme" in scco[0]["eventUrl"]
+    rec = next(a for a in scco if a["action"] == "record")
+    conn = next(a for a in scco if a["action"] == "connect")
+    # record action must come BEFORE connect (a record field inside connect is
+    # invalid → Stringee logs "Unknown" / REQUEST_ANSWER_URL_ERROR).
+    assert scco.index(rec) < scco.index(conn)
+    assert rec["format"] == "wav" and rec["channel"] == "two"
+    assert "softphone-recording/acme" in rec["eventUrl"]
+    # connect: from = the agent's app user (internal leg), to = the PSTN lead.
+    assert conn["from"] == {"type": "internal", "number": "agent-7", "alias": "agent-7"}
+    assert conn["to"]["number"] == "+918618795697"
+    assert conn["to"]["type"] == "external"
+    assert conn["peerToPeerCall"] is False
 
     async with maker() as s:
         row = (await s.execute(
@@ -221,24 +225,13 @@ async def test_stringee_answer_logs_manual_call_and_connects(ctx) -> None:
     assert row.tts_provider is None
 
 
-async def test_stringee_answer_caller_id_from_provider_number(ctx) -> None:
-    client, maker = ctx
-    # The tenant owns a Stringee number registered in tenant_phone_numbers; the
-    # connect SCCO `from` must be THAT number (Stringee rejects a `from` it
-    # doesn't own), not the generic telephony from_number.
-    from src.models.tenant import TenantPhoneNumber
-    async with maker() as s:
-        s.add(TenantPhoneNumber(
-            phone_number="918204268005", tenant_id="t1", provider="stringee"))
-        await s.commit()
-
+async def test_stringee_answer_requires_agent_user(ctx) -> None:
+    client, _ = ctx
+    # No userId/from in the answer request → no app-user leg to bridge → 400.
     resp = await client.post(
         "/api/v1/telephony/stringee/softphone-answer/acme",
-        json={"call_id": "ST-PN", "from": "agent", "to": "+918618795697"})
-    assert resp.status_code == 200
-    scco = resp.json()
-    assert scco[0]["from"]["number"] == "918204268005"
-    assert scco[0]["from"]["type"] == "internal"
+        json={"call_id": "ST-NU", "to": "+918618795697"})
+    assert resp.status_code == 400
 
 
 async def test_stringee_answer_reads_destination_from_custom(ctx) -> None:
@@ -253,9 +246,9 @@ async def test_stringee_answer_reads_destination_from_custom(ctx) -> None:
                 "callId": "ST-CUSTOM-1", "custom": json.dumps({"to": "+918618795697"})})
     assert resp.status_code == 200
     scco = resp.json()
-    assert scco[0]["action"] == "connect"
-    assert scco[0]["to"]["number"] == "+918618795697"
-    assert scco[0]["from"]["number"] == "+15550001111"
+    conn = next(a for a in scco if a["action"] == "connect")
+    assert conn["to"]["number"] == "+918618795697"
+    assert conn["from"]["number"] == "dev"  # the agent app user (userId)
 
     async with maker() as s:
         row = (await s.execute(

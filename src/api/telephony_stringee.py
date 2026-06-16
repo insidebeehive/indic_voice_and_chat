@@ -58,30 +58,39 @@ def closing_scco(*, audio_url: str) -> list[dict[str, Any]]:
 
 
 def softphone_connect_scco(
-    *, from_number: str, to_number: str, event_url: str, record: bool = True,
+    *, agent_user: str, to_number: str, event_url: str, record: bool = True,
 ) -> list[dict[str, Any]]:
-    """Bridge a human agent's browser (Stringee client) call to the lead (PSTN).
+    """Bridge a human agent's browser (Stringee app user) call to the lead (PSTN).
 
-    Used by the browser-softphone answer webhook: the agent's Web SDK call is the
-    caller; this connects it to ``to_number`` from the tenant's DID
-    (``from_number`` = caller-ID) and records **dual-channel** (``channel: two``)
-    so the agent and lead land on separate tracks — clean role attribution for
-    the same transcribe→analyze outcome pipeline AI calls use. ``event_url``
-    receives call/recording events (incl. the recording URL when ready).
+    Per Stringee's app-to-phone ``connect`` SCCO:
+    - ``from`` is the agent's **app user** (``type: internal`` — the existing
+      client call leg to bridge), NOT a phone number. The PSTN caller-ID shown to
+      the lead is the Stringee project's configured outbound number.
+    - ``to`` is the lead (``type: external``).
+    - Recording is a **separate** ``record`` action placed BEFORE ``connect`` (a
+      ``record`` *field* inside connect is invalid → Stringee logs "Unknown" /
+      REQUEST_ANSWER_URL_ERROR), and ``peerToPeerCall`` must be ``false`` or the
+      call can't be recorded.
+
+    ``event_url`` receives call + recording events (incl. the recording URL).
     """
-    action: dict[str, Any] = {
+    actions: list[dict[str, Any]] = []
+    if record:
+        # Dual-channel wav (agent on ch1, lead on ch2) so the recording webhook
+        # can split tracks for clean role attribution without transcoding.
+        actions.append({
+            "action": "record",
+            "eventUrl": event_url,
+            "format": "wav",
+            "channel": "two",
+        })
+    actions.append({
         "action": "connect",
-        # App-to-phone connect: the caller-ID is a Stringee-owned number (internal
-        # *to Stringee*) → type "internal"; the lead is a PSTN number outside
-        # Stringee → type "external". Per Stringee's app-to-phone SCCO spec; an
-        # "external" from (a number Stringee doesn't own) is rejected as Unknown →
-        # REQUEST_ANSWER_URL_ERROR.
-        "from": {"type": "internal", "number": from_number, "alias": from_number},
+        "from": {"type": "internal", "number": agent_user, "alias": agent_user},
         "to": {"type": "external", "number": to_number, "alias": to_number},
         "eventUrl": event_url,
-    }
-    if record:
-        # channel "two" = stereo (caller on ch1, callee on ch2); wav so we can
-        # split it with the stdlib wave module (no transcoding needed).
-        action["record"] = {"format": "wav", "channel": "two"}
-    return [action]
+        "timeout": 45,
+        "maxConnectTime": -1,
+        "peerToPeerCall": False,
+    })
+    return actions
