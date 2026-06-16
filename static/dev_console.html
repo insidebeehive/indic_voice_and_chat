@@ -38,9 +38,9 @@
       </select>
     </label>
     <label>Voice
-      <select id="voice">
-        <option>Aoede</option><option>Kore</option><option>Leda</option>
-      </select>
+      <!-- Populated per mode from /dev/voices: layered = configured TTS voices,
+           s2s = realtime allowed voices. -->
+      <select id="voice"></select>
     </label>
     <label>Telephony
       <select id="telephony">
@@ -190,7 +190,9 @@ async function start() {
   // S2S (Gemini Live) uses a sibling endpoint + a voice; layered = the cascade.
   const path = mode === "s2s" ? "/api/v1/dev/voice-live" : "/api/v1/dev/voice";
   let qs = "tenant=dev" + (leadName ? "&lead_name=" + encodeURIComponent(leadName) : "");
-  if (mode === "s2s") qs += "&voice=" + encodeURIComponent($("voice").value);
+  // Voice applies to both modes now: layered overrides the TTS voice, s2s the
+  // realtime voice (both validated server-side against the allowed set).
+  if ($("voice").value) qs += "&voice=" + encodeURIComponent($("voice").value);
   ws = new WebSocket(`${wsProto}://${location.host}${path}?${qs}`);
   ws.binaryType = "arraybuffer";
 
@@ -320,6 +322,30 @@ function syncTelephonyUI() {
 }
 $("telephony").addEventListener("change", syncTelephonyUI);
 syncTelephonyUI();
+
+// Voice dropdown is per-mode: layered shows the configured TTS provider's voice
+// roster, s2s shows the realtime allowed voices. Fetched so it tracks config.
+let _voiceData = { layered: { voices: [], default: "" }, s2s: { voices: [], default: "" } };
+function populateVoices(mode) {
+  const d = _voiceData[mode] || { voices: [], default: "" };
+  const sel = $("voice");
+  sel.innerHTML = "";
+  for (const v of d.voices) {
+    const o = document.createElement("option");
+    o.value = v; o.textContent = v;
+    if (v === d.default) o.selected = true;
+    sel.appendChild(o);
+  }
+}
+async function loadVoices() {
+  try {
+    const r = await fetch("/dev/voices?tenant=dev");
+    if (r.ok) _voiceData = await r.json();
+  } catch (e) { console.warn("[devconsole] voices fetch failed", e); }
+  populateVoices($("mode").value);
+}
+$("mode").addEventListener("change", () => populateVoices($("mode").value));
+loadVoices();
 
 async function placeCall(provider) {
   const to = ($("toNumber").value || "").trim();

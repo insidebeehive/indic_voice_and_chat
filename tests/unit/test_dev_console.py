@@ -97,6 +97,49 @@ def test_place_call_uses_selected_provider_and_its_caller_id(monkeypatch):
         set_tenant_resolver(None)
 
 
+def test_dev_voices_per_mode():
+    """The Voice dropdown source is per-mode: layered = the configured TTS
+    provider's roster (default = pipeline.tts.voice_id); s2s = the realtime
+    allowed_voices (default = pipeline.realtime.voice)."""
+    from src.config_tenant import (
+        TenantPipelineConfig,
+        TenantRealtimeConfig,
+        TenantSettings,
+        TenantTTSConfig,
+    )
+
+    register_tenant_for_test(TenantSettings(
+        id="t_dev", slug="dev", name="Dev",
+        pipeline=TenantPipelineConfig(
+            tts=TenantTTSConfig(language="hi-IN", voice_id="anushka"),
+            realtime=TenantRealtimeConfig(voice="Aoede", allowed_voices=["Aoede", "Kore", "Leda"]),
+        )))
+
+    class _FakeTTS:
+        def get_available_voices(self, language):
+            assert language == "hi-IN"
+            return [{"voice_id": "anushka", "gender": "female"},
+                    {"voice_id": "karun", "gender": "male"}]
+
+    class _FakeProviders:
+        def get_tts(self, tenant):
+            return _FakeTTS()
+
+    try:
+        app = FastAPI()
+        app.include_router(dev_router)
+        app.state.providers = _FakeProviders()
+        resp = TestClient(app).get("/dev/voices?tenant=dev")
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["layered"]["voices"] == ["anushka", "karun"]
+        assert data["layered"]["default"] == "anushka"
+        assert data["s2s"]["voices"] == ["Aoede", "Kore", "Leda"]
+        assert data["s2s"]["default"] == "Aoede"
+    finally:
+        set_tenant_resolver(None)
+
+
 def test_place_call_no_caller_id_for_provider(monkeypatch):
     def _no_build(cfg):
         raise AssertionError("adapter should not be built without a caller-ID")
