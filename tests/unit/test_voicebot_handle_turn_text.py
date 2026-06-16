@@ -34,6 +34,44 @@ def _agent(engine):
 
 
 @pytest.mark.asyncio
+async def test_active_language_switches_and_threads_to_engine():
+    """The agent starts in the campaign default, switches when the LLM reports a
+    new language, and passes the (BCP-47) active language to the engine each turn."""
+    captured = {"langs": []}
+
+    class _LangEngine:
+        agent_text = '{"response_text": "namaste", "action": "continue", "language": "hi"}'
+
+        async def run_turn_text(self, user_text, history, audio_sink, cancel_event=None, **kw):
+            captured["langs"].append(kw.get("language"))
+            return TurnResult(
+                user_text=user_text, user_language=None, user_confidence=1.0,
+                agent_text=self.agent_text, audio_bytes_sent=1, metrics=TurnMetrics(),
+            )
+
+    engine = _LangEngine()
+    agent = _agent(engine)
+    await agent.start()
+
+    async def sink(a):
+        pass
+
+    # Turn 1: default Hindi → engine gets hi-IN, stays hi.
+    await agent.handle_turn_text("hello", sink)
+    assert captured["langs"][0] == "hi-IN"
+    assert agent.active_language == "hi"
+
+    # Turn 2: the LLM now answers in Marathi → active language switches.
+    engine.agent_text = '{"response_text": "namaskar", "action": "continue", "language": "mr"}'
+    await agent.handle_turn_text("marathi madhe bola", sink)
+    assert agent.active_language == "mr"
+
+    # Turn 3: the switched language now reaches the engine.
+    await agent.handle_turn_text("kasa aahes", sink)
+    assert captured["langs"][-1] == "mr-IN"
+
+
+@pytest.mark.asyncio
 async def test_history_window_bounds_llm_context():
     """The LLM gets system prompt + last MAX_HISTORY_TURNS exchanges, not the
     whole transcript — so per-turn latency doesn't grow with call length. The

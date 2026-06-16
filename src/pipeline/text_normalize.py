@@ -72,3 +72,28 @@ def normalize_currency(text: str) -> str:
     if not text:
         return text
     return _CURRENCY_RE.sub(lambda m: f"{m.group(1).replace(',', '')} रुपये", text)
+
+
+# Indian languages written in Devanagari. The pronunciation + currency rewrites
+# above are Devanagari, so they're correct for these and wrong (wrong script) for
+# others (Telugu, Malayalam, Tamil, …).
+DEVANAGARI_LANGS = frozenset({"hi", "mr", "ne", "sa", "kok", "mai", "bho", "doi"})
+
+
+def normalize_for_tts(
+    text: str, language: str | None = None, extra: dict[str, str] | None = None
+) -> str:
+    """Language-aware TTS text normalization.
+
+    Applies the Devanagari currency + pronunciation rewrites only for
+    Devanagari-script languages (Hindi, Marathi, …). For other scripts (Telugu,
+    Malayalam) injecting Devanagari would render the wrong script, so the text is
+    returned unchanged until per-language maps exist. An unknown/empty language
+    keeps the legacy behaviour (apply — assumes Hindi).
+    """
+    if not text:
+        return text
+    base = (language or "").strip().lower().split("-")[0]
+    if base and base not in DEVANAGARI_LANGS:
+        return text
+    return apply_pronunciations(normalize_currency(text), extra=extra)

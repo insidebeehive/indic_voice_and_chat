@@ -110,6 +110,7 @@ class BrowserVoiceBridge:
         self._play_until = 0.0
         self._stream_provider = stream_provider
         self._stream_session = None
+        self._stream_language = ""  # base lang the Deepgram stream is currently open with
         self._agent_busy = False
         self._cancel_event = None  # set per in-flight streaming turn; barge-in fires it
         self._barge_enabled = False     # set by the client's {"type":"config","barge":...}
@@ -177,8 +178,10 @@ class BrowserVoiceBridge:
             if self._stream_provider is not None:
                 try:
                     from src.interfaces.stt import STTConfig
+                    self._stream_language = self._stt_language()
                     self._stream_session = await self._stream_provider.open_stream(
-                        STTConfig(language="hi", sample_rate=self._config.pcm_sample_rate)
+                        STTConfig(language=self._stream_language,
+                                  sample_rate=self._config.pcm_sample_rate)
                     )
                     stream_task = asyncio.create_task(self._run_stream_consumer())
                     log.info("browser bridge: deepgram streaming session open")
@@ -355,6 +358,23 @@ class BrowserVoiceBridge:
         self._reset_capture()  # drop audio captured while the agent was busy
         await self._send_json({"type": "status", "status": "listening"})
 
+    def _stt_language(self) -> str:
+        """Base language code to open the Deepgram stream with — the agent's
+        current conversation language (it switches when the caller changes
+        language). Deepgram wants a bare code (``hi``/``mr``)."""
+        return getattr(self._agent, "active_language", None) or "hi"
+
+    async def _maybe_reopen_stt_for_language(self) -> None:
+        """If the conversation switched language this turn, close the STT stream
+        so the consumer loop reopens it in the new language. Called right after a
+        turn while the agent is still 'busy', so the echo gate drops any audio
+        during the brief reopen window. Safe no-op in batch mode."""
+        if self._stream_session is not None and self._stt_language() != self._stream_language:
+            try:
+                await self._stream_session.aclose()
+            except Exception:  # noqa: BLE001 - consumer loop handles reopen/fallback
+                pass
+
     async def _run_stream_consumer(self) -> None:
         """Consume streaming-STT events, reopening the upstream if it drops.
 
@@ -371,25 +391,32 @@ class BrowserVoiceBridge:
             await self._consume_stream_events(self._stream_session)
             if self._stopped:
                 return
-            # events() returned while the call is live => the upstream dropped us.
-            reopens += 1
-            if reopens > _MAX_STREAM_REOPENS:
-                log.warning("deepgram dropped repeatedly; falling back to batch VAD")
-                self._stream_session = None
-                return
+            # events() returned. Either the caller's language changed (a deliberate
+            # reopen, triggered post-turn — not a failure) or the upstream dropped.
+            lang_switch = self._stt_language() != self._stream_language
+            if not lang_switch:
+                reopens += 1
+                if reopens > _MAX_STREAM_REOPENS:
+                    log.warning("deepgram dropped repeatedly; falling back to batch VAD")
+                    self._stream_session = None
+                    return
             try:
                 await self._stream_session.aclose()
             except Exception:  # noqa: BLE001
                 pass
-            await asyncio.sleep(_STREAM_REOPEN_BACKOFF_S)
+            if not lang_switch:
+                await asyncio.sleep(_STREAM_REOPEN_BACKOFF_S)
             if self._stopped:
                 return
             try:
+                self._stream_language = self._stt_language()
                 self._stream_session = await self._stream_provider.open_stream(
-                    STTConfig(language="hi", sample_rate=self._config.pcm_sample_rate)
+                    STTConfig(language=self._stream_language,
+                              sample_rate=self._config.pcm_sample_rate)
                 )
-                log.info("browser bridge: deepgram stream reopened after drop",
-                         extra={"reopen": reopens})
+                log.info("browser bridge: deepgram stream reopened",
+                         extra={"reopen": reopens, "language": self._stream_language,
+                                "reason": "language_switch" if lang_switch else "drop"})
             except Exception as e:  # noqa: BLE001
                 log.warning("deepgram reopen failed (%s); falling back to batch VAD", e)
                 self._stream_session = None
@@ -475,6 +502,10 @@ class BrowserVoiceBridge:
         # Only record the action for turns that actually completed (not barge-in
         # cancellations, where the action is a meaningless default).
         self._last_action = outcome.response.action
+        # If the agent switched conversation language this turn, reopen the STT
+        # stream so it transcribes the caller's new language (still busy here, so
+        # audio is gated during the reopen).
+        await self._maybe_reopen_stt_for_language()
         m = outcome.pipeline.metrics
         log.info(
             "browser turn (stream)",
