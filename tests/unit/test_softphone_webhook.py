@@ -187,7 +187,11 @@ async def test_stringee_answer_logs_manual_call_and_connects(ctx) -> None:
     scco = resp.json()
     assert scco[0]["action"] == "connect"
     assert scco[0]["to"]["number"] == "+918618795697"
+    assert scco[0]["to"]["type"] == "external"
     assert scco[0]["from"]["number"] == "+15550001111"
+    # Outbound caller-ID must be a Stringee-provisioned number → type "external";
+    # "internal" is for app users and makes Stringee reject the connect SCCO.
+    assert scco[0]["from"]["type"] == "external"
     assert scco[0]["record"] == {"format": "wav", "channel": "two"}
     assert "softphone-recording/acme" in scco[0]["eventUrl"]
 
