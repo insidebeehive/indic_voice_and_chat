@@ -50,6 +50,21 @@ def _to_tool(types, tool: RealtimeTool):
         name=tool.name, description=tool.description, parameters=_schema(types, tool.parameters))])
 
 
+def _build_speech_config(types, language_code, voice):
+    """Speech config for the Live session. ``language_code`` is set ONLY when
+    provided: native-audio Live models (e.g. gemini-3.1-flash-live) auto-detect
+    and switch languages naturally and don't accept an explicit code — leave it
+    unset (``pipeline.realtime.language_code: null``) and steer language via the
+    system instruction. A code is still honored for half-cascade models."""
+    speech = types.SpeechConfig()
+    if language_code:
+        speech.language_code = language_code
+    if voice:
+        speech.voice_config = types.VoiceConfig(
+            prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=voice))
+    return speech
+
+
 class GeminiLiveSession(IRealtimeSession):
     def __init__(self, cm, session) -> None:
         self._cm = cm          # the live.connect async context manager
@@ -61,10 +76,7 @@ class GeminiLiveSession(IRealtimeSession):
         from google.genai import types
 
         client = genai.Client(api_key=api_key)
-        speech = types.SpeechConfig(language_code=config.language_code)
-        if config.voice:
-            speech.voice_config = types.VoiceConfig(
-                prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=config.voice))
+        speech = _build_speech_config(types, config.language_code, config.voice)
         live_config = types.LiveConnectConfig(
             response_modalities=["AUDIO"],
             system_instruction=config.system_instruction or None,
