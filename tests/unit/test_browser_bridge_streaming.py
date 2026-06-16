@@ -232,6 +232,34 @@ async def test_stream_consumer_stops_without_reopen_when_call_ended(monkeypatch)
     assert prov.opens == 0  # no reopen attempted when stopped
 
 
+def test_streaming_supports_only_deepgram_languages():
+    bridge, _ = _bridge([])
+    for ok in ("hi", "mr-IN", "te", "ta", "bn", "en"):
+        assert bridge._streaming_supports(ok), ok
+    for no in ("ml", "pa", "od", "ml-IN"):   # Deepgram can't stream these
+        assert not bridge._streaming_supports(no), no
+
+
+@pytest.mark.asyncio
+async def test_stream_consumer_drops_to_batch_for_non_streamable_language(monkeypatch):
+    import src.api.browser_bridge as bb
+    monkeypatch.setattr(bb, "_STREAM_REOPEN_BACKOFF_S", 0)
+    s1 = _ScriptedSession([])              # events end immediately (as if torn down)
+    bridge = BrowserVoiceBridge(
+        websocket=_FakeWS(),
+        agent=_FakeAgent(),
+        vad=EnergyVAD(sample_rate=16000, frame_ms=30),
+        config=BrowserBridgeConfig(),
+        stream_provider=_FakeProvider(s1),
+    )
+    bridge._agent.active_language = "ml"    # Malayalam — Deepgram can't stream it
+    bridge._stream_session = s1
+    bridge._stream_language = "hi"
+    await bridge._run_stream_consumer()
+    assert s1.closed                        # live stream torn down
+    assert bridge._stream_session is None    # -> batch path (Sarvam) takes over
+
+
 def test_build_streaming_provider_from_tenant():
     from types import SimpleNamespace
 

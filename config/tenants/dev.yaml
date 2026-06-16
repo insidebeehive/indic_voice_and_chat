@@ -37,11 +37,14 @@ pipeline:
   # connection regardless of this default.
   mode: layered
 
+  # Batch STT (telephony + the dev-console batch path). Sarvam saaras covers all
+  # 10 Indian languages (hi/bn/gu/kn/ml/mr/od/pa/ta/te), so the dev console can
+  # transcribe languages Deepgram streaming can't (ml/pa/od) by dropping to batch.
   stt:
-    provider: groq
-    model: whisper-large-v3
+    provider: sarvam
+    model: saaras:v2
     language: hi-IN
-    api_key_env: TENANT_DEV_GROQ_KEY
+    api_key_env: TENANT_DEV_SARVAM_KEY
 
   # Speech-to-speech (Gemini Live). Spike: ~1.4s first-word + natural Hinglish.
   # The dev console S2S path uses this; voice is selectable from allowed_voices.
@@ -54,11 +57,13 @@ pipeline:
     api_key_env: TENANT_DEV_GEMINI_KEY
 
   # Streaming STT for the dev console (Deepgram live). When present, the browser
-  # bridge streams audio live and uses Deepgram endpointing; pipeline.stt (Groq)
-  # remains the batch fallback. Telephony bridges ignore this block.
+  # bridge streams audio live and uses Deepgram endpointing; pipeline.stt (Sarvam)
+  # is the batch path for languages Deepgram can't stream. Telephony ignores this.
   stt_streaming:
     provider: deepgram
-    model: nova-2          # nova-2 hi validated; nova-3 multi also works
+    # nova-3 streams hi/bn/gu/kn/mr/ta/te (monolingual, per active language).
+    # Languages it can't stream (ml/pa/od) fall through to Sarvam batch (pipeline.stt).
+    model: nova-3
     language: hi
     endpointing: 400       # ms of trailing silence -> speech_final. 200 was too
                            # eager — natural mid-sentence pauses (breath/thinking)
