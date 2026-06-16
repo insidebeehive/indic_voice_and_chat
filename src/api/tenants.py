@@ -138,6 +138,7 @@ async def register_tenant(
     # TenantContext.secret(<name>) finds them in the decrypted secrets dict.
     tel = req.telephony
     sid_env = token_env = None
+    api_key_sid_env = api_key_secret_env = twiml_app_sid_env = None
     secret_rows: list[tuple[str, str]] = []
     if tel.keys:
         if not crypto.has_key():
@@ -152,6 +153,14 @@ async def register_tenant(
                 sid_env = name
             elif logical in ("auth_token", "token"):
                 token_env = name
+            # Twilio browser softphone credentials (distinct from the server
+            # account_sid/auth_token used for outbound dialing).
+            elif logical in ("api_key_sid", "twilio_api_key_sid"):
+                api_key_sid_env = name
+            elif logical in ("api_key_secret", "twilio_api_key_secret"):
+                api_key_secret_env = name
+            elif logical in ("twiml_app_sid",):
+                twiml_app_sid_env = name
 
     pipeline = TenantPipelineConfig(
         mode=req.mode,
@@ -187,6 +196,9 @@ async def register_tenant(
             webhook_base_url=tel.webhook_base_url,
             account_sid_env=sid_env,
             auth_token_env=token_env,
+            api_key_sid_env=api_key_sid_env,
+            api_key_secret_env=api_key_secret_env,
+            twiml_app_sid_env=twiml_app_sid_env,
         ),
     )
 
@@ -284,6 +296,8 @@ class TenantAnalytics(BaseModel):
     total_calls: int
     by_status: dict[str, int]
     by_outcome: dict[str, int]
+    # Manual (human softphone) vs AI (voicebot) call counts, keyed by agent_type.
+    by_agent_type: dict[str, int]
     total_duration_ms: int
     avg_duration_ms: int
 
@@ -297,23 +311,28 @@ async def tenant_analytics(
     """Call analytics for one tenant, aggregated from the conversations table."""
     await _require_tenant(session, tenant_id)
     rows = (await session.execute(
-        select(Conversation.status, Conversation.outcome, Conversation.duration_ms)
+        select(Conversation.status, Conversation.outcome, Conversation.duration_ms,
+               Conversation.agent_type)
         .where(Conversation.tenant_id == tenant_id)
     )).all()
     by_status: dict[str, int] = {}
     by_outcome: dict[str, int] = {}
+    by_agent_type: dict[str, int] = {}
     total_dur = 0
-    for status, outcome, dur in rows:
+    for status, outcome, dur, agent_type in rows:
         by_status[status or "unknown"] = by_status.get(status or "unknown", 0) + 1
         # Count rows with no outcome under "no_outcome" so by_outcome totals to
         # total_calls (matching by_status) — calls in progress or that ended
         # before analysis have no outcome yet.
         okey = outcome or "no_outcome"
         by_outcome[okey] = by_outcome.get(okey, 0) + 1
+        akey = agent_type or "unknown"
+        by_agent_type[akey] = by_agent_type.get(akey, 0) + 1
         total_dur += int(dur or 0)
     n = len(rows)
     return TenantAnalytics(
         tenant_id=tenant_id, total_calls=n, by_status=by_status, by_outcome=by_outcome,
+        by_agent_type=by_agent_type,
         total_duration_ms=total_dur, avg_duration_ms=(total_dur // n if n else 0),
     )
 

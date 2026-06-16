@@ -175,6 +175,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             )
         )
         log.info("dev console enabled at /dev/voice")
+    # Browser softphone recording webhook transcribes + analyzes with the
+    # tenant's STT + LLM, so it needs the same per-tenant provider registry.
+    telephony_hooks.set_softphone_providers(providers)
     app.state.providers = providers
 
     try:
@@ -184,6 +187,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         telephony_hooks.set_bridge_factory(None)
         telephony_hooks.set_exotel_bridge_factory(None)
         telephony_hooks.set_stringee_bridge_factory(None)
+        telephony_hooks.set_softphone_providers(None)
         set_browser_bridge_factory(None)
         set_call_outcome_persister(None)
         await redis_client.aclose()

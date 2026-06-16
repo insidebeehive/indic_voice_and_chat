@@ -83,6 +83,29 @@ def wav_to_pcm16(wav_bytes: bytes) -> tuple[bytes, int]:
     return frames, sample_rate
 
 
+def wav_split_stereo(wav_bytes: bytes) -> tuple[bytes, bytes, int]:
+    """Split a 16-bit WAV into its two mono channels: ``(left, right, sample_rate)``.
+
+    Used for dual-channel call recordings where each party is on its own track.
+    A mono WAV returns the same PCM for both channels (so callers can treat it
+    uniformly). Raises on non-16-bit or >2-channel audio.
+    """
+    with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
+        nchannels = wf.getnchannels()
+        sample_rate = wf.getframerate()
+        sample_width = wf.getsampwidth()
+        if sample_width != 2:
+            raise ValueError(f"Only 16-bit PCM supported, got {sample_width * 8}-bit")
+        frames = wf.readframes(wf.getnframes())
+    if nchannels == 1:
+        return frames, frames, sample_rate
+    if nchannels != 2:
+        raise ValueError(f"Unsupported channel count: {nchannels}")
+    left = audioop.tomono(frames, 2, 1.0, 0.0)
+    right = audioop.tomono(frames, 2, 0.0, 1.0)
+    return left, right, sample_rate
+
+
 # --- Energy / loudness --------------------------------------------------
 
 

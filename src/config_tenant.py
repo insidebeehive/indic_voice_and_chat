@@ -130,6 +130,17 @@ class TenantTelephonyConfig(BaseModel):
     webhook_base_url: Optional[str] = None
     account_sid_env: Optional[str] = None
     auth_token_env: Optional[str] = None
+    # Browser softphone (human agent ↔ lead) credentials. Distinct from the
+    # account_sid/auth_token used for server-side outbound dialing:
+    #   - Twilio mints a browser AccessToken from an API Key SID + Secret and a
+    #     TwiML App SID (whose Voice URL points at our softphone-twiml endpoint).
+    #   - Stringee reuses its account api_key_sid/secret (account_sid_env/
+    #     auth_token_env) to mint a client JWT — no extra fields needed.
+    # Like the other *_env fields these reference synthetic env-var names whose
+    # values live (encrypted) in tenant_secrets and resolve via TenantContext.secret.
+    api_key_sid_env: Optional[str] = None
+    api_key_secret_env: Optional[str] = None
+    twiml_app_sid_env: Optional[str] = None
     # Per-provider caller-IDs for the dev-console "place call" panel. The Telephony
     # dropdown picks the provider; this maps provider -> the number to dial *from*
     # (each provider needs its own owned number). e.g. {"twilio": "+1...", "exotel": "+91..."}.

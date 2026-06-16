@@ -37,6 +37,7 @@ async def insert_call(
     lead_id: Optional[str] = None,
     voice: Optional[str] = None,
     mode: Optional[str] = None,
+    agent_type: str = "voicebot",
 ) -> Conversation:
     """Insert an ``in_progress`` conversation row snapshotting the config used.
 
@@ -44,17 +45,26 @@ async def insert_call(
     record the same per-call config for statistics + billing. ``mode`` overrides
     the tenant default — the browser console can run S2S on a layered-default
     tenant (or vice-versa), and the recorded mode drives the cost calculation.
+
+    ``agent_type`` marks who talked: ``"voicebot"`` (our AI, the default) or
+    ``"human"`` (a CRM agent on the browser softphone). A human softphone call is
+    forced to ``layered`` mode and snapshots only STT+LLM — the cost actually
+    incurred is post-call transcription (STT) + outcome analysis (LLM); there is
+    no live TTS or S2S, so those are left unset and excluded from the platform
+    total. The outcome itself is produced by the same analyzer AI calls use.
     """
     p = tenant.settings.pipeline
-    eff_mode = mode or p.mode
+    is_human = agent_type == "human"
+    eff_mode = "layered" if is_human else (mode or p.mode)
     realtime_provider = p.realtime.provider if (eff_mode == "s2s" and p.realtime) else None
-    v = voice or p.tts.voice_id or (p.realtime.voice if p.realtime else None)
+    tts_provider = None if is_human else p.tts.provider
+    v = None if is_human else (voice or p.tts.voice_id or (p.realtime.voice if p.realtime else None))
     row = Conversation(
         id=call_id, tenant_id=tenant.id, campaign_id=campaign_id, lead_id=lead_id,
-        agent_type="voicebot", channel=channel, status="in_progress",
+        agent_type=agent_type, channel=channel, status="in_progress",
         pipeline_config=p.model_dump(), provider_call_sid=provider_call_sid,
         mode=eff_mode, stt_provider=p.stt.provider, llm_provider=p.llm.provider,
-        tts_provider=p.tts.provider, realtime_provider=realtime_provider, voice=v,
+        tts_provider=tts_provider, realtime_provider=realtime_provider, voice=v,
         telephony_provider=(p.telephony.provider or None),
     )
     session.add(row)

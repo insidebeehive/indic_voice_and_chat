@@ -19,18 +19,33 @@ import logging
 from collections.abc import Callable
 
 import httpx
-from fastapi import APIRouter, Form, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, Form, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, Response
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.api.deps import get_db_session
 from src.api.telephony_exotel import voicebot_xml
 from src.api.telephony_stringee import reprompt_scco
 from src.api.telephony_stringee_bridge import StringeeIvrBridge, registry
-from src.api.telephony_twilio import voice_twiml
+from src.api.telephony_twilio import softphone_dial_twiml, voice_twiml
 from src.auth import TenantContext
-from src.auth.middleware import tenant_from_twilio_to_number
+from src.auth.middleware import tenant_from_slug, tenant_from_twilio_to_number
 
 log = logging.getLogger(__name__)
 router = APIRouter(prefix="/telephony", tags=["telephony"])
+
+
+# --- Browser softphone (human agent ↔ lead) deps ---------------------------
+# The recording webhook needs the per-tenant provider registry (to build the
+# tenant's STT + LLM for transcription + outcome analysis). main.py wires it in
+# the lifespan; unset (tests without the full app) → the webhook 503s.
+_softphone_providers: object | None = None
+
+
+def set_softphone_providers(providers: object | None) -> None:
+    """Register the per-tenant provider registry used by the recording webhook."""
+    global _softphone_providers
+    _softphone_providers = providers
 
 
 # Factory: takes (websocket, tenant_context) -> bridge instance with .run()
@@ -136,6 +151,134 @@ async def twilio_stream(websocket: WebSocket, tenant_slug: str) -> None:
             await websocket.close()
         except Exception:  # noqa: BLE001
             pass
+
+
+# --- Browser softphone (human agent ↔ lead) ---------------------------------
+
+
+def _forwarded_base(request: Request) -> str:
+    """Public base URL for our telephony routes, honoring reverse-proxy headers."""
+    base = request.headers.get("x-forwarded-host") or request.url.netloc
+    proto = request.headers.get("x-forwarded-proto")
+    scheme = "https" if (proto == "https" or request.url.scheme == "https") else "http"
+    return f"{scheme}://{base}/api/v1/telephony"
+
+
+@router.post("/twilio/softphone-twiml/{tenant_slug}", response_class=Response)
+async def twilio_softphone_twiml(
+    tenant_slug: str,
+    request: Request,
+    To: str = Form(...),
+    From: str | None = Form(None),
+    CallSid: str | None = Form(None),
+    session: AsyncSession = Depends(get_db_session),
+) -> Response:
+    """TwiML App Voice URL for a tenant's browser softphone.
+
+    Hit when a human agent's browser (Twilio Voice JS SDK) places a call: ``To``
+    is the lead number the SDK passed; ``From`` is ``client:<identity>``. We log
+    the call as a **manual** conversation row (so the recording webhook can
+    finalize its outcome by CallSid) and return TwiML that dials the lead from
+    the tenant's caller-ID with dual-channel recording.
+    """
+    import uuid
+
+    from sqlalchemy import select
+
+    from src.api.call_store import insert_call
+    from src.models.conversation import Conversation
+
+    tenant = await tenant_from_slug(tenant_slug)
+    tel = tenant.settings.pipeline.telephony
+    caller_id = (tel.outbound_from or {}).get("twilio") or tel.from_number
+    if not caller_id:
+        raise HTTPException(status_code=400, detail="tenant has no Twilio caller-ID configured")
+
+    if CallSid:
+        existing = (await session.execute(
+            select(Conversation).where(Conversation.provider_call_sid == CallSid)
+        )).scalar_one_or_none()
+        if existing is None:
+            row = await insert_call(
+                session, call_id=f"call_{uuid.uuid4().hex[:16]}", tenant=tenant,
+                provider_call_sid=CallSid, channel="softphone", agent_type="human")
+            row.notes = f"manual softphone call → {To}"
+            await session.commit()
+
+    base = _forwarded_base(request)
+    cb = f"{base}/twilio/softphone-recording/{tenant_slug}"
+    body = softphone_dial_twiml(to_number=To, caller_id=caller_id, recording_callback_url=cb)
+    log.info("twilio softphone twiml", extra={
+        "tenant": tenant.slug, "to": To, "from": From, "sid": CallSid})
+    return Response(content=body, media_type="application/xml")
+
+
+async def _download_twilio_recording(url: str, account_sid: str | None, auth_token: str | None) -> bytes:
+    """Fetch a Twilio recording as a WAV. Twilio recordings require account auth."""
+    wav_url = url if url.endswith(".wav") else f"{url}.wav"
+    auth = (account_sid, auth_token) if (account_sid and auth_token) else None
+    async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=10.0)) as c:
+        resp = await c.get(wav_url, auth=auth)
+        resp.raise_for_status()
+        return resp.content
+
+
+@router.post("/twilio/softphone-recording/{tenant_slug}", response_class=Response)
+async def twilio_softphone_recording(
+    tenant_slug: str,
+    request: Request,
+    CallSid: str | None = Form(None),
+    RecordingUrl: str | None = Form(None),
+    RecordingDuration: str | None = Form(None),
+    session: AsyncSession = Depends(get_db_session),
+) -> Response:
+    """Twilio recording-status callback → transcribe → analyze → outcome.
+
+    Produces the **same** structured outcome an AI call does: the dual-channel
+    recording is split (agent track + lead track), each transcribed with the
+    tenant's STT, then the same ``analyze_call`` runs and the result is persisted
+    via the same ``record_outcome`` keyed by CallSid.
+    """
+    from datetime import datetime, timezone
+
+    from src.analysis.manual_call import finalize_manual_call
+    from src.interfaces.stt import STTConfig
+    from src.pipeline.audio_utils import pcm16_to_wav, wav_split_stereo
+
+    tenant = await tenant_from_slug(tenant_slug)
+    if not (CallSid and RecordingUrl):
+        log.warning("twilio softphone recording missing CallSid/RecordingUrl")
+        return Response(status_code=200)
+    if _softphone_providers is None:
+        log.warning("softphone recording webhook hit but provider registry unset")
+        return Response(status_code=503)
+
+    tel = tenant.settings.pipeline.telephony
+    try:
+        wav = await _download_twilio_recording(
+            RecordingUrl, tenant.secret(tel.account_sid_env), tenant.secret(tel.auth_token_env))
+        left, right, sr = wav_split_stereo(wav)
+    except Exception:  # noqa: BLE001 — a fetch/parse failure must not 500 Twilio
+        log.exception("twilio softphone recording fetch/split failed", extra={"sid": CallSid})
+        return Response(status_code=200)
+
+    # Twilio dual-channel <Dial>: channel 1 = the parent (human agent) leg,
+    # channel 2 = the dialed lead. Map agent→assistant, lead→user.
+    channels = [("assistant", pcm16_to_wav(left, sr)), ("user", pcm16_to_wav(right, sr))]
+    stt = _softphone_providers.get_stt(tenant)
+    llm = _softphone_providers.get_llm(tenant)
+    stt_config = STTConfig(language=tenant.settings.pipeline.stt.language, sample_rate=sr)
+    dur_ms = int(float(RecordingDuration) * 1000) if RecordingDuration else None
+
+    row = await finalize_manual_call(
+        session, provider_call_sid=CallSid, channels=channels,
+        stt=stt, stt_config=stt_config, llm=llm,
+        tenant_timezone=tenant.settings.timezone,
+        now=datetime.now(timezone.utc), duration_ms=dur_ms, recording_url=RecordingUrl)
+    log.info("twilio softphone recording finalized", extra={
+        "tenant": tenant.slug, "sid": CallSid, "found": row is not None,
+        "outcome": getattr(row, "outcome", None)})
+    return Response(status_code=200)
 
 
 # --- Exotel webhook + WS ----------------------------------------------------

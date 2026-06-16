@@ -87,6 +87,32 @@ async def test_register_requires_admin(ctx) -> None:
     assert (await client.post("/tenants", json=_body())).status_code == 401
 
 
+async def test_register_softphone_keys_mint_browser_token(ctx) -> None:
+    """Registering Twilio softphone keys persists the *_env references and the
+    resolver decrypts them so a browser AccessToken can be minted end-to-end."""
+    import jwt
+
+    from src.providers.telephony.softphone import mint_browser_credentials
+
+    client, resolver, _ = ctx
+    body = _body(slug="acme")
+    body["telephony"]["keys"].update({
+        "api_key_sid": "SKxxx", "api_key_secret": "sk-secret", "twiml_app_sid": "APxxx",
+    })
+    resp = await client.post("/tenants", json=body, headers=ADMIN_HEADERS)
+    assert resp.status_code == 201
+    token = resp.json()["api_token"]
+
+    tctx = await resolver.resolve_by_token(hash_api_token(token))
+    tel = tctx.settings.pipeline.telephony
+    assert tel.api_key_sid_env and tel.api_key_secret_env and tel.twiml_app_sid_env
+
+    creds = mint_browser_credentials(tctx, "agent-1")
+    claims = jwt.decode(creds.token, options={"verify_signature": False})
+    assert claims["iss"] == "SKxxx"
+    assert claims["grants"]["voice"]["outgoing"]["application_sid"] == "APxxx"
+
+
 async def test_register_issued_token_resolves(ctx) -> None:
     client, resolver, _ = ctx
     token = (await client.post("/tenants", json=_body(), headers=ADMIN_HEADERS)).json()["api_token"]
@@ -179,24 +205,33 @@ async def test_tenant_analytics_and_billing(ctx) -> None:
             id="c3", tenant_id=tid, agent_type="voicebot", channel="webconsole", status="ended",
             outcome=None, pipeline_config={}, provider_call_sid="s3",
             cost=0.02, duration_ms=30_000))
+        # a manual (human softphone) call — must be counted under by_agent_type
+        s.add(Conversation(
+            id="c4", tenant_id=tid, agent_type="human", channel="softphone", status="ended",
+            outcome="callback_requested", pipeline_config={}, provider_call_sid="s4",
+            telephony_provider="twilio", cost=0.01, duration_ms=45_000))
         await s.commit()
 
     an = (await client.get(f"/tenants/{tid}/analytics", headers=ADMIN_HEADERS)).json()
-    assert an["total_calls"] == 3
-    assert an["by_status"]["ended"] == 3
+    assert an["total_calls"] == 4
+    assert an["by_status"]["ended"] == 4
     assert an["by_outcome"]["interested"] == 1
     assert an["by_outcome"]["no_outcome"] == 1            # null outcome counted
-    # both breakdowns total to total_calls (the bug: they used to mismatch)
+    # manual vs AI breakdown
+    assert an["by_agent_type"]["voicebot"] == 3
+    assert an["by_agent_type"]["human"] == 1
+    # all breakdowns total to total_calls (the bug: they used to mismatch)
     assert sum(an["by_status"].values()) == an["total_calls"]
     assert sum(an["by_outcome"].values()) == an["total_calls"]
-    assert an["total_duration_ms"] == 210_000
+    assert sum(an["by_agent_type"].values()) == an["total_calls"]
+    assert an["total_duration_ms"] == 255_000
 
     bill = (await client.get(f"/tenants/{tid}/billing", headers=ADMIN_HEADERS)).json()
-    assert bill["total_calls"] == 3
-    assert bill["platform_cost"] == pytest.approx(0.11)        # 0.06 + 0.03 + 0.02, telephony excluded
-    assert bill["billable_minutes"] == pytest.approx(3.5)
-    # tentative telephony: 0.10/min * (2 + 1) min = 0.30 (c3 has no telephony)
-    assert bill["tentative_telephony_cost"] == pytest.approx(0.30)
+    assert bill["total_calls"] == 4
+    assert bill["platform_cost"] == pytest.approx(0.12)        # 0.06 + 0.03 + 0.02 + 0.01, telephony excluded
+    assert bill["billable_minutes"] == pytest.approx(4.25)
+    # tentative telephony: 0.10/min * (2 + 1 + 0.75) min = 0.375 (c3 has no telephony)
+    assert bill["tentative_telephony_cost"] == pytest.approx(0.375)
 
 
 async def test_tenant_analytics_unknown_404(ctx) -> None:
