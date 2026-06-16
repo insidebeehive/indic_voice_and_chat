@@ -179,9 +179,11 @@
         current = new StringeeCall(client, identity, to);
         current.isPhoneCall = true;
         // Stringee does NOT forward `to` to our Answer URL for app-to-phone calls
-        // (it arrives empty, fromInternal=true) — so carry the destination in
-        // customData, which Stringee delivers to the Answer URL as `custom`.
-        current.customDataFromYourServer =
+        // (it arrives empty, fromInternal=true) — so carry the destination in the
+        // call's `custom` field, which the SDK puts in the makeCall request and
+        // Stringee delivers to the Answer URL as the `custom` param. (NOT
+        // `customDataFromYourServer` — that's server→client, set from the SCCO.)
+        current.custom =
           (params && params.customData) || JSON.stringify({ to: to });
         wire(current);
         em.emit("status", "calling");
