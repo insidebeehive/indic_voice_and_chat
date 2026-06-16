@@ -359,12 +359,15 @@ def build_s2s_system_instruction(
     if _gd:
         parts.append(_gd)
 
-    # Language: speak directly, so natural Hinglish is encouraged (the opposite of
-    # the cascade's Devanagari-only rule, which only existed for the Hindi TTS).
+    # Language: speak directly (Hinglish encouraged), and switch languages on
+    # request. Dynamic, like the cascade — a language change must NEVER end the call.
     parts.append(
-        f"Speak in {script.language_default}. Use natural, warm, conversational Hindi and "
-        "code-switch to English for brand, tech and common words (app, link, casino, bonus, "
-        "WhatsApp) exactly the way Indian speakers do. Match the customer's formality."
+        f"Language: start in {script.language_default} — warm, natural, conversational, "
+        "code-switching to English for brand/tech/common words (app, link, casino, bonus, "
+        "WhatsApp) the way Indian speakers do. If the customer speaks in — or asks for — "
+        "another language (e.g. Marathi, Telugu, Tamil), simply SWITCH to that language and "
+        "keep the conversation going in it (switch again if they change). A language change is "
+        "NEVER a reason to end the call. Match the customer's formality."
     )
 
     parts.append(
@@ -422,8 +425,9 @@ def build_s2s_system_instruction(
         "Whenever you decide a next step or learn something about the customer, CALL the "
         "record_turn_signal function with `action` (one of continue, clarify, transfer, "
         "schedule_callback, send_info, close_positive, close_negative, end) and any "
-        "`updated_slots` you learned. Use close_positive/close_negative/end only when the "
-        "call is genuinely over; schedule_callback only once you have a specific day and time."
+        "`updated_slots` you learned. Use close_positive/close_negative/end ONLY when the "
+        "call is genuinely over — a request to change language is a `continue`, never an end. "
+        "schedule_callback only once you have a specific day and time."
     )
     return "\n\n".join(parts)
 
