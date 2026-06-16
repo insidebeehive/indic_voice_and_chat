@@ -29,6 +29,12 @@
 })(typeof self !== "undefined" ? self : this, function () {
   "use strict";
 
+  // The global object, captured inside the factory (the outer IIFE's `root`
+  // param is not in this scope). Provider SDKs register their globals here.
+  const glob = (typeof window !== "undefined") ? window
+    : (typeof self !== "undefined") ? self
+    : (typeof globalThis !== "undefined") ? globalThis : this;
+
   function loadScript(url) {
     return new Promise(function (resolve, reject) {
       if (!url) return reject(new Error("no SDK url provided and SDK global not found"));
@@ -84,10 +90,10 @@
 
   // --- Twilio ---------------------------------------------------------------
   async function buildTwilio(tok, opts, em) {
-    let Device = (root.Twilio && root.Twilio.Device) || (root.Device);
+    let Device = (glob.Twilio && glob.Twilio.Device) || (glob.Device);
     if (!Device) {
       await loadScript(opts.twilioSdkUrl);
-      Device = (root.Twilio && root.Twilio.Device) || root.Device;
+      Device = (glob.Twilio && glob.Twilio.Device) || glob.Device;
     }
     if (!Device) throw new Error("Twilio Voice SDK not found (set opts.twilioSdkUrl)");
 
@@ -128,10 +134,10 @@
   };
 
   async function buildStringee(tok, opts, em) {
-    if (!root.StringeeClient || !root.StringeeCall) {
+    if (!glob.StringeeClient || !glob.StringeeCall) {
       await loadScript(opts.stringeeSdkUrl);
     }
-    const StringeeClient = root.StringeeClient, StringeeCall = root.StringeeCall;
+    const StringeeClient = glob.StringeeClient, StringeeCall = glob.StringeeCall;
     if (!StringeeClient || !StringeeCall) {
       throw new Error("Stringee Web SDK not found (set opts.stringeeSdkUrl)");
     }
