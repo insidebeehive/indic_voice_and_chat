@@ -123,6 +123,9 @@ class _PerTenantRegistry:
     def evict(self, tenant_id: str) -> None:
         self._items.pop(tenant_id, None)
 
+    def clear(self) -> None:
+        self._items.clear()
+
     def items(self) -> dict[str, Any]:
         return dict(self._items)
 
@@ -141,13 +144,23 @@ class TenantRuntimeRegistry:
     session_stores: _PerTenantRegistry
     crms: _PerTenantRegistry
 
-    def evict_tenant(self, tenant_id: str) -> None:
-        self.providers.evict(tenant_id)
-        for reg in (
+    def _subregistries(self) -> tuple:
+        return (
             self.retrievers, self.dnd, self.schedulers, self.webhooks,
             self.chat_channels, self.session_stores, self.crms,
-        ):
+        )
+
+    def evict_tenant(self, tenant_id: str) -> None:
+        self.providers.evict(tenant_id)
+        for reg in self._subregistries():
             reg.evict(tenant_id)
+
+    def evict_all(self) -> None:
+        """Drop every cached per-tenant instance (providers + sub-registries) —
+        wired to the resolver's on_reload so a config/key update is picked up."""
+        self.providers.evict(None)
+        for reg in self._subregistries():
+            reg.clear()
 
 
 def make_per_tenant_registry(factory: Callable[[TenantContext], Any]) -> _PerTenantRegistry:

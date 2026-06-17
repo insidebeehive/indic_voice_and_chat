@@ -98,6 +98,73 @@ def build_provider_registry(
     )
 
 
+@dataclass
+class TenantDnd:
+    """A tenant's DND filter + calling-hours policy, built together (the scheduler
+    and the per-tenant compliance gate consume both)."""
+    filter: object   # DNDFilter
+    hours: object    # CallingHoursPolicy
+
+
+def build_runtime_registry(providers: TenantProviders, base_session_store: SessionStore):
+    """Instantiate the per-tenant ``TenantRuntimeRegistry`` (previously dead code):
+    one lazily-built instance per tenant for DND, scheduler, retriever, session
+    store, chat channel, CRM, webhooks. Real impls where they exist
+    (dnd/scheduler/retriever/session_store); honest stubs where only a ``fake``
+    exists (crm/chat); inert ``WebhookManager`` for webhooks (the live outbound
+    path is ``tenant_events``). Reuses the shared ``providers`` cache."""
+    from src.auth.registry import TenantRuntimeRegistry, _PerTenantRegistry
+    from src.campaign.dnd_filter import CallingHoursPolicy, DNDFilter, InMemoryDNDStore
+    from src.campaign.scheduler import CallScheduler, RateLimitConfig, RetryConfig
+    from src.integration.crm_client import FakeChatChannel, FakeCRMClient
+    from src.integration.webhooks import WebhookManager
+    from src.rag.embeddings import HashEmbedder
+    from src.rag.retriever import HybridRetriever, RetrievalConfig
+
+    def _dnd(tenant: TenantContext) -> TenantDnd:
+        c = getattr(tenant.settings, "compliance", None)
+        enabled = getattr(c, "dnd_check_enabled", None)
+        return TenantDnd(
+            filter=DNDFilter(InMemoryDNDStore(), enabled=True if enabled is None else enabled),
+            hours=CallingHoursPolicy(
+                start=getattr(c, "calling_hours_start", None) or "10:00",
+                end=getattr(c, "calling_hours_end", None) or "19:00"))
+
+    dnd_reg = _PerTenantRegistry(_dnd)
+
+    def _scheduler(tenant: TenantContext) -> CallScheduler:
+        d = dnd_reg.get(tenant)
+        c = getattr(tenant.settings, "compliance", None)
+        return CallScheduler(
+            hours=d.hours, dnd_filter=d.filter,
+            retry=RetryConfig(
+                max_retry_attempts=getattr(c, "max_retry_attempts", None) or 3,
+                retry_interval_hours=getattr(c, "retry_interval_hours", None) or 2),
+            rate_limit=RateLimitConfig(
+                max_concurrent_calls=tenant.settings.max_concurrent_calls or 10))
+
+    def _retriever(tenant: TenantContext) -> HybridRetriever:
+        return HybridRetriever(
+            embedder=HashEmbedder(),
+            vector_store=providers.get_vector_store(tenant),
+            config=RetrievalConfig())
+
+    def _session_store(tenant: TenantContext) -> SessionStore:
+        return SessionStore(redis=base_session_store.redis,
+                            ttl_seconds=base_session_store.ttl, tenant_id=tenant.id)
+
+    return TenantRuntimeRegistry(
+        providers=providers,
+        retrievers=_PerTenantRegistry(_retriever),
+        dnd=dnd_reg,
+        schedulers=_PerTenantRegistry(_scheduler),
+        webhooks=_PerTenantRegistry(lambda t: WebhookManager()),
+        chat_channels=_PerTenantRegistry(lambda t: FakeChatChannel()),
+        session_stores=_PerTenantRegistry(_session_store),
+        crms=_PerTenantRegistry(lambda t: FakeCRMClient()),
+    )
+
+
 # --- The bridge factory ------------------------------------------------
 
 
