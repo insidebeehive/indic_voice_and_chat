@@ -34,6 +34,23 @@ def active_campaign_slug() -> str:
     return os.environ.get("VOX_CAMPAIGN", DEFAULT_CAMPAIGN_SLUG)
 
 
+def parse_campaign_data(data: dict) -> LoadedCampaign:
+    """Parse a campaign dict (with or without the top-level ``campaign:`` wrapper)
+    into a script + slot schema. Shared by the YAML file loader and the DB-backed
+    per-tenant resolver, so both interpret a campaign identically."""
+    camp = data.get("campaign", data)  # tolerate with/without the wrapper
+    merged = {**(camp.get("agent") or {}), **(camp.get("script") or {})}
+    return LoadedCampaign(
+        VoiceBotScript.from_campaign_yaml(merged),
+        SlotSchema.from_campaign_yaml(camp.get("slots") or {}),
+    )
+
+
+def parse_campaign_yaml(text: str) -> LoadedCampaign:
+    """Parse a campaign YAML string (e.g. a DB ``campaigns.config_yaml``)."""
+    return parse_campaign_data(yaml.safe_load(text) or {})
+
+
 def load_campaign(
     slug: str, campaigns_dir: Path = DEFAULT_CAMPAIGNS_DIR
 ) -> LoadedCampaign:
@@ -51,8 +68,4 @@ def load_campaign(
 
     with path.open() as f:
         data = yaml.safe_load(f) or {}
-    camp = data.get("campaign", data)  # tolerate with/without the wrapper
-    merged = {**(camp.get("agent") or {}), **(camp.get("script") or {})}
-    script = VoiceBotScript.from_campaign_yaml(merged)
-    slots = SlotSchema.from_campaign_yaml(camp.get("slots") or {})
-    return LoadedCampaign(script, slots)
+    return parse_campaign_data(data)

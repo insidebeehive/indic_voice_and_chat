@@ -22,6 +22,7 @@ from sqlalchemy import select
 from src.auth import secrets as crypto
 from src.auth.context import hash_api_token
 from src.config_tenant import _resolve_dir, discover_tenant_slugs, load_tenant
+from src.models.campaign import Campaign
 from src.models.tenant import (
     ProviderCost,
     Tenant,
@@ -90,6 +91,45 @@ async def seed_if_empty(sessionmaker, tenant_dir=None) -> int:
         if (await session.execute(select(Tenant.id).limit(1))).first() is not None:
             return 0
         return await seed_tenants_from_yaml(session, tenant_dir)
+
+
+async def seed_campaigns_if_empty(sessionmaker, campaigns_dir=None) -> int:
+    """Give every tenant a DB campaign migrated from the global ``VOX_CAMPAIGN``
+    file, when they have none. Campaigns then diverge per-tenant via the
+    ``/campaigns`` API. Idempotent (skips a tenant that already has a campaign).
+
+    This backs the no-global-fallback resolution: every tenant needs a row, so
+    the live call never falls back to a shared/global script.
+    """
+    from src.dialogue.campaign_loader import DEFAULT_CAMPAIGNS_DIR, active_campaign_slug
+
+    base = campaigns_dir or DEFAULT_CAMPAIGNS_DIR
+    slug = active_campaign_slug()
+    path = base / f"{slug}.yaml"
+    if not path.exists():
+        log.warning("campaign seed: %s not found; skipping", path)
+        return 0
+    raw = path.read_text()
+    data = yaml.safe_load(raw) or {}
+    camp = data.get("campaign", data)
+    name = camp.get("name") or (camp.get("agent") or {}).get("company") or slug
+
+    seeded = 0
+    async with sessionmaker() as session:
+        tenant_ids = (await session.execute(select(Tenant.id))).scalars().all()
+        for tid in tenant_ids:
+            existing = (await session.execute(
+                select(Campaign.id).where(Campaign.tenant_id == tid).limit(1))).first()
+            if existing is not None:
+                continue
+            session.add(Campaign(
+                id=f"camp_{tid}_default", tenant_id=tid, name=str(name),
+                status="active", config_yaml=raw))
+            seeded += 1
+        await session.commit()
+    if seeded:
+        log.info("seeded default campaigns", extra={"count": seeded})
+    return seeded
 
 
 async def seed_provider_costs(sessionmaker, path: Path = _PROVIDER_COSTS_YAML) -> int:

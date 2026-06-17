@@ -59,7 +59,7 @@ from src.api.call_store import (
 from src.integration.tenant_events import deliver as deliver_tenant_event
 from src.auth.db_resolver import DbTenantResolver
 from src.auth.middleware import set_admin_tokens, set_tenant_resolver
-from src.auth.seed import seed_if_empty, seed_provider_costs
+from src.auth.seed import seed_campaigns_if_empty, seed_if_empty, seed_provider_costs
 from src.bootstrap import (
     build_provider_registry,
     make_bridge_factory,
@@ -69,6 +69,7 @@ from src.bootstrap import (
 from src.config import Settings, get_settings
 from src.config_tenant import TenantSettings
 from src.dialogue.campaign_loader import active_campaign_slug, load_campaign
+from src.dialogue.campaign_resolver import DbCampaignResolver
 from src.dialogue.context import SessionStore
 from src.models.database import dispose_engine, ensure_schema, get_engine, get_sessionmaker
 from src.utils.logging import configure_logging, get_logger
@@ -136,6 +137,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     if seeded:
         log.info("seeded tenants from YAML into DB", extra={"count": seeded})
     await seed_provider_costs(sessionmaker)
+    seeded_campaigns = await seed_campaigns_if_empty(sessionmaker)
+    if seeded_campaigns:
+        log.info("seeded default campaigns from VOX_CAMPAIGN", extra={"count": seeded_campaigns})
     resolver = DbTenantResolver(sessionmaker)
     await resolver.reload()
     set_tenant_resolver(resolver)
@@ -215,15 +219,20 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             providers=providers, script=campaign.script, slots=campaign.slots,
         )
     )
+    # Per-tenant campaign resolution: the dev-console bridges resolve the agent's
+    # script + slots per call STRICTLY from the tenant's DB campaign (campaigns
+    # table) — no global fallback. Every tenant is seeded one above, so the call
+    # never runs a shared/global script.
+    campaign_resolver = DbCampaignResolver(sessionmaker)
     if dev_console_enabled():
         set_browser_bridge_factory(
             make_browser_bridge_factory(
-                providers=providers, script=campaign.script, slots=campaign.slots,
+                providers=providers, campaign_resolver=campaign_resolver,
             )
         )
         set_live_bridge_factory(
             make_live_bridge_factory(
-                providers=providers, script=campaign.script, slots=campaign.slots,
+                providers=providers, campaign_resolver=campaign_resolver,
             )
         )
         log.info("dev console enabled at /dev/voice")
