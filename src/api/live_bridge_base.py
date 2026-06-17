@@ -41,8 +41,26 @@ RECORD_TURN_SIGNAL = RealtimeTool(
 )
 
 
+# Kickoff that makes the agent greet first (dev console). Sent as a turn-based
+# message (send_client_content under the hood), which keeps the realtime audio /
+# VAD path clean — a realtime-input text kickoff disrupts VAD so caller audio
+# never endpoints (see GeminiLiveSession.send_text). Greeting first warms the
+# Live session so the caller's first reply gets an instant response instead of
+# hitting a cold turn-1 (the "first hello lag").
+_GREETING_KICKOFF = (
+    "[The call has just connected and the caller is on the line. Begin now: "
+    "greet the caller with your opening line and introduce yourself, then stop "
+    "and wait for their reply.]"
+)
+
+
 class _BaseLiveBridge:
     """Drive a Live session for one call. Subclass and implement the transport."""
+
+    # Whether the agent opens the call (greets first). The dev console sets this
+    # so the model speaks immediately; telephony leaves it False (on a real call
+    # the callee says "hello" first).
+    _greets_first = False
 
     def __init__(self, *, agent, config: RealtimeConfig, connect_session,
                  llm=None, tenant_timezone: str = "Asia/Kolkata") -> None:
@@ -78,6 +96,7 @@ class _BaseLiveBridge:
             self._session = await self._connect_session(self._config)
             events_task = asyncio.create_task(self._consume_events())
             await self._emit_status("listening")
+            await self._maybe_greet()
             await self._inbound_loop()
         except Exception:  # noqa: BLE001 - never crash the socket handler
             log.exception("live bridge crashed")
@@ -116,6 +135,17 @@ class _BaseLiveBridge:
                 await self._agent.handle_hangup()
             except Exception:  # noqa: BLE001
                 log.exception("agent hangup failed on teardown")
+
+    async def _maybe_greet(self) -> None:
+        """If this transport has the agent greet first, send the kickoff so the
+        model opens the call immediately (and the session is warm by the time the
+        caller replies). No-op for transports where the caller speaks first."""
+        if not self._greets_first or self._session is None:
+            return
+        try:
+            await self._session.send_text(_GREETING_KICKOFF)
+        except Exception:  # noqa: BLE001 - a failed kickoff must not break the call
+            log.exception("greeting kickoff failed; continuing without it")
 
     # --- model event handling (shared) ----------------------------------
     async def _consume_events(self) -> None:

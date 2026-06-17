@@ -29,13 +29,14 @@ class _FakeSession:
     def __init__(self, events):
         self._events = events
         self.tool_responses = []
+        self.sent_text = []
         self.closed = False
 
     async def send_audio(self, p):
         pass
 
     async def send_text(self, t):
-        pass
+        self.sent_text.append(t)
 
     async def events(self):
         for e in self._events:
@@ -119,6 +120,23 @@ async def test_close_action_ends_call():
     await b._consume_events()
     assert agent.state.state is State.ENDED
     assert b._stopped is True
+
+
+@pytest.mark.asyncio
+async def test_browser_bridge_greets_first_kickoff():
+    # The browser console has the agent greet first: a kickoff turn triggers the
+    # opening (so the model speaks immediately) and warms the session, so the
+    # caller's first reply gets an instant reply (no cold-start lag on turn 1).
+    b, sess, agent = _bridge([])
+    assert b._greets_first is True
+    await b._maybe_greet()
+    assert sess.sent_text and sess.sent_text[0].strip()   # a kickoff was sent
+
+
+def test_telephony_bridge_does_not_greet_first():
+    # Telephony keeps "caller says hello first" — no kickoff.
+    from src.api.telephony_live_bridge import TelephonyLiveBridge
+    assert TelephonyLiveBridge._greets_first is False
 
 
 @pytest.mark.asyncio
