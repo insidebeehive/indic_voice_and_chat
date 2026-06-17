@@ -33,8 +33,8 @@
     <label><input type="checkbox" id="bargeIn" /> Allow interruptions (experimental)</label>
     <label>Mode
       <select id="mode">
+        <option value="s2s" selected>S2S (Gemini Live)</option>
         <option value="layered">Layered (cascade)</option>
-        <option value="s2s">S2S (Gemini Live)</option>
       </select>
     </label>
     <label>Voice
@@ -326,14 +326,20 @@ syncTelephonyUI();
 // Voice dropdown is per-mode: layered shows the configured TTS provider's voice
 // roster, s2s shows the realtime allowed voices. Fetched so it tracks config.
 let _voiceData = { layered: { voices: [], default: "" }, s2s: { voices: [], default: "" } };
+// Console dropdown default voice per mode (UI only — overrides the config-derived
+// default for the selector; falls back to the server default if the preferred
+// voice isn't in the roster). Does NOT change the tenant's configured voice.
+const _preferredVoice = { s2s: "Leda", layered: "arya" };
 function populateVoices(mode) {
   const d = _voiceData[mode] || { voices: [], default: "" };
+  const preferred = _preferredVoice[mode];
+  const def = d.voices.includes(preferred) ? preferred : d.default;
   const sel = $("voice");
   sel.innerHTML = "";
   for (const v of d.voices) {
     const o = document.createElement("option");
     o.value = v; o.textContent = v;
-    if (v === d.default) o.selected = true;
+    if (v === def) o.selected = true;
     sel.appendChild(o);
   }
 }
