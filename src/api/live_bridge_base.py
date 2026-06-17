@@ -151,8 +151,21 @@ class _BaseLiveBridge:
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001 - a model/stream error ends the call, not crash
-            log.exception("live event stream ended")
-            self._stopped = True
+            log.exception("live event stream ended (error)")
+        finally:
+            # The event stream has ended (clean close, error, or teardown cancel).
+            # If we got here while the call is still live, the upstream Live socket
+            # dropped on us (the preview native-audio model intermittently closes
+            # mid-call — connect() already retries the *open* for this reason).
+            # Nothing else would notice: the inbound loop keeps feeding audio to a
+            # dead session and the caller sits in "listening" with no reply forever.
+            # Signal stop so the bridge tears down cleanly and still emits an
+            # outcome. (Already-stopped → a normal end; no warning.)
+            if not self._stopped:
+                if not getattr(self._agent.state, "is_terminal", False):
+                    log.warning("live event stream ended while call active "
+                                "(upstream session closed?) — stopping bridge")
+                self._stopped = True
 
     async def _commit_turn(self) -> None:
         """Record the completed turn (transcript + slots) and advance state."""
@@ -176,6 +189,12 @@ class _BaseLiveBridge:
                 "user_chars": len(user), "agent_chars": len(agent), "action": action,
                 "user": user[:120], "agent": agent[:120]})
             self._last_action = action
+        else:
+            # turn_complete with nothing transcribed/spoken: the model produced no
+            # response this turn (e.g. it went silent after a language switch). We
+            # stay in listening; log it so a recurring pattern is visible rather
+            # than a silent "stuck in listening".
+            log.info("live turn completed with no response (model silent)")
         self._user_buf = ""
         self._agent_buf = ""
         self._pending_action = None

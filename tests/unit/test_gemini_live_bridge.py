@@ -122,6 +122,37 @@ async def test_close_action_ends_call():
 
 
 @pytest.mark.asyncio
+async def test_session_close_midcall_signals_stop():
+    # A normal (non-terminal) turn, then the Live event stream ends because the
+    # upstream socket dropped (the preview native-audio model does this). The
+    # bridge must signal stop so it tears down + emits an outcome instead of
+    # leaving the caller stuck in "listening" feeding a dead session forever.
+    events = [
+        RealtimeEvent(type="output_transcript", text="haan jee, boliye"),
+        RealtimeEvent(type="turn_complete"),
+        # stream ends here with no terminal action — the socket dropped.
+    ]
+    b, sess, agent = _bridge(events)
+    await agent.start()
+    await b._consume_events()
+    assert agent.state.state is State.LISTENING   # the call never reached a terminal action
+    assert b._stopped is True                      # ...but stop was signalled so teardown runs
+
+
+@pytest.mark.asyncio
+async def test_empty_turn_stays_in_listening():
+    # The model emitted a turn with no transcript/audio (it went silent — the
+    # post-language-switch failure mode). The bridge must stay in listening and
+    # not advance the state machine or crash.
+    events = [RealtimeEvent(type="turn_complete")]
+    b, sess, agent = _bridge(events)
+    await agent.start()
+    await b._consume_events()
+    assert agent.state.state is State.LISTENING
+    assert any(m.get("status") == "listening" for m in b._ws.sent_json)
+
+
+@pytest.mark.asyncio
 async def test_greeting_turn_with_no_user_text():
     # The kickoff greeting produces an agent turn with no user transcript.
     events = [

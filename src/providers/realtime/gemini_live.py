@@ -50,6 +50,20 @@ def _to_tool(types, tool: RealtimeTool):
         name=tool.name, description=tool.description, parameters=_schema(types, tool.parameters))])
 
 
+def _build_activity_detection(types):
+    """Caller-speech (VAD) detection tuned so a short opening utterance is caught
+    quickly. With the server defaults, a brief first "hello" was slow to register
+    — callers had to repeat it before the model engaged. HIGH start sensitivity
+    detects speech onset readily; a little prefix padding keeps the first phoneme
+    from being clipped. End-of-speech is left at the server default so natural
+    mid-sentence pauses don't endpoint early (the cascade hit that with too-eager
+    endpointing — see stt_streaming.endpointing in the tenant config)."""
+    return types.AutomaticActivityDetection(
+        start_of_speech_sensitivity=types.StartSensitivity.START_SENSITIVITY_HIGH,
+        prefix_padding_ms=200,
+    )
+
+
 def _build_speech_config(types, language_code, voice):
     """Speech config for the Live session. ``language_code`` is set ONLY when
     provided: native-audio Live models (e.g. gemini-3.1-flash-live) auto-detect
@@ -89,7 +103,7 @@ class GeminiLiveSession(IRealtimeSession):
             # caller speech interrupts the agent (native barge-in), and a turn is
             # just the detected speech (not the surrounding silence).
             realtime_input_config=types.RealtimeInputConfig(
-                automatic_activity_detection=types.AutomaticActivityDetection(),
+                automatic_activity_detection=_build_activity_detection(types),
                 activity_handling=types.ActivityHandling.START_OF_ACTIVITY_INTERRUPTS,
                 turn_coverage=types.TurnCoverage.TURN_INCLUDES_ONLY_ACTIVITY,
             ),

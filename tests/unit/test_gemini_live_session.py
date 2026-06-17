@@ -82,6 +82,19 @@ def test_speech_config_omits_language_code_when_unset():
     assert sc2.language_code == "hi-IN"                     # honored when given
 
 
+def test_activity_detection_tuned_for_quick_first_utterance():
+    # The default VAD was sluggish to detect a short opening "hello" (callers had
+    # to repeat it). Start-of-speech sensitivity must be HIGH so onset is caught
+    # promptly, with a little prefix padding so the first phoneme isn't clipped.
+    from google.genai import types
+
+    from src.providers.realtime.gemini_live import _build_activity_detection
+
+    ad = _build_activity_detection(types)
+    assert ad.start_of_speech_sensitivity == types.StartSensitivity.START_SENSITIVITY_HIGH
+    assert ad.prefix_padding_ms and ad.prefix_padding_ms > 0
+
+
 def test_to_tool_builds_function_declaration():
     from google.genai import types
     tool = _to_tool(types, RealtimeTool(
