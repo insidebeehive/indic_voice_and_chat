@@ -47,10 +47,15 @@ RECORD_TURN_SIGNAL = RealtimeTool(
 # never endpoints (see GeminiLiveSession.send_text). Greeting first warms the
 # Live session so the caller's first reply gets an instant response instead of
 # hitting a cold turn-1 (the "first hello lag").
+#
+# The opening is kept SHORT (one line) on purpose — script-independent — so a
+# caller who prefers another language can interject right away and the call
+# continues in their language from turn 1, without a "which language?" menu.
 _GREETING_KICKOFF = (
-    "[The call has just connected and the caller is on the line. Begin now: "
-    "greet the caller with your opening line and introduce yourself, then stop "
-    "and wait for their reply.]"
+    "[The call has just connected and the caller is on the line. Begin now: open "
+    "with your opening line, but keep it to ONE short, warm sentence — then STOP "
+    "and wait for the caller to reply. Keep it brief so they respond quickly, and "
+    "continue the whole call in whatever language they use in their reply.]"
 )
 
 

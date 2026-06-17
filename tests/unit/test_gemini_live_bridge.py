@@ -133,6 +133,17 @@ async def test_browser_bridge_greets_first_kickoff():
     assert sess.sent_text and sess.sent_text[0].strip()   # a kickoff was sent
 
 
+def test_greeting_kickoff_is_short_and_language_adaptive():
+    # The opening must be a SHORT greeting so a non-default-language caller can
+    # interject quickly and the agent continues in whatever language they reply
+    # in (script-independent — works for every campaign). No language menu.
+    from src.api.live_bridge_base import _GREETING_KICKOFF
+    k = _GREETING_KICKOFF.lower()
+    assert "short" in k                  # keep the opening brief
+    assert "language" in k               # match the caller's language from their reply
+    assert "wait" in k                   # then hand over to the caller
+
+
 def test_telephony_bridge_does_not_greet_first():
     # Telephony keeps "caller says hello first" — no kickoff.
     from src.api.telephony_live_bridge import TelephonyLiveBridge
