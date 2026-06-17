@@ -130,7 +130,7 @@ async def test_handle_turn_agent_raises_returns_reprompt_scco():
     assert scco[1]["action"] == "recordMessage"
 
 
-def test_make_stringee_bridge_factory_builds_a_bridge():
+async def test_make_stringee_bridge_factory_builds_a_bridge():
     from types import SimpleNamespace
 
     from src.bootstrap import make_stringee_bridge_factory
@@ -157,6 +157,6 @@ def test_make_stringee_bridge_factory_builds_a_bridge():
         providers=_Providers(), script=script, slots=SlotSchema(),
     )
     async def _fetch(url): return b""
-    bridge = factory(call_id="c-9", tenant=tenant,
-                     base_url="https://h/api/v1/telephony/stringee", fetch=_fetch)
+    bridge = await factory(call_id="c-9", tenant=tenant,
+                           base_url="https://h/api/v1/telephony/stringee", fetch=_fetch)
     assert bridge.call_id == "c-9"

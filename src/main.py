@@ -207,28 +207,29 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         extra={"slug": active_campaign_slug(), "agent": campaign.script.agent_name,
                "slots": list(campaign.slots.specs.keys())},
     )
+    # Per-tenant campaign resolution: EVERY bridge (telephony + dev console)
+    # resolves this call's script + slots from the tenant's DB campaign
+    # (?campaign=<id> on the media-stream URL, else the tenant's active campaign)
+    # — no global fallback. Every tenant is seeded a campaign on boot, so a call
+    # never runs a shared/global script.
+    campaign_resolver = DbCampaignResolver(sessionmaker)
     telephony_hooks.set_bridge_factory(
         make_bridge_factory(
             providers=providers, session_store=base_session_store,
-            script=campaign.script, slots=campaign.slots,
+            campaign_resolver=campaign_resolver,
         )
     )
     telephony_hooks.set_exotel_bridge_factory(
         make_exotel_bridge_factory(
             providers=providers, session_store=base_session_store,
-            script=campaign.script, slots=campaign.slots,
+            campaign_resolver=campaign_resolver,
         )
     )
     telephony_hooks.set_stringee_bridge_factory(
         make_stringee_bridge_factory(
-            providers=providers, script=campaign.script, slots=campaign.slots,
+            providers=providers, campaign_resolver=campaign_resolver,
         )
     )
-    # Per-tenant campaign resolution: the dev-console bridges resolve the agent's
-    # script + slots per call STRICTLY from the tenant's DB campaign (campaigns
-    # table) — no global fallback. Every tenant is seeded one above, so the call
-    # never runs a shared/global script.
-    campaign_resolver = DbCampaignResolver(sessionmaker)
     if dev_console_enabled():
         set_browser_bridge_factory(
             make_browser_bridge_factory(
