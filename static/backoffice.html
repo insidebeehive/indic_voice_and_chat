@@ -63,9 +63,11 @@
     <div class="tabs">
       <div class="tab active" id="tab_an" onclick="showTab('an')">Analytics</div>
       <div class="tab" id="tab_bill" onclick="showTab('bill')">Billing</div>
+      <div class="tab" id="tab_tel" onclick="showTab('tel')">Telephony</div>
     </div>
     <div id="pane_an"></div>
     <div id="pane_bill" hidden></div>
+    <div id="pane_tel" hidden></div>
   </div>
 </div>
 
@@ -96,6 +98,17 @@ async function api(path) {
   } catch (e) { return { ok: false, status: 0, json: { error: String(e) } }; }
 }
 
+async function apiSend(method, path, body) {
+  const headers = { "Content-Type": "application/json" };
+  const t = $("adminToken").value.trim();
+  if (t) headers["Authorization"] = "Bearer " + t;
+  try {
+    const res = await fetch(base() + path, { method, headers, body: JSON.stringify(body) });
+    const json = await res.json().catch(() => ({}));
+    return { ok: res.ok, status: res.status, json };
+  } catch (e) { return { ok: false, status: 0, json: { error: String(e) } }; }
+}
+
 const lay = (l) => l && l.provider ? `${l.provider}${l.model ? " · " + l.model : ""}` : "—";
 let SELECTED = null;
 
@@ -103,6 +116,8 @@ async function loadTenants() {
   const r = await api("/api/v1/tenants");
   if (!r.ok) { $("tlist").innerHTML = `<span class="hint">Could not load (${r.status}). Check the admin token.</span>`; return; }
   const ts = r.json.tenants || [];
+  window.TENANTS = {};
+  ts.forEach(t => { window.TENANTS[t.tenant_id] = t; });
   if (!ts.length) { $("tlist").innerHTML = `<span class="hint">No tenants yet — register one on <a href="/admin">/admin</a>.</span>`; return; }
   $("tlist").innerHTML = `<table><thead><tr>
       <th>slug</th><th>name</th><th>mode</th><th>LLM</th><th>STT</th><th>TTS</th>
@@ -124,12 +139,13 @@ async function selectTenant(id, slug) {
   showTab("an");
   await loadAnalytics(id);
   await loadBilling(id);
+  loadTelephony(id);
 }
 function showTab(which) {
-  $("tab_an").classList.toggle("active", which === "an");
-  $("tab_bill").classList.toggle("active", which === "bill");
-  $("pane_an").hidden = which !== "an";
-  $("pane_bill").hidden = which !== "bill";
+  for (const k of ["an", "bill", "tel"]) {
+    $("tab_" + k).classList.toggle("active", which === k);
+    $("pane_" + k).hidden = which !== k;
+  }
 }
 
 function statBox(k, v, cls) { return `<div class="stat ${cls || ""}"><div class="v">${v}</div><div class="k">${k}</div></div>`; }
@@ -166,6 +182,63 @@ async function loadBilling(id) {
     </div>
     <div class="hint" style="margin-top:.6rem;">Platform cost = STT/LLM/TTS or S2S (what we bill). Telephony runs on the
       tenant's own provider key, so it's shown as a tentative figure and is <b>not</b> in the platform cost.</div>`;
+}
+
+function loadTelephony(id) {
+  const t = (window.TENANTS || {})[id] || {};
+  $("pane_tel").innerHTML = `
+    <div class="hint" style="margin-bottom:.6rem;">Update this tenant's telephony config + credentials.
+      Credential values are <b>encrypted at rest</b> and write-only — leave a field blank to keep the
+      existing value. PATCHes <code>/api/v1/tenants/${id}</code>; the live resolver refreshes immediately.</div>
+    <div class="creds" style="gap:.6rem;">
+      <label>provider <input id="te_provider" value="${t.telephony_provider || ""}" placeholder="stringee | twilio | exotel" /></label>
+      <label>from_number <input id="te_from" placeholder="+91… / 91… (blank = keep)" /></label>
+      <label>webhook_base_url <input id="te_webhook" style="width:22rem" placeholder="https://…/api/v1/telephony (blank = keep)" /></label>
+    </div>
+    <h2 style="margin-top:.9rem;">Credentials <small class="hint">(blank = keep existing)</small></h2>
+    <div class="creds" style="gap:.6rem;">
+      <label>account_sid <input id="te_sid" placeholder="Twilio SID / Stringee API Key SID" /></label>
+      <label>auth_token <input id="te_tok" type="password" placeholder="Twilio token / Stringee API Key Secret" /></label>
+    </div>
+    <div class="creds" style="gap:.6rem;margin-top:.4rem;">
+      <label>api_key_sid <small class="hint">(Twilio softphone)</small> <input id="te_apisid" placeholder="SK…" /></label>
+      <label>api_key_secret <input id="te_apisecret" type="password" placeholder="…" /></label>
+      <label>twiml_app_sid <input id="te_twiml" placeholder="AP…" /></label>
+    </div>
+    <h2 style="margin-top:.9rem;">Outbound events webhook</h2>
+    <div class="creds" style="gap:.6rem;">
+      <label>events_webhook_url <input id="te_ewurl" style="width:22rem" placeholder="https://crm…/events (blank = keep)" /></label>
+      <label>events_webhook_secret_env <input id="te_ewsecret" placeholder="ENV_VAR_NAME (blank = keep)" /></label>
+    </div>
+    <div style="margin-top:.9rem;">
+      <button onclick="saveTelephony('${id}')">Save telephony</button>
+      <span id="te_result" class="hint" style="margin-left:.6rem;"></span>
+    </div>`;
+}
+
+async function saveTelephony(id) {
+  const v = (x) => ($(x).value || "").trim();
+  const tel = {};
+  if (v("te_provider")) tel.provider = v("te_provider");
+  if (v("te_from")) tel.from_number = v("te_from");
+  if (v("te_webhook")) tel.webhook_base_url = v("te_webhook");
+  if (v("te_ewurl")) tel.events_webhook_url = v("te_ewurl");
+  if (v("te_ewsecret")) tel.events_webhook_secret_env = v("te_ewsecret");
+  const keys = {};
+  for (const [field, el] of [["account_sid", "te_sid"], ["auth_token", "te_tok"],
+       ["api_key_sid", "te_apisid"], ["api_key_secret", "te_apisecret"], ["twiml_app_sid", "te_twiml"]])
+    if (v(el)) keys[field] = v(el);
+  if (Object.keys(keys).length) tel.keys = keys;
+  if (!Object.keys(tel).length) { $("te_result").textContent = "nothing to update"; return; }
+  $("te_result").textContent = "saving…";
+  const r = await apiSend("PATCH", `/api/v1/tenants/${id}`, { telephony: tel });
+  if (r.ok) {
+    $("te_result").textContent = "✓ saved — resolver refreshed";
+    for (const el of ["te_sid", "te_tok", "te_apisid", "te_apisecret", "te_twiml"]) $(el).value = "";
+    loadTenants();
+  } else {
+    $("te_result").textContent = `✗ ${r.status}: ${r.json.detail || r.json.error || "error"}`;
+  }
 }
 
 loadCreds(); loadTenants();
