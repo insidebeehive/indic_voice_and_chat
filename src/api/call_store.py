@@ -17,6 +17,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.auth.context import TenantContext
+from src.integration.tenant_events import build_envelope, channel_label
 from src.models.conversation import Conversation
 from src.models.tenant import ProviderCost
 
@@ -69,6 +70,11 @@ async def insert_call(
     )
     session.add(row)
     await session.commit()
+    await emit_tenant_event(build_envelope(
+        event_type="call.initiated", call_id=call_id, tenant_id=tenant.id,
+        channel=channel_label(agent_type),
+        data={"provider_call_sid": provider_call_sid, "mode": eff_mode,
+              "campaign_id": campaign_id, "lead_id": lead_id}))
     return row
 
 
@@ -96,6 +102,33 @@ async def deliver_to_persister(call_sid: Optional[str], payload: dict) -> None:
         await _persister(call_sid, payload)
     except Exception:  # noqa: BLE001 — teardown must survive a DB hiccup
         log.exception("call outcome persistence failed", extra={"sid": call_sid})
+
+
+# --- Outbound tenant event notifier hook --------------------------------
+# Like the persister, but for the tenant's OUTBOUND events webhook. When a call
+# starts (insert_call) or ends with an outcome (record_outcome), call_store hands
+# a ready-built envelope to this hook; the app wires it (lifespan) to resolve the
+# tenant's events_webhook_url + secret and POST it (signed, with retry). Both the
+# softphone (human) and voice-bot paths pass through these functions, so one hook
+# covers both. Unset (tests / no webhook configured) → a clean no-op.
+_event_notifier: Optional[Callable[[dict], Awaitable[None]]] = None
+
+
+def set_tenant_event_notifier(fn: Optional[Callable[[dict], Awaitable[None]]]) -> None:
+    global _event_notifier
+    _event_notifier = fn
+
+
+async def emit_tenant_event(envelope: dict) -> None:
+    """Hand a call-event envelope to the tenant notifier, if wired. Never raises —
+    event emission must not break call insert/finalize."""
+    if _event_notifier is None:
+        return
+    try:
+        await _event_notifier(envelope)
+    except Exception:  # noqa: BLE001 - delivery must not break call handling
+        log.exception("tenant event emit failed",
+                      extra={"event": envelope.get("event_type")})
 
 
 async def count_active_calls(session: AsyncSession, tenant_id: str) -> int:
@@ -241,6 +274,15 @@ async def record_outcome(
         duration_ms=row.duration_ms,
     )
     await session.commit()
+    # Terminal event: the LLM outcome IS the tenant's end-call signal. Fires for
+    # both voice-bot (via the persister) and softphone (manual_call → record_outcome).
+    await emit_tenant_event(build_envelope(
+        event_type="call.completed", call_id=row.id, tenant_id=row.tenant_id,
+        channel=channel_label(row.agent_type),
+        data={"outcome": outcome, "summary": summary, "notes": notes,
+              "callback_datetime": callback_at.isoformat() if callback_at else None,
+              "status": row.status, "duration_ms": row.duration_ms,
+              "provider_call_sid": row.provider_call_sid}))
     return row
 
 

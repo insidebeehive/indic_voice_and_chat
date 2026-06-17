@@ -51,7 +51,12 @@ from src.api.dev_console import (
 from src.api.dev_console import (
     ws_router as dev_ws_router,
 )
-from src.api.call_store import record_outcome, set_call_outcome_persister
+from src.api.call_store import (
+    record_outcome,
+    set_call_outcome_persister,
+    set_tenant_event_notifier,
+)
+from src.integration.tenant_events import deliver as deliver_tenant_event
 from src.auth.db_resolver import DbTenantResolver
 from src.auth.middleware import set_admin_tokens, set_tenant_resolver
 from src.auth.seed import seed_if_empty, seed_provider_costs
@@ -151,6 +156,29 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             )
     set_call_outcome_persister(_persist_call_outcome)
 
+    # Outbound per-tenant call-event webhook: call_store hands us a ready-built
+    # envelope at call start (call.initiated) and end (call.completed + outcome);
+    # we resolve the tenant's events_webhook_url + secret and POST it signed,
+    # fire-and-forget so a slow tenant endpoint never blocks call handling. The
+    # config fields live on TenantSettings (read via getattr so this is a clean
+    # no-op until the active_creds WIP adds events_webhook_url/secret_env).
+    def _tenant_settings_by_id(tenant_id: str):
+        for t in (getattr(app.state, "tenants", {}) or {}).values():
+            if getattr(t, "id", None) == tenant_id:
+                return t
+        return None
+
+    async def _notify_tenant_event(envelope: dict) -> None:
+        settings = _tenant_settings_by_id(envelope.get("tenant_id"))
+        url = getattr(settings, "events_webhook_url", None) if settings else None
+        if not url:
+            return
+        secret_env = getattr(settings, "events_webhook_secret_env", None)
+        secret = os.environ.get(secret_env) if secret_env else None
+        # Detached so delivery (retries/backoff) never blocks the caller.
+        asyncio.create_task(deliver_tenant_event(url, envelope, secret))
+    set_tenant_event_notifier(_notify_tenant_event)
+
     # --- Bridge factory: turn an inbound Twilio WS into a live agent ----
     providers = build_provider_registry(
         global_defaults={
@@ -217,6 +245,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         telephony_hooks.set_softphone_providers(None)
         set_browser_bridge_factory(None)
         set_call_outcome_persister(None)
+        set_tenant_event_notifier(None)
         await redis_client.aclose()
         await dispose_engine()
         set_tenant_resolver(None)

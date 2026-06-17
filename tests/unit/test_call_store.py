@@ -238,6 +238,96 @@ async def test_deliver_to_persister_swallows_errors(sm):
         set_call_outcome_persister(None)
 
 
+async def test_insert_call_emits_initiated_event(sm):
+    from src.api.call_store import insert_call, set_tenant_event_notifier
+    from src.auth.context import TenantContext
+    from src.config_tenant import (
+        TenantPipelineConfig, TenantSettings, TenantTelephonyConfig, TenantTTSConfig,
+    )
+    events = []
+
+    async def _notify(env):
+        events.append(env)
+
+    ctx = TenantContext(settings=TenantSettings(
+        id="t1", slug="t1", name="T1",
+        pipeline=TenantPipelineConfig(
+            tts=TenantTTSConfig(provider="sarvam", voice_id="anushka"),
+            telephony=TenantTelephonyConfig(provider="stringee"))))
+    set_tenant_event_notifier(_notify)
+    try:
+        async with sm() as s:
+            await insert_call(s, call_id="call_e", tenant=ctx, provider_call_sid="SID-E",
+                              channel="softphone", agent_type="human")
+    finally:
+        set_tenant_event_notifier(None)
+
+    assert len(events) == 1
+    e = events[0]
+    assert e["event_type"] == "call.initiated"
+    assert (e["call_id"], e["tenant_id"]) == ("call_e", "t1")
+    assert e["channel"] == "softphone"                 # agent_type=human
+    assert e["data"]["provider_call_sid"] == "SID-E"
+
+
+async def test_record_outcome_emits_completed_event(sm):
+    from src.api.call_store import record_outcome, set_tenant_event_notifier
+    events = []
+
+    async def _notify(env):
+        events.append(env)
+
+    async with sm() as s:
+        s.add(_conv(id="c_e", provider_call_sid="SID-RE", agent_type="voicebot"))
+        await s.commit()
+    set_tenant_event_notifier(_notify)
+    try:
+        async with sm() as s:
+            await record_outcome(s, "SID-RE", outcome="interested",
+                                 summary="Wants a callback", notes="Evenings",
+                                 duration_ms=60_000)
+    finally:
+        set_tenant_event_notifier(None)
+
+    assert len(events) == 1
+    e = events[0]
+    assert e["event_type"] == "call.completed"          # the end-call signal
+    assert e["channel"] == "voicebot"
+    assert e["data"]["outcome"] == "interested"
+    assert e["data"]["summary"] == "Wants a callback"
+    assert e["data"]["status"] == "ended"
+
+
+async def test_record_outcome_unknown_sid_emits_nothing(sm):
+    from src.api.call_store import record_outcome, set_tenant_event_notifier
+    events = []
+
+    async def _notify(env):
+        events.append(env)
+
+    set_tenant_event_notifier(_notify)
+    try:
+        async with sm() as s:
+            assert await record_outcome(s, "missing", outcome="x") is None
+    finally:
+        set_tenant_event_notifier(None)
+    assert events == []          # no row → no completed event
+
+
+async def test_emit_tenant_event_swallows_notifier_errors():
+    from src.api.call_store import emit_tenant_event, set_tenant_event_notifier
+
+    async def _boom(env):
+        raise RuntimeError("crm down")
+
+    set_tenant_event_notifier(_boom)
+    try:
+        # Must not propagate — a failing tenant webhook can't break call handling.
+        await emit_tenant_event({"event_type": "call.initiated"})
+    finally:
+        set_tenant_event_notifier(None)
+
+
 async def test_reap_stale_calls_closes_only_old_active(sm):
     from datetime import datetime, timedelta
 
