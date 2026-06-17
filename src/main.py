@@ -174,10 +174,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     async def _notify_tenant_event(envelope: dict) -> None:
         settings = _tenant_settings_by_id(envelope.get("tenant_id"))
-        url = getattr(settings, "events_webhook_url", None) if settings else None
+        tel = getattr(getattr(settings, "pipeline", None), "telephony", None)
+        url = getattr(tel, "events_webhook_url", None) if tel else None
         if not url:
             return
-        secret_env = getattr(settings, "events_webhook_secret_env", None)
+        secret_env = getattr(tel, "events_webhook_secret_env", None)
         secret = os.environ.get(secret_env) if secret_env else None
         # Detached so delivery (retries/backoff) never blocks the caller.
         asyncio.create_task(deliver_tenant_event(url, envelope, secret))
@@ -193,6 +194,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             "vector_store": settings.pipeline.vector_store.model_dump(),
         },
     )
+    # Drop cached per-tenant provider clients whenever tenants reload (e.g. after
+    # a key/config update via the tenant API) so the new creds take effect.
+    resolver.on_reload = providers.evict
+
     base_session_store = SessionStore(
         redis=redis_client, ttl_seconds=settings.redis.session_ttl_seconds
     )

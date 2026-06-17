@@ -328,6 +328,37 @@ async def test_emit_tenant_event_swallows_notifier_errors():
         set_tenant_event_notifier(None)
 
 
+async def test_mark_answered_sets_status_and_emits(sm):
+    from src.api.call_store import mark_answered, set_tenant_event_notifier
+    events = []
+
+    async def _notify(env):
+        events.append(env)
+
+    async with sm() as s:
+        s.add(_conv(id="c_a", provider_call_sid="SID-A", agent_type="human",
+                    status="in_progress"))
+        await s.commit()
+    set_tenant_event_notifier(_notify)
+    try:
+        async with sm() as s:
+            row = await mark_answered(s, "SID-A")
+        assert row is not None and row.status == "answered"
+    finally:
+        set_tenant_event_notifier(None)
+
+    assert len(events) == 1
+    assert events[0]["event_type"] == "call.answered"
+    assert events[0]["channel"] == "softphone"          # agent_type=human
+    assert events[0]["call_id"] == "c_a"
+
+
+async def test_mark_answered_unknown_sid_returns_none(sm):
+    from src.api.call_store import mark_answered
+    async with sm() as s:
+        assert await mark_answered(s, "missing") is None
+
+
 async def test_reap_stale_calls_closes_only_old_active(sm):
     from datetime import datetime, timedelta
 

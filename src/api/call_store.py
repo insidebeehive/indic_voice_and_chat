@@ -131,6 +131,28 @@ async def emit_tenant_event(envelope: dict) -> None:
                       extra={"event": envelope.get("event_type")})
 
 
+async def mark_answered(
+    session: AsyncSession, provider_call_sid: str
+) -> Optional[Conversation]:
+    """Mark a call answered: flip an in_progress row to ``answered`` and emit a
+    ``call.answered`` tenant event. Returns the row, or None if no match. (There
+    is no single DB choke point for "answered" across paths, so callers invoke
+    this where the call connects.)"""
+    row = (await session.execute(
+        select(Conversation).where(Conversation.provider_call_sid == provider_call_sid)
+    )).scalar_one_or_none()
+    if row is None:
+        return None
+    if row.status == "in_progress":
+        row.status = "answered"
+        await session.commit()
+    await emit_tenant_event(build_envelope(
+        event_type="call.answered", call_id=row.id, tenant_id=row.tenant_id,
+        channel=channel_label(row.agent_type),
+        data={"provider_call_sid": row.provider_call_sid}))
+    return row
+
+
 async def count_active_calls(session: AsyncSession, tenant_id: str) -> int:
     """How many of this tenant's calls are currently placing/live."""
     return (await session.execute(

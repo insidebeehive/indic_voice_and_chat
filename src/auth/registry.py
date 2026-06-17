@@ -92,8 +92,12 @@ class TenantProviders:
         self._cache[key] = client
         return client
 
-    def evict(self, tenant_id: str) -> None:
-        """Drop every cached client for one tenant (e.g. on config reload)."""
+    def evict(self, tenant_id: Optional[str] = None) -> None:
+        """Drop cached clients so a config/key update takes effect. ``tenant_id``
+        None drops everything (e.g. on a full resolver reload)."""
+        if tenant_id is None:
+            self._cache.clear()
+            return
         for key in [k for k in self._cache if k[0] == tenant_id]:
             del self._cache[key]
 

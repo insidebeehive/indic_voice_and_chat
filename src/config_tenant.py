@@ -144,6 +144,12 @@ class TenantTelephonyConfig(BaseModel):
     provider: Optional[str] = None
     from_number: Optional[str] = None
     webhook_base_url: Optional[str] = None
+    # Outbound CALL-EVENT webhook (distinct from webhook_base_url, the INBOUND
+    # telephony callback): where we POST call.initiated/answered/completed (+ the
+    # LLM outcome) for this tenant's calls, signed with the secret named by
+    # events_webhook_secret_env (value resolved via TenantContext.secret).
+    events_webhook_url: Optional[str] = None
+    events_webhook_secret_env: Optional[str] = None
     # Top-level credential refs (legacy / single-provider tenants). Kept for
     # backward compatibility; when ``creds_by_provider`` has an entry for the
     # active provider it takes precedence (see ``active_creds``).

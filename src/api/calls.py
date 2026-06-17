@@ -100,8 +100,28 @@ async def call_lead(
     if not tel.webhook_base_url:
         raise HTTPException(status_code=400, detail="tenant telephony.webhook_base_url must be set")
 
+    # Dial with the TENANT's telephony creds (resolved for its configured
+    # provider), not the platform env — otherwise every tenant's call bills/
+    # identifies as the platform's account. A cred that isn't configured yet
+    # resolves to None so the adapter can still fall back to env (until the
+    # tenant's keys are migrated into the DB).
+    def _cred(name):
+        try:
+            return tenant.secret(name) if name else None
+        except Exception:  # noqa: BLE001 - missing env → let the adapter decide
+            return None
+
+    creds = tel.active_creds()
+    acct, auth = _cred(creds.account_sid_env), _cred(creds.auth_token_env)
     try:
-        adapter = get_telephony_provider({"provider": provider})
+        adapter = get_telephony_provider({
+            "provider": provider,
+            "account_sid": acct, "auth_token": auth,
+            # Stringee's server adapter reads api_key_sid/api_key_secret (its
+            # account keys are stored as account_sid/auth_token) — pass them so it
+            # dials with the tenant's creds, not STRINGEE_API_KEY_SID from env.
+            "api_key_sid": acct, "api_key_secret": auth,
+        })
     except Exception as e:  # noqa: BLE001 — e.g. missing credentials
         raise HTTPException(status_code=400, detail=f"telephony adapter unavailable: {e}")
 
