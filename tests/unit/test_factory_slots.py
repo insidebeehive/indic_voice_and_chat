@@ -48,6 +48,17 @@ async def test_browser_factory_threads_lead_name_from_query() -> None:
     assert bridge._agent.session.lead_data.get("lead_name") == "Raju"
 
 
+def test_telephony_factories_are_async_for_per_call_campaign() -> None:
+    # The telephony factories must be async so they can resolve the per-tenant
+    # campaign per call (await resolver.resolve) like the dev-console ones.
+    from src.bootstrap import (
+        make_bridge_factory, make_exotel_bridge_factory, make_stringee_bridge_factory,
+    )
+    for fn in (make_bridge_factory, make_exotel_bridge_factory, make_stringee_bridge_factory):
+        factory = fn(_providers())
+        assert inspect.iscoroutinefunction(factory), fn.__name__
+
+
 async def test_browser_factory_resolves_campaign_per_call() -> None:
     from src.dialogue.campaign_loader import LoadedCampaign
     from src.dialogue.prompts import VoiceBotScript

@@ -181,6 +181,8 @@ def make_bridge_factory(
     bridge_config: TwilioBridgeConfig | None = None,
     script: VoiceBotScript = DEFAULT_DEMO_SCRIPT,
     slots: SlotSchema = SlotSchema(),
+    *,
+    campaign_resolver=None,
 ) -> Callable[[WebSocket, TenantContext], object]:
     """Return a callable suitable for ``set_bridge_factory(...)``.
 
@@ -190,18 +192,25 @@ def make_bridge_factory(
     """
     cfg = bridge_config or TwilioBridgeConfig()
 
-    def factory(websocket: WebSocket, tenant: TenantContext):
+    async def factory(websocket: WebSocket, tenant: TenantContext):
         from src.api import dev_call_control
 
         # A dev-console "place call" can override mode/voice for this one call.
         override = dev_call_control.pop_override(tenant.slug)
         mode = (override or {}).get("mode") or getattr(
             tenant.settings.pipeline, "mode", "layered")
+        # Per-tenant campaign: resolve this call's script + slots from the DB
+        # (?campaign=<id> on the stream URL, else the tenant's active campaign).
+        cur_script, cur_slots = script, slots
+        if campaign_resolver is not None:
+            cid = (getattr(websocket, "query_params", {}) or {}).get("campaign") or None
+            lc = await campaign_resolver.resolve(tenant.id, cid)
+            cur_script, cur_slots = lc.script, lc.slots
         # Speech-to-speech path: when the tenant is in s2s mode, drive Gemini Live
         # over the Twilio media stream instead of the STT->LLM->TTS cascade.
         if mode == "s2s":
             return _build_s2s_telephony_bridge(
-                providers, tenant, script, slots, websocket, session_store,
+                providers, tenant, cur_script, cur_slots, websocket, session_store,
                 encoding="mulaw", sid_field="streamSid", supports_clear=True,
                 call_sid_field="callSid", voice_override=(override or {}).get("voice"),
                 lead_data=_override_lead_data(override))
@@ -246,8 +255,8 @@ def make_bridge_factory(
         agent = VoiceBotAgent(
             session=session,
             state_machine=sm,
-            slot_schema=slots,
-            script=script,
+            slot_schema=cur_slots,
+            script=cur_script,
             engine=engine,
             store=store,
         )
@@ -324,6 +333,8 @@ def make_exotel_bridge_factory(
     bridge_config: ExotelBridgeConfig | None = None,
     script: VoiceBotScript = DEFAULT_DEMO_SCRIPT,
     slots: SlotSchema = SlotSchema(),
+    *,
+    campaign_resolver=None,
 ) -> Callable[[WebSocket, TenantContext], ExotelMediaBridge]:
     """Build an Exotel WS bridge per call, wired to the tenant's provider stack.
 
@@ -334,17 +345,22 @@ def make_exotel_bridge_factory(
     """
     cfg = bridge_config or ExotelBridgeConfig()
 
-    def factory(websocket: WebSocket, tenant: TenantContext):
+    async def factory(websocket: WebSocket, tenant: TenantContext):
         from src.api import dev_call_control
 
         override = dev_call_control.pop_override(tenant.slug)
         mode = (override or {}).get("mode") or getattr(
             tenant.settings.pipeline, "mode", "layered")
+        cur_script, cur_slots = script, slots
+        if campaign_resolver is not None:
+            cid = (getattr(websocket, "query_params", {}) or {}).get("campaign") or None
+            lc = await campaign_resolver.resolve(tenant.id, cid)
+            cur_script, cur_slots = lc.script, lc.slots
         # S2S path: drive Gemini Live over the Exotel media stream (raw PCM16@8k,
         # snake_case stream_sid, no `clear` frame) when the tenant is in s2s mode.
         if mode == "s2s":
             return _build_s2s_telephony_bridge(
-                providers, tenant, script, slots, websocket, session_store,
+                providers, tenant, cur_script, cur_slots, websocket, session_store,
                 encoding="pcm", sid_field="stream_sid", supports_clear=False,
                 call_sid_field="call_sid", voice_override=(override or {}).get("voice"),
                 lead_data=_override_lead_data(override))
@@ -383,8 +399,8 @@ def make_exotel_bridge_factory(
         agent = VoiceBotAgent(
             session=session,
             state_machine=sm,
-            slot_schema=slots,
-            script=script,
+            slot_schema=cur_slots,
+            script=cur_script,
             engine=engine,
             store=store,
         )
@@ -413,6 +429,8 @@ def make_stringee_bridge_factory(
     providers: TenantProviders,
     script: VoiceBotScript = DEFAULT_DEMO_SCRIPT,
     slots: SlotSchema = SlotSchema(),
+    *,
+    campaign_resolver=None,
 ):
     """Build a StringeeIvrBridge per call, wired to the tenant's providers.
 
@@ -421,7 +439,12 @@ def make_stringee_bridge_factory(
     """
     from src.api.telephony_stringee_bridge import StringeeIvrBridge
 
-    def factory(*, call_id, tenant, base_url, fetch):
+    async def factory(*, call_id, tenant, base_url, fetch):
+        # Per-tenant campaign (IVR has no query string → the tenant's active one).
+        cur_script, cur_slots = script, slots
+        if campaign_resolver is not None:
+            lc = await campaign_resolver.resolve(tenant.id, None)
+            cur_script, cur_slots = lc.script, lc.slots
         stt = providers.get_stt(tenant)
         llm = providers.get_llm(tenant)
         tts = providers.get_tts(tenant)
@@ -449,8 +472,8 @@ def make_stringee_bridge_factory(
         agent = VoiceBotAgent(
             session=session,
             state_machine=sm,
-            slot_schema=slots,
-            script=script,
+            slot_schema=cur_slots,
+            script=cur_script,
             engine=engine,
             store=None,
         )

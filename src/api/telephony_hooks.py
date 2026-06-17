@@ -15,6 +15,7 @@ Inbound flow:
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 from collections.abc import Callable
@@ -162,6 +163,8 @@ async def twilio_stream(websocket: WebSocket, tenant_slug: str) -> None:
         return
 
     bridge = _bridge_factory(websocket, tenant)
+    if inspect.isawaitable(bridge):
+        bridge = await bridge
     try:
         await bridge.run()
     except WebSocketDisconnect:
@@ -552,6 +555,8 @@ async def exotel_stream(websocket: WebSocket, tenant_slug: str) -> None:
         return
 
     bridge = _exotel_bridge_factory(websocket, tenant)
+    if inspect.isawaitable(bridge):
+        bridge = await bridge
     try:
         await bridge.run()
     except WebSocketDisconnect:
@@ -671,6 +676,8 @@ async def stringee_answer(request: Request):
         call_id=call_id, tenant=tenant,
         base_url=_stringee_base(request), fetch=_download,
     )
+    if inspect.isawaitable(bridge):
+        bridge = await bridge
     registry.put(bridge)
     scco = await bridge.start_call()
     if call_id:
