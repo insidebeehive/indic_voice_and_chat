@@ -62,6 +62,7 @@ from src.auth.middleware import set_admin_tokens, set_tenant_resolver
 from src.auth.seed import seed_campaigns_if_empty, seed_if_empty, seed_provider_costs
 from src.bootstrap import (
     build_provider_registry,
+    build_runtime_registry,
     make_bridge_factory,
     make_exotel_bridge_factory,
     make_stringee_bridge_factory,
@@ -194,13 +195,19 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             "vector_store": settings.pipeline.vector_store.model_dump(),
         },
     )
-    # Drop cached per-tenant provider clients whenever tenants reload (e.g. after
-    # a key/config update via the tenant API) so the new creds take effect.
-    resolver.on_reload = providers.evict
-
     base_session_store = SessionStore(
         redis=redis_client, ttl_seconds=settings.redis.session_ttl_seconds
     )
+
+    # Per-tenant runtime registry: one lazily-built instance per tenant for
+    # providers + DND / scheduler / retriever / session store / chat / CRM /
+    # webhooks. Real where impls exist, honest stubs for the fake-only ones.
+    runtime_registry = build_runtime_registry(providers, base_session_store)
+    app.state.registry = runtime_registry
+    # Drop ALL cached per-tenant instances (providers + sub-registries) whenever
+    # tenants reload (e.g. a key/config update via the tenant API) so the new
+    # config takes effect.
+    resolver.on_reload = runtime_registry.evict_all
     campaign = load_campaign(active_campaign_slug())
     log.info(
         "campaign loaded",
