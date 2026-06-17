@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from datetime import UTC, datetime
 
 from src.agents.state_machine import Event, State
@@ -67,6 +68,15 @@ class _BaseLiveBridge:
     # the callee says "hello" first).
     _greets_first = False
 
+    # Idle watchdog: if no model event arrives for this long, the Live session is
+    # treated as hung — it stopped endpointing / went silent and would otherwise
+    # leave the caller stuck in "listening" forever with NO outcome. Force
+    # teardown so an outcome is still produced. Generous, because between turns
+    # (while the caller is silent) no events flow either — caller speech produces
+    # incremental input_transcript events that keep resetting the clock.
+    _idle_timeout_s = 30.0
+    _idle_check_s = 5.0
+
     def __init__(self, *, agent, config: RealtimeConfig, connect_session,
                  llm=None, tenant_timezone: str = "Asia/Kolkata") -> None:
         self._agent = agent
@@ -86,6 +96,7 @@ class _BaseLiveBridge:
         self._pending_action: str | None = None
         self._pending_slots: dict = {}
         self._speaking = False
+        self._last_event_at = 0.0   # monotonic ts of the last model event (idle watchdog)
         # one-shot diagnostics: did the model ever HEAR the caller / RESPOND?
         self._dbg_heard_caller = False
         self._dbg_model_audio = False
@@ -93,25 +104,29 @@ class _BaseLiveBridge:
     # --- run skeleton (shared) ------------------------------------------
     async def _drive(self) -> None:
         events_task = None
+        watchdog_task = None
         try:
             # Inside the guard so a failure here (e.g. a store/Redis hiccup in
             # agent.start) tears down cleanly instead of crashing the WS handler.
             await self._agent.start()
             await self._on_start()
             self._session = await self._connect_session(self._config)
+            self._mark_activity()
             events_task = asyncio.create_task(self._consume_events())
+            watchdog_task = asyncio.create_task(self._idle_watchdog())
             await self._emit_status("listening")
             await self._maybe_greet()
             await self._inbound_loop()
         except Exception:  # noqa: BLE001 - never crash the socket handler
             log.exception("live bridge crashed")
         finally:
-            if events_task is not None:
-                events_task.cancel()
-                try:
-                    await events_task
-                except BaseException:  # noqa: BLE001
-                    pass
+            for task in (watchdog_task, events_task):
+                if task is not None:
+                    task.cancel()
+                    try:
+                        await task
+                    except BaseException:  # noqa: BLE001
+                        pass
             # Closing the realtime session / transport can raise when the call
             # dropped abnormally — must NOT skip outcome analysis below. Each
             # teardown step is isolated so the outcome is always computed.
@@ -152,11 +167,34 @@ class _BaseLiveBridge:
         except Exception:  # noqa: BLE001 - a failed kickoff must not break the call
             log.exception("greeting kickoff failed; continuing without it")
 
+    def _mark_activity(self) -> None:
+        """Record that a model event just arrived (resets the idle watchdog)."""
+        self._last_event_at = time.monotonic()
+
+    async def _idle_watchdog(self) -> None:
+        """Force teardown of a hung Live session. If no model event has arrived
+        for ``_idle_timeout_s`` the session has gone silent (it stopped
+        endpointing the caller / dropped the turn) and would otherwise hang
+        forever with no response and no outcome. Setting ``_stopped`` breaks the
+        inbound loop on its next frame (both transports stream audio
+        continuously), so ``_drive`` tears down and emits the outcome."""
+        while not self._stopped:
+            await asyncio.sleep(self._idle_check_s)
+            if self._stopped or self._session is None:
+                return
+            idle = time.monotonic() - self._last_event_at
+            if idle >= self._idle_timeout_s:
+                log.warning("live: no model events for %.0fs — session hung; "
+                            "forcing teardown so an outcome is produced", idle)
+                self._stopped = True
+                return
+
     # --- model event handling (shared) ----------------------------------
     async def _consume_events(self) -> None:
         assert self._session is not None
         try:
             async for ev in self._session.events():
+                self._mark_activity()
                 if ev.type == "audio":
                     if not self._dbg_model_audio:
                         self._dbg_model_audio = True
