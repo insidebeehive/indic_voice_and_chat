@@ -284,7 +284,7 @@ async def dev_voice_ws(websocket: WebSocket) -> None:
         await websocket.close(code=1008, reason="unknown tenant")
         return
 
-    bridge = _browser_bridge_factory(websocket, tenant)
+    bridge = await _browser_bridge_factory(websocket, tenant)
     try:
         await _run_billed_session(tenant, bridge, mode="layered")
     except WebSocketDisconnect:
@@ -314,7 +314,7 @@ async def dev_voice_live_ws(websocket: WebSocket) -> None:
         await websocket.close(code=1008, reason="unknown tenant")
         return
     try:
-        bridge = _live_bridge_factory(websocket, tenant)
+        bridge = await _live_bridge_factory(websocket, tenant)
     except Exception as e:  # noqa: BLE001 - e.g. tenant has no realtime config
         log.warning("dev console (s2s) bridge build failed: %s", e)
         await websocket.close(code=1011, reason="s2s not configured for tenant")
@@ -376,14 +376,26 @@ def make_browser_bridge_factory(
     providers: TenantProviders,
     script: VoiceBotScript = DEFAULT_DEMO_SCRIPT,
     slots: SlotSchema = SlotSchema(),
+    *,
+    campaign_resolver=None,
 ) -> BrowserBridgeFactory:
     """Build a BrowserVoiceBridge per connection, wired to the tenant stack.
 
     Mirrors ``src.bootstrap.make_bridge_factory`` but returns a browser bridge.
+    When a ``campaign_resolver`` is supplied, the agent's script + slots are
+    resolved per call from the tenant's DB campaign (``?campaign=<id>``, else the
+    tenant's active campaign, else the YAML fallback) instead of the global
+    closure script/slots.
     """
 
-    def factory(websocket: WebSocket, tenant: TenantContext) -> BrowserVoiceBridge:
+    async def factory(websocket: WebSocket, tenant: TenantContext) -> BrowserVoiceBridge:
         import uuid
+
+        cur_script, cur_slots = script, slots
+        if campaign_resolver is not None:
+            qp0 = getattr(websocket, "query_params", {}) or {}
+            lc = await campaign_resolver.resolve(tenant.id, qp0.get("campaign") or None)
+            cur_script, cur_slots = lc.script, lc.slots
 
         stt = providers.get_stt(tenant)
         llm = providers.get_llm(tenant)
@@ -425,8 +437,8 @@ def make_browser_bridge_factory(
         agent = VoiceBotAgent(
             session=AgentSession(session_id=session_id, lead_data=lead_data),
             state_machine=AgentStateMachine(),
-            slot_schema=slots,
-            script=script,
+            slot_schema=cur_slots,
+            script=cur_script,
             engine=engine,
             store=None,
         )
@@ -448,15 +460,26 @@ def make_live_bridge_factory(
     providers: TenantProviders,
     script: VoiceBotScript = DEFAULT_DEMO_SCRIPT,
     slots: SlotSchema = SlotSchema(),
+    *,
+    campaign_resolver=None,
 ) -> LiveBridgeFactory:
-    """Build a GeminiLiveBridge (S2S) per connection from pipeline.realtime."""
+    """Build a GeminiLiveBridge (S2S) per connection from pipeline.realtime.
 
-    def factory(websocket: WebSocket, tenant: TenantContext) -> GeminiLiveBridge:
+    With a ``campaign_resolver``, the agent's script + slots come per call from
+    the tenant's DB campaign (``?campaign=<id>`` → active → YAML fallback)."""
+
+    async def factory(websocket: WebSocket, tenant: TenantContext) -> GeminiLiveBridge:
         import uuid
 
         rt = getattr(tenant.settings.pipeline, "realtime", None)
         if rt is None or not getattr(rt, "provider", None):
             raise RuntimeError("tenant has no pipeline.realtime config for S2S")
+
+        cur_script, cur_slots = script, slots
+        if campaign_resolver is not None:
+            qp0 = getattr(websocket, "query_params", {}) or {}
+            lc = await campaign_resolver.resolve(tenant.id, qp0.get("campaign") or None)
+            cur_script, cur_slots = lc.script, lc.slots
 
         llm = providers.get_llm(tenant)
         # The agent is the same; only the bridge differs. The engine is required by
@@ -471,7 +494,7 @@ def make_live_bridge_factory(
         session_id = f"live_{uuid.uuid4().hex[:12]}"
         agent = VoiceBotAgent(
             session=AgentSession(session_id=session_id, lead_data=lead_data),
-            state_machine=AgentStateMachine(), slot_schema=slots, script=script,
+            state_machine=AgentStateMachine(), slot_schema=cur_slots, script=cur_script,
             engine=engine, store=None,
         )
 
@@ -482,7 +505,7 @@ def make_live_bridge_factory(
         key = tenant.secret(rt.api_key_env) if rt.api_key_env else None
         config = RealtimeConfig(
             model=rt.model, voice=voice, language_code=rt.language_code,
-            system_instruction=build_s2s_system_instruction(script, slots, lead_data),
+            system_instruction=build_s2s_system_instruction(cur_script, cur_slots, lead_data),
             tools=[RECORD_TURN_SIGNAL],
         )
 

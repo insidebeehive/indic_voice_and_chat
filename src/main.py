@@ -64,6 +64,7 @@ from src.bootstrap import (
 from src.config import Settings, get_settings
 from src.config_tenant import TenantSettings
 from src.dialogue.campaign_loader import active_campaign_slug, load_campaign
+from src.dialogue.campaign_resolver import DbCampaignResolver
 from src.dialogue.context import SessionStore
 from src.models.database import dispose_engine, ensure_schema, get_engine, get_sessionmaker
 from src.utils.logging import configure_logging, get_logger
@@ -187,15 +188,21 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             providers=providers, script=campaign.script, slots=campaign.slots,
         )
     )
+    # Per-tenant campaign resolution: the dev-console bridges resolve the agent's
+    # script + slots per call from the tenant's DB campaign (campaigns table), with
+    # the global VOX_CAMPAIGN file as the fallback for tenants with no DB campaign.
+    campaign_resolver = DbCampaignResolver(sessionmaker, fallback=campaign)
     if dev_console_enabled():
         set_browser_bridge_factory(
             make_browser_bridge_factory(
                 providers=providers, script=campaign.script, slots=campaign.slots,
+                campaign_resolver=campaign_resolver,
             )
         )
         set_live_bridge_factory(
             make_live_bridge_factory(
                 providers=providers, script=campaign.script, slots=campaign.slots,
+                campaign_resolver=campaign_resolver,
             )
         )
         log.info("dev console enabled at /dev/voice")
