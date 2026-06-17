@@ -86,12 +86,16 @@ _STATUS_MAP = {
 
 class StringeeAdapter(ITelephonyProvider):
     def __init__(self, config: dict[str, Any]) -> None:
-        api_key_sid = config.get("api_key_sid") or os.environ.get("STRINGEE_API_KEY_SID")
-        api_key_secret = config.get("api_key_secret") or os.environ.get("STRINGEE_API_KEY_SECRET")
+        # Per-tenant creds only — NO platform-env fallback. The caller resolves the
+        # tenant's Stringee keys (active_creds) and passes them here; a missing key
+        # must fail loudly, not silently dial on the platform's Stringee account.
+        api_key_sid = config.get("api_key_sid")
+        api_key_secret = config.get("api_key_secret")
         if not (api_key_sid and api_key_secret):
             raise ValueError(
-                "StringeeAdapter requires api_key_sid + api_key_secret (or "
-                "STRINGEE_API_KEY_SID / STRINGEE_API_KEY_SECRET env vars)"
+                "StringeeAdapter requires the tenant's api_key_sid + api_key_secret "
+                "(configure the tenant's Stringee keys; the platform env is no longer "
+                "a fallback)"
             )
         self._api_key_sid = api_key_sid
         self._api_key_secret = api_key_secret
