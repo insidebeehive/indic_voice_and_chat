@@ -193,6 +193,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             "vector_store": settings.pipeline.vector_store.model_dump(),
         },
     )
+    # Drop cached per-tenant provider clients whenever tenants reload (e.g. after
+    # a key/config update via the tenant API) so the new creds take effect.
+    resolver.on_reload = providers.evict
+
     base_session_store = SessionStore(
         redis=redis_client, ttl_seconds=settings.redis.session_ttl_seconds
     )

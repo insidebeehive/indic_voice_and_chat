@@ -111,6 +111,59 @@ async def test_call_lead_places_and_records(ctx) -> None:
     assert row.campaign_id == "c1"
 
 
+async def test_call_lead_dials_with_tenant_creds(monkeypatch) -> None:
+    # The outbound adapter must be built with the TENANT's telephony creds (so the
+    # call bills/identifies as the tenant), not the platform env.
+    monkeypatch.setenv("TENANT_T1_STRINGEE_SID", "ACTUAL-SID")
+    monkeypatch.setenv("TENANT_T1_STRINGEE_SECRET", "ACTUAL-SECRET")
+    captured: dict = {}
+    monkeypatch.setattr(calls, "get_telephony_provider",
+                        lambda cfg: captured.update(cfg) or _FakeAdapter())
+
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:", future=True)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    sm = async_sessionmaker(engine, expire_on_commit=False)
+    async with sm() as s:
+        s.add(Tenant(id="t1", slug="t1", name="T1"))
+        s.add(DbCampaign(id="c1", tenant_id="t1", name="C1", status="active", config_yaml=""))
+        await s.commit()
+
+    async def _session_override():
+        async with sm() as session:
+            yield session
+
+    tenant = TenantSettings(
+        id="t1", slug="t1", name="T1", max_concurrent_calls=2,
+        pipeline=TenantPipelineConfig(
+            mode="layered", stt=TenantSTTConfig(provider="groq"),
+            llm=TenantLLMConfig(provider="gemini"), tts=TenantTTSConfig(provider="sarvam"),
+            telephony=TenantTelephonyConfig(
+                provider="stringee", from_number="918204268005",
+                webhook_base_url="https://x.example/api/v1/telephony",
+                account_sid_env="TENANT_T1_STRINGEE_SID",
+                auth_token_env="TENANT_T1_STRINGEE_SECRET")))
+    set_tenant_resolver(None)
+    register_tenant_for_test(tenant, plaintext_tokens=["test-token"])
+    app = FastAPI()
+    app.include_router(calls.router)
+    app.dependency_overrides[get_db_session] = _session_override
+    transport = ASGITransport(app=app)
+    try:
+        async with AsyncClient(transport=transport, base_url="http://test", headers=HEADERS) as c:
+            resp = await c.post("/campaigns/c1/calls", json={"to_number": "+918618795697"})
+    finally:
+        set_tenant_resolver(None)
+        await engine.dispose()
+
+    assert resp.status_code == 202
+    assert captured["account_sid"] == "ACTUAL-SID"
+    assert captured["auth_token"] == "ACTUAL-SECRET"
+    # Mapped onto the keys the Stringee server adapter reads (not STRINGEE_* env).
+    assert captured["api_key_sid"] == "ACTUAL-SID"
+    assert captured["api_key_secret"] == "ACTUAL-SECRET"
+
+
 async def test_call_lead_inactive_campaign_409(ctx) -> None:
     client, _ = ctx
     resp = await client.post("/campaigns/c-ended/calls", json={"to_number": "+9118"})

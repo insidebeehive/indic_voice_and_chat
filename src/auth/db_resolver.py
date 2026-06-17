@@ -64,6 +64,10 @@ class DbTenantResolver:
         self._by_token: dict[str, TenantContext] = {}
         self._by_slug: dict[str, TenantContext] = {}
         self._by_phone: dict[str, TenantContext] = {}
+        # Optional callback fired after a (re)load so cached per-tenant provider
+        # clients can be evicted (e.g. providers.evict) — otherwise a key/config
+        # update leaves stale clients behind.
+        self.on_reload: Optional[callable] = None
 
     async def reload(self) -> int:
         """(Re)load every tenant from the DB. Returns the count loaded."""
@@ -85,6 +89,8 @@ class DbTenantResolver:
                     by_phone[p.phone_number] = ctx
             self._by_token, self._by_slug, self._by_phone = by_token, by_slug, by_phone
         log.info("tenant resolver loaded from DB", extra={"count": len(self._by_slug)})
+        if self.on_reload is not None:
+            self.on_reload()   # drop stale per-tenant provider clients
         return len(self._by_slug)
 
     async def refresh(self, tenant_id: str) -> None:
