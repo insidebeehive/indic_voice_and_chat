@@ -27,6 +27,7 @@ from src.auth import secrets as crypto
 from src.auth.context import hash_api_token
 from src.auth.middleware import require_admin
 from src.config_tenant import (
+    TelephonyCreds,
     TenantPipelineConfig,
     TenantRealtimeConfig,
     TenantSTTConfig,
@@ -207,6 +208,12 @@ async def register_tenant(
             from_number=tel.from_number,
             webhook_base_url=tel.webhook_base_url,
             **env_fields,
+            # also record the creds under the provider-specific slot so a tenant
+            # that later adds a second provider's keys resolves each correctly.
+            creds_by_provider=(
+                {tel.provider.lower(): TelephonyCreds(**env_fields)}
+                if env_fields and tel.provider else {}
+            ),
         ),
     )
 
@@ -329,6 +336,15 @@ async def update_tenant(
                     session.add(TenantSecret(
                         tenant_id=tenant_id, name=name,
                         value_encrypted=crypto.encrypt(value)))
+            # write the creds into the configured provider's slot (so they're
+            # selected by provider) and mirror to top-level for back-compat.
+            prov = (tel_cfg.get("provider") or "").lower()
+            cbp = dict(tel_cfg.get("creds_by_provider") or {})
+            slot = dict(cbp.get(prov) or {})
+            slot.update(env_fields)
+            if prov:
+                cbp[prov] = slot
+                tel_cfg["creds_by_provider"] = cbp
             tel_cfg.update(env_fields)
 
         pc["telephony"] = tel_cfg
@@ -349,11 +365,14 @@ async def update_tenant(
 
     pc = t.pipeline_config or {}
     tel_cfg = pc.get("telephony") or {}
+    # report the creds resolved for the *configured* provider (per-provider slot
+    # if present, else top-level) — names only, never values.
+    active = TenantTelephonyConfig(**tel_cfg).active_creds()
     configured = [
         field for field in (
             "account_sid_env", "auth_token_env", "api_key_sid_env",
             "api_key_secret_env", "twiml_app_sid_env")
-        if tel_cfg.get(field)
+        if getattr(active, field)
     ]
     return UpdateTenantResponse(
         tenant_id=t.id, slug=t.slug, status=t.status,

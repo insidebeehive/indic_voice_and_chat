@@ -298,10 +298,10 @@ async def twilio_softphone_recording(
         log.warning("softphone recording webhook hit but provider registry unset")
         return Response(status_code=503)
 
-    tel = tenant.settings.pipeline.telephony
+    c = tenant.settings.pipeline.telephony.active_creds()
     try:
         wav = await _download_twilio_recording(
-            RecordingUrl, tenant.secret(tel.account_sid_env), tenant.secret(tel.auth_token_env))
+            RecordingUrl, tenant.secret(c.account_sid_env), tenant.secret(c.auth_token_env))
         left, right, sr = wav_split_stereo(wav)
     except Exception:  # noqa: BLE001 — a fetch/parse failure must not 500 Twilio
         log.exception("twilio softphone recording fetch/split failed", extra={"sid": CallSid})
@@ -483,9 +483,9 @@ async def _download_stringee_recording(url: str, tenant: TenantContext) -> bytes
     tenant's Stringee keys are available (signed/public URLs work without it)."""
     from src.providers.telephony.stringee import mint_server_token
 
-    tel = tenant.settings.pipeline.telephony
-    sid = tenant.secret(tel.account_sid_env) if tel.account_sid_env else None
-    secret = tenant.secret(tel.auth_token_env) if tel.auth_token_env else None
+    c = tenant.settings.pipeline.telephony.active_creds()
+    sid = tenant.secret(c.account_sid_env) if c.account_sid_env else None
+    secret = tenant.secret(c.auth_token_env) if c.auth_token_env else None
     headers = {}
     if sid and secret:
         headers["X-STRINGEE-AUTH"] = mint_server_token(sid, secret)

@@ -55,10 +55,12 @@ class TenantProviders:
             self.global_defaults.get(layer, {}),
             api_key=api_key,
         )
-        # Telephony has dual secrets (account_sid + auth_token).
+        # Telephony has dual secrets (account_sid + auth_token), resolved for the
+        # tenant's *configured* provider (a tenant may hold creds for several).
         if layer == "telephony":
-            merged["account_sid"] = tenant.secret(tenant_layer.account_sid_env)
-            merged["auth_token"] = tenant.secret(tenant_layer.auth_token_env)
+            creds = tenant_layer.active_creds()
+            merged["account_sid"] = tenant.secret(creds.account_sid_env)
+            merged["auth_token"] = tenant.secret(creds.auth_token_env)
         # Vector store gets its own per-tenant directory.
         if layer == "vector_store":
             tenant_path = self.base_vector_path / tenant.id
