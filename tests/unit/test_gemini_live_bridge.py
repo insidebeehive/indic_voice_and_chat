@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 
 import pytest
@@ -148,6 +149,30 @@ def test_telephony_bridge_does_not_greet_first():
     # Telephony keeps "caller says hello first" — no kickoff.
     from src.api.telephony_live_bridge import TelephonyLiveBridge
     assert TelephonyLiveBridge._greets_first is False
+
+
+@pytest.mark.asyncio
+async def test_idle_watchdog_forces_stop_when_session_hangs():
+    # The Live session went silent (stopped endpointing) — no model events arrive.
+    # The watchdog must force stop so the call tears down + emits an outcome
+    # instead of hanging forever with no response and no outcome.
+    import time
+    b, sess, agent = _bridge([])
+    b._idle_timeout_s = 0.02
+    b._idle_check_s = 0.01
+    b._last_event_at = time.monotonic() - 5     # already long idle
+    await asyncio.wait_for(b._idle_watchdog(), timeout=2)
+    assert b._stopped is True
+
+
+@pytest.mark.asyncio
+async def test_consume_events_marks_activity():
+    # Every model event resets the idle clock so the watchdog doesn't end a live call.
+    b, sess, agent = _bridge([RealtimeEvent(type="turn_complete")])
+    await agent.start()
+    assert b._last_event_at == 0.0
+    await b._consume_events()
+    assert b._last_event_at > 0.0
 
 
 @pytest.mark.asyncio
