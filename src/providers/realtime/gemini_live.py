@@ -86,6 +86,16 @@ class GeminiLiveSession(IRealtimeSession):
 
     @classmethod
     async def connect(cls, config: RealtimeConfig, *, api_key: str) -> "GeminiLiveSession":
+        import os
+
+        # Fail clearly when NO key resolves: the tenant's realtime.api_key_env is
+        # unset AND no platform GEMINI_API_KEY/GOOGLE_API_KEY env (the by-design
+        # fallback). Otherwise the SDK fails mid-connect with an opaque error.
+        if not api_key and not (
+                os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")):
+            raise RuntimeError(
+                "Gemini Live needs an API key: set the tenant's pipeline.realtime."
+                "api_key_env or the platform GEMINI_API_KEY / GOOGLE_API_KEY")
         from google import genai
         from google.genai import types
 

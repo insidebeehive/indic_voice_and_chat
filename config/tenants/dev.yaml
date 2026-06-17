@@ -29,7 +29,6 @@ slug: dev
 name: Dev / Smoke Test
 status: active
 default_language: hi
-webhook_secret_env: TENANT_DEV_WEBHOOK_SECRET
 
 pipeline:
   # layered = STT->LLM->TTS cascade (default). s2s = end-to-end speech-to-speech
