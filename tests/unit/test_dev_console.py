@@ -140,6 +140,35 @@ def test_dev_voices_per_mode():
         set_tenant_resolver(None)
 
 
+def test_place_call_passes_tenant_creds_to_adapter(monkeypatch):
+    """The dev place-call must build the adapter with the SELECTED provider's
+    per-tenant creds (no platform-env fallback) — Stringee gets them mapped onto
+    api_key_sid/api_key_secret."""
+    monkeypatch.setenv("DEV_STR_SID", "SK.dev-sid")
+    monkeypatch.setenv("DEV_STR_SECRET", "dev-secret")
+    captured = {}
+
+    class _FakeAdapter:
+        async def initiate_call(self, cfg):
+            return CallSession(session_id="CA1", status="ringing",
+                               to_number=cfg.to_number, from_number=cfg.from_number)
+
+    monkeypatch.setattr(devmod, "get_telephony_provider",
+                        lambda cfg: captured.update(cfg) or _FakeAdapter())
+    register_tenant_for_test(TenantSettings(
+        id="t_dev", slug="dev", name="Dev",
+        pipeline=TenantPipelineConfig(telephony=TenantTelephonyConfig(
+            provider="stringee", from_number="+918204268005",
+            webhook_base_url="https://example.test/api/v1/telephony",
+            account_sid_env="DEV_STR_SID", auth_token_env="DEV_STR_SECRET"))))
+    resp = _client().post("/dev/place-call", json={
+        "provider": "stringee", "to_number": "+918618795697", "mode": "s2s", "voice": "Kore"})
+    assert resp.status_code == 200, resp.text
+    assert captured["account_sid"] == "SK.dev-sid"
+    assert captured["api_key_sid"] == "SK.dev-sid"        # mapped for the Stringee adapter
+    assert captured["api_key_secret"] == "dev-secret"
+
+
 def test_place_call_no_caller_id_for_provider(monkeypatch):
     def _no_build(cfg):
         raise AssertionError("adapter should not be built without a caller-ID")

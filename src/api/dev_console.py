@@ -205,9 +205,25 @@ async def dev_place_call(req: PlaceCallRequest) -> dict:
             detail=(f"no caller-ID configured for '{provider}'. Set "
                     f"pipeline.telephony.outbound_from.{provider} in config/tenants/{req.tenant}.yaml."))
 
+    # Build the adapter with the SELECTED provider's per-tenant creds (the dropdown
+    # provider may differ from the tenant's default) — no platform-env fallback.
+    # Stringee's server adapter reads api_key_sid/api_key_secret (stored as the
+    # account_sid/auth_token), the others account_sid/auth_token.
+    def _cred(name):
+        try:
+            return tenant.secret(name) if name else None
+        except Exception:  # noqa: BLE001 - missing env → let the adapter decide
+            return None
+
+    pcreds = tel.creds_for(provider)
+    acct, auth = _cred(pcreds.account_sid_env), _cred(pcreds.auth_token_env)
     try:
-        adapter = get_telephony_provider({"provider": provider})
-    except Exception as e:  # noqa: BLE001 - e.g. missing credentials in env
+        adapter = get_telephony_provider({
+            "provider": provider,
+            "account_sid": acct, "auth_token": auth,
+            "api_key_sid": acct, "api_key_secret": auth,
+        })
+    except Exception as e:  # noqa: BLE001 - e.g. missing per-tenant credentials
         raise HTTPException(status_code=400, detail=f"telephony adapter for '{provider}' unavailable: {e}")
 
     # Thread the console's Mode/Voice/lead to the media-stream bridge factory.
