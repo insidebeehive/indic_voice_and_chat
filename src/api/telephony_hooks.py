@@ -355,7 +355,7 @@ async def _log_softphone_call(tenant: TenantContext, provider_call_sid: str, to_
 
     from sqlalchemy import select
 
-    from src.api.call_store import insert_call
+    from src.api.call_store import insert_call, mark_answered
     from src.models.conversation import Conversation
     from src.models.database import get_sessionmaker
 
@@ -371,6 +371,8 @@ async def _log_softphone_call(tenant: TenantContext, provider_call_sid: str, to_
                     provider_call_sid=provider_call_sid, channel="softphone", agent_type="human")
                 row.notes = f"manual softphone call → {to_number}"
                 await session.commit()
+            # The softphone answer IS the connect → mark answered (call.answered).
+            await mark_answered(session, provider_call_sid)
     except Exception:  # noqa: BLE001 — logging must never break; the call already connected
         log.exception("stringee softphone: manual-call logging failed", extra={
             "call_sid": provider_call_sid})

@@ -77,6 +77,8 @@ class TelephonyConfigIn(BaseModel):
     provider: str
     from_number: Optional[str] = None
     webhook_base_url: Optional[str] = None
+    events_webhook_url: Optional[str] = None        # outbound call-event callback
+    events_webhook_secret_env: Optional[str] = None  # env var naming the signing secret
     # Telephony credentials — the ONLY per-tenant secrets. Encrypted at rest.
     # e.g. {"account_sid": "AC...", "auth_token": "..."}. Optional for providers
     # (Stringee) whose adapter reads its keys from the platform env directly.
@@ -207,6 +209,8 @@ async def register_tenant(
             provider=tel.provider,
             from_number=tel.from_number,
             webhook_base_url=tel.webhook_base_url,
+            events_webhook_url=tel.events_webhook_url,
+            events_webhook_secret_env=tel.events_webhook_secret_env,
             **env_fields,
             # also record the creds under the provider-specific slot so a tenant
             # that later adds a second provider's keys resolves each correctly.
@@ -256,6 +260,8 @@ class TelephonyUpdateIn(BaseModel):
     provider: Optional[str] = None
     from_number: Optional[str] = None
     webhook_base_url: Optional[str] = None
+    events_webhook_url: Optional[str] = None
+    events_webhook_secret_env: Optional[str] = None
     keys: dict[str, str] = Field(default_factory=dict)
     phone_numbers: Optional[list[str]] = None
 
@@ -318,6 +324,10 @@ async def update_tenant(
             tel_cfg["from_number"] = tu.from_number
         if tu.webhook_base_url is not None:
             tel_cfg["webhook_base_url"] = tu.webhook_base_url
+        if tu.events_webhook_url is not None:
+            tel_cfg["events_webhook_url"] = tu.events_webhook_url
+        if tu.events_webhook_secret_env is not None:
+            tel_cfg["events_webhook_secret_env"] = tu.events_webhook_secret_env
 
         if tu.keys:
             if not crypto.has_key():
