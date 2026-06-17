@@ -93,10 +93,12 @@ async def test_blank_identity_rejected_422(client) -> None:
 
 async def test_stringee_token_carries_caller_id_from_number(client, monkeypatch) -> None:
     # The browser must place the call FROM the caller-ID number, so the token
-    # response carries it (bare, no "+") in params.from_number.
-    monkeypatch.setenv("STRINGEE_API_KEY_SID", "SK.test")
-    monkeypatch.setenv("STRINGEE_API_KEY_SECRET", "stringee-secret-1234567890")
-    _register("stringee", from_number="+918204268005")
+    # response carries it (bare, no "+") in params.from_number. Stringee creds are
+    # now per-tenant (no platform-env fallback) — configure the tenant's keys.
+    monkeypatch.setenv("STR_SID", "SK.test")
+    monkeypatch.setenv("STR_SECRET", "stringee-secret-1234567890")
+    _register("stringee", from_number="+918204268005",
+              account_sid_env="STR_SID", auth_token_env="STR_SECRET")
     resp = await client.post("/softphone/token", json={"agent_identity": "dev"})
     assert resp.status_code == 200
     body = resp.json()

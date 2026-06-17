@@ -23,7 +23,6 @@ our token endpoint server-side and passes the result to its browser.
 
 from __future__ import annotations
 
-import os
 import time
 from dataclasses import dataclass, field
 from typing import Optional
@@ -127,13 +126,15 @@ def _mint_stringee(
 
     c = tenant.settings.pipeline.telephony.active_creds()
     # Stringee reuses its account api_key_sid/secret (stored as account_sid/
-    # auth_token), falling back to the platform env the server adapter uses.
-    api_key_sid = tenant.secret(c.account_sid_env) or os.environ.get("STRINGEE_API_KEY_SID")
-    api_key_secret = tenant.secret(c.auth_token_env) or os.environ.get("STRINGEE_API_KEY_SECRET")
+    # auth_token). Per-tenant only — NO platform-env fallback: a tenant without
+    # Stringee keys configured can't mint a token (fail loudly, don't borrow the
+    # platform's account).
+    api_key_sid = tenant.secret(c.account_sid_env) if c.account_sid_env else None
+    api_key_secret = tenant.secret(c.auth_token_env) if c.auth_token_env else None
     if not (api_key_sid and api_key_secret):
         raise SoftphoneConfigError(
-            f"Stringee softphone needs api_key_sid + api_key_secret for tenant "
-            f"{tenant.slug!r} (account_sid/auth_token or STRINGEE_API_KEY_* env)"
+            f"Stringee softphone needs the tenant's api_key_sid + api_key_secret for "
+            f"{tenant.slug!r} (set the tenant's Stringee account_sid/auth_token)"
         )
 
     issued = now if now is not None else int(time.time())
