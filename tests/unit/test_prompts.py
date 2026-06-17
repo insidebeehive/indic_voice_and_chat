@@ -181,6 +181,18 @@ def test_s2s_system_instruction_has_persona_tool_no_envelope() -> None:
     assert "Devanagari" not in instr
 
 
+def test_s2s_instruction_warns_against_repeating_offers() -> None:
+    # The S2S model kept re-asking "shall I send the WhatsApp link?" every turn.
+    # The instruction must carry the same don't-repeat-a-CTA restraint the cascade
+    # has, so an offer is made once, not pitched every turn.
+    from src.dialogue.prompts import build_s2s_system_instruction
+    script = VoiceBotScript.from_campaign_yaml(SCRIPT)
+    schema = SlotSchema.from_campaign_yaml(yaml.safe_load(SLOT_YAML))
+    instr = build_s2s_system_instruction(script, schema).lower()
+    assert "don't repeat an offer" in instr
+    assert "once" in instr and "unless the customer asks" in instr
+
+
 def test_gender_directive_enforces_feminine_in_both_prompts() -> None:
     # Language-agnostic now: holds in whatever language the agent is speaking,
     # not just Hindi (so it survives a switch to Marathi etc.).
