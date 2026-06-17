@@ -15,7 +15,7 @@ from __future__ import annotations
 import logging
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -65,6 +65,7 @@ class CallStatusResponse(BaseModel):
 async def call_lead(
     campaign_id: str,
     req: CallLeadRequest,
+    request: Request,
     session: AsyncSession = Depends(get_db_session),
     tenant: TenantContext = Depends(current_tenant),
 ) -> CallLeadResponse:
@@ -93,6 +94,18 @@ async def call_lead(
         raise HTTPException(
             status_code=429,
             detail=f"max concurrent calls reached ({cap}); retry when a call ends")
+
+    # Per-tenant compliance gate: calling hours + DND, from the runtime registry
+    # (skipped only in tests/contexts where the registry isn't wired).
+    registry = getattr(request.app.state, "registry", None)
+    if registry is not None:
+        dnd = registry.dnd.get(tenant)
+        if not dnd.hours.can_call_now():
+            raise HTTPException(
+                status_code=403, detail="outside this tenant's configured calling hours")
+        if dnd.filter.is_blocked(req.to_number):
+            raise HTTPException(
+                status_code=403, detail="destination is on the tenant's DND list")
 
     from_number = req.from_number or (tel.outbound_from or {}).get(provider) or tel.from_number
     if not from_number:

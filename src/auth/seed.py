@@ -45,6 +45,10 @@ async def seed_tenants_from_yaml(session, tenant_dir=None) -> int:
         s = load_tenant(slug, base)
         row = await session.get(Tenant, s.id)
         cfg = s.pipeline.model_dump()
+        # Compliance is a top-level TenantSettings field (not in the pipeline); ride
+        # it inside the pipeline_config JSON so it round-trips without a migration.
+        # db_resolver pulls it back out (TenantPipelineConfig ignores the extra key).
+        cfg["compliance"] = s.compliance.model_dump()
         if row is None:
             session.add(Tenant(
                 id=s.id, slug=s.slug, name=s.name, status=s.status,

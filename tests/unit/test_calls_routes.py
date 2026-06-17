@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import pytest_asyncio
 from fastapi import FastAPI
@@ -162,6 +164,63 @@ async def test_call_lead_dials_with_tenant_creds(monkeypatch) -> None:
     # Mapped onto the keys the Stringee server adapter reads (not STRINGEE_* env).
     assert captured["api_key_sid"] == "ACTUAL-SID"
     assert captured["api_key_secret"] == "ACTUAL-SECRET"
+
+
+async def _app_with_registry(registry):
+    """A call_lead app with a given runtime registry wired (for the compliance gate)."""
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:", future=True)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    sm = async_sessionmaker(engine, expire_on_commit=False)
+    async with sm() as s:
+        s.add(Tenant(id="t1", slug="t1", name="T1"))
+        s.add(DbCampaign(id="c1", tenant_id="t1", name="C1", status="active", config_yaml=""))
+        await s.commit()
+
+    async def _override():
+        async with sm() as session:
+            yield session
+
+    set_tenant_resolver(None)
+    register_tenant_for_test(_tenant(), plaintext_tokens=["test-token"])
+    app = FastAPI()
+    app.include_router(calls.router)
+    app.dependency_overrides[get_db_session] = _override
+    app.state.registry = registry
+    return app, engine
+
+
+def _dnd_registry(*, can_call, blocked):
+    from src.bootstrap import TenantDnd
+    return SimpleNamespace(dnd=SimpleNamespace(get=lambda t: TenantDnd(
+        filter=SimpleNamespace(is_blocked=lambda n: blocked),
+        hours=SimpleNamespace(can_call_now=lambda: can_call))))
+
+
+async def test_call_lead_blocked_outside_calling_hours() -> None:
+    app, engine = await _app_with_registry(_dnd_registry(can_call=False, blocked=False))
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app),
+                               base_url="http://test", headers=HEADERS) as c:
+            resp = await c.post("/campaigns/c1/calls", json={"to_number": "+918618795697"})
+    finally:
+        set_tenant_resolver(None)
+        await engine.dispose()
+    assert resp.status_code == 403
+    assert "calling hours" in resp.json()["detail"]
+
+
+async def test_call_lead_blocked_dnd_number() -> None:
+    app, engine = await _app_with_registry(_dnd_registry(can_call=True, blocked=True))
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app),
+                               base_url="http://test", headers=HEADERS) as c:
+            resp = await c.post("/campaigns/c1/calls", json={"to_number": "+918618795697"})
+    finally:
+        set_tenant_resolver(None)
+        await engine.dispose()
+    assert resp.status_code == 403
+    assert "DND" in resp.json()["detail"]
 
 
 async def test_call_lead_inactive_campaign_409(ctx) -> None:
