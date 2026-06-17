@@ -1,14 +1,13 @@
-"""Unit tests for per-tenant DB-backed campaign resolution."""
+"""Unit tests for per-tenant DB-backed campaign resolution (no global fallback)."""
 
 from __future__ import annotations
 
+import pytest
 import pytest_asyncio
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from src.dialogue.campaign_loader import LoadedCampaign, parse_campaign_yaml
-from src.dialogue.campaign_resolver import DbCampaignResolver
-from src.dialogue.prompts import VoiceBotScript
-from src.dialogue.slots import SlotSchema
+from src.dialogue.campaign_loader import parse_campaign_yaml
+from src.dialogue.campaign_resolver import CampaignNotConfigured, DbCampaignResolver
 from src.models.campaign import Campaign
 from src.models.database import Base
 from src.models.tenant import Tenant
@@ -33,11 +32,6 @@ campaign:
     name: Maya
     company: Globex
 """
-
-# Explicit fallback so tests don't depend on the on-disk VOX_CAMPAIGN file.
-FALLBACK = LoadedCampaign(
-    VoiceBotScript.from_campaign_yaml({"name": "Fallbk", "company": "Plat"}),
-    SlotSchema())
 
 
 @pytest_asyncio.fixture
@@ -67,37 +61,32 @@ def test_parse_campaign_yaml_builds_script_and_slots():
 
 
 async def test_resolve_by_campaign_id_returns_that_campaign(sm):
-    r = DbCampaignResolver(sm, fallback=FALLBACK)
-    lc = await r.resolve("t1", "c_other")
+    lc = await DbCampaignResolver(sm).resolve("t1", "c_other")
     assert lc.script.agent_name == "Maya"          # the requested one, not the default
 
 
 async def test_resolve_cross_tenant_guard(sm):
     # c_t2 belongs to t2; t1 must NOT receive it — falls through to a t1 campaign.
-    r = DbCampaignResolver(sm, fallback=FALLBACK)
-    lc = await r.resolve("t1", "c_t2")
-    assert lc.script.company_name in ("Acme", "Globex")   # a t1 campaign, never Globex-as-t2
-    assert lc.script.agent_name != "Fallbk"               # t1 has active campaigns
+    lc = await DbCampaignResolver(sm).resolve("t1", "c_t2")
+    assert lc.script.company_name in ("Acme", "Globex")   # a t1 campaign, never t2's
 
 
 async def test_resolve_active_when_no_campaign_id(sm):
-    r = DbCampaignResolver(sm, fallback=FALLBACK)
-    lc = await r.resolve("t1")
+    lc = await DbCampaignResolver(sm).resolve("t1")
     assert lc.script.agent_name in ("Riya", "Maya")       # a t1 active campaign
 
 
-async def test_resolve_falls_back_when_tenant_has_no_campaign(sm):
-    r = DbCampaignResolver(sm, fallback=FALLBACK)
-    lc = await r.resolve("t_none")
-    assert lc.script.agent_name == "Fallbk"
+async def test_resolve_raises_when_tenant_has_no_campaign(sm):
+    # No global fallback: a tenant with no campaign cannot run a call.
+    with pytest.raises(CampaignNotConfigured):
+        await DbCampaignResolver(sm).resolve("t_none")
 
 
-async def test_resolve_parse_error_falls_back(sm):
+async def test_resolve_raises_on_invalid_config_yaml(sm):
     async with sm() as s:
         s.add(Tenant(id="t3", slug="t3", name="T3"))
         s.add(Campaign(id="c_bad", tenant_id="t3", name="bad", status="active",
                        config_yaml="just a plain string, not a campaign mapping"))
         await s.commit()
-    r = DbCampaignResolver(sm, fallback=FALLBACK)
-    lc = await r.resolve("t3", "c_bad")
-    assert lc.script.agent_name == "Fallbk"               # unparseable → safe fallback
+    with pytest.raises(CampaignNotConfigured):
+        await DbCampaignResolver(sm).resolve("t3", "c_bad")

@@ -1,14 +1,15 @@
 """Per-tenant, DB-backed campaign resolution.
 
 The live call resolves which campaign (agent script + slots) to run from the DB
-``campaigns`` table — per-tenant, and per-call by ``campaign_id`` — instead of the
-single global ``VOX_CAMPAIGN`` file baked into the bridge factories at startup.
+``campaigns`` table — per-tenant, and per-call by ``campaign_id``. There is
+intentionally **NO global fallback**: every tenant must have a configured
+campaign (the startup seed migrates one in), so a misconfigured tenant fails
+loudly rather than silently running some other tenant's / a global script.
 
 Resolution order (per call):
   1. an explicit ``campaign_id`` (guarded so it belongs to the tenant), else
   2. the tenant's single active campaign, else
-  3. a YAML fallback (the global ``load_campaign`` default) so the app always has
-     a script — e.g. a tenant with no campaign rows yet, or an unparseable config.
+  3. raise ``CampaignNotConfigured``.
 
 Resolution happens once per call setup (not per turn), so it queries the DB each
 time rather than maintaining a cache to invalidate — correctness over a micro-opt.
@@ -22,38 +23,22 @@ from typing import Optional
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from src.dialogue.campaign_loader import (
-    LoadedCampaign,
-    active_campaign_slug,
-    load_campaign,
-    parse_campaign_yaml,
-)
+from src.dialogue.campaign_loader import LoadedCampaign, parse_campaign_yaml
 from src.models.campaign import Campaign
 
 log = logging.getLogger(__name__)
 
 
+class CampaignNotConfigured(RuntimeError):
+    """A tenant has no usable DB campaign. There is no global fallback, so the
+    call cannot proceed — the caller should reject the connection clearly."""
+
+
 class DbCampaignResolver:
-    """Resolve a tenant's campaign from the DB, with a YAML fallback.
+    """Resolve a tenant's campaign (script + slots) from the DB."""
 
-    ``fallback`` is the script used when a tenant has no usable DB campaign; if
-    omitted it lazily loads the global ``VOX_CAMPAIGN`` file (so behaviour matches
-    today for un-migrated tenants).
-    """
-
-    def __init__(
-        self,
-        sessionmaker: async_sessionmaker[AsyncSession],
-        *,
-        fallback: Optional[LoadedCampaign] = None,
-    ) -> None:
+    def __init__(self, sessionmaker: async_sessionmaker[AsyncSession]) -> None:
         self._sm = sessionmaker
-        self._fallback = fallback
-
-    def _fallback_campaign(self) -> LoadedCampaign:
-        if self._fallback is None:
-            self._fallback = load_campaign(active_campaign_slug())
-        return self._fallback
 
     async def _row(
         self, session: AsyncSession, tenant_id: str, campaign_id: Optional[str]
@@ -77,14 +62,16 @@ class DbCampaignResolver:
     async def resolve(
         self, tenant_id: str, campaign_id: Optional[str] = None
     ) -> LoadedCampaign:
-        """Return the script + slots for this call. Never raises — any DB or parse
-        failure falls back to the YAML default so a call always has a script."""
+        """Return the script + slots for this call, or raise
+        ``CampaignNotConfigured`` when the tenant has no usable campaign."""
+        async with self._sm() as session:
+            row = await self._row(session, tenant_id, campaign_id)
+        if row is None:
+            raise CampaignNotConfigured(
+                f"tenant {tenant_id} has no campaign (campaign_id={campaign_id})")
         try:
-            async with self._sm() as session:
-                row = await self._row(session, tenant_id, campaign_id)
-            if row is not None:
-                return parse_campaign_yaml(row.config_yaml)
-        except Exception:  # noqa: BLE001 - resolution must never break a call
-            log.exception("campaign resolution failed; using fallback",
-                          extra={"tenant_id": tenant_id, "campaign_id": campaign_id})
-        return self._fallback_campaign()
+            return parse_campaign_yaml(row.config_yaml)
+        except Exception as e:  # noqa: BLE001 - a broken config_yaml must fail clearly
+            raise CampaignNotConfigured(
+                f"campaign {row.id} for tenant {tenant_id} has invalid config_yaml: {e}"
+            ) from e

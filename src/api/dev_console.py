@@ -119,6 +119,29 @@ async def dev_voices(request: Request, tenant: str = "dev") -> dict:
     }
 
 
+@dev_router.get("/dev/campaigns")
+async def dev_campaigns(tenant: str = "dev") -> dict:
+    """The tenant's campaigns, for the console's campaign selector. The selected
+    id is passed to the voice WS as ``?campaign=<id>`` and drives the agent's
+    script + slots for that call (per-tenant, no global fallback)."""
+    from sqlalchemy import select
+
+    from src.auth.middleware import tenant_from_slug
+    from src.models.campaign import Campaign
+    from src.models.database import get_sessionmaker
+
+    try:
+        tctx = await tenant_from_slug(tenant)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=404, detail=f"unknown tenant: {e}")
+    async with get_sessionmaker()() as s:
+        rows = (await s.execute(
+            select(Campaign).where(Campaign.tenant_id == tctx.id)
+            .order_by(Campaign.status.desc(), Campaign.created_at.desc())
+        )).scalars().all()
+    return {"campaigns": [{"id": c.id, "name": c.name, "status": c.status} for c in rows]}
+
+
 # --- Telephony control panel: place an outbound call + poll its status --------
 #
 # WebConsole runs in-browser (the WS routes above). The Telephony dropdown picks
@@ -284,7 +307,12 @@ async def dev_voice_ws(websocket: WebSocket) -> None:
         await websocket.close(code=1008, reason="unknown tenant")
         return
 
-    bridge = await _browser_bridge_factory(websocket, tenant)
+    try:
+        bridge = await _browser_bridge_factory(websocket, tenant)
+    except Exception as e:  # noqa: BLE001 - e.g. tenant has no campaign configured
+        log.warning("dev console bridge build failed: %s", e)
+        await websocket.close(code=1011, reason="no campaign configured for tenant")
+        return
     try:
         await _run_billed_session(tenant, bridge, mode="layered")
     except WebSocketDisconnect:

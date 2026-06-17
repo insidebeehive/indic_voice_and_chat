@@ -42,6 +42,11 @@
            s2s = realtime allowed voices. -->
       <select id="voice"></select>
     </label>
+    <label>Campaign
+      <!-- The tenant's campaigns (from /dev/campaigns); the call runs the selected
+           one's script + slots. -->
+      <select id="campaign"></select>
+    </label>
     <label>Telephony
       <select id="telephony">
         <option value="WebConsole">WebConsole (browser)</option>
@@ -193,6 +198,8 @@ async function start() {
   // Voice applies to both modes now: layered overrides the TTS voice, s2s the
   // realtime voice (both validated server-side against the allowed set).
   if ($("voice").value) qs += "&voice=" + encodeURIComponent($("voice").value);
+  // The selected campaign drives the agent's script + slots for this call.
+  if ($("campaign").value) qs += "&campaign=" + encodeURIComponent($("campaign").value);
   ws = new WebSocket(`${wsProto}://${location.host}${path}?${qs}`);
   ws.binaryType = "arraybuffer";
 
@@ -352,6 +359,24 @@ async function loadVoices() {
 }
 $("mode").addEventListener("change", () => populateVoices($("mode").value));
 loadVoices();
+
+// Campaign selector: the tenant's campaigns drive the agent's script per call.
+async function loadCampaigns() {
+  const sel = $("campaign");
+  try {
+    const r = await fetch("/dev/campaigns?tenant=dev");
+    if (!r.ok) return;
+    const data = await r.json();
+    sel.innerHTML = "";
+    for (const c of (data.campaigns || [])) {
+      const o = document.createElement("option");
+      o.value = c.id;
+      o.textContent = c.name + (c.status !== "active" ? " (" + c.status + ")" : "");
+      sel.appendChild(o);
+    }
+  } catch (e) { console.warn("[devconsole] campaigns fetch failed", e); }
+}
+loadCampaigns();
 
 async function placeCall(provider) {
   const to = ($("toNumber").value || "").trim();
