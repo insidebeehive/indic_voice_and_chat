@@ -11,7 +11,6 @@ Schema (all sections optional — global defaults fill the gaps):
     name: Acme Telecom
     status: active                  # active | suspended
     default_language: hi
-    webhook_secret_env: TENANT_ACME_WEBHOOK_SECRET
 
     pipeline:
       stt:
@@ -237,7 +236,6 @@ class TenantSettings(BaseModel):
     default_language: str = "hi"
     timezone: str = "Asia/Kolkata"  # IANA tz; resolves relative callback times
     max_concurrent_calls: int = 1   # per-tenant cap on simultaneous live calls
-    webhook_secret_env: Optional[str] = None
 
     pipeline: TenantPipelineConfig = Field(default_factory=TenantPipelineConfig)
     compliance: TenantCompliance = Field(default_factory=TenantCompliance)

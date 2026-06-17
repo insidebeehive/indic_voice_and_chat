@@ -3,7 +3,6 @@ slug: example
 name: Example Telecom
 status: active
 default_language: hi
-webhook_secret_env: TENANT_EXAMPLE_WEBHOOK_SECRET
 
 pipeline:
   stt:
