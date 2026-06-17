@@ -124,27 +124,61 @@ class TenantTTSConfig(BaseModel):
     api_key_env: Optional[str] = None
 
 
+class TelephonyCreds(BaseModel):
+    """The set of credential *_env references for one telephony provider.
+
+    Each field names a (synthetic) env var whose value lives encrypted in
+    tenant_secrets and resolves via TenantContext.secret. ``account_sid_env`` /
+    ``auth_token_env`` are the account credentials (Twilio account SID/token,
+    Stringee API Key SID/Secret); the ``api_key_*`` / ``twiml_app_sid_env`` are
+    Twilio browser-softphone-only extras.
+    """
+    account_sid_env: Optional[str] = None
+    auth_token_env: Optional[str] = None
+    api_key_sid_env: Optional[str] = None
+    api_key_secret_env: Optional[str] = None
+    twiml_app_sid_env: Optional[str] = None
+
+
 class TenantTelephonyConfig(BaseModel):
     provider: Optional[str] = None
     from_number: Optional[str] = None
     webhook_base_url: Optional[str] = None
+    # Top-level credential refs (legacy / single-provider tenants). Kept for
+    # backward compatibility; when ``creds_by_provider`` has an entry for the
+    # active provider it takes precedence (see ``active_creds``).
     account_sid_env: Optional[str] = None
     auth_token_env: Optional[str] = None
-    # Browser softphone (human agent ↔ lead) credentials. Distinct from the
-    # account_sid/auth_token used for server-side outbound dialing:
-    #   - Twilio mints a browser AccessToken from an API Key SID + Secret and a
-    #     TwiML App SID (whose Voice URL points at our softphone-twiml endpoint).
-    #   - Stringee reuses its account api_key_sid/secret (account_sid_env/
-    #     auth_token_env) to mint a client JWT — no extra fields needed.
-    # Like the other *_env fields these reference synthetic env-var names whose
-    # values live (encrypted) in tenant_secrets and resolve via TenantContext.secret.
     api_key_sid_env: Optional[str] = None
     api_key_secret_env: Optional[str] = None
     twiml_app_sid_env: Optional[str] = None
+    # Per-provider credential slots, so a tenant that has keys for more than one
+    # provider (e.g. Twilio + Stringee) resolves the set matching its configured
+    # ``provider`` — not whichever was registered first. {provider: TelephonyCreds}.
+    creds_by_provider: dict[str, TelephonyCreds] = Field(default_factory=dict)
     # Per-provider caller-IDs for the dev-console "place call" panel. The Telephony
     # dropdown picks the provider; this maps provider -> the number to dial *from*
     # (each provider needs its own owned number). e.g. {"twilio": "+1...", "exotel": "+91..."}.
     outbound_from: dict[str, str] = Field(default_factory=dict)
+
+    def creds_for(self, provider: Optional[str]) -> "TelephonyCreds":
+        """Credential refs for ``provider`` — its per-provider slot if present,
+        else the top-level fields (back-compat for single-provider tenants)."""
+        key = (provider or self.provider or "").lower()
+        slot = self.creds_by_provider.get(key)
+        if slot is not None:
+            return slot
+        return TelephonyCreds(
+            account_sid_env=self.account_sid_env,
+            auth_token_env=self.auth_token_env,
+            api_key_sid_env=self.api_key_sid_env,
+            api_key_secret_env=self.api_key_secret_env,
+            twiml_app_sid_env=self.twiml_app_sid_env,
+        )
+
+    def active_creds(self) -> "TelephonyCreds":
+        """Credential refs for the tenant's *configured* telephony provider."""
+        return self.creds_for(self.provider)
 
 
 class TenantVectorStoreConfig(BaseModel):

@@ -7,6 +7,7 @@ import pytest
 
 from src.auth.context import TenantContext
 from src.config_tenant import (
+    TelephonyCreds,
     TenantPipelineConfig,
     TenantSettings,
     TenantTelephonyConfig,
@@ -107,3 +108,32 @@ def test_blank_identity_rejected() -> None:
     tenant = _tenant("twilio")
     with pytest.raises(SoftphoneConfigError):
         mint_browser_credentials(tenant, "")
+
+
+def test_provider_creds_selected_by_configured_provider() -> None:
+    """A tenant holding BOTH Twilio and Stringee creds mints with the set that
+    matches its configured provider — not whichever is top-level."""
+    settings = TenantSettings(
+        id="t1", slug="dev", name="Dev",
+        pipeline=TenantPipelineConfig(
+            telephony=TenantTelephonyConfig(
+                provider="stringee",
+                # top-level holds the (stale) Twilio creds
+                account_sid_env="TWILIO_SID", auth_token_env="TWILIO_TOK",
+                creds_by_provider={
+                    "twilio": TelephonyCreds(
+                        account_sid_env="TWILIO_SID", auth_token_env="TWILIO_TOK"),
+                    "stringee": TelephonyCreds(
+                        account_sid_env="STR_SID", auth_token_env="STR_SECRET"),
+                },
+            ),
+        ),
+    )
+    tenant = TenantContext(settings=settings, secrets_resolved={
+        "TWILIO_SID": "AC_twilio", "TWILIO_TOK": "twilio-tok",
+        "STR_SID": "SK_stringee", "STR_SECRET": "stringee-secret",
+    })
+    creds = mint_browser_credentials(tenant, "dev", now=1_000)
+    claims = jwt.decode(creds.token, "stringee-secret", algorithms=["HS256"],
+                        options={"verify_exp": False})
+    assert claims["iss"] == "SK_stringee"   # the Stringee SID, not the Twilio AC_…

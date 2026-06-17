@@ -90,11 +90,11 @@ def _mint_twilio(tenant: TenantContext, identity: str, ttl: int) -> SoftphoneCre
     from twilio.jwt.access_token import AccessToken
     from twilio.jwt.access_token.grants import VoiceGrant
 
-    tel = tenant.settings.pipeline.telephony
-    account_sid = tenant.secret(tel.account_sid_env)
-    api_key_sid = tenant.secret(tel.api_key_sid_env)
-    api_key_secret = tenant.secret(tel.api_key_secret_env)
-    twiml_app_sid = tenant.secret(tel.twiml_app_sid_env)
+    c = tenant.settings.pipeline.telephony.active_creds()
+    account_sid = tenant.secret(c.account_sid_env)
+    api_key_sid = tenant.secret(c.api_key_sid_env)
+    api_key_secret = tenant.secret(c.api_key_secret_env)
+    twiml_app_sid = tenant.secret(c.twiml_app_sid_env)
 
     missing = [
         label for label, val in (
@@ -125,11 +125,11 @@ def _mint_stringee(
 ) -> SoftphoneCredentials:
     import jwt  # PyJWT
 
-    tel = tenant.settings.pipeline.telephony
+    c = tenant.settings.pipeline.telephony.active_creds()
     # Stringee reuses its account api_key_sid/secret (stored as account_sid/
     # auth_token), falling back to the platform env the server adapter uses.
-    api_key_sid = tenant.secret(tel.account_sid_env) or os.environ.get("STRINGEE_API_KEY_SID")
-    api_key_secret = tenant.secret(tel.auth_token_env) or os.environ.get("STRINGEE_API_KEY_SECRET")
+    api_key_sid = tenant.secret(c.account_sid_env) or os.environ.get("STRINGEE_API_KEY_SID")
+    api_key_secret = tenant.secret(c.auth_token_env) or os.environ.get("STRINGEE_API_KEY_SECRET")
     if not (api_key_sid and api_key_secret):
         raise SoftphoneConfigError(
             f"Stringee softphone needs api_key_sid + api_key_secret for tenant "
