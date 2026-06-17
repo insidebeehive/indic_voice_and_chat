@@ -380,7 +380,11 @@ def build_s2s_system_instruction(
         "3. THEN nudge gently toward your objective with ONE short line; talking points are "
         "material, not a checklist to read out.\n"
         "4. REDIRECT ONLY WHEN the input is unrelated: briefly acknowledge, then steer back. "
-        "On-topic questions/concerns: answer, never deflect."
+        "On-topic questions/concerns: answer, never deflect.\n"
+        "5. DON'T REPEAT AN OFFER: once you've offered the WhatsApp link / bonus / next step, "
+        "do NOT bring it up again unless the customer asks — make the offer ONCE, when there's "
+        "genuine interest, then move on. Re-asking 'shall I send the link?' every turn sounds "
+        "robotic and pushy."
     )
 
     if script.objective:
@@ -414,7 +418,11 @@ def build_s2s_system_instruction(
             extra = (f" (one of: {', '.join(spec.values)})" if spec.values
                      else f" ({spec.type.value})")
             slot_lines.append(f"  {mark} {name}{extra}")
-        parts.append("Information to collect (* = required):\n" + "\n".join(slot_lines))
+        parts.append(
+            "Information to capture passively as you learn it from the conversation "
+            "(* = required) — report via record_turn_signal's updated_slots. Do NOT "
+            "interrogate the customer to fill these; infer them from what they say:\n"
+            + "\n".join(slot_lines))
 
     if lead_data:
         parts.append("Known lead data: " + json.dumps(lead_data, ensure_ascii=False))
