@@ -14,6 +14,7 @@ Lifespan-based startup:
 
 from __future__ import annotations
 
+import asyncio
 import os
 import sys
 from collections.abc import AsyncIterator
@@ -85,6 +86,29 @@ def _parse_callback(value):
         return datetime.fromisoformat(value)
     except (ValueError, TypeError):
         return None
+
+
+# How often the background sweep auto-closes calls stuck in an active status
+# (their finalization never fired). See call_store.reap_stale_calls.
+_REAP_INTERVAL_S = 600
+
+
+async def _reap_stale_calls_loop() -> None:
+    """Periodically close conversation rows stuck `in_progress`/`answered` so a
+    call whose finalization never fired (e.g. no recording webhook) doesn't
+    linger forever. Runs once at startup, then every _REAP_INTERVAL_S."""
+    from src.api.call_store import reap_stale_calls
+
+    sm = get_sessionmaker()
+    while True:
+        try:
+            async with sm() as s:
+                n = await reap_stale_calls(s)
+            if n:
+                log.info("reaped stale active calls", extra={"count": n})
+        except Exception:  # noqa: BLE001 - the reaper must never die (CancelledError still propagates)
+            log.exception("stale-call reaper failed")
+        await asyncio.sleep(_REAP_INTERVAL_S)
 
 
 @asynccontextmanager
@@ -180,10 +204,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     telephony_hooks.set_softphone_providers(providers)
     app.state.providers = providers
 
+    reaper_task = asyncio.create_task(_reap_stale_calls_loop())
+
     try:
         yield
     finally:
         log.info("shutdown")
+        reaper_task.cancel()
         telephony_hooks.set_bridge_factory(None)
         telephony_hooks.set_exotel_bridge_factory(None)
         telephony_hooks.set_stringee_bridge_factory(None)

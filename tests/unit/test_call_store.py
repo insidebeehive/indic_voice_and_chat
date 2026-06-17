@@ -236,3 +236,36 @@ async def test_deliver_to_persister_swallows_errors(sm):
         await deliver_to_persister("sid", {"outcome": "x"})
     finally:
         set_call_outcome_persister(None)
+
+
+async def test_reap_stale_calls_closes_only_old_active(sm):
+    from datetime import datetime, timedelta
+
+    from sqlalchemy import select
+
+    from src.api.call_store import reap_stale_calls
+    from src.models.conversation import Conversation
+
+    old = datetime.utcnow() - timedelta(hours=2)
+    async with sm() as s:
+        s.add_all([
+            _conv(id="c_old", provider_call_sid="old", status="in_progress", started_at=old),
+            _conv(id="c_answered_old", provider_call_sid="ans", status="answered", started_at=old),
+            _conv(id="c_recent", provider_call_sid="recent", status="in_progress",
+                  started_at=datetime.utcnow()),
+            _conv(id="c_ended", provider_call_sid="end", status="ended", started_at=old),
+        ])
+        await s.commit()
+
+        n = await reap_stale_calls(s, older_than_minutes=30)
+        assert n == 2   # only the two OLD active rows
+
+        rows = {r.id: r for r in (await s.execute(select(Conversation))).scalars().all()}
+        assert rows["c_old"].status == "ended" and rows["c_old"].ended_at is not None
+        assert "auto-closed" in (rows["c_old"].notes or "")
+        assert rows["c_answered_old"].status == "ended"
+        assert rows["c_recent"].status == "in_progress"   # too recent — untouched
+        assert rows["c_ended"].status == "ended"          # already ended — untouched
+
+        # Idempotent: a second sweep closes nothing new.
+        assert await reap_stale_calls(s, older_than_minutes=30) == 0

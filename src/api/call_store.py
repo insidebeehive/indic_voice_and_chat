@@ -10,7 +10,7 @@ bridge teardown share one implementation.
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Awaitable, Callable, Optional
 
 from sqlalchemy import func, select
@@ -242,3 +242,34 @@ async def record_outcome(
     )
     await session.commit()
     return row
+
+
+# A call that never reaches finalization (record_outcome) — e.g. a telephony call
+# whose recording webhook never fires, an abandoned/diagnostic hit, or a
+# connection that dies before the finalize step — would otherwise linger in an
+# active status forever. A periodic sweep closes them.
+STALE_CALL_MINUTES = 30
+
+
+async def reap_stale_calls(
+    session: AsyncSession, *, older_than_minutes: int = STALE_CALL_MINUTES
+) -> int:
+    """Auto-close conversation rows stuck in an active status (in_progress /
+    answered) longer than ``older_than_minutes`` — their finalization never
+    fired. Sets ``status='ended'`` + ``ended_at`` + a note. Returns the count
+    closed. Safe to run repeatedly (already-ended rows are untouched)."""
+    cutoff = datetime.utcnow() - timedelta(minutes=older_than_minutes)
+    rows = (await session.execute(
+        select(Conversation).where(
+            Conversation.status.in_(ACTIVE_STATUSES),
+            Conversation.started_at < cutoff,
+        )
+    )).scalars().all()
+    note = f"auto-closed: no finalization within {older_than_minutes}m"
+    for row in rows:
+        row.status = "ended"
+        row.ended_at = row.ended_at or datetime.utcnow()
+        row.notes = f"{row.notes}\n{note}" if row.notes else note
+    if rows:
+        await session.commit()
+    return len(rows)
