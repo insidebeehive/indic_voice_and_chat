@@ -143,6 +143,30 @@ class GeminiLLMAdapter(ILLMProvider):
             raw_response=_dump(response),
         )
 
+    async def transcribe_audio(self, audio: bytes, mime_type: str = "audio/mpeg") -> str:
+        """Transcribe a complete audio recording (e.g. a call mp3) to text via
+        Gemini multimodal — strong on Indian languages + Hindi/English code-switch,
+        and handles long, mono recordings the live turn-STT can't. Returns "" on
+        failure (analysis then falls back, never crashes)."""
+        prompt = (
+            "Transcribe this phone call audio verbatim. Preserve the original "
+            "languages exactly as spoken (Hindi/English/other code-switching). "
+            "Output ONLY the transcript text — no commentary, labels, or translation."
+        )
+        contents = [{"role": "user", "parts": [
+            {"text": prompt},
+            {"inline_data": {"mime_type": mime_type, "data": audio}},
+        ]}]
+        try:
+            response = await self._call_with_retry(
+                lambda: self._client.aio.models.generate_content(
+                    model=self._default_model, contents=contents),
+                what="transcribe")
+            return self._extract_text(response) or ""
+        except Exception:  # noqa: BLE001 - transcription failure must not crash finalize
+            log.exception("gemini audio transcription failed")
+            return ""
+
     async def generate_stream(
         self,
         messages: list[LLMMessage],

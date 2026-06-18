@@ -458,53 +458,55 @@ async def stringee_softphone_recording(
     return Response(status_code=200)
 
 
-def _softphone_channels(audio: bytes, language: Optional[str]):
-    """Build (channels, STTConfig) from a downloaded recording.
-
-    A **stereo WAV** is split into agent (left) + lead (right) channels for role
-    attribution. Anything else — Stringee records **mono mp3** — is one mixed
-    track passed to STT as-is (no channel split; the provider auto-detects mp3).
-    """
-    from src.interfaces.stt import STTConfig
-    from src.pipeline.audio_utils import pcm16_to_wav, wav_split_stereo
-
+def _recording_mime(audio: bytes) -> str:
+    """Sniff the recording's content type for the multimodal transcriber."""
     if audio[:4] == b"RIFF":
-        left, right, sr = wav_split_stereo(audio)
-        channels = [("assistant", pcm16_to_wav(left, sr)), ("user", pcm16_to_wav(right, sr))]
-        return channels, STTConfig(language=language, sample_rate=sr)
-    return [("user", audio)], STTConfig(language=language)
+        return "audio/wav"
+    return "audio/mpeg"   # Stringee records mono mp3
 
 
 async def _finalize_softphone_recording(
     tenant: TenantContext, call_id: str, rec_url: str, dur_ms: int | None,
 ) -> None:
-    """Fetch the recording (retry-on-404), transcribe, analyze, and persist the
-    outcome. Background task → opens its own DB session."""
+    """Fetch the recording (retry-on-404), transcribe it with the tenant's
+    multimodal LLM (Gemini — strong on Indian languages, handles the long mono mp3
+    the turn-STT can't), analyze, and persist the outcome. Background task → own
+    DB session."""
     from datetime import datetime, timezone
 
     from src.analysis.manual_call import finalize_manual_call
+    from src.interfaces.llm import LLMMessage
     from src.models.database import get_sessionmaker
 
     try:
         audio = await _download_stringee_recording(rec_url, tenant)
-        channels, stt_config = _softphone_channels(audio, tenant.settings.pipeline.stt.language)
-    except Exception:  # noqa: BLE001 — a fetch/parse failure must not break anything
-        log.exception("stringee softphone recording fetch/split failed", extra={"call_id": call_id})
+    except Exception:  # noqa: BLE001 — a fetch failure must not break anything
+        log.exception("stringee softphone recording fetch failed", extra={"call_id": call_id})
         return
 
-    stt = _softphone_providers.get_stt(tenant)
     llm = _softphone_providers.get_llm(tenant)
+    transcribe = getattr(llm, "transcribe_audio", None)
+    if transcribe is None:
+        log.warning("softphone recording: LLM %s has no audio transcription; skipping outcome",
+                    type(llm).__name__, extra={"call_id": call_id})
+        return
+    try:
+        text = await transcribe(audio, _recording_mime(audio))
+    except Exception:  # noqa: BLE001
+        log.exception("stringee softphone recording transcription failed", extra={"call_id": call_id})
+        return
+    transcript = [LLMMessage(role="user", content=text)] if (text or "").strip() else []
+
     sm = _softphone_sessionmaker or get_sessionmaker()
     try:
         async with sm() as session:
             row = await finalize_manual_call(
-                session, provider_call_sid=call_id, channels=channels,
-                stt=stt, stt_config=stt_config, llm=llm,
+                session, provider_call_sid=call_id, transcript=transcript, llm=llm,
                 tenant_timezone=tenant.settings.timezone,
                 now=datetime.now(timezone.utc), duration_ms=dur_ms, recording_url=rec_url)
         log.info("stringee softphone recording finalized", extra={
             "tenant": tenant.slug, "call_id": call_id, "found": row is not None,
-            "outcome": getattr(row, "outcome", None)})
+            "outcome": getattr(row, "outcome", None), "transcript_chars": len(text or "")})
     except Exception:  # noqa: BLE001 — never raise from a background task
         log.exception("stringee softphone recording finalize failed", extra={"call_id": call_id})
 
