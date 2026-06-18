@@ -64,3 +64,19 @@ async def test_resolver_rebuilds_settings_and_splits_secrets(sm, monkeypatch):
     assert (await r.resolve_by_token(hash_api_token("tok-abc"))).slug == "acme"
     assert (await r.resolve_by_phone_number("+1555")).slug == "acme"
     assert await r.resolve_by_slug("nope") is None
+
+
+def test_secret_optional_tenant_then_env_then_none(monkeypatch):
+    """Optional secrets (e.g. webhook signing) resolve from the decrypted per-tenant
+    secrets first, then process env, and return None (NOT raise) when unset."""
+    from src.auth.context import TenantContext
+    from src.config_tenant import TenantSettings
+
+    ctx = TenantContext(
+        settings=TenantSettings(id="t1", slug="t1", name="T1"),
+        secrets_resolved={"CRM_SIGNING_SECRET": "tenant-secret"})
+    assert ctx.secret_optional("CRM_SIGNING_SECRET") == "tenant-secret"  # per-tenant wins
+    monkeypatch.setenv("ENV_ONLY_SECRET", "from-env")
+    assert ctx.secret_optional("ENV_ONLY_SECRET") == "from-env"          # env fallback
+    assert ctx.secret_optional("MISSING_SECRET") is None                 # no raise (unlike secret())
+    assert ctx.secret_optional(None) is None

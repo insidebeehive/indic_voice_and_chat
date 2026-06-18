@@ -180,7 +180,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         if not url:
             return
         secret_env = getattr(tel, "events_webhook_secret_env", None)
-        secret = os.environ.get(secret_env) if secret_env else None
+        # Resolve the signing secret from the tenant's DECRYPTED secrets first
+        # (so it can be stored per-tenant like the telephony keys), falling back
+        # to process env. secret_optional() never raises — a missing secret just
+        # means the event is sent unsigned.
+        secret = None
+        if secret_env:
+            resolver = getattr(app.state, "tenant_resolver", None)
+            ctx = None
+            if resolver is not None and settings is not None and hasattr(resolver, "resolve_by_slug"):
+                ctx = await resolver.resolve_by_slug(settings.slug)
+            secret = ctx.secret_optional(secret_env) if ctx else os.environ.get(secret_env)
         # Detached so delivery (retries/backoff) never blocks the caller.
         asyncio.create_task(deliver_tenant_event(url, envelope, secret))
     set_tenant_event_notifier(_notify_tenant_event)

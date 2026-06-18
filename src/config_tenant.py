@@ -151,7 +151,8 @@ class TenantTelephonyConfig(BaseModel):
     # Outbound CALL-EVENT webhook (distinct from webhook_base_url, the INBOUND
     # telephony callback): where we POST call.initiated/answered/completed (+ the
     # LLM outcome) for this tenant's calls, signed with the secret named by
-    # events_webhook_secret_env (value resolved via TenantContext.secret).
+    # events_webhook_secret_env — resolved via TenantContext.secret_optional
+    # (per-tenant decrypted secret first, then process env; unset = sent unsigned).
     events_webhook_url: Optional[str] = None
     events_webhook_secret_env: Optional[str] = None
     # Top-level credential refs (legacy / single-provider tenants). Kept for

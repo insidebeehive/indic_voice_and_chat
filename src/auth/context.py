@@ -8,6 +8,7 @@ tenant-aware accepts one of these.
 from __future__ import annotations
 
 import hashlib
+import os
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -43,6 +44,16 @@ class TenantContext:
         if env_var in self.secrets_resolved:          # per-tenant telephony key
             return self.secrets_resolved[env_var]
         return self.settings.secret(env_var)          # master env (stt/llm/tts/s2s)
+
+    def secret_optional(self, env_var: Optional[str]) -> Optional[str]:
+        """Like ``secret()`` but returns None instead of raising when the name is
+        unset — for OPTIONAL secrets (e.g. the webhook signing key) where absence
+        just means "send unsigned". Per-tenant decrypted secret first, then env."""
+        if env_var is None:
+            return None
+        if env_var in self.secrets_resolved:          # per-tenant decrypted secret
+            return self.secrets_resolved[env_var]
+        return os.environ.get(env_var)                # env fallback, never raises
 
 
 def hash_api_token(plaintext: str) -> str:
