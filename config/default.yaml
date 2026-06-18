@@ -19,7 +19,7 @@ database:
 pipeline:
   stt:
     provider: sarvam
-    model: saaras:v2
+    model: saaras:v3
     language: hi-IN
     confidence_threshold: 0.6
     fallback_provider: groq

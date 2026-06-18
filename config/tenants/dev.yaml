@@ -41,7 +41,7 @@ pipeline:
   # transcribe languages Deepgram streaming can't (ml/pa/od) by dropping to batch.
   stt:
     provider: sarvam
-    model: saaras:v2
+    model: saaras:v3
     language: hi-IN
     api_key_env: TENANT_DEV_SARVAM_KEY
 
