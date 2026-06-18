@@ -172,6 +172,92 @@ async def test_update_tenant_stores_events_webhook_secret(ctx) -> None:
     assert ctx2.secret_optional(tel.events_webhook_secret_env) == "s3cret-value"
 
 
+_CAMP_YAML = """
+campaign:
+  id: c1
+  name: "Old Name"
+  status: active
+  agent:
+    name: "Anaaya"
+    company: "OldCo"
+    role: "Sales"
+  script:
+    greeting: "Hi from OldCo"
+    talking_points:
+      - "point one"
+    knowledge:
+      safety: "safe"
+  slots:
+    interest_level:
+      type: enum
+      values: [hot, cold]
+"""
+
+
+async def _seed_campaign(sm, tenant_id, cid="c1"):
+    from src.models.campaign import Campaign
+    async with sm() as s:
+        s.add(Campaign(id=cid, tenant_id=tenant_id, name="Old Name",
+                       status="active", config_yaml=_CAMP_YAML))
+        await s.commit()
+
+
+async def test_list_tenant_campaigns_returns_structured_script(ctx) -> None:
+    client, _, sm = ctx
+    tid = (await client.post(
+        "/tenants", json=_body(slug="acme"), headers=ADMIN_HEADERS)).json()["tenant_id"]
+    await _seed_campaign(sm, tid)
+
+    r = await client.get(f"/tenants/{tid}/campaigns", headers=ADMIN_HEADERS)
+    assert r.status_code == 200
+    camp = r.json()["campaigns"][0]
+    assert camp["id"] == "c1" and camp["status"] == "active"
+    sc = camp["script"]
+    assert sc["company"] == "OldCo"
+    assert sc["greeting"] == "Hi from OldCo"
+    assert sc["talking_points"] == ["point one"]
+    assert sc["knowledge"]["safety"] == "safe"
+
+
+async def test_update_campaign_script_preserves_slots_and_persists(ctx) -> None:
+    import yaml
+    from src.models.campaign import Campaign
+
+    client, _, sm = ctx
+    tid = (await client.post(
+        "/tenants", json=_body(slug="acme"), headers=ADMIN_HEADERS)).json()["tenant_id"]
+    await _seed_campaign(sm, tid)
+
+    r = await client.put(
+        f"/tenants/{tid}/campaigns/c1",
+        json={"company": "XYZ", "greeting": "Hi from {company_name}",
+              "talking_points": ["p1", "p2"]},
+        headers=ADMIN_HEADERS)
+    assert r.status_code == 200, r.text
+
+    g = (await client.get(f"/tenants/{tid}/campaigns", headers=ADMIN_HEADERS)).json()["campaigns"][0]
+    assert g["script"]["company"] == "XYZ"
+    assert g["script"]["greeting"] == "Hi from {company_name}"
+    assert g["script"]["talking_points"] == ["p1", "p2"]
+
+    # unmodeled keys (slots) and untouched fields (agent.name) are preserved
+    async with sm() as s:
+        row = (await s.execute(select(Campaign).where(Campaign.id == "c1"))).scalar_one()
+    camp = yaml.safe_load(row.config_yaml)["campaign"]
+    assert "interest_level" in camp["slots"]
+    assert camp["agent"]["name"] == "Anaaya"
+
+
+async def test_update_campaign_cross_tenant_404(ctx) -> None:
+    client, _, sm = ctx
+    tid = (await client.post(
+        "/tenants", json=_body(slug="acme"), headers=ADMIN_HEADERS)).json()["tenant_id"]
+    await _seed_campaign(sm, "t_other")   # campaign belongs to a different tenant
+    r = await client.put(f"/tenants/{tid}/campaigns/c1",
+                         json={"company": "X"}, headers=ADMIN_HEADERS)
+    assert r.status_code == 404
+
+
 async def test_update_tenant_status_and_404(ctx) -> None:
     client, _, _ = ctx
     tid = (await client.post(

@@ -64,10 +64,12 @@
       <div class="tab active" id="tab_an" onclick="showTab('an')">Analytics</div>
       <div class="tab" id="tab_bill" onclick="showTab('bill')">Billing</div>
       <div class="tab" id="tab_tel" onclick="showTab('tel')">Telephony</div>
+      <div class="tab" id="tab_camp" onclick="showTab('camp')">Campaign</div>
     </div>
     <div id="pane_an"></div>
     <div id="pane_bill" hidden></div>
     <div id="pane_tel" hidden></div>
+    <div id="pane_camp" hidden></div>
   </div>
 </div>
 
@@ -140,9 +142,10 @@ async function selectTenant(id, slug) {
   await loadAnalytics(id);
   await loadBilling(id);
   loadTelephony(id);
+  loadCampaigns(id);
 }
 function showTab(which) {
-  for (const k of ["an", "bill", "tel"]) {
+  for (const k of ["an", "bill", "tel", "camp"]) {
     $("tab_" + k).classList.toggle("active", which === k);
     $("pane_" + k).hidden = which !== k;
   }
@@ -263,6 +266,106 @@ async function saveTelephony(id) {
     $("te_result").textContent = "✓ saved — resolver refreshed";
   } else {
     $("te_result").textContent = `✗ ${r.status}: ${r.json.detail || r.json.error || "error"}`;
+  }
+}
+
+// --- Campaign script editor ---------------------------------------------
+let CAMPAIGNS = {};   // campaign_id -> {id, name, status, script}
+const _lines = (a) => (a || []).join("\n");
+const _toList = (s) => (s || "").split("\n").map(x => x.trim()).filter(Boolean);
+const escA = (s) => String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;");
+const escT = (s) => String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;");
+
+async function loadCampaigns(id) {
+  const r = await api(`/api/v1/tenants/${id}/campaigns`);
+  if (!r.ok) { $("pane_camp").innerHTML = `<span class="hint">campaigns error ${r.status}</span>`; return; }
+  const camps = r.json.campaigns || [];
+  CAMPAIGNS = {};
+  camps.forEach(c => { CAMPAIGNS[c.id] = c; });
+  if (!camps.length) { $("pane_camp").innerHTML = `<span class="hint">No campaigns for this tenant.</span>`; return; }
+  const opts = camps.map(c => `<option value="${escA(c.id)}">${escT(c.name)} (${c.status})</option>`).join("");
+  $("pane_camp").innerHTML = `
+    <div class="hint" style="margin-bottom:.6rem;">Edit the voicebot script. Saved to the campaign in the DB
+      and read live on the next call (no redeploy). PATCHes <code>/api/v1/tenants/${id}/campaigns/&lt;id&gt;</code>.</div>
+    <label>Campaign <select id="c_select" onchange="renderCampaignForm('${id}')">${opts}</select></label>
+    <div id="c_form" style="margin-top:.7rem;"></div>`;
+  renderCampaignForm(id);
+}
+
+function _field(label, fid, val, ta) {
+  return ta
+    ? `<label style="flex:1 1 100%;">${label}<textarea id="${fid}" rows="2" style="width:100%;">${escT(val)}</textarea></label>`
+    : `<label>${label}<input id="${fid}" value="${escA(val)}" /></label>`;
+}
+
+function renderCampaignForm(tenantId) {
+  const c = CAMPAIGNS[$("c_select").value];
+  if (!c) return;
+  const s = c.script || {};
+  const kn = s.knowledge || {};
+  const knRows = Object.entries(kn).map(([k, v]) =>
+    `<div class="creds" data-kn-row style="gap:.4rem;">
+       <input data-kn-key value="${escA(k)}" placeholder="key" style="width:11rem;" />
+       <input data-kn-val value="${escA(v)}" placeholder="response" style="flex:1 1 20rem;" /></div>`).join("");
+  $("c_form").innerHTML = `
+    <div class="creds" style="gap:.6rem;">
+      ${_field("Campaign name", "c_name", c.name)}
+      ${_field("Agent name", "c_agent_name", s.agent_name)}
+      ${_field("Company", "c_company", s.company)}
+      ${_field("Role", "c_role", s.role)}
+      ${_field("Personality", "c_personality", s.personality)}
+      ${_field("Language", "c_language", s.language)}
+      ${_field("Gender", "c_gender", s.gender)}
+      ${_field("Conversation style", "c_conversation_style", s.conversation_style)}
+      ${_field("Max turns", "c_max_turns", s.max_turns)}
+    </div>
+    <div class="creds" style="gap:.6rem;margin-top:.5rem;">
+      ${_field("Greeting", "c_greeting", s.greeting, true)}
+      ${_field("Objective", "c_objective", s.objective, true)}
+      ${_field("Closing", "c_closing", s.closing, true)}
+      ${_field("Talking points (one per line)", "c_talking_points", _lines(s.talking_points), true)}
+      ${_field("Do's (one per line)", "c_dos", _lines(s.dos), true)}
+      ${_field("Don'ts (one per line)", "c_donts", _lines(s.donts), true)}
+    </div>
+    <h2 style="margin-top:.7rem;">Knowledge / objection responses</h2>
+    <div id="c_knowledge">${knRows}</div>
+    <button class="ghost sm" onclick="document.getElementById('c_knowledge').insertAdjacentHTML('beforeend', _knRow())">+ add</button>
+    <div style="margin-top:.8rem;">
+      <button onclick="saveCampaign('${tenantId}', '${escA(c.id)}')">Save script</button>
+      <span id="c_result" class="hint" style="margin-left:.6rem;"></span>
+    </div>`;
+}
+
+function _knRow() {
+  return `<div class="creds" data-kn-row style="gap:.4rem;">
+    <input data-kn-key placeholder="key" style="width:11rem;" />
+    <input data-kn-val placeholder="response" style="flex:1 1 20rem;" /></div>`;
+}
+
+async function saveCampaign(tenantId, campId) {
+  const v = (x) => ($(x).value || "").trim();
+  const knowledge = {};
+  document.querySelectorAll("#c_knowledge [data-kn-row]").forEach(row => {
+    const k = (row.querySelector("[data-kn-key]").value || "").trim();
+    const val = (row.querySelector("[data-kn-val]").value || "").trim();
+    if (k) knowledge[k] = val;
+  });
+  const body = {
+    name: v("c_name"), agent_name: v("c_agent_name"), company: v("c_company"),
+    role: v("c_role"), personality: v("c_personality"), language: v("c_language"),
+    gender: v("c_gender"), conversation_style: v("c_conversation_style"),
+    max_turns: Number(v("c_max_turns")) || 0,
+    greeting: v("c_greeting"), objective: v("c_objective"), closing: v("c_closing"),
+    talking_points: _toList(v("c_talking_points")), dos: _toList(v("c_dos")),
+    donts: _toList(v("c_donts")), knowledge,
+  };
+  $("c_result").textContent = "saving…";
+  const r = await apiSend("PUT", `/api/v1/tenants/${tenantId}/campaigns/${campId}`, body);
+  if (r.ok) {
+    CAMPAIGNS[campId] = r.json;        // refresh from the server's re-parsed script
+    $("c_result").textContent = "✓ saved — live on the next call";
+  } else {
+    $("c_result").textContent = `✗ ${r.status}: ${r.json.detail || r.json.error || "error"}`;
   }
 }
 
