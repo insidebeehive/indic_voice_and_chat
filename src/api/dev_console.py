@@ -230,6 +230,7 @@ async def dev_place_call(req: PlaceCallRequest) -> dict:
             "account_sid": acct, "auth_token": auth,
             "api_key_sid": acct, "api_key_secret": auth,
             "user_id": uid,
+            "base_url": tel.stringee_base_url,   # regional Stringee REST host, if set
         })
     except Exception as e:  # noqa: BLE001 - e.g. missing per-tenant credentials
         raise HTTPException(status_code=400, detail=f"telephony adapter for '{provider}' unavailable: {e}")

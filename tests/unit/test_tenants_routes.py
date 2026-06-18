@@ -258,6 +258,21 @@ async def test_update_campaign_cross_tenant_404(ctx) -> None:
     assert r.status_code == 404
 
 
+async def test_update_and_list_tenant_stringee_base_url(ctx) -> None:
+    """Per-tenant regional Stringee REST host is settable + surfaced for prefill."""
+    client, _, _ = ctx
+    tid = (await client.post(
+        "/tenants", json=_body(slug="acme"), headers=ADMIN_HEADERS)).json()["tenant_id"]
+    r = await client.patch(
+        f"/tenants/{tid}",
+        json={"telephony": {"stringee_base_url": "https://asia-2.api.stringee.com"}},
+        headers=ADMIN_HEADERS)
+    assert r.status_code == 200
+    acme = next(t for t in (await client.get("/tenants", headers=ADMIN_HEADERS)).json()["tenants"]
+                if t["tenant_id"] == tid)
+    assert acme["telephony_stringee_base_url"] == "https://asia-2.api.stringee.com"
+
+
 async def test_update_tenant_status_and_404(ctx) -> None:
     client, _, _ = ctx
     tid = (await client.post(

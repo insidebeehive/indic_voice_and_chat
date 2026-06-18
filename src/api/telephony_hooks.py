@@ -488,14 +488,25 @@ async def _download_stringee_recording(url: str, tenant: TenantContext) -> bytes
     tenant's Stringee keys are available (signed/public URLs work without it)."""
     from src.providers.telephony.stringee import mint_server_token
 
-    creds = tenant.settings.pipeline.telephony.active_creds()
+    tel = tenant.settings.pipeline.telephony
+    creds = tel.active_creds()
     sid = tenant.secret(creds.account_sid_env) if creds.account_sid_env else None
     secret = tenant.secret(creds.auth_token_env) if creds.auth_token_env else None
-    # Go straight to https (Stringee 301-redirects http→https). Auth is the same
-    # X-STRINGEE-AUTH server token the callout uses — but the recording must be
-    # owned by THIS tenant's Stringee project, else Stringee returns r:5 "keySid
-    # invalid" (see scripts/stringee_recording_probe.py).
-    url = url.replace("http://", "https://", 1)
+    # Go straight to https (Stringee 301-redirects http→https), and rewrite the
+    # host to the tenant's regional Stringee REST base when set — the URL arrives
+    # pointing at api.stringee.com, but a regional project's keySid is only valid
+    # on its regional host (e.g. asia-2.api.stringee.com), else r:5 "keySid
+    # invalid" (see scripts/stringee_recording_probe.py). Auth is the same
+    # X-STRINGEE-AUTH server token the callout uses.
+    if tel.stringee_base_url:
+        from urllib.parse import urlsplit
+        base = tel.stringee_base_url.rstrip("/")
+        if "://" not in base:
+            base = "https://" + base
+        parts = urlsplit(url if "://" in url else "https://" + url)
+        url = f"{base}{parts.path}" + (f"?{parts.query}" if parts.query else "")
+    else:
+        url = url.replace("http://", "https://", 1)
     headers = {}
     if sid and secret:
         headers["X-STRINGEE-AUTH"] = mint_server_token(sid, secret)

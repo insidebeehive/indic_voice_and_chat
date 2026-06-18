@@ -222,6 +222,8 @@ function loadTelephony(id) {
           .map(p => `<option value="${p}"${p === (t.telephony_provider || "") ? " selected" : ""}>${p}</option>`).join("")
       }</select></label>
       <label>from_number <input id="te_from" value="${escAttr(t.telephony_from_number)}" placeholder="+91… / 91…" /></label>
+      <label>Stringee REST base <small class="hint">(regional host)</small>
+        <input id="te_strbase" style="width:18rem" value="${escAttr(t.telephony_stringee_base_url)}" placeholder="https://asia-2.api.stringee.com (blank = api.stringee.com)" /></label>
     </div>
     <h2 style="margin-top:.9rem;">Stringee webhook URLs <small class="hint">(paste into this tenant's Stringee project — read-only)</small></h2>
     <div class="creds" style="gap:.6rem;">
@@ -249,6 +251,7 @@ async function saveTelephony(id) {
   const tel = {};
   if (v("te_provider")) tel.provider = v("te_provider");
   if (v("te_from")) tel.from_number = v("te_from");
+  if (v("te_strbase")) tel.stringee_base_url = v("te_strbase");
   if (v("te_ewurl")) tel.events_webhook_url = v("te_ewurl");
   const keys = {};
   if (v("te_ewsecret")) keys.events_webhook_secret = v("te_ewsecret");   // stored encrypted, signs the events

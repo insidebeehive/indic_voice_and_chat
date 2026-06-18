@@ -140,6 +140,9 @@ async def call_lead(
             # dials with the tenant's creds, not STRINGEE_API_KEY_SID from env.
             "api_key_sid": acct, "api_key_secret": auth,
             "user_id": uid,
+            # Regional Stringee REST host (e.g. asia-2.api.stringee.com); None →
+            # adapter falls back to api.stringee.com.
+            "base_url": tel.stringee_base_url,
         })
     except Exception as e:  # noqa: BLE001 — e.g. missing credentials
         raise HTTPException(status_code=400, detail=f"telephony adapter unavailable: {e}")
