@@ -36,6 +36,8 @@ from src.config_tenant import (
     platform_webhook_base_url,
 )
 from src.config_tenant import TenantLLMConfig as _LLM
+from src.dialogue.campaign_loader import parse_campaign_yaml
+from src.models.campaign import Campaign
 from src.models.conversation import Conversation
 from src.models.tenant import ProviderCost, Tenant, TenantApiKey, TenantPhoneNumber, TenantSecret
 
@@ -566,3 +568,133 @@ async def tenant_billing(
         avg_cost_per_call=round(platform / n, 6) if n else 0.0,
         tentative_telephony_cost=round(tentative_tel, 6),
     )
+
+
+# --- Campaign script editor (backoffice) --------------------------------
+#
+# The voicebot script lives in campaigns.config_yaml (a YAML blob, read live per
+# call by DbCampaignResolver). These admin routes expose it as structured fields
+# so the backoffice can view/edit it without hand-editing YAML. Edits merge into
+# the existing YAML dict — every key we don't model (slots, id, status) is kept.
+
+
+class CampaignScriptIn(BaseModel):
+    """Structured campaign-script fields. All optional — only provided fields are
+    overlaid onto the existing config_yaml."""
+    name: Optional[str] = None
+    agent_name: Optional[str] = None
+    company: Optional[str] = None
+    role: Optional[str] = None
+    personality: Optional[str] = None
+    language: Optional[str] = None
+    gender: Optional[str] = None
+    greeting: Optional[str] = None
+    objective: Optional[str] = None
+    closing: Optional[str] = None
+    conversation_style: Optional[str] = None
+    max_turns: Optional[int] = None
+    talking_points: Optional[list[str]] = None
+    dos: Optional[list[str]] = None
+    donts: Optional[list[str]] = None
+    knowledge: Optional[dict[str, str]] = None
+
+
+# CampaignScriptIn field -> (block, yaml_key); block is "agent" or "script".
+_AGENT_FIELDS = {
+    "agent_name": "name", "company": "company", "role": "role",
+    "personality": "personality", "language": "language", "gender": "gender",
+}
+_SCRIPT_SCALARS = {
+    "greeting": "greeting", "objective": "objective", "closing": "closing",
+    "conversation_style": "conversation_style", "max_turns": "max_turns",
+}
+_SCRIPT_LISTS = ("talking_points", "dos", "donts")
+
+
+def _campaign_script_fields(config_yaml: str) -> dict:
+    """Parse config_yaml into the structured editor fields (reuses the same
+    parser the runtime uses). Returns {} if the YAML can't be parsed."""
+    try:
+        sc = parse_campaign_yaml(config_yaml).script
+    except Exception:  # noqa: BLE001 - a broken row shouldn't break the list
+        return {}
+    closing = sc.closing.get("default") or next(iter(sc.closing.values()), "") if sc.closing else ""
+    return {
+        "agent_name": sc.agent_name, "company": sc.company_name, "role": sc.agent_role,
+        "personality": sc.personality, "language": sc.language_default, "gender": sc.gender,
+        "greeting": sc.opening, "objective": sc.objective, "closing": closing,
+        "conversation_style": sc.conversation_style, "max_turns": sc.max_turns,
+        "talking_points": sc.talking_points, "dos": sc.dos, "donts": sc.donts,
+        "knowledge": sc.knowledge,
+    }
+
+
+def _apply_campaign_script(config_yaml: str, req: "CampaignScriptIn") -> str:
+    """Overlay the provided fields onto the existing campaign YAML, preserving
+    every key we don't model (slots, id, status, ...). Validates the result
+    parses; raises ValueError otherwise."""
+    import yaml
+
+    data = yaml.safe_load(config_yaml) or {}
+    wrapped = "campaign" in data
+    camp = data["campaign"] if wrapped else data
+    if req.name is not None:
+        camp["name"] = req.name
+    agent = camp.setdefault("agent", {})
+    script = camp.setdefault("script", {})
+    for field_, ykey in _AGENT_FIELDS.items():
+        v = getattr(req, field_)
+        if v is not None:
+            agent[ykey] = v
+    for field_, ykey in _SCRIPT_SCALARS.items():
+        v = getattr(req, field_)
+        if v is not None:
+            script[ykey] = v
+    for field_ in _SCRIPT_LISTS:
+        v = getattr(req, field_)
+        if v is not None:
+            script[field_] = v
+    if req.knowledge is not None:
+        script["knowledge"] = req.knowledge
+    out = yaml.safe_dump(data, allow_unicode=True, sort_keys=False)
+    parse_campaign_yaml(out)  # validate it still parses into a script
+    return out
+
+
+@router.get("/{tenant_id}/campaigns")
+async def list_tenant_campaigns(
+    tenant_id: str,
+    session: AsyncSession = Depends(get_db_session),
+    _: None = Depends(require_admin),
+) -> dict:
+    """The tenant's campaigns with their script as structured fields (admin)."""
+    await _require_tenant(session, tenant_id)
+    rows = (await session.execute(
+        select(Campaign).where(Campaign.tenant_id == tenant_id).order_by(Campaign.created_at)
+    )).scalars().all()
+    return {"campaigns": [
+        {"id": c.id, "name": c.name, "status": c.status,
+         "script": _campaign_script_fields(c.config_yaml)} for c in rows]}
+
+
+@router.put("/{tenant_id}/campaigns/{campaign_id}")
+async def update_campaign_script(
+    tenant_id: str,
+    campaign_id: str,
+    req: CampaignScriptIn,
+    session: AsyncSession = Depends(get_db_session),
+    _: None = Depends(require_admin),
+) -> dict:
+    """Edit a campaign's script (structured fields merged into its config_yaml)."""
+    row = await session.get(Campaign, campaign_id)
+    if row is None or row.tenant_id != tenant_id:
+        raise HTTPException(status_code=404, detail="campaign not found")
+    try:
+        row.config_yaml = _apply_campaign_script(row.config_yaml, req)
+    except Exception as e:  # noqa: BLE001 - invalid YAML/script → 400
+        raise HTTPException(status_code=400, detail=f"invalid script: {e}")
+    if req.name is not None:
+        row.name = req.name
+    await session.commit()
+    return {"id": row.id, "name": row.name, "status": row.status,
+            "script": _campaign_script_fields(row.config_yaml)}
