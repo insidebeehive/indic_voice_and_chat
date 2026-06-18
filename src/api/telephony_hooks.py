@@ -494,7 +494,10 @@ async def _download_stringee_recording(url: str, tenant: TenantContext) -> bytes
     headers = {}
     if sid and secret:
         headers["X-STRINGEE-AUTH"] = mint_server_token(sid, secret)
-    async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=10.0)) as c:
+    # Stringee 301-redirects http→https for recording URLs — follow it (httpx
+    # doesn't by default, and a 3xx would otherwise raise in raise_for_status).
+    async with httpx.AsyncClient(
+        timeout=httpx.Timeout(30.0, connect=10.0), follow_redirects=True) as c:
         resp = await c.get(url, headers=headers)
         resp.raise_for_status()
         return resp.content
