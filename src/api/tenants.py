@@ -79,6 +79,7 @@ class RealtimeChoice(BaseModel):
 class TelephonyConfigIn(BaseModel):
     provider: str
     from_number: Optional[str] = None
+    stringee_base_url: Optional[str] = None   # regional Stringee REST host, if any
     # No per-tenant inbound webhook base URL — it's the platform WEBHOOK_BASE_URL
     # (always our app, common to every tenant).
     events_webhook_url: Optional[str] = None        # outbound call-event callback
@@ -219,6 +220,7 @@ async def register_tenant(
         telephony=TenantTelephonyConfig(
             provider=tel.provider,
             from_number=tel.from_number,
+            stringee_base_url=tel.stringee_base_url,
             events_webhook_url=tel.events_webhook_url,
             **env_fields,
             # also record the creds under the provider-specific slot so a tenant
@@ -268,6 +270,7 @@ class TelephonyUpdateIn(BaseModel):
     merged (upserted) into the tenant's existing encrypted secrets."""
     provider: Optional[str] = None
     from_number: Optional[str] = None
+    stringee_base_url: Optional[str] = None
     events_webhook_url: Optional[str] = None
     keys: dict[str, str] = Field(default_factory=dict)
     phone_numbers: Optional[list[str]] = None
@@ -329,6 +332,8 @@ async def update_tenant(
             tel_cfg["provider"] = tu.provider
         if tu.from_number is not None:
             tel_cfg["from_number"] = tu.from_number
+        if tu.stringee_base_url is not None:
+            tel_cfg["stringee_base_url"] = tu.stringee_base_url
         if tu.events_webhook_url is not None:
             tel_cfg["events_webhook_url"] = tu.events_webhook_url
 
@@ -409,6 +414,7 @@ class TenantSummary(BaseModel):
     # Non-secret telephony config (so the backoffice can prefill it) + the NAMES
     # (never values) of the creds configured for the active provider.
     telephony_from_number: Optional[str] = None
+    telephony_stringee_base_url: Optional[str] = None
     telephony_events_webhook_url: Optional[str] = None
     telephony_events_webhook_secret_set: bool = False   # whether a signing secret is configured (never the value)
     telephony_creds_configured: list[str] = Field(default_factory=list)
@@ -459,6 +465,7 @@ async def list_tenants(
             realtime=_layer(pc, "realtime"),
             telephony_provider=tel.get("provider"),
             telephony_from_number=tel.get("from_number"),
+            telephony_stringee_base_url=tel.get("stringee_base_url"),
             telephony_events_webhook_url=tel.get("events_webhook_url"),
             telephony_events_webhook_secret_set=bool(tel.get("events_webhook_secret_env")),
             telephony_creds_configured=_configured_creds(tel),

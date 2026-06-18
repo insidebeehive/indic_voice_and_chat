@@ -147,6 +147,12 @@ class TelephonyCreds(BaseModel):
 class TenantTelephonyConfig(BaseModel):
     provider: Optional[str] = None
     from_number: Optional[str] = None
+    # Stringee REST API base for this tenant's project. Stringee projects live on
+    # regional hosts (e.g. https://asia-2.api.stringee.com); the global
+    # api.stringee.com rejects a regional keySid with r:5 "keySid invalid". Used
+    # for the recording download (and passed to the adapter for the callout).
+    # Default unset → the adapter/download use api.stringee.com.
+    stringee_base_url: Optional[str] = None
     # NB: there is no per-tenant inbound webhook base URL — it's always *our* app,
     # common to every tenant, so it lives at the platform level (WEBHOOK_BASE_URL /
     # settings.pipeline.telephony.webhook_base_url, see ``platform_webhook_base_url``).

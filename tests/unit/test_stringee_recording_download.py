@@ -26,6 +26,29 @@ def _tenant_with_creds() -> TenantContext:
 
 @respx.mock
 @pytest.mark.asyncio
+async def test_download_rewrites_host_to_tenant_regional_base() -> None:
+    """When the tenant's Stringee project is on a regional REST host, the recording
+    URL (which arrives pointing at api.stringee.com) is rewritten to that host —
+    otherwise the global host returns r:5 'keySid invalid'."""
+    from src.config_tenant import TenantPipelineConfig, TenantTelephonyConfig
+    tenant = TenantContext(
+        settings=TenantSettings(
+            id="t", slug="t", name="T",
+            pipeline=TenantPipelineConfig(telephony=TenantTelephonyConfig(
+                provider="stringee", account_sid_env="SID", auth_token_env="SEC",
+                stringee_base_url="https://asia-2.api.stringee.com"))),
+        secrets_resolved={"SID": "keysid", "SEC": "keysecret"})
+    route = respx.get("https://asia-2.api.stringee.com/v1/call/recording/abc").mock(
+        return_value=httpx.Response(200, content=b"WAV"))
+    out = await telephony_hooks._download_stringee_recording(
+        "http://api.stringee.com/v1/call/recording/abc", tenant)
+    assert out == b"WAV"
+    assert route.calls.last.request.url.host == "asia-2.api.stringee.com"
+    assert route.calls.last.request.url.path == "/v1/call/recording/abc"
+
+
+@respx.mock
+@pytest.mark.asyncio
 async def test_download_goes_to_https_with_auth_header() -> None:
     """Fetch over https (Stringee 301s http→https) authenticated with the
     X-STRINGEE-AUTH server token — the same auth the callout uses."""
