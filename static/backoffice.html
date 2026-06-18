@@ -184,34 +184,50 @@ async function loadBilling(id) {
       tenant's own provider key, so it's shown as a tentative figure and is <b>not</b> in the platform cost.</div>`;
 }
 
+// Credential fields per provider — [logical_name, label, isSecret]. Only the
+// fields a provider actually uses are shown when it's selected.
+const TEL_FIELDS = {
+  stringee:   [["account_sid","API Key SID",false],["auth_token","API Key Secret",true],["user_id","User ID (e.g. dev)",false]],
+  twilio:     [["account_sid","Account SID",false],["auth_token","Auth Token",true],["api_key_sid","API Key SID (softphone)",false],["api_key_secret","API Key Secret (softphone)",true],["twiml_app_sid","TwiML App SID (softphone)",false]],
+  exotel:     [["account_sid","API Key / SID",false],["auth_token","API Token",true]],
+  infobip:    [["account_sid","API Key",false],["auth_token","API Secret",true]],
+  telnyx:     [["account_sid","API Key / SID",false],["auth_token","API Secret",true]],
+  webconsole: [],
+};
+const escAttr = (s) => String(s == null ? "" : s).replace(/&/g,"&amp;").replace(/"/g,"&quot;").replace(/</g,"&lt;");
+
+function renderTelKeyFields() {
+  const fields = TEL_FIELDS[$("te_provider").value] || [];
+  $("te_keyfields").innerHTML = fields.length
+    ? `<div class="creds" style="gap:.6rem;margin-top:.5rem;">${fields.map(([logical,label,secret]) =>
+        `<label>${label} <input data-logical="${logical}" type="${secret ? "password" : "text"}" placeholder="new value (blank = keep)" /></label>`).join("")}</div>`
+    : `<span class="hint">No credentials for this provider.</span>`;
+}
+function editTelKeys() { $("te_keybox").hidden = false; $("te_editbtn").hidden = true; renderTelKeyFields(); }
+function onTelProviderChange() { if (!$("te_keybox").hidden) renderTelKeyFields(); }  // re-render for new provider while editing
+
 function loadTelephony(id) {
   const t = (window.TENANTS || {})[id] || {};
+  const cfg = t.telephony_creds_configured || [];
   $("pane_tel").innerHTML = `
-    <div class="hint" style="margin-bottom:.6rem;">Update this tenant's telephony config + credentials.
-      Credential values are <b>encrypted at rest</b> and write-only — leave a field blank to keep the
-      existing value. PATCHes <code>/api/v1/tenants/${id}</code>; the live resolver refreshes immediately.</div>
+    <div class="hint" style="margin-bottom:.6rem;">Update this tenant's telephony config. Credential values are
+      <b>encrypted &amp; write-only</b> — never shown; click <b>Edit keys</b> to set new ones. PATCHes
+      <code>/api/v1/tenants/${id}</code>; the live resolver refreshes immediately.</div>
     <div class="creds" style="gap:.6rem;">
-      <label>provider <select id="te_provider">${
+      <label>provider <select id="te_provider" onchange="onTelProviderChange()">${
         ["stringee","twilio","exotel","infobip","telnyx","webconsole"]
           .map(p => `<option value="${p}"${p === (t.telephony_provider || "") ? " selected" : ""}>${p}</option>`).join("")
       }</select></label>
-      <label>from_number <input id="te_from" placeholder="+91… / 91… (blank = keep)" /></label>
+      <label>from_number <input id="te_from" value="${escAttr(t.telephony_from_number)}" placeholder="+91… / 91…" /></label>
     </div>
-    <h2 style="margin-top:.9rem;">Credentials <small class="hint">(blank = keep existing)</small></h2>
+    <h2 style="margin-top:.9rem;">Credentials</h2>
+    <div class="hint">Configured: ${cfg.length ? `<b>${cfg.map(c => c.replace(/_env$/,"")).join(", ")}</b>` : "none"} <small>(names only — values hidden)</small></div>
+    <div style="margin-top:.4rem;"><button id="te_editbtn" class="ghost sm" onclick="editTelKeys()">Edit keys</button></div>
+    <div id="te_keybox" hidden><div id="te_keyfields"></div></div>
+    <h2 style="margin-top:.9rem;">Outbound events webhook <small class="hint">(tenant CRM callback)</small></h2>
     <div class="creds" style="gap:.6rem;">
-      <label>account_sid <input id="te_sid" placeholder="Twilio SID / Stringee API Key SID" /></label>
-      <label>auth_token <input id="te_tok" type="password" placeholder="Twilio token / Stringee API Key Secret" /></label>
-      <label>user_id <small class="hint">(Stringee)</small> <input id="te_userid" placeholder="Stringee app user id (e.g. dev)" /></label>
-    </div>
-    <div class="creds" style="gap:.6rem;margin-top:.4rem;">
-      <label>api_key_sid <small class="hint">(Twilio softphone)</small> <input id="te_apisid" placeholder="SK…" /></label>
-      <label>api_key_secret <input id="te_apisecret" type="password" placeholder="…" /></label>
-      <label>twiml_app_sid <input id="te_twiml" placeholder="AP…" /></label>
-    </div>
-    <h2 style="margin-top:.9rem;">Outbound events webhook</h2>
-    <div class="creds" style="gap:.6rem;">
-      <label>events_webhook_url <input id="te_ewurl" style="width:22rem" placeholder="https://crm…/events (blank = keep)" /></label>
-      <label>events_webhook_secret_env <input id="te_ewsecret" placeholder="ENV_VAR_NAME (blank = keep)" /></label>
+      <label>events_webhook_url <input id="te_ewurl" style="width:22rem" value="${escAttr(t.telephony_events_webhook_url)}" placeholder="https://crm…/events" /></label>
+      <label>events_webhook_secret_env <input id="te_ewsecret" value="${escAttr(t.telephony_events_webhook_secret_env)}" placeholder="ENV_VAR_NAME" /></label>
     </div>
     <div style="margin-top:.9rem;">
       <button onclick="saveTelephony('${id}')">Save telephony</button>
@@ -220,24 +236,25 @@ function loadTelephony(id) {
 }
 
 async function saveTelephony(id) {
-  const v = (x) => ($(x).value || "").trim();
+  const v = (x) => { const el = $(x); return el ? (el.value || "").trim() : ""; };
   const tel = {};
   if (v("te_provider")) tel.provider = v("te_provider");
   if (v("te_from")) tel.from_number = v("te_from");
   if (v("te_ewurl")) tel.events_webhook_url = v("te_ewurl");
   if (v("te_ewsecret")) tel.events_webhook_secret_env = v("te_ewsecret");
   const keys = {};
-  for (const [field, el] of [["account_sid", "te_sid"], ["auth_token", "te_tok"], ["user_id", "te_userid"],
-       ["api_key_sid", "te_apisid"], ["api_key_secret", "te_apisecret"], ["twiml_app_sid", "te_twiml"]])
-    if (v(el)) keys[field] = v(el);
+  document.querySelectorAll("#te_keyfields input[data-logical]").forEach(el => {
+    const val = (el.value || "").trim();
+    if (val) keys[el.dataset.logical] = val;
+  });
   if (Object.keys(keys).length) tel.keys = keys;
   if (!Object.keys(tel).length) { $("te_result").textContent = "nothing to update"; return; }
   $("te_result").textContent = "saving…";
   const r = await apiSend("PATCH", `/api/v1/tenants/${id}`, { telephony: tel });
   if (r.ok) {
+    await loadTenants();      // refresh window.TENANTS, then re-render the pane (collapses Edit keys)
+    loadTelephony(id);
     $("te_result").textContent = "✓ saved — resolver refreshed";
-    for (const el of ["te_sid", "te_tok", "te_userid", "te_apisid", "te_apisecret", "te_twiml"]) $(el).value = "";
-    loadTenants();
   } else {
     $("te_result").textContent = `✗ ${r.status}: ${r.json.detail || r.json.error || "error"}`;
   }
