@@ -254,6 +254,11 @@ async def test_list_tenants_shows_mode_and_models(ctx) -> None:
     assert acme["llm"]["model"] == "gemini-2.5-flash-lite"
     assert acme["tts"]["model"] == "bulbul:v3"
     assert acme["telephony_provider"] == "twilio"
+    # Non-secret telephony config surfaces so the backoffice can prefill it, and
+    # the names (NOT values) of configured creds show what's set.
+    assert acme["telephony_from_number"] == "+15705255679"
+    assert "account_sid_env" in acme["telephony_creds_configured"]
+    assert "auth_token_env" in acme["telephony_creds_configured"]
 
 
 async def test_list_tenants_requires_admin(ctx) -> None:

@@ -375,19 +375,11 @@ async def update_tenant(
 
     pc = t.pipeline_config or {}
     tel_cfg = pc.get("telephony") or {}
-    # report the creds resolved for the *configured* provider (per-provider slot
-    # if present, else top-level) — names only, never values.
-    active = TenantTelephonyConfig(**tel_cfg).active_creds()
-    configured = [
-        field for field in (
-            "account_sid_env", "auth_token_env", "api_key_sid_env",
-            "api_key_secret_env", "twiml_app_sid_env", "user_id_env")
-        if getattr(active, field)
-    ]
     return UpdateTenantResponse(
         tenant_id=t.id, slug=t.slug, status=t.status,
         telephony_provider=tel_cfg.get("provider"),
-        telephony_creds_configured=configured,
+        # names only, never values — for the active provider's slot.
+        telephony_creds_configured=_configured_creds(tel_cfg),
     )
 
 
@@ -411,6 +403,12 @@ class TenantSummary(BaseModel):
     tts: LayerInfo
     realtime: LayerInfo
     telephony_provider: Optional[str] = None
+    # Non-secret telephony config (so the backoffice can prefill it) + the NAMES
+    # (never values) of the creds configured for the active provider.
+    telephony_from_number: Optional[str] = None
+    telephony_events_webhook_url: Optional[str] = None
+    telephony_events_webhook_secret_env: Optional[str] = None
+    telephony_creds_configured: list[str] = Field(default_factory=list)
 
 
 class TenantListResponse(BaseModel):
@@ -423,6 +421,18 @@ def _layer(pc: dict, key: str) -> LayerInfo:
     return LayerInfo(provider=d.get("provider"), model=d.get("model"))
 
 
+_CRED_ENV_FIELDS = (
+    "account_sid_env", "auth_token_env", "api_key_sid_env",
+    "api_key_secret_env", "twiml_app_sid_env", "user_id_env",
+)
+
+
+def _configured_creds(tel_cfg: dict) -> list[str]:
+    """Names (never values) of the cred slots set for the active provider."""
+    active = TenantTelephonyConfig(**tel_cfg).active_creds()
+    return [f for f in _CRED_ENV_FIELDS if getattr(active, f)]
+
+
 @router.get("", response_model=TenantListResponse)
 async def list_tenants(
     session: AsyncSession = Depends(get_db_session),
@@ -433,12 +443,17 @@ async def list_tenants(
     items = []
     for t in rows:
         pc = t.pipeline_config or {}
+        tel = pc.get("telephony") or {}
         items.append(TenantSummary(
             tenant_id=t.id, slug=t.slug, name=t.name, status=t.status,
             mode=t.mode, max_concurrent_calls=t.max_concurrent_calls,
             stt=_layer(pc, "stt"), llm=_layer(pc, "llm"), tts=_layer(pc, "tts"),
             realtime=_layer(pc, "realtime"),
-            telephony_provider=(pc.get("telephony") or {}).get("provider"),
+            telephony_provider=tel.get("provider"),
+            telephony_from_number=tel.get("from_number"),
+            telephony_events_webhook_url=tel.get("events_webhook_url"),
+            telephony_events_webhook_secret_env=tel.get("events_webhook_secret_env"),
+            telephony_creds_configured=_configured_creds(tel),
         ))
     return TenantListResponse(tenants=items, total=len(items))
 
