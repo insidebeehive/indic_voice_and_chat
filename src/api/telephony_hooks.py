@@ -15,6 +15,7 @@ Inbound flow:
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 import logging
@@ -431,19 +432,15 @@ async def stringee_softphone_answer(
 async def stringee_softphone_recording(
     tenant_slug: str,
     request: Request,
-    session: AsyncSession = Depends(get_db_session),
+    background_tasks: BackgroundTasks,
 ):
     """Stringee event webhook → on a recording URL, transcribe → analyze → outcome.
 
-    Tolerant of Stringee's field names (recording URL + call_id appear under
-    several keys across versions). Non-recording events are acknowledged 200.
+    The fetch + transcribe + analyze runs in a BACKGROUND task: recordings lag the
+    event (the download retries on 404) and STT/LLM take time, so Stringee's
+    webhook gets a fast 200 instead of being held open. Tolerant of Stringee's
+    field names; non-recording events are acknowledged 200.
     """
-    from datetime import datetime, timezone
-
-    from src.analysis.manual_call import finalize_manual_call
-    from src.interfaces.stt import STTConfig
-    from src.pipeline.audio_utils import pcm16_to_wav, wav_split_stereo
-
     data = await _stringee_params(request)
     log.info("stringee softphone recording", extra={
         "tenant": tenant_slug, "method": request.method, "data": data})
@@ -455,37 +452,59 @@ async def stringee_softphone_recording(
     if _softphone_providers is None:
         log.warning("stringee softphone recording hit but provider registry unset")
         return Response(status_code=503)
+    dur_raw = data.get("duration") or data.get("callDuration") or data.get("recordDuration")
+    dur_ms = int(float(dur_raw) * 1000) if dur_raw else None
+    background_tasks.add_task(_finalize_softphone_recording, tenant, call_id, rec_url, dur_ms)
+    return Response(status_code=200)
 
-    tel = tenant.settings.pipeline.telephony
+
+async def _finalize_softphone_recording(
+    tenant: TenantContext, call_id: str, rec_url: str, dur_ms: int | None,
+) -> None:
+    """Fetch the recording (retry-on-404), transcribe both channels, analyze, and
+    persist the outcome. Background task → opens its own DB session."""
+    from datetime import datetime, timezone
+
+    from src.analysis.manual_call import finalize_manual_call
+    from src.interfaces.stt import STTConfig
+    from src.models.database import get_sessionmaker
+    from src.pipeline.audio_utils import pcm16_to_wav, wav_split_stereo
+
     try:
         wav = await _download_stringee_recording(rec_url, tenant)
         left, right, sr = wav_split_stereo(wav)
-    except Exception:  # noqa: BLE001 — a fetch/parse failure must not 500 Stringee
+    except Exception:  # noqa: BLE001 — a fetch/parse failure must not break anything
         log.exception("stringee softphone recording fetch/split failed", extra={"call_id": call_id})
-        return Response(status_code=200)
+        return
 
     # Dual-channel connect recording: ch1 = caller (agent), ch2 = callee (lead).
     channels = [("assistant", pcm16_to_wav(left, sr)), ("user", pcm16_to_wav(right, sr))]
     stt = _softphone_providers.get_stt(tenant)
     llm = _softphone_providers.get_llm(tenant)
     stt_config = STTConfig(language=tenant.settings.pipeline.stt.language, sample_rate=sr)
-    dur_raw = data.get("duration") or data.get("callDuration") or data.get("recordDuration")
-    dur_ms = int(float(dur_raw) * 1000) if dur_raw else None
+    sm = _softphone_sessionmaker or get_sessionmaker()
+    try:
+        async with sm() as session:
+            row = await finalize_manual_call(
+                session, provider_call_sid=call_id, channels=channels,
+                stt=stt, stt_config=stt_config, llm=llm,
+                tenant_timezone=tenant.settings.timezone,
+                now=datetime.now(timezone.utc), duration_ms=dur_ms, recording_url=rec_url)
+        log.info("stringee softphone recording finalized", extra={
+            "tenant": tenant.slug, "call_id": call_id, "found": row is not None,
+            "outcome": getattr(row, "outcome", None)})
+    except Exception:  # noqa: BLE001 — never raise from a background task
+        log.exception("stringee softphone recording finalize failed", extra={"call_id": call_id})
 
-    row = await finalize_manual_call(
-        session, provider_call_sid=call_id, channels=channels,
-        stt=stt, stt_config=stt_config, llm=llm,
-        tenant_timezone=tenant.settings.timezone,
-        now=datetime.now(timezone.utc), duration_ms=dur_ms, recording_url=rec_url)
-    log.info("stringee softphone recording finalized", extra={
-        "tenant": tenant.slug, "call_id": call_id, "found": row is not None,
-        "outcome": getattr(row, "outcome", None)})
-    return Response(status_code=200)
 
-
-async def _download_stringee_recording(url: str, tenant: TenantContext) -> bytes:
+async def _download_stringee_recording(
+    url: str, tenant: TenantContext, *, attempts: int = 6, _sleep=asyncio.sleep,
+) -> bytes:
     """Fetch a Stringee recording, authenticating with a server token when the
-    tenant's Stringee keys are available (signed/public URLs work without it)."""
+    tenant's Stringee keys are available (signed/public URLs work without it).
+
+    The recording lags the event — Stringee briefly returns 404 right after the
+    call ends — so retry on 404 with backoff until it's ready."""
     from src.providers.telephony.stringee import mint_server_token
 
     tel = tenant.settings.pipeline.telephony
@@ -510,11 +529,19 @@ async def _download_stringee_recording(url: str, tenant: TenantContext) -> bytes
     headers = {}
     if sid and secret:
         headers["X-STRINGEE-AUTH"] = mint_server_token(sid, secret)
+    delay = 3.0
     async with httpx.AsyncClient(
         timeout=httpx.Timeout(30.0, connect=10.0), follow_redirects=True) as client:
-        resp = await client.get(url, headers=headers)
-        resp.raise_for_status()
-        return resp.content
+        for attempt in range(attempts):
+            resp = await client.get(url, headers=headers)
+            if resp.status_code == 404 and attempt < attempts - 1:
+                await _sleep(delay)            # recording not ready yet — wait + retry
+                delay = min(delay * 2, 30.0)
+                continue
+            resp.raise_for_status()
+            return resp.content
+    resp.raise_for_status()   # exhausted retries on 404
+    return resp.content
 
 
 # --- Exotel webhook + WS ----------------------------------------------------
