@@ -26,6 +26,26 @@ def _tenant_with_creds() -> TenantContext:
 
 @respx.mock
 @pytest.mark.asyncio
+async def test_download_retries_on_404_until_recording_ready() -> None:
+    """The recording lags the event — Stringee 404s briefly after the call. The
+    download retries on 404 (with backoff) instead of giving up."""
+    route = respx.get("https://api.stringee.com/v1/call/recording/abc").mock(
+        side_effect=[httpx.Response(404), httpx.Response(404),
+                     httpx.Response(200, content=b"WAV")])
+    sleeps: list[float] = []
+
+    async def _fake_sleep(s):
+        sleeps.append(s)
+
+    out = await telephony_hooks._download_stringee_recording(
+        "http://api.stringee.com/v1/call/recording/abc", _tenant(), _sleep=_fake_sleep)
+    assert out == b"WAV"
+    assert route.call_count == 3        # 404, 404, 200
+    assert len(sleeps) == 2             # waited before each retry
+
+
+@respx.mock
+@pytest.mark.asyncio
 async def test_download_rewrites_host_to_tenant_regional_base() -> None:
     """When the tenant's Stringee project is on a regional REST host, the recording
     URL (which arrives pointing at api.stringee.com) is rewritten to that host —
