@@ -9,6 +9,31 @@ from src.auth.context import TenantContext
 from src.config_tenant import TenantSettings
 
 
+def test_softphone_channels_mono_mp3_single_track() -> None:
+    """Stringee records mono mp3 — not a stereo WAV — so it's transcribed as one
+    mixed track (passed to STT as-is), not split into agent/lead channels."""
+    mp3 = b"\xff\xe3\x28\xc4" + b"\x00" * 200   # mp3 frame sync, not RIFF
+    channels, cfg = telephony_hooks._softphone_channels(mp3, "hi")
+    assert len(channels) == 1
+    assert channels[0][0] == "user" and channels[0][1] == mp3   # raw bytes → STT
+    assert cfg.language == "hi"
+
+
+def test_softphone_channels_stereo_wav_split() -> None:
+    """A stereo WAV is split into agent (L) + lead (R) channels for role attribution."""
+    import io
+    import wave
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(2)
+        w.setsampwidth(2)
+        w.setframerate(8000)
+        w.writeframes(b"\x01\x00\x02\x00" * 10)
+    channels, cfg = telephony_hooks._softphone_channels(buf.getvalue(), "hi")
+    assert [c[0] for c in channels] == ["assistant", "user"]
+    assert cfg.sample_rate == 8000
+
+
 def _tenant() -> TenantContext:
     # No creds env set → no auth header; exercises the plain (signed-URL) path.
     return TenantContext(settings=TenantSettings(id="t", slug="t", name="T"))

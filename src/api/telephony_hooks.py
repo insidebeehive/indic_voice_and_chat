@@ -458,30 +458,42 @@ async def stringee_softphone_recording(
     return Response(status_code=200)
 
 
+def _softphone_channels(audio: bytes, language: Optional[str]):
+    """Build (channels, STTConfig) from a downloaded recording.
+
+    A **stereo WAV** is split into agent (left) + lead (right) channels for role
+    attribution. Anything else — Stringee records **mono mp3** — is one mixed
+    track passed to STT as-is (no channel split; the provider auto-detects mp3).
+    """
+    from src.interfaces.stt import STTConfig
+    from src.pipeline.audio_utils import pcm16_to_wav, wav_split_stereo
+
+    if audio[:4] == b"RIFF":
+        left, right, sr = wav_split_stereo(audio)
+        channels = [("assistant", pcm16_to_wav(left, sr)), ("user", pcm16_to_wav(right, sr))]
+        return channels, STTConfig(language=language, sample_rate=sr)
+    return [("user", audio)], STTConfig(language=language)
+
+
 async def _finalize_softphone_recording(
     tenant: TenantContext, call_id: str, rec_url: str, dur_ms: int | None,
 ) -> None:
-    """Fetch the recording (retry-on-404), transcribe both channels, analyze, and
-    persist the outcome. Background task → opens its own DB session."""
+    """Fetch the recording (retry-on-404), transcribe, analyze, and persist the
+    outcome. Background task → opens its own DB session."""
     from datetime import datetime, timezone
 
     from src.analysis.manual_call import finalize_manual_call
-    from src.interfaces.stt import STTConfig
     from src.models.database import get_sessionmaker
-    from src.pipeline.audio_utils import pcm16_to_wav, wav_split_stereo
 
     try:
-        wav = await _download_stringee_recording(rec_url, tenant)
-        left, right, sr = wav_split_stereo(wav)
+        audio = await _download_stringee_recording(rec_url, tenant)
+        channels, stt_config = _softphone_channels(audio, tenant.settings.pipeline.stt.language)
     except Exception:  # noqa: BLE001 — a fetch/parse failure must not break anything
         log.exception("stringee softphone recording fetch/split failed", extra={"call_id": call_id})
         return
 
-    # Dual-channel connect recording: ch1 = caller (agent), ch2 = callee (lead).
-    channels = [("assistant", pcm16_to_wav(left, sr)), ("user", pcm16_to_wav(right, sr))]
     stt = _softphone_providers.get_stt(tenant)
     llm = _softphone_providers.get_llm(tenant)
-    stt_config = STTConfig(language=tenant.settings.pipeline.stt.language, sample_rate=sr)
     sm = _softphone_sessionmaker or get_sessionmaker()
     try:
         async with sm() as session:
