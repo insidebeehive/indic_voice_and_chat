@@ -67,6 +67,10 @@ class _FakeLLM:
                  ' "callback_phrase": null}',
             finish_reason="stop")
 
+    async def transcribe_audio(self, audio, mime_type="audio/mpeg") -> str:
+        # Stringee softphone recordings are transcribed by the multimodal LLM.
+        return "agent: namaste\nlead: haan bataiye"
+
 
 class _FakeProviders:
     def __init__(self) -> None:

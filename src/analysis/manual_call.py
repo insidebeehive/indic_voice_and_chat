@@ -131,12 +131,13 @@ async def finalize_manual_call(
     session: AsyncSession,
     *,
     provider_call_sid: str,
-    channels: list[RecordingChannel],
-    stt: ISTTProvider,
-    stt_config: STTConfig,
     llm: ILLMProvider,
     tenant_timezone: str,
     now: datetime,
+    channels: Optional[list[RecordingChannel]] = None,
+    stt: Optional[ISTTProvider] = None,
+    stt_config: Optional[STTConfig] = None,
+    transcript: Optional[list[LLMMessage]] = None,
     telephony_status: Optional[str] = None,
     final_action: Optional[str] = None,
     duration_ms: Optional[int] = None,
@@ -144,12 +145,16 @@ async def finalize_manual_call(
 ) -> Optional[Conversation]:
     """Transcribe → analyze → persist a manual call's outcome.
 
-    Produces the identical ``CallAnalysis`` an AI call would (same ``analyze_call``)
-    and writes it through the same ``record_outcome``. Returns the updated
-    conversation row, or ``None`` if no row matches the SID.
+    Either pass per-channel audio (``channels`` + ``stt``/``stt_config``, the
+    dual-channel STT path) OR a pre-built ``transcript`` (e.g. from a multimodal
+    LLM that transcribed the whole recording). Produces the identical
+    ``CallAnalysis`` an AI call would (same ``analyze_call``) and writes it through
+    the same ``record_outcome``. Returns the row, or ``None`` if no SID matches.
     """
-    channel_results = await transcribe_channels(channels, stt=stt, stt_config=stt_config)
-    transcript = build_transcript(channel_results)
+    if transcript is None:
+        channel_results = await transcribe_channels(
+            channels or [], stt=stt, stt_config=stt_config or STTConfig())
+        transcript = build_transcript(channel_results)
     analysis = await analyze_call(
         transcript=transcript,
         slots={},

@@ -303,3 +303,23 @@ def test_extract_text_falls_back_to_candidate_parts() -> None:
 
 def test_extract_text_empty_when_no_candidates() -> None:
     assert GeminiLLMAdapter._extract_text(SimpleNamespace(text=None, candidates=[])) == ""
+
+
+@pytest.mark.asyncio
+async def test_transcribe_audio_returns_text_and_sends_inline_audio() -> None:
+    client = _make_client(generate_return=_response("नमस्ते, transcript"))
+    adapter = GeminiLLMAdapter({"client": client})
+    out = await adapter.transcribe_audio(b"\xff\xe3audio-bytes", "audio/mpeg")
+    assert out == "नमस्ते, transcript"
+    parts = client.aio.models.generate_content.call_args.kwargs["contents"][0]["parts"]
+    assert any(p.get("inline_data", {}).get("mime_type") == "audio/mpeg"
+               and p["inline_data"]["data"] == b"\xff\xe3audio-bytes" for p in parts)
+
+
+@pytest.mark.asyncio
+async def test_transcribe_audio_returns_empty_on_failure() -> None:
+    from unittest.mock import AsyncMock
+    client = _make_client()
+    client.aio.models.generate_content = AsyncMock(side_effect=RuntimeError("boom"))
+    adapter = GeminiLLMAdapter({"client": client})
+    assert await adapter.transcribe_audio(b"x", "audio/mpeg") == ""
