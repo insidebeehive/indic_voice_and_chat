@@ -12,7 +12,7 @@ from __future__ import annotations
 
 MODELS: dict[str, dict[str, list[str]]] = {
     "stt": {
-        "sarvam": ["saaras:v2"],
+        "sarvam": ["saaras:v3"],
         "groq": ["whisper-large-v3", "whisper-large-v3-turbo"],
         "deepgram": ["nova-2", "nova-3"],
     },

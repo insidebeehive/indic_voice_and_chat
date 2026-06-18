@@ -20,7 +20,7 @@ from src.interfaces.stt import ISTTProvider, STTConfig, STTResult
 
 
 SARVAM_BASE_URL = "https://api.sarvam.ai"
-DEFAULT_MODEL = "saaras:v2"
+DEFAULT_MODEL = "saaras:v3"
 
 # Per Sarvam docs (subset; full list maintained upstream).
 SUPPORTED_LANGUAGES = [

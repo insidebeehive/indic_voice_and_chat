@@ -15,7 +15,7 @@ Schema (all sections optional — global defaults fill the gaps):
     pipeline:
       stt:
         provider: sarvam
-        model: saaras:v2
+        model: saaras:v3
         api_key_env: TENANT_ACME_SARVAM_KEY
       llm:
         provider: groq
