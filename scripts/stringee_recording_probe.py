@@ -15,6 +15,8 @@ Credentials (first match wins):
 Usage:
     python scripts/stringee_recording_probe.py --call-id call-vn-1-... --tenant stage
     python scripts/stringee_recording_probe.py --call-id call-vn-1-... --sid SK... --secret ...
+    # validate a key is REST-enabled (no call id needed):
+    python scripts/stringee_recording_probe.py --check-key --sid SK... --secret ...
 
 A real GET hits the Stringee API; recordings are only available for a window
 after the call, so use a recent call id.
@@ -96,10 +98,12 @@ async def _probe(label: str, url: str, headers: dict) -> None:
 
 async def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Probe Stringee recording-download auth")
-    ap.add_argument("--call-id", required=True)
+    ap.add_argument("--call-id", default=None, help="required unless --check-key")
     ap.add_argument("--tenant", default=None, help="resolve creds from this tenant's DB row")
     ap.add_argument("--sid", default=None)
     ap.add_argument("--secret", default=None)
+    ap.add_argument("--check-key", action="store_true",
+                    help="only verify the key is REST-enabled (GET /v1/call/log) — no call id needed")
     args = ap.parse_args(argv)
     _load_dotenv()
 
@@ -117,6 +121,23 @@ async def main(argv: list[str] | None = None) -> int:
         return 2
 
     token = mint_server_token(sid, secret)
+
+    if args.check_key:
+        # Read-only REST auth probe: 200 => the keySid is REST-enabled (recordings
+        # will work); r:5 "keySid invalid" => REST not enabled for this key.
+        print(f"keySid={sid[:6]}… — checking REST access via GET /v1/call/log")
+        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as c:
+            r = await c.get("https://api.stringee.com/v1/call/log",
+                            headers={"X-STRINGEE-AUTH": token})
+        ok = r.status_code == 200
+        print(f"  HTTP {r.status_code}  {r.text[:160]}")
+        print("  => REST ENABLED — recordings will download with this key" if ok
+              else "  => REST NOT enabled for this keySid (recording download will 403)")
+        return 0 if ok else 1
+
+    if not args.call_id:
+        print("error: --call-id is required (or use --check-key)", file=sys.stderr)
+        return 2
     print(f"call_id={args.call_id}  keySid={sid[:6]}…  token={token[:10]}…\n")
 
     https = f"{RECORDING_BASE}/{args.call_id}"
