@@ -80,7 +80,8 @@ class TelephonyConfigIn(BaseModel):
     # No per-tenant inbound webhook base URL — it's the platform WEBHOOK_BASE_URL
     # (always our app, common to every tenant).
     events_webhook_url: Optional[str] = None        # outbound call-event callback
-    events_webhook_secret_env: Optional[str] = None  # env var naming the signing secret
+    # The signing secret is NOT named here — pass it as keys["events_webhook_secret"]
+    # (a value, encrypted at rest); it sets events_webhook_secret_env to a derived name.
     # Telephony credentials — the ONLY per-tenant secrets. Encrypted at rest.
     # e.g. {"account_sid": "AC...", "auth_token": "..."}. Optional for providers
     # (Stringee) whose adapter reads its keys from the platform env directly.
@@ -132,6 +133,9 @@ _TEL_KEY_ENV_FIELD = {
     # Stringee outbound app-user id — a non-null userId keeps the callout an
     # app-user->phone call so the Answer URL/SCCO runs (else silent phone->phone).
     "user_id": "user_id_env", "stringee_user_id": "user_id_env",
+    # The HMAC secret we sign outbound call-event webhooks with — entered as a
+    # VALUE, encrypted, and referenced by events_webhook_secret_env.
+    "events_webhook_secret": "events_webhook_secret_env",
 }
 
 
@@ -214,7 +218,6 @@ async def register_tenant(
             provider=tel.provider,
             from_number=tel.from_number,
             events_webhook_url=tel.events_webhook_url,
-            events_webhook_secret_env=tel.events_webhook_secret_env,
             **env_fields,
             # also record the creds under the provider-specific slot so a tenant
             # that later adds a second provider's keys resolves each correctly.
@@ -264,7 +267,6 @@ class TelephonyUpdateIn(BaseModel):
     provider: Optional[str] = None
     from_number: Optional[str] = None
     events_webhook_url: Optional[str] = None
-    events_webhook_secret_env: Optional[str] = None
     keys: dict[str, str] = Field(default_factory=dict)
     phone_numbers: Optional[list[str]] = None
 
@@ -327,8 +329,6 @@ async def update_tenant(
             tel_cfg["from_number"] = tu.from_number
         if tu.events_webhook_url is not None:
             tel_cfg["events_webhook_url"] = tu.events_webhook_url
-        if tu.events_webhook_secret_env is not None:
-            tel_cfg["events_webhook_secret_env"] = tu.events_webhook_secret_env
 
         if tu.keys:
             if not crypto.has_key():
@@ -408,7 +408,7 @@ class TenantSummary(BaseModel):
     # (never values) of the creds configured for the active provider.
     telephony_from_number: Optional[str] = None
     telephony_events_webhook_url: Optional[str] = None
-    telephony_events_webhook_secret_env: Optional[str] = None
+    telephony_events_webhook_secret_set: bool = False   # whether a signing secret is configured (never the value)
     telephony_creds_configured: list[str] = Field(default_factory=list)
     # Per-tenant Stringee webhook URLs (platform base + this tenant's slug) to
     # paste into the tenant's Stringee project so calls attribute correctly.
@@ -458,7 +458,7 @@ async def list_tenants(
             telephony_provider=tel.get("provider"),
             telephony_from_number=tel.get("from_number"),
             telephony_events_webhook_url=tel.get("events_webhook_url"),
-            telephony_events_webhook_secret_env=tel.get("events_webhook_secret_env"),
+            telephony_events_webhook_secret_set=bool(tel.get("events_webhook_secret_env")),
             telephony_creds_configured=_configured_creds(tel),
             stringee_softphone_answer_url=(
                 f"{base}/stringee/softphone-answer/{t.slug}" if base else None),

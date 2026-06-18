@@ -151,6 +151,27 @@ async def test_update_tenant_stores_stringee_user_id(ctx) -> None:
     assert "user_id_env" in resp.json()["telephony_creds_configured"]
 
 
+async def test_update_tenant_stores_events_webhook_secret(ctx) -> None:
+    """The events-webhook signing secret is entered as a VALUE and stored encrypted
+    (not an env-var name), so we can sign outbound call-event POSTs with it."""
+    client, resolver, _ = ctx
+    tid = (await client.post(
+        "/tenants", json=_body(slug="acme"), headers=ADMIN_HEADERS)).json()["tenant_id"]
+
+    resp = await client.patch(
+        f"/tenants/{tid}",
+        json={"telephony": {"events_webhook_url": "https://crm.example/events",
+                            "keys": {"events_webhook_secret": "s3cret-value"}}},
+        headers=ADMIN_HEADERS)
+    assert resp.status_code == 200
+
+    ctx2 = await resolver.resolve_by_slug("acme")
+    tel = ctx2.settings.pipeline.telephony
+    assert tel.events_webhook_url == "https://crm.example/events"
+    assert tel.events_webhook_secret_env                     # a derived NAME, set via keys
+    assert ctx2.secret_optional(tel.events_webhook_secret_env) == "s3cret-value"
+
+
 async def test_update_tenant_status_and_404(ctx) -> None:
     client, _, _ = ctx
     tid = (await client.post(
