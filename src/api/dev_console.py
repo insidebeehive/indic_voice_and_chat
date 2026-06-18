@@ -239,10 +239,15 @@ async def dev_place_call(req: PlaceCallRequest) -> dict:
     if provider in _STREAM_PROVIDERS:
         dev_call_control.set_override(
             tenant.slug, mode=req.mode, voice=req.voice.strip(), lead_name=req.lead_name.strip())
+    # Stringee: scope the answer URL to the placing tenant's slug so the bridge is
+    # built with THIS tenant's config (not resolved from the shared caller number).
+    answer_path = _ANSWER_PATH[provider]
+    if provider == "stringee":
+        answer_path = f"{answer_path}/{tenant.slug}"
     cfg = CallConfig(
         to_number=req.to_number.strip(),
         from_number=from_number,
-        webhook_url=f"{webhook_base.rstrip('/')}/{_ANSWER_PATH[provider]}",
+        webhook_url=f"{webhook_base.rstrip('/')}/{answer_path}",
     )
     try:
         session = await adapter.initiate_call(cfg)

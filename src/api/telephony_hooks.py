@@ -653,22 +653,17 @@ async def _resolve_stringee_tenant(data: dict):
     return None
 
 
-@router.api_route("/stringee/answer", methods=["GET", "POST"])
-async def stringee_answer(request: Request):
-    """Call answered -> build the call's bridge and return the opening SCCO.
-
-    Stringee fetches the answer_url via **GET** (call info in the query string);
-    we accept POST/JSON too. The whole request is logged so the first live call
-    reveals Stringee's real field names.
-    """
+async def _stringee_answer(request: Request, tenant: "TenantContext | None"):
+    """Build the call's bridge for an already-resolved tenant and return the
+    opening SCCO. Shared by the slug route (outbound, tenant from the URL) and the
+    number route (inbound fallback, tenant from the dialed/caller number)."""
     data = await _stringee_params(request)
     log.info("stringee answer", extra={"method": request.method, "data": data})
     call_id = str(data.get("call_id") or data.get("callId") or data.get("call_sid") or "")
     if not call_id:
         log.warning("stringee answer missing call_id; keys=%s", sorted(data.keys()))
-    tenant = await _resolve_stringee_tenant(data)
     if tenant is None:
-        log.warning("stringee answer: no tenant for any number; keys=%s", sorted(data.keys()))
+        log.warning("stringee answer: no tenant; keys=%s", sorted(data.keys()))
         return Response(status_code=404)
     if _stringee_bridge_factory is None:
         return Response(status_code=503)
@@ -685,6 +680,28 @@ async def stringee_answer(request: Request):
         dev_call_control.monitor.set_status(call_id, "answered")
     log.info("stringee answer registered", extra={"tenant": tenant.slug, "call_id": call_id})
     return JSONResponse(scco)
+
+
+@router.api_route("/stringee/answer/{tenant_slug}", methods=["GET", "POST"])
+async def stringee_answer_for_tenant(tenant_slug: str, request: Request):
+    """Outbound answer URL: the placing tenant is the slug in the path (set when we
+    built the callout's answer_url), so attribution + the live bridge's config
+    follow who placed the call — not the shared caller/dialed number."""
+    try:
+        tenant = await tenant_from_slug(tenant_slug)
+    except Exception:  # noqa: BLE001 - unknown slug → 404 below
+        tenant = None
+    return await _stringee_answer(request, tenant)
+
+
+@router.api_route("/stringee/answer", methods=["GET", "POST"])
+async def stringee_answer(request: Request):
+    """Inbound fallback: resolve the tenant from the dialed/caller number when the
+    answer URL carries no slug. Stringee fetches the answer_url via GET (call info
+    in the query string); we accept POST/JSON too.
+    """
+    tenant = await _resolve_stringee_tenant(await _stringee_params(request))
+    return await _stringee_answer(request, tenant)
 
 
 @router.api_route("/stringee/event/{tenant_slug}", methods=["GET", "POST"])
