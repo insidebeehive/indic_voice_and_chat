@@ -465,6 +465,21 @@ def _recording_mime(audio: bytes) -> str:
     return "audio/mpeg"   # Stringee records mono mp3
 
 
+def _audio_transcriber(tenant_llm):
+    """An LLM that can transcribe audio. Use the tenant's analysis LLM if it can
+    (Gemini tenants); otherwise (e.g. Groq) fall back to a platform Gemini
+    transcriber from GEMINI_API_KEY — Gemini handles Indian languages + the long
+    mono mp3. Returns None if no audio-capable transcriber is available."""
+    if getattr(tenant_llm, "transcribe_audio", None):
+        return tenant_llm
+    from src.providers import get_llm_provider
+    try:
+        return get_llm_provider({"provider": "gemini"})  # GEMINI_API_KEY from env
+    except Exception:  # noqa: BLE001
+        log.warning("softphone recording: no Gemini transcriber — set the platform GEMINI_API_KEY")
+        return None
+
+
 async def _finalize_softphone_recording(
     tenant: TenantContext, call_id: str, rec_url: str, dur_ms: int | None,
 ) -> None:
@@ -485,13 +500,13 @@ async def _finalize_softphone_recording(
         return
 
     llm = _softphone_providers.get_llm(tenant)
-    transcribe = getattr(llm, "transcribe_audio", None)
-    if transcribe is None:
-        log.warning("softphone recording: LLM %s has no audio transcription; skipping outcome",
-                    type(llm).__name__, extra={"call_id": call_id})
+    transcriber = _audio_transcriber(llm)
+    if transcriber is None:
+        log.warning("softphone recording: no audio transcriber; skipping outcome",
+                    extra={"call_id": call_id})
         return
     try:
-        text = await transcribe(audio, _recording_mime(audio))
+        text = await transcriber.transcribe_audio(audio, _recording_mime(audio))
     except Exception:  # noqa: BLE001
         log.exception("stringee softphone recording transcription failed", extra={"call_id": call_id})
         return

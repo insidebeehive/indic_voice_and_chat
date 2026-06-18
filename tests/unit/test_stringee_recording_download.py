@@ -14,6 +14,28 @@ def test_recording_mime_sniffs_wav_vs_mp3() -> None:
     assert telephony_hooks._recording_mime(b"\xff\xe3\x28\xc4") == "audio/mpeg"
 
 
+def test_audio_transcriber_uses_tenant_llm_if_capable() -> None:
+    class _LLM:
+        async def transcribe_audio(self, audio, mime_type="audio/mpeg"):
+            return "x"
+    llm = _LLM()
+    assert telephony_hooks._audio_transcriber(llm) is llm
+
+
+def test_audio_transcriber_falls_back_to_gemini(monkeypatch) -> None:
+    """A tenant whose analysis LLM can't transcribe audio (e.g. Groq) still gets a
+    Gemini transcriber from the platform key."""
+    import src.providers as providers
+    sentinel = object()
+    monkeypatch.setattr(
+        providers, "get_llm_provider",
+        lambda cfg: sentinel if cfg.get("provider") == "gemini" else None)
+
+    class _GroqLike:  # no transcribe_audio
+        pass
+    assert telephony_hooks._audio_transcriber(_GroqLike()) is sentinel
+
+
 def _tenant() -> TenantContext:
     # No creds env set → no auth header; exercises the plain (signed-URL) path.
     return TenantContext(settings=TenantSettings(id="t", slug="t", name="T"))
