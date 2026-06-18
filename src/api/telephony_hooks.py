@@ -488,17 +488,22 @@ async def _download_stringee_recording(url: str, tenant: TenantContext) -> bytes
     tenant's Stringee keys are available (signed/public URLs work without it)."""
     from src.providers.telephony.stringee import mint_server_token
 
-    c = tenant.settings.pipeline.telephony.active_creds()
-    sid = tenant.secret(c.account_sid_env) if c.account_sid_env else None
-    secret = tenant.secret(c.auth_token_env) if c.auth_token_env else None
+    creds = tenant.settings.pipeline.telephony.active_creds()
+    sid = tenant.secret(creds.account_sid_env) if creds.account_sid_env else None
+    secret = tenant.secret(creds.auth_token_env) if creds.auth_token_env else None
+    # Stringee 301-redirects http→https and DROPS the query string on the redirect,
+    # so go straight to https. The recording GET authenticates via the access_token
+    # query param (the X-STRINGEE-AUTH header alone gets 403 here); send both.
+    url = url.replace("http://", "https://", 1)
     headers = {}
     if sid and secret:
-        headers["X-STRINGEE-AUTH"] = mint_server_token(sid, secret)
-    # Stringee 301-redirects http→https for recording URLs — follow it (httpx
-    # doesn't by default, and a 3xx would otherwise raise in raise_for_status).
+        token = mint_server_token(sid, secret)
+        headers["X-STRINGEE-AUTH"] = token
+        sep = "&" if "?" in url else "?"
+        url = f"{url}{sep}access_token={token}"
     async with httpx.AsyncClient(
-        timeout=httpx.Timeout(30.0, connect=10.0), follow_redirects=True) as c:
-        resp = await c.get(url, headers=headers)
+        timeout=httpx.Timeout(30.0, connect=10.0), follow_redirects=True) as client:
+        resp = await client.get(url, headers=headers)
         resp.raise_for_status()
         return resp.content
 
