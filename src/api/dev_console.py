@@ -28,6 +28,7 @@ from src.api.gemini_live_bridge import RECORD_TURN_SIGNAL, GeminiLiveBridge
 from src.auth.context import TenantContext
 from src.auth.registry import TenantProviders
 from src.bootstrap import DEFAULT_DEMO_SCRIPT
+from src.config_tenant import platform_webhook_base_url
 from src.dialogue.prompts import VoiceBotScript, build_s2s_system_instruction
 from src.dialogue.slots import SlotSchema
 from src.interfaces.realtime import RealtimeConfig
@@ -189,11 +190,10 @@ async def dev_place_call(req: PlaceCallRequest) -> dict:
         raise HTTPException(
             status_code=400,
             detail=f"provider '{provider}' can't be placed from here; use {list(_PLACE_CALL_PROVIDERS)}")
-    webhook_base = tel.effective_webhook_base_url()   # tenant value, else platform WEBHOOK_BASE_URL
+    webhook_base = platform_webhook_base_url()   # platform-level; not per-tenant
     if not webhook_base:
         raise HTTPException(
-            status_code=400,
-            detail="no telephony webhook base URL — set tenant telephony.webhook_base_url or platform WEBHOOK_BASE_URL")
+            status_code=400, detail="platform WEBHOOK_BASE_URL is not set")
 
     # The dropdown drives the provider — build *its* adapter (creds resolve from the
     # provider's env vars) and dial from *its* configured caller-ID, independent of

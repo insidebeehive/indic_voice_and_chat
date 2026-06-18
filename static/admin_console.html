@@ -117,7 +117,6 @@
       <div class="grid">
         <label>Provider <select id="t_tel_provider" onchange="syncTelProvider()"></select></label>
         <label>From number <input id="t_from" value="+15705255679" /></label>
-        <label>Webhook base URL <input id="t_webhook" value="https://example.com/api/v1/telephony" /></label>
         <label>account_sid / API Key SID <input id="t_sid" placeholder="Twilio AC… / Stringee SK… (encrypted at rest)" /></label>
         <label>auth_token / API Key Secret <input id="t_tok" placeholder="Twilio token / Stringee secret (encrypted at rest)" /></label>
         <label>user_id <input id="t_user_id" placeholder="Stringee app user id (e.g. dev) — Stringee only" /></label>
@@ -316,7 +315,7 @@ async function registerTenant() {
   const mode = $("t_mode").value;
   const body = {
     name: $("t_name").value, mode, max_concurrent_calls: Number($("t_max").value) || 1,
-    telephony: { provider: $("t_tel_provider").value, from_number: $("t_from").value, webhook_base_url: $("t_webhook").value, keys: {} },
+    telephony: { provider: $("t_tel_provider").value, from_number: $("t_from").value, keys: {} },
   };
   if (mode === "s2s") body.realtime = { provider: $("sel_s2s").value, model: $("mdl_s2s").value, voice: $("voi_s2s").value, language_code: $("t_lang").value };
   else {
