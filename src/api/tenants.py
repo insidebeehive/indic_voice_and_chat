@@ -33,6 +33,7 @@ from src.config_tenant import (
     TenantSTTConfig,
     TenantTelephonyConfig,
     TenantTTSConfig,
+    platform_webhook_base_url,
 )
 from src.config_tenant import TenantLLMConfig as _LLM
 from src.models.conversation import Conversation
@@ -409,6 +410,10 @@ class TenantSummary(BaseModel):
     telephony_events_webhook_url: Optional[str] = None
     telephony_events_webhook_secret_env: Optional[str] = None
     telephony_creds_configured: list[str] = Field(default_factory=list)
+    # Per-tenant Stringee webhook URLs (platform base + this tenant's slug) to
+    # paste into the tenant's Stringee project so calls attribute correctly.
+    stringee_softphone_answer_url: Optional[str] = None
+    stringee_answer_url: Optional[str] = None
 
 
 class TenantListResponse(BaseModel):
@@ -440,6 +445,7 @@ async def list_tenants(
 ) -> TenantListResponse:
     """List every tenant with its mode + selected providers/models (admin)."""
     rows = (await session.execute(select(Tenant).order_by(Tenant.created_at))).scalars().all()
+    base = (platform_webhook_base_url() or "").rstrip("/")
     items = []
     for t in rows:
         pc = t.pipeline_config or {}
@@ -454,6 +460,10 @@ async def list_tenants(
             telephony_events_webhook_url=tel.get("events_webhook_url"),
             telephony_events_webhook_secret_env=tel.get("events_webhook_secret_env"),
             telephony_creds_configured=_configured_creds(tel),
+            stringee_softphone_answer_url=(
+                f"{base}/stringee/softphone-answer/{t.slug}" if base else None),
+            stringee_answer_url=(
+                f"{base}/stringee/answer/{t.slug}" if base else None),
         ))
     return TenantListResponse(tenants=items, total=len(items))
 

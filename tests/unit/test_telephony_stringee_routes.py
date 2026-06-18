@@ -51,6 +51,25 @@ def test_answer_returns_opening_scco_and_audio_served(client):
     assert a.status_code == 200 and a.content[:4] == b"RIFF"
 
 
+def test_answer_by_slug_resolves_tenant_from_path(client, monkeypatch):
+    """The slug route resolves the tenant from the URL path (the placing tenant),
+    NOT from the shared caller/dialed number."""
+    from types import SimpleNamespace
+    seen = {}
+
+    async def _by_slug(slug):
+        seen["slug"] = slug
+        return SimpleNamespace(slug=slug, id=slug)
+    monkeypatch.setattr(hooks, "tenant_from_slug", _by_slug)
+
+    r = client.get("/api/v1/telephony/stringee/answer/stage"
+                   "?call_id=s1&from=918204268005&to=918618795697")
+    assert r.status_code == 200
+    assert seen["slug"] == "stage"          # resolved by slug, not number
+    scco = r.json()
+    assert scco[0]["action"] == "play" and scco[1]["action"] == "recordMessage"
+
+
 def test_answer_accepts_get_with_query_params(client):
     # Stringee fetches answer_url via GET with call info in the query string.
     r = client.get("/api/v1/telephony/stringee/answer"

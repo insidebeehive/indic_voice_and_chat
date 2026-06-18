@@ -220,6 +220,11 @@ function loadTelephony(id) {
       }</select></label>
       <label>from_number <input id="te_from" value="${escAttr(t.telephony_from_number)}" placeholder="+91… / 91…" /></label>
     </div>
+    <h2 style="margin-top:.9rem;">Stringee webhook URLs <small class="hint">(paste into this tenant's Stringee project — read-only)</small></h2>
+    <div class="creds" style="gap:.6rem;">
+      <label>Softphone Answer URL <input style="width:30rem" readonly onclick="this.select()" value="${escAttr(t.stringee_softphone_answer_url)}" /></label>
+      <label>Voicebot Answer URL <input style="width:30rem" readonly onclick="this.select()" value="${escAttr(t.stringee_answer_url)}" /></label>
+    </div>
     <h2 style="margin-top:.9rem;">Credentials</h2>
     <div class="hint">Configured: ${cfg.length ? `<b>${cfg.map(c => c.replace(/_env$/,"")).join(", ")}</b>` : "none"} <small>(names only — values hidden)</small></div>
     <div style="margin-top:.4rem;"><button id="te_editbtn" class="ghost sm" onclick="editTelKeys()">Edit keys</button></div>

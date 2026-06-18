@@ -288,7 +288,7 @@ def test_place_call_falls_back_to_platform_webhook_base_url(monkeypatch):
         resp = _client().post("/dev/place-call", json={
             "provider": "stringee", "to_number": "+918618795697", "mode": "s2s", "voice": "Kore"})
         assert resp.status_code == 200, resp.text
-        assert captured["webhook_url"] == "https://platform.example/api/v1/telephony/stringee/answer"
+        assert captured["webhook_url"] == "https://platform.example/api/v1/telephony/stringee/answer/dev"
     finally:
         set_tenant_resolver(None)
 
@@ -340,7 +340,7 @@ def test_place_call_stringee_uses_answer_webhook_no_override(monkeypatch):
         assert resp.json()["provider_call_sid"] == "STR1"
         cfg = captured["cfg"]
         assert cfg.from_number == "+918204268005"
-        assert cfg.webhook_url == "https://example.test/api/v1/telephony/stringee/answer"
+        assert cfg.webhook_url == "https://example.test/api/v1/telephony/stringee/answer/dev"
         from src.api import dev_call_control
         assert dev_call_control.monitor.get("STR1")["status"] == "calling"
         assert dev_call_control.pop_override("dev") is None     # IVR ignores Mode/Voice

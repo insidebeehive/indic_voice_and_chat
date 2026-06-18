@@ -259,6 +259,10 @@ async def test_list_tenants_shows_mode_and_models(ctx) -> None:
     assert acme["telephony_from_number"] == "+15705255679"
     assert "account_sid_env" in acme["telephony_creds_configured"]
     assert "auth_token_env" in acme["telephony_creds_configured"]
+    # Per-tenant Stringee webhook URLs (slug in the path) to paste into the
+    # tenant's Stringee project so calls attribute to the right tenant.
+    assert acme["stringee_softphone_answer_url"].endswith("/stringee/softphone-answer/acme")
+    assert acme["stringee_answer_url"].endswith("/stringee/answer/acme")
 
 
 async def test_list_tenants_requires_admin(ctx) -> None:

@@ -144,10 +144,15 @@ async def call_lead(
     except Exception as e:  # noqa: BLE001 — e.g. missing credentials
         raise HTTPException(status_code=400, detail=f"telephony adapter unavailable: {e}")
 
+    # Stringee: scope the answer URL to the calling tenant's slug so the answering
+    # bridge uses THIS tenant's config (not resolved from the shared number).
+    answer_url = webhook_base.rstrip("/")
+    if provider == "stringee":
+        answer_url = f"{answer_url}/stringee/answer/{tenant.slug}"
     cfg = CallConfig(
         to_number=req.to_number.strip(),
         from_number=from_number,
-        webhook_url=webhook_base.rstrip("/"),
+        webhook_url=answer_url,
     )
     try:
         call_session = await adapter.initiate_call(cfg)
