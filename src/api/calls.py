@@ -126,6 +126,9 @@ async def call_lead(
 
     creds = tel.active_creds()
     acct, auth = _cred(creds.account_sid_env), _cred(creds.auth_token_env)
+    # Stringee: the callout needs a non-null userId, or it goes out as a
+    # phone->phone external call and the Answer URL/SCCO never runs (silent bot).
+    uid = _cred(creds.user_id_env)
     try:
         adapter = get_telephony_provider({
             "provider": provider,
@@ -134,6 +137,7 @@ async def call_lead(
             # account keys are stored as account_sid/auth_token) — pass them so it
             # dials with the tenant's creds, not STRINGEE_API_KEY_SID from env.
             "api_key_sid": acct, "api_key_secret": auth,
+            "user_id": uid,
         })
     except Exception as e:  # noqa: BLE001 — e.g. missing credentials
         raise HTTPException(status_code=400, detail=f"telephony adapter unavailable: {e}")

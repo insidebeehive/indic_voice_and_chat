@@ -169,6 +169,36 @@ def test_place_call_passes_tenant_creds_to_adapter(monkeypatch):
     assert captured["api_key_secret"] == "dev-secret"
 
 
+def test_place_call_passes_stringee_user_id_to_adapter(monkeypatch):
+    """Stringee's callout needs a non-null userId, or it degrades to a
+    phone->phone external call and the Answer URL/SCCO never runs (the bot stays
+    silent). The dev place-call must resolve the tenant's per-provider
+    ``user_id_env`` and pass it to the adapter as ``user_id``."""
+    monkeypatch.setenv("DEV_STR_SID", "SK.dev-sid")
+    monkeypatch.setenv("DEV_STR_SECRET", "dev-secret")
+    monkeypatch.setenv("DEV_STR_USER", "dev")
+    captured = {}
+
+    class _FakeAdapter:
+        async def initiate_call(self, cfg):
+            return CallSession(session_id="CA1", status="ringing",
+                               to_number=cfg.to_number, from_number=cfg.from_number)
+
+    monkeypatch.setattr(devmod, "get_telephony_provider",
+                        lambda cfg: captured.update(cfg) or _FakeAdapter())
+    register_tenant_for_test(TenantSettings(
+        id="t_dev", slug="dev", name="Dev",
+        pipeline=TenantPipelineConfig(telephony=TenantTelephonyConfig(
+            provider="stringee", from_number="+918204268005",
+            webhook_base_url="https://example.test/api/v1/telephony",
+            account_sid_env="DEV_STR_SID", auth_token_env="DEV_STR_SECRET",
+            user_id_env="DEV_STR_USER"))))
+    resp = _client().post("/dev/place-call", json={
+        "provider": "stringee", "to_number": "+918618795697", "mode": "s2s", "voice": "Kore"})
+    assert resp.status_code == 200, resp.text
+    assert captured["user_id"] == "dev"
+
+
 def test_place_call_no_caller_id_for_provider(monkeypatch):
     def _no_build(cfg):
         raise AssertionError("adapter should not be built without a caller-ID")
