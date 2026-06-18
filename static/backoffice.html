@@ -191,7 +191,10 @@ function loadTelephony(id) {
       Credential values are <b>encrypted at rest</b> and write-only — leave a field blank to keep the
       existing value. PATCHes <code>/api/v1/tenants/${id}</code>; the live resolver refreshes immediately.</div>
     <div class="creds" style="gap:.6rem;">
-      <label>provider <input id="te_provider" value="${t.telephony_provider || ""}" placeholder="stringee | twilio | exotel" /></label>
+      <label>provider <select id="te_provider">${
+        ["stringee","twilio","exotel","infobip","telnyx","webconsole"]
+          .map(p => `<option value="${p}"${p === (t.telephony_provider || "") ? " selected" : ""}>${p}</option>`).join("")
+      }</select></label>
       <label>from_number <input id="te_from" placeholder="+91… / 91… (blank = keep)" /></label>
       <label>webhook_base_url <input id="te_webhook" style="width:22rem" placeholder="https://…/api/v1/telephony (blank = keep)" /></label>
     </div>
@@ -199,6 +202,7 @@ function loadTelephony(id) {
     <div class="creds" style="gap:.6rem;">
       <label>account_sid <input id="te_sid" placeholder="Twilio SID / Stringee API Key SID" /></label>
       <label>auth_token <input id="te_tok" type="password" placeholder="Twilio token / Stringee API Key Secret" /></label>
+      <label>user_id <small class="hint">(Stringee)</small> <input id="te_userid" placeholder="Stringee app user id (e.g. dev)" /></label>
     </div>
     <div class="creds" style="gap:.6rem;margin-top:.4rem;">
       <label>api_key_sid <small class="hint">(Twilio softphone)</small> <input id="te_apisid" placeholder="SK…" /></label>
@@ -225,7 +229,7 @@ async function saveTelephony(id) {
   if (v("te_ewurl")) tel.events_webhook_url = v("te_ewurl");
   if (v("te_ewsecret")) tel.events_webhook_secret_env = v("te_ewsecret");
   const keys = {};
-  for (const [field, el] of [["account_sid", "te_sid"], ["auth_token", "te_tok"],
+  for (const [field, el] of [["account_sid", "te_sid"], ["auth_token", "te_tok"], ["user_id", "te_userid"],
        ["api_key_sid", "te_apisid"], ["api_key_secret", "te_apisecret"], ["twiml_app_sid", "te_twiml"]])
     if (v(el)) keys[field] = v(el);
   if (Object.keys(keys).length) tel.keys = keys;
@@ -234,7 +238,7 @@ async function saveTelephony(id) {
   const r = await apiSend("PATCH", `/api/v1/tenants/${id}`, { telephony: tel });
   if (r.ok) {
     $("te_result").textContent = "✓ saved — resolver refreshed";
-    for (const el of ["te_sid", "te_tok", "te_apisid", "te_apisecret", "te_twiml"]) $(el).value = "";
+    for (const el of ["te_sid", "te_tok", "te_userid", "te_apisid", "te_apisecret", "te_twiml"]) $(el).value = "";
     loadTenants();
   } else {
     $("te_result").textContent = `✗ ${r.status}: ${r.json.detail || r.json.error || "error"}`;

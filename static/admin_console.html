@@ -105,7 +105,7 @@
         </div>
         <div class="crow tentative" id="row_telephony">
           <span class="clabel">Telephony <small>(tenant's own key — tentative)</small></span>
-          <span class="cctrl"><select id="sel_telephony" onchange="recompute()"></select></span>
+          <span class="cctrl"><select id="sel_telephony" onchange="$('t_tel_provider').value=this.value; recompute()"></select></span>
           <span class="ccost tnt" id="cost_telephony">—</span>
         </div>
       </div>
@@ -115,10 +115,12 @@
       <!-- telephony details (creds + routing) -->
       <h2 style="margin-top:1rem;">Telephony details</h2>
       <div class="grid">
+        <label>Provider <select id="t_tel_provider" onchange="syncTelProvider()"></select></label>
         <label>From number <input id="t_from" value="+15705255679" /></label>
         <label>Webhook base URL <input id="t_webhook" value="https://example.com/api/v1/telephony" /></label>
-        <label>account_sid <input id="t_sid" placeholder="AC… (encrypted at rest)" /></label>
-        <label>auth_token <input id="t_tok" placeholder="… (encrypted at rest)" /></label>
+        <label>account_sid / API Key SID <input id="t_sid" placeholder="Twilio AC… / Stringee SK… (encrypted at rest)" /></label>
+        <label>auth_token / API Key Secret <input id="t_tok" placeholder="Twilio token / Stringee secret (encrypted at rest)" /></label>
+        <label>user_id <input id="t_user_id" placeholder="Stringee app user id (e.g. dev) — Stringee only" /></label>
       </div>
 
       <!-- browser softphone (human agent ↔ lead) — Twilio only for now -->
@@ -197,6 +199,11 @@ function show(el, obj) { const e = $(el); e.hidden = false; e.innerHTML = ""; co
 let MODELS = {};   // kind -> provider -> [models]
 let COSTS = {};    // kind -> provider -> model("" = provider-level) -> cost/min
 
+function syncTelProvider() {   // Telephony-details provider is authoritative; mirror to the cost row
+  const sel = $("sel_telephony");
+  if (sel) sel.value = $("t_tel_provider").value;
+  recompute();
+}
 function setOptions(sel, values, selected) {
   if (!sel) return;
   sel.innerHTML = "";
@@ -281,7 +288,9 @@ async function loadCosts() {
   // telephony options: webconsole (browser test) + catalog providers (fallback set)
   const cat = Object.keys(COSTS.telephony || {});
   const tels = Array.from(new Set(["webconsole", ...(cat.length ? cat : TEL_FALLBACK)]));
-  setOptions($("sel_telephony"), tels, "twilio");
+  const cur = $("t_tel_provider").value || "twilio";   // preserve an explicit pick across reloads
+  setOptions($("sel_telephony"), tels, cur);
+  setOptions($("t_tel_provider"), tels, cur);           // authoritative provider chooser (with the creds)
   $("cost_note").textContent = r.ok
     ? "Per-model rates from the cost catalog (live) — total updates with the model dropdowns."
     : "Could not load rates — enter your admin token + Save.";
@@ -307,7 +316,7 @@ async function registerTenant() {
   const mode = $("t_mode").value;
   const body = {
     name: $("t_name").value, mode, max_concurrent_calls: Number($("t_max").value) || 1,
-    telephony: { provider: $("sel_telephony").value, from_number: $("t_from").value, webhook_base_url: $("t_webhook").value, keys: {} },
+    telephony: { provider: $("t_tel_provider").value, from_number: $("t_from").value, webhook_base_url: $("t_webhook").value, keys: {} },
   };
   if (mode === "s2s") body.realtime = { provider: $("sel_s2s").value, model: $("mdl_s2s").value, voice: $("voi_s2s").value, language_code: $("t_lang").value };
   else {
@@ -318,6 +327,8 @@ async function registerTenant() {
   if ($("t_slug").value.trim()) body.slug = $("t_slug").value.trim();
   if ($("t_sid").value.trim()) body.telephony.keys.account_sid = $("t_sid").value.trim();
   if ($("t_tok").value.trim()) body.telephony.keys.auth_token = $("t_tok").value.trim();
+  // Stringee outbound app-user id (else the callout is a silent phone->phone external)
+  if ($("t_user_id").value.trim()) body.telephony.keys.user_id = $("t_user_id").value.trim();
   // browser softphone (Twilio) — only sent if filled in
   if ($("t_apikey_sid").value.trim()) body.telephony.keys.api_key_sid = $("t_apikey_sid").value.trim();
   if ($("t_apikey_secret").value.trim()) body.telephony.keys.api_key_secret = $("t_apikey_secret").value.trim();
