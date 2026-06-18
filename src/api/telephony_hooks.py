@@ -491,16 +491,14 @@ async def _download_stringee_recording(url: str, tenant: TenantContext) -> bytes
     creds = tenant.settings.pipeline.telephony.active_creds()
     sid = tenant.secret(creds.account_sid_env) if creds.account_sid_env else None
     secret = tenant.secret(creds.auth_token_env) if creds.auth_token_env else None
-    # Stringee 301-redirects http→https and DROPS the query string on the redirect,
-    # so go straight to https. The recording GET authenticates via the access_token
-    # query param (the X-STRINGEE-AUTH header alone gets 403 here); send both.
+    # Go straight to https (Stringee 301-redirects http→https). Auth is the same
+    # X-STRINGEE-AUTH server token the callout uses — but the recording must be
+    # owned by THIS tenant's Stringee project, else Stringee returns r:5 "keySid
+    # invalid" (see scripts/stringee_recording_probe.py).
     url = url.replace("http://", "https://", 1)
     headers = {}
     if sid and secret:
-        token = mint_server_token(sid, secret)
-        headers["X-STRINGEE-AUTH"] = token
-        sep = "&" if "?" in url else "?"
-        url = f"{url}{sep}access_token={token}"
+        headers["X-STRINGEE-AUTH"] = mint_server_token(sid, secret)
     async with httpx.AsyncClient(
         timeout=httpx.Timeout(30.0, connect=10.0), follow_redirects=True) as client:
         resp = await client.get(url, headers=headers)

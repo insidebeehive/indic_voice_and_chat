@@ -26,17 +26,17 @@ def _tenant_with_creds() -> TenantContext:
 
 @respx.mock
 @pytest.mark.asyncio
-async def test_download_authenticates_via_access_token_query_over_https() -> None:
-    """Stringee's recording GET wants the token as an access_token query param, and
-    its 301 drops the query — so we go straight to https with access_token set."""
-    route = respx.get(url__startswith="https://api.stringee.com/v1/call/recording/abc").mock(
+async def test_download_goes_to_https_with_auth_header() -> None:
+    """Fetch over https (Stringee 301s http→https) authenticated with the
+    X-STRINGEE-AUTH server token — the same auth the callout uses."""
+    route = respx.get("https://api.stringee.com/v1/call/recording/abc").mock(
         return_value=httpx.Response(200, content=b"DATA"))
     out = await telephony_hooks._download_stringee_recording(
         "http://api.stringee.com/v1/call/recording/abc", _tenant_with_creds())
     assert out == b"DATA"
     req = route.calls.last.request
-    assert req.url.scheme == "https"            # upgraded up front, no redirect to drop the query
-    assert "access_token=" in str(req.url)      # token carried as a query param
+    assert req.url.scheme == "https"                       # upgraded up front
+    assert req.headers.get("X-STRINGEE-AUTH")              # authenticated via header
 
 
 @respx.mock
