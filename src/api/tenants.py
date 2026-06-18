@@ -127,6 +127,9 @@ _TEL_KEY_ENV_FIELD = {
     "api_key_sid": "api_key_sid_env", "twilio_api_key_sid": "api_key_sid_env",
     "api_key_secret": "api_key_secret_env", "twilio_api_key_secret": "api_key_secret_env",
     "twiml_app_sid": "twiml_app_sid_env",
+    # Stringee outbound app-user id — a non-null userId keeps the callout an
+    # app-user->phone call so the Answer URL/SCCO runs (else silent phone->phone).
+    "user_id": "user_id_env", "stringee_user_id": "user_id_env",
 }
 
 
@@ -381,7 +384,7 @@ async def update_tenant(
     configured = [
         field for field in (
             "account_sid_env", "auth_token_env", "api_key_sid_env",
-            "api_key_secret_env", "twiml_app_sid_env")
+            "api_key_secret_env", "twiml_app_sid_env", "user_id_env")
         if getattr(active, field)
     ]
     return UpdateTenantResponse(

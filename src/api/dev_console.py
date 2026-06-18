@@ -217,11 +217,15 @@ async def dev_place_call(req: PlaceCallRequest) -> dict:
 
     pcreds = tel.creds_for(provider)
     acct, auth = _cred(pcreds.account_sid_env), _cred(pcreds.auth_token_env)
+    # Stringee: the callout needs a non-null userId, or it goes out as a
+    # phone->phone external call and the Answer URL/SCCO never runs (silent bot).
+    uid = _cred(pcreds.user_id_env)
     try:
         adapter = get_telephony_provider({
             "provider": provider,
             "account_sid": acct, "auth_token": auth,
             "api_key_sid": acct, "api_key_secret": auth,
+            "user_id": uid,
         })
     except Exception as e:  # noqa: BLE001 - e.g. missing per-tenant credentials
         raise HTTPException(status_code=400, detail=f"telephony adapter for '{provider}' unavailable: {e}")

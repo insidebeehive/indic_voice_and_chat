@@ -130,6 +130,27 @@ async def test_update_tenant_fixes_stringee_keys_and_resolver(ctx) -> None:
     assert claims["iss"] == "RIGHT_SID"
 
 
+async def test_update_tenant_stores_stringee_user_id(ctx) -> None:
+    """The backoffice Telephony tab can set the Stringee outbound ``user_id``
+    (stored as user_id_env). Without it the callout degrades to phone->phone
+    external and the Answer URL/SCCO never runs."""
+    client, _, _ = ctx
+    body = _body(slug="dev")
+    body["telephony"] = {
+        "provider": "stringee", "from_number": "+15705255679",
+        "keys": {"account_sid": "SID", "auth_token": "secret"},
+    }
+    reg = (await client.post("/tenants", json=body, headers=ADMIN_HEADERS)).json()
+    tid = reg["tenant_id"]
+
+    resp = await client.patch(
+        f"/tenants/{tid}",
+        json={"telephony": {"keys": {"user_id": "dev"}}},
+        headers=ADMIN_HEADERS)
+    assert resp.status_code == 200
+    assert "user_id_env" in resp.json()["telephony_creds_configured"]
+
+
 async def test_update_tenant_status_and_404(ctx) -> None:
     client, _, _ = ctx
     tid = (await client.post(

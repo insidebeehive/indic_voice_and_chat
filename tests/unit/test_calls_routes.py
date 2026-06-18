@@ -118,6 +118,7 @@ async def test_call_lead_dials_with_tenant_creds(monkeypatch) -> None:
     # call bills/identifies as the tenant), not the platform env.
     monkeypatch.setenv("TENANT_T1_STRINGEE_SID", "ACTUAL-SID")
     monkeypatch.setenv("TENANT_T1_STRINGEE_SECRET", "ACTUAL-SECRET")
+    monkeypatch.setenv("TENANT_T1_STRINGEE_USER", "dev")
     captured: dict = {}
     monkeypatch.setattr(calls, "get_telephony_provider",
                         lambda cfg: captured.update(cfg) or _FakeAdapter())
@@ -144,7 +145,8 @@ async def test_call_lead_dials_with_tenant_creds(monkeypatch) -> None:
                 provider="stringee", from_number="918204268005",
                 webhook_base_url="https://x.example/api/v1/telephony",
                 account_sid_env="TENANT_T1_STRINGEE_SID",
-                auth_token_env="TENANT_T1_STRINGEE_SECRET")))
+                auth_token_env="TENANT_T1_STRINGEE_SECRET",
+                user_id_env="TENANT_T1_STRINGEE_USER")))
     set_tenant_resolver(None)
     register_tenant_for_test(tenant, plaintext_tokens=["test-token"])
     app = FastAPI()
@@ -164,6 +166,9 @@ async def test_call_lead_dials_with_tenant_creds(monkeypatch) -> None:
     # Mapped onto the keys the Stringee server adapter reads (not STRINGEE_* env).
     assert captured["api_key_sid"] == "ACTUAL-SID"
     assert captured["api_key_secret"] == "ACTUAL-SECRET"
+    # Stringee userId — without it the callout degrades to phone->phone external
+    # and the Answer URL/SCCO never runs (silent bot).
+    assert captured["user_id"] == "dev"
 
 
 async def _app_with_registry(registry):

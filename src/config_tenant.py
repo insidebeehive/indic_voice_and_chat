@@ -137,6 +137,11 @@ class TelephonyCreds(BaseModel):
     api_key_sid_env: Optional[str] = None
     api_key_secret_env: Optional[str] = None
     twiml_app_sid_env: Optional[str] = None
+    # Stringee-only: the originating app user id for outbound callouts. A non-null
+    # ``userId`` makes the callout an app-user->phone call (so Stringee fetches the
+    # Answer URL and runs the SCCO); without it the call degrades to phone->phone
+    # external and the bot never speaks. Names a secret resolved via .secret().
+    user_id_env: Optional[str] = None
 
 
 class TenantTelephonyConfig(BaseModel):
@@ -157,6 +162,7 @@ class TenantTelephonyConfig(BaseModel):
     api_key_sid_env: Optional[str] = None
     api_key_secret_env: Optional[str] = None
     twiml_app_sid_env: Optional[str] = None
+    user_id_env: Optional[str] = None
     # Per-provider credential slots, so a tenant that has keys for more than one
     # provider (e.g. Twilio + Stringee) resolves the set matching its configured
     # ``provider`` — not whichever was registered first. {provider: TelephonyCreds}.
@@ -179,6 +185,7 @@ class TenantTelephonyConfig(BaseModel):
             api_key_sid_env=self.api_key_sid_env,
             api_key_secret_env=self.api_key_secret_env,
             twiml_app_sid_env=self.twiml_app_sid_env,
+            user_id_env=self.user_id_env,
         )
 
     def active_creds(self) -> "TelephonyCreds":
