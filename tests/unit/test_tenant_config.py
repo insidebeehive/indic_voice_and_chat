@@ -133,28 +133,19 @@ def test_secret_returns_none_when_env_name_is_none() -> None:
     assert t.secret(None) is None
 
 
-def test_effective_webhook_base_url_uses_tenant_value() -> None:
-    from src.config_tenant import TenantTelephonyConfig
-
-    tel = TenantTelephonyConfig(
-        provider="stringee", webhook_base_url="https://t.example/api/v1/telephony")
-    assert tel.effective_webhook_base_url() == "https://t.example/api/v1/telephony"
-
-
-def test_effective_webhook_base_url_falls_back_to_platform(monkeypatch) -> None:
-    """A tenant with no webhook_base_url falls back to the platform-level
-    WEBHOOK_BASE_URL (settings.pipeline.telephony.webhook_base_url) — the inbound
+def test_platform_webhook_base_url_reads_settings(monkeypatch) -> None:
+    """The telephony webhook base is platform-level (WEBHOOK_BASE_URL →
+    settings.pipeline.telephony.webhook_base_url), not per-tenant — the inbound
     callback is always our own app, common to every tenant."""
     from types import SimpleNamespace
 
     import src.config as cfg
-    from src.config_tenant import TenantTelephonyConfig
+    from src.config_tenant import platform_webhook_base_url
 
     fake = SimpleNamespace(pipeline=SimpleNamespace(telephony=SimpleNamespace(
         webhook_base_url="https://platform.example/api/v1/telephony")))
     monkeypatch.setattr(cfg, "get_settings", lambda: fake)
-    tel = TenantTelephonyConfig(provider="stringee")  # no per-tenant override
-    assert tel.effective_webhook_base_url() == "https://platform.example/api/v1/telephony"
+    assert platform_webhook_base_url() == "https://platform.example/api/v1/telephony"
 
 
 def test_merge_provider_config_overrides_only_set_fields() -> None:

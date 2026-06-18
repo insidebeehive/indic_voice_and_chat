@@ -21,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.call_store import count_active_calls, insert_call
 from src.api.deps import get_db_session
+from src.config_tenant import platform_webhook_base_url
 from src.auth import TenantContext, current_tenant
 from src.interfaces.telephony import CallConfig
 from src.models.campaign import Campaign as DbCampaign
@@ -110,11 +111,9 @@ async def call_lead(
     from_number = req.from_number or (tel.outbound_from or {}).get(provider) or tel.from_number
     if not from_number:
         raise HTTPException(status_code=400, detail="no caller-ID configured for this tenant")
-    webhook_base = tel.effective_webhook_base_url()   # tenant value, else platform WEBHOOK_BASE_URL
+    webhook_base = platform_webhook_base_url()   # platform-level; not per-tenant
     if not webhook_base:
-        raise HTTPException(
-            status_code=400,
-            detail="no telephony webhook base URL — set tenant telephony.webhook_base_url or platform WEBHOOK_BASE_URL")
+        raise HTTPException(status_code=400, detail="platform WEBHOOK_BASE_URL is not set")
 
     # Dial with the TENANT's telephony creds (resolved for its configured
     # provider), not the platform env — otherwise every tenant's call bills/

@@ -53,7 +53,6 @@ def _tenant(max_concurrent: int = 2) -> TenantSettings:
             tts=TenantTTSConfig(provider="sarvam", voice_id="anushka"),
             telephony=TenantTelephonyConfig(
                 provider="twilio", from_number="+15705255679",
-                webhook_base_url="https://x.example/api/v1/telephony",
             ),
         ),
     )
@@ -143,7 +142,6 @@ async def test_call_lead_dials_with_tenant_creds(monkeypatch) -> None:
             llm=TenantLLMConfig(provider="gemini"), tts=TenantTTSConfig(provider="sarvam"),
             telephony=TenantTelephonyConfig(
                 provider="stringee", from_number="918204268005",
-                webhook_base_url="https://x.example/api/v1/telephony",
                 account_sid_env="TENANT_T1_STRINGEE_SID",
                 auth_token_env="TENANT_T1_STRINGEE_SECRET",
                 user_id_env="TENANT_T1_STRINGEE_USER")))

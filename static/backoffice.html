@@ -196,7 +196,6 @@ function loadTelephony(id) {
           .map(p => `<option value="${p}"${p === (t.telephony_provider || "") ? " selected" : ""}>${p}</option>`).join("")
       }</select></label>
       <label>from_number <input id="te_from" placeholder="+91… / 91… (blank = keep)" /></label>
-      <label>webhook_base_url <input id="te_webhook" style="width:22rem" placeholder="https://…/api/v1/telephony (blank = keep)" /></label>
     </div>
     <h2 style="margin-top:.9rem;">Credentials <small class="hint">(blank = keep existing)</small></h2>
     <div class="creds" style="gap:.6rem;">
@@ -225,7 +224,6 @@ async function saveTelephony(id) {
   const tel = {};
   if (v("te_provider")) tel.provider = v("te_provider");
   if (v("te_from")) tel.from_number = v("te_from");
-  if (v("te_webhook")) tel.webhook_base_url = v("te_webhook");
   if (v("te_ewurl")) tel.events_webhook_url = v("te_ewurl");
   if (v("te_ewsecret")) tel.events_webhook_secret_env = v("te_ewsecret");
   const keys = {};

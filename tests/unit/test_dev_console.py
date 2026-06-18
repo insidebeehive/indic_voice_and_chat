@@ -46,7 +46,6 @@ def _register_dev_tenant(provider="stringee", outbound_from=None):
         id="t_dev", slug="dev", name="Dev",
         pipeline=TenantPipelineConfig(telephony=TenantTelephonyConfig(
             provider=provider, from_number="+918204268005",
-            webhook_base_url="https://example.test/api/v1/telephony",
             outbound_from=outbound_from or {}))))
 
 
@@ -54,6 +53,16 @@ def _client():
     app = FastAPI()
     app.include_router(dev_router)
     return TestClient(app)
+
+
+def _pin_platform_webhook(monkeypatch, base="https://example.test/api/v1/telephony"):
+    """The webhook base is platform-level (WEBHOOK_BASE_URL), not per-tenant —
+    pin it so the outbound Answer URL is deterministic."""
+    from types import SimpleNamespace
+
+    import src.config as _cfg
+    monkeypatch.setattr(_cfg, "get_settings", lambda: SimpleNamespace(
+        pipeline=SimpleNamespace(telephony=SimpleNamespace(webhook_base_url=base))))
 
 
 def test_place_call_uses_selected_provider_and_its_caller_id(monkeypatch):
@@ -73,6 +82,7 @@ def test_place_call_uses_selected_provider_and_its_caller_id(monkeypatch):
         return _FakeAdapter()
 
     monkeypatch.setattr(devmod, "get_telephony_provider", _fake_build)
+    _pin_platform_webhook(monkeypatch)
     _register_dev_tenant(provider="stringee", outbound_from={"twilio": "+15705255679"})
     try:
         client = _client()
@@ -159,7 +169,6 @@ def test_place_call_passes_tenant_creds_to_adapter(monkeypatch):
         id="t_dev", slug="dev", name="Dev",
         pipeline=TenantPipelineConfig(telephony=TenantTelephonyConfig(
             provider="stringee", from_number="+918204268005",
-            webhook_base_url="https://example.test/api/v1/telephony",
             account_sid_env="DEV_STR_SID", auth_token_env="DEV_STR_SECRET"))))
     resp = _client().post("/dev/place-call", json={
         "provider": "stringee", "to_number": "+918618795697", "mode": "s2s", "voice": "Kore"})
@@ -190,7 +199,6 @@ def test_place_call_passes_stringee_user_id_to_adapter(monkeypatch):
         id="t_dev", slug="dev", name="Dev",
         pipeline=TenantPipelineConfig(telephony=TenantTelephonyConfig(
             provider="stringee", from_number="+918204268005",
-            webhook_base_url="https://example.test/api/v1/telephony",
             account_sid_env="DEV_STR_SID", auth_token_env="DEV_STR_SECRET",
             user_id_env="DEV_STR_USER"))))
     resp = _client().post("/dev/place-call", json={
@@ -269,6 +277,7 @@ def test_place_call_stringee_uses_answer_webhook_no_override(monkeypatch):
                                to_number=cfg.to_number, from_number=cfg.from_number)
 
     monkeypatch.setattr(devmod, "get_telephony_provider", lambda cfg: _FakeAdapter())
+    _pin_platform_webhook(monkeypatch)
     _register_dev_tenant(provider="stringee")          # from_number +918204268005
     try:
         resp = _client().post("/dev/place-call", json={
