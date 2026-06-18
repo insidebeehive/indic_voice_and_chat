@@ -397,13 +397,15 @@ async def test_tenant_analytics_and_billing(ctx) -> None:
     tid = (await client.post("/tenants", json=_body(slug="acme"), headers=ADMIN_HEADERS)).json()["tenant_id"]
 
     # seed a couple of finished conversations + a telephony rate
+    from src.models.campaign import Campaign
     from src.models.conversation import Conversation
     from src.models.tenant import ProviderCost
     async with sm() as s:
         s.add(ProviderCost(kind="telephony", provider="twilio", model="", cost_per_min=0.10))
+        s.add(Campaign(id="camp1", tenant_id=tid, name="Promo", status="active", config_yaml=""))
         s.add(Conversation(
             id="c1", tenant_id=tid, agent_type="voicebot", channel="voice", status="ended",
-            outcome="interested", pipeline_config={}, provider_call_sid="s1",
+            outcome="interested", pipeline_config={}, provider_call_sid="s1", campaign_id="camp1",
             telephony_provider="twilio", cost=0.06, duration_ms=120_000))
         s.add(Conversation(
             id="c2", tenant_id=tid, agent_type="voicebot", channel="voice", status="ended",
@@ -429,10 +431,13 @@ async def test_tenant_analytics_and_billing(ctx) -> None:
     # manual vs AI breakdown
     assert an["by_agent_type"]["voicebot"] == 3
     assert an["by_agent_type"]["human"] == 1
+    # channel / provider / campaign breakdowns
+    assert an["by_channel"] == {"voice": 2, "webconsole": 1, "softphone": 1}
+    assert an["by_provider"]["twilio"] == 3 and an["by_provider"]["none"] == 1
+    assert an["by_campaign"]["Promo"] == 1 and an["by_campaign"]["none"] == 3  # campaign_id→name
     # all breakdowns total to total_calls (the bug: they used to mismatch)
-    assert sum(an["by_status"].values()) == an["total_calls"]
-    assert sum(an["by_outcome"].values()) == an["total_calls"]
-    assert sum(an["by_agent_type"].values()) == an["total_calls"]
+    for key in ("by_status", "by_outcome", "by_agent_type", "by_channel", "by_provider", "by_campaign"):
+        assert sum(an[key].values()) == an["total_calls"], key
     assert an["total_duration_ms"] == 255_000
 
     bill = (await client.get(f"/tenants/{tid}/billing", headers=ADMIN_HEADERS)).json()
