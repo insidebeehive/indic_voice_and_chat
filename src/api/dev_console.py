@@ -189,9 +189,11 @@ async def dev_place_call(req: PlaceCallRequest) -> dict:
         raise HTTPException(
             status_code=400,
             detail=f"provider '{provider}' can't be placed from here; use {list(_PLACE_CALL_PROVIDERS)}")
-    if not tel.webhook_base_url:
+    webhook_base = tel.effective_webhook_base_url()   # tenant value, else platform WEBHOOK_BASE_URL
+    if not webhook_base:
         raise HTTPException(
-            status_code=400, detail="tenant telephony.webhook_base_url must be set to place a call")
+            status_code=400,
+            detail="no telephony webhook base URL — set tenant telephony.webhook_base_url or platform WEBHOOK_BASE_URL")
 
     # The dropdown drives the provider — build *its* adapter (creds resolve from the
     # provider's env vars) and dial from *its* configured caller-ID, independent of
@@ -238,7 +240,7 @@ async def dev_place_call(req: PlaceCallRequest) -> dict:
     cfg = CallConfig(
         to_number=req.to_number.strip(),
         from_number=from_number,
-        webhook_url=f"{tel.webhook_base_url.rstrip('/')}/{_ANSWER_PATH[provider]}",
+        webhook_url=f"{webhook_base.rstrip('/')}/{_ANSWER_PATH[provider]}",
     )
     try:
         session = await adapter.initiate_call(cfg)

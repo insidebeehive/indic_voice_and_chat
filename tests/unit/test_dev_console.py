@@ -199,6 +199,38 @@ def test_place_call_passes_stringee_user_id_to_adapter(monkeypatch):
     assert captured["user_id"] == "dev"
 
 
+def test_place_call_falls_back_to_platform_webhook_base_url(monkeypatch):
+    """A tenant with no webhook_base_url uses the platform-level WEBHOOK_BASE_URL
+    to build the outbound Answer URL (the inbound callback is always our app)."""
+    from types import SimpleNamespace
+
+    import src.config as cfg
+    fake = SimpleNamespace(pipeline=SimpleNamespace(telephony=SimpleNamespace(
+        webhook_base_url="https://platform.example/api/v1/telephony")))
+    monkeypatch.setattr(cfg, "get_settings", lambda: fake)
+
+    captured = {}
+
+    class _FakeAdapter:
+        async def initiate_call(self, c):
+            captured["webhook_url"] = c.webhook_url
+            return CallSession(session_id="CA1", status="ringing",
+                               to_number=c.to_number, from_number=c.from_number)
+
+    monkeypatch.setattr(devmod, "get_telephony_provider", lambda cfg_: _FakeAdapter())
+    register_tenant_for_test(TenantSettings(
+        id="t_dev", slug="dev", name="Dev",
+        pipeline=TenantPipelineConfig(telephony=TenantTelephonyConfig(
+            provider="stringee", from_number="+918204268005"))))  # no webhook_base_url
+    try:
+        resp = _client().post("/dev/place-call", json={
+            "provider": "stringee", "to_number": "+918618795697", "mode": "s2s", "voice": "Kore"})
+        assert resp.status_code == 200, resp.text
+        assert captured["webhook_url"] == "https://platform.example/api/v1/telephony/stringee/answer"
+    finally:
+        set_tenant_resolver(None)
+
+
 def test_place_call_no_caller_id_for_provider(monkeypatch):
     def _no_build(cfg):
         raise AssertionError("adapter should not be built without a caller-ID")
