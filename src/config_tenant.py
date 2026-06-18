@@ -192,6 +192,19 @@ class TenantTelephonyConfig(BaseModel):
         """Credential refs for the tenant's *configured* telephony provider."""
         return self.creds_for(self.provider)
 
+    def effective_webhook_base_url(self) -> Optional[str]:
+        """The base URL telephony callbacks come back on, falling back to the
+        platform-level ``WEBHOOK_BASE_URL`` when the tenant has none.
+
+        This URL only seeds the OUTBOUND callout's Answer URL — it's always *our*
+        app, common to every tenant (inbound is host-derived + number-resolved, so
+        it never reads this). So a per-tenant value is optional; it matters only
+        for white-label deploys where tenants answer on different domains."""
+        if self.webhook_base_url:
+            return self.webhook_base_url
+        from src.config import get_settings  # lazy: avoid import cycle at module load
+        return get_settings().pipeline.telephony.webhook_base_url
+
 
 class TenantVectorStoreConfig(BaseModel):
     provider: Optional[str] = None

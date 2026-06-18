@@ -110,8 +110,11 @@ async def call_lead(
     from_number = req.from_number or (tel.outbound_from or {}).get(provider) or tel.from_number
     if not from_number:
         raise HTTPException(status_code=400, detail="no caller-ID configured for this tenant")
-    if not tel.webhook_base_url:
-        raise HTTPException(status_code=400, detail="tenant telephony.webhook_base_url must be set")
+    webhook_base = tel.effective_webhook_base_url()   # tenant value, else platform WEBHOOK_BASE_URL
+    if not webhook_base:
+        raise HTTPException(
+            status_code=400,
+            detail="no telephony webhook base URL — set tenant telephony.webhook_base_url or platform WEBHOOK_BASE_URL")
 
     # Dial with the TENANT's telephony creds (resolved for its configured
     # provider), not the platform env — otherwise every tenant's call bills/
@@ -145,7 +148,7 @@ async def call_lead(
     cfg = CallConfig(
         to_number=req.to_number.strip(),
         from_number=from_number,
-        webhook_url=tel.webhook_base_url.rstrip("/"),
+        webhook_url=webhook_base.rstrip("/"),
     )
     try:
         call_session = await adapter.initiate_call(cfg)
