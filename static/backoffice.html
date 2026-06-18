@@ -232,7 +232,8 @@ function loadTelephony(id) {
     <h2 style="margin-top:.9rem;">Outbound events webhook <small class="hint">(tenant CRM callback)</small></h2>
     <div class="creds" style="gap:.6rem;">
       <label>events_webhook_url <input id="te_ewurl" style="width:22rem" value="${escAttr(t.telephony_events_webhook_url)}" placeholder="https://crm…/events" /></label>
-      <label>events_webhook_secret_env <input id="te_ewsecret" value="${escAttr(t.telephony_events_webhook_secret_env)}" placeholder="ENV_VAR_NAME" /></label>
+      <label>signing secret <small class="hint">(${t.telephony_events_webhook_secret_set ? "set" : "not set"} · X-Signature HMAC; blank = keep)</small>
+        <input id="te_ewsecret" type="password" placeholder="paste the CRM's webhookSecret value" /></label>
     </div>
     <div style="margin-top:.9rem;">
       <button onclick="saveTelephony('${id}')">Save telephony</button>
@@ -246,8 +247,8 @@ async function saveTelephony(id) {
   if (v("te_provider")) tel.provider = v("te_provider");
   if (v("te_from")) tel.from_number = v("te_from");
   if (v("te_ewurl")) tel.events_webhook_url = v("te_ewurl");
-  if (v("te_ewsecret")) tel.events_webhook_secret_env = v("te_ewsecret");
   const keys = {};
+  if (v("te_ewsecret")) keys.events_webhook_secret = v("te_ewsecret");   // stored encrypted, signs the events
   document.querySelectorAll("#te_keyfields input[data-logical]").forEach(el => {
     const val = (el.value || "").trim();
     if (val) keys[el.dataset.logical] = val;
