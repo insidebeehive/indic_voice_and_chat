@@ -27,8 +27,10 @@ from src.api.browser_bridge import BrowserBridgeConfig, BrowserVoiceBridge
 from src.api.gemini_live_bridge import RECORD_TURN_SIGNAL, GeminiLiveBridge
 from src.auth.context import TenantContext
 from src.auth.registry import TenantProviders
+from src.api.call_store import insert_call
 from src.bootstrap import DEFAULT_DEMO_SCRIPT
 from src.config_tenant import platform_webhook_base_url
+from src.models.database import get_sessionmaker
 from src.dialogue.prompts import VoiceBotScript, build_s2s_system_instruction
 from src.dialogue.slots import SlotSchema
 from src.interfaces.realtime import RealtimeConfig
@@ -251,9 +253,26 @@ async def dev_place_call(req: PlaceCallRequest) -> dict:
         raise HTTPException(status_code=502, detail=f"call failed: {e}")
 
     dev_call_control.monitor.set_status(session.session_id, "calling")
+    # Register the conversation for the tenant that PLACED the call (not derived
+    # from the number) — a real outbound voicebot/voice call, mirroring the
+    # campaign path so the outcome persists + it shows in analytics. Best-effort:
+    # a DB hiccup must not fail the (already-placed) call.
+    call_id = f"call_{uuid.uuid4().hex[:16]}"
+    try:
+        sm = get_sessionmaker()
+        async with sm() as db:
+            await insert_call(
+                db, call_id=call_id, tenant=tenant,
+                provider_call_sid=session.session_id, channel="voice",
+                mode=req.mode, voice=req.voice.strip() or None)
+    except Exception:  # noqa: BLE001 — the call is already placed; recording is best-effort
+        log.exception("dev place-call: failed to record conversation",
+                      extra={"tenant": tenant.slug, "sid": session.session_id})
     log.info("dev console placed call", extra={
         "tenant": tenant.slug, "provider": provider, "call_sid": session.session_id})
-    return {"call_sid": session.session_id, "status": "calling"}
+    # Same shape as the campaign path's CallLeadResponse.
+    return {"call_id": call_id, "status": "in_progress",
+            "provider_call_sid": session.session_id}
 
 
 @dev_router.get("/dev/call-status/{call_sid}")
