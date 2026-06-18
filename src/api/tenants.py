@@ -491,6 +491,9 @@ class TenantAnalytics(BaseModel):
     by_outcome: dict[str, int]
     # Manual (human softphone) vs AI (voicebot) call counts, keyed by agent_type.
     by_agent_type: dict[str, int]
+    by_campaign: dict[str, int]    # keyed by campaign name ("none" for ad-hoc calls)
+    by_channel: dict[str, int]     # voice / webconsole / softphone
+    by_provider: dict[str, int]    # telephony provider ("none" if unset)
     total_duration_ms: int
     avg_duration_ms: int
 
@@ -503,29 +506,43 @@ async def tenant_analytics(
 ) -> TenantAnalytics:
     """Call analytics for one tenant, aggregated from the conversations table."""
     await _require_tenant(session, tenant_id)
+    # campaign_id → name, so the breakdown reads in campaign names not opaque ids.
+    camp_names = dict((await session.execute(
+        select(Campaign.id, Campaign.name).where(Campaign.tenant_id == tenant_id)
+    )).all())
     rows = (await session.execute(
         select(Conversation.status, Conversation.outcome, Conversation.duration_ms,
-               Conversation.agent_type)
+               Conversation.agent_type, Conversation.campaign_id, Conversation.channel,
+               Conversation.telephony_provider)
         .where(Conversation.tenant_id == tenant_id)
     )).all()
+
+    def _bump(d: dict[str, int], key: str) -> None:
+        d[key] = d.get(key, 0) + 1
+
     by_status: dict[str, int] = {}
     by_outcome: dict[str, int] = {}
     by_agent_type: dict[str, int] = {}
+    by_campaign: dict[str, int] = {}
+    by_channel: dict[str, int] = {}
+    by_provider: dict[str, int] = {}
     total_dur = 0
-    for status, outcome, dur, agent_type in rows:
-        by_status[status or "unknown"] = by_status.get(status or "unknown", 0) + 1
+    for status, outcome, dur, agent_type, campaign_id, channel, provider in rows:
+        _bump(by_status, status or "unknown")
         # Count rows with no outcome under "no_outcome" so by_outcome totals to
         # total_calls (matching by_status) — calls in progress or that ended
         # before analysis have no outcome yet.
-        okey = outcome or "no_outcome"
-        by_outcome[okey] = by_outcome.get(okey, 0) + 1
-        akey = agent_type or "unknown"
-        by_agent_type[akey] = by_agent_type.get(akey, 0) + 1
+        _bump(by_outcome, outcome or "no_outcome")
+        _bump(by_agent_type, agent_type or "unknown")
+        _bump(by_campaign, camp_names.get(campaign_id, campaign_id) if campaign_id else "none")
+        _bump(by_channel, channel or "unknown")
+        _bump(by_provider, provider or "none")
         total_dur += int(dur or 0)
     n = len(rows)
     return TenantAnalytics(
         tenant_id=tenant_id, total_calls=n, by_status=by_status, by_outcome=by_outcome,
-        by_agent_type=by_agent_type,
+        by_agent_type=by_agent_type, by_campaign=by_campaign, by_channel=by_channel,
+        by_provider=by_provider,
         total_duration_ms=total_dur, avg_duration_ms=(total_dur // n if n else 0),
     )
 

@@ -165,9 +165,13 @@ async function loadAnalytics(id) {
       ${statBox("Total minutes", mins(a.total_duration_ms))}
       ${statBox("Avg call (min)", mins(a.avg_duration_ms))}
     </div>
-    <div style="display:grid;grid-template-columns:1fr 1fr;gap:1rem;margin-top:.8rem;">
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:1rem;margin-top:.8rem;">
       <div><h2>By status</h2><div class="kv">${rows(a.by_status)}</div></div>
       <div><h2>By outcome</h2><div class="kv">${rows(a.by_outcome)}</div></div>
+      <div><h2>By campaign</h2><div class="kv">${rows(a.by_campaign || {})}</div></div>
+      <div><h2>By call type</h2><div class="kv">${rows(a.by_agent_type || {})}</div></div>
+      <div><h2>By channel</h2><div class="kv">${rows(a.by_channel || {})}</div></div>
+      <div><h2>By provider</h2><div class="kv">${rows(a.by_provider || {})}</div></div>
     </div>`;
 }
 
