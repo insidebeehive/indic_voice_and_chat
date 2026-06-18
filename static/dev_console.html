@@ -400,8 +400,9 @@ async function placeCall(provider) {
     resetStartButton();
     return;
   }
-  if (!body.call_sid) { setStatus("no call id returned"); resetStartButton(); return; }
-  pollCall(body.call_sid);
+  const sid = body.provider_call_sid || body.call_sid;   // unified shape; call_sid kept as fallback
+  if (!sid) { setStatus("no call id returned"); resetStartButton(); return; }
+  pollCall(sid);
 }
 
 function pollCall(callSid) {

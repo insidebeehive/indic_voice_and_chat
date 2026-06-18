@@ -30,6 +30,8 @@ def test_dev_voice_page_served():
 
 # --- place-call + status endpoints --------------------------------------------
 
+import pytest
+
 import src.api.dev_console as devmod
 from src.auth import register_tenant_for_test
 from src.auth.middleware import set_tenant_resolver
@@ -39,6 +41,16 @@ from src.config_tenant import (
     TenantTelephonyConfig,
 )
 from src.interfaces.telephony import CallSession
+
+
+@pytest.fixture(autouse=True)
+def _no_db_recording(monkeypatch):
+    """Place-call records a conversation row via insert_call; unit tests have no
+    DB, so stub it to a no-op by default. The dedicated recording test overrides
+    this to assert the wiring."""
+    async def _noop(db, **kw):
+        return None
+    monkeypatch.setattr(devmod, "insert_call", _noop, raising=False)
 
 
 def _register_dev_tenant(provider="stringee", outbound_from=None):
@@ -90,7 +102,7 @@ def test_place_call_uses_selected_provider_and_its_caller_id(monkeypatch):
             "provider": "twilio", "to_number": "+919999999999",
             "mode": "s2s", "voice": "Kore", "lead_name": "Raju"})
         assert resp.status_code == 200, resp.text
-        assert resp.json()["call_sid"] == "CA123"
+        assert resp.json()["provider_call_sid"] == "CA123"
         assert captured["provider"] == "twilio"             # selected provider's adapter
         cfg = captured["cfg"]
         assert cfg.to_number == "+919999999999"
@@ -207,6 +219,48 @@ def test_place_call_passes_stringee_user_id_to_adapter(monkeypatch):
     assert captured["user_id"] == "dev"
 
 
+def test_place_call_records_conversation_for_requesting_tenant(monkeypatch):
+    """An outbound dev place-call registers a conversation row for the tenant that
+    PLACED it (not derived from the number), as a voice/voicebot call, and returns
+    the same shape as the campaign path (call_id + provider_call_sid)."""
+    _pin_platform_webhook(monkeypatch)
+    captured = {}
+
+    class _FakeAdapter:
+        async def initiate_call(self, cfg):
+            return CallSession(session_id="STR1", status="starting",
+                               to_number=cfg.to_number, from_number=cfg.from_number)
+    monkeypatch.setattr(devmod, "get_telephony_provider", lambda c: _FakeAdapter())
+
+    async def _fake_insert(db, **kw):
+        captured.update(kw)
+    monkeypatch.setattr(devmod, "insert_call", _fake_insert)
+
+    class _Ctx:
+        async def __aenter__(self): return "db"
+        async def __aexit__(self, *a): return False
+    monkeypatch.setattr(devmod, "get_sessionmaker", lambda: (lambda: _Ctx()))
+
+    register_tenant_for_test(TenantSettings(
+        id="t_stage", slug="stage", name="Stage",
+        pipeline=TenantPipelineConfig(telephony=TenantTelephonyConfig(
+            provider="stringee", from_number="+918204268005"))))
+    try:
+        resp = _client().post("/dev/place-call", json={
+            "provider": "stringee", "to_number": "+918618795697",
+            "mode": "s2s", "voice": "Kore", "tenant": "stage"})
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["provider_call_sid"] == "STR1"
+        assert body["call_id"]
+        # row attributed to the PLACING tenant, as a voice/voicebot call
+        assert captured["tenant"].id == "t_stage"
+        assert captured["channel"] == "voice"
+        assert captured["provider_call_sid"] == "STR1"
+    finally:
+        set_tenant_resolver(None)
+
+
 def test_place_call_falls_back_to_platform_webhook_base_url(monkeypatch):
     """A tenant with no webhook_base_url uses the platform-level WEBHOOK_BASE_URL
     to build the outbound Answer URL (the inbound callback is always our app)."""
@@ -283,7 +337,7 @@ def test_place_call_stringee_uses_answer_webhook_no_override(monkeypatch):
         resp = _client().post("/dev/place-call", json={
             "provider": "stringee", "to_number": "+918618795697", "mode": "s2s", "voice": "Kore"})
         assert resp.status_code == 200, resp.text
-        assert resp.json()["call_sid"] == "STR1"
+        assert resp.json()["provider_call_sid"] == "STR1"
         cfg = captured["cfg"]
         assert cfg.from_number == "+918204268005"
         assert cfg.webhook_url == "https://example.test/api/v1/telephony/stringee/answer"
