@@ -28,7 +28,6 @@ llm:
     gemini-2.0-flash-lite: 0.0006
   groq:
     llama-3.3-70b-versatile: 0.0012
-    llama-3.1-70b-versatile: 0.0012
     llama-3.1-8b-instant: 0.0003
   anthropic:
     claude-haiku-4-5: 0.002

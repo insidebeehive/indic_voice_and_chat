@@ -36,7 +36,7 @@ async def test_generate_returns_text_and_usage() -> None:
 
     result = await adapter.generate(
         [LLMMessage(role="user", content="hi")],
-        LLMConfig(model="llama-3.1-70b-versatile", temperature=0.5, max_tokens=100),
+        LLMConfig(model="llama-3.3-70b-versatile", temperature=0.5, max_tokens=100),
     )
     assert result.text == '{"response_text": "ok"}'
     assert result.finish_reason == "stop"
@@ -46,7 +46,7 @@ async def test_generate_returns_text_and_usage() -> None:
     create = client.chat.completions.create
     create.assert_awaited_once()
     kwargs = create.await_args.kwargs
-    assert kwargs["model"] == "llama-3.1-70b-versatile"
+    assert kwargs["model"] == "llama-3.3-70b-versatile"
     assert kwargs["temperature"] == 0.5
     assert kwargs["max_tokens"] == 100
     assert kwargs["response_format"] == {"type": "json_object"}
