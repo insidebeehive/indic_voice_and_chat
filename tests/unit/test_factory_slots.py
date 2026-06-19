@@ -59,6 +59,45 @@ def test_telephony_factories_are_async_for_per_call_campaign() -> None:
         assert inspect.iscoroutinefunction(factory), fn.__name__
 
 
+async def test_s2s_factory_tolerates_missing_tenant_realtime_key() -> None:
+    """s2s bridge build must NOT raise when the tenant's ``realtime.api_key_env``
+    is unset — the key is passed as ``None`` so ``GeminiLiveSession.connect`` can
+    fall back to the platform ``GEMINI_API_KEY``/``GOOGLE_API_KEY``. Resolving it
+    with the *raising* ``tenant.secret()`` instead crashes the bridge on connect
+    → the Twilio WS dies → the call drops instantly with no audio."""
+    from src.api import dev_call_control
+    from src.api.telephony_live_bridge import TelephonyLiveBridge
+    from src.config_tenant import MissingEnvError
+
+    realtime = SimpleNamespace(
+        model="gemini-x-live", voice="Aoede", allowed_voices=["Aoede"],
+        language_code="hi-IN", api_key_env="TENANT_DEV_GEMINI_KEY")
+    pipeline = SimpleNamespace(
+        stt=SimpleNamespace(language="hi-IN"),
+        llm=SimpleNamespace(temperature=0.5, max_tokens=256, response_format="json"),
+        tts=SimpleNamespace(language="hi-IN", voice_id=None),
+        realtime=realtime,
+    )
+
+    def _raises(env_var):  # the real TenantContext.secret() raises on a missing key
+        raise MissingEnvError(f"{env_var!r} not set")
+
+    tenant = SimpleNamespace(
+        slug="dev", id="t1",
+        settings=SimpleNamespace(pipeline=pipeline, timezone="Asia/Kolkata"),
+        secret=_raises,
+        secret_optional=lambda env_var: None,
+    )
+
+    dev_call_control.set_override("dev", mode="s2s", voice="Aoede", lead_name="")
+    try:
+        factory = make_bridge_factory(_providers())
+        bridge = await factory(websocket=object(), tenant=tenant)
+    finally:
+        dev_call_control.pop_override("dev")
+    assert isinstance(bridge, TelephonyLiveBridge)
+
+
 async def test_browser_factory_resolves_campaign_per_call() -> None:
     from src.dialogue.campaign_loader import LoadedCampaign
     from src.dialogue.prompts import VoiceBotScript
