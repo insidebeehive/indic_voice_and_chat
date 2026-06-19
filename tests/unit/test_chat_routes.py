@@ -8,16 +8,20 @@ from typing import AsyncIterator
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from src.agents.base import AgentSession
 from src.agents.chatbot import ChatBotAgent
 from src.api import chat
+from src.api.deps import get_db_session
 from src.auth import TenantContext, register_tenant_for_test
 from src.auth.middleware import set_tenant_resolver
 from src.config_tenant import TenantSettings
 from src.dialogue.context import SessionStore
-from src.interfaces.llm import ILLMProvider, LLMConfig, LLMMessage, LLMResult
+from src.interfaces.llm import ILLMProvider, LLMResult
 from src.interfaces.vector_store import Document
+from src.models.database import Base
+from src.models.tenant import Tenant
 from src.providers.vector_store.faiss_store import FAISSAdapter
 from src.rag.embeddings import HashEmbedder
 from src.rag.retriever import HybridRetriever, RetrievalConfig
@@ -52,6 +56,19 @@ async def app(tmp_faiss_index: str, fake_redis):
 
     session_store = SessionStore(fake_redis, ttl_seconds=300, tenant_id="t1")
 
+    # In-memory DB for chat_sessions / chat_messages.
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:", future=True)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    sm = async_sessionmaker(engine, expire_on_commit=False)
+    async with sm() as s:
+        s.add(Tenant(id="t1", slug="t1", name="Acme"))
+        await s.commit()
+
+    async def _session_override():
+        async with sm() as session:
+            yield session
+
     async def factory(tenant: TenantContext, session_id: str) -> ChatBotAgent:
         return ChatBotAgent(
             session=AgentSession(session_id=session_id),
@@ -68,15 +85,121 @@ async def app(tmp_faiss_index: str, fake_redis):
         )
 
     chat.set_chatbot_factory(factory)
+    chat.set_chat_sessionmaker(sm)
     register_tenant_for_test(
         TenantSettings(id="t1", slug="t1", name="Acme"),
         plaintext_tokens=["test-token"],
     )
     a = FastAPI()
     a.include_router(chat.router)
+    a.dependency_overrides[get_db_session] = _session_override
     yield a
     chat.set_chatbot_factory(None)
+    chat.set_chat_sessionmaker(None)
     set_tenant_resolver(None)
+    await engine.dispose()
+
+
+def _create_session(client: TestClient, **body) -> str:
+    resp = client.post("/chat/sessions", json=body, headers=HEADERS)
+    assert resp.status_code == 201, resp.text
+    return resp.json()["session_id"]
+
+
+# --- Session lifecycle --------------------------------------------------
+
+
+def test_create_session_returns_id_greeting_ws_url(app: FastAPI) -> None:
+    client = TestClient(app)
+    resp = client.post("/chat/sessions",
+                       json={"customer_name": "Raju", "language": "en"}, headers=HEADERS)
+    assert resp.status_code == 201
+    body = resp.json()
+    assert body["session_id"].startswith("cs_")
+    assert "Raju" in body["greeting"]
+    assert body["ws_url"].endswith(f"/api/v1/chat/ws/{body['session_id']}")
+
+
+def test_create_session_requires_auth(app: FastAPI) -> None:
+    client = TestClient(app)
+    assert client.post("/chat/sessions", json={}).status_code == 401
+
+
+def test_list_sessions_scoped_to_tenant(app: FastAPI) -> None:
+    client = TestClient(app)
+    _create_session(client, customer_id="cust_1")
+    _create_session(client, customer_id="cust_2")
+    resp = client.get("/chat/sessions", headers=HEADERS)
+    assert resp.status_code == 200
+    assert len(resp.json()["sessions"]) == 2
+
+
+def test_get_session_detail_includes_messages(app: FastAPI) -> None:
+    client = TestClient(app)
+    sid = _create_session(client, customer_name="Raju")
+    with client.websocket_connect(f"/chat/ws/{sid}") as ws:
+        ws.send_text(json.dumps({"type": "message", "text": "Plan B?"}))
+        assert json.loads(ws.receive_text())["type"] == "typing"
+        assert json.loads(ws.receive_text())["type"] == "message"
+
+    resp = client.get(f"/chat/sessions/{sid}", headers=HEADERS)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["message_count"] == 2
+    roles = [m["role"] for m in body["messages"]]
+    assert roles == ["customer", "agent"]
+    assert body["messages"][0]["content"] == "Plan B?"
+    assert body["messages"][1]["content"] == "Plan B has 500GB."
+
+
+def test_get_unknown_session_404(app: FastAPI) -> None:
+    client = TestClient(app)
+    assert client.get("/chat/sessions/nope", headers=HEADERS).status_code == 404
+
+
+# --- WebSocket (capability model) --------------------------------------
+
+
+def test_websocket_round_trip(app: FastAPI) -> None:
+    client = TestClient(app)
+    sid = _create_session(client)
+    with client.websocket_connect(f"/chat/ws/{sid}") as ws:
+        ws.send_text(json.dumps({"type": "message", "text": "Plan B?"}))
+        assert json.loads(ws.receive_text())["type"] == "typing"
+        reply = json.loads(ws.receive_text())
+    assert reply["type"] == "message"
+    assert reply["session_id"] == sid
+    assert reply["text"] == "Plan B has 500GB."
+    assert "plans.md:0" in reply["sources"]
+
+
+def test_websocket_unknown_session_closes(app: FastAPI) -> None:
+    client = TestClient(app)
+    from starlette.websockets import WebSocketDisconnect
+    with pytest.raises(WebSocketDisconnect):
+        with client.websocket_connect("/chat/ws/cs_doesnotexist") as ws:
+            ws.receive_text()
+
+
+def test_websocket_invalid_json_returns_error(app: FastAPI) -> None:
+    client = TestClient(app)
+    sid = _create_session(client)
+    with client.websocket_connect(f"/chat/ws/{sid}") as ws:
+        ws.send_text("not json")
+        err = json.loads(ws.receive_text())
+        assert err["type"] == "error"
+
+
+def test_websocket_end_marks_session_ended(app: FastAPI) -> None:
+    client = TestClient(app)
+    sid = _create_session(client)
+    with client.websocket_connect(f"/chat/ws/{sid}") as ws:
+        ws.send_text(json.dumps({"type": "end"}))
+        assert json.loads(ws.receive_text())["type"] == "ended"
+    assert client.get(f"/chat/sessions/{sid}", headers=HEADERS).json()["status"] == "ended"
+
+
+# --- HTTP single-turn channel ------------------------------------------
 
 
 def test_post_message_creates_session_and_returns_answer(app: FastAPI) -> None:
@@ -85,58 +208,19 @@ def test_post_message_creates_session_and_returns_answer(app: FastAPI) -> None:
     assert resp.status_code == 200
     body = resp.json()
     assert body["response_text"] == "Plan B has 500GB."
-    assert body["session_id"].startswith("chat_")
+    assert body["session_id"].startswith("cs_")
     assert "plans.md:0" in body["sources_used"]
-    assert body["confidence"] == "high"
-
-
-def test_post_message_uses_supplied_session_id(app: FastAPI) -> None:
-    client = TestClient(app)
-    resp = client.post(
-        "/chat/message",
-        json={"session_id": "my-session", "message": "Plan B?"},
-        headers=HEADERS,
-    )
-    assert resp.json()["session_id"] == "my-session"
 
 
 def test_get_history_returns_persisted_turns(app: FastAPI) -> None:
     client = TestClient(app)
     client.post("/chat/message", json={"session_id": "hist-test", "message": "First Q"}, headers=HEADERS)
     client.post("/chat/message", json={"session_id": "hist-test", "message": "Second Q"}, headers=HEADERS)
-
     resp = client.get("/chat/history/hist-test", headers=HEADERS)
     assert resp.status_code == 200
     body = resp.json()
-    assert body["session_id"] == "hist-test"
     assert len(body["history"]) == 4  # 2 user + 2 agent
-    assert body["history"][0]["role"] == "user"
     assert body["history"][0]["content"] == "First Q"
-
-
-def test_websocket_round_trip(app: FastAPI) -> None:
-    client = TestClient(app)
-    with client.websocket_connect("/chat/ws", headers=HEADERS) as ws:
-        ws.send_text(json.dumps({"session_id": "ws-1", "message": "Plan B?"}))
-        reply = json.loads(ws.receive_text())
-    assert reply["session_id"] == "ws-1"
-    assert reply["response_text"] == "Plan B has 500GB."
-
-
-def test_websocket_invalid_json_returns_error(app: FastAPI) -> None:
-    client = TestClient(app)
-    with client.websocket_connect("/chat/ws", headers=HEADERS) as ws:
-        ws.send_text("not json")
-        err = json.loads(ws.receive_text())
-        assert "error" in err
-
-
-def test_websocket_missing_message_returns_error(app: FastAPI) -> None:
-    client = TestClient(app)
-    with client.websocket_connect("/chat/ws", headers=HEADERS) as ws:
-        ws.send_text(json.dumps({"session_id": "x"}))
-        err = json.loads(ws.receive_text())
-        assert "error" in err
 
 
 def test_post_when_factory_unset_returns_503() -> None:

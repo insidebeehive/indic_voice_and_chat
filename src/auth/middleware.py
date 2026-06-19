@@ -36,6 +36,8 @@ class TenantResolver(Protocol):
 
     async def resolve_by_phone_number(self, phone_number: str) -> Optional[TenantContext]: ...
 
+    async def resolve_by_id(self, tenant_id: str) -> Optional[TenantContext]: ...
+
 
 class InMemoryTenantResolver:
     """Test/bootstrap resolver: registers tenants by token, slug, and phone."""
@@ -44,6 +46,7 @@ class InMemoryTenantResolver:
         self._by_token: dict[str, TenantContext] = {}
         self._by_slug: dict[str, TenantContext] = {}
         self._by_phone: dict[str, TenantContext] = {}
+        self._by_id: dict[str, TenantContext] = {}
 
     def register(
         self,
@@ -53,6 +56,7 @@ class InMemoryTenantResolver:
     ) -> TenantContext:
         ctx = TenantContext(settings=settings)
         self._by_slug[settings.slug] = ctx
+        self._by_id[settings.id] = ctx
         for token in plaintext_tokens or []:
             self._by_token[hash_api_token(token)] = ctx
         for phone in settings.phone_numbers:
@@ -63,6 +67,7 @@ class InMemoryTenantResolver:
         self._by_token.clear()
         self._by_slug.clear()
         self._by_phone.clear()
+        self._by_id.clear()
 
     async def resolve_by_token(self, token_hash: str) -> Optional[TenantContext]:
         return self._by_token.get(token_hash)
@@ -72,6 +77,9 @@ class InMemoryTenantResolver:
 
     async def resolve_by_phone_number(self, phone_number: str) -> Optional[TenantContext]:
         return self._by_phone.get(phone_number)
+
+    async def resolve_by_id(self, tenant_id: str) -> Optional[TenantContext]:
+        return self._by_id.get(tenant_id)
 
 
 _resolver: Optional[TenantResolver] = None
@@ -187,3 +195,11 @@ async def tenant_from_slug(slug: str) -> TenantContext:
     if tctx is None:
         raise HTTPException(status_code=404, detail=f"unknown tenant slug {slug!r}")
     return tctx
+
+
+async def tenant_from_id(tenant_id: str) -> Optional[TenantContext]:
+    """Resolve a tenant by its id (e.g. from a chat_sessions row). Returns None
+    if unknown — callers decide how to fail (a closed WS, not an HTTP error)."""
+    if _resolver is None:
+        return None
+    return await _resolver.resolve_by_id(tenant_id)

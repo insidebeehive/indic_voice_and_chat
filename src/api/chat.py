@@ -1,14 +1,20 @@
-"""ChatBot endpoints (PRD §7.3).
+"""ChatBot endpoints.
 
-Three surfaces, all backed by the same ``ChatBotAgent``:
+Surfaces, all backed by the same ``ChatBotAgent``:
 
-- ``WS  /chat/ws``        real-time bidirectional, one JSON message per turn
-- ``POST /chat/message``  single-turn HTTP, suitable for WhatsApp / async channels
-- ``GET  /chat/history/{session_id}`` retrieve the persisted conversation
+- ``POST /chat/sessions``            create a session (authed) → session_id + ws_url
+- ``GET  /chat/sessions``            list this tenant's sessions
+- ``GET  /chat/sessions/{id}``       session detail + message history
+- ``WS   /chat/ws/{session_id}``     real-time conversation; the **session_id is
+  the capability** — the WS resolves the owning tenant from the chat_sessions row,
+  so the browser client needs no tenant credentials over the socket.
+- ``POST /chat/message``             single-turn HTTP (WhatsApp / async channels),
+  authenticated by tenant bearer token / ``X-Tenant-Slug`` header.
+- ``GET  /chat/history/{session_id}`` retrieve the persisted Redis history.
 
-Agent construction happens in ``set_chatbot_factory(factory)`` — the factory
-takes a session_id and returns a configured ``ChatBotAgent``. Wiring this
-factory at app startup keeps the routes thin and easy to test.
+The per-session agent is built by ``set_chatbot_factory(factory)``; the DB
+sessionmaker (for the WS tenant lookup + message persistence) is injected via
+``set_chat_sessionmaker`` (defaults to the app's global sessionmaker).
 """
 
 from __future__ import annotations
@@ -18,11 +24,23 @@ import logging
 import uuid
 from typing import Awaitable, Callable, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Path, WebSocket, WebSocketDisconnect
+from fastapi import (
+    APIRouter,
+    Depends,
+    HTTPException,
+    Path,
+    Request,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from pydantic import BaseModel, Field
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.agents.chatbot import ChatBotAgent
+from src.agents.chatbot import ChatBotAgent, ChatTurnResult
+from src.api.deps import get_db_session
 from src.auth import TenantContext, current_tenant
+from src.models.chat import ChatMessage, ChatSession
 
 log = logging.getLogger(__name__)
 router = APIRouter(prefix="/chat", tags=["chat"])
@@ -33,12 +51,25 @@ router = APIRouter(prefix="/chat", tags=["chat"])
 
 ChatBotFactory = Callable[[TenantContext, str], Awaitable[ChatBotAgent]]
 _factory: Optional[ChatBotFactory] = None
+_sessionmaker: object | None = None
 
 
 def set_chatbot_factory(factory: Optional[ChatBotFactory]) -> None:
     """Register / unregister the per-session agent factory."""
     global _factory
     _factory = factory
+
+
+def set_chat_sessionmaker(sessionmaker: object | None) -> None:
+    """Inject the async sessionmaker the WS uses to resolve/persist sessions
+    (tests pass an in-memory one; prod falls back to the app's global)."""
+    global _sessionmaker
+    _sessionmaker = sessionmaker
+
+
+def _sm():
+    from src.models.database import get_sessionmaker
+    return _sessionmaker or get_sessionmaker()
 
 
 async def _get_agent(tenant: TenantContext, session_id: str) -> ChatBotAgent:
@@ -51,11 +82,72 @@ async def _get_agent(tenant: TenantContext, session_id: str) -> ChatBotAgent:
 
 
 def _scoped_session(tenant: TenantContext, session_id: str) -> str:
-    """Namespace ``session_id`` by tenant so two tenants can use the same id."""
+    """Namespace the Redis session id by tenant so two tenants can use the same id."""
     return f"{tenant.id}:{session_id}"
 
 
+def _new_session_id() -> str:
+    return f"cs_{uuid.uuid4().hex[:16]}"
+
+
+def _ws_url(request: Request, session_id: str) -> str:
+    base = request.headers.get("x-forwarded-host") or request.url.netloc
+    proto = request.headers.get("x-forwarded-proto")
+    scheme = "wss" if (proto == "https" or request.url.scheme == "https") else "ws"
+    return f"{scheme}://{base}/api/v1/chat/ws/{session_id}"
+
+
+def _greeting(company: str, customer_name: Optional[str], language: str) -> str:
+    name = (customer_name or "").strip()
+    if language.startswith("hi"):
+        who = f"{name} जी" if name else "आप"
+        return f"नमस्ते {who}! मैं {company} की सहायक हूँ। मैं आपकी कैसे मदद कर सकती हूँ?"
+    who = name or "there"
+    return f"Hi {who}! I'm the {company} assistant. How can I help you today?"
+
+
 # --- Schemas ------------------------------------------------------------
+
+
+class CreateSessionRequest(BaseModel):
+    customer_id: Optional[str] = None
+    customer_name: Optional[str] = None
+    language: Optional[str] = None
+    metadata: dict = Field(default_factory=dict)
+
+
+class CreateSessionResponse(BaseModel):
+    session_id: str
+    greeting: str
+    ws_url: str
+
+
+class SessionSummary(BaseModel):
+    session_id: str
+    status: str
+    customer_id: Optional[str] = None
+    customer_name: Optional[str] = None
+    language: str
+    message_count: int
+    started_at: Optional[str] = None
+    ended_at: Optional[str] = None
+
+
+class SessionListResponse(BaseModel):
+    sessions: list[SessionSummary]
+
+
+class SessionMessage(BaseModel):
+    role: str
+    type: str
+    content: str
+    sources: Optional[list] = None
+    timestamp: Optional[str] = None
+
+
+class SessionDetailResponse(SessionSummary):
+    summary: Optional[str] = None
+    messages: list[SessionMessage] = []
 
 
 class ChatMessageRequest(BaseModel):
@@ -84,7 +176,83 @@ class HistoryResponse(BaseModel):
     history: list[HistoryEntry]
 
 
-# --- HTTP routes --------------------------------------------------------
+# --- Session lifecycle (authed) ----------------------------------------
+
+
+@router.post("/sessions", response_model=CreateSessionResponse, status_code=201)
+async def create_session(
+    req: CreateSessionRequest,
+    request: Request,
+    tenant: TenantContext = Depends(current_tenant),
+    session: AsyncSession = Depends(get_db_session),
+) -> CreateSessionResponse:
+    session_id = _new_session_id()
+    language = req.language or getattr(tenant.settings, "default_language", None) or "hi"
+    session.add(ChatSession(
+        id=session_id, tenant_id=tenant.id,
+        customer_id=req.customer_id, customer_name=req.customer_name,
+        language=language, status="active", extra_data=req.metadata or {},
+    ))
+    await session.commit()
+    return CreateSessionResponse(
+        session_id=session_id,
+        greeting=_greeting(tenant.name, req.customer_name, language),
+        ws_url=_ws_url(request, session_id),
+    )
+
+
+@router.get("/sessions", response_model=SessionListResponse)
+async def list_sessions(
+    status: Optional[str] = None,
+    customer_id: Optional[str] = None,
+    tenant: TenantContext = Depends(current_tenant),
+    session: AsyncSession = Depends(get_db_session),
+) -> SessionListResponse:
+    q = select(ChatSession).where(ChatSession.tenant_id == tenant.id)
+    if status:
+        q = q.where(ChatSession.status == status)
+    if customer_id:
+        q = q.where(ChatSession.customer_id == customer_id)
+    q = q.order_by(ChatSession.started_at.desc())
+    rows = (await session.execute(q)).scalars().all()
+    return SessionListResponse(sessions=[_summary(r) for r in rows])
+
+
+@router.get("/sessions/{session_id}", response_model=SessionDetailResponse)
+async def get_session(
+    session_id: str = Path(min_length=1),
+    tenant: TenantContext = Depends(current_tenant),
+    session: AsyncSession = Depends(get_db_session),
+) -> SessionDetailResponse:
+    row = await session.get(ChatSession, session_id)
+    if row is None or row.tenant_id != tenant.id:
+        raise HTTPException(status_code=404, detail="chat session not found")
+    msgs = (await session.execute(
+        select(ChatMessage).where(ChatMessage.session_id == session_id)
+        .order_by(ChatMessage.id)
+    )).scalars().all()
+    base = _summary(row).model_dump()
+    return SessionDetailResponse(
+        **base, summary=row.summary,
+        messages=[SessionMessage(
+            role=m.role, type=m.type, content=m.content,
+            sources=list(m.sources) if m.sources else None,
+            timestamp=m.created_at.isoformat() if m.created_at else None,
+        ) for m in msgs],
+    )
+
+
+def _summary(row: ChatSession) -> SessionSummary:
+    return SessionSummary(
+        session_id=row.id, status=row.status,
+        customer_id=row.customer_id, customer_name=row.customer_name,
+        language=row.language, message_count=row.message_count,
+        started_at=row.started_at.isoformat() if row.started_at else None,
+        ended_at=row.ended_at.isoformat() if row.ended_at else None,
+    )
+
+
+# --- HTTP single-turn (header-authed; WhatsApp / async) ----------------
 
 
 @router.post("/message", response_model=ChatMessageResponse)
@@ -94,15 +262,8 @@ async def chat_message(
     session_id = req.session_id or _new_session_id()
     agent = await _get_agent(tenant, _scoped_session(tenant, session_id))
     result = await agent.handle_message(req.message)
-    return ChatMessageResponse(
-        session_id=session_id,
-        response_text=result.response.response_text,
-        language=result.response.language,
-        confidence=result.response.confidence,
-        sources_used=result.response.sources_used,
-        action=result.response.action,
-        suggested_followups=result.response.suggested_followups,
-    )
+    await _persist_turn(session_id, req.message, result)
+    return _to_message_response(session_id, result)
 
 
 @router.get("/history/{session_id}", response_model=HistoryResponse)
@@ -118,53 +279,60 @@ async def chat_history(
     )
 
 
-# --- WebSocket route ----------------------------------------------------
+# --- WebSocket (session_id is the capability) --------------------------
 
 
-@router.websocket("/ws")
-async def chat_websocket(websocket: WebSocket) -> None:
+@router.websocket("/ws/{session_id}")
+async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
     await websocket.accept()
     if _factory is None:
         await websocket.close(code=1011, reason="chatbot factory unset")
         return
 
-    # Resolve tenant from the WS bearer token (or X-Tenant-Slug header).
-    from src.auth.middleware import _resolve as _resolve_tenant  # local import to avoid cycle
+    # Resolve the owning tenant from the session row — no creds over the socket.
+    from src.auth.middleware import tenant_from_id
 
-    tenant = await _resolve_tenant(websocket, allow_slug_header=True)
+    async with _sm()() as db:
+        row = await db.get(ChatSession, session_id)
+    if row is None:
+        await websocket.close(code=4004, reason="chat session not found")
+        return
+    tenant = await tenant_from_id(row.tenant_id)
     if tenant is None:
-        await websocket.close(code=1008, reason="missing/invalid tenant credentials")
+        await websocket.close(code=1011, reason="tenant unavailable")
         return
 
-    session_id: Optional[str] = None
-    agent: Optional[ChatBotAgent] = None
+    agent = await _factory(tenant, _scoped_session(tenant, session_id))
     try:
         while True:
             raw = await websocket.receive_text()
             try:
                 msg = json.loads(raw)
             except json.JSONDecodeError:
-                await websocket.send_text(json.dumps({"error": "invalid json"}))
+                await websocket.send_text(json.dumps({"type": "error", "message": "invalid json"}))
                 continue
 
-            user_text = (msg.get("message") or "").strip()
+            mtype = msg.get("type", "message")
+            if mtype == "end":
+                await _end_session(session_id)
+                await websocket.send_text(json.dumps({"type": "ended"}))
+                break
+
+            user_text = (msg.get("text") or msg.get("message") or "").strip()
             if not user_text:
-                await websocket.send_text(json.dumps({"error": "missing 'message'"}))
+                await websocket.send_text(json.dumps({"type": "error", "message": "missing 'text'"}))
                 continue
 
-            if agent is None:
-                session_id = msg.get("session_id") or _new_session_id()
-                agent = await _factory(tenant, _scoped_session(tenant, session_id))
-
+            await websocket.send_text(json.dumps({"type": "typing"}))
             result = await agent.handle_message(user_text)
+            await _persist_turn(session_id, user_text, result)
             await websocket.send_text(json.dumps({
+                "type": "message",
                 "session_id": session_id,
-                "response_text": result.response.response_text,
-                "language": result.response.language,
-                "confidence": result.response.confidence,
-                "sources_used": result.response.sources_used,
+                "text": result.response.response_text,
+                "sources": result.response.sources_used,
+                "suggestions": result.response.suggested_followups,
                 "action": result.response.action,
-                "suggested_followups": result.response.suggested_followups,
             }))
     except WebSocketDisconnect:
         log.info("chat ws client disconnected", extra={"session_id": session_id})
@@ -176,5 +344,53 @@ async def chat_websocket(websocket: WebSocket) -> None:
             pass
 
 
-def _new_session_id() -> str:
-    return f"chat_{uuid.uuid4().hex[:12]}"
+# --- Persistence helpers ------------------------------------------------
+
+
+async def _persist_turn(session_id: str, user_text: str, result: ChatTurnResult) -> None:
+    """Append the customer + agent messages to chat_messages and bump the count.
+    Best-effort: a missing session row (e.g. /message with an ad-hoc id) is a
+    no-op so the conversational reply is never blocked on persistence."""
+    try:
+        async with _sm()() as db:
+            row = await db.get(ChatSession, session_id)
+            if row is None:
+                return
+            db.add(ChatMessage(session_id=session_id, role="customer", type="text",
+                               content=user_text))
+            db.add(ChatMessage(
+                session_id=session_id, role="agent", type="text",
+                content=result.response.response_text,
+                sources=result.response.sources_used or None,
+            ))
+            row.message_count = (row.message_count or 0) + 2
+            await db.commit()
+    except Exception:  # noqa: BLE001 — persistence must not break the conversation
+        log.exception("chat message persistence failed", extra={"session_id": session_id})
+
+
+async def _end_session(session_id: str) -> None:
+    from datetime import datetime, timezone
+    try:
+        async with _sm()() as db:
+            row = await db.get(ChatSession, session_id)
+            if row is None:
+                return
+            row.status = "ended"
+            row.ended_at = datetime.now(timezone.utc).replace(tzinfo=None)
+            await db.commit()
+    except Exception:  # noqa: BLE001
+        log.exception("chat session end failed", extra={"session_id": session_id})
+
+
+def _to_message_response(session_id: str, result: ChatTurnResult) -> ChatMessageResponse:
+    r = result.response
+    return ChatMessageResponse(
+        session_id=session_id,
+        response_text=r.response_text,
+        language=r.language,
+        confidence=r.confidence,
+        sources_used=r.sources_used,
+        action=r.action,
+        suggested_followups=r.suggested_followups,
+    )
