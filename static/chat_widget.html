@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>ChatBot — reference widget</title>
+<style>
+  :root { --bg:#f5f6f8; --agent:#fff; --cust:#2563eb; --cust-fg:#fff; }
+  * { box-sizing: border-box; font-family: system-ui, sans-serif; }
+  body { margin:0; background:var(--bg); display:flex; justify-content:center; }
+  #app { width:100%; max-width:480px; height:100vh; display:flex; flex-direction:column; background:var(--bg); }
+  header { padding:.8rem 1rem; background:#111827; color:#fff; font-weight:600; }
+  #setup { padding:1rem; display:flex; flex-direction:column; gap:.5rem; }
+  #setup input { padding:.5rem; border:1px solid #d1d5db; border-radius:6px; }
+  #setup button, #composer button { padding:.5rem .9rem; border:0; border-radius:6px; background:var(--cust); color:#fff; cursor:pointer; }
+  #log { flex:1; overflow-y:auto; padding:1rem; display:flex; flex-direction:column; gap:.5rem; }
+  .msg { max-width:78%; padding:.55rem .8rem; border-radius:14px; white-space:pre-wrap; line-height:1.35; }
+  .msg.agent { background:var(--agent); align-self:flex-start; border:1px solid #e5e7eb; }
+  .msg.customer { background:var(--cust); color:var(--cust-fg); align-self:flex-end; }
+  .meta { font-size:.7rem; color:#6b7280; align-self:flex-start; }
+  #typing { font-style:italic; color:#6b7280; padding:0 1rem .4rem; height:1.1rem; }
+  #suggestions { display:flex; gap:.4rem; flex-wrap:wrap; padding:0 1rem .4rem; }
+  #suggestions button { background:#e5e7eb; color:#111827; border:0; border-radius:14px; padding:.35rem .7rem; cursor:pointer; font-size:.8rem; }
+  #composer { display:flex; gap:.5rem; padding:.7rem; border-top:1px solid #e5e7eb; background:#fff; }
+  #composer input { flex:1; padding:.6rem; border:1px solid #d1d5db; border-radius:8px; }
+  .hidden { display:none; }
+</style>
+</head>
+<body>
+<div id="app">
+  <header>Support Chat <span id="status" style="font-weight:400;opacity:.7"></span></header>
+  <div id="setup">
+    <input id="base" placeholder="API base (e.g. http://localhost:8000)" value="" />
+    <input id="token" placeholder="Tenant bearer token" />
+    <input id="name" placeholder="Your name (optional)" />
+    <button id="start">Start chat</button>
+    <small style="color:#6b7280">Demo only — a real CRM creates the session server-side and embeds the returned <code>ws_url</code>.</small>
+  </div>
+  <div id="log" class="hidden"></div>
+  <div id="typing"></div>
+  <div id="suggestions"></div>
+  <div id="composer" class="hidden">
+    <input id="text" placeholder="Type a message…" autocomplete="off" />
+    <button id="send">Send</button>
+    <button id="end" style="background:#9ca3af">End</button>
+  </div>
+</div>
+<script>
+(function () {
+  const $ = (id) => document.getElementById(id);
+  let ws = null, sessionId = null;
+
+  function add(role, text) {
+    const el = document.createElement("div");
+    el.className = "msg " + (role === "customer" ? "customer" : "agent");
+    el.textContent = text;
+    $("log").appendChild(el);
+    $("log").scrollTop = $("log").scrollHeight;
+  }
+  function meta(text) {
+    const el = document.createElement("div");
+    el.className = "meta"; el.textContent = text;
+    $("log").appendChild(el);
+  }
+  function setSuggestions(opts) {
+    const box = $("suggestions"); box.innerHTML = "";
+    (opts || []).forEach((o) => {
+      const b = document.createElement("button");
+      b.textContent = o; b.onclick = () => { sendText(o); box.innerHTML = ""; };
+      box.appendChild(b);
+    });
+  }
+
+  async function start() {
+    const base = ($("base").value || window.location.origin).replace(/\/$/, "");
+    const token = $("token").value.trim();
+    const resp = await fetch(base + "/api/v1/chat/sessions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Authorization": "Bearer " + token },
+      body: JSON.stringify({ customer_name: $("name").value.trim() || null }),
+    });
+    if (!resp.ok) { alert("Failed to create session: " + resp.status); return; }
+    const data = await resp.json();
+    sessionId = data.session_id;
+    $("setup").classList.add("hidden");
+    $("log").classList.remove("hidden");
+    $("composer").classList.remove("hidden");
+    if (data.greeting) add("agent", data.greeting);
+    connect(data.ws_url);
+  }
+
+  function connect(wsUrl) {
+    ws = new WebSocket(wsUrl);
+    ws.onopen = () => { $("status").textContent = "● connected"; };
+    ws.onclose = () => { $("status").textContent = "○ disconnected"; };
+    ws.onmessage = (ev) => {
+      const m = JSON.parse(ev.data);
+      if (m.type === "typing") { $("typing").textContent = "typing…"; return; }
+      $("typing").textContent = "";
+      if (m.type === "message") {
+        add("agent", m.text);
+        if (m.sources && m.sources.length) meta("sources: " + m.sources.join(", "));
+        setSuggestions(m.suggestions);
+      } else if (m.type === "ended") {
+        add("agent", "— chat ended —"); $("composer").classList.add("hidden");
+      } else if (m.type === "error") {
+        meta("error: " + m.message);
+      }
+    };
+  }
+
+  function sendText(text) {
+    if (!text || !ws || ws.readyState !== 1) return;
+    add("customer", text);
+    ws.send(JSON.stringify({ type: "message", text: text }));
+    $("text").value = "";
+  }
+
+  $("start").onclick = start;
+  $("send").onclick = () => sendText($("text").value.trim());
+  $("text").addEventListener("keydown", (e) => { if (e.key === "Enter") sendText($("text").value.trim()); });
+  $("end").onclick = () => { if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: "end" })); };
+})();
+</script>
+</body>
+</html>

@@ -39,7 +39,7 @@ from fastapi import FastAPI
 from fastapi.responses import FileResponse
 from sqlalchemy import text
 
-from src.api import api_router, telephony_hooks
+from src.api import api_router, chat as chat_api, telephony_hooks
 from src.api.dev_console import (
     dev_console_enabled,
     dev_router,
@@ -64,6 +64,7 @@ from src.bootstrap import (
     build_provider_registry,
     build_runtime_registry,
     make_bridge_factory,
+    make_chatbot_factory,
     make_exotel_bridge_factory,
     make_stringee_bridge_factory,
 )
@@ -262,6 +263,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Browser softphone recording webhook transcribes + analyzes with the
     # tenant's STT + LLM, so it needs the same per-tenant provider registry.
     telephony_hooks.set_softphone_providers(providers)
+    # ChatBot: per-(tenant, session) agent factory + the sessionmaker the WS uses
+    # to resolve the tenant from the chat_sessions row and persist messages.
+    chat_api.set_chatbot_factory(make_chatbot_factory(runtime_registry))
+    chat_api.set_chat_sessionmaker(sessionmaker)
     app.state.providers = providers
 
     reaper_task = asyncio.create_task(_reap_stale_calls_loop())
@@ -275,6 +280,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         telephony_hooks.set_exotel_bridge_factory(None)
         telephony_hooks.set_stringee_bridge_factory(None)
         telephony_hooks.set_softphone_providers(None)
+        chat_api.set_chatbot_factory(None)
+        chat_api.set_chat_sessionmaker(None)
         set_browser_bridge_factory(None)
         set_call_outcome_persister(None)
         set_tenant_event_notifier(None)
@@ -345,6 +352,14 @@ async def softphone_test_page() -> FileResponse:
     Test-only (it mints the token in the browser); a real CRM mints server-side.
     """
     return FileResponse(_STATIC_DIR / "softphone_test.html", media_type="text/html")
+
+
+@app.get("/chat-widget", include_in_schema=False)
+async def chat_widget() -> FileResponse:
+    """Reference chat UI for demos/testing. Creates a session via
+    POST /api/v1/chat/sessions, then connects the returned ws_url. A real CRM
+    builds its own UI against the same APIs and mints the session server-side."""
+    return FileResponse(_STATIC_DIR / "chat_widget.html", media_type="text/html")
 
 
 @app.get("/health")

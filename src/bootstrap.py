@@ -165,6 +165,32 @@ def build_runtime_registry(providers: TenantProviders, base_session_store: Sessi
     )
 
 
+# --- ChatBot factory ---------------------------------------------------
+
+
+def make_chatbot_factory(registry):
+    """Per-(tenant, session) ChatBotAgent factory for ``chat.set_chatbot_factory``.
+
+    Reuses the tenant's LLM, per-tenant hybrid retriever, and Redis session store
+    from the runtime registry — the same per-tenant wiring the voice bridges use,
+    so a chat and a call for one tenant share providers + the knowledge index.
+    """
+    from src.agents.base import AgentSession
+    from src.agents.chatbot import ChatBotAgent
+
+    async def factory(tenant: TenantContext, session_id: str) -> ChatBotAgent:
+        return ChatBotAgent(
+            session=AgentSession(session_id=session_id),
+            llm=registry.providers.get_llm(tenant),
+            retriever=registry.retrievers.get(tenant),
+            company_name=tenant.name,
+            language_default=getattr(tenant.settings, "default_language", None) or "en",
+            store=registry.session_stores.get(tenant),
+        )
+
+    return factory
+
+
 # --- The bridge factory ------------------------------------------------
 
 
