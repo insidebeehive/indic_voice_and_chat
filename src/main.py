@@ -39,7 +39,12 @@ from fastapi import FastAPI
 from fastapi.responses import FileResponse
 from sqlalchemy import text
 
-from src.api import api_router, chat as chat_api, telephony_hooks
+from src.api import (
+    api_router,
+    chat as chat_api,
+    knowledge as knowledge_api,
+    telephony_hooks,
+)
 from src.api.dev_console import (
     dev_console_enabled,
     dev_router,
@@ -267,6 +272,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # to resolve the tenant from the chat_sessions row and persist messages.
     chat_api.set_chatbot_factory(make_chatbot_factory(runtime_registry))
     chat_api.set_chat_sessionmaker(sessionmaker)
+    # Knowledge ingest/query resolve the SAME per-tenant retriever the chatbot
+    # uses (registry.retrievers), so ingested docs are retrievable in chat.
+    knowledge_api.set_retriever_factory(lambda t: runtime_registry.retrievers.get(t))
     app.state.providers = providers
 
     reaper_task = asyncio.create_task(_reap_stale_calls_loop())
@@ -282,6 +290,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         telephony_hooks.set_softphone_providers(None)
         chat_api.set_chatbot_factory(None)
         chat_api.set_chat_sessionmaker(None)
+        knowledge_api.set_retriever_factory(None)
         set_browser_bridge_factory(None)
         set_call_outcome_persister(None)
         set_tenant_event_notifier(None)

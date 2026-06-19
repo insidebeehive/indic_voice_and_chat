@@ -16,13 +16,18 @@ from __future__ import annotations
 
 import logging
 import uuid
-from typing import Optional
+from pathlib import Path
+from typing import Callable, Optional
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, Field
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.api.deps import get_db_session
 from src.auth import TenantContext, current_tenant
 from src.interfaces.vector_store import Document
+from src.models.benchmark import KBDocument
 from src.rag.ingestion import ChunkConfig, detect_language, get_chunker, parse_document
 from src.rag.retriever import HybridRetriever
 
@@ -33,28 +38,38 @@ router = APIRouter(prefix="/knowledge", tags=["knowledge"])
 # --- DI -----------------------------------------------------------------
 
 
-_retriever: Optional[HybridRetriever] = None
+# A factory that returns the retriever for a tenant. Prod wires the per-tenant
+# registry retriever (so ingestion + the chatbot share one index); tests pass a
+# single retriever via ``set_retriever``.
+RetrieverFactory = Callable[[TenantContext], HybridRetriever]
+_retriever_factory: Optional[RetrieverFactory] = None
 _chunk_config: ChunkConfig = ChunkConfig()
-# In-memory document registry. Phase 5+ replaces this with the kb_documents
-# Postgres table; for Phase 4 in-memory is sufficient and keeps tests fast.
-_documents: dict[str, dict] = {}
 
 
-def set_retriever(retriever: HybridRetriever, chunk_config: Optional[ChunkConfig] = None) -> None:
-    global _retriever, _chunk_config, _documents
-    _retriever = retriever
+def set_retriever_factory(
+    factory: Optional[RetrieverFactory], chunk_config: Optional[ChunkConfig] = None,
+) -> None:
+    global _retriever_factory, _chunk_config
+    _retriever_factory = factory
     if chunk_config is not None:
         _chunk_config = chunk_config
-    _documents = {}
 
 
-def _require_retriever() -> HybridRetriever:
-    if _retriever is None:
+def set_retriever(
+    retriever: Optional[HybridRetriever], chunk_config: Optional[ChunkConfig] = None,
+) -> None:
+    """Convenience: use ONE retriever for every tenant (tests). ``None`` clears."""
+    set_retriever_factory(
+        (lambda _tenant: retriever) if retriever is not None else None, chunk_config)
+
+
+def _retriever_for(tenant: TenantContext) -> HybridRetriever:
+    if _retriever_factory is None:
         raise HTTPException(
             status_code=503,
             detail="knowledge base not initialized; set_retriever() not called",
         )
-    return _retriever
+    return _retriever_factory(tenant)
 
 
 # --- Schemas ------------------------------------------------------------
@@ -113,8 +128,9 @@ async def ingest_document(
     file: UploadFile = File(...),
     document_id: Optional[str] = Form(None),
     tenant: TenantContext = Depends(current_tenant),
+    session: AsyncSession = Depends(get_db_session),
 ) -> IngestResponse:
-    retriever = _require_retriever()
+    retriever = _retriever_for(tenant)
     data = await file.read()
     if not data:
         raise HTTPException(status_code=400, detail="empty upload")
@@ -147,13 +163,16 @@ async def ingest_document(
         for c in raw_chunks
     ]
     indexed = await retriever.index(docs)
-    _documents[doc_id] = {
-        "tenant_id": tenant.id,
-        "filename": file.filename,
-        "language": language,
-        "chunk_count": indexed,
-        "chunk_ids": [d.id for d in docs],
-    }
+    session.add(KBDocument(
+        id=doc_id,
+        tenant_id=tenant.id,
+        filename=file.filename or doc_id,
+        source_type=(Path(file.filename).suffix.lstrip(".").lower() if file.filename else None),
+        language=language,
+        chunk_count=indexed,
+        extra_data={"chunk_ids": [d.id for d in docs]},
+    ))
+    await session.commit()
     log.info("ingested document", extra={"document_id": doc_id, "chunks": indexed})
     return IngestResponse(
         document_id=doc_id,
@@ -166,31 +185,37 @@ async def ingest_document(
 @router.get("/documents", response_model=DocumentsResponse)
 async def list_documents(
     tenant: TenantContext = Depends(current_tenant),
+    session: AsyncSession = Depends(get_db_session),
 ) -> DocumentsResponse:
-    _require_retriever()
+    rows = (await session.execute(
+        select(KBDocument).where(KBDocument.tenant_id == tenant.id)
+        .order_by(KBDocument.ingested_at.desc())
+    )).scalars().all()
     items = [
         DocumentInfo(
-            id=doc_id,
-            filename=info["filename"] or doc_id,
-            language=info.get("language"),
-            chunk_count=info.get("chunk_count", 0),
+            id=r.id, filename=r.filename or r.id,
+            language=r.language, chunk_count=r.chunk_count or 0,
         )
-        for doc_id, info in _documents.items()
-        if info.get("tenant_id") == tenant.id
+        for r in rows
     ]
     return DocumentsResponse(documents=items, total=len(items))
 
 
 @router.delete("/documents/{document_id}")
 async def delete_document(
-    document_id: str, tenant: TenantContext = Depends(current_tenant),
+    document_id: str,
+    tenant: TenantContext = Depends(current_tenant),
+    session: AsyncSession = Depends(get_db_session),
 ) -> dict:
-    retriever = _require_retriever()
-    info = _documents.get(document_id)
-    if info is None or info.get("tenant_id") != tenant.id:
+    retriever = _retriever_for(tenant)
+    row = await session.get(KBDocument, document_id)
+    if row is None or row.tenant_id != tenant.id:
         raise HTTPException(status_code=404, detail="document not found")
-    _documents.pop(document_id, None)
-    n = await retriever.delete(info["chunk_ids"])
+    chunk_ids = (row.extra_data or {}).get("chunk_ids") or [
+        f"{document_id}::chunk-{i}" for i in range(row.chunk_count or 0)]
+    await session.delete(row)
+    await session.commit()
+    n = await retriever.delete(chunk_ids)
     return {"document_id": document_id, "chunks_removed": n}
 
 
@@ -198,7 +223,7 @@ async def delete_document(
 async def query(
     req: QueryRequest, tenant: TenantContext = Depends(current_tenant),
 ) -> QueryResponse:
-    retriever = _require_retriever()
+    retriever = _retriever_for(tenant)
     # Always filter by tenant_id so query results never leak across tenants.
     filters = dict(req.filters or {})
     filters["tenant_id"] = tenant.id
@@ -221,11 +246,15 @@ async def query(
 @router.get("/stats", response_model=StatsResponse)
 async def stats(
     tenant: TenantContext = Depends(current_tenant),
+    session: AsyncSession = Depends(get_db_session),
 ) -> StatsResponse:
-    _require_retriever()
-    docs = [info for info in _documents.values() if info.get("tenant_id") == tenant.id]
-    chunk_count = sum(info.get("chunk_count", 0) for info in docs)
-    return StatsResponse(document_count=len(docs), chunk_count=chunk_count)
+    rows = (await session.execute(
+        select(KBDocument).where(KBDocument.tenant_id == tenant.id)
+    )).scalars().all()
+    return StatsResponse(
+        document_count=len(rows),
+        chunk_count=sum(r.chunk_count or 0 for r in rows),
+    )
 
 
 def _new_id() -> str:

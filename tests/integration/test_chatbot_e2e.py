@@ -19,13 +19,17 @@ from typing import AsyncIterator
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from src.agents.base import AgentSession
 from src.agents.chatbot import ChatBotAgent
 from src.api import chat, knowledge
+from src.api.deps import get_db_session
 from src.auth import TenantContext, register_tenant_for_test
 from src.auth.middleware import set_tenant_resolver
 from src.config_tenant import TenantSettings
+from src.models.database import Base
+from src.models.tenant import Tenant
 
 HEADERS = {"Authorization": "Bearer test-token"}
 from src.dialogue.context import SessionStore
@@ -112,7 +116,20 @@ async def app(tmp_faiss_index: str, fake_redis):
             store=session_store,
         )
 
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:", future=True)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    sm = async_sessionmaker(engine, expire_on_commit=False)
+    async with sm() as s:
+        s.add(Tenant(id="t1", slug="t1", name="Acme Telecom"))
+        await s.commit()
+
+    async def _session_override():
+        async with sm() as session:
+            yield session
+
     chat.set_chatbot_factory(factory)
+    chat.set_chat_sessionmaker(sm)
     register_tenant_for_test(
         TenantSettings(id="t1", slug="t1", name="Acme Telecom"),
         plaintext_tokens=["test-token"],
@@ -120,10 +137,13 @@ async def app(tmp_faiss_index: str, fake_redis):
     a = FastAPI()
     a.include_router(knowledge.router)
     a.include_router(chat.router)
+    a.dependency_overrides[get_db_session] = _session_override
     yield a, llm, session_store, retriever
     chat.set_chatbot_factory(None)
+    chat.set_chat_sessionmaker(None)
     knowledge.set_retriever(None, None)  # type: ignore[arg-type]
     set_tenant_resolver(None)
+    await engine.dispose()
 
 
 @pytest.mark.asyncio
