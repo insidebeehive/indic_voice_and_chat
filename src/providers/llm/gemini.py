@@ -21,7 +21,7 @@ from src.interfaces.llm import ILLMProvider, LLMConfig, LLMMessage, LLMResult
 
 log = logging.getLogger(__name__)
 
-DEFAULT_MODEL = "gemini-2.0-flash"
+DEFAULT_MODEL = "gemini-2.5-flash"
 
 # Gemini intermittently returns transient backend errors — most notably
 # ``500 INTERNAL`` ("An internal error has occurred. Please retry...") — even
