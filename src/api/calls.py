@@ -19,6 +19,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.api.answer_paths import ANSWER_PATHS
 from src.api.call_store import count_active_calls, insert_call
 from src.api.deps import get_db_session
 from src.config_tenant import platform_webhook_base_url
@@ -147,11 +148,14 @@ async def call_lead(
     except Exception as e:  # noqa: BLE001 — e.g. missing credentials
         raise HTTPException(status_code=400, detail=f"telephony adapter unavailable: {e}")
 
-    # Stringee: scope the answer URL to the calling tenant's slug so the answering
-    # bridge uses THIS tenant's config (not resolved from the shared number).
+    # Slug-scope the answer URL so the answering bridge resolves THIS tenant by
+    # slug (and runs with its config), instead of reverse-resolving our caller-ID
+    # — which would require the number to be in tenant_phone_numbers. Same pattern
+    # as the dev console. Providers without a slug-scoped route keep the bare base.
     answer_url = webhook_base.rstrip("/")
-    if provider == "stringee":
-        answer_url = f"{answer_url}/stringee/answer/{tenant.slug}"
+    answer_path = ANSWER_PATHS.get(provider)
+    if answer_path:
+        answer_url = f"{answer_url}/{answer_path}/{tenant.slug}"
     cfg = CallConfig(
         to_number=req.to_number.strip(),
         from_number=from_number,

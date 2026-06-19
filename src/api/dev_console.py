@@ -23,6 +23,7 @@ from pydantic import BaseModel
 from src.agents.base import AgentSession
 from src.agents.state_machine import AgentStateMachine
 from src.agents.voicebot import VoiceBotAgent
+from src.api.answer_paths import ANSWER_PATHS
 from src.api.browser_bridge import BrowserBridgeConfig, BrowserVoiceBridge
 from src.api.gemini_live_bridge import RECORD_TURN_SIGNAL, GeminiLiveBridge
 from src.auth.context import TenantContext
@@ -188,10 +189,11 @@ async def dev_campaigns(tenant: str = "dev") -> dict:
 # resolve from the provider's env vars); the caller-ID comes from
 # pipeline.telephony.outbound_from[provider]. Needs a publicly reachable host.
 
-# Providers the dev console can place an outbound call with, and the answer-webhook
-# path each one uses. Twilio/Exotel run the media-stream bridge (S2S or cascade,
-# per the Mode override); Stringee is a turn-based IVR with its own /stringee/answer.
-_ANSWER_PATH = {"twilio": "twilio/voice", "exotel": "exotel/voice", "stringee": "stringee/answer"}
+# Providers the dev console can place an outbound call with. The answer-webhook
+# path per provider is the shared ANSWER_PATHS map. Twilio/Exotel run the
+# media-stream bridge (S2S or cascade, per the Mode override); Stringee is a
+# turn-based IVR with its own /stringee/answer.
+_ANSWER_PATH = ANSWER_PATHS
 _PLACE_CALL_PROVIDERS = tuple(_ANSWER_PATH)
 # Stringee is IVR-only — Mode/Voice (S2S vs cascade) don't apply to it.
 _STREAM_PROVIDERS = ("twilio", "exotel")
