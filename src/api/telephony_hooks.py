@@ -99,6 +99,15 @@ def set_stringee_bridge_factory(factory) -> None:
     _stringee_bridge_factory = factory
 
 
+def _ws_stream_url(request: Request, path: str) -> str:
+    """Build the media-stream WSS URL for ``/api/v1/telephony/{path}``, honoring
+    the reverse-proxy forwarded host/proto (Northflank terminates TLS upstream)."""
+    base = request.headers.get("x-forwarded-host") or request.url.netloc
+    forwarded_proto = request.headers.get("x-forwarded-proto")
+    scheme = "wss" if (forwarded_proto == "https" or request.url.scheme == "https") else "ws"
+    return f"{scheme}://{base}/api/v1/telephony/{path}"
+
+
 @router.post("/twilio/voice", response_class=Response)
 async def twilio_voice(
     request: Request,
@@ -123,12 +132,9 @@ async def twilio_voice(
     lookup_number = From if (is_outbound and From) else To
     tenant = await tenant_from_twilio_to_number(lookup_number)
 
-    base = request.headers.get("x-forwarded-host") or request.url.netloc
-    forwarded_proto = request.headers.get("x-forwarded-proto")
-    scheme = "wss" if (forwarded_proto == "https" or request.url.scheme == "https") else "ws"
     # Tenant slug goes in the URL **path** — Twilio strips query strings
     # from <Stream url=...> attributes when opening the WSS connection.
-    stream_url = f"{scheme}://{base}/api/v1/telephony/twilio/stream/{tenant.slug}"
+    stream_url = _ws_stream_url(request, f"twilio/stream/{tenant.slug}")
     body = voice_twiml(stream_url)
     log.info(
         "twilio voice webhook",
@@ -138,6 +144,34 @@ async def twilio_voice(
         },
     )
     return Response(content=body, media_type="application/xml")
+
+
+@router.post("/twilio/voice/{tenant_slug}", response_class=Response)
+async def twilio_voice_for_tenant(
+    request: Request,
+    tenant_slug: str,
+    To: str | None = Form(None),
+    From: str | None = Form(None),
+    CallSid: str | None = Form(None),
+    Direction: str | None = Form(None),
+) -> Response:
+    """Slug-scoped answer URL for **outbound** calls we place ourselves (dev
+    console / orchestrator). The placing tenant is already known, so we resolve
+    by slug and skip the caller-ID lookup — the outbound caller-ID need NOT be
+    registered in ``tenant_phone_numbers`` (mirrors ``/stringee/answer/{slug}``).
+    Inbound calls keep using the bare ``/twilio/voice`` (resolve by number)."""
+    from src.auth.middleware import tenant_from_slug
+
+    tenant = await tenant_from_slug(tenant_slug)
+    stream_url = _ws_stream_url(request, f"twilio/stream/{tenant.slug}")
+    log.info(
+        "twilio voice webhook (slug-scoped)",
+        extra={
+            "tenant": tenant.slug, "direction": Direction,
+            "to": To, "from": From, "sid": CallSid,
+        },
+    )
+    return Response(content=voice_twiml(stream_url), media_type="application/xml")
 
 
 @router.websocket("/twilio/stream/{tenant_slug}")
@@ -594,10 +628,7 @@ async def exotel_voice(
     lookup_number = From if (is_outbound and From) else To
     tenant = await tenant_from_twilio_to_number(lookup_number)
 
-    base = request.headers.get("x-forwarded-host") or request.url.netloc
-    forwarded_proto = request.headers.get("x-forwarded-proto")
-    scheme = "wss" if (forwarded_proto == "https" or request.url.scheme == "https") else "ws"
-    stream_url = f"{scheme}://{base}/api/v1/telephony/exotel/stream/{tenant.slug}"
+    stream_url = _ws_stream_url(request, f"exotel/stream/{tenant.slug}")
     body = voicebot_xml(stream_url)
     log.info(
         "exotel voice webhook",
@@ -607,6 +638,33 @@ async def exotel_voice(
         },
     )
     return Response(content=body, media_type="application/xml")
+
+
+@router.post("/exotel/voice/{tenant_slug}", response_class=Response)
+async def exotel_voice_for_tenant(
+    request: Request,
+    tenant_slug: str,
+    To: str | None = Form(None),
+    From: str | None = Form(None),
+    CallSid: str | None = Form(None),
+    Direction: str | None = Form(None),
+) -> Response:
+    """Slug-scoped answer URL for **outbound** calls we place (dev console /
+    orchestrator) — resolves the placing tenant by slug, so the outbound
+    caller-ID need not be registered in ``tenant_phone_numbers``. Symmetric to
+    the Twilio slug route; inbound keeps the bare ``/exotel/voice``."""
+    from src.auth.middleware import tenant_from_slug
+
+    tenant = await tenant_from_slug(tenant_slug)
+    stream_url = _ws_stream_url(request, f"exotel/stream/{tenant.slug}")
+    log.info(
+        "exotel voice webhook (slug-scoped)",
+        extra={
+            "tenant": tenant.slug, "direction": Direction,
+            "to": To, "from": From, "sid": CallSid,
+        },
+    )
+    return Response(content=voicebot_xml(stream_url), media_type="application/xml")
 
 
 @router.websocket("/exotel/stream/{tenant_slug}")
