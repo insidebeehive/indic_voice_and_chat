@@ -323,3 +323,112 @@ async def test_transcribe_audio_returns_empty_on_failure() -> None:
     client.aio.models.generate_content = AsyncMock(side_effect=RuntimeError("boom"))
     adapter = GeminiLLMAdapter({"client": client})
     assert await adapter.transcribe_audio(b"x", "audio/mpeg") == ""
+
+
+# --- Multimodal content (Phase 0) --------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_generate_multimodal_content_emits_inline_data_parts() -> None:
+    from src.interfaces.llm import ContentPart
+    client = _make_client(generate_return=_response("ok"))
+    adapter = GeminiLLMAdapter({"client": client})
+    msg = LLMMessage(role="user", content=[
+        ContentPart(type="text", text="what is this?"),
+        ContentPart(type="image", inline_data={"mime_type": "image/jpeg", "data": b"img"}),
+    ])
+    await adapter.generate([msg], LLMConfig(response_format="text"))
+    contents = client.aio.models.generate_content.await_args.kwargs["contents"]
+    parts = contents[0]["parts"]
+    assert parts[0] == {"text": "what is this?"}
+    assert parts[1]["inline_data"]["mime_type"] == "image/jpeg"
+    assert parts[1]["inline_data"]["data"] == b"img"
+
+
+# --- Tool / function calling (Phase 0) ---------------------------------
+
+
+def _tool_call_response(name: str, args: dict, finish_reason: str = "STOP") -> SimpleNamespace:
+    part = SimpleNamespace(text=None, function_call=SimpleNamespace(name=name, args=args))
+    candidate = SimpleNamespace(
+        content=SimpleNamespace(parts=[part]),
+        finish_reason=SimpleNamespace(name=finish_reason),
+    )
+    return SimpleNamespace(
+        text=None, candidates=[candidate],
+        usage_metadata=SimpleNamespace(prompt_token_count=1, candidates_token_count=1),
+    )
+
+
+@pytest.mark.asyncio
+async def test_generate_with_tools_passes_function_declarations() -> None:
+    from src.interfaces.llm import ToolSpec
+    client = _make_client(generate_return=_response("ok"))
+    adapter = GeminiLLMAdapter({"client": client})
+    tools = [ToolSpec(
+        name="search_kb", description="search",
+        parameters={"type": "object", "properties": {"q": {"type": "string"}}, "required": ["q"]})]
+    await adapter.generate(
+        [LLMMessage(role="user", content="hi")],
+        LLMConfig(response_format="text", tools=tools))
+    cfg = client.aio.models.generate_content.await_args.kwargs["config"]
+    decls = cfg["tools"][0]["function_declarations"]
+    assert decls[0]["name"] == "search_kb"
+    assert decls[0]["parameters"]["properties"]["q"]["type"] == "string"
+
+
+@pytest.mark.asyncio
+async def test_generate_extracts_tool_calls_from_response() -> None:
+    from src.interfaces.llm import ToolSpec
+    client = _make_client(generate_return=_tool_call_response("search_kb", {"q": "refund"}))
+    adapter = GeminiLLMAdapter({"client": client})
+    result = await adapter.generate(
+        [LLMMessage(role="user", content="hi")],
+        LLMConfig(response_format="text", tools=[ToolSpec("search_kb", "s", {"type": "object"})]))
+    assert len(result.tool_calls) == 1
+    assert result.tool_calls[0].name == "search_kb"
+    assert result.tool_calls[0].arguments == {"q": "refund"}
+
+
+@pytest.mark.asyncio
+async def test_generate_with_tools_omits_json_mime() -> None:
+    # Gemini rejects response_mime_type=application/json together with tools.
+    from src.interfaces.llm import ToolSpec
+    client = _make_client(generate_return=_response("ok"))
+    adapter = GeminiLLMAdapter({"client": client})
+    await adapter.generate(
+        [LLMMessage(role="user", content="hi")],
+        LLMConfig(response_format="json", tools=[ToolSpec("t", "d", {"type": "object"})]))
+    cfg = client.aio.models.generate_content.await_args.kwargs["config"]
+    assert "response_mime_type" not in cfg
+    assert "tools" in cfg
+
+
+@pytest.mark.asyncio
+async def test_tool_result_message_becomes_function_response() -> None:
+    from src.interfaces.llm import ToolCall
+    client = _make_client(generate_return=_response("ok"))
+    adapter = GeminiLLMAdapter({"client": client})
+    msgs = [
+        LLMMessage(role="user", content="status?"),
+        LLMMessage(role="assistant", content="",
+                   tool_calls=[ToolCall(id="c1", name="search_kb", arguments={"q": "x"})]),
+        LLMMessage(role="tool", name="search_kb", tool_call_id="c1", content='{"results": []}'),
+    ]
+    await adapter.generate(msgs, LLMConfig(response_format="text"))
+    contents = client.aio.models.generate_content.await_args.kwargs["contents"]
+    model_parts = [c for c in contents if c["role"] == "model"]
+    assert model_parts and "function_call" in model_parts[0]["parts"][0]
+    fr = [p for c in contents for p in c["parts"] if "function_response" in p]
+    assert fr and fr[0]["function_response"]["name"] == "search_kb"
+
+
+@pytest.mark.asyncio
+async def test_generate_no_tools_is_unchanged_regression() -> None:
+    # The str-content + no-tools path must be byte-identical to before Phase 0.
+    client = _make_client(generate_return=_response("ok"))
+    adapter = GeminiLLMAdapter({"client": client})
+    await adapter.generate([LLMMessage(role="user", content="hi")], LLMConfig())
+    kwargs = client.aio.models.generate_content.await_args.kwargs
+    assert kwargs["contents"] == [{"role": "user", "parts": [{"text": "hi"}]}]
+    assert "tools" not in kwargs["config"]
