@@ -231,10 +231,17 @@ def test_upload_endpoint_processes_and_persists(app: FastAPI) -> None:
 def test_websocket_end_marks_session_ended(app: FastAPI) -> None:
     client = TestClient(app)
     sid = _create_session(client)
+    # one turn so there's something to summarize
     with client.websocket_connect(f"/chat/ws/{sid}") as ws:
+        ws.send_text(json.dumps({"type": "message", "text": "Plan B?"}))
+        json.loads(ws.receive_text())  # typing
+        json.loads(ws.receive_text())  # message
         ws.send_text(json.dumps({"type": "end"}))
-        assert json.loads(ws.receive_text())["type"] == "ended"
-    assert client.get(f"/chat/sessions/{sid}", headers=HEADERS).json()["status"] == "ended"
+        ended = json.loads(ws.receive_text())
+    assert ended["type"] == "ended"
+    detail = client.get(f"/chat/sessions/{sid}", headers=HEADERS).json()
+    assert detail["status"] == "ended"
+    assert detail["summary"]  # a session summary was stored
 
 
 # --- HTTP single-turn channel ------------------------------------------

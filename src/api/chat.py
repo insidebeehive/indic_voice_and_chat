@@ -266,6 +266,7 @@ async def chat_message(
     agent = await _get_agent(tenant, _scoped_session(tenant, session_id))
     result = await agent.handle_message(req.message)
     await _persist_turn(session_id, req.message, result)
+    await _emit_escalation(tenant.id, session_id, result)
     return _to_message_response(session_id, result)
 
 
@@ -298,6 +299,7 @@ async def upload_media(
     await _persist_turn(
         session_id, text or f"[{mime}]", result,
         user_type=("image" if mime.startswith("image/") else "video"), media_mime=mime)
+    await _emit_escalation(tenant.id, session_id, result)
     return _to_message_response(session_id, result)
 
 
@@ -349,8 +351,9 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
 
             mtype = msg.get("type", "message")
             if mtype == "end":
-                await _end_session(session_id)
-                await websocket.send_text(json.dumps({"type": "ended"}))
+                summary = await agent.summarize_session()
+                await _end_session(session_id, summary)
+                await websocket.send_text(json.dumps({"type": "ended", "summary": summary}))
                 break
 
             if mtype in ("image", "video"):
@@ -365,7 +368,7 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
                 result = await agent.handle_image(data, mime, caption)
                 await _persist_turn(session_id, caption or f"[{mtype}]", result,
                                     user_type=mtype, media_mime=mime)
-                await _send_reply(websocket, session_id, result)
+                await _send_reply(websocket, session_id, result, tenant.id)
                 continue
 
             user_text = (msg.get("text") or msg.get("message") or "").strip()
@@ -376,7 +379,7 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
             await websocket.send_text(json.dumps({"type": "typing"}))
             result = await agent.handle_message(user_text)
             await _persist_turn(session_id, user_text, result)
-            await _send_reply(websocket, session_id, result)
+            await _send_reply(websocket, session_id, result, tenant.id)
     except WebSocketDisconnect:
         log.info("chat ws client disconnected", extra={"session_id": session_id})
     except Exception:  # noqa: BLE001 — never let the websocket task escape
@@ -390,9 +393,11 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
 # --- Persistence helpers ------------------------------------------------
 
 
-async def _send_reply(websocket: WebSocket, session_id: str, result: ChatTurnResult) -> None:
+async def _send_reply(
+    websocket: WebSocket, session_id: str, result: ChatTurnResult, tenant_id: str,
+) -> None:
     """Send the agent's reply frame, plus an escalation/call_offer frame if the
-    agent's tools fired one."""
+    agent's tools fired one, and emit a signed chat.escalated tenant event."""
     await websocket.send_text(json.dumps({
         "type": "message",
         "session_id": session_id,
@@ -412,6 +417,26 @@ async def _send_reply(websocket: WebSocket, session_id: str, result: ChatTurnRes
             "type": "call_offer",
             "reason": result.call_offer.get("reason", ""),
         }))
+    await _emit_escalation(tenant_id, session_id, result)
+
+
+async def _emit_escalation(tenant_id: str, session_id: str, result: ChatTurnResult) -> None:
+    """Emit a signed ``chat.escalated`` tenant event when the agent escalated.
+    Delivered via the same notifier the call events use (no-op if unwired)."""
+    if not result.escalation:
+        return
+    from src.api.call_store import emit_tenant_event
+    from src.integration.tenant_events import build_envelope
+    await emit_tenant_event(build_envelope(
+        event_type="chat.escalated",
+        call_id=session_id,
+        tenant_id=tenant_id,
+        channel="chat",
+        data={
+            "reason": result.escalation.get("reason", ""),
+            "summary": result.escalation.get("summary", ""),
+        },
+    ))
 
 
 async def _persist_turn(
@@ -439,7 +464,7 @@ async def _persist_turn(
         log.exception("chat message persistence failed", extra={"session_id": session_id})
 
 
-async def _end_session(session_id: str) -> None:
+async def _end_session(session_id: str, summary: str = "") -> None:
     from datetime import datetime, timezone
     try:
         async with _sm()() as db:
@@ -448,6 +473,8 @@ async def _end_session(session_id: str) -> None:
                 return
             row.status = "ended"
             row.ended_at = datetime.now(timezone.utc).replace(tzinfo=None)
+            if summary:
+                row.summary = summary
             await db.commit()
     except Exception:  # noqa: BLE001
         log.exception("chat session end failed", extra={"session_id": session_id})
