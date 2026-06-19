@@ -196,7 +196,7 @@ async def test_recording_callback_finalizes_same_outcome(ctx) -> None:
     assert row.outcome == LeadCallOutcome.INTERESTED.value
     assert row.summary == "Lead is keen."
     assert "Wants the link." in row.notes
-    assert "https://api.twilio.com/REC/abc" in row.notes
+    assert "api.twilio.com" not in (row.notes or "")   # recording URL not echoed back
     assert row.status == "ended"
     assert row.duration_ms == 37_000
 
@@ -287,7 +287,7 @@ async def test_stringee_recording_finalizes_same_outcome(ctx) -> None:
         )).scalar_one()
     assert row.outcome == LeadCallOutcome.INTERESTED.value
     assert row.summary == "Lead is keen."
-    assert "https://rec.stringee/abc.wav" in row.notes
+    assert "rec.stringee" not in (row.notes or "")     # recording URL not echoed back
     assert row.status == "ended"
     assert row.duration_ms == 52_000
 

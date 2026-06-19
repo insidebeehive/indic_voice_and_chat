@@ -136,7 +136,7 @@ async def test_finalize_manual_call_writes_same_outcome_shape(sm) -> None:
     assert row.outcome == LeadCallOutcome.CALLBACK_REQUESTED.value
     assert row.summary == "Lead asked to be called back."
     assert "Prefers evening." in row.notes
-    assert "https://rec.example/r1" in row.notes      # recording URL appended
+    assert "rec.example" not in (row.notes or "")     # recording URL NOT sent — call_id is enough
     assert row.status == "ended"
     assert row.duration_ms == 42_000
     assert stt.calls == 2                              # one batch pass per channel
