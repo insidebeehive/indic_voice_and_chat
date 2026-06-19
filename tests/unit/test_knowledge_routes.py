@@ -7,11 +7,15 @@ import io
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from src.api import knowledge
+from src.api.deps import get_db_session
 from src.auth import register_tenant_for_test
 from src.auth.middleware import set_tenant_resolver
 from src.config_tenant import TenantSettings
+from src.models.database import Base
+from src.models.tenant import Tenant
 from src.providers.vector_store.faiss_store import FAISSAdapter
 from src.rag.embeddings import HashEmbedder, IdentityReranker
 from src.rag.ingestion import ChunkConfig
@@ -22,7 +26,7 @@ HEADERS = {"Authorization": "Bearer test-token"}
 
 
 @pytest.fixture
-def app(tmp_faiss_index: str) -> FastAPI:
+async def app(tmp_faiss_index: str) -> FastAPI:
     store = FAISSAdapter({"embedding_dim": 64, "index_path": tmp_faiss_index})
     retriever = HybridRetriever(
         embedder=HashEmbedder(dim=64),
@@ -30,6 +34,18 @@ def app(tmp_faiss_index: str) -> FastAPI:
         reranker=IdentityReranker(),
         config=RetrievalConfig(strategy="hybrid", top_k=3, oversample_k=8),
     )
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:", future=True)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    sm = async_sessionmaker(engine, expire_on_commit=False)
+    async with sm() as s:
+        s.add(Tenant(id="t1", slug="t1", name="T1"))
+        await s.commit()
+
+    async def _session_override():
+        async with sm() as session:
+            yield session
+
     knowledge.set_retriever(retriever, ChunkConfig(chunk_size=10, chunk_overlap=2, strategy="recursive"))
     register_tenant_for_test(
         TenantSettings(id="t1", slug="t1", name="T1"),
@@ -38,9 +54,11 @@ def app(tmp_faiss_index: str) -> FastAPI:
 
     app = FastAPI()
     app.include_router(knowledge.router)
+    app.dependency_overrides[get_db_session] = _session_override
     yield app
     knowledge.set_retriever(None, None)  # type: ignore[arg-type]
     set_tenant_resolver(None)
+    await engine.dispose()
 
 
 def test_ingest_a_markdown_document(app: FastAPI) -> None:
