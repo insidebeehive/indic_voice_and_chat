@@ -164,16 +164,16 @@ async def finalize_manual_call(
         now=now,
         llm=llm,
     )
-    notes = analysis.notes or ""
-    if recording_url:
-        notes = f"{notes}\n[recording] {recording_url}".strip()
+    # We deliberately do NOT echo recording_url back to the CRM — the call_id
+    # (provider_call_sid) is already in the event, and the CRM can fetch the
+    # recording itself if it needs it.
     return await record_outcome(
         session,
         provider_call_sid,
         status="ended",
         outcome=analysis.outcome.value,
         summary=analysis.summary,
-        notes=notes,
+        notes=analysis.notes or "",
         callback_at=analysis.callback_datetime,
         duration_ms=duration_ms,
     )
