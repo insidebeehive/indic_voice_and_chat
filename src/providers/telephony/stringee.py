@@ -109,12 +109,17 @@ class StringeeAdapter(ITelephonyProvider):
             or STRINGEE_BASE_URL
         ).rstrip("/")
         self._timeout = config.get("timeout", 30.0)
-        # Stringee requires a non-null ``userId`` on the callout (the app user the
-        # call originates as). With it the callout is an app-user->phone call and
-        # Stringee fetches the Answer URL + runs the SCCO; WITHOUT it the call
-        # degrades to phone->phone external and the Answer URL never fires (silent
-        # bot). Sourced per-tenant via config["user_id"] (the STRINGEE_USER_ID env
-        # is a legacy fallback only — tenancy stores it per-tenant now).
+        # ``userId`` is included in the callout body when set, but be aware:
+        # a SERVER REST callout (/v1/call2/callout) is treated by Stringee as an
+        # EXTERNAL phone->phone call regardless of this body field — it does NOT
+        # become an app-user->phone call and Stringee does not run our SCCO for it
+        # (confirmed live: outbound voicebot calls show UserID=null / phone->phone,
+        # TTS=0). Only a CLIENT-SDK access token carries a userId that makes a call
+        # app-originated, which is why the browser softphone works but server-
+        # originated outbound AI does not. Use Twilio/Exotel for outbound AI;
+        # reserve Stringee for the browser softphone + inbound. Kept here in case a
+        # future Stringee feature/config honors it. Per-tenant via config["user_id"]
+        # (STRINGEE_USER_ID env is a legacy fallback only).
         self._user_id: str | None = config.get("user_id") or os.environ.get("STRINGEE_USER_ID")
         # Tests can inject a pre-built bearer; otherwise we mint a fresh JWT.
         self._token_override: str | None = config.get("access_token")
@@ -130,12 +135,11 @@ class StringeeAdapter(ITelephonyProvider):
         import jwt  # PyJWT — already pulled in transitively by Twilio SDK
 
         now = int(time.time())
-        # The server REST callout requires ``rest_api: true`` (else r:45). The
-        # callout's ``userId`` (set in the body below) is what makes Stringee treat
-        # it as an app-user->phone call so it fetches the Answer URL + runs the
-        # SCCO; with userId:null the call degrades to phone->phone external and the
-        # Answer URL never fires (confirmed in the Stringee call log: app-user calls
-        # ran the SCCO + recorded, null-userId calls were silent phone->phone).
+        # The server REST callout requires ``rest_api: true`` (else r:45). NOTE: a
+        # server callout is treated as an EXTERNAL phone->phone call — a body
+        # ``userId`` does NOT make it app-originated and Stringee does not run our
+        # SCCO for it (confirmed live: outbound voicebot calls = UserID null /
+        # phone->phone / TTS 0). Outbound AI should go via Twilio/Exotel.
         payload = {
             "jti": f"{self._api_key_sid}-{now}",
             "iss": self._api_key_sid,
@@ -175,13 +179,12 @@ class StringeeAdapter(ITelephonyProvider):
             "to": [{"type": "external", "number": to_number, "alias": to_number}],
             "answer_url": config.webhook_url,
         }
-        # ``userId`` makes this an app-user->phone call so the Answer URL/SCCO runs;
-        # null -> silent phone->phone external. Mandatory in practice — log if unset.
+        # Include ``userId`` when set, but note Stringee ignores it for a server
+        # callout (stays external phone->phone; our SCCO does not run). Outbound AI
+        # voicebot should use Twilio/Exotel; Stringee is for the browser softphone
+        # (app-originated via a client token) + inbound.
         if self._user_id:
             body["userId"] = self._user_id
-        else:
-            log.warning("stringee callout has no userId — call will be a silent "
-                        "phone->phone external (set the tenant's telephony user_id)")
         # Log WHICH project (keySid=iss) + region (base) is authenticating, so a
         # FROM_NUMBER_NOT_BELONG_YOUR_PROJECT (r:15) is easy to diagnose: the
         # number is fine, the keys/region just don't own it.
