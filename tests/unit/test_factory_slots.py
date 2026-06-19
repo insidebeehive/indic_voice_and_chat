@@ -98,6 +98,21 @@ async def test_s2s_factory_tolerates_missing_tenant_realtime_key() -> None:
     assert isinstance(bridge, TelephonyLiveBridge)
 
 
+async def test_browser_factory_loads_chat_handoff(fake_redis) -> None:
+    import json
+
+    await fake_redis.set("chat_handoff:tok1", json.dumps({
+        "customer_name": "Raju", "chat_summary": "asked about Plan B", "customer_id": "cust1"}))
+    factory = make_browser_bridge_factory(
+        _providers(), handoff_store=SimpleNamespace(redis=fake_redis))
+    ws = SimpleNamespace(query_params={"handoff": "tok1"})
+    bridge = await factory(websocket=ws, tenant=_tenant())
+    ld = bridge._agent.session.lead_data
+    assert ld["name"] == "Raju"
+    assert ld["chat_summary"] == "asked about Plan B"
+    assert ld["customer_id"] == "cust1"
+
+
 async def test_browser_factory_resolves_campaign_per_call() -> None:
     from src.dialogue.campaign_loader import LoadedCampaign
     from src.dialogue.prompts import VoiceBotScript
