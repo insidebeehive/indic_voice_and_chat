@@ -12,7 +12,7 @@ pipeline:
     api_key_env: TENANT_EXAMPLE_SARVAM_KEY
   llm:
     provider: groq
-    model: llama-3.1-70b-versatile
+    model: llama-3.3-70b-versatile
     temperature: 0.7
     api_key_env: TENANT_EXAMPLE_GROQ_KEY
   tts:
