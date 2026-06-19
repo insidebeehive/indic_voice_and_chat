@@ -228,7 +228,7 @@ def test_bootstrap_builds_s2s_telephony_bridge():
         id="t1", slug="dev",
         settings=SimpleNamespace(pipeline=SimpleNamespace(mode="s2s", realtime=rt),
                                  timezone="Asia/Kolkata"),
-        secret=lambda env: "fake-key")
+        secret=lambda env: "fake-key", secret_optional=lambda env: "fake-key")
     providers = SimpleNamespace(get_stt=lambda t: None, get_llm=lambda t: object(),
                                 get_tts=lambda t: None)
 
@@ -255,7 +255,7 @@ def test_build_s2s_telephony_bridge_applies_voice_and_lead_override():
         id="t1", slug="dev",
         settings=SimpleNamespace(pipeline=SimpleNamespace(mode="s2s", realtime=rt),
                                  timezone="Asia/Kolkata"),
-        secret=lambda env: "fake-key")
+        secret=lambda env: "fake-key", secret_optional=lambda env: "fake-key")
     providers = SimpleNamespace(get_stt=lambda t: None, get_llm=lambda t: object(),
                                 get_tts=lambda t: None)
 
@@ -280,7 +280,7 @@ def test_build_s2s_telephony_bridge_rejects_disallowed_voice():
         id="t1", slug="dev",
         settings=SimpleNamespace(pipeline=SimpleNamespace(mode="s2s", realtime=rt),
                                  timezone="Asia/Kolkata"),
-        secret=lambda env: "k")
+        secret=lambda env: "k", secret_optional=lambda env: "k")
     providers = SimpleNamespace(get_stt=lambda t: None, get_llm=lambda t: object(),
                                 get_tts=lambda t: None)
     bridge = _build_s2s_telephony_bridge(

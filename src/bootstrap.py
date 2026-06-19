@@ -223,7 +223,11 @@ def _build_s2s_telephony_bridge(
     allowed = getattr(rt, "allowed_voices", None)
     if allowed and voice not in allowed:
         voice = rt.voice
-    key = tenant.secret(rt.api_key_env) if rt.api_key_env else None
+    # OPTIONAL: a missing per-tenant realtime key must NOT raise — pass None so
+    # GeminiLiveSession.connect falls back to the platform GEMINI_API_KEY /
+    # GOOGLE_API_KEY. Using the raising tenant.secret() here would crash the
+    # bridge on connect → the Twilio WS dies → the call drops instantly, no audio.
+    key = tenant.secret_optional(rt.api_key_env) if rt.api_key_env else None
     config = RealtimeConfig(
         model=rt.model, voice=voice, language_code=rt.language_code,
         system_instruction=build_s2s_system_instruction(script, slots, lead_data),
