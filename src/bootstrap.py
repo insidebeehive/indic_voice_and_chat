@@ -171,17 +171,89 @@ def build_runtime_registry(providers: TenantProviders, base_session_store: Sessi
 # --- ChatBot factory ---------------------------------------------------
 
 
-def make_chatbot_factory(registry):
+def _crm_params_to_schema(params: dict) -> dict:
+    """Turn a PRD-style ``{name: {type, description, source}}`` map into the
+    JSON-Schema the LLM tool declaration needs. LLM-sourced params are required;
+    session-sourced ones are filled from session context, so not required."""
+    props: dict = {}
+    required: list[str] = []
+    for name, spec in (params or {}).items():
+        spec = spec or {}
+        prop = {"type": spec.get("type", "string")}
+        if spec.get("description"):
+            prop["description"] = spec["description"]
+        props[name] = prop
+        if spec.get("source", "llm") == "llm":
+            required.append(name)
+    schema: dict = {"type": "object", "properties": props}
+    if required:
+        schema["required"] = required
+    return schema
+
+
+def make_chatbot_factory(registry, sessionmaker=None):
     """Per-(tenant, session) ChatBotAgent factory for ``chat.set_chatbot_factory``.
 
     Reuses the tenant's LLM, per-tenant hybrid retriever, and Redis session store
     from the runtime registry — the same per-tenant wiring the voice bridges use,
     so a chat and a call for one tenant share providers + the knowledge index.
+    Loads the tenant's registered CRM tools (chat_tools) and enables the agentic
+    tool loop (builtin search/escalate/offer + CRM tools).
     """
+    from sqlalchemy import select
+
     from src.agents.base import AgentSession
     from src.agents.chatbot import ChatBotAgent
+    from src.auth import secrets as crypto
+    from src.chatbot.tool_executor import execute_crm_tool
+    from src.interfaces.llm import ToolSpec
+    from src.models.chat import ChatTool
+    from src.models.tenant import TenantSecret
+
+    async def _load_crm_tools(tenant: TenantContext):
+        """Return (tool_specs, {name: exec_spec}) for the tenant's CRM tools."""
+        if sessionmaker is None:
+            return [], {}
+        specs: list[ToolSpec] = []
+        execs: dict[str, dict] = {}
+        async with sessionmaker() as db:
+            rows = (await db.execute(
+                select(ChatTool).where(ChatTool.tenant_id == tenant.id)
+            )).scalars().all()
+            for r in rows:
+                specs.append(ToolSpec(
+                    name=r.name, description=r.description,
+                    parameters=_crm_params_to_schema(r.parameters)))
+                token = None
+                secret_name = (r.auth_config or {}).get("token_secret_name")
+                if secret_name:
+                    sec = (await db.execute(
+                        select(TenantSecret).where(
+                            TenantSecret.tenant_id == tenant.id,
+                            TenantSecret.name == secret_name)
+                    )).scalar_one_or_none()
+                    if sec is not None:
+                        try:
+                            token = crypto.decrypt(sec.value_encrypted)
+                        except Exception:  # noqa: BLE001 — bad/again token → unauth call
+                            token = None
+                execs[r.name] = {
+                    "endpoint": r.endpoint, "method": r.method,
+                    "parameters": r.parameters or {}, "auth_type": r.auth_type, "token": token}
+        return specs, execs
 
     async def factory(tenant: TenantContext, session_id: str) -> ChatBotAgent:
+        crm_specs, crm_execs = await _load_crm_tools(tenant)
+
+        async def crm_executor(tc) -> dict:
+            spec = crm_execs.get(tc.name)
+            if spec is None:
+                return {"error": f"unknown tool {tc.name}"}
+            return await execute_crm_tool(
+                endpoint=spec["endpoint"], method=spec["method"],
+                parameters=spec["parameters"], auth_type=spec["auth_type"],
+                token=spec["token"], args=tc.arguments or {}, context={})
+
         return ChatBotAgent(
             session=AgentSession(session_id=session_id),
             llm=registry.providers.get_llm(tenant),
@@ -189,6 +261,9 @@ def make_chatbot_factory(registry):
             company_name=tenant.name,
             language_default=getattr(tenant.settings, "default_language", None) or "en",
             store=registry.session_stores.get(tenant),
+            enable_tools=True,
+            crm_tools=crm_specs,
+            crm_executor=crm_executor,
         )
 
     return factory

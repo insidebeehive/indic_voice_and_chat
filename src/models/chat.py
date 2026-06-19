@@ -12,7 +12,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, func
+from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, func
 from sqlalchemy import JSON
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -58,5 +58,29 @@ class ChatMessage(Base):
     sources: Mapped[Optional[dict]] = mapped_column(JSON)
     tool_calls: Mapped[Optional[dict]] = mapped_column(JSON)
     latency_ms: Mapped[Optional[int]] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=False), server_default=func.now())
+
+
+class ChatTool(Base):
+    """A tenant-registered CRM API endpoint the ChatBot may call as a tool
+    (PRD §4.6). The auth token is NOT stored here — it lives encrypted in
+    ``tenant_secrets`` under ``auth_config['token_secret_name']``."""
+
+    __tablename__ = "chat_tools"
+    __table_args__ = (UniqueConstraint("tenant_id", "name", name="uq_chat_tools_tenant_name"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    tenant_id: Mapped[str] = mapped_column(
+        String(50), ForeignKey("tenants.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    name: Mapped[str] = mapped_column(String(100), nullable=False)
+    description: Mapped[str] = mapped_column(Text, nullable=False)
+    endpoint: Mapped[str] = mapped_column(String(500), nullable=False)
+    method: Mapped[str] = mapped_column(String(10), default="GET")
+    auth_type: Mapped[Optional[str]] = mapped_column(String(20))  # bearer|api_key|none
+    auth_config: Mapped[dict] = mapped_column(JSON, default=dict)
+    parameters: Mapped[dict] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=False), server_default=func.now())
