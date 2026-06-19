@@ -107,7 +107,9 @@ def test_place_call_uses_selected_provider_and_its_caller_id(monkeypatch):
         cfg = captured["cfg"]
         assert cfg.to_number == "+919999999999"
         assert cfg.from_number == "+15705255679"            # twilio caller-ID, not stringee's
-        assert cfg.webhook_url == "https://example.test/api/v1/telephony/twilio/voice"
+        # Slug-scoped answer URL: outbound calls we place resolve the tenant by
+        # slug, so the caller-ID need not be in tenant_phone_numbers.
+        assert cfg.webhook_url == "https://example.test/api/v1/telephony/twilio/voice/dev"
 
         from src.api import dev_call_control
         assert dev_call_control.monitor.get("CA123")["status"] == "calling"

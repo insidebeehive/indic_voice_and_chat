@@ -240,11 +240,12 @@ async def dev_place_call(req: PlaceCallRequest) -> dict:
     if provider in _STREAM_PROVIDERS:
         dev_call_control.set_override(
             tenant.slug, mode=req.mode, voice=req.voice.strip(), lead_name=req.lead_name.strip())
-    # Stringee: scope the answer URL to the placing tenant's slug so the bridge is
-    # built with THIS tenant's config (not resolved from the shared caller number).
-    answer_path = _ANSWER_PATH[provider]
-    if provider == "stringee":
-        answer_path = f"{answer_path}/{tenant.slug}"
+    # Scope the answer URL to the placing tenant's slug for ALL providers: this is
+    # an outbound call WE place, so the tenant is known — the answer webhook resolves
+    # by slug and the bridge is built with THIS tenant's config, instead of reverse-
+    # resolving our own caller-ID (which would require the number to be registered in
+    # tenant_phone_numbers). Every place-call provider has a slug-scoped answer route.
+    answer_path = f"{_ANSWER_PATH[provider]}/{tenant.slug}"
     cfg = CallConfig(
         to_number=req.to_number.strip(),
         from_number=from_number,

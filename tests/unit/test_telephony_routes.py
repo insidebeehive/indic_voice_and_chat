@@ -94,6 +94,41 @@ def test_twilio_voice_outbound_unknown_from_returns_404() -> None:
         set_tenant_resolver(None)
 
 
+def test_twilio_voice_slug_route_resolves_by_slug_without_phone_registration() -> None:
+    """Outbound calls WE place use a slug-scoped answer URL, so the tenant is
+    resolved by slug — the caller-ID need NOT be in ``tenant_phone_numbers``
+    (mirrors the Stringee ``/stringee/answer/{slug}`` design)."""
+    # Tenant owns an UNRELATED number; the outbound From caller-ID is NOT registered.
+    _register_dev_tenant_with_phone("+18888888888")
+    try:
+        app = _make_app()
+        client = TestClient(app)
+        resp = client.post(
+            "/telephony/twilio/voice/dev",
+            data={
+                "To": "+918618795697",
+                "From": "+15705255679",   # not in phone_numbers — must still work
+                "Direction": "outbound-api",
+                "CallSid": "CAslug",
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        assert "/api/v1/telephony/twilio/stream/dev" in resp.text
+    finally:
+        set_tenant_resolver(None)
+
+
+def test_twilio_voice_slug_route_unknown_slug_returns_404() -> None:
+    _register_dev_tenant_with_phone("+18888888888")
+    try:
+        app = _make_app()
+        client = TestClient(app)
+        resp = client.post("/telephony/twilio/voice/ghost", data={"To": "+918618795697"})
+        assert resp.status_code == 404
+    finally:
+        set_tenant_resolver(None)
+
+
 def test_twilio_voice_missing_to_param_returns_422() -> None:
     _register_dev_tenant_with_phone()
     try:
@@ -210,6 +245,37 @@ def test_exotel_voice_outbound_resolves_tenant_by_from() -> None:
         )
         assert resp.status_code == 200, resp.text
         assert "/exotel/stream/dev" in resp.text
+    finally:
+        set_tenant_resolver(None)
+
+
+def test_exotel_voice_slug_route_resolves_by_slug_without_phone_registration() -> None:
+    _register_dev_tenant_with_phone("+18888888888")
+    try:
+        app = _make_app()
+        client = TestClient(app)
+        resp = client.post(
+            "/telephony/exotel/voice/dev",
+            data={
+                "To": "+918618795697",
+                "From": "+15705255679",   # not in phone_numbers — must still work
+                "Direction": "outbound-api",
+                "CallSid": "EXslug",
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        assert "/api/v1/telephony/exotel/stream/dev" in resp.text
+    finally:
+        set_tenant_resolver(None)
+
+
+def test_exotel_voice_slug_route_unknown_slug_returns_404() -> None:
+    _register_dev_tenant_with_phone("+18888888888")
+    try:
+        app = _make_app()
+        client = TestClient(app)
+        resp = client.post("/telephony/exotel/voice/ghost", data={"To": "+918618795697"})
+        assert resp.status_code == 404
     finally:
         set_tenant_resolver(None)
 
