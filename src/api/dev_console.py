@@ -440,7 +440,7 @@ def _build_stream_provider(tenant: TenantContext):
             "language": cfg.language,
             "endpointing": cfg.endpointing,
             "utterance_end_ms": cfg.utterance_end_ms,
-            "api_key": tenant.secret(cfg.api_key_env) if cfg.api_key_env else None,
+            # Platform-level key: the adapter reads DEEPGRAM_API_KEY from env.
         }
         return get_streaming_stt_provider(merged)
     except Exception as e:  # noqa: BLE001 - never block a call on streaming setup
@@ -578,7 +578,8 @@ def make_live_bridge_factory(
         voice = (qp.get("voice") or "").strip() or rt.voice
         if rt.allowed_voices and voice not in rt.allowed_voices:
             voice = rt.voice
-        key = tenant.secret(rt.api_key_env) if rt.api_key_env else None
+        # Platform-level key: connect() reads GEMINI_API_KEY / GOOGLE_API_KEY.
+        key = None
         config = RealtimeConfig(
             model=rt.model, voice=voice, language_code=rt.language_code,
             system_instruction=build_s2s_system_instruction(cur_script, cur_slots, lead_data),

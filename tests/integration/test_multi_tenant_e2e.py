@@ -101,18 +101,19 @@ def env(monkeypatch):
 
 
 def test_tenant_providers_route_to_distinct_clients(env, tmp_path) -> None:
-    """Each tenant builds its own STT/LLM/TTS/Twilio clients with its own
-    API keys. Verified through the TenantProviders factory."""
+    """Each tenant gets its own cached STT/LLM/TTS instance and its own Twilio
+    creds + vector-store path. STT/LLM/TTS keys are PLATFORM-level (read from env
+    by the adapter), so no per-tenant api_key is injected into their configs."""
     stt_calls: list[dict] = []
     llm_calls: list[dict] = []
 
     def stt_factory(cfg):
         stt_calls.append(dict(cfg))
-        return MagicMock(name=f"stt-{cfg.get('api_key')}", api_key=cfg["api_key"])
+        return MagicMock(name=f"stt-{len(stt_calls)}", api_key=cfg.get("api_key"))
 
     def llm_factory(cfg):
         llm_calls.append(dict(cfg))
-        return MagicMock(name=f"llm-{cfg.get('api_key')}", api_key=cfg["api_key"])
+        return MagicMock(name=f"llm-{len(llm_calls)}", api_key=cfg.get("api_key"))
 
     providers = TenantProviders(
         global_defaults={
@@ -136,14 +137,16 @@ def test_tenant_providers_route_to_distinct_clients(env, tmp_path) -> None:
 
     acme_llm = providers.get_llm(acme)
     globex_llm = providers.get_llm(globex)
-    assert acme_llm is not globex_llm
-    assert acme_llm.api_key == "acme-groq-key"
-    assert globex_llm.api_key == "globex-groq-key"
+    assert acme_llm is not globex_llm                  # distinct cached instance per tenant
+    # Platform-level keys: none injected per tenant (adapter reads GROQ_API_KEY etc.)
+    assert llm_calls[0].get("api_key") is None
+    assert "api_key" not in llm_calls[1]
 
     acme_stt = providers.get_stt(acme)
     globex_stt = providers.get_stt(globex)
-    assert acme_stt.api_key == "acme-sarvam-key"
-    assert globex_stt.api_key == "globex-sarvam-key"
+    assert acme_stt is not globex_stt
+    assert stt_calls[0].get("api_key") is None
+    assert "api_key" not in stt_calls[1]
 
     # Vector store paths are tenant-namespaced subdirectories.
     acme_vs = providers.get_vector_store(acme)
