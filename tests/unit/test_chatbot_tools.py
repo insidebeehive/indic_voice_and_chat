@@ -137,6 +137,31 @@ async def test_crm_tool_executed_via_injected_executor(retriever) -> None:
 
 
 @pytest.mark.asyncio
+async def test_summarize_session(retriever) -> None:
+    llm = ScriptedLLM([LLMResult(
+        text="Customer asked about Plan B; provided details.", finish_reason="stop")])
+    agent = ChatBotAgent(
+        session=AgentSession(session_id="s", turns=[
+            LLMMessage(role="user", content="tell me about Plan B"),
+            LLMMessage(role="assistant", content="Plan B has 500GB."),
+        ]),
+        llm=llm, retriever=retriever, company_name="Acme", language_default="en")
+    summary = await agent.summarize_session()
+    assert summary == "Customer asked about Plan B; provided details."
+    # The conversation was passed to the summarizer.
+    assert "Plan B" in llm.calls[0][0][-1].content
+
+
+@pytest.mark.asyncio
+async def test_summarize_empty_session_returns_blank(retriever) -> None:
+    llm = ScriptedLLM([])
+    agent = ChatBotAgent(session=AgentSession(session_id="s"), llm=llm, retriever=retriever,
+                         company_name="Acme", language_default="en")
+    assert await agent.summarize_session() == ""
+    assert llm.calls == []
+
+
+@pytest.mark.asyncio
 async def test_no_tool_call_answers_directly(retriever) -> None:
     llm = ScriptedLLM([LLMResult(text="Hello! How can I help?", finish_reason="stop")])
     agent = _agent(llm, retriever)

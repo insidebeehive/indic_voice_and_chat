@@ -279,6 +279,30 @@ class ChatBotAgent(BaseAgent):
                 },
             )
 
+    async def summarize_session(self) -> str:
+        """One-line LLM summary of the conversation (for session end / handoff).
+        Returns "" when there's nothing to summarize or the LLM fails."""
+        lines = [
+            f"{'Customer' if m.role == 'user' else 'Agent'}: {m.content}"
+            for m in self.session.turns
+            if m.role in ("user", "assistant") and isinstance(m.content, str) and m.content
+        ]
+        if not lines:
+            return ""
+        messages = [
+            LLMMessage(role="system",
+                       content="Summarize this customer-support chat in one concise sentence "
+                               "(the issue + outcome). Reply with only the sentence."),
+            LLMMessage(role="user", content="\n".join(lines)),
+        ]
+        try:
+            result = await self._llm.generate(
+                messages, LLMConfig(response_format="text", temperature=0.3, max_tokens=120))
+            return (result.text or "").strip()
+        except Exception:  # noqa: BLE001 — summary is best-effort
+            log.exception("chat session summarize failed")
+            return ""
+
     async def get_history(self) -> list[dict[str, Any]]:
         if self.store is None:
             return [
