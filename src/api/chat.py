@@ -43,6 +43,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.agents.chatbot import ChatBotAgent, ChatTurnResult
 from src.api.deps import get_db_session
 from src.auth import TenantContext, current_tenant
+from src.interfaces.llm import LLMMessage
 from src.models.chat import ChatMessage, ChatSession
 
 log = logging.getLogger(__name__)
@@ -55,6 +56,14 @@ router = APIRouter(prefix="/chat", tags=["chat"])
 ChatBotFactory = Callable[[TenantContext, str], Awaitable[ChatBotAgent]]
 _factory: Optional[ChatBotFactory] = None
 _sessionmaker: object | None = None
+_handoff_store: object | None = None  # SessionStore: carries chat→voice handoff context
+
+
+def set_chat_handoff_store(store: object | None) -> None:
+    """Inject the Redis-backed store the chat→voice handoff uses to pass the
+    chat summary into the voice agent."""
+    global _handoff_store
+    _handoff_store = store
 
 
 def set_chatbot_factory(factory: Optional[ChatBotFactory]) -> None:
@@ -93,11 +102,19 @@ def _new_session_id() -> str:
     return f"cs_{uuid.uuid4().hex[:16]}"
 
 
-def _ws_url(request: Request, session_id: str) -> str:
+def _ws_base(request: Request) -> str:
     base = request.headers.get("x-forwarded-host") or request.url.netloc
     proto = request.headers.get("x-forwarded-proto")
     scheme = "wss" if (proto == "https" or request.url.scheme == "https") else "ws"
-    return f"{scheme}://{base}/api/v1/chat/ws/{session_id}"
+    return f"{scheme}://{base}/api/v1"
+
+
+def _ws_url(request: Request, session_id: str) -> str:
+    return f"{_ws_base(request)}/chat/ws/{session_id}"
+
+
+def _voice_call_url(request: Request, tenant_slug: str, token: str) -> str:
+    return f"{_ws_base(request)}/chat/voice?tenant={tenant_slug}&handoff={token}"
 
 
 def _greeting(company: str, customer_name: Optional[str], language: str) -> str:
@@ -301,6 +318,73 @@ async def upload_media(
         user_type=("image" if mime.startswith("image/") else "video"), media_mime=mime)
     await _emit_escalation(tenant.id, session_id, result)
     return _to_message_response(session_id, result)
+
+
+class CallHandoffResponse(BaseModel):
+    call_url: str
+    call_id: str
+
+
+@router.post("/{session_id}/call", response_model=CallHandoffResponse)
+async def request_call(
+    session_id: str,
+    request: Request,
+    session: AsyncSession = Depends(get_db_session),
+) -> CallHandoffResponse:
+    """Chat→voice handoff (PRD §4.4): summarize the chat, stash the context under
+    a short-lived token, and return a browser-voice call URL. Capability model:
+    the tenant is resolved from the session row (no auth header)."""
+    from src.auth.middleware import tenant_from_id
+
+    row = await session.get(ChatSession, session_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="chat session not found")
+    tenant = await tenant_from_id(row.tenant_id)
+    if tenant is None:
+        raise HTTPException(status_code=503, detail="tenant unavailable")
+    if _factory is None or _handoff_store is None:
+        raise HTTPException(status_code=503, detail="chat voice handoff not initialized")
+
+    # Summarize the conversation so far (from persisted messages) for the voicebot.
+    agent = await _factory(tenant, _scoped_session(tenant, session_id))
+    msgs = (await session.execute(
+        select(ChatMessage).where(ChatMessage.session_id == session_id).order_by(ChatMessage.id)
+    )).scalars().all()
+    for m in msgs:
+        role = "user" if m.role == "customer" else ("assistant" if m.role == "agent" else m.role)
+        agent.session.turns.append(LLMMessage(role=role, content=m.content))
+    summary = await agent.summarize_session()
+
+    token = uuid.uuid4().hex
+    context = {
+        "chat_session_id": session_id,
+        "customer_name": row.customer_name,
+        "customer_id": row.customer_id,
+        "language": row.language,
+        "chat_summary": summary,
+    }
+    await _handoff_store.redis.set(
+        f"chat_handoff:{token}", json.dumps(context), ex=600)  # 10-min TTL
+    return CallHandoffResponse(
+        call_url=_voice_call_url(request, tenant.slug, token), call_id=token)
+
+
+@router.websocket("/voice")
+async def chat_voice_ws(websocket: WebSocket) -> None:
+    """Always-on browser-voice WS for the chat→voice handoff. Reuses the dev
+    console's browser bridge (un-gated). Tenant from ?tenant; handoff context
+    from ?handoff (resolved by the bridge factory). The dev console's own
+    /dev/voice stays behind VOX_DEV_CONSOLE."""
+    from src.api.dev_console import run_browser_voice
+    from src.auth.middleware import tenant_from_slug
+
+    await websocket.accept()
+    try:
+        tenant = await tenant_from_slug(websocket.query_params.get("tenant", ""))
+    except Exception:  # noqa: BLE001
+        await websocket.close(code=1008, reason="unknown tenant")
+        return
+    await run_browser_voice(websocket, tenant)
 
 
 @router.get("/history/{session_id}", response_model=HistoryResponse)

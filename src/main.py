@@ -253,12 +253,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             providers=providers, campaign_resolver=campaign_resolver,
         )
     )
-    if dev_console_enabled():
-        set_browser_bridge_factory(
-            make_browser_bridge_factory(
-                providers=providers, campaign_resolver=campaign_resolver,
-            )
+    # The browser voice bridge is wired ALWAYS (not just for the dev console) so
+    # the chat→voice handoff (/api/v1/chat/voice) works in prod; the dev console's
+    # own WS routes stay behind VOX_DEV_CONSOLE. handoff_store lets a ?handoff token
+    # carry the chat summary into the voice agent.
+    set_browser_bridge_factory(
+        make_browser_bridge_factory(
+            providers=providers, campaign_resolver=campaign_resolver,
+            handoff_store=base_session_store,
         )
+    )
+    if dev_console_enabled():
         set_live_bridge_factory(
             make_live_bridge_factory(
                 providers=providers, campaign_resolver=campaign_resolver,
@@ -272,6 +277,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # to resolve the tenant from the chat_sessions row and persist messages.
     chat_api.set_chatbot_factory(make_chatbot_factory(runtime_registry, sessionmaker))
     chat_api.set_chat_sessionmaker(sessionmaker)
+    chat_api.set_chat_handoff_store(base_session_store)
     # Knowledge ingest/query resolve the SAME per-tenant retriever the chatbot
     # uses (registry.retrievers), so ingested docs are retrievable in chat.
     knowledge_api.set_retriever_factory(lambda t: runtime_registry.retrievers.get(t))
@@ -290,6 +296,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         telephony_hooks.set_softphone_providers(None)
         chat_api.set_chatbot_factory(None)
         chat_api.set_chat_sessionmaker(None)
+        chat_api.set_chat_handoff_store(None)
         knowledge_api.set_retriever_factory(None)
         set_browser_bridge_factory(None)
         set_call_outcome_persister(None)

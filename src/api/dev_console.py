@@ -64,6 +64,38 @@ def set_browser_bridge_factory(factory: Optional[BrowserBridgeFactory]) -> None:
     _browser_bridge_factory = factory
 
 
+def get_browser_bridge_factory() -> Optional["BrowserBridgeFactory"]:
+    """The browser-voice bridge factory (used by the always-on chat→voice
+    handoff route, which lives outside the VOX_DEV_CONSOLE gate)."""
+    return _browser_bridge_factory
+
+
+async def run_browser_voice(websocket: WebSocket, tenant: TenantContext) -> None:
+    """Build + run a browser voice session for an already-accepted websocket.
+    Shared by the dev console (/dev/voice) and the chat→voice handoff
+    (/chat/voice)."""
+    if _browser_bridge_factory is None:
+        await websocket.close(code=1011, reason="browser bridge factory unset")
+        return
+    try:
+        bridge = await _browser_bridge_factory(websocket, tenant)
+    except Exception as e:  # noqa: BLE001 - e.g. tenant has no campaign configured
+        log.warning("browser voice bridge build failed: %s", e)
+        await websocket.close(code=1011, reason="no campaign configured for tenant")
+        return
+    try:
+        await _run_billed_session(tenant, bridge, mode="layered")
+    except WebSocketDisconnect:
+        log.info("browser voice client disconnected", extra={"tenant": tenant.slug})
+    except Exception:  # noqa: BLE001
+        log.exception("browser voice bridge crashed", extra={"tenant": tenant.slug})
+    finally:
+        try:
+            await websocket.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 # Factory: (websocket, tenant) -> GeminiLiveBridge (the S2S path). Set during lifespan.
 LiveBridgeFactory = Callable[[WebSocket, TenantContext], GeminiLiveBridge]
 _live_bridge_factory: Optional[LiveBridgeFactory] = None
@@ -343,9 +375,6 @@ async def dev_voice_ws(websocket: WebSocket) -> None:
     from src.auth.middleware import tenant_from_slug
 
     await websocket.accept()
-    if _browser_bridge_factory is None:
-        await websocket.close(code=1011, reason="browser bridge factory unset")
-        return
     try:
         tenant = await tenant_from_slug(
             websocket.query_params.get("tenant", "dev")
@@ -354,24 +383,7 @@ async def dev_voice_ws(websocket: WebSocket) -> None:
         log.warning("dev console tenant resolution failed: %s", e)
         await websocket.close(code=1008, reason="unknown tenant")
         return
-
-    try:
-        bridge = await _browser_bridge_factory(websocket, tenant)
-    except Exception as e:  # noqa: BLE001 - e.g. tenant has no campaign configured
-        log.warning("dev console bridge build failed: %s", e)
-        await websocket.close(code=1011, reason="no campaign configured for tenant")
-        return
-    try:
-        await _run_billed_session(tenant, bridge, mode="layered")
-    except WebSocketDisconnect:
-        log.info("dev console client disconnected", extra={"tenant": tenant.slug})
-    except Exception:  # noqa: BLE001
-        log.exception("dev console bridge crashed", extra={"tenant": tenant.slug})
-    finally:
-        try:
-            await websocket.close()
-        except Exception:  # noqa: BLE001
-            pass
+    await run_browser_voice(websocket, tenant)
 
 
 @ws_router.websocket("/voice-live")
@@ -454,6 +466,7 @@ def make_browser_bridge_factory(
     slots: SlotSchema = SlotSchema(),
     *,
     campaign_resolver=None,
+    handoff_store=None,
 ) -> BrowserBridgeFactory:
     """Build a BrowserVoiceBridge per connection, wired to the tenant stack.
 
@@ -510,6 +523,25 @@ def make_browser_bridge_factory(
         query_params = getattr(websocket, "query_params", {}) or {}
         lead_name = (query_params.get("lead_name") or "").strip()
         lead_data = {"lead_name": lead_name, "name": lead_name} if lead_name else {}
+        # Chat→voice handoff: a ?handoff=<token> resolves a short-lived Redis blob
+        # (chat summary + customer context) so the voice agent continues the chat.
+        handoff_token = (query_params.get("handoff") or "").strip()
+        if handoff_token and handoff_store is not None:
+            try:
+                import json as _json
+                raw = await handoff_store.redis.get(f"chat_handoff:{handoff_token}")
+                if raw:
+                    ctx = _json.loads(raw)
+                    name = (ctx.get("customer_name") or "").strip()
+                    if name:
+                        lead_data["name"] = name
+                        lead_data.setdefault("lead_name", name)
+                    if ctx.get("chat_summary"):
+                        lead_data["chat_summary"] = ctx["chat_summary"]
+                    if ctx.get("customer_id"):
+                        lead_data["customer_id"] = ctx["customer_id"]
+            except Exception:  # noqa: BLE001 — a bad handoff blob must not block the call
+                log.warning("chat handoff context load failed", extra={"token": handoff_token})
         agent = VoiceBotAgent(
             session=AgentSession(session_id=session_id, lead_data=lead_data),
             state_machine=AgentStateMachine(),

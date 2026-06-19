@@ -86,6 +86,7 @@ async def app(tmp_faiss_index: str, fake_redis):
 
     chat.set_chatbot_factory(factory)
     chat.set_chat_sessionmaker(sm)
+    chat.set_chat_handoff_store(session_store)
     register_tenant_for_test(
         TenantSettings(id="t1", slug="t1", name="Acme"),
         plaintext_tokens=["test-token"],
@@ -96,6 +97,7 @@ async def app(tmp_faiss_index: str, fake_redis):
     yield a
     chat.set_chatbot_factory(None)
     chat.set_chat_sessionmaker(None)
+    chat.set_chat_handoff_store(None)
     set_tenant_resolver(None)
     await engine.dispose()
 
@@ -211,6 +213,29 @@ def test_websocket_image_missing_data_errors(app: FastAPI) -> None:
     with client.websocket_connect(f"/chat/ws/{sid}") as ws:
         ws.send_text(json.dumps({"type": "image", "mime": "image/jpeg"}))
         assert json.loads(ws.receive_text())["type"] == "error"
+
+
+async def test_request_call_returns_voice_url_and_stores_context(app: FastAPI, fake_redis) -> None:
+    client = TestClient(app)
+    sid = _create_session(client, customer_name="Raju")
+    # one turn so there's something to summarize
+    with client.websocket_connect(f"/chat/ws/{sid}") as ws:
+        ws.send_text(json.dumps({"type": "message", "text": "my plan?"}))
+        json.loads(ws.receive_text())  # typing
+        json.loads(ws.receive_text())  # message
+
+    resp = client.post(f"/chat/{sid}/call")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert "/chat/voice?tenant=t1&handoff=" in body["call_url"]
+    token = body["call_id"]
+    # The handoff context was stashed in Redis for the voice bridge to pick up.
+    raw = await fake_redis.get(f"chat_handoff:{token}")
+    assert raw is not None
+    ctx = json.loads(raw)
+    assert ctx["chat_session_id"] == sid
+    assert ctx["customer_name"] == "Raju"
+    assert "chat_summary" in ctx
 
 
 def test_upload_endpoint_processes_and_persists(app: FastAPI) -> None:
