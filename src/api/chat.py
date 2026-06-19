@@ -27,9 +27,12 @@ from typing import Awaitable, Callable, Optional
 from fastapi import (
     APIRouter,
     Depends,
+    File,
+    Form,
     HTTPException,
     Path,
     Request,
+    UploadFile,
     WebSocket,
     WebSocketDisconnect,
 )
@@ -266,6 +269,38 @@ async def chat_message(
     return _to_message_response(session_id, result)
 
 
+@router.post("/{session_id}/upload", response_model=ChatMessageResponse)
+async def upload_media(
+    session_id: str,
+    file: UploadFile = File(...),
+    text: str = Form(""),
+    session: AsyncSession = Depends(get_db_session),
+) -> ChatMessageResponse:
+    """Multipart image/video upload (PRD §4.3). Capability model: the tenant is
+    resolved from the session row (same as the WS), so no auth header is needed.
+    Processes synchronously and returns the agent's reply."""
+    from src.auth.middleware import tenant_from_id
+
+    row = await session.get(ChatSession, session_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="chat session not found")
+    tenant = await tenant_from_id(row.tenant_id)
+    if tenant is None:
+        raise HTTPException(status_code=503, detail="tenant unavailable")
+    if _factory is None:
+        raise HTTPException(status_code=503, detail="chatbot factory not initialized")
+    data = await file.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="empty upload")
+    mime = file.content_type or "application/octet-stream"
+    agent = await _factory(tenant, _scoped_session(tenant, session_id))
+    result = await agent.handle_image(data, mime, text)
+    await _persist_turn(
+        session_id, text or f"[{mime}]", result,
+        user_type=("image" if mime.startswith("image/") else "video"), media_mime=mime)
+    return _to_message_response(session_id, result)
+
+
 @router.get("/history/{session_id}", response_model=HistoryResponse)
 async def chat_history(
     session_id: str = Path(min_length=1),
@@ -318,6 +353,21 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
                 await websocket.send_text(json.dumps({"type": "ended"}))
                 break
 
+            if mtype in ("image", "video"):
+                data = msg.get("data")
+                mime = msg.get("mime") or ""
+                if not data or not mime:
+                    await websocket.send_text(json.dumps(
+                        {"type": "error", "message": "image/video needs 'data' + 'mime'"}))
+                    continue
+                caption = (msg.get("text") or "").strip()
+                await websocket.send_text(json.dumps({"type": "typing"}))
+                result = await agent.handle_image(data, mime, caption)
+                await _persist_turn(session_id, caption or f"[{mtype}]", result,
+                                    user_type=mtype, media_mime=mime)
+                await _send_reply(websocket, session_id, result)
+                continue
+
             user_text = (msg.get("text") or msg.get("message") or "").strip()
             if not user_text:
                 await websocket.send_text(json.dumps({"type": "error", "message": "missing 'text'"}))
@@ -326,14 +376,7 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
             await websocket.send_text(json.dumps({"type": "typing"}))
             result = await agent.handle_message(user_text)
             await _persist_turn(session_id, user_text, result)
-            await websocket.send_text(json.dumps({
-                "type": "message",
-                "session_id": session_id,
-                "text": result.response.response_text,
-                "sources": result.response.sources_used,
-                "suggestions": result.response.suggested_followups,
-                "action": result.response.action,
-            }))
+            await _send_reply(websocket, session_id, result)
     except WebSocketDisconnect:
         log.info("chat ws client disconnected", extra={"session_id": session_id})
     except Exception:  # noqa: BLE001 — never let the websocket task escape
@@ -347,7 +390,34 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
 # --- Persistence helpers ------------------------------------------------
 
 
-async def _persist_turn(session_id: str, user_text: str, result: ChatTurnResult) -> None:
+async def _send_reply(websocket: WebSocket, session_id: str, result: ChatTurnResult) -> None:
+    """Send the agent's reply frame, plus an escalation/call_offer frame if the
+    agent's tools fired one."""
+    await websocket.send_text(json.dumps({
+        "type": "message",
+        "session_id": session_id,
+        "text": result.response.response_text,
+        "sources": result.response.sources_used,
+        "suggestions": result.response.suggested_followups,
+        "action": result.response.action,
+    }))
+    if result.escalation:
+        await websocket.send_text(json.dumps({
+            "type": "escalation",
+            "reason": result.escalation.get("reason", ""),
+            "context_summary": result.escalation.get("summary", ""),
+        }))
+    if result.call_offer:
+        await websocket.send_text(json.dumps({
+            "type": "call_offer",
+            "reason": result.call_offer.get("reason", ""),
+        }))
+
+
+async def _persist_turn(
+    session_id: str, user_text: str, result: ChatTurnResult,
+    *, user_type: str = "text", media_mime: Optional[str] = None,
+) -> None:
     """Append the customer + agent messages to chat_messages and bump the count.
     Best-effort: a missing session row (e.g. /message with an ad-hoc id) is a
     no-op so the conversational reply is never blocked on persistence."""
@@ -356,8 +426,8 @@ async def _persist_turn(session_id: str, user_text: str, result: ChatTurnResult)
             row = await db.get(ChatSession, session_id)
             if row is None:
                 return
-            db.add(ChatMessage(session_id=session_id, role="customer", type="text",
-                               content=user_text))
+            db.add(ChatMessage(session_id=session_id, role="customer", type=user_type,
+                               content=user_text, media_mime=media_mime))
             db.add(ChatMessage(
                 session_id=session_id, role="agent", type="text",
                 content=result.response.response_text,

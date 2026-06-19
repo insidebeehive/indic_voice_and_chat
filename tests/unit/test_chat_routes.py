@@ -190,6 +190,44 @@ def test_websocket_invalid_json_returns_error(app: FastAPI) -> None:
         assert err["type"] == "error"
 
 
+def test_websocket_image_message_persists_as_image(app: FastAPI) -> None:
+    import base64
+    client = TestClient(app)
+    sid = _create_session(client)
+    with client.websocket_connect(f"/chat/ws/{sid}") as ws:
+        ws.send_text(json.dumps({
+            "type": "image", "mime": "image/jpeg",
+            "data": base64.b64encode(b"imgbytes").decode(), "text": "what plan is this?"}))
+        assert json.loads(ws.receive_text())["type"] == "typing"
+        reply = json.loads(ws.receive_text())
+    assert reply["type"] == "message"
+    detail = client.get(f"/chat/sessions/{sid}", headers=HEADERS).json()
+    assert detail["messages"][0]["type"] == "image"
+
+
+def test_websocket_image_missing_data_errors(app: FastAPI) -> None:
+    client = TestClient(app)
+    sid = _create_session(client)
+    with client.websocket_connect(f"/chat/ws/{sid}") as ws:
+        ws.send_text(json.dumps({"type": "image", "mime": "image/jpeg"}))
+        assert json.loads(ws.receive_text())["type"] == "error"
+
+
+def test_upload_endpoint_processes_and_persists(app: FastAPI) -> None:
+    import io
+    client = TestClient(app)
+    sid = _create_session(client)
+    resp = client.post(
+        f"/chat/{sid}/upload",
+        files={"file": ("err.jpg", io.BytesIO(b"imgbytes"), "image/jpeg")},
+        data={"text": "what is this error?"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["session_id"] == sid
+    detail = client.get(f"/chat/sessions/{sid}", headers=HEADERS).json()
+    assert detail["messages"][0]["type"] == "image"
+
+
 def test_websocket_end_marks_session_ended(app: FastAPI) -> None:
     client = TestClient(app)
     sid = _create_session(client)

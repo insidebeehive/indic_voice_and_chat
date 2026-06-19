@@ -17,15 +17,19 @@ are voice concerns that the VoiceBotAgent handles.
 
 from __future__ import annotations
 
+import json
+import logging
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 from src.agents.base import AgentSession, BaseAgent
+from src.chatbot.media import prepare_multimodal_content
+from src.chatbot.tools import BUILTIN_TOOLS, ESCALATE, OFFER_CALL, SEARCH_KB
 from src.dialogue.context import SessionStore
 from src.dialogue.prompts import build_chatbot_system_prompt
 from src.dialogue.response_parser import ChatBotResponse, parse_chatbot_response
 from src.dialogue.slots import SlotFiller, SlotSchema
-from src.interfaces.llm import ILLMProvider, LLMConfig, LLMMessage
+from src.interfaces.llm import ILLMProvider, LLMConfig, LLMMessage, ToolCall, ToolSpec
 from src.rag.context_builder import (
     GuardConfig,
     apply_hallucination_guard,
@@ -33,12 +37,26 @@ from src.rag.context_builder import (
 )
 from src.rag.retriever import HybridRetriever, RetrievedChunk
 
+log = logging.getLogger(__name__)
+
+# Executes a tenant-registered (CRM) tool call → a JSON-able result dict.
+CrmExecutor = Callable[[ToolCall], Awaitable[dict]]
+
+
+def _chunk_source(chunk: RetrievedChunk) -> str:
+    md = chunk.document.metadata or {}
+    fn = md.get("filename") or md.get("document_id") or chunk.document.id
+    page = md.get("page", md.get("section"))
+    return f"{fn}:{page}" if page is not None else str(fn)
+
 
 @dataclass
 class ChatTurnResult:
     response: ChatBotResponse
     retrieved: list[RetrievedChunk]
     rag_context_chars: int
+    escalation: Optional[dict] = None
+    call_offer: Optional[dict] = None
 
 
 class ChatBotAgent(BaseAgent):
@@ -53,6 +71,10 @@ class ChatBotAgent(BaseAgent):
         store: Optional[SessionStore] = None,
         guard_config: Optional[GuardConfig] = None,
         max_context_chars: int = 4000,
+        enable_tools: bool = False,
+        crm_tools: Optional[list[ToolSpec]] = None,
+        crm_executor: Optional[CrmExecutor] = None,
+        max_tool_rounds: int = 4,
     ) -> None:
         # ChatBot doesn't need slots — pass an empty schema so BaseAgent is happy.
         super().__init__(
@@ -68,6 +90,13 @@ class ChatBotAgent(BaseAgent):
         self._language = language_default
         self._guard = guard_config
         self._max_context_chars = max_context_chars
+        # Agentic tool-calling (opt-in): builtin tools (search KB / escalate /
+        # offer call) + any tenant CRM tools. Off by default so the single-shot
+        # RAG path is unchanged.
+        self._enable_tools = enable_tools
+        self._crm_tools = crm_tools or []
+        self._crm_executor = crm_executor
+        self._max_tool_rounds = max_tool_rounds
 
     async def handle_message(self, user_text: str) -> ChatTurnResult:
         if not user_text or not user_text.strip():
@@ -80,40 +109,155 @@ class ChatBotAgent(BaseAgent):
                 retrieved=[],
                 rag_context_chars=0,
             )
+        user_msg = LLMMessage(role="user", content=user_text)
+        if self._enable_tools:
+            return await self._handle_with_tools(user_msg, query_text=user_text)
+        return await self._single_shot(user_msg, query_text=user_text)
 
-        # 1. Retrieval
-        retrieved = await self._retriever.search(user_text)
+    async def handle_image(
+        self, media: object, mime: str, text: str = "",
+    ) -> ChatTurnResult:
+        """Handle an image/video (+ optional caption) from the customer. The
+        media is sent to the multimodal LLM; retrieval (if any) uses the caption."""
+        parts = prepare_multimodal_content(text, media, mime)
+        user_msg = LLMMessage(role="user", content=parts)
+        if self._enable_tools:
+            return await self._handle_with_tools(user_msg, query_text=text)
+        return await self._single_shot(user_msg, query_text=text)
 
+    # --- Single-shot RAG path (no tools) -------------------------------
+
+    async def _single_shot(self, user_msg: LLMMessage, query_text: str) -> ChatTurnResult:
+        # 1. Retrieval (on the text part; multimodal-only turns skip it)
+        retrieved = await self._retriever.search(query_text) if query_text.strip() else []
         # 2. Build context
         rag = build_rag_context(retrieved, max_chars=self._max_context_chars)
-
         # 3. Compose messages
-        system_prompt = build_chatbot_system_prompt(
-            company_name=self._company,
-            language_default=self._language,
-            rag_context=rag.text,
-        )
-        messages: list[LLMMessage] = [LLMMessage(role="system", content=system_prompt)]
-        # Replay history (user/agent only — system is rebuilt each turn so
-        # the freshest RAG context is in front of the LLM).
-        for m in self.session.turns:
-            if m.role in ("user", "assistant"):
-                messages.append(m)
-        messages.append(LLMMessage(role="user", content=user_text))
-
+        messages = self._compose(rag.text, user_msg)
         # 4. LLM
         result = await self._llm.generate(messages, self._llm_config)
         response = parse_chatbot_response(result.text)
-
-        # 5. Guard
-        response = apply_hallucination_guard(response, rag, self._guard)
-
+        # 5. Guard. Skip only for a multimodal turn with no retrieval — that
+        # answer is grounded in the image, not the (empty) knowledge base, so the
+        # no-retrieval fallback would wrongly clobber it. Text turns are unchanged.
+        multimodal = isinstance(user_msg.content, list)
+        if retrieved or not multimodal:
+            response = apply_hallucination_guard(response, rag, self._guard)
         # 6. Persist
-        self.session.turns.append(LLMMessage(role="user", content=user_text))
-        self.session.turns.append(
-            LLMMessage(role="assistant", content=response.response_text)
+        await self._persist(user_msg, query_text, response, len(retrieved))
+        return ChatTurnResult(
+            response=response, retrieved=retrieved, rag_context_chars=len(rag.text))
+
+    # --- Tool-calling path (agentic) -----------------------------------
+
+    async def _handle_with_tools(self, user_msg: LLMMessage, query_text: str) -> ChatTurnResult:
+        tools = list(BUILTIN_TOOLS) + list(self._crm_tools)
+        # Tools fetch their own context (search_knowledge_base), so the system
+        # prompt starts without a pre-built RAG block.
+        messages = self._compose("", user_msg)
+        retrieved_all: list[RetrievedChunk] = []
+        escalation: Optional[dict] = None
+        call_offer: Optional[dict] = None
+        text = ""
+        # JSON response-format is incompatible with tools (Gemini), so the loop
+        # runs in text mode; the structured fields are derived from tool results.
+        cfg = LLMConfig(
+            model=self._llm_config.model,
+            temperature=self._llm_config.temperature,
+            max_tokens=self._llm_config.max_tokens,
+            response_format="text",
+            tools=tools,
         )
-        await self.persist_turn("user", user_text)
+        for _ in range(self._max_tool_rounds):
+            result = await self._llm.generate(messages, cfg)
+            if not result.tool_calls:
+                text = result.text
+                break
+            messages.append(LLMMessage(role="assistant", content="", tool_calls=result.tool_calls))
+            for tc in result.tool_calls:
+                out, chunks, esc, off = await self._exec_tool(tc)
+                retrieved_all.extend(chunks)
+                escalation = esc or escalation
+                call_offer = off or call_offer
+                messages.append(LLMMessage(
+                    role="tool", name=tc.name, tool_call_id=tc.id, content=json.dumps(out)))
+        else:
+            # Ran out of rounds still wanting tools — force a final plain answer.
+            result = await self._llm.generate(
+                messages, LLMConfig(temperature=cfg.temperature, max_tokens=cfg.max_tokens,
+                                    response_format="text"))
+            text = result.text
+
+        rag = build_rag_context(retrieved_all, max_chars=self._max_context_chars)
+        # Dedupe sources, preserving order.
+        sources = list(dict.fromkeys(_chunk_source(c) for c in retrieved_all))
+        response = ChatBotResponse(
+            response_text=text,
+            language=self._language,
+            confidence="high",
+            sources_used=sources,
+            action="escalate" if escalation else "none",
+        )
+        # Only guard when the agent actually retrieved (search_knowledge_base was
+        # called). A no-search turn (greeting, clarifying question, CRM-tool
+        # answer) is legitimately ungrounded — the no-retrieval fallback must not
+        # clobber it.
+        if retrieved_all:
+            response = apply_hallucination_guard(response, rag, self._guard)
+        await self._persist(user_msg, query_text, response, len(retrieved_all))
+        return ChatTurnResult(
+            response=response, retrieved=retrieved_all, rag_context_chars=len(rag.text),
+            escalation=escalation, call_offer=call_offer)
+
+    async def _exec_tool(self, tc: ToolCall):
+        """Dispatch a tool call. Returns (result_dict, chunks, escalation, call_offer)."""
+        args = tc.arguments or {}
+        if tc.name == SEARCH_KB:
+            chunks = await self._retriever.search(args.get("query", ""))
+            return (
+                {"results": [{"content": c.document.content, "source": _chunk_source(c),
+                              "score": c.score} for c in chunks]},
+                chunks, None, None,
+            )
+        if tc.name == ESCALATE:
+            esc = {"reason": args.get("reason", ""), "summary": args.get("summary", "")}
+            return {"status": "escalated", **esc}, [], esc, None
+        if tc.name == OFFER_CALL:
+            off = {"reason": args.get("reason", "")}
+            return {"status": "offered", **off}, [], None, off
+        # Tenant CRM tool.
+        if self._crm_executor is not None:
+            try:
+                out = await self._crm_executor(tc)
+                return (out if isinstance(out, dict) else {"result": out}), [], None, None
+            except Exception:  # noqa: BLE001 — a failing tool must not kill the turn
+                log.exception("crm tool failed", extra={"tool": tc.name})
+                return {"error": f"tool {tc.name} failed"}, [], None, None
+        return {"error": f"unknown tool {tc.name}"}, [], None, None
+
+    # --- Shared helpers -------------------------------------------------
+
+    def _compose(self, rag_text: str, user_msg: LLMMessage) -> list[LLMMessage]:
+        system_prompt = build_chatbot_system_prompt(
+            company_name=self._company,
+            language_default=self._language,
+            rag_context=rag_text,
+        )
+        messages: list[LLMMessage] = [LLMMessage(role="system", content=system_prompt)]
+        # Replay prior user/assistant turns (system is rebuilt each turn).
+        for m in self.session.turns:
+            if m.role in ("user", "assistant"):
+                messages.append(m)
+        messages.append(user_msg)
+        return messages
+
+    async def _persist(
+        self, user_msg: LLMMessage, query_text: str, response: ChatBotResponse, retrieved_count: int,
+    ) -> None:
+        user_repr = query_text if query_text.strip() else "[media]"
+        self.session.turns.append(user_msg)
+        self.session.turns.append(LLMMessage(role="assistant", content=response.response_text))
+        await self.persist_turn("user", user_repr)
         await self.persist_turn(
             "agent",
             response.response_text,
@@ -121,10 +265,9 @@ class ChatBotAgent(BaseAgent):
                 "confidence": response.confidence,
                 "sources_used": response.sources_used,
                 "action": response.action,
-                "retrieved_count": len(retrieved),
+                "retrieved_count": retrieved_count,
             },
         )
-        # ChatBot has no state machine, so just persist a basic state blob.
         if self.store is not None:
             await self.store.set_state(
                 self.session.session_id,
@@ -132,17 +275,9 @@ class ChatBotAgent(BaseAgent):
                     "agent_type": "chatbot",
                     "last_action": response.action,
                     "last_confidence": response.confidence,
-                    "turn_count": sum(
-                        1 for m in self.session.turns if m.role == "user"
-                    ),
+                    "turn_count": sum(1 for m in self.session.turns if m.role == "user"),
                 },
             )
-
-        return ChatTurnResult(
-            response=response,
-            retrieved=retrieved,
-            rag_context_chars=len(rag.text),
-        )
 
     async def get_history(self) -> list[dict[str, Any]]:
         if self.store is None:
