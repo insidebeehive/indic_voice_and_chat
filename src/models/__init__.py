@@ -2,7 +2,7 @@
 
 from src.models.benchmark import BenchmarkRun, KBDocument
 from src.models.campaign import Campaign, Lead
-from src.models.chat import ChatMessage, ChatSession
+from src.models.chat import ChatMessage, ChatSession, ChatTool
 from src.models.conversation import Conversation, Event, Turn
 from src.models.database import Base, get_engine, get_sessionmaker
 from src.models.tenant import (
@@ -19,6 +19,7 @@ __all__ = [
     "Campaign",
     "ChatMessage",
     "ChatSession",
+    "ChatTool",
     "Conversation",
     "Event",
     "KBDocument",

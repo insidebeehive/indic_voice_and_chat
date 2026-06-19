@@ -270,7 +270,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     telephony_hooks.set_softphone_providers(providers)
     # ChatBot: per-(tenant, session) agent factory + the sessionmaker the WS uses
     # to resolve the tenant from the chat_sessions row and persist messages.
-    chat_api.set_chatbot_factory(make_chatbot_factory(runtime_registry))
+    chat_api.set_chatbot_factory(make_chatbot_factory(runtime_registry, sessionmaker))
     chat_api.set_chat_sessionmaker(sessionmaker)
     # Knowledge ingest/query resolve the SAME per-tenant retriever the chatbot
     # uses (registry.retrievers), so ingested docs are retrievable in chat.

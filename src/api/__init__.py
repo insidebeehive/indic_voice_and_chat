@@ -8,6 +8,7 @@ from src.api import (
     campaigns,
     catalog,
     chat,
+    chat_tools,
     config_routes,
     conversations,
     knowledge,
@@ -31,4 +32,5 @@ api_router.include_router(knowledge.router)
 api_router.include_router(webhooks_routes.router)
 api_router.include_router(benchmarks.router)
 api_router.include_router(chat.router)
+api_router.include_router(chat_tools.router)
 api_router.include_router(telephony_hooks.router)
