@@ -112,6 +112,24 @@ async def test_call_lead_places_and_records(ctx) -> None:
     assert row.campaign_id == "c1"
 
 
+async def test_call_lead_twilio_answer_url_is_slug_scoped(ctx, monkeypatch) -> None:
+    # Campaign outbound (like the dev console) must slug-scope the answer URL so
+    # the bridge resolves the tenant by slug — not by reverse-looking-up the
+    # caller-ID (which isn't in tenant_phone_numbers). The tenant here is twilio.
+    client, sm = ctx
+    captured: dict = {}
+
+    class _Cap(_FakeAdapter):
+        async def initiate_call(self, cfg):  # noqa: ANN001
+            captured["webhook_url"] = cfg.webhook_url
+            return await super().initiate_call(cfg)
+
+    monkeypatch.setattr(calls, "get_telephony_provider", lambda cfg: _Cap())
+    resp = await client.post("/campaigns/c1/calls", json={"to_number": "+918618795697"})
+    assert resp.status_code == 202, resp.text
+    assert captured["webhook_url"].endswith("/twilio/voice/t1")
+
+
 async def test_call_lead_dials_with_tenant_creds(monkeypatch) -> None:
     # The outbound adapter must be built with the TENANT's telephony creds (so the
     # call bills/identifies as the tenant), not the platform env.
