@@ -93,15 +93,31 @@ def _providers(tmp_path: Path) -> tuple[TenantProviders, dict[str, list]]:
 # --- TenantProviders ----------------------------------------------------
 
 
-def test_get_stt_resolves_api_key_from_env(tmp_path, env) -> None:
+def test_get_stt_does_not_inject_tenant_api_key(tmp_path, env) -> None:
+    # STT/LLM/TTS keys are PLATFORM-level: the registry must NOT resolve a
+    # per-tenant api_key — the adapter reads its platform env var (SARVAM_API_KEY
+    # etc.) itself. So no "api_key" is injected into the provider config.
     providers, calls = _providers(tmp_path)
     t = _tenant("acme")
     providers.get_stt(t)
-    assert calls["stt"][0]["api_key"] == "acme-sarvam-key"
+    assert "api_key" not in calls["stt"][0]
     assert calls["stt"][0]["provider"] == "sarvam"
     # global defaults survived
     assert calls["stt"][0]["model"] == "saaras:v2"
     assert calls["stt"][0]["language"] == "hi-IN"
+
+
+def test_non_telephony_never_reads_tenant_secret(tmp_path, env) -> None:
+    """Even when the tenant config references an UNSET api_key_env, building an
+    stt/llm/tts client must NOT raise — the per-tenant key lookup is gone, so the
+    placeholder/missing var is irrelevant (this is the dev TENANT_DEV_GEMINI_KEY
+    bug class)."""
+    providers, calls = _providers(tmp_path)
+    t = _tenant("acme", stt_key_env="DEFINITELY_UNSET", llm_key_env="ALSO_UNSET")
+    providers.get_stt(t)   # must not raise MissingEnvError
+    providers.get_llm(t)
+    assert "api_key" not in calls["stt"][0]
+    assert "api_key" not in calls["llm"][0]
 
 
 def test_telephony_resolves_both_secrets(tmp_path, env) -> None:
@@ -140,10 +156,10 @@ def test_providers_separate_instances_per_tenant(tmp_path, env) -> None:
                      twilio_sid="SID2", twilio_tok="TOK2")
     providers.get_llm(acme)
     providers.get_llm(globex)
-    assert len(calls["llm"]) == 2
-    # And distinct API keys per tenant
-    assert calls["llm"][0]["api_key"] == "acme-groq-key"
-    assert calls["llm"][1]["api_key"] == "globex-groq-key"
+    assert len(calls["llm"]) == 2          # a separate cached instance per tenant
+    # Keys are platform-level now, so none are injected per tenant.
+    assert "api_key" not in calls["llm"][0]
+    assert "api_key" not in calls["llm"][1]
 
 
 def test_provider_evict_drops_cached_clients(tmp_path, env) -> None:

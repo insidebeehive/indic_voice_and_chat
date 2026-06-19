@@ -48,12 +48,13 @@ class TenantProviders:
 
     def _config_for(self, tenant: TenantContext, layer: str) -> dict[str, Any]:
         tenant_layer = getattr(tenant.settings.pipeline, layer)
-        env_key = getattr(tenant_layer, "api_key_env", None) if layer != "telephony" else None
-        api_key = tenant.secret(env_key) if env_key else None
+        # STT/LLM/TTS keys are PLATFORM-level, not per-tenant: we do NOT resolve a
+        # per-tenant api_key here. Each adapter reads its own platform env var
+        # (SARVAM_API_KEY / GROQ_API_KEY / GEMINI_API_KEY / DEEPGRAM_API_KEY / …)
+        # when no api_key is in the config. Only TELEPHONY creds are per-tenant.
         merged = merge_provider_config(
             tenant_layer,
             self.global_defaults.get(layer, {}),
-            api_key=api_key,
         )
         # Telephony has dual secrets (account_sid + auth_token), resolved for the
         # tenant's *configured* provider (a tenant may hold creds for several).

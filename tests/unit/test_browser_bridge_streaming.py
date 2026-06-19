@@ -260,10 +260,17 @@ async def test_stream_consumer_drops_to_batch_for_non_streamable_language(monkey
     assert bridge._stream_session is None    # -> batch path (Sarvam) takes over
 
 
-def test_build_streaming_provider_from_tenant():
+def test_build_streaming_provider_from_tenant(monkeypatch):
     from types import SimpleNamespace
 
     from src.api.dev_console import _build_stream_provider
+
+    # Streaming STT key is PLATFORM-level: the adapter reads DEEPGRAM_API_KEY from
+    # env, NOT a per-tenant secret — tenant.secret must not be consulted.
+    monkeypatch.setenv("DEEPGRAM_API_KEY", "dg_platform_key")
+
+    def _no_secret(env):
+        raise AssertionError("tenant.secret must not be called for streaming STT")
 
     tenant = SimpleNamespace(
         settings=SimpleNamespace(pipeline=SimpleNamespace(
@@ -273,7 +280,7 @@ def test_build_streaming_provider_from_tenant():
                 api_key_env="TENANT_DEV_DEEPGRAM_KEY",
             )
         )),
-        secret=lambda env: "dg_secret" if env == "TENANT_DEV_DEEPGRAM_KEY" else None,
+        secret=_no_secret,
     )
     provider = _build_stream_provider(tenant)
     assert provider.__class__.__name__ == "DeepgramSTTAdapter"
