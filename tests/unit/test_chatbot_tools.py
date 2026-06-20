@@ -86,6 +86,24 @@ async def test_search_tool_is_called_then_answer(retriever) -> None:
 
 
 @pytest.mark.asyncio
+async def test_tool_path_parses_json_envelope_final_reply(retriever) -> None:
+    # The model emits the structured JSON envelope (per the system prompt) even in
+    # the tool loop — the agent must PARSE it, not return raw JSON to the customer.
+    envelope = ('```json\n{"response_text": "Plan B has 500GB.", "language": "hi",'
+                ' "confidence": "high", "sources_used": [], "action": "none"}\n```')
+    llm = ScriptedLLM([
+        LLMResult(text="", finish_reason="tool_calls", tool_calls=[
+            ToolCall(id="t1", name="search_knowledge_base", arguments={"query": "Plan B"})]),
+        LLMResult(text=envelope, finish_reason="stop"),
+    ])
+    agent = _agent(llm, retriever)
+    result = await agent.handle_message("Plan B?")
+    assert result.response.response_text == "Plan B has 500GB."   # parsed, not raw JSON
+    assert "```json" not in result.response.response_text
+    assert result.response.language == "hi"
+
+
+@pytest.mark.asyncio
 async def test_escalate_tool_sets_action_and_escalation(retriever) -> None:
     llm = ScriptedLLM([
         LLMResult(text="", finish_reason="tool_calls", tool_calls=[

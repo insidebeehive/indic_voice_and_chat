@@ -189,15 +189,23 @@ class ChatBotAgent(BaseAgent):
             text = result.text
 
         rag = build_rag_context(retrieved_all, max_chars=self._max_context_chars)
-        # Dedupe sources, preserving order.
+        # Dedupe tool-retrieved sources, preserving order.
         sources = list(dict.fromkeys(_chunk_source(c) for c in retrieved_all))
-        response = ChatBotResponse(
-            response_text=text,
-            language=self._language,
-            confidence="high",
-            sources_used=sources,
-            action="escalate" if escalation else "none",
-        )
+        # The model usually emits the structured JSON envelope (per the system
+        # prompt) even in the tool loop, so PARSE it — otherwise the customer gets
+        # raw JSON. ``raw`` is set only when a real envelope was found; for a plain
+        # text answer keep it verbatim (the JSON-fallback would mangle it). Then
+        # overlay tool-derived signals (retrieved sources, escalation).
+        parsed = parse_chatbot_response(text)
+        if parsed.raw and not parsed.parse_error:
+            response = parsed   # a real JSON envelope with a response_text
+        else:
+            response = ChatBotResponse(response_text=(text or "").strip(), language=self._language)
+        if not response.language:
+            response.language = self._language
+        response.sources_used = list(dict.fromkeys([*sources, *(response.sources_used or [])]))
+        if escalation:
+            response.action = "escalate"
         # Only guard when the agent actually retrieved (search_knowledge_base was
         # called). A no-search turn (greeting, clarifying question, CRM-tool
         # answer) is legitimately ungrounded — the no-retrieval fallback must not
