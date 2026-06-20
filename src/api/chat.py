@@ -440,30 +440,39 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
                 await websocket.send_text(json.dumps({"type": "ended", "summary": summary}))
                 break
 
-            if mtype in ("image", "video"):
-                data = msg.get("data")
-                mime = msg.get("mime") or ""
-                if not data or not mime:
-                    await websocket.send_text(json.dumps(
-                        {"type": "error", "message": "image/video needs 'data' + 'mime'"}))
+            # A single turn's failure must not black-hole the conversation: send an
+            # error frame and keep the socket open (a real disconnect re-raises).
+            try:
+                if mtype in ("image", "video"):
+                    data = msg.get("data")
+                    mime = msg.get("mime") or ""
+                    if not data or not mime:
+                        await websocket.send_text(json.dumps(
+                            {"type": "error", "message": "image/video needs 'data' + 'mime'"}))
+                        continue
+                    caption = (msg.get("text") or "").strip()
+                    await websocket.send_text(json.dumps({"type": "typing"}))
+                    result = await agent.handle_image(data, mime, caption)
+                    await _persist_turn(session_id, caption or f"[{mtype}]", result,
+                                        user_type=mtype, media_mime=mime)
+                    await _send_reply(websocket, session_id, result, tenant.id)
                     continue
-                caption = (msg.get("text") or "").strip()
+
+                user_text = (msg.get("text") or msg.get("message") or "").strip()
+                if not user_text:
+                    await websocket.send_text(json.dumps({"type": "error", "message": "missing 'text'"}))
+                    continue
+
                 await websocket.send_text(json.dumps({"type": "typing"}))
-                result = await agent.handle_image(data, mime, caption)
-                await _persist_turn(session_id, caption or f"[{mtype}]", result,
-                                    user_type=mtype, media_mime=mime)
+                result = await agent.handle_message(user_text)
+                await _persist_turn(session_id, user_text, result)
                 await _send_reply(websocket, session_id, result, tenant.id)
-                continue
-
-            user_text = (msg.get("text") or msg.get("message") or "").strip()
-            if not user_text:
-                await websocket.send_text(json.dumps({"type": "error", "message": "missing 'text'"}))
-                continue
-
-            await websocket.send_text(json.dumps({"type": "typing"}))
-            result = await agent.handle_message(user_text)
-            await _persist_turn(session_id, user_text, result)
-            await _send_reply(websocket, session_id, result, tenant.id)
+            except WebSocketDisconnect:
+                raise
+            except Exception:  # noqa: BLE001 — one bad turn must not drop the chat
+                log.exception("chat turn failed", extra={"session_id": session_id})
+                await websocket.send_text(json.dumps(
+                    {"type": "error", "message": "Sorry, something went wrong — please try again."}))
     except WebSocketDisconnect:
         log.info("chat ws client disconnected", extra={"session_id": session_id})
     except Exception:  # noqa: BLE001 — never let the websocket task escape
