@@ -95,10 +95,12 @@ def test_chatbot_prompt_with_rag_context() -> None:
 def test_chatbot_prompt_has_scope_guardrails() -> None:
     prompt = build_chatbot_system_prompt(company_name="Acme")
     assert "SCOPE" in prompt
-    # personal/operator data → deferred ("few days"); off-topic → declined.
+    # player- and operator-specific are named separately, then deferred ("few days").
+    assert "player-specific" in prompt
+    assert "operator-specific" in prompt
     assert "few days" in prompt
+    # off-topic → declined.
     assert "unable to answer" in prompt
-    assert "PERSONAL ACCOUNT" in prompt
 
 
 def test_response_schemas_are_valid_json() -> None:
