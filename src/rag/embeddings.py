@@ -106,6 +106,66 @@ class LocalEmbedder:
         return self.embed_documents([text])[0]
 
 
+def _l2_normalize(vec: list[float]) -> list[float]:
+    norm = math.sqrt(sum(v * v for v in vec)) or 1.0
+    return [v / norm for v in vec]
+
+
+class GeminiEmbedder:
+    """Embeddings via the Gemini API — no torch/sentence-transformers, so it
+    keeps the deploy image slim and reuses the platform GEMINI_API_KEY. Uses
+    ``output_dimensionality`` to match the FAISS index dim, and L2-normalizes the
+    vectors itself (Gemini does NOT normalize when the output dim is reduced) so
+    cosine == inner product (matches our IndexFlatIP)."""
+
+    DEFAULT_MODEL = "text-embedding-004"
+
+    def __init__(
+        self,
+        model_name: str = DEFAULT_MODEL,
+        dim: int = 384,
+        api_key: Optional[str] = None,
+        client: object = None,
+    ) -> None:
+        self.model_name = model_name
+        self.dim = dim
+        self._api_key = api_key
+        self._client = client  # injectable for tests
+
+    def _ensure_client(self):
+        if self._client is not None:
+            return self._client
+        import os
+
+        api_key = (self._api_key or os.environ.get("GEMINI_API_KEY")
+                   or os.environ.get("GOOGLE_API_KEY"))
+        if not api_key:
+            raise RuntimeError(
+                "GeminiEmbedder requires an API key (GEMINI_API_KEY / GOOGLE_API_KEY)")
+        from google import genai  # type: ignore[import-not-found]
+
+        self._client = genai.Client(api_key=api_key)
+        return self._client
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        if not texts:
+            return []
+        client = self._ensure_client()
+        resp = client.models.embed_content(
+            model=self.model_name,
+            contents=texts,
+            config={"output_dimensionality": self.dim},
+        )
+        out: list[list[float]] = []
+        for emb in (getattr(resp, "embeddings", None) or []):
+            values = getattr(emb, "values", None)
+            out.append(_l2_normalize(list(values if values is not None else emb)))
+        return out
+
+    def embed_query(self, text: str) -> list[float]:
+        return self.embed_documents([text])[0]
+
+
 # --- Rerankers ----------------------------------------------------------
 
 
