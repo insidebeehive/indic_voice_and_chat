@@ -64,16 +64,17 @@ Add a Northflank **PostgreSQL** addon. Set `DATABASE_URL` using the **asyncpg** 
 addon's URI from `postgresql://USER:PASS@HOST:PORT/DB` to
 `postgresql+asyncpg://USER:PASS@HOST:PORT/DB` (the app uses the async driver).
 
-Migrations run **automatically on container start** — the Docker `CMD` is
-`alembic upgrade head && uvicorn …`, so every deploy applies pending migrations
-before serving (fail-fast: a failed migration won't start a stale app). The DB
-role only needs rights on an already-provisioned schema; `env.py` skips
-`CREATE SCHEMA` when the schema already exists (first-time provisioning still
-needs a role with database-level CREATE, or pre-create the schema once).
+**Migrations run as a separate pre-deploy step, NOT from the app container.**
+The app runs as a least-privilege DB role that can't run DDL — creating FKs to
+tables it doesn't own (e.g. `tenants`) needs REFERENCES privilege it lacks, so
+`alembic upgrade head` from the app container fails (`permission denied for
+table tenants`). Instead, run a Northflank **pre-deploy Job** that executes
+`alembic upgrade head` using the **schema-owner** `DATABASE_URL`, then deploy
+the app image. (`env.py` already skips `CREATE SCHEMA` when the schema exists.)
 
-For a **multi-replica** service, drop the in-container step and run
-`alembic upgrade head` as a single **pre-deploy Job** instead (Alembic has no
-cross-process lock, so replicas shouldn't migrate concurrently).
+Alternative: grant the app role `REFERENCES`/`CREATE` on the schema's tables so
+it can run migrations itself — but a dedicated owner-role migration job keeps the
+runtime least-privilege.
 
 ### Telephony (real calls)
 Set `WEBHOOK_BASE_URL=https://<service>.<project>.code.run/api/v1/telephony` and repoint your
