@@ -92,6 +92,15 @@ def test_chatbot_prompt_with_rag_context() -> None:
     assert '"sources_used"' in prompt
 
 
+def test_chatbot_prompt_has_scope_guardrails() -> None:
+    prompt = build_chatbot_system_prompt(company_name="Acme")
+    assert "SCOPE" in prompt
+    # personal/operator data → deferred ("few days"); off-topic → declined.
+    assert "few days" in prompt
+    assert "unable to answer" in prompt
+    assert "PERSONAL ACCOUNT" in prompt
+
+
 def test_response_schemas_are_valid_json() -> None:
     # Smoke test — assert they're JSON-serializable
     json.dumps(VOICEBOT_RESPONSE_SCHEMA)
