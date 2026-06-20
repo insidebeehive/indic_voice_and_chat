@@ -63,3 +63,60 @@ def test_identity_reranker_empty_inputs() -> None:
     r = IdentityReranker()
     assert r.rerank("", ["x", "y"]) == [0.0, 0.0]
     assert r.rerank("hello", []) == []
+
+
+# --- GeminiEmbedder (Phase 5 deploy: no-torch embeddings) ----------------
+
+
+def _fake_gemini_client(dim: int):
+    """Fake genai client: returns deterministic vectors of length `dim`,
+    records the call kwargs."""
+    from types import SimpleNamespace
+
+    calls = []
+
+    class _Models:
+        def embed_content(self, *, model, contents, config=None):
+            calls.append({"model": model, "contents": contents, "config": config})
+            embs = [SimpleNamespace(values=[float((i + 1) * (j + 1)) for j in range(dim)])
+                    for i, _ in enumerate(contents)]
+            return SimpleNamespace(embeddings=embs)
+
+    return SimpleNamespace(models=_Models()), calls
+
+
+def test_gemini_embedder_uses_output_dim_and_normalizes() -> None:
+    import math
+
+    from src.rag.embeddings import GeminiEmbedder
+
+    client, calls = _fake_gemini_client(dim=384)
+    emb = GeminiEmbedder(dim=384, client=client)
+    vecs = emb.embed_documents(["hello", "world"])
+
+    assert len(vecs) == 2
+    assert all(len(v) == 384 for v in vecs)
+    # requested the reduced output dimensionality
+    assert calls[0]["config"] == {"output_dimensionality": 384}
+    # L2-normalized (unit length) so cosine == inner product for the FAISS index
+    assert all(abs(math.sqrt(sum(x * x for x in v)) - 1.0) < 1e-6 for v in vecs)
+
+
+def test_gemini_embedder_empty_and_query() -> None:
+    from src.rag.embeddings import GeminiEmbedder
+
+    client, _ = _fake_gemini_client(dim=8)
+    emb = GeminiEmbedder(dim=8, client=client)
+    assert emb.embed_documents([]) == []
+    assert len(emb.embed_query("hi")) == 8
+
+
+def test_gemini_embedder_requires_key_without_client(monkeypatch) -> None:
+    import pytest
+
+    from src.rag.embeddings import GeminiEmbedder
+
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    with pytest.raises(RuntimeError):
+        GeminiEmbedder().embed_documents(["x"])

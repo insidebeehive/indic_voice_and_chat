@@ -118,7 +118,7 @@ def build_runtime_registry(providers: TenantProviders, base_session_store: Sessi
     from src.campaign.scheduler import CallScheduler, RateLimitConfig, RetryConfig
     from src.integration.crm_client import FakeChatChannel, FakeCRMClient
     from src.integration.webhooks import WebhookManager
-    from src.rag.embeddings import LocalEmbedder
+    from src.rag.embeddings import GeminiEmbedder
     from src.rag.retriever import HybridRetriever, RetrievalConfig
 
     def _dnd(tenant: TenantContext) -> TenantDnd:
@@ -144,11 +144,12 @@ def build_runtime_registry(providers: TenantProviders, base_session_store: Sessi
                 max_concurrent_calls=tenant.settings.max_concurrent_calls or 10))
 
     def _retriever(tenant: TenantContext) -> HybridRetriever:
-        # Semantic multilingual embeddings (384-dim, matches the vector store).
-        # LocalEmbedder lazy-loads the model on first encode, so building the
-        # registry stays cheap; only an actual ingest/query pays the load.
+        # Semantic multilingual embeddings via Gemini (384-dim, matches the vector
+        # store) — no torch/sentence-transformers, so the deploy image stays slim
+        # and it reuses the platform GEMINI_API_KEY. The client is built lazily on
+        # first ingest/query.
         return HybridRetriever(
-            embedder=LocalEmbedder(),
+            embedder=GeminiEmbedder(dim=384),
             vector_store=providers.get_vector_store(tenant),
             config=RetrievalConfig())
 
