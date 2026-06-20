@@ -155,6 +155,30 @@ async def test_crm_tool_executed_via_injected_executor(retriever) -> None:
 
 
 @pytest.mark.asyncio
+async def test_search_failure_still_replies(retriever) -> None:
+    # If the KB search throws (e.g. embedder unavailable), the turn must NOT crash —
+    # the error is fed back as a tool result and the model still answers.
+    class _BoomRetriever:
+        async def search(self, *a, **k):
+            raise RuntimeError("embedder unavailable")
+
+    llm = ScriptedLLM([
+        LLMResult(text="", finish_reason="tool_calls", tool_calls=[
+            ToolCall(id="t1", name="search_knowledge_base", arguments={"query": "plans"})]),
+        LLMResult(text="I couldn't check the docs just now, but I can still help.",
+                  finish_reason="stop"),
+    ])
+    agent = ChatBotAgent(
+        session=AgentSession(session_id="s"), llm=llm, retriever=_BoomRetriever(),
+        company_name="Acme", language_default="en", enable_tools=True)
+    result = await agent.handle_message("what plans do you have?")
+    assert result.response.response_text == "I couldn't check the docs just now, but I can still help."
+    # The error was fed back to the model as the tool result.
+    tool_msgs = [m for m in llm.calls[1][0] if m.role == "tool"]
+    assert tool_msgs and "error" in json.loads(tool_msgs[0].content)
+
+
+@pytest.mark.asyncio
 async def test_summarize_session(retriever) -> None:
     llm = ScriptedLLM([LLMResult(
         text="Customer asked about Plan B; provided details.", finish_reason="stop")])

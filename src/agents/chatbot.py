@@ -221,7 +221,12 @@ class ChatBotAgent(BaseAgent):
         """Dispatch a tool call. Returns (result_dict, chunks, escalation, call_offer)."""
         args = tc.arguments or {}
         if tc.name == SEARCH_KB:
-            chunks = await self._retriever.search(args.get("query", ""))
+            try:
+                chunks = await self._retriever.search(args.get("query", ""))
+            except Exception:  # noqa: BLE001 — a search failure (e.g. embedder
+                # unavailable) must not kill the turn; the model answers without RAG.
+                log.exception("knowledge search failed", extra={"query": args.get("query", "")})
+                return {"error": "knowledge search is temporarily unavailable", "results": []}, [], None, None
             return (
                 {"results": [{"content": c.document.content, "source": _chunk_source(c),
                               "score": c.score} for c in chunks]},
