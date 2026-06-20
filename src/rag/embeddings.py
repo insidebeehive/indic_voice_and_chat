@@ -118,7 +118,7 @@ class GeminiEmbedder:
     vectors itself (Gemini does NOT normalize when the output dim is reduced) so
     cosine == inner product (matches our IndexFlatIP)."""
 
-    DEFAULT_MODEL = "text-embedding-004"
+    DEFAULT_MODEL = "gemini-embedding-001"
 
     def __init__(
         self,
