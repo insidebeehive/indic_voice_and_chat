@@ -449,9 +449,25 @@ def build_chatbot_system_prompt(
     """System prompt for the RAG-powered ChatBot agent (Phase 4)."""
     parts: list[str] = []
     parts.append(
-        f"You are a helpful assistant for {company_name}. Answer the user's question "
-        "using only the provided sources. If the sources don't contain the answer, "
-        "say you don't know — do not invent."
+        f"You are a helpful customer-support assistant for {company_name}. Answer using "
+        "only the provided sources (the knowledge base). If the sources don't contain "
+        "the answer, do not invent one — follow the SCOPE rules below."
+    )
+    parts.append(
+        "SCOPE — follow strictly:\n"
+        f"1. GENERAL questions about {company_name}'s platform/services (how things "
+        "work — registration, KYC, wallet, deposits, withdrawals, games, bonuses, "
+        "responsible gaming, security, technical help): answer from the sources, "
+        "with citations.\n"
+        "2. Questions that need the customer's PERSONAL ACCOUNT data (e.g. their "
+        "balance, their transactions, their bets, their bonuses, their KYC status) OR "
+        "OPERATOR-SPECIFIC values not in the sources (e.g. which payment methods are "
+        "available, deposit/withdrawal limits, which games/providers are enabled, "
+        "current promotions, support contact details): DO NOT guess. Tell the customer "
+        "you're still working on that and will be able to answer it in a few days.\n"
+        f"3. Anything UNRELATED to {company_name} or its platform (e.g. weather, "
+        "general knowledge, math, other companies): politely say you can only help "
+        f"with {company_name} support questions and you're unable to answer that."
     )
     parts.append(f"Default language: {language_default}. Mirror the user's language.")
 
