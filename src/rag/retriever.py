@@ -136,9 +136,12 @@ class HybridRetriever:
             return 0
 
         # Backfill embeddings on chunks that arrive without them.
+        # Embedders are sync (Gemini REST call); run in a thread to avoid blocking the event loop.
         missing = [c for c in chunks if c.embedding is None]
         if missing:
-            vectors = self._embedder.embed_documents([c.content for c in missing])
+            vectors = await asyncio.to_thread(
+                self._embedder.embed_documents, [c.content for c in missing]
+            )
             for c, v in zip(missing, vectors):
                 c.embedding = v
 

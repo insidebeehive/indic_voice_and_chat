@@ -124,6 +124,80 @@ async def _reap_stale_calls_loop() -> None:
         await asyncio.sleep(_REAP_INTERVAL_S)
 
 
+async def _seed_global_kb(resolver: DbTenantResolver, runtime_registry, sessionmaker) -> None:
+    """Re-ingest bundled global KB docs into every tenant's FAISS index at startup.
+
+    FAISS is in-memory and lost on each deploy; this seeds it on boot from docs
+    bundled at data/kb/global/. Uses deterministic doc_ids (filename-based) so
+    KBDocument DB rows are replaced, not duplicated, across restarts.
+    """
+    from sqlalchemy import delete as sa_delete
+
+    from src.interfaces.vector_store import Document
+    from src.models.benchmark import KBDocument
+    from src.rag.ingestion import ChunkConfig, detect_language, get_chunker, parse_document
+
+    kb_dir = Path("data/kb/global")
+    if not kb_dir.is_dir():
+        return
+    exts = {".md", ".txt", ".pdf", ".docx", ".csv"}
+    files = sorted(
+        p for p in kb_dir.rglob("*")
+        if p.is_file() and p.suffix.lower() in exts and not p.name.startswith(".")
+    )
+    if not files:
+        return
+
+    chunker = get_chunker(ChunkConfig())
+    tenants = list(resolver._by_slug.values())
+
+    for tenant in tenants:
+        retriever = runtime_registry.retrievers.get(tenant)
+        total = 0
+        for f in files:
+            doc_id = f"global_kb_{f.stem}"
+            try:
+                text = parse_document(f.name, f.read_bytes())
+                if not text.strip():
+                    continue
+                language = detect_language(text)
+                raw_chunks = chunker(text, {
+                    "filename": f.name, "document_id": doc_id,
+                    "language": language, "tenant_id": tenant.id,
+                })
+                if not raw_chunks:
+                    continue
+                docs = [
+                    Document(
+                        id=f"{doc_id}::chunk-{c.index}",
+                        content=c.text,
+                        metadata={**c.metadata, "section": c.index, "page": c.index},
+                    )
+                    for c in raw_chunks
+                ]
+                n = await retriever.index(docs)
+                total += n
+                async with sessionmaker() as session:
+                    await session.execute(
+                        sa_delete(KBDocument).where(
+                            KBDocument.id == doc_id,
+                            KBDocument.tenant_id == tenant.id,
+                        )
+                    )
+                    session.add(KBDocument(
+                        id=doc_id, tenant_id=tenant.id, filename=f.name,
+                        source_type=f.suffix.lstrip(".").lower(),
+                        language=language, chunk_count=n,
+                        extra_data={"chunk_ids": [d.id for d in docs]},
+                    ))
+                    await session.commit()
+            except Exception:  # noqa: BLE001 - one bad file must not abort the whole seed
+                log.exception("global KB seed failed", extra={"file": f.name, "tenant": tenant.slug})
+        if total:
+            log.info("global KB seeded", extra={
+                "tenant": tenant.slug, "files": len(files), "chunks": total})
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings: Settings = get_settings()
@@ -284,12 +358,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.providers = providers
 
     reaper_task = asyncio.create_task(_reap_stale_calls_loop())
+    kb_seed_task = asyncio.create_task(_seed_global_kb(resolver, runtime_registry, sessionmaker))
 
     try:
         yield
     finally:
         log.info("shutdown")
         reaper_task.cancel()
+        kb_seed_task.cancel()
         telephony_hooks.set_bridge_factory(None)
         telephony_hooks.set_exotel_bridge_factory(None)
         telephony_hooks.set_stringee_bridge_factory(None)

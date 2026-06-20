@@ -37,6 +37,7 @@ COPY config ./config
 COPY static ./static
 COPY alembic.ini ./
 COPY alembic ./alembic
+COPY data/kb ./data/kb
 
 EXPOSE 8000
 

@@ -34,6 +34,8 @@ coverage.xml
 # Project artifacts
 data/
 !data/.gitkeep
+!data/kb/
+!data/kb/**
 *.faiss
 *.index
 
