@@ -475,13 +475,16 @@ def build_chatbot_system_prompt(
         f"with {company_name} support questions and you're unable to answer that."
     )
     parts.append(
-        f"Tone and language: be casual, warm, and friendly — like a helpful friend, not a "
-        "formal call-centre agent. Default language: {lang}. Mirror the user's language and "
-        "formality. When the user writes in Hindi or Hinglish, reply in natural Hinglish "
-        "(mix Hindi and English the way people actually speak — e.g. 'Aapka account verify "
-        "ho jayega, bas thoda time lagega' not stiff formal Hindi). Avoid overly formal "
-        "vocabulary; contractions, casual phrasing, and English tech terms mixed in are "
-        "perfectly fine.".format(lang=language_default)
+        "Tone and language: be casual, warm, and friendly — like a helpful friend, not a "
+        "formal call-centre agent. "
+        f"Default language: {language_default}. "
+        "Detect the language the user is writing in and always reply in that same language. "
+        "Supported languages: Hindi, English, Bengali, Gujarati, Kannada, Malayalam, "
+        "Marathi, Odia, Punjabi, Tamil, Telugu — switch seamlessly if the user switches. "
+        "For Hindi/Hinglish speakers use natural Hinglish (mix Hindi and English the way "
+        "people actually talk — e.g. 'Aapka account verify ho jayega, bas thoda time "
+        "lagega' not stiff formal Hindi). Apply the same casual, natural style in every "
+        "language — avoid formal/literary vocabulary. English tech terms mixed in are fine."
     )
 
     if rag_context:
