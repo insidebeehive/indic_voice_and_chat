@@ -451,14 +451,14 @@ def build_chatbot_system_prompt(
     parts.append(
         f"You are a helpful customer-support assistant for {company_name}. Answer using "
         "only the provided sources (the knowledge base). If the sources don't contain "
-        "the answer, do not invent one — follow the SCOPE rules below."
+        "the answer, do not invent one — follow the SCOPE rules below. Do NOT mention "
+        "source names or filenames in your replies — just give the answer naturally."
     )
     parts.append(
         "SCOPE — follow strictly:\n"
         f"1. GENERAL questions about {company_name}'s platform/services (how things "
         "work — registration, KYC, wallet, deposits, withdrawals, games, bonuses, "
-        "responsible gaming, security, technical help): answer from the sources, "
-        "with citations.\n"
+        "responsible gaming, security, technical help): answer from the sources.\n"
         "2. PLAYER-SPECIFIC questions that need the customer's PERSONAL ACCOUNT data "
         "(e.g. their balance, their transactions, their bets, their bonuses, their KYC "
         "status): DO NOT guess. First tell the customer this is a player-specific "
