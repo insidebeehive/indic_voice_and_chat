@@ -6,7 +6,7 @@ import asyncio
 from logging.config import fileConfig
 
 from alembic import context
-from sqlalchemy import pool
+from sqlalchemy import pool, text
 from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import async_engine_from_config
 from sqlalchemy.schema import CreateSchema
@@ -72,12 +72,22 @@ async def run_migrations_online() -> None:
         connect_args=connect_args,
     )
 
-    # Create the schema first, in its own committed transaction (search_path
-    # tolerates it not existing yet). Then run the migrations.
+    # Ensure the schema exists, then run the migrations. ``CREATE SCHEMA IF NOT
+    # EXISTS`` still needs database-level CREATE in Postgres even when the schema
+    # is already there, so we check existence first and only attempt the CREATE
+    # when it's actually missing. This lets a limited deploy role (with rights on
+    # an already-provisioned schema, but not database-level CREATE) run migrations;
+    # first-time provisioning still needs a privileged role.
     if DB_SCHEMA:
         async with connectable.begin() as conn:
-            await conn.run_sync(
-                lambda c: c.execute(CreateSchema(DB_SCHEMA, if_not_exists=True)))
+            exists = await conn.run_sync(
+                lambda c: c.execute(
+                    text("SELECT 1 FROM information_schema.schemata WHERE schema_name = :s"),
+                    {"s": DB_SCHEMA},
+                ).first() is not None)
+            if not exists:
+                await conn.run_sync(
+                    lambda c: c.execute(CreateSchema(DB_SCHEMA, if_not_exists=True)))
 
     async with connectable.connect() as connection:
         await connection.run_sync(do_run_migrations)

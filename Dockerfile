@@ -40,4 +40,10 @@ COPY alembic ./alembic
 
 EXPOSE 8000
 
-CMD ["uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Apply DB migrations before serving, then exec the app (so uvicorn is PID 1 and
+# receives signals). Fail-fast: a failed migration must not start a stale app.
+# `alembic upgrade head` is idempotent; env.py skips CREATE SCHEMA when the schema
+# already exists, so a least-privilege DB role can run it.
+# NOTE: for multi-replica deploys, run migrations as a single pre-deploy job
+# instead (Alembic has no cross-process lock).
+CMD ["sh", "-c", "alembic upgrade head && exec uvicorn src.main:app --host 0.0.0.0 --port 8000"]

@@ -64,9 +64,16 @@ Add a Northflank **PostgreSQL** addon. Set `DATABASE_URL` using the **asyncpg** 
 addon's URI from `postgresql://USER:PASS@HOST:PORT/DB` to
 `postgresql+asyncpg://USER:PASS@HOST:PORT/DB` (the app uses the async driver).
 
-Run migrations once against the addon (Northflank **Job** or a one-off exec on the service):
-`alembic upgrade head`. (Verify whether Alembic needs a sync URL — `alembic/env.py` reads the DB URL;
-if it errors on the asyncpg scheme, give the job a `postgresql://` URL instead. Confirm during Stage 2.)
+Migrations run **automatically on container start** — the Docker `CMD` is
+`alembic upgrade head && uvicorn …`, so every deploy applies pending migrations
+before serving (fail-fast: a failed migration won't start a stale app). The DB
+role only needs rights on an already-provisioned schema; `env.py` skips
+`CREATE SCHEMA` when the schema already exists (first-time provisioning still
+needs a role with database-level CREATE, or pre-create the schema once).
+
+For a **multi-replica** service, drop the in-container step and run
+`alembic upgrade head` as a single **pre-deploy Job** instead (Alembic has no
+cross-process lock, so replicas shouldn't migrate concurrently).
 
 ### Telephony (real calls)
 Set `WEBHOOK_BASE_URL=https://<service>.<project>.code.run/api/v1/telephony` and repoint your
