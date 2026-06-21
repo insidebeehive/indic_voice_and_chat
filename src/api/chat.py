@@ -130,7 +130,7 @@ def _greeting(company: str, customer_name: Optional[str], language: str) -> str:
 
 
 class CreateSessionRequest(BaseModel):
-    customer_id: Optional[str] = None
+    user_id: Optional[str] = None
     customer_name: Optional[str] = None
     language: Optional[str] = None
     metadata: dict = Field(default_factory=dict)
@@ -210,7 +210,7 @@ async def create_session(
     language = req.language or getattr(tenant.settings, "default_language", None) or "hi"
     session.add(ChatSession(
         id=session_id, tenant_id=tenant.id,
-        customer_id=req.customer_id, customer_name=req.customer_name,
+        customer_id=req.user_id, customer_name=req.customer_name,
         language=language, status="active", extra_data=req.metadata or {},
     ))
     await session.commit()

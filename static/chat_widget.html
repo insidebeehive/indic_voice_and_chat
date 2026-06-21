@@ -79,7 +79,7 @@
       method: "POST",
       headers: { "Content-Type": "application/json", "Authorization": "Bearer " + token },
       body: JSON.stringify({
-        customer_id: $("userid").value.trim() || null,
+        user_id: $("userid").value.trim() || null,
         customer_name: $("name").value.trim() || null,
       }),
     });
