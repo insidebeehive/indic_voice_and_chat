@@ -104,6 +104,10 @@ class RegisterTenantRequest(BaseModel):
     tts: Optional[LayerChoice] = None
     realtime: Optional[RealtimeChoice] = None
     telephony: TelephonyConfigIn
+    # CRM operator ID — the CRM system's identifier for this operator/tenant.
+    # Injected into every CRM tool call as "operator_id" so the CRM can scope
+    # responses. Defaults to the platform's tenant ID if not provided.
+    crm_operator_id: Optional[str] = None
 
 
 class RegisterTenantResponse(BaseModel):
@@ -232,11 +236,14 @@ async def register_tenant(
         ),
     )
 
+    pipeline_config = pipeline.model_dump()
+    if req.crm_operator_id:
+        pipeline_config["crm"] = {"operator_id": req.crm_operator_id}
     session.add(Tenant(
         id=tenant_id, slug=slug, name=req.name, status="active",
         timezone=req.timezone, default_language=req.default_language,
         mode=req.mode, max_concurrent_calls=req.max_concurrent_calls,
-        pipeline_config=pipeline.model_dump(),
+        pipeline_config=pipeline_config,
     ))
     for ph in tel.phone_numbers:
         session.add(TenantPhoneNumber(

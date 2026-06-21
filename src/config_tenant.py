@@ -243,6 +243,10 @@ class TenantCRMConfig(BaseModel):
     kind: str = "fake"
     endpoint_env: Optional[str] = None
     token_env: Optional[str] = None
+    # The CRM system's operator identifier for this tenant. Injected into every
+    # CRM tool call as the "operator_id" session context param so the CRM can
+    # scope API responses to the right operator. Defaults to the tenant's own id.
+    operator_id: Optional[str] = None
 
 
 class TenantWhatsAppConfig(BaseModel):

@@ -23,7 +23,7 @@ from sqlalchemy.orm import selectinload
 
 from src.auth import secrets as secret_crypto
 from src.auth.context import TenantContext
-from src.config_tenant import TenantCompliance, TenantPipelineConfig, TenantSettings
+from src.config_tenant import TenantCompliance, TenantCRMConfig, TenantPipelineConfig, TenantSettings
 from src.models.tenant import Tenant
 
 log = logging.getLogger(__name__)
@@ -39,6 +39,7 @@ def tenant_context_from_row(tenant: Tenant) -> TenantContext:
     # compliance rides inside pipeline_config (seeded there); pull it back out so a
     # tenant's calling-hours / DND config is honored, not the defaults.
     compliance = TenantCompliance(**(pc.get("compliance") or {}))
+    crm = TenantCRMConfig(**(pc.get("crm") or {}))
     settings = TenantSettings(
         id=tenant.id,
         slug=tenant.slug,
@@ -49,6 +50,7 @@ def tenant_context_from_row(tenant: Tenant) -> TenantContext:
         max_concurrent_calls=tenant.max_concurrent_calls,
         pipeline=pipeline,
         compliance=compliance,
+        crm=crm,
         phone_numbers=[p.phone_number for p in tenant.phone_numbers],
     )
     resolved: dict[str, str] = {}

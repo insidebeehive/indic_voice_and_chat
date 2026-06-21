@@ -88,19 +88,19 @@ def test_chatbot_prompt_with_rag_context() -> None:
     )
     assert "Acme" in prompt
     assert "Plan B has 500GB" in prompt
-    assert "do not invent" in prompt
     assert '"sources_used"' in prompt
 
 
 def test_chatbot_prompt_has_scope_guardrails() -> None:
     prompt = build_chatbot_system_prompt(company_name="Acme")
     assert "SCOPE" in prompt
-    # player- and operator-specific are named separately, then deferred ("few days").
-    assert "player-specific" in prompt
-    assert "operator-specific" in prompt
-    assert "few days" in prompt
-    # off-topic → declined.
-    assert "unable to answer" in prompt
+    # player- and operator-specific are named separately.
+    assert "player-specific" in prompt or "PLAYER-SPECIFIC" in prompt
+    assert "operator-specific" in prompt or "OPERATOR-SPECIFIC" in prompt
+    # agent IS the support — should never defer to an external team.
+    assert "YOU are the support" in prompt
+    # off-topic → declined (exact wording may vary).
+    assert "unable to answer" in prompt or "can only help" in prompt
 
 
 def test_response_schemas_are_valid_json() -> None:

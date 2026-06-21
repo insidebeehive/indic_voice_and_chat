@@ -263,7 +263,25 @@ def make_chatbot_factory(registry, sessionmaker=None, platform_retriever=None):
         return specs, execs
 
     async def factory(tenant: TenantContext, session_id: str) -> ChatBotAgent:
+        # Load the chat session so we have customer_id (= logged-in user/player ID)
+        # for CRM tool calls that need player-specific context.
+        user_id: str | None = None
+        if sessionmaker is not None:
+            from src.models.chat import ChatSession as _ChatSession
+            async with sessionmaker() as _db:
+                _row = await _db.get(_ChatSession, session_id)
+                user_id = _row.customer_id if _row else None
+
         crm_specs, crm_execs = await _load_crm_tools(tenant)
+
+        # operator_id = the CRM's operator identifier for this tenant. Set via
+        # crm_operator_id at tenant registration; falls back to tenant.id.
+        # user_id = the logged-in player's ID passed at chat session creation.
+        # CRM tool parameters declared with source="session" pull from this dict.
+        _operator_id = (
+            getattr(tenant.settings.crm, "operator_id", None) or tenant.id
+        )
+        _crm_context = {"operator_id": _operator_id, "user_id": user_id}
 
         async def crm_executor(tc) -> dict:
             spec = crm_execs.get(tc.name)
@@ -272,7 +290,7 @@ def make_chatbot_factory(registry, sessionmaker=None, platform_retriever=None):
             return await execute_crm_tool(
                 endpoint=spec["endpoint"], method=spec["method"],
                 parameters=spec["parameters"], auth_type=spec["auth_type"],
-                token=spec["token"], args=tc.arguments or {}, context={})
+                token=spec["token"], args=tc.arguments or {}, context=_crm_context)
 
         return ChatBotAgent(
             session=AgentSession(session_id=session_id),
