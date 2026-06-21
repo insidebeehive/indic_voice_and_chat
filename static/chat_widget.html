@@ -32,7 +32,8 @@
   <div id="setup">
     <input id="base" placeholder="API base (e.g. http://localhost:8000)" value="" />
     <input id="token" placeholder="Tenant bearer token" />
-    <input id="name" placeholder="Your name (optional)" />
+    <input id="userid" placeholder="User ID (logged-in player ID)" />
+    <input id="name" placeholder="Player name (optional)" />
     <button id="start">Start chat</button>
     <small style="color:#6b7280">Demo only — a real CRM creates the session server-side and embeds the returned <code>ws_url</code>.</small>
   </div>
@@ -77,7 +78,10 @@
     const resp = await fetch(base + "/api/v1/chat/sessions", {
       method: "POST",
       headers: { "Content-Type": "application/json", "Authorization": "Bearer " + token },
-      body: JSON.stringify({ customer_name: $("name").value.trim() || null }),
+      body: JSON.stringify({
+        customer_id: $("userid").value.trim() || null,
+        customer_name: $("name").value.trim() || null,
+      }),
     });
     if (!resp.ok) { alert("Failed to create session: " + resp.status); return; }
     const data = await resp.json();
