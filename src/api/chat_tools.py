@@ -23,6 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.api.deps import get_db_session
 from src.auth import TenantContext, current_tenant
 from src.auth import secrets as crypto
+from src.chatbot.catalog import ALL_TOOLS
 from src.models.chat import ChatTool
 from src.models.tenant import TenantSecret
 
@@ -162,3 +163,92 @@ async def delete_tool(
             await session.delete(sec)
     await session.commit()
     return {"tool_name": tool_name, "deleted": True}
+
+
+# --- Catalog seeding --------------------------------------------------------
+
+
+class SeedFromCatalogRequest(BaseModel):
+    crm_base_url: str = Field(min_length=1, description="Base URL of the operator's CRM API")
+    auth_type: Optional[str] = "bearer"  # bearer|api_key|none
+    auth_token: Optional[str] = None
+    tools: Optional[list[str]] = None  # None → seed all catalog tools
+
+
+class SeedFromCatalogResponse(BaseModel):
+    registered: int
+    tool_names: list[str]
+    unknown: list[str]
+
+
+@router.post("/tools/from-catalog", response_model=SeedFromCatalogResponse)
+async def seed_tools_from_catalog(
+    req: SeedFromCatalogRequest,
+    tenant: TenantContext = Depends(current_tenant),
+    session: AsyncSession = Depends(get_db_session),
+) -> SeedFromCatalogResponse:
+    """Register the standard betting-platform CRM tools for this tenant.
+
+    The caller supplies only their CRM base URL and auth token; the catalog
+    provides descriptions, parameter specs, and default path templates.
+    Existing tools with the same name are updated (upsert).
+    """
+    names_requested = req.tools or list(ALL_TOOLS.keys())
+    unknown = [n for n in names_requested if n not in ALL_TOOLS]
+
+    base = req.crm_base_url.rstrip("/")
+    registered: list[str] = []
+
+    for name in names_requested:
+        if name not in ALL_TOOLS:
+            continue
+        spec = ALL_TOOLS[name]
+        endpoint = base + spec["default_path"]
+
+        auth_config: dict = {}
+        if req.auth_token:
+            if not crypto.has_key():
+                raise HTTPException(
+                    status_code=400,
+                    detail="VOX_SECRET_KEY is not set — cannot encrypt the tool auth token")
+            secret_name = _token_secret_name(name)
+            existing_secret = (await session.execute(
+                select(TenantSecret).where(
+                    TenantSecret.tenant_id == tenant.id,
+                    TenantSecret.name == secret_name)
+            )).scalar_one_or_none()
+            enc = crypto.encrypt(req.auth_token)
+            if existing_secret is not None:
+                existing_secret.value_encrypted = enc
+            else:
+                session.add(TenantSecret(
+                    tenant_id=tenant.id, name=secret_name, value_encrypted=enc))
+            auth_config["token_secret_name"] = secret_name
+
+        row = (await session.execute(
+            select(ChatTool).where(ChatTool.tenant_id == tenant.id, ChatTool.name == name)
+        )).scalar_one_or_none()
+        if row is not None:
+            row.description = spec["description"]
+            row.endpoint = endpoint
+            row.method = spec.get("method", "GET")
+            row.auth_type = req.auth_type
+            if auth_config or req.auth_token:
+                row.auth_config = auth_config
+            row.parameters = spec["parameters"]
+        else:
+            session.add(ChatTool(
+                tenant_id=tenant.id, name=name,
+                description=spec["description"],
+                endpoint=endpoint,
+                method=spec.get("method", "GET"),
+                auth_type=req.auth_type,
+                auth_config=auth_config,
+                parameters=spec["parameters"],
+            ))
+        registered.append(name)
+
+    await session.commit()
+    log.info("seeded catalog tools", extra={"tenant": tenant.slug, "tools": registered})
+    return SeedFromCatalogResponse(
+        registered=len(registered), tool_names=registered, unknown=unknown)
