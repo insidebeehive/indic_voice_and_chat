@@ -332,12 +332,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         make_browser_bridge_factory(
             providers=providers, campaign_resolver=campaign_resolver,
             handoff_store=base_session_store,
+            platform_retriever=platform_retriever,
         )
     )
     if dev_console_enabled():
         set_live_bridge_factory(
             make_live_bridge_factory(
                 providers=providers, campaign_resolver=campaign_resolver,
+                platform_retriever=platform_retriever,
             )
         )
         log.info("dev console enabled at /dev/voice")
