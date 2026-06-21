@@ -362,6 +362,10 @@ class BrowserVoiceBridge:
             remaining = self._play_until - time.monotonic()
             if remaining > 0:
                 await asyncio.sleep(remaining + 0.5)
+            # Emit outcome NOW while the socket is still open. The finally
+            # block also calls this but _emit_outcome is idempotent — by the
+            # time finally runs, the browser may have already closed the tab.
+            await self._emit_outcome()
             return
         self._reset_capture()  # drop audio captured while the agent was busy
         await self._send_json({"type": "status", "status": "listening"})
@@ -561,6 +565,10 @@ class BrowserVoiceBridge:
             remaining = self._play_until - time.monotonic()
             if remaining > 0:
                 await asyncio.sleep(remaining + 0.5)
+            # Emit outcome while the socket is still open (stream task context).
+            # The finally block also calls this but by then the browser may have
+            # already closed the tab after seeing state=ended.
+            await self._emit_outcome()
             return
         self._agent_busy = False
         await self._send_json({"type": "status", "status": "listening"})
