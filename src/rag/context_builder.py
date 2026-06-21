@@ -15,11 +15,16 @@ The hallucination guard is a small post-LLM check:
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from src.dialogue.response_parser import ChatBotResponse
+from src.interfaces.vector_store import Document
 from src.rag.retriever import RetrievedChunk
+
+if TYPE_CHECKING:
+    from src.rag.retriever import HybridRetriever
 
 
 @dataclass
@@ -71,6 +76,64 @@ def _source_tag(chunk: RetrievedChunk) -> str:
     if filename:
         return str(filename)
     return chunk.document.id
+
+
+# --- Multi-retriever helpers ---------------------------------------------
+
+
+async def search_combined(
+    query: str,
+    retrievers: list["HybridRetriever"],
+    top_k: int = 5,
+    filters: Optional[dict] = None,
+) -> list[RetrievedChunk]:
+    """Query multiple retrievers in parallel and merge results by score."""
+    if not retrievers:
+        return []
+    results_per = await asyncio.gather(
+        *[r.search(query, top_k=top_k, filters=filters) for r in retrievers]
+    )
+    seen: set[str] = set()
+    merged: list[RetrievedChunk] = []
+    for chunk in sorted(
+        (c for batch in results_per for c in batch),
+        key=lambda c: c.score, reverse=True,
+    ):
+        if chunk.document.id not in seen:
+            seen.add(chunk.document.id)
+            merged.append(chunk)
+    return merged[:top_k]
+
+
+def build_voicebot_kb_context(
+    retrievers: list["HybridRetriever"],
+    max_chars: int = 8000,
+) -> str:
+    """Build a static KB context string from all docs in the given retrievers.
+
+    Intended for injection into the voicebot system prompt at call start so the
+    agent has factual KB content for the full call without per-turn retrieval.
+    """
+    seen: set[str] = set()
+    all_docs: list[Document] = []
+    for r in retrievers:
+        for doc in r.list_all():
+            if doc.id not in seen:
+                seen.add(doc.id)
+                all_docs.append(doc)
+    if not all_docs:
+        return ""
+    parts: list[str] = []
+    total = 0
+    for doc in all_docs:
+        md = doc.metadata or {}
+        fn = md.get("filename") or doc.id
+        entry = f"[{fn}]\n{doc.content.strip()}"
+        if total + len(entry) + 2 > max_chars:
+            break
+        parts.append(entry)
+        total += len(entry) + 2
+    return "\n\n".join(parts)
 
 
 # --- Hallucination guard -------------------------------------------------

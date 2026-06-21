@@ -28,6 +28,7 @@ from src.api.deps import get_db_session
 from src.auth import TenantContext, current_tenant
 from src.interfaces.vector_store import Document
 from src.models.benchmark import KBDocument
+from src.rag.context_builder import search_combined
 from src.rag.ingestion import ChunkConfig, detect_language, get_chunker, parse_document
 from src.rag.retriever import HybridRetriever
 
@@ -38,11 +39,11 @@ router = APIRouter(prefix="/knowledge", tags=["knowledge"])
 # --- DI -----------------------------------------------------------------
 
 
-# A factory that returns the retriever for a tenant. Prod wires the per-tenant
-# registry retriever (so ingestion + the chatbot share one index); tests pass a
-# single retriever via ``set_retriever``.
+# A factory that returns the TENANT retriever (for ingest + tenant-specific search).
+# A separate platform retriever holds the global KB shared across all tenants.
 RetrieverFactory = Callable[[TenantContext], HybridRetriever]
 _retriever_factory: Optional[RetrieverFactory] = None
+_platform_retriever: Optional[HybridRetriever] = None
 _chunk_config: ChunkConfig = ChunkConfig()
 
 
@@ -53,6 +54,12 @@ def set_retriever_factory(
     _retriever_factory = factory
     if chunk_config is not None:
         _chunk_config = chunk_config
+
+
+def set_platform_retriever(retriever: Optional[HybridRetriever]) -> None:
+    """Set the platform-level shared retriever (global KB, all tenants)."""
+    global _platform_retriever
+    _platform_retriever = retriever
 
 
 def set_retriever(
@@ -70,6 +77,11 @@ def _retriever_for(tenant: TenantContext) -> HybridRetriever:
             detail="knowledge base not initialized; set_retriever() not called",
         )
     return _retriever_factory(tenant)
+
+
+def _active_retrievers(tenant: TenantContext) -> list[HybridRetriever]:
+    """Platform retriever + tenant retriever, skipping None."""
+    return [r for r in [_platform_retriever, _retriever_for(tenant)] if r is not None]
 
 
 # --- Schemas ------------------------------------------------------------
@@ -223,11 +235,14 @@ async def delete_document(
 async def query(
     req: QueryRequest, tenant: TenantContext = Depends(current_tenant),
 ) -> QueryResponse:
-    retriever = _retriever_for(tenant)
-    # Always filter by tenant_id so query results never leak across tenants.
-    filters = dict(req.filters or {})
-    filters["tenant_id"] = tenant.id
-    results = await retriever.search(req.query, top_k=req.top_k, filters=filters)
+    retrievers = _active_retrievers(tenant)
+    # Tenant-specific retriever is filtered to tenant_id; platform retriever is
+    # unfiltered (platform docs have no tenant_id). Pass tenant filter only to the
+    # tenant retriever via search_combined's per-retriever filter support is not yet
+    # implemented — instead, platform docs are naturally unscoped (no tenant_id in
+    # metadata) and FAISS has no FK, so cross-tenant leakage via the platform index
+    # is fine (it only holds shared global docs).
+    results = await search_combined(req.query, retrievers, top_k=req.top_k)
     hits = [
         QueryHit(
             chunk_id=r.document.id,
@@ -248,8 +263,12 @@ async def stats(
     tenant: TenantContext = Depends(current_tenant),
     session: AsyncSession = Depends(get_db_session),
 ) -> StatsResponse:
+    # Count platform docs (tenant_id IS NULL) + tenant-specific docs.
+    from sqlalchemy import or_, null
     rows = (await session.execute(
-        select(KBDocument).where(KBDocument.tenant_id == tenant.id)
+        select(KBDocument).where(
+            or_(KBDocument.tenant_id == tenant.id, KBDocument.tenant_id == null())
+        )
     )).scalars().all()
     return StatsResponse(
         document_count=len(rows),

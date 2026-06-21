@@ -150,6 +150,10 @@ class HybridRetriever:
         self._bm25.index(chunks)
         return await self._dense.index(chunks)
 
+    def list_all(self, max_chunks: int = 200) -> list[Document]:
+        """Return all indexed chunks (drawn from the in-memory BM25 index)."""
+        return list(self._bm25._docs.values())[:max_chunks]
+
     async def delete(self, doc_ids: list[str]) -> int:
         self._bm25.delete(doc_ids)
         return await self._dense.delete(doc_ids)

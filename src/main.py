@@ -66,6 +66,7 @@ from src.auth.db_resolver import DbTenantResolver
 from src.auth.middleware import set_admin_tokens, set_tenant_resolver
 from src.auth.seed import seed_campaigns_if_empty, seed_if_empty, seed_provider_costs
 from src.bootstrap import (
+    build_platform_retriever,
     build_provider_registry,
     build_runtime_registry,
     make_bridge_factory,
@@ -124,12 +125,13 @@ async def _reap_stale_calls_loop() -> None:
         await asyncio.sleep(_REAP_INTERVAL_S)
 
 
-async def _seed_global_kb(resolver: DbTenantResolver, runtime_registry, sessionmaker) -> None:
-    """Re-ingest bundled global KB docs into every tenant's FAISS index at startup.
+async def _seed_global_kb(platform_retriever, sessionmaker) -> None:
+    """Re-ingest bundled global KB docs into the platform FAISS index at startup.
 
     FAISS is in-memory and lost on each deploy; this seeds it on boot from docs
     bundled at data/kb/global/. Uses deterministic doc_ids (filename-based) so
-    KBDocument DB rows are replaced, not duplicated, across restarts.
+    KBDocument DB rows are replaced, not duplicated, across restarts. Docs are
+    stored with tenant_id=NULL (platform-level, shared across all tenants).
     """
     from sqlalchemy import delete as sa_delete
 
@@ -149,53 +151,44 @@ async def _seed_global_kb(resolver: DbTenantResolver, runtime_registry, sessionm
         return
 
     chunker = get_chunker(ChunkConfig())
-    tenants = list(resolver._by_slug.values())
-
-    for tenant in tenants:
-        retriever = runtime_registry.retrievers.get(tenant)
-        total = 0
-        for f in files:
-            doc_id = f"global_kb_{f.stem}"
-            try:
-                text = parse_document(f.name, f.read_bytes())
-                if not text.strip():
-                    continue
-                language = detect_language(text)
-                raw_chunks = chunker(text, {
-                    "filename": f.name, "document_id": doc_id,
-                    "language": language, "tenant_id": tenant.id,
-                })
-                if not raw_chunks:
-                    continue
-                docs = [
-                    Document(
-                        id=f"{doc_id}::chunk-{c.index}",
-                        content=c.text,
-                        metadata={**c.metadata, "section": c.index, "page": c.index},
-                    )
-                    for c in raw_chunks
-                ]
-                n = await retriever.index(docs)
-                total += n
-                async with sessionmaker() as session:
-                    await session.execute(
-                        sa_delete(KBDocument).where(
-                            KBDocument.id == doc_id,
-                            KBDocument.tenant_id == tenant.id,
-                        )
-                    )
-                    session.add(KBDocument(
-                        id=doc_id, tenant_id=tenant.id, filename=f.name,
-                        source_type=f.suffix.lstrip(".").lower(),
-                        language=language, chunk_count=n,
-                        extra_data={"chunk_ids": [d.id for d in docs]},
-                    ))
-                    await session.commit()
-            except Exception:  # noqa: BLE001 - one bad file must not abort the whole seed
-                log.exception("global KB seed failed", extra={"file": f.name, "tenant": tenant.slug})
-        if total:
-            log.info("global KB seeded", extra={
-                "tenant": tenant.slug, "files": len(files), "chunks": total})
+    total = 0
+    for f in files:
+        doc_id = f"global_kb_{f.stem}"
+        try:
+            text = parse_document(f.name, f.read_bytes())
+            if not text.strip():
+                continue
+            language = detect_language(text)
+            raw_chunks = chunker(text, {
+                "filename": f.name, "document_id": doc_id, "language": language,
+            })
+            if not raw_chunks:
+                continue
+            docs = [
+                Document(
+                    id=f"{doc_id}::chunk-{c.index}",
+                    content=c.text,
+                    metadata={**c.metadata, "section": c.index, "page": c.index},
+                )
+                for c in raw_chunks
+            ]
+            n = await platform_retriever.index(docs)
+            total += n
+            async with sessionmaker() as session:
+                await session.execute(
+                    sa_delete(KBDocument).where(KBDocument.id == doc_id)
+                )
+                session.add(KBDocument(
+                    id=doc_id, tenant_id=None, filename=f.name,
+                    source_type=f.suffix.lstrip(".").lower(),
+                    language=language, chunk_count=n,
+                    extra_data={"chunk_ids": [d.id for d in docs]},
+                ))
+                await session.commit()
+        except Exception:  # noqa: BLE001 - one bad file must not abort the whole seed
+            log.exception("global KB seed failed", extra={"file": f.name})
+    if total:
+        log.info("platform KB seeded", extra={"files": len(files), "chunks": total})
 
 
 @asynccontextmanager
@@ -294,6 +287,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # webhooks. Real where impls exist, honest stubs for the fake-only ones.
     runtime_registry = build_runtime_registry(providers, base_session_store)
     app.state.registry = runtime_registry
+    platform_retriever = build_platform_retriever()
     # Drop ALL cached per-tenant instances (providers + sub-registries) whenever
     # tenants reload (e.g. a key/config update via the tenant API) so the new
     # config takes effect.
@@ -314,17 +308,20 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         make_bridge_factory(
             providers=providers, session_store=base_session_store,
             campaign_resolver=campaign_resolver,
+            platform_retriever=platform_retriever,
         )
     )
     telephony_hooks.set_exotel_bridge_factory(
         make_exotel_bridge_factory(
             providers=providers, session_store=base_session_store,
             campaign_resolver=campaign_resolver,
+            platform_retriever=platform_retriever,
         )
     )
     telephony_hooks.set_stringee_bridge_factory(
         make_stringee_bridge_factory(
             providers=providers, campaign_resolver=campaign_resolver,
+            platform_retriever=platform_retriever,
         )
     )
     # The browser voice bridge is wired ALWAYS (not just for the dev console) so
@@ -349,16 +346,19 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     telephony_hooks.set_softphone_providers(providers)
     # ChatBot: per-(tenant, session) agent factory + the sessionmaker the WS uses
     # to resolve the tenant from the chat_sessions row and persist messages.
-    chat_api.set_chatbot_factory(make_chatbot_factory(runtime_registry, sessionmaker))
+    chat_api.set_chatbot_factory(
+        make_chatbot_factory(runtime_registry, sessionmaker,
+                             platform_retriever=platform_retriever))
     chat_api.set_chat_sessionmaker(sessionmaker)
     chat_api.set_chat_handoff_store(base_session_store)
     # Knowledge ingest/query resolve the SAME per-tenant retriever the chatbot
     # uses (registry.retrievers), so ingested docs are retrievable in chat.
     knowledge_api.set_retriever_factory(lambda t: runtime_registry.retrievers.get(t))
+    knowledge_api.set_platform_retriever(platform_retriever)
     app.state.providers = providers
 
     reaper_task = asyncio.create_task(_reap_stale_calls_loop())
-    kb_seed_task = asyncio.create_task(_seed_global_kb(resolver, runtime_registry, sessionmaker))
+    kb_seed_task = asyncio.create_task(_seed_global_kb(platform_retriever, sessionmaker))
 
     try:
         yield
@@ -374,6 +374,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         chat_api.set_chat_sessionmaker(None)
         chat_api.set_chat_handoff_store(None)
         knowledge_api.set_retriever_factory(None)
+        knowledge_api.set_platform_retriever(None)
         set_browser_bridge_factory(None)
         set_call_outcome_persister(None)
         set_tenant_event_notifier(None)

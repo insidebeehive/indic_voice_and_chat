@@ -34,6 +34,7 @@ from src.rag.context_builder import (
     GuardConfig,
     apply_hallucination_guard,
     build_rag_context,
+    search_combined,
 )
 from src.rag.retriever import HybridRetriever, RetrievedChunk
 
@@ -65,6 +66,7 @@ class ChatBotAgent(BaseAgent):
         session: AgentSession,
         llm: ILLMProvider,
         retriever: HybridRetriever,
+        platform_retriever: Optional[HybridRetriever] = None,
         llm_config: Optional[LLMConfig] = None,
         company_name: str = "[Your Company]",
         language_default: str = "en",
@@ -85,6 +87,11 @@ class ChatBotAgent(BaseAgent):
         )
         self._llm = llm
         self._retriever = retriever
+        self._platform_retriever = platform_retriever
+        # Ordered list: platform KB first (broadest), then tenant-specific.
+        self._retrievers: list[HybridRetriever] = [
+            r for r in [platform_retriever, retriever] if r is not None
+        ]
         self._llm_config = llm_config or LLMConfig(response_format="json")
         self._company = company_name
         self._language = language_default
@@ -129,7 +136,7 @@ class ChatBotAgent(BaseAgent):
 
     async def _single_shot(self, user_msg: LLMMessage, query_text: str) -> ChatTurnResult:
         # 1. Retrieval (on the text part; multimodal-only turns skip it)
-        retrieved = await self._retriever.search(query_text) if query_text.strip() else []
+        retrieved = await search_combined(query_text, self._retrievers) if query_text.strip() else []
         # 2. Build context
         rag = build_rag_context(retrieved, max_chars=self._max_context_chars)
         # 3. Compose messages
@@ -222,7 +229,7 @@ class ChatBotAgent(BaseAgent):
         args = tc.arguments or {}
         if tc.name == SEARCH_KB:
             try:
-                chunks = await self._retriever.search(args.get("query", ""))
+                chunks = await search_combined(args.get("query", ""), self._retrievers)
             except Exception:  # noqa: BLE001 — a search failure (e.g. embedder
                 # unavailable) must not kill the turn; the model answers without RAG.
                 log.exception("knowledge search failed", extra={"query": args.get("query", "")})

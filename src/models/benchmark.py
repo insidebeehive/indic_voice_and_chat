@@ -30,9 +30,9 @@ class KBDocument(Base):
     __tablename__ = "kb_documents"
 
     id: Mapped[str] = mapped_column(String(50), primary_key=True)
-    tenant_id: Mapped[str] = mapped_column(
+    tenant_id: Mapped[Optional[str]] = mapped_column(
         String(50), ForeignKey("tenants.id", ondelete="CASCADE"),
-        nullable=False, index=True,
+        nullable=True, index=True,
     )
     filename: Mapped[str] = mapped_column(String(255), nullable=False)
     source_type: Mapped[Optional[str]] = mapped_column(String(50))

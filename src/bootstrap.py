@@ -83,6 +83,25 @@ DEFAULT_DEMO_SCRIPT = VoiceBotScript(
 # --- Per-tenant runtime builders ---------------------------------------
 
 
+def build_platform_retriever(base_vector_path: Path = Path("data/faiss")) -> "HybridRetriever":
+    """One shared FAISS+BM25 retriever for the global KB (all tenants)."""
+    from src.providers.vector_store.faiss_store import FAISSAdapter
+    from src.rag.embeddings import GeminiEmbedder
+    from src.rag.retriever import HybridRetriever, RetrievalConfig
+
+    platform_path = base_vector_path / "platform"
+    platform_path.mkdir(parents=True, exist_ok=True)
+    vector_store = FAISSAdapter({
+        "embedding_dim": 384,
+        "index_path": str(platform_path / "index"),
+    })
+    return HybridRetriever(
+        embedder=GeminiEmbedder(dim=384),
+        vector_store=vector_store,
+        config=RetrievalConfig(),
+    )
+
+
 def build_provider_registry(
     global_defaults: dict, base_vector_path: Path = Path("data/faiss"),
 ) -> TenantProviders:
@@ -192,7 +211,7 @@ def _crm_params_to_schema(params: dict) -> dict:
     return schema
 
 
-def make_chatbot_factory(registry, sessionmaker=None):
+def make_chatbot_factory(registry, sessionmaker=None, platform_retriever=None):
     """Per-(tenant, session) ChatBotAgent factory for ``chat.set_chatbot_factory``.
 
     Reuses the tenant's LLM, per-tenant hybrid retriever, and Redis session store
@@ -259,6 +278,7 @@ def make_chatbot_factory(registry, sessionmaker=None):
             session=AgentSession(session_id=session_id),
             llm=registry.providers.get_llm(tenant),
             retriever=registry.retrievers.get(tenant),
+            platform_retriever=platform_retriever,
             company_name=tenant.name,
             language_default=getattr(tenant.settings, "default_language", None) or "en",
             store=registry.session_stores.get(tenant),
@@ -293,7 +313,7 @@ def _build_s2s_telephony_bridge(
     slots: SlotSchema, websocket: WebSocket, session_store: SessionStore | None,
     *, encoding: str, sid_field: str, supports_clear: bool,
     call_sid_field: str = "callSid", voice_override: str | None = None,
-    lead_data: dict | None = None,
+    lead_data: dict | None = None, kb_context: str | None = None,
 ):
     """Build a TelephonyLiveBridge (Gemini Live over the media stream) for a call
     whose tenant has pipeline.mode == 's2s'. Mirrors the cascade agent assembly
@@ -335,7 +355,7 @@ def _build_s2s_telephony_bridge(
     key = None
     config = RealtimeConfig(
         model=rt.model, voice=voice, language_code=rt.language_code,
-        system_instruction=build_s2s_system_instruction(script, slots, lead_data),
+        system_instruction=build_s2s_system_instruction(script, slots, lead_data, kb_context=kb_context),
         tools=[RECORD_TURN_SIGNAL])
 
     async def connect(cfg: RealtimeConfig):
@@ -351,6 +371,13 @@ def _build_s2s_telephony_bridge(
         call_sid_field=call_sid_field)
 
 
+def _build_kb_context(platform_retriever, tenant_retriever) -> str:
+    """Build a static KB context string from platform + tenant retrievers for voicebot."""
+    from src.rag.context_builder import build_voicebot_kb_context
+    retrievers = [r for r in [platform_retriever, tenant_retriever] if r is not None]
+    return build_voicebot_kb_context(retrievers)
+
+
 def make_bridge_factory(
     providers: TenantProviders,
     session_store: SessionStore | None = None,
@@ -359,6 +386,7 @@ def make_bridge_factory(
     slots: SlotSchema = SlotSchema(),
     *,
     campaign_resolver=None,
+    platform_retriever=None,
 ) -> Callable[[WebSocket, TenantContext], object]:
     """Return a callable suitable for ``set_bridge_factory(...)``.
 
@@ -384,12 +412,13 @@ def make_bridge_factory(
             cur_script, cur_slots = lc.script, lc.slots
         # Speech-to-speech path: when the tenant is in s2s mode, drive Gemini Live
         # over the Twilio media stream instead of the STT->LLM->TTS cascade.
+        kb_ctx = _build_kb_context(platform_retriever, None)
         if mode == "s2s":
             return _build_s2s_telephony_bridge(
                 providers, tenant, cur_script, cur_slots, websocket, session_store,
                 encoding="mulaw", sid_field="streamSid", supports_clear=True,
                 call_sid_field="callSid", voice_override=(override or {}).get("voice"),
-                lead_data=_override_lead_data(override))
+                lead_data=_override_lead_data(override), kb_context=kb_ctx)
         # Build a fresh agent per call; provider clients are cached on the
         # registry so we don't pay reconstruction cost.
         stt = providers.get_stt(tenant)
@@ -435,6 +464,7 @@ def make_bridge_factory(
             script=cur_script,
             engine=engine,
             store=store,
+            kb_context=kb_ctx or None,
         )
 
         log.info(
@@ -511,6 +541,7 @@ def make_exotel_bridge_factory(
     slots: SlotSchema = SlotSchema(),
     *,
     campaign_resolver=None,
+    platform_retriever=None,
 ) -> Callable[[WebSocket, TenantContext], ExotelMediaBridge]:
     """Build an Exotel WS bridge per call, wired to the tenant's provider stack.
 
@@ -534,12 +565,13 @@ def make_exotel_bridge_factory(
             cur_script, cur_slots = lc.script, lc.slots
         # S2S path: drive Gemini Live over the Exotel media stream (raw PCM16@8k,
         # snake_case stream_sid, no `clear` frame) when the tenant is in s2s mode.
+        kb_ctx = _build_kb_context(platform_retriever, None)
         if mode == "s2s":
             return _build_s2s_telephony_bridge(
                 providers, tenant, cur_script, cur_slots, websocket, session_store,
                 encoding="pcm", sid_field="stream_sid", supports_clear=False,
                 call_sid_field="call_sid", voice_override=(override or {}).get("voice"),
-                lead_data=_override_lead_data(override))
+                lead_data=_override_lead_data(override), kb_context=kb_ctx)
         stt = providers.get_stt(tenant)
         llm = providers.get_llm(tenant)
         tts = providers.get_tts(tenant)
@@ -579,6 +611,7 @@ def make_exotel_bridge_factory(
             script=cur_script,
             engine=engine,
             store=store,
+            kb_context=kb_ctx or None,
         )
 
         log.info(
@@ -607,6 +640,7 @@ def make_stringee_bridge_factory(
     slots: SlotSchema = SlotSchema(),
     *,
     campaign_resolver=None,
+    platform_retriever=None,
 ):
     """Build a StringeeIvrBridge per call, wired to the tenant's providers.
 
@@ -652,6 +686,7 @@ def make_stringee_bridge_factory(
             script=cur_script,
             engine=engine,
             store=None,
+            kb_context=_build_kb_context(platform_retriever, None) or None,
         )
 
         log.info(

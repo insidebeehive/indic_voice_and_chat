@@ -184,6 +184,7 @@ def build_voicebot_system_prompt(
     schema: SlotSchema,
     lead_data: Optional[dict[str, Any]] = None,
     extra_directives: Optional[list[str]] = None,
+    kb_context: Optional[str] = None,
 ) -> str:
     """Assemble the VoiceBotAgent system prompt.
 
@@ -325,6 +326,12 @@ def build_voicebot_system_prompt(
         "- Set action=end only when the conversation is genuinely over."
     )
 
+    if kb_context:
+        parts.append(
+            "Knowledge base (use this to answer factual questions from the caller; "
+            "do not recite verbatim, answer naturally):\n" + kb_context
+        )
+
     if extra_directives:
         parts.append("Additional directives:\n" + "\n".join(f"- {d}" for d in extra_directives))
 
@@ -335,6 +342,7 @@ def build_s2s_system_instruction(
     script: VoiceBotScript,
     schema: SlotSchema,
     lead_data: Optional[dict[str, Any]] = None,
+    kb_context: Optional[str] = None,
 ) -> str:
     """System instruction for a speech-to-speech (Gemini Live) session.
 
@@ -426,6 +434,12 @@ def build_s2s_system_instruction(
 
     if lead_data:
         parts.append("Known lead data: " + json.dumps(lead_data, ensure_ascii=False))
+
+    if kb_context:
+        parts.append(
+            "Knowledge base (use this to answer factual questions from the caller; "
+            "answer naturally, do not read it out verbatim):\n" + kb_context
+        )
 
     # Tool-based control: the S2S model self-reports the dialogue action + slots
     # (replaces the cascade's JSON envelope; consumed by VoiceBotAgent.apply_signal).

@@ -69,6 +69,7 @@ class VoiceBotAgent(BaseAgent):
         engine: PipelineEngine,
         store=None,
         extra_directives: Optional[list[str]] = None,
+        kb_context: Optional[str] = None,
     ) -> None:
         slots = SlotFiller(slot_schema)
         super().__init__(session=session, state_machine=state_machine, slots=slots, store=store)
@@ -85,6 +86,7 @@ class VoiceBotAgent(BaseAgent):
             schema=slot_schema,
             lead_data=session.lead_data,
             extra_directives=extra_directives,
+            kb_context=kb_context,
         )
         self.session.turns.append(LLMMessage(role="system", content=self._system_prompt))
 
