@@ -303,6 +303,8 @@ class UpdateTenantResponse(BaseModel):
     # Which telephony credential slots are now configured (names only, never
     # values) — lets an admin confirm e.g. the Stringee account_sid is set.
     telephony_creds_configured: list[str]
+    events_webhook_url: Optional[str] = None
+    events_webhook_secret_set: bool = False
 
 
 async def _refresh_resolver(request: Request, tenant_id: str) -> None:
@@ -407,8 +409,9 @@ async def update_tenant(
     return UpdateTenantResponse(
         tenant_id=t.id, slug=t.slug, status=t.status,
         telephony_provider=tel_cfg.get("provider"),
-        # names only, never values — for the active provider's slot.
         telephony_creds_configured=_configured_creds(tel_cfg),
+        events_webhook_url=pc.get("events_webhook_url"),
+        events_webhook_secret_set=bool(pc.get("events_webhook_secret_env")),
     )
 
 

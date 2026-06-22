@@ -503,6 +503,9 @@ def build_chatbot_system_prompt(
         "sets up a browser-based web call automatically. Do NOT ask for a phone number. "
         "Do NOT put call-related questions in suggested_followups."
     )
+    if rag_context:
+        parts.append("Reference sources:\n" + rag_context)
+
     parts.append(
         "LANGUAGE — CRITICAL RULE: detect the language of the user's LATEST message and "
         "reply in EXACTLY that language. The user's language ALWAYS overrides the "
@@ -510,15 +513,14 @@ def build_chatbot_system_prompt(
         "English. If they write in Hindi → reply in Hindi. If they switch mid-conversation "
         "→ switch immediately. Never reply in a different language than what the user just "
         "wrote in. The suggested_followups must also be in the same language as your reply.\n"
+        "IMPORTANT: the reference sources above may be written in Hindi or another language "
+        "— that does NOT determine your reply language. Only the user's message language does.\n"
         "Tone: casual, warm, and friendly — like a helpful friend, not a formal call-centre "
         "agent. For Hindi/Hinglish speakers use natural Hinglish (mix Hindi and English the "
         "way people actually talk — avoid stiff formal Hindi). English tech terms mixed in "
         "are always fine. Supported languages: Hindi, English, Bengali, Gujarati, Kannada, "
         "Malayalam, Marathi, Odia, Punjabi, Tamil, Telugu."
     )
-
-    if rag_context:
-        parts.append("Reference sources:\n" + rag_context)
 
     parts.append(
         "Respond with a single JSON object matching this schema:\n"
