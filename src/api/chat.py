@@ -714,6 +714,88 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
                 # A single turn's failure must not black-hole the conversation: send an
                 # error frame and keep the socket open (a real disconnect re-raises).
                 try:
+                    if mtype == "audio":
+                        raw_data = msg.get("data")
+                        mime = (msg.get("mime") or "").strip()
+                        if not raw_data or not mime or not mime.startswith("audio/"):
+                            await websocket.send_text(json.dumps(
+                                {"type": "error", "message": "audio needs 'data' (base64) + 'mime' (audio/*)"}))
+                            continue
+                        if _media_store is None:
+                            await websocket.send_text(json.dumps(
+                                {"type": "error", "message": "voice messages not available — media storage not configured"}))
+                            continue
+                        try:
+                            audio_bytes = base64.b64decode(raw_data)
+                        except Exception:
+                            await websocket.send_text(json.dumps(
+                                {"type": "error", "message": "invalid base64 in audio data"}))
+                            continue
+
+                        await websocket.send_text(json.dumps({"type": "typing"}))
+
+                        object_key = _media_key(tenant.id, session_id, mime)
+                        # Upload to S3 and transcribe in parallel
+                        transcript = ""
+                        try:
+                            upload_coro = _media_store.upload(audio_bytes, object_key, mime.split(";")[0])
+                            if hasattr(agent.llm, "transcribe_audio"):
+                                transcript, _ = await asyncio.gather(
+                                    agent.llm.transcribe_audio(audio_bytes, mime.split(";")[0]),
+                                    upload_coro,
+                                )
+                            else:
+                                await upload_coro
+                        except Exception:
+                            log.exception("audio upload/transcription failed", extra={"session_id": session_id})
+                            await websocket.send_text(json.dumps(
+                                {"type": "error", "message": "Could not save voice message — please try again."}))
+                            continue
+
+                        # If transcription succeeded, get AI response; else inform customer
+                        if transcript:
+                            result = await agent.handle_message(transcript)
+                            msg_id = await _persist_turn(
+                                session_id, transcript, result,
+                                user_type="audio", media_mime=mime, media_url=object_key,
+                            )
+                            if msg_id is not None:
+                                await websocket.send_text(json.dumps({
+                                    "type": "audio_ack",
+                                    "media_url": f"/api/v1/chat/media/{msg_id}",
+                                }))
+                            await _send_reply(websocket, session_id, result, tenant.id)
+                            if result.escalation:
+                                await _handle_escalation(websocket, session_id, tenant, row, result)
+                                await _run_human_mode(websocket, session_id, tenant)
+                                break
+                        else:
+                            # Persist audio without agent reply
+                            async with _sm()() as db:
+                                r = await db.get(ChatSession, session_id)
+                                if r:
+                                    audio_msg = ChatMessage(
+                                        session_id=session_id, role="customer", type="audio",
+                                        content="[audio]", media_mime=mime, media_url=object_key,
+                                    )
+                                    db.add(audio_msg)
+                                    r.message_count = (r.message_count or 0) + 1
+                                    await db.flush()
+                                    msg_id = audio_msg.id
+                                    await db.commit()
+                                else:
+                                    msg_id = None
+                            if msg_id is not None:
+                                await websocket.send_text(json.dumps({
+                                    "type": "audio_ack",
+                                    "media_url": f"/api/v1/chat/media/{msg_id}",
+                                }))
+                            await websocket.send_text(json.dumps({
+                                "type": "error",
+                                "message": "Could not transcribe voice message — please type your message instead.",
+                            }))
+                        continue
+
                     if mtype in ("image", "video"):
                         data = msg.get("data")
                         mime = msg.get("mime") or ""
