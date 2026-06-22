@@ -531,8 +531,8 @@ async def agent_websocket(websocket: WebSocket, session_id: str) -> None:
                 if item is None:  # customer WS dropped — notify agent but keep loop alive
                     await websocket.send_text(json.dumps({
                         "type": "system", "text": "Customer disconnected — session still open"}))
-                    continue
-                await websocket.send_text(item)
+                else:
+                    await websocket.send_text(item)
 
             if ws_task in done:
                 try:
@@ -862,8 +862,7 @@ async def _run_human_mode(
                 try:
                     raw = ws_task.result()
                 except WebSocketDisconnect:
-                    await bq.put(None)
-                    raise
+                    raise  # outer except handles bq.put(None)
                 try:
                     msg = json.loads(raw)
                 except (ValueError, TypeError):

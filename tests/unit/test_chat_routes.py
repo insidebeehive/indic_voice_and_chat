@@ -9,6 +9,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.pool import NullPool
 
 from src.agents.base import AgentSession
 from src.agents.chatbot import ChatBotAgent
@@ -18,7 +19,7 @@ from src.auth import TenantContext, register_tenant_for_test
 from src.auth.middleware import set_tenant_resolver
 from src.config_tenant import TenantSettings
 from src.dialogue.context import SessionStore
-from src.interfaces.llm import ILLMProvider, LLMResult
+from src.interfaces.llm import ILLMProvider, LLMResult, ToolCall
 from src.interfaces.vector_store import Document
 from src.models.database import Base
 from src.models.tenant import Tenant
@@ -311,3 +312,193 @@ def test_post_without_auth_returns_401(app: FastAPI) -> None:
     client = TestClient(app)
     resp = client.post("/chat/message", json={"message": "x"})
     assert resp.status_code == 401
+
+
+# --- BO handover: claim + agent WebSocket ---------------------------------
+
+# Fixture using an escalating FakeLLM so tests can trigger escalation via the
+# customer WS without touching the DB directly (avoids aiosqlite/event-loop issues).
+class _FakeLLMEscalating(_FakeLLM):
+    """Returns an escalate_to_human tool call on the first tool-enabled call,
+    then plain text on the second (after tool result is appended)."""
+    def __init__(self):
+        super().__init__({
+            "response_text": "Connecting you to a human agent.",
+            "language": "en",
+            "sources_used": [],
+            "confidence": "high",
+            "action": "escalate",
+        })
+        self._round = 0
+
+    async def generate(self, messages, config) -> LLMResult:  # type: ignore[override]
+        self._round += 1
+        if self._round == 1 and getattr(config, "tools", None):
+            return LLMResult(
+                text="",
+                finish_reason="tool_calls",
+                tool_calls=[ToolCall(
+                    id="tc1", name="escalate_to_human",
+                    arguments={"reason": "user needs help", "summary": "refund query"},
+                )],
+            )
+        return await super().generate(messages, config)
+
+
+@pytest.fixture
+async def escalating_app(tmp_faiss_index: str, fake_redis, tmp_path):
+    store = FAISSAdapter({"embedding_dim": 64, "index_path": tmp_faiss_index})
+    retriever = HybridRetriever(
+        embedder=HashEmbedder(dim=64),
+        vector_store=store,
+        config=RetrievalConfig(strategy="hybrid", top_k=2, oversample_k=8, reranking=False),
+    )
+    await retriever.index([
+        Document(id="c1", content="refund policy", metadata={"filename": "policy.md", "page": 0})
+    ])
+    session_store = SessionStore(fake_redis, ttl_seconds=300, tenant_id="t1")
+    # NullPool + file DB so TestClient's background event loop creates fresh
+    # connections (not reused from pytest-asyncio's event loop), and all
+    # connections share the same persistent data.
+    db_path = tmp_path / "test_handover.db"
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{db_path}",
+        connect_args={"check_same_thread": False},
+        poolclass=NullPool,
+        future=True,
+    )
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    sm = async_sessionmaker(engine, expire_on_commit=False)
+    async with sm() as s:
+        s.add(Tenant(id="t1", slug="t1", name="Acme"))
+        await s.commit()
+
+    async def _session_override():
+        async with sm() as session:
+            yield session
+
+    async def factory(tenant: TenantContext, session_id: str) -> ChatBotAgent:
+        return ChatBotAgent(
+            session=AgentSession(session_id=session_id),
+            llm=_FakeLLMEscalating(),
+            retriever=retriever,
+            company_name="Acme",
+            store=session_store,
+            enable_tools=True,
+        )
+
+    chat.set_chatbot_factory(factory)
+    chat.set_chat_sessionmaker(sm)
+    chat.set_chat_handoff_store(session_store)
+    register_tenant_for_test(
+        TenantSettings(id="t1", slug="t1", name="Acme"),
+        plaintext_tokens=["test-token"],
+    )
+    a = FastAPI()
+    a.include_router(chat.router)
+    a.dependency_overrides[get_db_session] = _session_override
+    yield a
+    chat.set_chatbot_factory(None)
+    chat.set_chat_sessionmaker(None)
+    chat.set_chat_handoff_store(None)
+    set_tenant_resolver(None)
+    await engine.dispose()
+
+
+def test_claim_session_and_agent_ws(escalating_app: FastAPI) -> None:
+    """Full BO handover: customer WS escalates → claim → agent-ws history + reply."""
+    from starlette.websockets import WebSocketDisconnect
+
+    client = TestClient(escalating_app)
+    sid = _create_session(client)
+
+    # --- Trigger escalation via the customer WS ---
+    with client.websocket_connect(f"/chat/ws/{sid}") as ws:
+        ws.send_text(json.dumps({"type": "message", "text": "I want a refund"}))
+        # Consume: typing, message, escalation, mode_change
+        frames = []
+        for _ in range(4):
+            try:
+                frames.append(json.loads(ws.receive_text()))
+            except WebSocketDisconnect:  # pragma: no cover
+                break
+    types = [f["type"] for f in frames]
+    assert "mode_change" in types, f"expected mode_change, got: {types}"
+
+    # --- Claim ---
+    r = client.post(
+        f"/chat/sessions/{sid}/claim",
+        json={"agent_id": "a01", "agent_name": "Priya"},
+        headers=HEADERS,
+    )
+    assert r.status_code == 200, r.text
+    assert r.json() == {"status": "claimed", "agent_id": "a01"}
+
+    # Re-claim returns 409.
+    r2 = client.post(
+        f"/chat/sessions/{sid}/claim",
+        json={"agent_id": "a01", "agent_name": "Priya"},
+        headers=HEADERS,
+    )
+    assert r2.status_code == 409
+
+    # --- Agent WebSocket: history + reply + end ---
+    with client.websocket_connect(
+        f"/chat/sessions/{sid}/agent-ws?token=test-token"
+    ) as ws:
+        hist = json.loads(ws.receive_text())
+        assert hist["type"] == "history"
+        assert len(hist["messages"]) >= 1
+        assert hist["messages"][0]["role"] in ("customer", "agent")
+
+        # Agent sends a reply and ends the session.
+        ws.send_text(json.dumps({"type": "reply", "text": "Hi, I'm Priya. Let me help!"}))
+        ws.send_text(json.dumps({"type": "end"}))
+        # Drain all frames (possibly a "Customer disconnected" system notification)
+        # until the server closes — that close happens AFTER _end_session commits.
+        while True:
+            try:
+                ws.receive_text()
+            except WebSocketDisconnect:
+                break
+
+    # Verify via HTTP: session ended and agent message stored.
+    detail = client.get(f"/chat/sessions/{sid}", headers=HEADERS).json()
+    assert detail["status"] == "ended", f"expected ended, got: {detail['status']}"
+    ha = [m for m in detail["messages"] if m["role"] == "human_agent"]
+    assert len(ha) == 1, f"expected 1 human_agent message: {detail['messages']}"
+    assert ha[0]["content"] == "Hi, I'm Priya. Let me help!"
+
+    # Teardown queues so they don't bleed into other tests.
+    chat._bo_queues.pop(sid, None)
+    chat._customer_queues.pop(sid, None)
+
+
+def test_agent_ws_invalid_token_closes(app: FastAPI) -> None:
+    """WS closes with 'invalid token' when token is wrong (no DB access needed)."""
+    from starlette.websockets import WebSocketDisconnect
+
+    client = TestClient(app)
+    sid = _create_session(client)
+    # Session is in 'ai' mode — token check runs before mode check, so
+    # wrong-token always closes regardless of mode.
+    with pytest.raises(WebSocketDisconnect):
+        with client.websocket_connect(
+            f"/chat/sessions/{sid}/agent-ws?token=wrong-token"
+        ) as ws:
+            ws.receive_text()
+
+
+def test_agent_ws_wrong_mode_closes(app: FastAPI) -> None:
+    """WS closes when session is not in handover mode (ai mode by default)."""
+    from starlette.websockets import WebSocketDisconnect
+
+    client = TestClient(app)
+    sid = _create_session(client)
+
+    with pytest.raises(WebSocketDisconnect):
+        with client.websocket_connect(
+            f"/chat/sessions/{sid}/agent-ws?token=test-token"
+        ) as ws:
+            ws.receive_text()
