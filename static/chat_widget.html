@@ -25,6 +25,10 @@
   #composer input[type="text"] { flex:1; padding:.6rem; border:1px solid #d1d5db; border-radius:8px; }
   #attach-btn { background:none; border:none; font-size:1.2rem; cursor:pointer; padding:.3rem; color:#6b7280; line-height:1; }
   #attach-btn:hover { color:#111827; }
+  #mic-btn { background:none; border:none; font-size:1.2rem; cursor:pointer; padding:.3rem; color:#6b7280; line-height:1; }
+  #mic-btn:hover { color:#111827; }
+  #mic-btn.recording { color:#dc2626; }
+  #rec-timer { display:none; color:#dc2626; font-size:.85em; font-weight:600; }
   #file-input { display:none; }
   #preview-bar { display:none; align-items:center; gap:.5rem; padding:.4rem .7rem; background:#f0f9ff; border-top:1px solid #bae6fd; font-size:.8rem; color:#0369a1; }
   #preview-bar button { background:none; border:none; cursor:pointer; color:#64748b; font-size:1rem; line-height:1; }
@@ -52,6 +56,8 @@
   <div id="composer" class="hidden">
     <button id="attach-btn" title="Attach image or video">📎</button>
     <input id="file-input" type="file" accept="image/*,video/*" />
+    <button id="mic-btn" title="Record voice message" onclick="toggleRecording()">🎤</button>
+    <span id="rec-timer">0:00</span>
     <input id="text" type="text" placeholder="Type a message…" autocomplete="off" />
     <button id="send">Send</button>
     <button id="end" style="background:#9ca3af">End</button>
@@ -62,6 +68,7 @@
   const $ = (id) => document.getElementById(id);
   let ws = null, sessionId = null;
   let _wsUrl = null, _sessionEnded = false, _reconnectDelay = 2000, _reconnectTimer = null;
+  let pendingAudioBubble = null;
 
   function add(role, text) {
     const el = document.createElement("div");
@@ -145,6 +152,55 @@
           $("log").appendChild(el);
           $("log").scrollTop = $("log").scrollHeight;
         }
+      } else if (m.type === "audio_ack") {
+        if (pendingAudioBubble) {
+          pendingAudioBubble.el.src = m.media_url;
+          URL.revokeObjectURL(pendingAudioBubble.localUrl);
+          pendingAudioBubble = null;
+        }
+      } else if (m.type === "history") {
+        (m.messages || []).forEach(hm => {
+          if (hm.media_url && hm.media_mime) {
+            const mime = hm.media_mime.split(";")[0];
+            const src = hm.media_url + "?session_id=" + sessionId;
+            const side = (hm.role === "customer") ? "customer" : "agent";
+            const wrap = document.createElement("div");
+            wrap.className = "msg " + side;
+            let mediaEl;
+            if (mime.startsWith("image/")) {
+              mediaEl = document.createElement("img");
+              mediaEl.src = src;
+              mediaEl.style.cssText = "max-width:200px;border-radius:8px;display:block;";
+            } else if (mime.startsWith("video/")) {
+              mediaEl = document.createElement("video");
+              mediaEl.controls = true;
+              mediaEl.src = src;
+              mediaEl.style.maxWidth = "220px";
+            } else if (mime.startsWith("audio/")) {
+              mediaEl = document.createElement("audio");
+              mediaEl.controls = true;
+              mediaEl.src = src;
+              mediaEl.style.maxWidth = "220px";
+            }
+            if (mediaEl) {
+              wrap.appendChild(mediaEl);
+              $("log").appendChild(wrap);
+              $("log").scrollTop = $("log").scrollHeight;
+            } else {
+              add(side, "[media]");
+            }
+            return;
+          }
+          if (hm.role === "customer") {
+            add("customer", hm.text || "");
+          } else if (hm.role === "human_agent") {
+            add("agent", hm.text || "");
+          } else if (hm.role === "agent") {
+            add("agent", hm.text || "");
+          } else {
+            meta(hm.text || "");
+          }
+        });
       } else if (m.type === "ended") {
         _sessionEnded = true;
         add("agent", "— chat ended —"); $("composer").classList.add("hidden");
@@ -349,6 +405,105 @@ registerProcessor('capture-processor', CaptureProcessor);
   $("send").onclick = () => sendText($("text").value.trim());
   $("text").addEventListener("keydown", (e) => { if (e.key === "Enter") sendText($("text").value.trim()); });
   $("end").onclick = () => { if (ws && ws.readyState === 1) { _sessionEnded = true; ws.send(JSON.stringify({ type: "end" })); } };
+
+  // ---- Voice message recording ----
+  let _mediaRecorder = null;
+  let _audioChunks = [];
+  let _recTimerInterval = null;
+  let _recSeconds = 0;
+  const MAX_REC_SECONDS = 60;
+
+  function _stopRecording() {
+    if (_mediaRecorder && _mediaRecorder.state !== "inactive") {
+      _mediaRecorder.stop();
+    }
+  }
+
+  function addAudioBubble(src, side) {
+    const audio = document.createElement("audio");
+    audio.controls = true;
+    audio.src = src;
+    audio.style.maxWidth = "220px";
+    const wrap = document.createElement("div");
+    wrap.className = "msg " + side;
+    wrap.appendChild(audio);
+    $("log").appendChild(wrap);
+    $("log").scrollTop = $("log").scrollHeight;
+    return audio;
+  }
+
+  window.toggleRecording = async function () {
+    const btn = $("mic-btn");
+    const timer = $("rec-timer");
+
+    if (_mediaRecorder && _mediaRecorder.state === "recording") {
+      _stopRecording();
+      return;
+    }
+
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      alert("Microphone not supported in this browser.");
+      return;
+    }
+
+    let stream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    } catch (e) {
+      alert("Microphone permission denied.");
+      return;
+    }
+
+    _audioChunks = [];
+    _mediaRecorder = new MediaRecorder(stream, { mimeType: "audio/webm;codecs=opus" });
+
+    _mediaRecorder.ondataavailable = (e) => {
+      if (e.data.size > 0) _audioChunks.push(e.data);
+    };
+
+    _mediaRecorder.onstop = async () => {
+      clearInterval(_recTimerInterval);
+      timer.style.display = "none";
+      btn.textContent = "🎤";
+      btn.classList.remove("recording");
+      stream.getTracks().forEach(t => t.stop());
+
+      const blob = new Blob(_audioChunks, { type: "audio/webm;codecs=opus" });
+      _audioChunks = [];
+
+      // Show local audio bubble immediately (no server round-trip for playback)
+      const localUrl = URL.createObjectURL(blob);
+      const bubbleEl = addAudioBubble(localUrl, "customer");
+
+      // Encode and send over WS
+      const buf = await blob.arrayBuffer();
+      const bytes = new Uint8Array(buf);
+      let binary = "";
+      for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+      const b64 = btoa(binary);
+      if (ws && ws.readyState === 1) {
+        ws.send(JSON.stringify({ type: "audio", data: b64, mime: "audio/webm;codecs=opus" }));
+      }
+
+      // Track the bubble for audio_ack URL swap
+      pendingAudioBubble = { el: bubbleEl, localUrl };
+    };
+
+    _mediaRecorder.start();
+    btn.textContent = "⏹";
+    btn.classList.add("recording");
+    _recSeconds = 0;
+    timer.style.display = "inline";
+    timer.textContent = "0:00";
+
+    _recTimerInterval = setInterval(() => {
+      _recSeconds++;
+      const m = Math.floor(_recSeconds / 60);
+      const s = _recSeconds % 60;
+      timer.textContent = `${m}:${s.toString().padStart(2, "0")}`;
+      if (_recSeconds >= MAX_REC_SECONDS) _stopRecording();
+    }, 1000);
+  };
 })();
 </script>
 </body>
