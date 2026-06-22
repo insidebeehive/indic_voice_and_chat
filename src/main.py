@@ -350,6 +350,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                              platform_retriever=platform_retriever))
     chat_api.set_chat_sessionmaker(sessionmaker)
     chat_api.set_chat_handoff_store(base_session_store)
+    from src.providers.media.s3 import S3MediaStorage
+    if settings.media_storage is not None:
+        ms = settings.media_storage
+        chat_api.set_media_store(S3MediaStorage(
+            endpoint_url=ms.endpoint_url,
+            access_key=ms.access_key,
+            secret_key=ms.secret_key,
+            bucket=ms.bucket,
+            region=ms.region,
+        ))
     # Knowledge ingest/query resolve the SAME per-tenant retriever the chatbot
     # uses (registry.retrievers), so ingested docs are retrievable in chat.
     knowledge_api.set_retriever_factory(lambda t: runtime_registry.retrievers.get(t))
@@ -372,6 +382,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         chat_api.set_chatbot_factory(None)
         chat_api.set_chat_sessionmaker(None)
         chat_api.set_chat_handoff_store(None)
+        chat_api.set_media_store(None)
         knowledge_api.set_retriever_factory(None)
         knowledge_api.set_platform_retriever(None)
         set_browser_bridge_factory(None)

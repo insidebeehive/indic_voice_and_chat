@@ -192,6 +192,15 @@ class ComplianceConfig(BaseModel):
     retry_interval_hours: int = 2
 
 
+class MediaStorageConfig(BaseModel):
+    endpoint_url: Optional[str] = None  # omit for AWS S3; set for R2/B2/MinIO
+    access_key: str = ""
+    secret_key: str = ""
+    bucket: str = "chat-media"
+    region: str = "auto"
+    signed_url_ttl_seconds: int = 3600
+
+
 # --- Top-level settings ---------------------------------------------------
 
 
@@ -223,6 +232,13 @@ class Secrets(BaseSettings):
     VOX_DB_SCHEMA: Optional[str] = None
     REDIS_URL: Optional[str] = None
 
+    # Media storage (S3-compatible)
+    MEDIA_STORAGE_ENDPOINT_URL: Optional[str] = None
+    MEDIA_STORAGE_ACCESS_KEY: Optional[str] = None
+    MEDIA_STORAGE_SECRET_KEY: Optional[str] = None
+    MEDIA_STORAGE_BUCKET: Optional[str] = None
+    MEDIA_STORAGE_REGION: Optional[str] = None
+
     # Misc
     WEBHOOK_BASE_URL: Optional[str] = None
     SECRET_KEY: str = "change-me-in-prod"
@@ -240,6 +256,7 @@ class Settings(BaseModel):
     voice_pipeline: VoicePipelineConfig
     rag: RAGConfig
     compliance: ComplianceConfig
+    media_storage: Optional[MediaStorageConfig] = None
 
     secrets: Secrets
 
@@ -266,6 +283,17 @@ def _apply_env_overrides(yaml_data: dict[str, Any], secrets: Secrets) -> dict[st
         yaml_data.setdefault("pipeline", {}).setdefault("telephony", {})[
             "webhook_base_url"
         ] = secrets.WEBHOOK_BASE_URL
+    ms = secrets
+    if ms.MEDIA_STORAGE_ACCESS_KEY:
+        yaml_data.setdefault("media_storage", {})["access_key"] = ms.MEDIA_STORAGE_ACCESS_KEY
+    if ms.MEDIA_STORAGE_SECRET_KEY:
+        yaml_data.setdefault("media_storage", {})["secret_key"] = ms.MEDIA_STORAGE_SECRET_KEY
+    if ms.MEDIA_STORAGE_BUCKET:
+        yaml_data.setdefault("media_storage", {})["bucket"] = ms.MEDIA_STORAGE_BUCKET
+    if ms.MEDIA_STORAGE_ENDPOINT_URL:
+        yaml_data.setdefault("media_storage", {})["endpoint_url"] = ms.MEDIA_STORAGE_ENDPOINT_URL
+    if ms.MEDIA_STORAGE_REGION:
+        yaml_data.setdefault("media_storage", {})["region"] = ms.MEDIA_STORAGE_REGION
     return yaml_data
 
 

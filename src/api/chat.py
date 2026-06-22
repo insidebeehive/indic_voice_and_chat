@@ -20,6 +20,7 @@ sessionmaker (for the WS tenant lookup + message persistence) is injected via
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import uuid
@@ -37,11 +38,13 @@ from fastapi import (
     WebSocket,
     WebSocketDisconnect,
 )
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.agents.chatbot import ChatBotAgent, ChatTurnResult
+from src.interfaces.media_storage import IMediaStorage
 from src.api.deps import get_db_session
 from src.auth import TenantContext, current_tenant
 from src.interfaces.llm import LLMMessage
@@ -64,6 +67,7 @@ _handoff_store: object | None = None  # SessionStore: carries chat→voice hando
 # _customer_queues: BO agent WS puts here → customer WS reads
 _bo_queues: dict = {}
 _customer_queues: dict = {}
+_media_store: Optional[IMediaStorage] = None
 
 
 def set_chat_handoff_store(store: object | None) -> None:
@@ -71,6 +75,29 @@ def set_chat_handoff_store(store: object | None) -> None:
     chat summary into the voice agent."""
     global _handoff_store
     _handoff_store = store
+
+
+def set_media_store(store: Optional[IMediaStorage]) -> None:
+    """Inject (or clear) the S3-compatible media store used to persist chat media."""
+    global _media_store
+    _media_store = store
+
+
+def _mime_ext(mime: str) -> str:
+    mapping = {
+        "audio/webm": "webm", "audio/ogg": "ogg",
+        "audio/mpeg": "mp3", "audio/mp4": "m4a", "audio/wav": "wav",
+        "image/jpeg": "jpg", "image/png": "png",
+        "image/gif": "gif", "image/webp": "webp",
+        "video/mp4": "mp4", "video/webm": "webm", "video/quicktime": "mov",
+    }
+    base = mime.split(";")[0].strip().lower()
+    return mapping.get(base) or base.split("/")[-1]
+
+
+def _media_key(tenant_id: str, session_id: str, mime: str) -> str:
+    ext = _mime_ext(mime)
+    return f"chat/{tenant_id}/{session_id}/{uuid.uuid4().hex}.{ext}"
 
 
 def set_chatbot_factory(factory: Optional[ChatBotFactory]) -> None:

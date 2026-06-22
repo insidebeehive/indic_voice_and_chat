@@ -33,6 +33,20 @@ def test_env_override_database_url(monkeypatch) -> None:
     assert s.database.url == "postgresql+asyncpg://x:y@example:5432/somedb"
 
 
+def test_media_storage_config_from_env(monkeypatch):
+    monkeypatch.setenv("MEDIA_STORAGE_ACCESS_KEY", "ak")
+    monkeypatch.setenv("MEDIA_STORAGE_SECRET_KEY", "sk")
+    monkeypatch.setenv("MEDIA_STORAGE_BUCKET", "mybucket")
+    monkeypatch.setenv("MEDIA_STORAGE_ENDPOINT_URL", "https://r2.example.com")
+    from src.config import reset_settings_cache, load_settings
+    reset_settings_cache()
+    s = load_settings("config/default.yaml")
+    assert s.media_storage is not None
+    assert s.media_storage.access_key == "ak"
+    assert s.media_storage.bucket == "mybucket"
+    reset_settings_cache()
+
+
 def test_explicit_path_override(tmp_path: Path) -> None:
     custom = tmp_path / "custom.yaml"
     custom.write_text(
