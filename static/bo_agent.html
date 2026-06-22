@@ -44,6 +44,10 @@
   .composer { border-top:1px solid #1f2937; display:flex; gap:.5rem; padding:.75rem 1rem; flex-shrink:0; }
   .composer textarea { flex:1; background:#0b1220; color:#e2e8f0; border:1px solid #334155; border-radius:.4rem; padding:.5rem; font:inherit; font-size:.88rem; resize:none; height:2.6rem; min-height:2.6rem; }
   .composer textarea:focus { outline:none; border-color:#3b82f6; }
+  .pending-card { background:#1e293b; border:1px solid #334155; border-radius:.4rem; padding:.4rem .6rem; cursor:pointer; font-size:.8rem; }
+  .pending-card:hover { border-color:#3b82f6; }
+  .pending-card .pc-name { font-weight:600; color:#e2e8f0; }
+  .pending-card .pc-meta { color:#94a3b8; margin-top:.15rem; }
 </style>
 </head>
 <body>
@@ -78,6 +82,14 @@
       <h2>Status</h2>
       <span id="statusPill" class="status-pill s-disconnected">Disconnected</span>
       <div id="statusDetail" class="hint" style="margin-top:.4rem"></div>
+    </div>
+
+    <hr class="sep" />
+
+    <div>
+      <h2>Pending sessions <button class="ghost sm" onclick="loadPending()" style="margin-left:.4rem">↻</button></h2>
+      <p class="hint" style="margin:.1rem 0 .5rem">Sessions awaiting a human agent. Auto-refreshes every 10 s.</p>
+      <div id="pendingList" style="display:flex;flex-direction:column;gap:.4rem;margin-top:.4rem"></div>
     </div>
 
     <hr class="sep" />
@@ -304,6 +316,69 @@ function cleanup() {
   $("btnSend").disabled = true;
   currentSession = null;
 }
+
+// ---------------------------------------------------------------------------
+// Pending sessions panel
+// ---------------------------------------------------------------------------
+let _pollTimer = null;
+
+async function loadPending() {
+  if (!token()) return;
+  try {
+    const r = await fetch(`${base()}/api/v1/chat/sessions?mode=awaiting_human`, {
+      headers: { "Authorization": `Bearer ${token()}` },
+    });
+    if (!r.ok) return;
+    const data = await r.json();
+    renderPending(data.sessions || []);
+  } catch {}
+}
+
+function renderPending(sessions) {
+  const el = $("pendingList");
+  if (!sessions.length) {
+    el.innerHTML = '<p class="hint" style="margin:0">No sessions waiting</p>';
+    return;
+  }
+  el.innerHTML = "";
+  sessions.forEach(s => {
+    const card = document.createElement("div");
+    card.className = "pending-card";
+    const name = s.customer_name || s.customer_id || "Anonymous";
+    const age = s.started_at ? _ago(s.started_at) : "";
+    card.innerHTML =
+      `<div class="pc-name">${name}</div>` +
+      `<div class="pc-meta">${s.message_count} msgs · ${age}</div>`;
+    card.onclick = () => {
+      $("sessionId").value = s.session_id;
+      sysMsg(`Session ${s.session_id} selected from pending list`);
+    };
+    el.appendChild(card);
+  });
+}
+
+function _ago(isoStr) {
+  const ms = Date.now() - new Date(isoStr).getTime();
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return `${s}s ago`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ago`;
+  return `${Math.floor(m / 60)}h ago`;
+}
+
+function startPoll() {
+  loadPending();
+  if (_pollTimer) clearInterval(_pollTimer);
+  _pollTimer = setInterval(loadPending, 10000);
+}
+
+// Start polling once creds are saved or on load if token already stored.
+(function initPoll() {
+  if (localStorage.getItem("bo_token")) startPoll();
+})();
+
+const _origSaveCreds = saveCreds;
+saveCreds = function() { _origSaveCreds(); startPoll(); };
 
 // ---------------------------------------------------------------------------
 // Parse claim_url from escalation webhook

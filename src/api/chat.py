@@ -150,6 +150,7 @@ class CreateSessionResponse(BaseModel):
 class SessionSummary(BaseModel):
     session_id: str
     status: str
+    mode: str
     customer_id: Optional[str] = None
     customer_name: Optional[str] = None
     language: str
@@ -234,6 +235,7 @@ async def create_session(
 @router.get("/sessions", response_model=SessionListResponse)
 async def list_sessions(
     status: Optional[str] = None,
+    mode: Optional[str] = None,
     customer_id: Optional[str] = None,
     tenant: TenantContext = Depends(current_tenant),
     session: AsyncSession = Depends(get_db_session),
@@ -241,6 +243,8 @@ async def list_sessions(
     q = select(ChatSession).where(ChatSession.tenant_id == tenant.id)
     if status:
         q = q.where(ChatSession.status == status)
+    if mode:
+        q = q.where(ChatSession.mode == mode)
     if customer_id:
         q = q.where(ChatSession.customer_id == customer_id)
     q = q.order_by(ChatSession.started_at.desc())
@@ -274,7 +278,7 @@ async def get_session(
 
 def _summary(row: ChatSession) -> SessionSummary:
     return SessionSummary(
-        session_id=row.id, status=row.status,
+        session_id=row.id, status=row.status, mode=row.mode,
         customer_id=row.customer_id, customer_name=row.customer_name,
         language=row.language, message_count=row.message_count,
         started_at=row.started_at.isoformat() if row.started_at else None,
