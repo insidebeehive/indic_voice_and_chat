@@ -119,65 +119,125 @@
   let voiceWs = null;
 
   function showCallOffer(reason, callUrl) {
-    // Show a dismissible banner with a "Start Voice Call" button.
-    const banner = document.createElement("div");
-    banner.id = "call-banner";
-    banner.style.cssText = "background:#1d4ed8;color:#fff;padding:.6rem 1rem;display:flex;gap:.5rem;align-items:center;font-size:.85rem;";
-    const label = document.createElement("span");
-    label.textContent = "🎙 Voice call available" + (reason ? ` — ${reason}` : "");
-    label.style.flex = "1";
+    if (!callUrl) {
+      add("agent", "⚠️ Voice call could not be set up right now. Please try again or type your question.");
+      return;
+    }
+    // Render as a chat bubble so it's always visible in the conversation flow.
+    const wrap = document.createElement("div");
+    wrap.className = "msg agent";
+    wrap.style.cssText = "background:#eff6ff;border:1px solid #bfdbfe;display:flex;flex-direction:column;gap:.4rem;";
+    const lbl = document.createElement("span");
+    lbl.textContent = "🎙 Ready to connect a voice call" + (reason ? ` — ${reason}` : "") + ".";
     const btn = document.createElement("button");
-    btn.textContent = "Start Call";
-    btn.style.cssText = "padding:.35rem .7rem;background:#fff;color:#1d4ed8;border:0;border-radius:6px;cursor:pointer;font-weight:600;";
-    btn.onclick = () => { banner.remove(); startVoiceCall(callUrl); };
-    const dismiss = document.createElement("button");
-    dismiss.textContent = "✕";
-    dismiss.style.cssText = "background:transparent;border:0;color:#fff;cursor:pointer;font-size:1rem;";
-    dismiss.onclick = () => banner.remove();
-    banner.appendChild(label); banner.appendChild(btn); banner.appendChild(dismiss);
-    $("app").insertBefore(banner, $("log"));
+    btn.textContent = "Start Voice Call";
+    btn.style.cssText = "padding:.4rem .8rem;background:#1d4ed8;color:#fff;border:0;border-radius:6px;cursor:pointer;font-weight:600;align-self:flex-start;";
+    btn.onclick = () => { btn.disabled = true; btn.textContent = "Connecting…"; startVoiceCall(callUrl); };
+    wrap.appendChild(lbl); wrap.appendChild(btn);
+    $("log").appendChild(wrap);
+    $("log").scrollTop = $("log").scrollHeight;
+  }
+
+  // Inline worklet — no external file needed (mirrors dev_console.html approach).
+  const VOICE_WORKLET = `
+class CaptureProcessor extends AudioWorkletProcessor {
+  process(inputs) {
+    const ch = inputs[0] && inputs[0][0];
+    if (ch) this.port.postMessage(ch.slice(0));
+    return true;
+  }
+}
+registerProcessor('capture-processor', CaptureProcessor);
+`;
+
+  function _downsampleToInt16(float32, inRate) {
+    const TARGET = 16000;
+    if (inRate === TARGET) {
+      const out = new Int16Array(float32.length);
+      for (let i = 0; i < float32.length; i++) {
+        const s = Math.max(-1, Math.min(1, float32[i]));
+        out[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+      }
+      return out;
+    }
+    const ratio = inRate / TARGET;
+    const outLen = Math.floor(float32.length / ratio);
+    const out = new Int16Array(outLen);
+    for (let i = 0; i < outLen; i++) {
+      const s = Math.max(-1, Math.min(1, float32[Math.floor(i * ratio)]));
+      out[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+    }
+    return out;
   }
 
   function startVoiceCall(callUrl) {
-    if (!callUrl) { meta("voice call unavailable (no URL)"); return; }
+    if (!callUrl) { add("agent", "⚠️ No call URL — voice call unavailable."); return; }
     add("agent", "— connecting voice call… —");
     voiceWs = new WebSocket(callUrl);
-    // Feed mic audio to the voice WebSocket (basic passthrough; mirrors dev console).
-    navigator.mediaDevices.getUserMedia({ audio: true }).then((stream) => {
-      const ctx = new AudioContext({ sampleRate: 16000 });
-      const src = ctx.createMediaStreamSource(stream);
-      ctx.audioWorklet.addModule("/static/pcm-processor.js").then(() => {
-        const node = new AudioWorkletNode(ctx, "pcm-processor");
-        src.connect(node);
-        node.port.onmessage = (e) => {
-          if (voiceWs && voiceWs.readyState === 1) voiceWs.send(e.data);
+    voiceWs.binaryType = "arraybuffer";
+
+    let audioCtx = null, playCursor = 0, micStream = null, workletNode = null, running = false;
+
+    function playPcm16(int16) {
+      const buf = audioCtx.createBuffer(1, int16.length, 16000);
+      const ch = buf.getChannelData(0);
+      for (let i = 0; i < int16.length; i++) ch[i] = int16[i] / 0x8000;
+      const src = audioCtx.createBufferSource();
+      src.buffer = buf; src.connect(audioCtx.destination);
+      const now = audioCtx.currentTime;
+      if (playCursor < now) playCursor = now;
+      src.start(playCursor);
+      playCursor += buf.duration;
+    }
+
+    function teardown() {
+      running = false;
+      if (workletNode) { try { workletNode.disconnect(); } catch (_) {} workletNode = null; }
+      if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
+      if (audioCtx) { audioCtx.close(); audioCtx = null; }
+      if (voiceWs && voiceWs.readyState === 1) voiceWs.close();
+      voiceWs = null;
+    }
+
+    voiceWs.onopen = async () => {
+      voiceWs.send(JSON.stringify({ type: "hello", tenant: "chat" }));
+      try {
+        micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        audioCtx = new AudioContext({ sampleRate: 16000 });
+        const blobUrl = URL.createObjectURL(new Blob([VOICE_WORKLET], { type: "application/javascript" }));
+        await audioCtx.audioWorklet.addModule(blobUrl);
+        workletNode = new AudioWorkletNode(audioCtx, "capture-processor");
+        workletNode.port.onmessage = (e) => {
+          if (!running || !voiceWs || voiceWs.readyState !== 1) return;
+          voiceWs.send(_downsampleToInt16(e.data, audioCtx.sampleRate).buffer);
         };
-      });
-      voiceWs.onmessage = (ev) => {
+        const src = audioCtx.createMediaStreamSource(micStream);
+        const sink = audioCtx.createGain(); sink.gain.value = 0;
+        src.connect(workletNode); workletNode.connect(sink).connect(audioCtx.destination);
+        running = true;
+        add("agent", "— voice call connected — speak now —");
+      } catch (err) {
+        add("agent", "⚠️ Mic error: " + err.message);
+        teardown();
+      }
+    };
+
+    voiceWs.onmessage = (ev) => {
+      if (ev.data instanceof ArrayBuffer) {
+        if (audioCtx) playPcm16(new Int16Array(ev.data));
+        return;
+      }
+      try {
         const m = JSON.parse(ev.data);
-        if (m.type === "audio") {
-          // Play TTS audio returned from the voice bridge.
-          const buf = Uint8Array.from(atob(m.data), c => c.charCodeAt(0));
-          ctx.decodeAudioData(buf.buffer).then(decoded => {
-            const src2 = ctx.createBufferSource();
-            src2.buffer = decoded; src2.connect(ctx.destination); src2.start();
-          }).catch(() => {});
-        } else if (m.type === "state" && m.state === "ended") {
-          add("agent", "— voice call ended —");
-          voiceWs.close(); voiceWs = null;
-          stream.getTracks().forEach(t => t.stop());
-        } else if (m.type === "transcript" || m.type === "message") {
-          if (m.role === "agent" && m.text) add("agent", m.text);
+        if (m.type === "transcript" && m.role === "agent" && m.text) add("agent", m.text);
+        else if (m.type === "state" && m.state === "ended") {
+          add("agent", "— voice call ended —"); teardown();
         }
-      };
-      voiceWs.onclose = () => {
-        add("agent", "— voice call disconnected —");
-        stream.getTracks().forEach(t => t.stop());
-        voiceWs = null;
-      };
-    }).catch((err) => {
-      meta("mic access denied: " + err.message);
-    });
+      } catch (_) {}
+    };
+
+    voiceWs.onclose = () => { add("agent", "— voice call disconnected —"); teardown(); };
+    voiceWs.onerror = () => { add("agent", "⚠️ Voice connection error."); teardown(); };
   }
 
   function sendText(text) {
