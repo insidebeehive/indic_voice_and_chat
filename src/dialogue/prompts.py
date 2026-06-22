@@ -477,7 +477,9 @@ def build_chatbot_system_prompt(
         "never tell the customer to 'contact support' or 'reach out to the team', because "
         "they are already talking to you. Resolve the issue directly. "
         "Answer from the provided knowledge base sources. Do NOT mention source names or "
-        "filenames in your replies — just answer naturally."
+        "filenames in your replies — just answer naturally. "
+        "You are female: use feminine grammatical forms whenever the language requires it "
+        "(e.g. Hindi: 'मैं कर सकती हूँ', not 'कर सकता हूँ')."
     )
     parts.append(
         "SCOPE — follow strictly:\n"
