@@ -21,8 +21,13 @@
   #typing { font-style:italic; color:#6b7280; padding:0 1rem .4rem; height:1.1rem; }
   #suggestions { display:flex; gap:.4rem; flex-wrap:wrap; padding:0 1rem .4rem; }
   #suggestions button { background:#e5e7eb; color:#111827; border:0; border-radius:14px; padding:.35rem .7rem; cursor:pointer; font-size:.8rem; }
-  #composer { display:flex; gap:.5rem; padding:.7rem; border-top:1px solid #e5e7eb; background:#fff; }
-  #composer input { flex:1; padding:.6rem; border:1px solid #d1d5db; border-radius:8px; }
+  #composer { display:flex; gap:.5rem; padding:.7rem; border-top:1px solid #e5e7eb; background:#fff; align-items:center; }
+  #composer input[type="text"] { flex:1; padding:.6rem; border:1px solid #d1d5db; border-radius:8px; }
+  #attach-btn { background:none; border:none; font-size:1.2rem; cursor:pointer; padding:.3rem; color:#6b7280; line-height:1; }
+  #attach-btn:hover { color:#111827; }
+  #file-input { display:none; }
+  #preview-bar { display:none; align-items:center; gap:.5rem; padding:.4rem .7rem; background:#f0f9ff; border-top:1px solid #bae6fd; font-size:.8rem; color:#0369a1; }
+  #preview-bar button { background:none; border:none; cursor:pointer; color:#64748b; font-size:1rem; line-height:1; }
   .hidden { display:none; }
 </style>
 </head>
@@ -40,8 +45,14 @@
   <div id="log" class="hidden"></div>
   <div id="typing"></div>
   <div id="suggestions"></div>
+  <div id="preview-bar">
+    <span id="preview-name"></span>
+    <button id="preview-clear" title="Remove">✕</button>
+  </div>
   <div id="composer" class="hidden">
-    <input id="text" placeholder="Type a message…" autocomplete="off" />
+    <button id="attach-btn" title="Attach image or video">📎</button>
+    <input id="file-input" type="file" accept="image/*,video/*" />
+    <input id="text" type="text" placeholder="Type a message…" autocomplete="off" />
     <button id="send">Send</button>
     <button id="end" style="background:#9ca3af">End</button>
   </div>
@@ -240,8 +251,51 @@ registerProcessor('capture-processor', CaptureProcessor);
     voiceWs.onerror = () => { add("agent", "⚠️ Voice connection error."); teardown(); };
   }
 
+  // --- Attachment handling ------------------------------------------------
+  let pendingFile = null;
+
+  function clearPending() {
+    pendingFile = null;
+    $("preview-bar").style.display = "none";
+    $("preview-name").textContent = "";
+    $("file-input").value = "";
+  }
+
+  $("attach-btn").onclick = () => $("file-input").click();
+
+  $("file-input").onchange = () => {
+    const f = $("file-input").files[0];
+    if (!f) return;
+    pendingFile = f;
+    $("preview-name").textContent = f.name;
+    $("preview-bar").style.display = "flex";
+  };
+
+  $("preview-clear").onclick = clearPending;
+
+  function sendMedia(file, caption) {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const dataUrl = reader.result;           // "data:<mime>;base64,<data>"
+      const comma = dataUrl.indexOf(",");
+      const b64 = dataUrl.slice(comma + 1);
+      const mime = file.type || "application/octet-stream";
+      const mtype = mime.startsWith("video/") ? "video" : "image";
+      add("customer", (caption ? caption + "\n" : "") + `[${file.name}]`);
+      ws.send(JSON.stringify({ type: mtype, data: b64, mime, text: caption }));
+    };
+    reader.readAsDataURL(file);
+  }
+
   function sendText(text) {
-    if (!text || !ws || ws.readyState !== 1) return;
+    if (!ws || ws.readyState !== 1) return;
+    if (pendingFile) {
+      sendMedia(pendingFile, text);
+      clearPending();
+      $("text").value = "";
+      return;
+    }
+    if (!text) return;
     add("customer", text);
     ws.send(JSON.stringify({ type: "message", text: text }));
     $("text").value = "";
