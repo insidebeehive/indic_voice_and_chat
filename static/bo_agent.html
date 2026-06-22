@@ -36,9 +36,10 @@
   .chat-wrap { flex:1; display:flex; flex-direction:column; min-height:0; }
   .log { flex:1; overflow-y:auto; padding:1rem; display:flex; flex-direction:column; gap:.55rem; }
   .msg { max-width:72%; padding:.5rem .75rem; border-radius:.6rem; font-size:.88rem; line-height:1.45; }
-  .msg.customer { background:#1e293b; align-self:flex-start; }
-  .msg.agent    { background:#1e3a5f; align-self:flex-end; }
-  .msg.system   { background:transparent; align-self:center; color:#94a3b8; font-size:.78rem; font-style:italic; }
+  .msg.customer  { background:#1e293b; align-self:flex-start; }
+  .msg.ai-agent  { background:#1e2a1e; align-self:flex-start; border-left:3px solid #4ade80; }
+  .msg.agent     { background:#1e3a5f; align-self:flex-end; }
+  .msg.system    { background:transparent; align-self:center; color:#94a3b8; font-size:.78rem; font-style:italic; }
   .msg .who { font-size:.68rem; color:#64748b; margin-bottom:.2rem; }
   .composer { border-top:1px solid #1f2937; display:flex; gap:.5rem; padding:.75rem 1rem; flex-shrink:0; }
   .composer textarea { flex:1; background:#0b1220; color:#e2e8f0; border:1px solid #334155; border-radius:.4rem; padding:.5rem; font:inherit; font-size:.88rem; resize:none; height:2.6rem; min-height:2.6rem; }
@@ -155,7 +156,7 @@ function addMsg(who, text, cls) {
   if (who !== "system") {
     const lbl = document.createElement("div");
     lbl.className = "who";
-    lbl.textContent = who === "customer" ? "Customer" : "You (agent)";
+    lbl.textContent = who === "customer" ? "Customer" : (who === "ai-agent" ? "AI Agent" : "You (agent)");
     div.appendChild(lbl);
   }
   const txt = document.createElement("span");
@@ -225,13 +226,21 @@ function connectWs(sessionId) {
       clearLog();
       sysMsg("--- conversation history ---");
       (msg.messages || []).forEach(m => {
-        const cls = m.role === "user" ? "customer" : (m.role === "human_agent" ? "agent" : "system");
-        addMsg(cls === "customer" ? "customer" : (cls === "agent" ? "agent" : "system"),
-               m.text, cls);
+        if (m.role === "user" || m.role === "customer") {
+          addMsg("customer", m.text, "customer");
+        } else if (m.role === "human_agent") {
+          addMsg("agent", m.text, "agent");
+        } else if (m.role === "agent") {
+          addMsg("ai-agent", m.text, "ai-agent");
+        } else {
+          sysMsg(m.text);
+        }
       });
       sysMsg("--- live ---");
     } else if (msg.type === "customer_message") {
       addMsg("customer", msg.text);
+    } else if (msg.type === "system") {
+      sysMsg(msg.text);
     } else if (msg.type === "session_ended") {
       sysMsg("Customer disconnected — session ended");
       setStatus("ended", "Customer left");

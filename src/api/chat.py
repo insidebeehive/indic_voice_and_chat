@@ -524,8 +524,10 @@ async def agent_websocket(websocket: WebSocket, session_id: str) -> None:
 
             if bq_task in done:
                 item = bq_task.result()
-                if item is None:  # customer disconnected sentinel
-                    break
+                if item is None:  # customer WS dropped — notify agent but keep loop alive
+                    await websocket.send_text(json.dumps({
+                        "type": "system", "text": "Customer disconnected — session still open"}))
+                    continue
                 await websocket.send_text(item)
 
             if ws_task in done:
