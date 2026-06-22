@@ -105,12 +105,79 @@
         add("agent", m.text);
         if (m.sources && m.sources.length) meta("sources: " + m.sources.join(", "));
         setSuggestions(m.suggestions);
+      } else if (m.type === "call_offer") {
+        showCallOffer(m.reason, m.call_url);
       } else if (m.type === "ended") {
         add("agent", "— chat ended —"); $("composer").classList.add("hidden");
       } else if (m.type === "error") {
         meta("error: " + m.message);
       }
     };
+  }
+
+  // --- Voice call offer ---------------------------------------------------
+  let voiceWs = null;
+
+  function showCallOffer(reason, callUrl) {
+    // Show a dismissible banner with a "Start Voice Call" button.
+    const banner = document.createElement("div");
+    banner.id = "call-banner";
+    banner.style.cssText = "background:#1d4ed8;color:#fff;padding:.6rem 1rem;display:flex;gap:.5rem;align-items:center;font-size:.85rem;";
+    const label = document.createElement("span");
+    label.textContent = "🎙 Voice call available" + (reason ? ` — ${reason}` : "");
+    label.style.flex = "1";
+    const btn = document.createElement("button");
+    btn.textContent = "Start Call";
+    btn.style.cssText = "padding:.35rem .7rem;background:#fff;color:#1d4ed8;border:0;border-radius:6px;cursor:pointer;font-weight:600;";
+    btn.onclick = () => { banner.remove(); startVoiceCall(callUrl); };
+    const dismiss = document.createElement("button");
+    dismiss.textContent = "✕";
+    dismiss.style.cssText = "background:transparent;border:0;color:#fff;cursor:pointer;font-size:1rem;";
+    dismiss.onclick = () => banner.remove();
+    banner.appendChild(label); banner.appendChild(btn); banner.appendChild(dismiss);
+    $("app").insertBefore(banner, $("log"));
+  }
+
+  function startVoiceCall(callUrl) {
+    if (!callUrl) { meta("voice call unavailable (no URL)"); return; }
+    add("agent", "— connecting voice call… —");
+    voiceWs = new WebSocket(callUrl);
+    // Feed mic audio to the voice WebSocket (basic passthrough; mirrors dev console).
+    navigator.mediaDevices.getUserMedia({ audio: true }).then((stream) => {
+      const ctx = new AudioContext({ sampleRate: 16000 });
+      const src = ctx.createMediaStreamSource(stream);
+      ctx.audioWorklet.addModule("/static/pcm-processor.js").then(() => {
+        const node = new AudioWorkletNode(ctx, "pcm-processor");
+        src.connect(node);
+        node.port.onmessage = (e) => {
+          if (voiceWs && voiceWs.readyState === 1) voiceWs.send(e.data);
+        };
+      });
+      voiceWs.onmessage = (ev) => {
+        const m = JSON.parse(ev.data);
+        if (m.type === "audio") {
+          // Play TTS audio returned from the voice bridge.
+          const buf = Uint8Array.from(atob(m.data), c => c.charCodeAt(0));
+          ctx.decodeAudioData(buf.buffer).then(decoded => {
+            const src2 = ctx.createBufferSource();
+            src2.buffer = decoded; src2.connect(ctx.destination); src2.start();
+          }).catch(() => {});
+        } else if (m.type === "state" && m.state === "ended") {
+          add("agent", "— voice call ended —");
+          voiceWs.close(); voiceWs = null;
+          stream.getTracks().forEach(t => t.stop());
+        } else if (m.type === "transcript" || m.type === "message") {
+          if (m.role === "agent" && m.text) add("agent", m.text);
+        }
+      };
+      voiceWs.onclose = () => {
+        add("agent", "— voice call disconnected —");
+        stream.getTracks().forEach(t => t.stop());
+        voiceWs = null;
+      };
+    }).catch((err) => {
+      meta("mic access denied: " + err.message);
+    });
   }
 
   function sendText(text) {

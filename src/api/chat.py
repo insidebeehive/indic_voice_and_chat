@@ -404,7 +404,7 @@ async def chat_history(
 
 
 @router.websocket("/ws/{session_id}")
-async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
+async def chat_websocket(websocket: WebSocket, session_id: str, request: Request) -> None:
     await websocket.accept()
     if _factory is None:
         await websocket.close(code=1011, reason="chatbot factory unset")
@@ -466,7 +466,21 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
                 await websocket.send_text(json.dumps({"type": "typing"}))
                 result = await agent.handle_message(user_text)
                 await _persist_turn(session_id, user_text, result)
-                await _send_reply(websocket, session_id, result, tenant.id)
+                call_url: Optional[str] = None
+                if result.call_offer and _handoff_store is not None:
+                    summary = await agent.summarize_session()
+                    token = uuid.uuid4().hex
+                    context = {
+                        "chat_session_id": session_id,
+                        "customer_name": row.customer_name,
+                        "customer_id": row.customer_id,
+                        "language": row.language,
+                        "chat_summary": summary,
+                    }
+                    await _handoff_store.redis.set(
+                        f"chat_handoff:{token}", json.dumps(context), ex=600)
+                    call_url = _voice_call_url(request, tenant.slug, token)
+                await _send_reply(websocket, session_id, result, tenant.id, call_url=call_url)
             except WebSocketDisconnect:
                 raise
             except Exception:  # noqa: BLE001 — one bad turn must not drop the chat
@@ -488,6 +502,7 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
 
 async def _send_reply(
     websocket: WebSocket, session_id: str, result: ChatTurnResult, tenant_id: str,
+    *, call_url: Optional[str] = None,
 ) -> None:
     """Send the agent's reply frame, plus an escalation/call_offer frame if the
     agent's tools fired one, and emit a signed chat.escalated tenant event."""
@@ -509,6 +524,7 @@ async def _send_reply(
         await websocket.send_text(json.dumps({
             "type": "call_offer",
             "reason": result.call_offer.get("reason", ""),
+            "call_url": call_url,  # WebSocket URL the browser connects to directly
         }))
     await _emit_escalation(tenant_id, session_id, result)
 

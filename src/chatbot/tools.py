@@ -47,8 +47,13 @@ BUILTIN_TOOLS: list[ToolSpec] = [
     ),
     ToolSpec(
         name=OFFER_CALL,
-        description=("Offer the customer a voice call when the issue would be easier "
-                     "to resolve by talking."),
+        description=(
+            "Offer the customer a browser-based voice call so they can speak with "
+            "you directly — no phone number needed. The system automatically opens "
+            "a web audio call in their browser. Use when the issue is complex enough "
+            "that talking would be faster than typing. Do NOT ask the customer for "
+            "a phone number; just call this tool with the reason."
+        ),
         parameters={
             "type": "object",
             "properties": {"reason": {"type": "string"}},
