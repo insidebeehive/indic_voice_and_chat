@@ -1,4 +1,7 @@
-"""Platform-level KB: make kb_documents.tenant_id nullable (NULL = platform).
+"""Platform-level KB: dedicated table for platform docs (no tenant FK).
+
+Instead of making kb_documents.tenant_id nullable (requires table ownership),
+we create a separate platform_kb_documents table with no tenant constraint.
 
 Revision: 0006_platform_kb
 Down: 0005_chat_tools
@@ -16,21 +19,17 @@ depends_on = None
 
 
 def upgrade() -> None:
-    # Drop the FK + NOT NULL constraint, then re-add FK as nullable.
-    with op.batch_alter_table("kb_documents") as batch_op:
-        batch_op.alter_column(
-            "tenant_id",
-            existing_type=sa.String(50),
-            nullable=True,
-        )
+    op.create_table(
+        "platform_kb_documents",
+        sa.Column("id", sa.String(50), primary_key=True),
+        sa.Column("filename", sa.String(255), nullable=False),
+        sa.Column("source_type", sa.String(50)),
+        sa.Column("language", sa.String(10)),
+        sa.Column("chunk_count", sa.Integer, server_default="0"),
+        sa.Column("metadata", sa.JSON, server_default="{}"),
+        sa.Column("ingested_at", sa.DateTime, server_default=sa.func.now()),
+    )
 
 
 def downgrade() -> None:
-    # Delete platform rows (tenant_id IS NULL) before restoring NOT NULL.
-    op.execute("DELETE FROM kb_documents WHERE tenant_id IS NULL")
-    with op.batch_alter_table("kb_documents") as batch_op:
-        batch_op.alter_column(
-            "tenant_id",
-            existing_type=sa.String(50),
-            nullable=False,
-        )
+    op.drop_table("platform_kb_documents")

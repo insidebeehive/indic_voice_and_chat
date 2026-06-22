@@ -136,7 +136,7 @@ async def _seed_global_kb(platform_retriever, sessionmaker) -> None:
     from sqlalchemy import delete as sa_delete
 
     from src.interfaces.vector_store import Document
-    from src.models.benchmark import KBDocument
+    from src.models.benchmark import PlatformKBDocument
     from src.rag.ingestion import ChunkConfig, detect_language, get_chunker, parse_document
 
     kb_dir = Path("data/kb/global")
@@ -176,10 +176,10 @@ async def _seed_global_kb(platform_retriever, sessionmaker) -> None:
             total += n
             async with sessionmaker() as session:
                 await session.execute(
-                    sa_delete(KBDocument).where(KBDocument.id == doc_id)
+                    sa_delete(PlatformKBDocument).where(PlatformKBDocument.id == doc_id)
                 )
-                session.add(KBDocument(
-                    id=doc_id, tenant_id=None, filename=f.name,
+                session.add(PlatformKBDocument(
+                    id=doc_id, filename=f.name,
                     source_type=f.suffix.lstrip(".").lower(),
                     language=language, chunk_count=n,
                     extra_data={"chunk_ids": [d.id for d in docs]},

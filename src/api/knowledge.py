@@ -27,7 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.api.deps import get_db_session
 from src.auth import TenantContext, current_tenant
 from src.interfaces.vector_store import Document
-from src.models.benchmark import KBDocument
+from src.models.benchmark import KBDocument, PlatformKBDocument
 from src.rag.context_builder import search_combined
 from src.rag.ingestion import ChunkConfig, detect_language, get_chunker, parse_document
 from src.rag.retriever import HybridRetriever
@@ -263,16 +263,16 @@ async def stats(
     tenant: TenantContext = Depends(current_tenant),
     session: AsyncSession = Depends(get_db_session),
 ) -> StatsResponse:
-    # Count platform docs (tenant_id IS NULL) + tenant-specific docs.
-    from sqlalchemy import or_, null
-    rows = (await session.execute(
-        select(KBDocument).where(
-            or_(KBDocument.tenant_id == tenant.id, KBDocument.tenant_id == null())
-        )
+    tenant_rows = (await session.execute(
+        select(KBDocument).where(KBDocument.tenant_id == tenant.id)
     )).scalars().all()
+    platform_rows = (await session.execute(
+        select(PlatformKBDocument)
+    )).scalars().all()
+    all_rows = tenant_rows + platform_rows
     return StatsResponse(
-        document_count=len(rows),
-        chunk_count=sum(r.chunk_count or 0 for r in rows),
+        document_count=len(all_rows),
+        chunk_count=sum(r.chunk_count or 0 for r in all_rows),
     )
 
 

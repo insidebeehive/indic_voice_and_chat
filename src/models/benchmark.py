@@ -30,10 +30,26 @@ class KBDocument(Base):
     __tablename__ = "kb_documents"
 
     id: Mapped[str] = mapped_column(String(50), primary_key=True)
-    tenant_id: Mapped[Optional[str]] = mapped_column(
+    tenant_id: Mapped[str] = mapped_column(
         String(50), ForeignKey("tenants.id", ondelete="CASCADE"),
-        nullable=True, index=True,
+        nullable=False, index=True,
     )
+    filename: Mapped[str] = mapped_column(String(255), nullable=False)
+    source_type: Mapped[Optional[str]] = mapped_column(String(50))
+    language: Mapped[Optional[str]] = mapped_column(String(10))
+    chunk_count: Mapped[int] = mapped_column(Integer, default=0)
+    extra_data: Mapped[dict] = mapped_column("metadata", JSON, default=dict)
+    ingested_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=False), server_default=func.now()
+    )
+
+
+class PlatformKBDocument(Base):
+    """Platform-level KB documents shared across all tenants (no tenant FK)."""
+
+    __tablename__ = "platform_kb_documents"
+
+    id: Mapped[str] = mapped_column(String(50), primary_key=True)
     filename: Mapped[str] = mapped_column(String(255), nullable=False)
     source_type: Mapped[Optional[str]] = mapped_column(String(50))
     language: Mapped[Optional[str]] = mapped_column(String(10))

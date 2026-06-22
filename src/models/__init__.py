@@ -1,6 +1,6 @@
 """Database models (SQLAlchemy 2.x async)."""
 
-from src.models.benchmark import BenchmarkRun, KBDocument
+from src.models.benchmark import BenchmarkRun, KBDocument, PlatformKBDocument
 from src.models.campaign import Campaign, Lead
 from src.models.chat import ChatMessage, ChatSession, ChatTool
 from src.models.conversation import Conversation, Event, Turn
@@ -23,6 +23,7 @@ __all__ = [
     "Conversation",
     "Event",
     "KBDocument",
+    "PlatformKBDocument",
     "Lead",
     "ProviderCost",
     "Tenant",
