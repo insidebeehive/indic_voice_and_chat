@@ -812,7 +812,7 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
                             try:
                                 raw_bytes = base64.b64decode(data)
                                 object_key = _media_key(tenant.id, session_id, mime)
-                                await _media_store.upload(raw_bytes, object_key, mime)
+                                await _media_store.upload(raw_bytes, object_key, mime.split(";")[0])
                             except Exception:
                                 log.exception("media upload failed", extra={"session_id": session_id})
                                 object_key = None
