@@ -1,0 +1,318 @@
+<!-- static/bo_agent.html — BO support agent test console.
+     Lets a support agent claim an escalated chat session and converse with the customer. -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>BO Agent Console</title>
+<style>
+  :root { color-scheme: dark; }
+  body { font-family: system-ui, sans-serif; margin:0; background:#0f172a; color:#e2e8f0; display:flex; flex-direction:column; height:100vh; }
+  header { padding:.75rem 1rem; background:#111827; border-bottom:1px solid #1f2937; flex-shrink:0; }
+  header h1 { font-size:1.05rem; margin:0 0 .5rem; }
+  .creds { display:flex; gap:.75rem; flex-wrap:wrap; align-items:flex-end; }
+  label { font-size:.8rem; color:#cbd5e1; display:flex; flex-direction:column; gap:.2rem; }
+  input { background:#0b1220; color:#e2e8f0; border:1px solid #334155; border-radius:.35rem; padding:.4rem; font:inherit; }
+  button { padding:.45rem .9rem; border-radius:.4rem; border:0; cursor:pointer; font-weight:600; background:#3b82f6; color:#fff; }
+  button.ghost { background:#334155; color:#e2e8f0; }
+  button.sm { padding:.25rem .5rem; font-size:.75rem; }
+  button.danger { background:#dc2626; }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+  .hint { color:#94a3b8; font-size:.75rem; }
+  .main { display:flex; flex:1; min-height:0; gap:0; }
+
+  /* Left panel: connect controls + status */
+  .side { width:280px; flex-shrink:0; border-right:1px solid #1f2937; padding:1rem; display:flex; flex-direction:column; gap:.8rem; overflow-y:auto; }
+  .side h2 { font-size:.88rem; color:#cbd5e1; margin:0 0 .4rem; }
+  .status-pill { display:inline-block; padding:.2rem .55rem; border-radius:99px; font-size:.72rem; font-weight:700; letter-spacing:.03em; }
+  .s-disconnected { background:#1f2937; color:#94a3b8; }
+  .s-awaiting    { background:#78350f; color:#fbbf24; }
+  .s-connected   { background:#14532d; color:#86efac; }
+  .s-ended       { background:#1e1b2e; color:#a78bfa; }
+  .sep { border:0; border-top:1px solid #1f2937; margin:.2rem 0; }
+
+  /* Chat area */
+  .chat-wrap { flex:1; display:flex; flex-direction:column; min-height:0; }
+  .log { flex:1; overflow-y:auto; padding:1rem; display:flex; flex-direction:column; gap:.55rem; }
+  .msg { max-width:72%; padding:.5rem .75rem; border-radius:.6rem; font-size:.88rem; line-height:1.45; }
+  .msg.customer { background:#1e293b; align-self:flex-start; }
+  .msg.agent    { background:#1e3a5f; align-self:flex-end; }
+  .msg.system   { background:transparent; align-self:center; color:#94a3b8; font-size:.78rem; font-style:italic; }
+  .msg .who { font-size:.68rem; color:#64748b; margin-bottom:.2rem; }
+  .composer { border-top:1px solid #1f2937; display:flex; gap:.5rem; padding:.75rem 1rem; flex-shrink:0; }
+  .composer textarea { flex:1; background:#0b1220; color:#e2e8f0; border:1px solid #334155; border-radius:.4rem; padding:.5rem; font:inherit; font-size:.88rem; resize:none; height:2.6rem; min-height:2.6rem; }
+  .composer textarea:focus { outline:none; border-color:#3b82f6; }
+</style>
+</head>
+<body>
+<header>
+  <h1>BO Agent Console <span class="hint">— claim escalated chat sessions and reply as a human agent</span></h1>
+  <div class="creds">
+    <label>API base URL <input id="baseUrl" style="width:15rem" placeholder="(same origin)" /></label>
+    <label>Tenant token <input id="tenantToken" style="width:18rem" placeholder="Bearer token" /></label>
+    <label>Agent ID <input id="agentId" style="width:9rem" placeholder="e.g. agent_01" /></label>
+    <label>Agent name <input id="agentName" style="width:9rem" placeholder="e.g. Priya" /></label>
+    <button class="ghost sm" onclick="saveCreds()">Save</button>
+  </div>
+</header>
+
+<div class="main">
+  <!-- Left panel -->
+  <div class="side">
+    <div>
+      <h2>Session</h2>
+      <label style="margin-bottom:.5rem">Session ID
+        <input id="sessionId" style="width:100%;box-sizing:border-box" placeholder="paste session_id here" />
+      </label>
+      <div style="display:flex;gap:.4rem;flex-wrap:wrap;">
+        <button id="btnClaim" onclick="claimSession()">Claim &amp; Connect</button>
+        <button id="btnEnd" class="danger sm" onclick="endSession()" disabled>End Session</button>
+      </div>
+    </div>
+
+    <hr class="sep" />
+
+    <div>
+      <h2>Status</h2>
+      <span id="statusPill" class="status-pill s-disconnected">Disconnected</span>
+      <div id="statusDetail" class="hint" style="margin-top:.4rem"></div>
+    </div>
+
+    <hr class="sep" />
+
+    <div>
+      <h2>Webhook test</h2>
+      <p class="hint" style="margin:.1rem 0 .5rem">Paste a <code>claim_url</code> from the escalation_requested webhook to auto-fill the session.</p>
+      <label>claim_url
+        <input id="claimUrl" style="width:100%;box-sizing:border-box" placeholder="https://…/chat/sessions/{id}/claim" />
+      </label>
+      <button class="ghost sm" style="margin-top:.4rem" onclick="fromClaimUrl()">Use URL</button>
+    </div>
+  </div>
+
+  <!-- Chat area -->
+  <div class="chat-wrap">
+    <div class="log" id="log"></div>
+    <div class="composer">
+      <textarea id="reply" placeholder="Type reply… (Enter to send, Shift+Enter for newline)" onkeydown="onKey(event)"></textarea>
+      <button id="btnSend" onclick="sendReply()" disabled>Send</button>
+    </div>
+  </div>
+</div>
+
+<script>
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
+let ws = null;
+let currentSession = null;
+
+const $ = id => document.getElementById(id);
+
+// ---------------------------------------------------------------------------
+// Creds persistence
+// ---------------------------------------------------------------------------
+function saveCreds() {
+  localStorage.setItem("bo_baseUrl",    $("baseUrl").value.trim());
+  localStorage.setItem("bo_token",      $("tenantToken").value.trim());
+  localStorage.setItem("bo_agentId",    $("agentId").value.trim());
+  localStorage.setItem("bo_agentName",  $("agentName").value.trim());
+  setStatus("disconnected", "Credentials saved");
+}
+
+(function loadCreds() {
+  $("baseUrl").value   = localStorage.getItem("bo_baseUrl")   || "";
+  $("tenantToken").value = localStorage.getItem("bo_token")   || "";
+  $("agentId").value   = localStorage.getItem("bo_agentId")   || "";
+  $("agentName").value = localStorage.getItem("bo_agentName") || "";
+})();
+
+function base() { return ($("baseUrl").value.trim() || "").replace(/\/$/, ""); }
+function token() { return $("tenantToken").value.trim(); }
+function agentId() { return $("agentId").value.trim() || "agent_01"; }
+function agentName() { return $("agentName").value.trim() || "Support Agent"; }
+
+// ---------------------------------------------------------------------------
+// Status display
+// ---------------------------------------------------------------------------
+function setStatus(state, detail) {
+  const pill = $("statusPill");
+  pill.className = "status-pill";
+  const map = {disconnected:"s-disconnected", awaiting:"s-awaiting", connected:"s-connected", ended:"s-ended"};
+  pill.classList.add(map[state] || "s-disconnected");
+  const labels = {disconnected:"Disconnected", awaiting:"Awaiting claim…", connected:"Connected", ended:"Session ended"};
+  pill.textContent = labels[state] || state;
+  $("statusDetail").textContent = detail || "";
+}
+
+// ---------------------------------------------------------------------------
+// Chat log helpers
+// ---------------------------------------------------------------------------
+function addMsg(who, text, cls) {
+  const div = document.createElement("div");
+  div.className = "msg " + (cls || who);
+  if (who !== "system") {
+    const lbl = document.createElement("div");
+    lbl.className = "who";
+    lbl.textContent = who === "customer" ? "Customer" : "You (agent)";
+    div.appendChild(lbl);
+  }
+  const txt = document.createElement("span");
+  txt.textContent = text;
+  div.appendChild(txt);
+  $("log").appendChild(div);
+  $("log").scrollTop = $("log").scrollHeight;
+}
+
+function sysMsg(text) { addMsg("system", text, "system"); }
+
+function clearLog() { $("log").innerHTML = ""; }
+
+// ---------------------------------------------------------------------------
+// Claim session
+// ---------------------------------------------------------------------------
+async function claimSession() {
+  const sessionId = $("sessionId").value.trim();
+  if (!sessionId) { alert("Enter a session ID"); return; }
+  if (!token())   { alert("Enter a tenant token"); return; }
+
+  $("btnClaim").disabled = true;
+  setStatus("awaiting", "Claiming session…");
+
+  try {
+    const r = await fetch(`${base()}/api/v1/chat/sessions/${sessionId}/claim`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${token()}` },
+      body: JSON.stringify({ agent_id: agentId(), agent_name: agentName() }),
+    });
+    const body = await r.json();
+    if (!r.ok) {
+      setStatus("disconnected", `Claim failed: ${body.detail || r.status}`);
+      $("btnClaim").disabled = false;
+      return;
+    }
+    sysMsg(`✓ Session claimed (agent: ${body.agent_id})`);
+    currentSession = sessionId;
+    connectWs(sessionId);
+  } catch (e) {
+    setStatus("disconnected", `Error: ${e.message}`);
+    $("btnClaim").disabled = false;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Agent WebSocket
+// ---------------------------------------------------------------------------
+function connectWs(sessionId) {
+  const wsBase = base().replace(/^http/, "ws") || `ws://${location.host}`;
+  const url = `${wsBase}/api/v1/chat/sessions/${sessionId}/agent-ws?token=${encodeURIComponent(token())}`;
+
+  ws = new WebSocket(url);
+
+  ws.onopen = () => {
+    setStatus("connected", `Session: ${sessionId}`);
+    $("btnEnd").disabled = false;
+    $("btnSend").disabled = false;
+    sysMsg("WebSocket connected — session history below:");
+  };
+
+  ws.onmessage = e => {
+    let msg;
+    try { msg = JSON.parse(e.data); } catch { return; }
+
+    if (msg.type === "history") {
+      clearLog();
+      sysMsg("--- conversation history ---");
+      (msg.messages || []).forEach(m => {
+        const cls = m.role === "user" ? "customer" : (m.role === "human_agent" ? "agent" : "system");
+        addMsg(cls === "customer" ? "customer" : (cls === "agent" ? "agent" : "system"),
+               m.text, cls);
+      });
+      sysMsg("--- live ---");
+    } else if (msg.type === "customer_message") {
+      addMsg("customer", msg.text);
+    } else if (msg.type === "session_ended") {
+      sysMsg("Customer disconnected — session ended");
+      setStatus("ended", "Customer left");
+      cleanup();
+    } else {
+      sysMsg(`[${msg.type}] ${JSON.stringify(msg)}`);
+    }
+  };
+
+  ws.onerror = () => {
+    setStatus("disconnected", "WebSocket error");
+    cleanup();
+  };
+
+  ws.onclose = ev => {
+    if (ev.code !== 1000) {
+      setStatus("disconnected", `WS closed (${ev.code}: ${ev.reason || "no reason"})`);
+    }
+    cleanup();
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Send reply
+// ---------------------------------------------------------------------------
+function sendReply() {
+  const text = $("reply").value.trim();
+  if (!text || !ws || ws.readyState !== WebSocket.OPEN) return;
+  ws.send(JSON.stringify({ type: "reply", text }));
+  addMsg("agent", text);
+  $("reply").value = "";
+  $("reply").style.height = "2.6rem";
+}
+
+function onKey(e) {
+  if (e.key === "Enter" && !e.shiftKey) {
+    e.preventDefault();
+    sendReply();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// End session
+// ---------------------------------------------------------------------------
+function endSession() {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  if (!confirm("End this session? The customer will be disconnected.")) return;
+  ws.send(JSON.stringify({ type: "end" }));
+  sysMsg("Session ended by you");
+  setStatus("ended", "");
+  cleanup();
+}
+
+// ---------------------------------------------------------------------------
+// Cleanup
+// ---------------------------------------------------------------------------
+function cleanup() {
+  if (ws) { try { ws.close(); } catch {} ws = null; }
+  $("btnClaim").disabled = false;
+  $("btnEnd").disabled = true;
+  $("btnSend").disabled = true;
+  currentSession = null;
+}
+
+// ---------------------------------------------------------------------------
+// Parse claim_url from escalation webhook
+// ---------------------------------------------------------------------------
+function fromClaimUrl() {
+  const url = $("claimUrl").value.trim();
+  // expect …/chat/sessions/{id}/claim
+  const m = url.match(/\/chat\/sessions\/([^/]+)\/claim/);
+  if (!m) { alert("Could not extract session ID from URL"); return; }
+  $("sessionId").value = m[1];
+  // also try to set base from the URL
+  try {
+    const u = new URL(url);
+    $("baseUrl").value = u.origin;
+  } catch {}
+  $("claimUrl").value = "";
+  sysMsg(`Session ID set to: ${m[1]} — click Claim & Connect when ready`);
+}
+</script>
+</body>
+</html>

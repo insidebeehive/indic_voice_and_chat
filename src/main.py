@@ -429,6 +429,12 @@ async def backoffice() -> FileResponse:
     return FileResponse(_STATIC_DIR / "backoffice.html", media_type="text/html")
 
 
+@app.get("/bo-agent", include_in_schema=False)
+async def bo_agent_console() -> FileResponse:
+    """BO support-agent console: claim escalated sessions and chat with customers."""
+    return FileResponse(_STATIC_DIR / "bo_agent.html", media_type="text/html")
+
+
 @app.get("/softphone.js", include_in_schema=False)
 async def softphone_helper() -> FileResponse:
     """Provider-agnostic browser softphone helper (wraps Twilio + Stringee SDKs).

@@ -430,7 +430,7 @@ async def claim_session(
     tenant: TenantContext = Depends(current_tenant),
     session: AsyncSession = Depends(get_db_session),
 ) -> ClaimResponse:
-    """BO agent claims an awaiting_human session; 409 if already in human mode."""
+    """BO agent claims an awaiting_human session; 409 if already claimed; 400 if wrong mode."""
     row = await session.get(ChatSession, session_id)
     if row is None or row.tenant_id != tenant.id:
         raise HTTPException(status_code=404, detail="chat session not found")
@@ -438,6 +438,11 @@ async def claim_session(
         raise HTTPException(
             status_code=409,
             detail=f"session already claimed by {row.claimed_by or 'another agent'}",
+        )
+    if row.mode != "awaiting_human":
+        raise HTTPException(
+            status_code=400,
+            detail=f"session is not awaiting handover (mode: {row.mode})",
         )
     from datetime import datetime, timezone
     row.mode = "human"
