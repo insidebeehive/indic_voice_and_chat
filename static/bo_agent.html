@@ -201,6 +201,13 @@ async function claimSession() {
     });
     const body = await r.json();
     if (!r.ok) {
+      if (r.status === 409) {
+        // Already claimed (e.g. reconnecting after page refresh). WS still works.
+        sysMsg("⚠ Session already claimed — reconnecting WebSocket…");
+        currentSession = sessionId;
+        connectWs(sessionId);
+        return;
+      }
       setStatus("disconnected", `Claim failed: ${body.detail || r.status}`);
       $("btnClaim").disabled = false;
       return;
@@ -217,13 +224,19 @@ async function claimSession() {
 // ---------------------------------------------------------------------------
 // Agent WebSocket
 // ---------------------------------------------------------------------------
+let _reconnectDelay = 2000;
+let _reconnectTimer = null;
+let _sessionEndedByAgent = false;
+
 function connectWs(sessionId) {
   const wsBase = base().replace(/^http/, "ws") || `ws://${location.host}`;
   const url = `${wsBase}/api/v1/chat/sessions/${sessionId}/agent-ws?token=${encodeURIComponent(token())}`;
 
+  if (_reconnectTimer) { clearTimeout(_reconnectTimer); _reconnectTimer = null; }
   ws = new WebSocket(url);
 
   ws.onopen = () => {
+    _reconnectDelay = 2000;
     setStatus("connected", `Session: ${sessionId}`);
     $("btnEnd").disabled = false;
     $("btnSend").disabled = false;
@@ -268,10 +281,20 @@ function connectWs(sessionId) {
   };
 
   ws.onclose = ev => {
-    if (ev.code !== 1000) {
+    const clean = ev.code === 1000 || ev.code === 4000;
+    if (!clean) {
       setStatus("disconnected", `WS closed (${ev.code}: ${ev.reason || "no reason"})`);
     }
-    cleanup();
+    $("btnEnd").disabled = true;
+    $("btnSend").disabled = true;
+    ws = null;
+    if (!clean && !_sessionEndedByAgent && currentSession === sessionId) {
+      sysMsg(`Reconnecting in ${_reconnectDelay / 1000}s…`);
+      _reconnectTimer = setTimeout(() => connectWs(sessionId), _reconnectDelay);
+      _reconnectDelay = Math.min(_reconnectDelay * 2, 30000);
+    } else {
+      cleanup();
+    }
   };
 }
 
@@ -300,6 +323,7 @@ function onKey(e) {
 function endSession() {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
   if (!confirm("End this session? The customer will be disconnected.")) return;
+  _sessionEndedByAgent = true;
   ws.send(JSON.stringify({ type: "end" }));
   sysMsg("Session ended by you");
   setStatus("ended", "");
@@ -310,6 +334,9 @@ function endSession() {
 // Cleanup
 // ---------------------------------------------------------------------------
 function cleanup() {
+  if (_reconnectTimer) { clearTimeout(_reconnectTimer); _reconnectTimer = null; }
+  _sessionEndedByAgent = false;
+  _reconnectDelay = 2000;
   if (ws) { try { ws.close(); } catch {} ws = null; }
   $("btnClaim").disabled = false;
   $("btnEnd").disabled = true;

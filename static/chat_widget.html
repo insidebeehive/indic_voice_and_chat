@@ -61,6 +61,7 @@
 (function () {
   const $ = (id) => document.getElementById(id);
   let ws = null, sessionId = null;
+  let _wsUrl = null, _sessionEnded = false, _reconnectDelay = 2000, _reconnectTimer = null;
 
   function add(role, text) {
     const el = document.createElement("div");
@@ -105,9 +106,20 @@
   }
 
   function connect(wsUrl) {
+    _wsUrl = wsUrl;
+    if (_reconnectTimer) { clearTimeout(_reconnectTimer); _reconnectTimer = null; }
     ws = new WebSocket(wsUrl);
-    ws.onopen = () => { $("status").textContent = "● connected"; };
-    ws.onclose = () => { $("status").textContent = "○ disconnected"; };
+    ws.onopen = () => { $("status").textContent = "● connected"; _reconnectDelay = 2000; };
+    ws.onclose = () => {
+      $("status").textContent = "○ disconnected";
+      if (!_sessionEnded) {
+        _reconnectTimer = setTimeout(() => {
+          $("status").textContent = "↻ reconnecting…";
+          connect(_wsUrl);
+        }, _reconnectDelay);
+        _reconnectDelay = Math.min(_reconnectDelay * 2, 30000);
+      }
+    };
     ws.onmessage = (ev) => {
       const m = JSON.parse(ev.data);
       if (m.type === "typing") { $("typing").textContent = "typing…"; return; }
@@ -134,6 +146,7 @@
           $("log").scrollTop = $("log").scrollHeight;
         }
       } else if (m.type === "ended") {
+        _sessionEnded = true;
         add("agent", "— chat ended —"); $("composer").classList.add("hidden");
       } else if (m.type === "error") {
         meta("error: " + m.message);
@@ -335,7 +348,7 @@ registerProcessor('capture-processor', CaptureProcessor);
   $("start").onclick = start;
   $("send").onclick = () => sendText($("text").value.trim());
   $("text").addEventListener("keydown", (e) => { if (e.key === "Enter") sendText($("text").value.trim()); });
-  $("end").onclick = () => { if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: "end" })); };
+  $("end").onclick = () => { if (ws && ws.readyState === 1) { _sessionEnded = true; ws.send(JSON.stringify({ type: "end" })); } };
 })();
 </script>
 </body>
