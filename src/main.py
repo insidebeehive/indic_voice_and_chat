@@ -350,8 +350,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                              platform_retriever=platform_retriever))
     chat_api.set_chat_sessionmaker(sessionmaker)
     chat_api.set_chat_handoff_store(base_session_store)
-    from src.providers.media.s3 import S3MediaStorage
     if settings.media_storage is not None:
+        from src.providers.media.s3 import S3MediaStorage
         ms = settings.media_storage
         chat_api.set_media_store(S3MediaStorage(
             endpoint_url=ms.endpoint_url,

@@ -283,17 +283,16 @@ def _apply_env_overrides(yaml_data: dict[str, Any], secrets: Secrets) -> dict[st
         yaml_data.setdefault("pipeline", {}).setdefault("telephony", {})[
             "webhook_base_url"
         ] = secrets.WEBHOOK_BASE_URL
-    ms = secrets
-    if ms.MEDIA_STORAGE_ACCESS_KEY:
-        yaml_data.setdefault("media_storage", {})["access_key"] = ms.MEDIA_STORAGE_ACCESS_KEY
-    if ms.MEDIA_STORAGE_SECRET_KEY:
-        yaml_data.setdefault("media_storage", {})["secret_key"] = ms.MEDIA_STORAGE_SECRET_KEY
-    if ms.MEDIA_STORAGE_BUCKET:
-        yaml_data.setdefault("media_storage", {})["bucket"] = ms.MEDIA_STORAGE_BUCKET
-    if ms.MEDIA_STORAGE_ENDPOINT_URL:
-        yaml_data.setdefault("media_storage", {})["endpoint_url"] = ms.MEDIA_STORAGE_ENDPOINT_URL
-    if ms.MEDIA_STORAGE_REGION:
-        yaml_data.setdefault("media_storage", {})["region"] = ms.MEDIA_STORAGE_REGION
+    if secrets.MEDIA_STORAGE_ACCESS_KEY:
+        yaml_data.setdefault("media_storage", {})["access_key"] = secrets.MEDIA_STORAGE_ACCESS_KEY
+    if secrets.MEDIA_STORAGE_SECRET_KEY:
+        yaml_data.setdefault("media_storage", {})["secret_key"] = secrets.MEDIA_STORAGE_SECRET_KEY
+    if secrets.MEDIA_STORAGE_BUCKET:
+        yaml_data.setdefault("media_storage", {})["bucket"] = secrets.MEDIA_STORAGE_BUCKET
+    if secrets.MEDIA_STORAGE_ENDPOINT_URL:
+        yaml_data.setdefault("media_storage", {})["endpoint_url"] = secrets.MEDIA_STORAGE_ENDPOINT_URL
+    if secrets.MEDIA_STORAGE_REGION:
+        yaml_data.setdefault("media_storage", {})["region"] = secrets.MEDIA_STORAGE_REGION
     return yaml_data
 
 
