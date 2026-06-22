@@ -529,22 +529,53 @@ def make_browser_bridge_factory(
         # Chat→voice handoff: a ?handoff=<token> resolves a short-lived Redis blob
         # (chat summary + customer context) so the voice agent continues the chat.
         handoff_token = (query_params.get("handoff") or "").strip()
+        handoff_ctx: dict | None = None
         if handoff_token and handoff_store is not None:
             try:
                 import json as _json
                 raw = await handoff_store.redis.get(f"chat_handoff:{handoff_token}")
                 if raw:
-                    ctx = _json.loads(raw)
-                    name = (ctx.get("customer_name") or "").strip()
+                    handoff_ctx = _json.loads(raw)
+                    name = (handoff_ctx.get("customer_name") or "").strip()
                     if name:
                         lead_data["name"] = name
                         lead_data.setdefault("lead_name", name)
-                    if ctx.get("chat_summary"):
-                        lead_data["chat_summary"] = ctx["chat_summary"]
-                    if ctx.get("customer_id"):
-                        lead_data["customer_id"] = ctx["customer_id"]
+                    if handoff_ctx.get("chat_summary"):
+                        lead_data["chat_summary"] = handoff_ctx["chat_summary"]
+                    if handoff_ctx.get("customer_id"):
+                        lead_data["customer_id"] = handoff_ctx["customer_id"]
             except Exception:  # noqa: BLE001 — a bad handoff blob must not block the call
                 log.warning("chat handoff context load failed", extra={"token": handoff_token})
+
+        # When a valid handoff is present, replace the campaign script with a
+        # support-mode script. Campaign objective/opening/slots are irrelevant here.
+        extra_directives: list[str] | None = None
+        if handoff_ctx is not None:
+            lang = (handoff_ctx.get("language") or cur_script.language_default or "hi")
+            cur_script = VoiceBotScript(
+                agent_name=cur_script.agent_name,
+                agent_role="Customer Support",
+                company_name=cur_script.company_name,
+                language_default=lang,
+            )
+            cur_slots = SlotSchema()
+            chat_summary = lead_data.get("chat_summary", "")
+            if chat_summary:
+                extra_directives = [
+                    "CONTEXT — CHAT HANDOFF: The customer just switched from a support "
+                    "chat conversation to this voice call. Summary of that chat:\n"
+                    f"{chat_summary}\n\n"
+                    "Continue helping them from where the chat left off. "
+                    "Do NOT run a sales script. Do NOT ask them to repeat what they already "
+                    "told you in the chat. Greet them briefly (e.g. 'I can hear you now, '  "
+                    "'how can I help?') and pick up the conversation."
+                ]
+            else:
+                extra_directives = [
+                    "CONTEXT — CHAT HANDOFF: The customer switched from a support chat to "
+                    "this voice call. Greet them briefly and ask how you can help."
+                ]
+
         from src.bootstrap import _build_kb_context  # noqa: PLC0415
 
         kb_ctx = _build_kb_context(platform_retriever, None) or None
@@ -555,6 +586,7 @@ def make_browser_bridge_factory(
             script=cur_script,
             engine=engine,
             store=None,
+            extra_directives=extra_directives,
             kb_context=kb_ctx,
         )
         log.info("dev console built call", extra={"tenant": tenant.slug, "session_id": session_id})
