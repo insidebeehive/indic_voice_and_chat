@@ -43,6 +43,52 @@ log = logging.getLogger(__name__)
 # Executes a tenant-registered (CRM) tool call → a JSON-able result dict.
 CrmExecutor = Callable[[ToolCall], Awaitable[dict]]
 
+# Unicode block boundaries for common Indic scripts.
+_SCRIPT_RANGES: list[tuple[int, int, str]] = [
+    (0x0900, 0x097F, "Hindi"),       # Devanagari (Hindi, Marathi, Sanskrit)
+    (0x0980, 0x09FF, "Bengali"),
+    (0x0A00, 0x0A7F, "Punjabi"),     # Gurmukhi
+    (0x0A80, 0x0AFF, "Gujarati"),
+    (0x0B00, 0x0B7F, "Odia"),
+    (0x0B80, 0x0BFF, "Tamil"),
+    (0x0C00, 0x0C7F, "Telugu"),
+    (0x0C80, 0x0CFF, "Kannada"),
+    (0x0D00, 0x0D7F, "Malayalam"),
+]
+
+
+def _detect_script(text: str) -> Optional[str]:
+    """Return a language name from the dominant Unicode script in *text*.
+
+    Counts Indic-script characters vs ASCII-alpha characters.  Returns None
+    when the text is empty, purely numeric/punctuation, or too mixed to call
+    (Hinglish).  The result is used to inject an unambiguous language
+    directive into the system prompt so the LLM never has to guess.
+    """
+    if not text:
+        return None
+    indic_lang: Optional[str] = None
+    indic_count = 0
+    latin_count = 0
+    for ch in text:
+        cp = ord(ch)
+        if ch.isascii() and ch.isalpha():
+            latin_count += 1
+        else:
+            for lo, hi, lang in _SCRIPT_RANGES:
+                if lo <= cp <= hi:
+                    indic_count += 1
+                    indic_lang = lang
+                    break
+    total = indic_count + latin_count
+    if total == 0:
+        return None
+    if indic_count / total >= 0.6:
+        return indic_lang
+    if latin_count / total >= 0.6:
+        return "English"
+    return None  # mixed / Hinglish — let the model decide
+
 
 def _chunk_source(chunk: RetrievedChunk) -> str:
     md = chunk.document.metadata or {}
@@ -140,7 +186,7 @@ class ChatBotAgent(BaseAgent):
         # 2. Build context
         rag = build_rag_context(retrieved, max_chars=self._max_context_chars)
         # 3. Compose messages
-        messages = self._compose(rag.text, user_msg)
+        messages = self._compose(rag.text, user_msg, query_text=query_text)
         # 4. LLM
         result = await self._llm.generate(messages, self._llm_config)
         response = parse_chatbot_response(result.text)
@@ -161,7 +207,7 @@ class ChatBotAgent(BaseAgent):
         tools = list(BUILTIN_TOOLS) + list(self._crm_tools)
         # Tools fetch their own context (search_knowledge_base), so the system
         # prompt starts without a pre-built RAG block.
-        messages = self._compose("", user_msg)
+        messages = self._compose("", user_msg, query_text=query_text)
         retrieved_all: list[RetrievedChunk] = []
         escalation: Optional[dict] = None
         call_offer: Optional[dict] = None
@@ -257,11 +303,16 @@ class ChatBotAgent(BaseAgent):
 
     # --- Shared helpers -------------------------------------------------
 
-    def _compose(self, rag_text: str, user_msg: LLMMessage) -> list[LLMMessage]:
+    def _compose(
+        self, rag_text: str, user_msg: LLMMessage, query_text: str = "",
+    ) -> list[LLMMessage]:
+        lang = _detect_script(query_text)
+        extra = [f"The user's current message is in {lang}. Your response_text MUST be in {lang}."] if lang else None
         system_prompt = build_chatbot_system_prompt(
             company_name=self._company,
             language_default=self._language,
             rag_context=rag_text,
+            extra_directives=extra,
         )
         messages: list[LLMMessage] = [LLMMessage(role="system", content=system_prompt)]
         # Replay prior user/assistant turns (system is rebuilt each turn).
