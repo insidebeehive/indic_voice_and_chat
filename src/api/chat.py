@@ -19,6 +19,7 @@ sessionmaker (for the WS tenant lookup + message persistence) is injected via
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import uuid
@@ -57,6 +58,12 @@ ChatBotFactory = Callable[[TenantContext, str], Awaitable[ChatBotAgent]]
 _factory: Optional[ChatBotFactory] = None
 _sessionmaker: object | None = None
 _handoff_store: object | None = None  # SessionStore: carries chat→voice handoff context
+
+# Per-session queues bridging customer WS ↔ BO agent WS in handover mode.
+# _bo_queues:       customer WS puts here → BO agent WS reads
+# _customer_queues: BO agent WS puts here → customer WS reads
+_bo_queues: dict = {}
+_customer_queues: dict = {}
 
 
 def set_chat_handoff_store(store: object | None) -> None:
@@ -212,6 +219,11 @@ async def create_session(
         language=language, status="active", extra_data=req.metadata or {},
     ))
     await session.commit()
+    from src.api.chat_webhooks import send_bo_webhook
+    await send_bo_webhook(tenant, "session_started", {
+        "session_id": session_id,
+        "customer": {"name": req.customer_name, "id": req.user_id},
+    })
     return CreateSessionResponse(
         session_id=session_id,
         greeting=_greeting(tenant.name, req.customer_name, language),
@@ -398,6 +410,158 @@ async def chat_history(
     )
 
 
+# --- BO handover: claim + agent WebSocket --------------------------------
+
+
+class ClaimRequest(BaseModel):
+    agent_id: str
+    agent_name: str
+
+
+class ClaimResponse(BaseModel):
+    status: str
+    agent_id: str
+
+
+@router.post("/sessions/{session_id}/claim", response_model=ClaimResponse)
+async def claim_session(
+    session_id: str,
+    req: ClaimRequest,
+    tenant: TenantContext = Depends(current_tenant),
+    session: AsyncSession = Depends(get_db_session),
+) -> ClaimResponse:
+    """BO agent claims an awaiting_human session; 409 if already in human mode."""
+    row = await session.get(ChatSession, session_id)
+    if row is None or row.tenant_id != tenant.id:
+        raise HTTPException(status_code=404, detail="chat session not found")
+    if row.mode == "human":
+        raise HTTPException(
+            status_code=409,
+            detail=f"session already claimed by {row.claimed_by or 'another agent'}",
+        )
+    from datetime import datetime, timezone
+    row.mode = "human"
+    row.claimed_by = req.agent_id
+    row.claimed_at = datetime.now(timezone.utc).replace(tzinfo=None)
+    await session.commit()
+    cq = _customer_queues.get(session_id)
+    if cq:
+        await cq.put(json.dumps({
+            "type": "mode_change", "mode": "human",
+            "agent_name": req.agent_name,
+        }))
+    log.info("session claimed", extra={"session_id": session_id, "agent": req.agent_id})
+    return ClaimResponse(status="claimed", agent_id=req.agent_id)
+
+
+@router.websocket("/sessions/{session_id}/agent-ws")
+async def agent_websocket(websocket: WebSocket, session_id: str) -> None:
+    """BO agent WebSocket. Auth via ?token= query param (tenant bearer token).
+    On connect sends full history; then forwards customer messages to BO and
+    BO replies to the customer WS. BO sends {type:'reply', text:'...'} frames."""
+    await websocket.accept()
+
+    token = (websocket.query_params.get("token") or "").strip()
+    if not token:
+        await websocket.close(code=1008, reason="missing token")
+        return
+    from src.auth.middleware import tenant_from_token
+    try:
+        tenant = await tenant_from_token(token)
+    except Exception:  # noqa: BLE001
+        await websocket.close(code=1008, reason="invalid token")
+        return
+    if tenant is None:
+        await websocket.close(code=1008, reason="invalid token")
+        return
+
+    async with _sm()() as db:
+        row = await db.get(ChatSession, session_id)
+    if row is None or row.tenant_id != tenant.id:
+        await websocket.close(code=4004, reason="session not found")
+        return
+    if row.mode not in ("awaiting_human", "human"):
+        await websocket.close(code=4004, reason="session not in handover mode")
+        return
+
+    # Send full history on connect
+    async with _sm()() as db:
+        msgs = (await db.execute(
+            select(ChatMessage)
+            .where(ChatMessage.session_id == session_id)
+            .order_by(ChatMessage.id)
+        )).scalars().all()
+    await websocket.send_text(json.dumps({
+        "type": "history",
+        "messages": [
+            {"role": m.role, "text": m.content,
+             "ts": m.created_at.isoformat() if m.created_at else None}
+            for m in msgs
+        ],
+    }))
+
+    bq: asyncio.Queue = _bo_queues.setdefault(session_id, asyncio.Queue())
+    cq: asyncio.Queue = _customer_queues.setdefault(session_id, asyncio.Queue())
+
+    try:
+        while True:
+            ws_task = asyncio.ensure_future(websocket.receive_text())
+            bq_task = asyncio.ensure_future(bq.get())
+            done, pending = await asyncio.wait(
+                {ws_task, bq_task}, return_when=asyncio.FIRST_COMPLETED
+            )
+            for t in pending:
+                t.cancel()
+                try:
+                    await t
+                except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                    pass
+
+            if bq_task in done:
+                item = bq_task.result()
+                if item is None:  # customer disconnected sentinel
+                    break
+                await websocket.send_text(item)
+
+            if ws_task in done:
+                try:
+                    raw = ws_task.result()
+                except WebSocketDisconnect:
+                    break
+                try:
+                    msg = json.loads(raw)
+                except (ValueError, TypeError):
+                    continue
+                mtype = msg.get("type", "reply")
+                if mtype == "reply":
+                    text = (msg.get("text") or "").strip()
+                    if not text:
+                        continue
+                    async with _sm()() as db:
+                        r2 = await db.get(ChatSession, session_id)
+                        if r2:
+                            db.add(ChatMessage(
+                                session_id=session_id, role="human_agent",
+                                type="text", content=text,
+                            ))
+                            r2.message_count = (r2.message_count or 0) + 1
+                            await db.commit()
+                    await cq.put(json.dumps({"type": "message", "text": text, "from": "human_agent"}))
+                elif mtype == "end":
+                    await cq.put(json.dumps({"type": "ended"}))
+                    await _end_session(session_id, "Ended by support agent")
+                    break
+    except WebSocketDisconnect:
+        log.info("agent ws disconnected", extra={"session_id": session_id})
+    except Exception:  # noqa: BLE001
+        log.exception("agent ws crashed", extra={"session_id": session_id})
+    finally:
+        try:
+            await websocket.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 # --- WebSocket (session_id is the capability) --------------------------
 
 
@@ -424,6 +588,13 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
     agent = await _factory(tenant, _scoped_session(tenant, session_id))
     try:
         while True:
+            # If the session was handed over to a human, switch to the human-mode loop.
+            async with _sm()() as db:
+                cur_row = await db.get(ChatSession, session_id)
+            if cur_row and cur_row.mode in ("awaiting_human", "human"):
+                await _run_human_mode(websocket, session_id, tenant)
+                break
+
             raw = await websocket.receive_text()
             try:
                 msg = json.loads(raw)
@@ -435,6 +606,7 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
             if mtype == "end":
                 summary = await agent.summarize_session()
                 await _end_session(session_id, summary)
+                await _send_close_webhook(tenant, session_id, "ai", summary)
                 await websocket.send_text(json.dumps({"type": "ended", "summary": summary}))
                 break
 
@@ -454,6 +626,8 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
                     await _persist_turn(session_id, caption or f"[{mtype}]", result,
                                         user_type=mtype, media_mime=mime)
                     await _send_reply(websocket, session_id, result, tenant.id)
+                    if result.escalation:
+                        await _handle_escalation(websocket, session_id, tenant, row, result)
                     continue
 
                 user_text = (msg.get("text") or msg.get("message") or "").strip()
@@ -479,6 +653,8 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
                         f"chat_handoff:{token}", json.dumps(context), ex=600)
                     call_url = _voice_call_url(websocket, tenant.slug, token)
                 await _send_reply(websocket, session_id, result, tenant.id, call_url=call_url)
+                if result.escalation:
+                    await _handle_escalation(websocket, session_id, tenant, row, result)
             except WebSocketDisconnect:
                 raise
             except Exception:  # noqa: BLE001 — one bad turn must not drop the chat
@@ -524,7 +700,6 @@ async def _send_reply(
             "reason": result.call_offer.get("reason", ""),
             "call_url": call_url,  # WebSocket URL the browser connects to directly
         }))
-    await _emit_escalation(tenant_id, session_id, result)
 
 
 async def _emit_escalation(tenant_id: str, session_id: str, result: ChatTurnResult) -> None:
@@ -579,12 +754,165 @@ async def _end_session(session_id: str, summary: str = "") -> None:
             if row is None:
                 return
             row.status = "ended"
+            row.mode = "closed"
             row.ended_at = datetime.now(timezone.utc).replace(tzinfo=None)
             if summary:
                 row.summary = summary
             await db.commit()
     except Exception:  # noqa: BLE001
         log.exception("chat session end failed", extra={"session_id": session_id})
+
+
+async def _handle_escalation(
+    websocket: WebSocket,
+    session_id: str,
+    tenant: TenantContext,
+    row: ChatSession,
+    result: ChatTurnResult,
+) -> None:
+    """Flip session to awaiting_human, notify BO, inform customer of queue status.
+    Checks support hours: outside hours the customer is queued and told when BO opens."""
+    from src.api.chat_webhooks import send_bo_webhook
+    from src.chatbot.support_hours import is_bo_available
+
+    reason = result.escalation.get("reason", "")
+    summary = result.escalation.get("summary", "")
+    available, next_slot = is_bo_available(tenant.settings.chat_support)
+
+    async with _sm()() as db:
+        r = await db.get(ChatSession, session_id)
+        if r:
+            r.mode = "awaiting_human"
+            await db.commit()
+
+    _bo_queues.setdefault(session_id, asyncio.Queue())
+    _customer_queues.setdefault(session_id, asyncio.Queue())
+
+    await send_bo_webhook(tenant, "escalation_requested", {
+        "session_id": session_id,
+        "reason": reason,
+        "summary": summary,
+        "customer": {"name": row.customer_name, "id": row.customer_id},
+        "claim_url": f"/api/v1/chat/sessions/{session_id}/claim",
+        "agent_ws_url": f"/api/v1/chat/sessions/{session_id}/agent-ws",
+        "bo_available": available,
+    })
+
+    await websocket.send_text(json.dumps({"type": "mode_change", "mode": "awaiting_human"}))
+
+    if not available and next_slot:
+        await websocket.send_text(json.dumps({
+            "type": "message",
+            "text": (
+                f"Our support team is currently unavailable. "
+                f"They will be available {next_slot} and will assist you then. "
+                "Please stay in this chat and we will connect you as soon as they come online."
+            ),
+            "sources": [], "suggestions": [], "action": "wait",
+        }))
+
+    await _emit_escalation(tenant.id, session_id, result)
+
+
+async def _run_human_mode(
+    websocket: WebSocket,
+    session_id: str,
+    tenant: TenantContext,
+) -> None:
+    """Handle the customer WS while mode is awaiting_human or human.
+    Races between messages from the customer and replies from the BO agent WS."""
+    bq: asyncio.Queue = _bo_queues.setdefault(session_id, asyncio.Queue())
+    cq: asyncio.Queue = _customer_queues.setdefault(session_id, asyncio.Queue())
+
+    try:
+        while True:
+            ws_task = asyncio.ensure_future(websocket.receive_text())
+            cq_task = asyncio.ensure_future(cq.get())
+            done, pending = await asyncio.wait(
+                {ws_task, cq_task}, return_when=asyncio.FIRST_COMPLETED
+            )
+            for t in pending:
+                t.cancel()
+                try:
+                    await t
+                except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                    pass
+
+            if cq_task in done:
+                item = cq_task.result()
+                await websocket.send_text(item)
+                if json.loads(item).get("type") == "ended":
+                    break
+
+            if ws_task in done:
+                try:
+                    raw = ws_task.result()
+                except WebSocketDisconnect:
+                    await bq.put(None)
+                    raise
+                try:
+                    msg = json.loads(raw)
+                except (ValueError, TypeError):
+                    continue
+                mtype = msg.get("type", "message")
+                if mtype == "end":
+                    from src.api.chat_webhooks import send_bo_webhook
+                    summary = "Ended by customer"
+                    await _end_session(session_id, summary)
+                    await send_bo_webhook(tenant, "session_closed", {
+                        "session_id": session_id,
+                        "mode_at_close": "human",
+                        "summary": summary,
+                    })
+                    await bq.put(None)
+                    await websocket.send_text(json.dumps({"type": "ended"}))
+                    break
+                user_text = (msg.get("text") or "").strip()
+                if user_text:
+                    async with _sm()() as db:
+                        r = await db.get(ChatSession, session_id)
+                        if r:
+                            db.add(ChatMessage(
+                                session_id=session_id, role="customer",
+                                type="text", content=user_text,
+                            ))
+                            r.message_count = (r.message_count or 0) + 1
+                            await db.commit()
+                    await bq.put(json.dumps({
+                        "type": "customer_message",
+                        "text": user_text,
+                        "session_id": session_id,
+                    }))
+    except WebSocketDisconnect:
+        await bq.put(None)
+        raise
+
+
+async def _send_close_webhook(
+    tenant: TenantContext, session_id: str, mode_at_close: str, summary: str,
+) -> None:
+    """Send session_closed webhook with full transcript. Best-effort."""
+    from src.api.chat_webhooks import send_bo_webhook
+    try:
+        async with _sm()() as db:
+            msgs = (await db.execute(
+                select(ChatMessage)
+                .where(ChatMessage.session_id == session_id)
+                .order_by(ChatMessage.id)
+            )).scalars().all()
+        transcript = [
+            {"role": m.role, "text": m.content,
+             "ts": m.created_at.isoformat() if m.created_at else None}
+            for m in msgs
+        ]
+        await send_bo_webhook(tenant, "session_closed", {
+            "session_id": session_id,
+            "mode_at_close": mode_at_close,
+            "summary": summary,
+            "transcript": transcript,
+        })
+    except Exception:  # noqa: BLE001
+        log.exception("session_closed webhook failed", extra={"session_id": session_id})
 
 
 def _to_message_response(session_id: str, result: ChatTurnResult) -> ChatMessageResponse:

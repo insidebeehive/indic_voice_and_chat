@@ -118,6 +118,21 @@
         setSuggestions(m.suggestions);
       } else if (m.type === "call_offer") {
         showCallOffer(m.reason, m.call_url);
+      } else if (m.type === "mode_change") {
+        if (m.mode === "awaiting_human") {
+          const el = document.createElement("div");
+          el.className = "meta";
+          el.innerHTML = '<span style="color:#d97706;">&#x23F3; Connecting you to a support agent, please wait&hellip;</span>';
+          $("log").appendChild(el);
+          $("log").scrollTop = $("log").scrollHeight;
+        } else if (m.mode === "human") {
+          const name = m.agent_name ? m.agent_name : "a support agent";
+          const el = document.createElement("div");
+          el.className = "meta";
+          el.innerHTML = `<span style="color:#16a34a;">&#x2713; You are now connected with ${name}</span>`;
+          $("log").appendChild(el);
+          $("log").scrollTop = $("log").scrollHeight;
+        }
       } else if (m.type === "ended") {
         add("agent", "— chat ended —"); $("composer").classList.add("hidden");
       } else if (m.type === "error") {

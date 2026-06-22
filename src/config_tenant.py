@@ -255,6 +255,15 @@ class TenantWhatsAppConfig(BaseModel):
     token_env: Optional[str] = None
 
 
+class ChatSupportConfig(BaseModel):
+    """BO (back-office) handover settings for the chat module."""
+    bo_webhook_url: Optional[str] = None
+    support_timezone: str = "Asia/Kolkata"
+    # Keyed by day-range string ("mon-fri", "sat", "sun"); value = "HH:MM-HH:MM".
+    # Absent key = closed that day. Empty dict = check disabled (always available).
+    support_hours: dict = Field(default_factory=dict)
+
+
 class TenantSettings(BaseModel):
     """Validated tenant configuration loaded from YAML."""
 
@@ -270,6 +279,7 @@ class TenantSettings(BaseModel):
     compliance: TenantCompliance = Field(default_factory=TenantCompliance)
     crm: TenantCRMConfig = Field(default_factory=TenantCRMConfig)
     whatsapp: TenantWhatsAppConfig = Field(default_factory=TenantWhatsAppConfig)
+    chat_support: ChatSupportConfig = Field(default_factory=ChatSupportConfig)
     phone_numbers: list[str] = Field(default_factory=list)
 
     @field_validator("timezone")

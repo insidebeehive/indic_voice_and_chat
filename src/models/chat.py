@@ -40,6 +40,9 @@ class ChatSession(Base):
     ended_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=False))
     summary: Mapped[Optional[str]] = mapped_column(Text)
     satisfaction: Mapped[Optional[str]] = mapped_column(String(20))  # positive|neutral|negative
+    mode: Mapped[str] = mapped_column(String(20), default="ai")  # ai|awaiting_human|human|closed
+    claimed_by: Mapped[Optional[str]] = mapped_column(String(100))
+    claimed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=False))
 
 
 class ChatMessage(Base):
