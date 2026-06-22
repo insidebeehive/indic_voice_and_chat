@@ -805,9 +805,21 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
                             continue
                         caption = (msg.get("text") or "").strip()
                         await websocket.send_text(json.dumps({"type": "typing"}))
+
+                        # Upload to S3 if storage is configured
+                        object_key: Optional[str] = None
+                        if _media_store is not None:
+                            try:
+                                raw_bytes = base64.b64decode(data)
+                                object_key = _media_key(tenant.id, session_id, mime)
+                                await _media_store.upload(raw_bytes, object_key, mime)
+                            except Exception:
+                                log.exception("media upload failed", extra={"session_id": session_id})
+                                object_key = None
+
                         result = await agent.handle_image(data, mime, caption)
                         await _persist_turn(session_id, caption or f"[{mtype}]", result,
-                                            user_type=mtype, media_mime=mime)
+                                            user_type=mtype, media_mime=mime, media_url=object_key)
                         await _send_reply(websocket, session_id, result, tenant.id)
                         if result.escalation:
                             await _handle_escalation(websocket, session_id, tenant, row, result)
