@@ -386,9 +386,6 @@ async def update_tenant(
 
         pc["telephony"] = tel_cfg
 
-    if req.status is not None or req.events_webhook_url is not None or req.telephony is not None:
-        t.pipeline_config = pc  # reassign (new object) so the JSON column is marked dirty
-
         if tu.phone_numbers is not None:
             for pn in (await session.execute(
                 select(TenantPhoneNumber).where(TenantPhoneNumber.tenant_id == tenant_id)
@@ -397,6 +394,9 @@ async def update_tenant(
             for ph in tu.phone_numbers:
                 session.add(TenantPhoneNumber(
                     phone_number=ph, tenant_id=tenant_id, provider=tel_cfg.get("provider")))
+
+    if req.status is not None or req.events_webhook_url is not None or req.telephony is not None:
+        t.pipeline_config = pc  # reassign (new object) so the JSON column is marked dirty
 
     await session.commit()
     await _refresh_resolver(request, tenant_id)

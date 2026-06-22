@@ -160,16 +160,15 @@ async def test_update_tenant_stores_events_webhook_secret(ctx) -> None:
 
     resp = await client.patch(
         f"/tenants/{tid}",
-        json={"telephony": {"events_webhook_url": "https://crm.example/events",
-                            "keys": {"events_webhook_secret": "s3cret-value"}}},
+        json={"events_webhook_url": "https://crm.example/events",
+              "telephony": {"keys": {"events_webhook_secret": "s3cret-value"}}},
         headers=ADMIN_HEADERS)
     assert resp.status_code == 200
 
     ctx2 = await resolver.resolve_by_slug("acme")
-    tel = ctx2.settings.pipeline.telephony
-    assert tel.events_webhook_url == "https://crm.example/events"
-    assert tel.events_webhook_secret_env                     # a derived NAME, set via keys
-    assert ctx2.secret_optional(tel.events_webhook_secret_env) == "s3cret-value"
+    assert ctx2.settings.events_webhook_url == "https://crm.example/events"
+    assert ctx2.settings.events_webhook_secret_env           # a derived NAME, set via keys
+    assert ctx2.secret_optional(ctx2.settings.events_webhook_secret_env) == "s3cret-value"
 
 
 _CAMP_YAML = """

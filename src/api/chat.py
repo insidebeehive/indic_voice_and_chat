@@ -592,80 +592,83 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
 
     agent = await _factory(tenant, _scoped_session(tenant, session_id))
     try:
-        while True:
-            # If the session was handed over to a human, switch to the human-mode loop.
-            async with _sm()() as db:
-                cur_row = await db.get(ChatSession, session_id)
-            if cur_row and cur_row.mode in ("awaiting_human", "human"):
-                await _run_human_mode(websocket, session_id, tenant)
-                break
+        # Handle reconnect: session may already be in human/awaiting_human mode.
+        async with _sm()() as db:
+            cur_row = await db.get(ChatSession, session_id)
+        if cur_row and cur_row.mode in ("awaiting_human", "human"):
+            await _run_human_mode(websocket, session_id, tenant)
+        else:
+            while True:
+                raw = await websocket.receive_text()
+                try:
+                    msg = json.loads(raw)
+                except json.JSONDecodeError:
+                    await websocket.send_text(json.dumps({"type": "error", "message": "invalid json"}))
+                    continue
 
-            raw = await websocket.receive_text()
-            try:
-                msg = json.loads(raw)
-            except json.JSONDecodeError:
-                await websocket.send_text(json.dumps({"type": "error", "message": "invalid json"}))
-                continue
+                mtype = msg.get("type", "message")
+                if mtype == "end":
+                    summary = await agent.summarize_session()
+                    await _end_session(session_id, summary)
+                    await _send_close_webhook(tenant, session_id, "ai", summary)
+                    await websocket.send_text(json.dumps({"type": "ended", "summary": summary}))
+                    break
 
-            mtype = msg.get("type", "message")
-            if mtype == "end":
-                summary = await agent.summarize_session()
-                await _end_session(session_id, summary)
-                await _send_close_webhook(tenant, session_id, "ai", summary)
-                await websocket.send_text(json.dumps({"type": "ended", "summary": summary}))
-                break
-
-            # A single turn's failure must not black-hole the conversation: send an
-            # error frame and keep the socket open (a real disconnect re-raises).
-            try:
-                if mtype in ("image", "video"):
-                    data = msg.get("data")
-                    mime = msg.get("mime") or ""
-                    if not data or not mime:
-                        await websocket.send_text(json.dumps(
-                            {"type": "error", "message": "image/video needs 'data' + 'mime'"}))
+                # A single turn's failure must not black-hole the conversation: send an
+                # error frame and keep the socket open (a real disconnect re-raises).
+                try:
+                    if mtype in ("image", "video"):
+                        data = msg.get("data")
+                        mime = msg.get("mime") or ""
+                        if not data or not mime:
+                            await websocket.send_text(json.dumps(
+                                {"type": "error", "message": "image/video needs 'data' + 'mime'"}))
+                            continue
+                        caption = (msg.get("text") or "").strip()
+                        await websocket.send_text(json.dumps({"type": "typing"}))
+                        result = await agent.handle_image(data, mime, caption)
+                        await _persist_turn(session_id, caption or f"[{mtype}]", result,
+                                            user_type=mtype, media_mime=mime)
+                        await _send_reply(websocket, session_id, result, tenant.id)
+                        if result.escalation:
+                            await _handle_escalation(websocket, session_id, tenant, row, result)
+                            await _run_human_mode(websocket, session_id, tenant)
+                            break
                         continue
-                    caption = (msg.get("text") or "").strip()
+
+                    user_text = (msg.get("text") or msg.get("message") or "").strip()
+                    if not user_text:
+                        await websocket.send_text(json.dumps({"type": "error", "message": "missing 'text'"}))
+                        continue
+
                     await websocket.send_text(json.dumps({"type": "typing"}))
-                    result = await agent.handle_image(data, mime, caption)
-                    await _persist_turn(session_id, caption or f"[{mtype}]", result,
-                                        user_type=mtype, media_mime=mime)
-                    await _send_reply(websocket, session_id, result, tenant.id)
+                    result = await agent.handle_message(user_text)
+                    await _persist_turn(session_id, user_text, result)
+                    call_url: Optional[str] = None
+                    if result.call_offer and _handoff_store is not None:
+                        summary = await agent.summarize_session()
+                        token = uuid.uuid4().hex
+                        context = {
+                            "chat_session_id": session_id,
+                            "customer_name": row.customer_name,
+                            "customer_id": row.customer_id,
+                            "language": row.language,
+                            "chat_summary": summary,
+                        }
+                        await _handoff_store.redis.set(
+                            f"chat_handoff:{token}", json.dumps(context), ex=600)
+                        call_url = _voice_call_url(websocket, tenant.slug, token)
+                    await _send_reply(websocket, session_id, result, tenant.id, call_url=call_url)
                     if result.escalation:
                         await _handle_escalation(websocket, session_id, tenant, row, result)
-                    continue
-
-                user_text = (msg.get("text") or msg.get("message") or "").strip()
-                if not user_text:
-                    await websocket.send_text(json.dumps({"type": "error", "message": "missing 'text'"}))
-                    continue
-
-                await websocket.send_text(json.dumps({"type": "typing"}))
-                result = await agent.handle_message(user_text)
-                await _persist_turn(session_id, user_text, result)
-                call_url: Optional[str] = None
-                if result.call_offer and _handoff_store is not None:
-                    summary = await agent.summarize_session()
-                    token = uuid.uuid4().hex
-                    context = {
-                        "chat_session_id": session_id,
-                        "customer_name": row.customer_name,
-                        "customer_id": row.customer_id,
-                        "language": row.language,
-                        "chat_summary": summary,
-                    }
-                    await _handoff_store.redis.set(
-                        f"chat_handoff:{token}", json.dumps(context), ex=600)
-                    call_url = _voice_call_url(websocket, tenant.slug, token)
-                await _send_reply(websocket, session_id, result, tenant.id, call_url=call_url)
-                if result.escalation:
-                    await _handle_escalation(websocket, session_id, tenant, row, result)
-            except WebSocketDisconnect:
-                raise
-            except Exception:  # noqa: BLE001 — one bad turn must not drop the chat
-                log.exception("chat turn failed", extra={"session_id": session_id})
-                await websocket.send_text(json.dumps(
-                    {"type": "error", "message": "Sorry, something went wrong — please try again."}))
+                        await _run_human_mode(websocket, session_id, tenant)
+                        break
+                except WebSocketDisconnect:
+                    raise
+                except Exception:  # noqa: BLE001 — one bad turn must not drop the chat
+                    log.exception("chat turn failed", extra={"session_id": session_id})
+                    await websocket.send_text(json.dumps(
+                        {"type": "error", "message": "Sorry, something went wrong — please try again."}))
     except WebSocketDisconnect:
         log.info("chat ws client disconnected", extra={"session_id": session_id})
     except Exception:  # noqa: BLE001 — never let the websocket task escape
