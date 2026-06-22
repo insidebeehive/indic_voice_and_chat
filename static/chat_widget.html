@@ -268,7 +268,7 @@ registerProcessor('capture-processor', CaptureProcessor);
 
   $("attach-btn").onclick = () => $("file-input").click();
 
-  const MAX_IMAGE_MB = 5, MAX_VIDEO_MB = 50;
+  const MAX_IMAGE_MB = 1, MAX_VIDEO_MB = 5;
 
   $("file-input").onchange = () => {
     const f = $("file-input").files[0];
