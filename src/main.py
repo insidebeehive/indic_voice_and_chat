@@ -234,12 +234,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             )
     set_call_outcome_persister(_persist_call_outcome)
 
-    # Outbound per-tenant call-event webhook: call_store hands us a ready-built
-    # envelope at call start (call.initiated) and end (call.completed + outcome);
-    # we resolve the tenant's events_webhook_url + secret and POST it signed,
-    # fire-and-forget so a slow tenant endpoint never blocks call handling. The
-    # config fields live on TenantSettings (read via getattr so this is a clean
-    # no-op until the active_creds WIP adds events_webhook_url/secret_env).
+    # Outbound per-tenant event webhook: call_store hands us a ready-built
+    # envelope at call start/end; we resolve the tenant's events_webhook_url +
+    # secret from TenantSettings (top-level, not under telephony) and POST it
+    # signed, fire-and-forget so a slow tenant endpoint never blocks call handling.
     def _tenant_settings_by_id(tenant_id: str):
         for t in (getattr(app.state, "tenants", {}) or {}).values():
             if getattr(t, "id", None) == tenant_id:
@@ -248,11 +246,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     async def _notify_tenant_event(envelope: dict) -> None:
         settings = _tenant_settings_by_id(envelope.get("tenant_id"))
-        tel = getattr(getattr(settings, "pipeline", None), "telephony", None)
-        url = getattr(tel, "events_webhook_url", None) if tel else None
+        url = getattr(settings, "events_webhook_url", None)
         if not url:
             return
-        secret_env = getattr(tel, "events_webhook_secret_env", None)
+        secret_env = getattr(settings, "events_webhook_secret_env", None)
         # Resolve the signing secret from the tenant's DECRYPTED secrets first
         # (so it can be stored per-tenant like the telephony keys), falling back
         # to process env. secret_optional() never raises — a missing secret just

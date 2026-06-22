@@ -41,6 +41,13 @@ def tenant_context_from_row(tenant: Tenant) -> TenantContext:
     compliance = TenantCompliance(**(pc.get("compliance") or {}))
     crm = TenantCRMConfig(**(pc.get("crm") or {}))
     chat_support = ChatSupportConfig(**(pc.get("chat_support") or {}))
+    # events_webhook_url lives at the top level of pipeline_config (not under telephony).
+    # Fall back to the old telephony location for rows written before this change.
+    tel_pc = pc.get("telephony") or {}
+    events_webhook_url = pc.get("events_webhook_url") or tel_pc.get("events_webhook_url")
+    events_webhook_secret_env = (
+        pc.get("events_webhook_secret_env") or tel_pc.get("events_webhook_secret_env")
+    )
     settings = TenantSettings(
         id=tenant.id,
         slug=tenant.slug,
@@ -49,6 +56,8 @@ def tenant_context_from_row(tenant: Tenant) -> TenantContext:
         default_language=tenant.default_language,
         timezone=tenant.timezone,
         max_concurrent_calls=tenant.max_concurrent_calls,
+        events_webhook_url=events_webhook_url,
+        events_webhook_secret_env=events_webhook_secret_env,
         pipeline=pipeline,
         compliance=compliance,
         crm=crm,

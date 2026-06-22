@@ -82,9 +82,6 @@ class TelephonyConfigIn(BaseModel):
     stringee_base_url: Optional[str] = None   # regional Stringee REST host, if any
     # No per-tenant inbound webhook base URL — it's the platform WEBHOOK_BASE_URL
     # (always our app, common to every tenant).
-    events_webhook_url: Optional[str] = None        # outbound call-event callback
-    # The signing secret is NOT named here — pass it as keys["events_webhook_secret"]
-    # (a value, encrypted at rest); it sets events_webhook_secret_env to a derived name.
     # Telephony credentials — the ONLY per-tenant secrets. Encrypted at rest.
     # e.g. {"account_sid": "AC...", "auth_token": "..."}. Optional for providers
     # (Stringee) whose adapter reads its keys from the platform env directly.
@@ -104,6 +101,9 @@ class RegisterTenantRequest(BaseModel):
     tts: Optional[LayerChoice] = None
     realtime: Optional[RealtimeChoice] = None
     telephony: TelephonyConfigIn
+    # Outbound event webhook — receives call + chat handover lifecycle events,
+    # signed when events_webhook_secret is provided (pass as keys["events_webhook_secret"]).
+    events_webhook_url: Optional[str] = None
     # CRM operator ID — the CRM system's identifier for this operator/tenant.
     # Injected into every CRM tool call as "operator_id" so the CRM can scope
     # responses. Defaults to the platform's tenant ID if not provided.
@@ -225,18 +225,25 @@ async def register_tenant(
             provider=tel.provider,
             from_number=tel.from_number,
             stringee_base_url=tel.stringee_base_url,
-            events_webhook_url=tel.events_webhook_url,
-            **env_fields,
+            **{k: v for k, v in env_fields.items() if k != "events_webhook_secret_env"},
             # also record the creds under the provider-specific slot so a tenant
             # that later adds a second provider's keys resolves each correctly.
             creds_by_provider=(
-                {tel.provider.lower(): TelephonyCreds(**env_fields)}
+                {tel.provider.lower(): TelephonyCreds(
+                    **{k: v for k, v in env_fields.items() if k != "events_webhook_secret_env"}
+                )}
                 if env_fields and tel.provider else {}
             ),
         ),
     )
 
     pipeline_config = pipeline.model_dump()
+    # events_webhook fields live at the top level of pipeline_config (not under telephony)
+    # so they apply to both call events and chat handover events.
+    if req.events_webhook_url:
+        pipeline_config["events_webhook_url"] = req.events_webhook_url
+    if env_fields.get("events_webhook_secret_env"):
+        pipeline_config["events_webhook_secret_env"] = env_fields["events_webhook_secret_env"]
     if req.crm_operator_id:
         pipeline_config["crm"] = {"operator_id": req.crm_operator_id}
     session.add(Tenant(
@@ -278,13 +285,13 @@ class TelephonyUpdateIn(BaseModel):
     provider: Optional[str] = None
     from_number: Optional[str] = None
     stringee_base_url: Optional[str] = None
-    events_webhook_url: Optional[str] = None
     keys: dict[str, str] = Field(default_factory=dict)
     phone_numbers: Optional[list[str]] = None
 
 
 class UpdateTenantRequest(BaseModel):
     status: Optional[str] = Field(default=None, pattern="^(active|suspended)$")
+    events_webhook_url: Optional[str] = None
     telephony: Optional[TelephonyUpdateIn] = None
 
 
@@ -331,9 +338,13 @@ async def update_tenant(
     if req.status is not None:
         t.status = req.status
 
+    pc = dict(t.pipeline_config or {})
+
+    if req.events_webhook_url is not None:
+        pc["events_webhook_url"] = req.events_webhook_url
+
     if req.telephony is not None:
         tu = req.telephony
-        pc = dict(t.pipeline_config or {})
         tel_cfg = dict(pc.get("telephony") or {})
         if tu.provider is not None:
             tel_cfg["provider"] = tu.provider
@@ -341,8 +352,6 @@ async def update_tenant(
             tel_cfg["from_number"] = tu.from_number
         if tu.stringee_base_url is not None:
             tel_cfg["stringee_base_url"] = tu.stringee_base_url
-        if tu.events_webhook_url is not None:
-            tel_cfg["events_webhook_url"] = tu.events_webhook_url
 
         if tu.keys:
             if not crypto.has_key():
@@ -361,6 +370,9 @@ async def update_tenant(
                     session.add(TenantSecret(
                         tenant_id=tenant_id, name=name,
                         value_encrypted=crypto.encrypt(value)))
+            # events_webhook_secret_env goes to top-level; telephony creds go under telephony.
+            if "events_webhook_secret_env" in env_fields:
+                pc["events_webhook_secret_env"] = env_fields.pop("events_webhook_secret_env")
             # write the creds into the configured provider's slot (so they're
             # selected by provider) and mirror to top-level for back-compat.
             prov = (tel_cfg.get("provider") or "").lower()
@@ -373,6 +385,8 @@ async def update_tenant(
             tel_cfg.update(env_fields)
 
         pc["telephony"] = tel_cfg
+
+    if req.status is not None or req.events_webhook_url is not None or req.telephony is not None:
         t.pipeline_config = pc  # reassign (new object) so the JSON column is marked dirty
 
         if tu.phone_numbers is not None:
@@ -422,8 +436,8 @@ class TenantSummary(BaseModel):
     # (never values) of the creds configured for the active provider.
     telephony_from_number: Optional[str] = None
     telephony_stringee_base_url: Optional[str] = None
-    telephony_events_webhook_url: Optional[str] = None
-    telephony_events_webhook_secret_set: bool = False   # whether a signing secret is configured (never the value)
+    events_webhook_url: Optional[str] = None
+    events_webhook_secret_set: bool = False
     telephony_creds_configured: list[str] = Field(default_factory=list)
     # Per-tenant Stringee webhook URLs (platform base + this tenant's slug) to
     # paste into the tenant's Stringee project so calls attribute correctly.
@@ -473,8 +487,10 @@ async def list_tenants(
             telephony_provider=tel.get("provider"),
             telephony_from_number=tel.get("from_number"),
             telephony_stringee_base_url=tel.get("stringee_base_url"),
-            telephony_events_webhook_url=tel.get("events_webhook_url"),
-            telephony_events_webhook_secret_set=bool(tel.get("events_webhook_secret_env")),
+            events_webhook_url=pc.get("events_webhook_url") or tel.get("events_webhook_url"),
+            events_webhook_secret_set=bool(
+                pc.get("events_webhook_secret_env") or tel.get("events_webhook_secret_env")
+            ),
             telephony_creds_configured=_configured_creds(tel),
             stringee_softphone_answer_url=(
                 f"{base}/stringee/softphone-answer/{t.slug}" if base else None),

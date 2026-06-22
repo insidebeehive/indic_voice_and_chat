@@ -156,13 +156,6 @@ class TenantTelephonyConfig(BaseModel):
     # NB: there is no per-tenant inbound webhook base URL — it's always *our* app,
     # common to every tenant, so it lives at the platform level (WEBHOOK_BASE_URL /
     # settings.pipeline.telephony.webhook_base_url, see ``platform_webhook_base_url``).
-    # Outbound CALL-EVENT webhook (the tenant's CRM callback, distinct from the
-    # platform inbound base): where we POST call.initiated/answered/completed (+ the
-    # LLM outcome) for this tenant's calls, signed with the secret named by
-    # events_webhook_secret_env — resolved via TenantContext.secret_optional
-    # (per-tenant decrypted secret first, then process env; unset = sent unsigned).
-    events_webhook_url: Optional[str] = None
-    events_webhook_secret_env: Optional[str] = None
     # Top-level credential refs (legacy / single-provider tenants). Kept for
     # backward compatibility; when ``creds_by_provider`` has an entry for the
     # active provider it takes precedence (see ``active_creds``).
@@ -257,7 +250,6 @@ class TenantWhatsAppConfig(BaseModel):
 
 class ChatSupportConfig(BaseModel):
     """BO (back-office) handover settings for the chat module."""
-    bo_webhook_url: Optional[str] = None
     support_timezone: str = "Asia/Kolkata"
     # Keyed by day-range string ("mon-fri", "sat", "sun"); value = "HH:MM-HH:MM".
     # Absent key = closed that day. Empty dict = check disabled (always available).
@@ -275,6 +267,10 @@ class TenantSettings(BaseModel):
     timezone: str = "Asia/Kolkata"  # IANA tz; resolves relative callback times
     max_concurrent_calls: int = 1   # per-tenant cap on simultaneous live calls
 
+    # Outbound event webhook — receives all lifecycle events (calls, chat handovers).
+    # Signed with HMAC-SHA256 when events_webhook_secret_env is set.
+    events_webhook_url: Optional[str] = None
+    events_webhook_secret_env: Optional[str] = None
     pipeline: TenantPipelineConfig = Field(default_factory=TenantPipelineConfig)
     compliance: TenantCompliance = Field(default_factory=TenantCompliance)
     crm: TenantCRMConfig = Field(default_factory=TenantCRMConfig)
