@@ -557,7 +557,6 @@ async def agent_websocket(websocket: WebSocket, session_id: str) -> None:
                             ))
                             r2.message_count = (r2.message_count or 0) + 1
                             await db.commit()
-                    log.info("agent reply queued for customer", extra={"session_id": session_id, "cq_size": cq.qsize() + 1})
                     await cq.put(json.dumps({"type": "message", "text": text, "from": "human_agent"}))
                 elif mtype == "end":
                     await cq.put(json.dumps({"type": "ended"}))
@@ -842,8 +841,6 @@ async def _run_human_mode(
     Races between messages from the customer and replies from the BO agent WS."""
     bq: asyncio.Queue = _bo_queues.setdefault(session_id, asyncio.Queue())
     cq: asyncio.Queue = _customer_queues.setdefault(session_id, asyncio.Queue())
-    log.info("human mode started for customer ws", extra={"session_id": session_id})
-
     try:
         while True:
             ws_task = asyncio.ensure_future(websocket.receive_text())
@@ -860,7 +857,6 @@ async def _run_human_mode(
 
             if cq_task in done:
                 item = cq_task.result()
-                log.info("forwarding cq item to customer ws", extra={"session_id": session_id, "type": json.loads(item).get("type")})
                 await websocket.send_text(item)
                 if json.loads(item).get("type") == "ended":
                     break
