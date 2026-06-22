@@ -120,11 +120,8 @@ def _voice_call_url(conn, tenant_slug: str, token: str) -> str:
 
 def _greeting(company: str, customer_name: Optional[str], language: str) -> str:
     name = (customer_name or "").strip()
-    if language.startswith("hi"):
-        who = f"{name} जी" if name else "आप"
-        return f"नमस्ते {who}! मैं {company} की सहायक हूँ। मैं आपकी कैसे मदद कर सकती हूँ?"
-    who = name or "there"
-    return f"Hi {who}! I'm the {company} assistant. How can I help you today?"
+    who = name if name else "there"
+    return f"Hello {who}, how can I help?"
 
 
 # --- Schemas ------------------------------------------------------------
