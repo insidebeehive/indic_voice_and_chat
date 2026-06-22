@@ -233,6 +233,8 @@ function connectWs(sessionId) {
   const url = `${wsBase}/api/v1/chat/sessions/${sessionId}/agent-ws?token=${encodeURIComponent(token())}`;
 
   if (_reconnectTimer) { clearTimeout(_reconnectTimer); _reconnectTimer = null; }
+  console.log("[bo-agent] connecting", url.replace(/token=[^&]+/, "token=***"));
+  sysMsg(`Connecting to session ${sessionId}…`);
   ws = new WebSocket(url);
 
   ws.onopen = () => {
@@ -275,15 +277,18 @@ function connectWs(sessionId) {
     }
   };
 
-  ws.onerror = () => {
+  ws.onerror = (err) => {
+    console.error("[bo-agent] WS error", err);
     setStatus("disconnected", "WebSocket error");
-    cleanup();
   };
 
   ws.onclose = ev => {
+    console.warn("[bo-agent] WS closed", ev.code, ev.reason);
     const clean = ev.code === 1000 || ev.code === 4000;
     if (!clean) {
-      setStatus("disconnected", `WS closed (${ev.code}: ${ev.reason || "no reason"})`);
+      const detail = `WS closed (${ev.code}: ${ev.reason || "no reason"})`;
+      setStatus("disconnected", detail);
+      sysMsg(`⚠ ${detail}`);
     }
     $("btnEnd").disabled = true;
     $("btnSend").disabled = true;
