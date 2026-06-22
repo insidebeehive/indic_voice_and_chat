@@ -532,8 +532,14 @@ async def agent_websocket(websocket: WebSocket, session_id: str) -> None:
     await websocket.send_text(json.dumps({
         "type": "history",
         "messages": [
-            {"role": m.role, "text": m.content,
-             "ts": m.created_at.isoformat() if m.created_at else None}
+            {
+                "id": m.id,
+                "role": m.role,
+                "text": m.content,
+                "media_url": (f"/api/v1/chat/media/{m.id}" if m.media_url else None),
+                "media_mime": m.media_mime,
+                "ts": m.created_at.isoformat() if m.created_at else None,
+            }
             for m in msgs
         ],
     }))
@@ -771,26 +777,33 @@ async def _emit_escalation(tenant_id: str, session_id: str, result: ChatTurnResu
 async def _persist_turn(
     session_id: str, user_text: str, result: ChatTurnResult,
     *, user_type: str = "text", media_mime: Optional[str] = None,
-) -> None:
+    media_url: Optional[str] = None,
+) -> Optional[int]:
     """Append the customer + agent messages to chat_messages and bump the count.
-    Best-effort: a missing session row (e.g. /message with an ad-hoc id) is a
-    no-op so the conversational reply is never blocked on persistence."""
+    Returns the customer ChatMessage.id on success, None on error or missing session."""
     try:
         async with _sm()() as db:
             row = await db.get(ChatSession, session_id)
             if row is None:
-                return
-            db.add(ChatMessage(session_id=session_id, role="customer", type=user_type,
-                               content=user_text, media_mime=media_mime))
+                return None
+            customer_msg = ChatMessage(
+                session_id=session_id, role="customer", type=user_type,
+                content=user_text, media_mime=media_mime, media_url=media_url,
+            )
+            db.add(customer_msg)
             db.add(ChatMessage(
                 session_id=session_id, role="agent", type="text",
                 content=result.response.response_text,
                 sources=result.response.sources_used or None,
             ))
             row.message_count = (row.message_count or 0) + 2
+            await db.flush()
+            msg_id = customer_msg.id
             await db.commit()
-    except Exception:  # noqa: BLE001 — persistence must not break the conversation
+            return msg_id
+    except Exception:
         log.exception("chat message persistence failed", extra={"session_id": session_id})
+        return None
 
 
 async def _end_session(session_id: str, summary: str = "") -> None:
