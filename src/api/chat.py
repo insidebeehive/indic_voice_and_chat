@@ -443,6 +443,58 @@ async def chat_history(
     )
 
 
+@router.get("/media/{message_id}")
+async def get_media(
+    message_id: int,
+    session: AsyncSession = Depends(get_db_session),
+    authorization: Optional[str] = Header(default=None),
+    session_id: Optional[str] = Query(default=None),
+) -> RedirectResponse:
+    """Serve a signed URL for a chat media message.
+
+    Accepts either:
+      Authorization: Bearer <token>   (CRM / programmatic)
+      ?session_id=<sid>               (widget / BO console HTML elements)
+    """
+    from src.auth.middleware import tenant_from_bearer_token
+
+    if _media_store is None:
+        raise HTTPException(status_code=503, detail="media storage not configured")
+
+    msg = await session.get(ChatMessage, message_id)
+    if msg is None or not msg.media_url:
+        raise HTTPException(status_code=404, detail="media not found")
+
+    authed = False
+    if authorization and authorization.startswith("Bearer "):
+        try:
+            tenant = await tenant_from_bearer_token(authorization[len("Bearer "):])
+        except Exception:  # noqa: BLE001
+            tenant = None
+        if tenant is not None:
+            chat_row = await session.get(ChatSession, msg.session_id)
+            if chat_row and chat_row.tenant_id == tenant.id:
+                authed = True
+
+    if not authed and session_id and msg.session_id == session_id:
+        authed = True
+
+    if not authed:
+        raise HTTPException(status_code=401, detail="unauthorized")
+
+    ttl = 3600
+    try:
+        from src.config import get_settings
+        cfg = get_settings().media_storage
+        if cfg is not None:
+            ttl = cfg.signed_url_ttl_seconds
+    except Exception:  # noqa: BLE001
+        pass
+
+    url = await _media_store.signed_url(msg.media_url, ttl_seconds=ttl)
+    return RedirectResponse(url=url, status_code=302)
+
+
 # --- BO handover: claim + agent WebSocket --------------------------------
 
 
