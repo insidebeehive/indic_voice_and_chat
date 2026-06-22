@@ -565,8 +565,12 @@ async def agent_websocket(websocket: WebSocket, session_id: str) -> None:
                     break
     except WebSocketDisconnect:
         log.info("agent ws disconnected", extra={"session_id": session_id})
-    except Exception:  # noqa: BLE001
-        log.exception("agent ws crashed", extra={"session_id": session_id})
+    except Exception as _exc:  # noqa: BLE001
+        log.error(
+            "agent ws crashed: %s: %s", type(_exc).__name__, _exc,
+            extra={"session_id": session_id},
+        )
+        log.exception("agent ws crashed (full tb)", extra={"session_id": session_id})
     finally:
         try:
             await websocket.close()
