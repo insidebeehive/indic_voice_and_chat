@@ -53,7 +53,7 @@ class ChatMessage(Base):
         String(50), ForeignKey("chat_sessions.id", ondelete="CASCADE"),
         nullable=False, index=True,
     )
-    role: Mapped[str] = mapped_column(String(10), nullable=False)  # customer|agent|system
+    role: Mapped[str] = mapped_column(String(20), nullable=False)  # customer|agent|human_agent|system
     type: Mapped[str] = mapped_column(String(10), default="text")  # text|image|video|tool
     content: Mapped[str] = mapped_column(Text, nullable=False)
     media_url: Mapped[Optional[str]] = mapped_column(String(500))
