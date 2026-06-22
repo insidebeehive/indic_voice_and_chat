@@ -229,7 +229,8 @@ let _reconnectTimer = null;
 let _sessionEndedByAgent = false;
 
 function connectWs(sessionId) {
-  const wsBase = base().replace(/^http/, "ws") || `ws://${location.host}`;
+  const _b = base();
+  const wsBase = _b ? _b.replace(/^http/, "ws") : `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}`;
   const url = `${wsBase}/api/v1/chat/sessions/${sessionId}/agent-ws?token=${encodeURIComponent(token())}`;
 
   if (_reconnectTimer) { clearTimeout(_reconnectTimer); _reconnectTimer = null; }
