@@ -474,9 +474,9 @@ async def agent_websocket(websocket: WebSocket, session_id: str) -> None:
     if not token:
         await websocket.close(code=1008, reason="missing token")
         return
-    from src.auth.middleware import tenant_from_token
+    from src.auth.middleware import tenant_from_bearer_token
     try:
-        tenant = await tenant_from_token(token)
+        tenant = await tenant_from_bearer_token(token)
     except Exception:  # noqa: BLE001
         await websocket.close(code=1008, reason="invalid token")
         return

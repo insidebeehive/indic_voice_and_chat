@@ -203,3 +203,11 @@ async def tenant_from_id(tenant_id: str) -> Optional[TenantContext]:
     if _resolver is None:
         return None
     return await _resolver.resolve_by_id(tenant_id)
+
+
+async def tenant_from_bearer_token(token: str) -> Optional[TenantContext]:
+    """Resolve a tenant from a raw bearer token (no 'Bearer ' prefix).
+    Used for WebSocket endpoints where the token is passed as a query param."""
+    if _resolver is None:
+        return None
+    return await _resolver.resolve_by_token(hash_api_token(token))
