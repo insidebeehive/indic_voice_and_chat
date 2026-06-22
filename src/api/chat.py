@@ -102,10 +102,11 @@ def _new_session_id() -> str:
     return f"cs_{uuid.uuid4().hex[:16]}"
 
 
-def _ws_base(request: Request) -> str:
-    base = request.headers.get("x-forwarded-host") or request.url.netloc
-    proto = request.headers.get("x-forwarded-proto")
-    scheme = "wss" if (proto == "https" or request.url.scheme == "https") else "ws"
+def _ws_base(conn) -> str:
+    """Build the WebSocket API base from any HTTPConnection (Request or WebSocket)."""
+    base = conn.headers.get("x-forwarded-host") or conn.url.netloc
+    proto = conn.headers.get("x-forwarded-proto")
+    scheme = "wss" if (proto == "https" or conn.url.scheme == "https") else "ws"
     return f"{scheme}://{base}/api/v1"
 
 
@@ -113,8 +114,8 @@ def _ws_url(request: Request, session_id: str) -> str:
     return f"{_ws_base(request)}/chat/ws/{session_id}"
 
 
-def _voice_call_url(request: Request, tenant_slug: str, token: str) -> str:
-    return f"{_ws_base(request)}/chat/voice?tenant={tenant_slug}&handoff={token}"
+def _voice_call_url(conn, tenant_slug: str, token: str) -> str:
+    return f"{_ws_base(conn)}/chat/voice?tenant={tenant_slug}&handoff={token}"
 
 
 def _greeting(company: str, customer_name: Optional[str], language: str) -> str:
@@ -404,7 +405,7 @@ async def chat_history(
 
 
 @router.websocket("/ws/{session_id}")
-async def chat_websocket(websocket: WebSocket, session_id: str, request: Request) -> None:
+async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
     await websocket.accept()
     if _factory is None:
         await websocket.close(code=1011, reason="chatbot factory unset")
@@ -479,7 +480,7 @@ async def chat_websocket(websocket: WebSocket, session_id: str, request: Request
                     }
                     await _handoff_store.redis.set(
                         f"chat_handoff:{token}", json.dumps(context), ex=600)
-                    call_url = _voice_call_url(request, tenant.slug, token)
+                    call_url = _voice_call_url(websocket, tenant.slug, token)
                 await _send_reply(websocket, session_id, result, tenant.id, call_url=call_url)
             except WebSocketDisconnect:
                 raise
