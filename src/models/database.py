@@ -57,11 +57,17 @@ def _quote_ident(name: str) -> str:
 
 def search_path_connect_args(url: str) -> dict:
     """asyncpg connect_args that pin search_path to our schema (+ public for
-    shared types/extensions). Empty for SQLite / unconfigured."""
+    shared types/extensions). Empty for SQLite / unconfigured.
+
+    statement_cache_size=0 disables asyncpg's prepared-statement cache so
+    queries work correctly through PgBouncer in transaction-pooling mode."""
     schema = get_schema(url)
-    if not schema:
+    if _is_sqlite(url):
         return {}
-    return {"server_settings": {"search_path": f"{_quote_ident(schema)},public"}}
+    args: dict = {"statement_cache_size": 0}
+    if schema:
+        args["server_settings"] = {"search_path": f"{_quote_ident(schema)},public"}
+    return args
 
 
 def get_engine(url: Optional[str] = None) -> AsyncEngine:
