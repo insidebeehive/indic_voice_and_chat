@@ -268,11 +268,21 @@ registerProcessor('capture-processor', CaptureProcessor);
 
   $("attach-btn").onclick = () => $("file-input").click();
 
+  const MAX_IMAGE_MB = 5, MAX_VIDEO_MB = 50;
+
   $("file-input").onchange = () => {
     const f = $("file-input").files[0];
     if (!f) return;
+    const isVideo = f.type.startsWith("video/");
+    const limitMB = isVideo ? MAX_VIDEO_MB : MAX_IMAGE_MB;
+    if (f.size > limitMB * 1024 * 1024) {
+      add("agent", `⚠️ File too large. Max size: ${limitMB} MB for ${isVideo ? "video" : "images"}.`);
+      $("file-input").value = "";
+      return;
+    }
     pendingFile = f;
-    $("preview-name").textContent = f.name;
+    const sizeMB = (f.size / 1024 / 1024).toFixed(1);
+    $("preview-name").textContent = `${f.name} (${sizeMB} MB)`;
     $("preview-bar").style.display = "flex";
   };
 
