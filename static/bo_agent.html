@@ -254,6 +254,32 @@ function connectWs(sessionId) {
       clearLog();
       sysMsg("--- conversation history ---");
       (msg.messages || []).forEach(m => {
+        const side = (m.role === "customer" || m.role === "user") ? "customer"
+                   : (m.role === "human_agent") ? "agent"
+                   : (m.role === "agent") ? "ai-agent"
+                   : null;
+
+        if (m.media_url && m.media_mime) {
+          const mime = m.media_mime.split(";")[0];
+          const src = m.media_url + (m.media_url.includes("?") ? "&" : "?") + `session_id=${sessionId}`;
+          let html;
+          if (mime.startsWith("image/")) {
+            html = `<img src="${src}" style="max-width:200px;border-radius:6px;" onerror="this.alt='[image unavailable]'">`;
+          } else if (mime.startsWith("video/")) {
+            html = `<video controls src="${src}" style="max-width:240px;"></video>`;
+          } else if (mime.startsWith("audio/")) {
+            html = `<audio controls src="${src}" style="max-width:220px;"></audio>`;
+          }
+          if (html && side) {
+            const wrapper = document.createElement("div");
+            wrapper.className = `msg ${side}`;
+            wrapper.innerHTML = html;
+            $("log").appendChild(wrapper);
+            $("log").scrollTop = $("log").scrollHeight;
+            return;
+          }
+        }
+
         if (m.role === "user" || m.role === "customer") {
           addMsg("customer", m.text, "customer");
         } else if (m.role === "human_agent") {
