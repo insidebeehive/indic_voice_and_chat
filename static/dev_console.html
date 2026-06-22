@@ -278,21 +278,26 @@ async function start() {
     }
   };
 
-  ws.onclose = (e) => { console.warn("[devconsole] ws CLOSED code=", e.code, "reason=", e.reason, "wasClean=", e.wasClean); stop(); setStatus("closed"); };
+  ws.onclose = (e) => { console.warn("[devconsole] ws CLOSED code=", e.code, "reason=", e.reason, "wasClean=", e.wasClean); stop(false); setStatus("closed"); };
   ws.onerror = (e) => { console.error("[devconsole] ws ERROR", e); setStatus("connection error"); };
 }
 
-function stop() {
+function stop(immediate) {
   running = false;
   if (workletNode) { try { workletNode.disconnect(); } catch (_) {} }
   workletNode = null;
   if (micStream) micStream.getTracks().forEach((t) => t.stop());
   micStream = null;
-  if (audioCtx) { audioCtx.close(); audioCtx = null; }
   agentSpeaking = false;
   if (ws && ws.readyState === WebSocket.OPEN) ws.close();
   $("start").classList.remove("stop");
   $("start").textContent = "Start";
+  // Delay closing AudioContext so any already-scheduled audio finishes playing.
+  if (audioCtx) {
+    const ctx = audioCtx; audioCtx = null;
+    const waitMs = immediate ? 0 : Math.max(300, (playCursor - ctx.currentTime + 0.5) * 1000);
+    setTimeout(() => ctx.close(), waitMs);
+  }
 }
 
 // Graceful end: ask the server to finalize and push the outcome while the
@@ -311,7 +316,7 @@ function endCall() {
   setStatus("ending…");
   ws.send(JSON.stringify({ type: "end" }));
   // Fallback: if the server hasn't closed within 6s, force teardown.
-  setTimeout(() => { if (ws && ws.readyState === WebSocket.OPEN) stop(); }, 6000);
+  setTimeout(() => { if (ws && ws.readyState === WebSocket.OPEN) stop(true); }, 6000);
 }
 
 // --- Telephony: place an outbound call + poll its status ----------------------
