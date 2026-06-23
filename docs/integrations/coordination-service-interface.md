@@ -26,7 +26,7 @@ Customer (any channel)
 │             Coordination Service  (CRM team)                │
 │                                                             │
 │  Channel adapters:                                          │
-│    Chat WebSocket relay                                     │
+│    Chat WebSocket relay  (replaces CRM Backend relay)       │
 │    Telephony (Twilio, Stringee, SIP, VoIP)                  │
 │    WhatsApp, SMS (future)                                   │
 │                                                             │
@@ -37,23 +37,25 @@ Customer (any channel)
 │                                                             │  │
 │  Call recording (owns the audio archive)                    │  │
 └────────────────────────────────────────────────────────────┘  │
-                                                                  │
-                                              ┌───────────────────┘
-                                              ▼
-                              ┌─────────────────────────────┐
-                              │       AI Platform (us)       │
-                              │                              │
-                              │  STT → LLM → TTS             │
-                              │  RAG / knowledge base        │
-                              │  CRM tool integration        │
-                              │  Escalation decision         │
-                              │  Media storage (S3)          │
-                              │  Summarization API           │
-                              └─────────────────────────────┘
+        │                                     ┌───────────────────┘
+        │ webhooks + escalation events         ▼
+        │                         ┌─────────────────────────────┐
+        ▼                         │       AI Platform (us)       │
+┌──────────────────────┐          │                              │
+│   CRM Backend        │◄─────────│  webhooks (lifecycle events) │
+│                      │          │                              │
+│  Webhooks receiver   │          │  STT → LLM → TTS             │
+│  Human agent console │──────────│  RAG / knowledge base        │
+│  Ticket system       │  claim + │  CRM tool integration        │
+│  Analytics           │  agent-ws│  Escalation decision         │
+│  Business logic      │          │  Media storage (S3)          │
+└──────────────────────┘          │  Summarization API           │
+                                  └─────────────────────────────┘
 ```
 
 **CS owns:** channels, routing, telephony, call recording  
-**We own:** AI intelligence, speech processing, media storage, summarization
+**We own:** AI intelligence, speech processing, media storage, summarization  
+**CRM Backend owns:** webhooks receiver, human agent console, ticket system, analytics
 
 ---
 
@@ -61,6 +63,10 @@ Customer (any channel)
 
 | Concern | Today | With CS |
 |---|---|---|
+| Chat WebSocket relay | CRM Backend | CS (CRM Backend retains webhooks + agent console) |
+| Chat session creation (API call) | CRM Backend | CS on CRM Backend's behalf |
+| Human agent console (claim + agent-ws) | CRM Backend | stays with CRM Backend |
+| Webhook events receiver | CRM Backend | stays with CRM Backend (CS forwards our events) |
 | Twilio / Stringee / Exotel adapters | active | stay active until CS is proven |
 | SIP / DiDLogic trunk | active | stays until CS is proven |
 | STT (Sarvam, Deepgram, Gemini) | us | stays with us |
@@ -102,11 +108,15 @@ No summarization call needed — transcript is already structured text.
 ### 2. Customer → AI → Human (chat handover)
 
 ```
-Customer chats with AI via CS
+Customer chats with AI via CS relay
 AI decides to escalate
         │
-CS switches relay to human agent's console
-Human agent types replies, customer types back
+We fire escalation_requested webhook ──► CRM Backend
+CRM Backend agent claims session (POST /sessions/{id}/claim)
+CRM Backend agent connects to our agent-ws
+        │
+Customer continues via the same CS relay connection (unchanged)
+Human agent messages flow through our platform → CS relay → customer
         │
    session ends
         │
@@ -114,6 +124,8 @@ Full text transcript (AI portion + human agent portion) available in:
   - Our DB
   - session_closed webhook
 
+CS stays in the relay path for the customer throughout.
+CRM Backend owns the human agent console — CS is not involved there.
 No summarization call needed.
 ```
 
@@ -187,6 +199,15 @@ Optionally: CRM calls our summarization API with the recording
 ## What CS Must Provide Us
 
 For the CS telephony option to work, CS must expose the following to us:
+
+### Chat WebSocket relay
+
+CS must implement our existing chat WS protocol — the same protocol currently implemented by CRM Backend (documented in `chat-widget-backend-integration.md`). CS calls our session creation API, relays frames bidirectionally between CRM Frontend and our WS, and rewrites media URLs before forwarding to CRM Frontend.
+
+CS must also:
+- Call `POST /api/v1/chat/sessions` with a tenant Bearer token to create sessions
+- Forward our lifecycle webhook events (`session_started`, `escalation_requested`, `session_closed`) to CRM Backend's configured webhook endpoint
+- Leave the human agent console path unchanged — CRM Backend agents claim sessions and connect to our `agent-ws` directly, bypassing CS
 
 ### Inbound call delivery
 
