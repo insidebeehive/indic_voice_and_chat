@@ -7,12 +7,14 @@
 
 ## Approach
 
-We add the Coordination Service (CS) as **one more telephony option** alongside our existing providers (Twilio, Stringee, Exotel). Nothing gets removed. Once CS is integrated, tested, and proven across all scenarios, we retire the other providers one by one.
+The Coordination Service (CS) is the **channel and coordination layer** between CRM Frontend (customers) and the AI Platform. Its Phase 1 deliverable is **chat relay**: session creation, WebSocket relay, media proxying, webhook forwarding, and human agent console proxy. Voice channel adapters (Twilio, SIP, WebRTC) are a Phase 2 skeleton.
 
 This means:
-- No disruption to current production integrations
-- CS can be validated in staging before any cutover
-- Rollback is trivial — just switch the tenant config back to Twilio/Stringee
+- CRM Frontend never calls AI Platform directly — all chat traffic goes through CS.
+- CRM Backend (CSS) never calls AI Platform directly — CS is the bridge for all AI Platform interactions.
+- For direct-human sessions (`operator_flag=human`), CSS handles its own WebSocket; CS is not in the path.
+- No disruption to current production integrations — CS is validated in staging before any cutover.
+- Rollback is trivial — switch the tenant config back to direct CRM Backend → AI Platform integration.
 
 ---
 
@@ -25,37 +27,40 @@ Customer (any channel)
 ┌────────────────────────────────────────────────────────────┐
 │             Coordination Service  (CRM team)                │
 │                                                             │
-│  Channel adapters:                                          │
-│    Chat WebSocket relay  (replaces CRM Backend relay)       │
-│    Telephony (Twilio, Stringee, SIP, VoIP)                  │
-│    WhatsApp, SMS (future)                                   │
+│  Chat relay (Phase 1):                                      │
+│    Session create proxy (CRM Frontend → AI Platform)        │
+│    WebSocket relay (bidirectional, with media rewrite)      │
+│    Webhook forwarder (AI Platform → CS → CSS)               │
+│    Human agent console proxy (claim + agent-ws)             │
 │                                                             │
 │  Session router:                                            │
-│    operator flag = AI      ───────────────────────────────► │──┐
-│    operator flag = human   ──► BO agent softphone           │  │
-│    operator flag = hybrid  ──► AI first, escalate to human  │  │
+│    operator_flag = ai/hybrid  ────────────────────────────► │──┐
+│    operator_flag = human  ──► CSS owns WS directly          │  │
+│                               (CS not involved)             │  │
 │                                                             │  │
-│  Call recording (owns the audio archive)                    │  │
+│  Voice channel adapters (Phase 2 — skeleton only):          │  │
+│    Intercepts call_offer (pstn transport)                    │  │
+│    Bridges provider audio ↔ AI Platform voice WS            │  │
 └────────────────────────────────────────────────────────────┘  │
         │                                     ┌───────────────────┘
         │ webhooks + escalation events         ▼
         │                         ┌─────────────────────────────┐
         ▼                         │       AI Platform (us)       │
 ┌──────────────────────┐          │                              │
-│   CRM Backend        │◄─────────│  webhooks (lifecycle events) │
+│   CSS (CRM Backend)  │◄─────────│  webhooks (lifecycle events) │
 │                      │          │                              │
 │  Webhooks receiver   │          │  STT → LLM → TTS             │
-│  Human agent console │──────────│  RAG / knowledge base        │
+│  Support agent console──────────│  RAG / knowledge base        │
 │  Ticket system       │  claim + │  CRM tool integration        │
-│  Analytics           │  agent-ws│  Escalation decision         │
-│  Business logic      │          │  Media storage (S3)          │
+│  Analytics           │ agent-ws │  Escalation decision         │
+│  Business logic      │ (via CS) │  Media storage (S3)          │
 └──────────────────────┘          │  Summarization API           │
                                   └─────────────────────────────┘
 ```
 
-**CS owns:** channels, routing, telephony, call recording  
+**CS owns:** channel relay, webhook forwarding, session routing, voice channel adapters (Phase 2)  
 **We own:** AI intelligence, speech processing, media storage, summarization  
-**CRM Backend owns:** webhooks receiver, human agent console, ticket system, analytics
+**CSS owns:** webhooks receiver, support agent console, ticket system, analytics, business logic
 
 ---
 
@@ -63,12 +68,11 @@ Customer (any channel)
 
 | Concern | Today | With CS |
 |---|---|---|
-| Chat WebSocket relay | CRM Backend | CS (CRM Backend retains webhooks + agent console) |
-| Chat session creation (API call) | CRM Backend | CS on CRM Backend's behalf |
-| Human agent console (claim + agent-ws) | CRM Backend | stays with CRM Backend |
-| Webhook events receiver | CRM Backend | stays with CRM Backend (CS forwards our events) |
-| Twilio / Stringee / Exotel adapters | active | stay active until CS is proven |
-| SIP / DiDLogic trunk | active | stays until CS is proven |
+| Chat WebSocket relay | CRM Backend | CS (CSS retains webhooks + agent console) |
+| Chat session creation (API call) | CRM Backend | CS on CSS's behalf |
+| Human agent console (claim + agent-ws) | CRM Backend calls AI Platform directly | CRM Backend calls CS; CS proxies to AI Platform |
+| Webhook events receiver | CRM Backend | stays with CSS (CS forwards our events) |
+| Direct-human chat WS | CRM Backend | stays with CSS (CSS-owned; CS not involved for `operator_flag=human`) |
 | STT (Sarvam, Deepgram, Gemini) | us | stays with us |
 | LLM (Gemini) | us | stays with us |
 | TTS | us | stays with us |
@@ -77,13 +81,12 @@ Customer (any channel)
 | Escalation decision | us | stays with us |
 | Media storage (S3) | us | stays with us |
 | Chat transcript | DB + webhook | unchanged |
-| Call recording | not our concern | CS owns it |
 
 ---
 
 ## Inbound Scenarios
 
-**Entry point is always chat.** The customer opens the chat widget. The conversation can stay in chat or escalate to a voice call from within chat.
+**Entry point is always chat.** The customer opens the chat widget. The conversation can stay in chat, escalate to a human agent within chat, or transition to a voice call from within chat.
 
 ### 1. Customer → AI (chat only)
 
@@ -100,7 +103,7 @@ CS (chat relay) ──turns──► Us
         │
 Full text transcript available in:
   - Our DB (GET /api/v1/chat/sessions/{id})
-  - session_closed webhook payload
+  - session_closed webhook payload (forwarded by CS to CSS)
 
 No summarization call needed — transcript is already structured text.
 ```
@@ -111,21 +114,25 @@ No summarization call needed — transcript is already structured text.
 Customer chats with AI via CS relay
 AI decides to escalate
         │
-We fire escalation_requested webhook ──► CRM Backend
-CRM Backend agent claims session (POST /sessions/{id}/claim)
-CRM Backend agent connects to our agent-ws
+We fire escalation_requested webhook ──► CS
+CS does two things in parallel:
+  1. Forwards the escalation WS frame to CRM Frontend over the relay
+  2. Forwards escalation_requested webhook to CSS (with event_id + field rewrites)
+CSS support agent claims session via CS (POST /chat/sessions/{cs_id}/claim)
+CSS support agent connects to CS agent-ws (WS /chat/agent-ws/{cs_id})
+CS proxies both claim and agent-ws to AI Platform
         │
-Customer continues via the same CS relay connection (unchanged)
-Human agent messages flow through our platform → CS relay → customer
+Customer continues on the same CS relay connection (unchanged)
+Support agent messages flow: AI Platform → CS relay → CRM Frontend
+Customer messages flow: CRM Frontend → CS relay → AI Platform → CS agent-ws → agent console
         │
    session ends
         │
 Full text transcript (AI portion + human agent portion) available in:
   - Our DB
-  - session_closed webhook
+  - session_closed webhook (CS forwards to CSS)
 
-CS stays in the relay path for the customer throughout.
-CRM Backend owns the human agent console — CS is not involved there.
+CSS never calls AI Platform directly — all claim and agent-ws traffic goes through CS.
 No summarization call needed.
 ```
 
@@ -135,108 +142,128 @@ No summarization call needed.
 Customer chats with AI via CS
 Customer requests a voice call  OR  AI sends call_offer
         │
-CS initiates a voice call via its telephony layer
-CS streams call audio to us (PCM-16, 16 kHz, mono)
-We continue as the AI voice agent (STT → LLM → TTS)
+AI Platform sends call_offer frame over the chat relay WS:
+  {
+    "type": "call_offer",
+    "transport": "websocket | webrtc | pstn",
+    "call_url": "wss://...",
+    "ice_servers": [{"urls": "stun:..."}],   // webrtc only
+    "to": "+919876543210"                    // pstn only
+  }
         │
-   call ends
+CS handles based on transport:
+
+  transport = websocket or webrtc:
+    CS forwards call_offer as-is to CRM Frontend
+    CRM Frontend connects directly to call_url — CS is not in the audio path
+    (For webrtc: CRM Frontend uses ice_servers for ICE negotiation)
         │
-CS saves the voice recording  ◄── CS responsibility
+  transport = pstn:
+    CS intercepts the frame (does NOT forward to CRM Frontend)
+    CS calls IVoiceChannel.initiate_call(to, from_, stream_url=call_url, callback_url)
+    CS bridges provider audio ↔ AI Platform voice WS (call_url)
+    CRM Frontend receives mode_change{mode:"voice_pending"} instead
         │
-Optionally: CRM calls our summarization API with the recording
-            to get a structured transcript + summary
+   call ends (pstn only):
+        │
+    Provider POSTs callback ──► CS
+    CS calls: POST /api/v1/chat/sessions/{session_id}/end
+    AI Platform emits session_closed webhook ──► CS ──► CSS
+    CS sends CRM Frontend an ended frame
 ```
 
 Chat transcript (before the voice call) is already in our DB.  
-Voice recording is owned and archived by CS.  
-Summarization is CRM's choice, not mandatory.
+Voice recording — if any — is an optional concern for the CRM team.  
+Summarization is CSS's choice, not mandatory.
 
-### 4. Customer → Human (direct, operator flag = human)
+### 4. Customer → Human (direct, operator_flag = human)
 
 ```
-CS routes chat directly to human agent's console.
-We are not involved at all.
+CSS receives POST /api/chat/start from CRM Frontend
+CSS determines operator_flag = human
+CSS returns ws_url pointing to its own WebSocket (wss://css.example.com/api/chat/ws/{ticket_id})
+Customer connects to CSS's WS directly
+CS is not involved at all.
 ```
+
+CSS owns the direct-human chat path end-to-end. CS returns `{"handled_by": "crm"}` when `operator_flag=human` and takes no further action.
 
 ---
 
 ## Outbound Scenarios
 
-### 1. AI → Customer
+### 1. AI → Customer (AI-initiated voice via chat session)
 
 ```
-Us ──POST /cs/calls──► CS  (initiate outbound call)
-CS dials the customer
-CS ──PCM-16 audio stream──► Us
-STT → LLM → TTS — unchanged from today
+AI is in an active chat session via CS relay
+AI decides to call the customer back
+        │
+AI Platform sends call_offer with transport=pstn over the relay WS
+CS intercepts; calls IVoiceChannel.initiate_call(to, ...)
+CS dials the customer; bridges provider audio ↔ AI Platform voice WS (call_url)
         │
    call ends
         │
-We push summary to CS callback URL  ◄── we generate this automatically
-(we have the full STT transcript; CS doesn't need to send us audio)
-
-CS also saves its own recording for archive/compliance.
+Provider POSTs callback ──► CS
+CS calls: POST /api/v1/chat/sessions/{session_id}/end
+AI Platform emits session_closed webhook (with transcript + summary) ──► CS ──► CSS
 ```
 
-We generate the summary ourselves because we ran the full conversation — CS gets it pushed at call end.
+We generate the transcript on our side because we ran the full conversation — CSS receives it via the `session_closed` webhook.
 
-### 2. Human → Customer
+### 2. Human → Customer (support agent-initiated call)
 
 ```
-BO agent initiates call via CS softphone
-CS connects BO agent ↔ customer
+Support agent initiates call via softphone (CS or external)
+CS connects support agent ↔ customer
 We are not involved during the call
         │
    call ends
         │
-CS saves the recording  ◄── CS responsibility
-        │
-Optionally: CRM calls our summarization API with the recording
+Optionally: CSS calls our summarization API with the recording
 ```
 
 ---
 
 ## What CS Must Provide Us
 
-For the CS voice channel adapter to work, CS must expose the following to us:
+For the CS integration to work, CS must implement the following towards AI Platform:
 
 ### Chat WebSocket relay
 
 CS must implement our existing chat WS protocol — the same protocol currently implemented by CRM Backend (documented in `chat-widget-backend-integration.md`). CS calls our session creation API, relays frames bidirectionally between CRM Frontend and our WS, and rewrites media URLs before forwarding to CRM Frontend.
 
 CS must also:
-- Call `POST /api/v1/chat/sessions` with a tenant Bearer token to create sessions
-- Forward our lifecycle webhook events (`session_started`, `escalation_requested`, `session_closed`) to CRM Backend's configured webhook endpoint
-- Leave the human agent console path unchanged — CRM Backend agents claim sessions and connect to our `agent-ws` directly, bypassing CS
+- Call `POST /api/v1/chat/sessions` with a tenant Bearer token to create sessions.
+- Forward our lifecycle webhook events (`session_started`, `escalation_requested`, `session_closed`) to CSS's configured webhook endpoint. Before forwarding, CS adds `event_id` (UUID) and rewrites `session_id` to the `cs_session_id` form, and rewrites `claim_url` / `agent_ws_url` from AI Platform paths to CS paths (see CS PRD §1.4).
+- Proxy the human agent console path: `POST /chat/sessions/{cs_id}/claim` → proxied to `POST /api/v1/chat/sessions/{platform_id}/claim`; `WS /chat/agent-ws/{cs_id}` → proxied to `WS /api/v1/chat/sessions/{platform_id}/agent-ws`. CSS calls these CS-form paths; CS does the translation. CSS never reaches AI Platform directly.
 
-### Inbound call delivery
+### Voice handoff (pstn transport)
 
-When a customer call arrives (voice, from within chat), CS notifies us:
+When AI Platform sends a `call_offer` frame with `transport=pstn` over the chat relay:
 
-```
-POST <our-inbound-webhook-url>
-Content-Type: application/json
-
+```json
 {
-  "call_id":    "cs-call-xyz",
-  "session_id": "cs-session-abc",   // CS session ID
-  "stream_url": "wss://cs.example.com/streams/cs-call-xyz",
-  "direction":  "inbound",
-  "from":       "+919876543210",
-  "context": {
-    "customer_id":    "player-42",
-    "customer_name":  "Rahul",
-    "language":       "hi",
-    "chat_session_id": "cs-session-abc"
-  }
+  "type": "call_offer",
+  "transport": "pstn",
+  "call_url": "wss://ai.example.com/voice/ws/plat_7f3a9b2e",
+  "to": "+919876543210"
 }
 ```
 
-We respond `200` to accept the call, then connect to `stream_url`.
+CS must:
+1. **Intercept** this frame — do not forward to CRM Frontend.
+2. Call `IVoiceChannel.initiate_call(to=frame.to, from_=tenant.caller_id, stream_url=frame.call_url, callback_url=cs_callback_url)`.
+3. Bridge provider audio ↔ `frame.call_url` (AI Platform voice WS).
+4. Send CRM Frontend: `{"type":"mode_change","mode":"voice_pending","message":"Calling you now…"}`
+5. When call ends: call `POST /api/v1/chat/sessions/{session_id}/end` on AI Platform.
+6. Send CRM Frontend: `{"type":"ended"}`
 
-### Audio stream
+For `websocket` and `webrtc` transports, CS forwards the `call_offer` frame as-is — CS is not in the audio path.
 
-Bidirectional WebSocket at `stream_url`:
+### Audio stream (pstn bridging)
+
+For pstn calls, CS bridges provider audio to our voice WS at `call_url`:
 
 - **Binary frames:** PCM-16, 16 kHz, mono, little-endian (~20 ms chunks)
 - **Text frames (JSON):**
@@ -249,36 +276,23 @@ Bidirectional WebSocket at `stream_url`:
 | Us → CS | `{"type":"escalation","reason":"...","summary":"..."}` | AI requests human handover |
 | Us → CS | `{"type":"ended","summary":"..."}` | AI ended the call |
 
-### Outbound call API
+### Session end (pstn call completion)
+
+When a pstn call ends, CS calls:
 
 ```
-POST /cs/calls
-Authorization: Bearer <cs-issued-service-token>
+POST /api/v1/chat/sessions/{session_id}/end
+Authorization: Bearer <tenant-token>
 Content-Type: application/json
 
 {
-  "to":         "+919876543210",
-  "from":       "+918204268005",
-  "stream_url": "wss://us.example.com/voice/stream/cs-call-xyz",
-  "callback_url": "https://us.example.com/api/v1/voice/cs-callback"
-}
-```
-
-CS dials `to`, connects the audio to our `stream_url`, POSTs call-end event to `callback_url`.
-
-### Call-end event
-
-```
-POST <our-callback-url>
-Content-Type: application/json
-
-{
-  "call_id":   "cs-call-xyz",
-  "session_id": "cs-session-abc",
+  "call_id":    "cs-call-xyz",
   "status":    "completed | failed | no_answer",
   "duration_s": 142
 }
 ```
+
+We respond by emitting the `session_closed` webhook (which CS then forwards to CSS).
 
 ---
 
@@ -319,21 +333,24 @@ Response `200`:
 |---|---|
 | Customer → AI (chat only) | No — text transcript already in DB |
 | Customer → AI → Human (chat) | No — text transcript already in DB |
-| Customer → AI → Voice | Optional — CS owns the recording; CRM's choice |
-| AI → Customer (outbound) | Not needed — we push summary automatically at call end |
-| Human → Customer (outbound) | Optional — CS owns the recording; CRM's choice |
+| Customer → AI → Voice (pstn) | Optional — CRM's choice |
+| AI → Customer outbound (pstn) | Not needed — transcript in session_closed webhook |
+| Human → Customer (outbound) | Optional — CRM's choice |
 
 ---
 
 ## Migration Path
 
-**Phase 1 — Add CS as a telephony option**  
-CS is configured on a test tenant alongside our existing providers. We wire up the CS adapter (inbound webhook + audio stream + outbound call API). All existing tenants on Twilio/Stringee are unaffected.
+**Phase 1 — Add CS as the channel layer (chat relay)**  
+CS is configured on a test tenant. We wire up the CS adapter (session proxy + WS relay + webhook forwarding + agent console proxy). All existing tenants on direct CRM Backend → AI Platform integration are unaffected.
 
 **Phase 2 — Test all scenarios**  
-Validate every inbound and outbound scenario end-to-end through CS. Run in parallel with existing providers on production tenants if needed.
+Validate every inbound and outbound scenario end-to-end through CS. Run in parallel with direct integration on production tenants if needed.
 
-**Phase 3 — Cut over and retire**  
-Once CS is proven, switch production tenants to CS. Retire the Twilio, Stringee, and Exotel adapters from our codebase (`src/api/telephony/`, `src/api/stringee/`).
+**Phase 3 — Cut over**  
+Once CS is proven, switch production tenants to route through CS. Direct CRM Backend → AI Platform calls are retired.
 
-Each phase is independently deployable. Rollback at any phase = switch tenant config back to previous provider.
+**Phase 4 — Voice channel adapters**  
+With chat relay stable, implement real voice channel adapters (Twilio, SIP/DiDLogic, WebRTC) so `pstn`-transport calls go live. Each adapter is independent — add one, register it, test it. No architectural changes to the chat relay.
+
+Each phase is independently deployable. Rollback at any phase = switch tenant config back to previous path.

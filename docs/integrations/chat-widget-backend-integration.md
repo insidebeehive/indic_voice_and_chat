@@ -77,9 +77,9 @@ Content-Type: application/json
 
 ```json
 {
-  "session_id": "cs_a1b2c3d4e5f6g7h8",
+  "session_id": "cs_a1b2c3d4",
   "greeting":   "Hello Rahul, how can I help?",
-  "ws_url":     "wss://platform.example.com/api/v1/chat/ws/cs_a1b2c3d4e5f6g7h8"
+  "ws_url":     "wss://platform.example.com/api/v1/chat/ws/cs_a1b2c3d4"
 }
 ```
 
@@ -308,7 +308,7 @@ Sent when a session is created.
 ```json
 {
   "event": "session_started",
-  "session_id": "cs_a1b2c3d4e5f6g7h8",
+  "session_id": "cs_a1b2c3d4",
   "customer": {
     "name": "Rahul",
     "id": "player-42"
@@ -325,15 +325,15 @@ Sent when the AI decides it cannot handle the conversation and needs a human.
 ```json
 {
   "event": "escalation_requested",
-  "session_id": "cs_a1b2c3d4e5f6g7h8",
+  "session_id": "cs_a1b2c3d4",
   "reason": "Customer requested human support",
   "summary": "Customer is asking about a withdrawal that has been pending for 3 days.",
   "customer": {
     "name": "Rahul",
     "id": "player-42"
   },
-  "claim_url": "/api/v1/chat/sessions/cs_a1b2c3d4e5f6g7h8/claim",
-  "agent_ws_url": "/api/v1/chat/sessions/cs_a1b2c3d4e5f6g7h8/agent-ws",
+  "claim_url": "/api/v1/chat/sessions/cs_a1b2c3d4/claim",
+  "agent_ws_url": "/api/v1/chat/sessions/cs_a1b2c3d4/agent-ws",
   "bo_available": true
 }
 ```
@@ -342,9 +342,11 @@ Sent when the AI decides it cannot handle the conversation and needs a human.
 |---|---|
 | `reason` | Display to your human agent as context |
 | `summary` | AI-generated summary of the conversation so far |
-| `claim_url` | Relative URL — prepend our base URL; your agent calls this to claim the session |
-| `agent_ws_url` | Relative URL — prepend our base URL; your agent console connects here |
-| `bo_available` | `false` means outside support hours — customer is already informed and waiting |
+| `claim_url` | Relative URL — prepend our base URL (direct mode) or CS base URL (CS mode); call this to claim the session |
+| `agent_ws_url` | Relative URL — prepend the appropriate base URL; your agent console connects here |
+| `bo_available` | `false` means outside support hours — customer is already informed and waiting. **Note:** when CS is deployed, agent availability is managed by CSS's own business-hours config; CS does not guarantee this field is forwarded. |
+
+> **When the Coordination Service is deployed:** CS rewrites `claim_url` and `agent_ws_url` to its own path format before forwarding (`/chat/sessions/{cs_id}/claim` and `/chat/agent-ws/{cs_id}`). Call these against the CS base URL — not our platform URL. CSS never calls us directly.
 
 ### `session_closed`
 
@@ -353,7 +355,7 @@ Sent when a session ends (by customer, agent, or AI).
 ```json
 {
   "event": "session_closed",
-  "session_id": "cs_a1b2c3d4e5f6g7h8",
+  "session_id": "cs_a1b2c3d4",
   "mode_at_close": "ai",
   "summary": "Customer asked about withdrawal delay; resolved by AI.",
   "transcript": [

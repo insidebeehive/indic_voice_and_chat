@@ -25,7 +25,7 @@ AI Platform (us)
 Your backend decides whether a conversation goes to AI or directly to a human agent. When it goes to AI, your backend creates a session with the platform and gives you two things:
 
 ```
-session_id  — e.g. "cs_a1b2c3d4e5f6g7h8"
+session_id  — e.g. "cs_a1b2c3d4"
 ws_url      — the WebSocket URL to connect to
 ```
 
