@@ -39,8 +39,9 @@ CS makes the AI Platform pluggable: CRM Backend talks to CS, not directly to the
           └────────────┬──────────────────────────────┬─────────────────┘
                        │                              │
             [1] chat WS (always)          [2] voice: websocket / webrtc
-            wss://cs.example.com               direct to call_url
-            /chat/ws/{id}                  (CS not in audio path)
+            wss://cs.example.com          CS relays call_offer with call_url
+            /chat/ws/{id}                 browser then dials call_url directly
+                                          (CS not in the actual call)
                        │                              │
                        ▼                              ▼
 ┌──────────────────────────────────┐   ┌─────────────────────────────────────┐
