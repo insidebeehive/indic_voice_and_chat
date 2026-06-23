@@ -34,42 +34,49 @@ CS makes the AI Platform pluggable: CRM Backend talks to CS, not directly to the
 ## Topology
 
 ```
-Customer browser
-        │  WebSocket: wss://cs.example.com/chat/ws/{session_id}
-        ▼
-┌────────────────────────────────────────────────────────────────┐
-│                  Coordination Service                           │
-│                                                                │
-│  Chat relay ──────────────────────────────────────────────────►│──┐
-│  Session router (operator flag: ai / human / hybrid)           │  │
-│  Media proxy                                                   │  │
-│  Webhook forwarder                                             │  │
-│  Voice channel registry (IVoiceChannel → adapter)             │  │
-└────────────────────────────────────────────────────────────────┘  │
-        │                    │                     ┌───────────────┘
-        │ webhooks            │ telephony           │  calls AI Platform APIs
-        │ (lifecycle events)  │ (skeleton — 501)    │
-        ▼                    ▼                     ▼
-┌──────────────┐   ┌──────────────────────────┐   ┌─────────────────────────────┐
-│  CRM Backend  │   │   Telephony Providers     │   │       AI Platform            │
-│               │   │                          │   │                              │
-│  Webhook recv │   │  ┌──────────────────┐    │   │  POST /chat/sessions         │
-│  Agent console│   │  │ SIP / DiDLogic   │    │   │  WS   /chat/ws/{id}          │
-│  Ticket system│   │  │ (SIP UAC, RTP)   │    │   │  GET  /chat/sessions/{id}    │
-│  Analytics    │   │  ├──────────────────┤    │   │  POST /sessions/{id}/claim   │
-│  Business lgc │   │  │ Twilio           │    │   │  WS   /sessions/{id}/agent-ws│
-└──────────────┘   │  │ (REST + TwiML)   │    │   │  GET  /chat/media/{id}        │
-                   │  ├──────────────────┤    │   └─────────────────────────────┘
-                   │  │ Stringee         │    │
-                   │  │ (REST + SDK)     │    │
-                   │  └──────────────────┘    │
-                   └──────────────────────────┘
+                     ┌─────────────────────────────────────────────────────┐
+                     │              Customer browser                        │
+                     │                                                     │
+                     │  [chat]  WS wss://cs.example.com/chat/ws/{id}       │
+                     │  [voice] transport=websocket → direct WS call_url   │
+                     │  [voice] transport=webrtc    → WebRTC peer conn      │
+                     │  [voice] transport=pstn      → waits for phone call  │
+                     └──────────────┬─────────────────────────────────────┘
+                                    │ chat WS (always)
+                                    │ call_url direct (websocket / webrtc only)
+                                    ▼
+┌───────────────────────────────────────────────────────────────────────────┐
+│                         Coordination Service                               │
+│                                                                           │
+│  Chat relay          (session create, WS proxy, media rewrite)            │
+│  Session router      (operator flag: ai / human / hybrid)                 │
+│  Media proxy         (GET /chat/media/{id})                               │
+│  Webhook forwarder   (AI Platform → CRM Backend, HMAC sign+verify)        │
+│  Voice channel registry  (IVoiceChannel → adapter; pstn transport only)   │
+└───┬──────────────────────────┬────────────────────────┬───────────────────┘
+    │ webhooks                  │ pstn: initiate_call()   │ chat API calls
+    │ (lifecycle events)        │ (skeleton — 501)        │
+    ▼                          ▼                         ▼
+┌──────────────┐  ┌─────────────────────────────┐  ┌──────────────────────────────┐
+│  CRM Backend  │  │    Telephony Providers       │  │        AI Platform            │
+│               │  │                             │  │                              │
+│  Webhook recv │  │  SIP / DiDLogic             │  │  POST /chat/sessions          │
+│  Agent console│  │  (SIP UAC + RTP bridge)     │  │  WS   /chat/ws/{id}           │
+│  Ticket system│  ├─────────────────────────────┤  │  GET  /chat/sessions/{id}     │
+│  Analytics    │  │  Twilio / Vonage / Plivo     │  │  POST /sessions/{id}/claim    │
+│  Business lgc │  │  (REST API + WS stream)     │  │  WS   /sessions/{id}/agent-ws │
+└──────────────┘  ├─────────────────────────────┤  │  GET  /chat/media/{id}         │
+                  │  Stringee                    │  │  WS   voice stream (call_url)  │
+                  │  (REST + SDK)               │  └──────────────────────────────┘
+                  └─────────────────────────────┘
 ```
 
 **Traffic rules:**
 - CRM Frontend never calls AI Platform or CRM Backend directly.
 - CRM Backend never calls AI Platform directly (CS is the bridge).
-- The one exception: voice WS (`call_url` in `call_offer`) connects CRM Frontend to AI Platform directly — PCM-16 binary streams are too expensive to relay through an extra hop. This is documented explicitly and cannot be expanded.
+- **Voice `transport=websocket` / `transport=webrtc`:** CS forwards the `call_offer` frame as-is. CRM Frontend connects directly to `call_url` (websocket) or performs WebRTC ICE negotiation directly. CS is not in the audio path — binary streams are too expensive to relay.
+- **Voice `transport=pstn`:** CS intercepts the `call_offer`, calls `IVoiceChannel.initiate_call()` on the tenant's telephony adapter to dial the customer's phone. CS bridges the provider's RTP/audio stream to AI Platform's voice WS. CRM Frontend receives a `mode_change` instead.
+- The direct-connection exception applies only to `websocket` and `webrtc` transports. It cannot be extended to other frame types.
 
 ---
 
