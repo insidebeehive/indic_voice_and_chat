@@ -177,6 +177,10 @@ new
  │
  ├──(operator_flag=ai/hybrid)────► ai_active ──(escalation_requested)──► queued
  │                                      │                                    │
+ │                    (session_closed, AI resolved without escalation)        │
+ │                                      ▼                                    │
+ │                                   closed ◄── (24h timeout, any status)    │
+ │                                                                           │
  ├──(operator_flag=human)──────────► queued ◄────────────────────────────────┘
  │                                      │
  │                               (agent claims)
@@ -185,13 +189,23 @@ new
  │                                      │
  │                   ┌──────────────────┴──────────────────┐
  │                   ▼                                     ▼
- │                resolved                         closed
- │            (by agent action)         (session_closed webhook, or 24h timeout)
+ │                resolved                            closed
+ │            (by agent action)              (session_closed webhook)
  │                   │
  │               (customer reopens by starting a new chat — linked to same ticket
- │                if within N hours; configurable)
+ │                if within N hours; configurable reopen window)
  └───────────────────┘
 ```
+
+**Terminal transitions by trigger:**
+
+| Trigger | From | To |
+|---|---|---|
+| `session_closed` webhook, `mode_at_close=ai` | `ai_active` | `closed` |
+| `session_closed` webhook, `mode_at_close=human` | `in_progress` | `resolved` |
+| Agent action: Resolve | `in_progress` | `resolved` |
+| Agent action: Close | any | `closed` |
+| 24h timeout (background job) | any non-terminal | `closed` |
 
 ### 2.3 Ticket messages
 
@@ -340,17 +354,19 @@ CSS action: confirm ticket exists (it was created at `POST /api/chat/start`); st
   "summary": "Customer is asking about a 3-day withdrawal delay.",
   "customer": { "name": "Rahul", "id": "player-42" },
   "claim_url": "/chat/sessions/cs_a1b2c3d4/claim",
-  "agent_ws_url": "/chat/sessions/cs_a1b2c3d4/agent-ws"
+  "agent_ws_url": "/chat/agent-ws/cs_a1b2c3d4",
+  "event_id": "evt_9f3b1a2c"
 }
 ```
 
 CSS actions:
-1. Transition ticket status: `ai_active` → `queued`
-2. Add `QueueEntry` for this ticket
-3. Store `claim_url` and `agent_ws_url` (CSS needs these to proxy agent connections to CS)
-4. Store escalation `summary` as an internal system message on the ticket
-5. Notify online agents via WebSocket push (new queue entry)
-6. Signal CRM Frontend that escalation is in progress (via the customer's WS or a separate notification mechanism — TBD with CRM Frontend team)
+1. Deduplicate on `event_id` — if already processed, return 200 and stop.
+2. Transition ticket status: `ai_active` → `queued` (verify ticket is in `ai_active` first; if already `queued`, idempotent no-op)
+3. Add `QueueEntry` for this ticket
+4. Store `claim_url` and `agent_ws_url` into the `chat_sessions` row for this ticket (CSS uses these when an agent claims)
+5. Store escalation `summary` as an internal system message on the ticket
+6. Notify online agents via WebSocket push (new queue entry)
+7. CRM Frontend is already notified via the `escalation` frame CS forwarded over the customer relay WS — CSS does not re-signal the customer.
 
 ### Event: `session_closed`
 
@@ -360,6 +376,7 @@ CSS actions:
   "session_id": "cs_a1b2c3d4",
   "mode_at_close": "human",
   "summary": "Customer asked about withdrawal; resolved by agent.",
+  "event_id": "evt_4c8d2f1e",
   "transcript": [
     { "role": "customer",    "text": "Hello",         "ts": "..." },
     { "role": "ai_agent",   "text": "Hello Rahul…",  "ts": "..." },
@@ -369,12 +386,15 @@ CSS actions:
 ```
 
 CSS actions:
-1. Store transcript as `TicketMessage` rows
-2. Store `summary` on ticket
-3. Transition ticket: `in_progress` → `resolved` (or `closed` if no agent was involved)
-4. Record `resolved_at`
-5. Compute and store resolution metrics for analytics
-6. Trigger CSAT survey (if configured)
+1. Deduplicate on `event_id`.
+2. Store transcript as `TicketMessage` rows.
+3. Store `summary` on ticket.
+4. Transition ticket based on `mode_at_close`:
+   - `ai` → `ai_active` → `closed` (AI resolved without a human agent)
+   - `human` → `in_progress` → `resolved`
+5. Record `resolved_at` (human) or `closed_at` (AI).
+6. Compute and store resolution metrics for analytics.
+7. Trigger CSAT survey (if configured).
 
 ---
 
@@ -673,11 +693,17 @@ GET/PUT          /api/admin/notifications
 
 **tenants** — id, name, slug, plan, created_at
 
-**tickets** — id, tenant_id, status, priority, category, customer_id, customer_name, language, assigned_agent_id, team_id, sla_due_at, sla_breached, created_at, first_response_at, resolved_at, closed_at, ai_session_id, summary, tags[], metadata (jsonb)
+**tickets** — id, tenant_id, status, priority, category, customer_id, customer_name, language, assigned_agent_id, team_id, sla_response_due_at, sla_resolution_due_at, sla_response_breached, sla_resolution_breached, created_at, first_response_at, resolved_at, closed_at, summary, tags[], metadata (jsonb), abandoned (bool)
+
+> `sla_response_due_at` and `sla_resolution_due_at` are computed from `SLAPolicy.first_response_minutes` and `SLAPolicy.resolution_minutes` at ticket creation. Two separate deadline fields are required because the SLA report measures both dimensions independently.
 
 **ticket_messages** — id, ticket_id, role, content, media_url, media_mime, ts, is_internal
 
 **chat_sessions** — id, ticket_id, type (ai/human), cs_session_id, cs_ws_url, cs_claim_url, cs_agent_ws_url, status, started_at, ended_at
+
+> `chat_sessions.cs_session_id` is the authoritative CS session reference for this ticket. The `escalation_requested` webhook handler stores `claim_url` and `agent_ws_url` into this row. There is no separate `ai_session_id` on the ticket — use `chat_sessions.cs_session_id` joined via `ticket_id`.
+
+> **Abandonment detection:** CSS detects abandonment when a customer WS disconnects (direct-human sessions) or when CS delivers a `session_closed` webhook with no agent ever having claimed the ticket and `mode_at_close = ai`. Set `tickets.abandoned = true` and emit an `abandoned` `ticket_event` so the Volume and Queue reports can count it.
 
 **queue_entries** — id, ticket_id, priority, enqueued_at, claimed_at, claimed_by_agent_id
 
@@ -810,7 +836,7 @@ GET/PUT          /api/admin/notifications
 
 7. **Multi-tenant deployment model** — Single CSS deployment serving all tenants (with tenant_id everywhere), or one deployment per tenant (simpler isolation, higher ops overhead)?
 
-8. **Reopen policy** — If a customer starts a new chat after their ticket is `resolved`, does CSS create a new ticket or reopen the existing one? If reopening: what is the time window (e.g. within 24 hours of resolution)?
+8. ~~**Reopen policy**~~ — *Resolved:* CSS links a new chat to the same ticket if started within a configurable window (default: 24 hours of resolution). This is reflected in the §2.2 state machine. Confirm the default window with the support team.
 
 9. **Skill-based routing** — Is agent skill/specialisation (e.g. payments, technical, VIP) needed in Phase 1, or is it acceptable to add in a later sprint?
 

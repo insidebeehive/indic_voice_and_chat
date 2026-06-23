@@ -4,6 +4,8 @@
 **Authors:** AI Platform team  
 **Status:** Proposed — for review and discussion
 
+> **Terminology note:** This document uses "CRM Backend" to refer to the system that receives CS webhooks, hosts the human agent console, and owns tickets and analytics. That system is also called the **Chat Support System (CSS)** in `chat-support-system-prd.md`. The terms are interchangeable. Config keys use `crm_backend` for consistency with existing AI Platform config.
+
 ---
 
 ## Overview
@@ -50,8 +52,8 @@ CS makes the AI Platform pluggable: CRM Backend talks to CS, not directly to the
 │  Chat relay                      │                │  POST /api/v1/chat/sessions            │
 │  (session create, WS proxy,      │                │  WS   /api/v1/chat/ws/{id}             │
 │   media rewrite)                 │                │  GET  /api/v1/chat/sessions/{id}       │
-│                                  │                │  POST /api/v1/sessions/{id}/claim      │
-│  Session router                  │                │  WS   /api/v1/sessions/{id}/agent-ws   │
+│                                  │                │  POST /api/v1/chat/sessions/{id}/claim │
+│  Session router                  │                │  WS   /api/v1/chat/sessions/{id}/agent-ws│
 │  (operator flag: ai/human/hybrid)│                │  GET  /api/v1/chat/media/{id}          │
 │                                  │◄────────────── │                                      │
 │  Webhook forwarder               │  ◄── webhooks  │  POST /internal/platform-webhook       │
@@ -190,8 +192,10 @@ CS stores in Redis (`cs:session:{session_id}`, TTL 24 h):
 | `escalation` | Forward as-is |
 | `mode_change` | Forward as-is |
 | `call_offer` | Forward `call_url` as-is (voice WS exception — see §1.6) |
-| `ended` | Forward; close both connections after delivery |
+| `ended` | Forward; close both connections after delivery (see exception below) |
 | `error` | Forward as-is |
+
+> **CS-originated frames (pstn transport):** In the `pstn` voice path, CS generates two frames itself rather than forwarding from AI Platform: `mode_change` (mode=`voice_pending`, sent when CS intercepts `call_offer`) and `ended` (sent after AI Platform confirms session close). For `ended` specifically: CS must **not** close the AI Platform relay WS until AI Platform has processed the session end — closing it prematurely would kill the active bridged call. The "close both connections" rule applies only to AI-Platform-originated `ended` frames on non-pstn sessions.
 
 **Media URL rewriting:**
 ```
@@ -212,12 +216,20 @@ CS receives AI Platform lifecycle events:
 - `escalation_requested`
 - `session_closed`
 
+When `escalation_requested` arrives, CS does two things in parallel:
+1. **Forwards the `escalation` WS frame** to CRM Frontend over the customer's relay WS (already described in §1.3 relay table — same underlying event, two channels).
+2. **Forwards the `escalation_requested` webhook** to CSS so CSS can enqueue the ticket and alert agents.
+
+CRM Frontend receives the `escalation` frame from the relay (not from CSS). CSS does not re-signal the customer — the relay already did it.
+
 **Verification:** CS verifies the `X-Signature: sha256=<hmac>` header from AI Platform using the per-tenant `ai_platform_webhook_secret`.
 
-**Forwarding:** CS POSTs the body unchanged to `crm_backend.webhook_url`, signing with `crm_backend.webhook_secret`:
+**Forwarding:** CS POSTs the body to `crm_backend.webhook_url` with an added `event_id` field (CS-generated UUID) and signs with `crm_backend.webhook_secret`:
 ```
 X-CS-Signature: sha256=<hmac>
+X-CS-Event-ID: <uuid>
 ```
+CSS must treat `event_id` as an idempotency key — duplicate deliveries (retries) must be deduplicated. CSS should also tolerate out-of-order delivery; where ordering matters (e.g. `escalation_requested` before `session_closed`), CSS should verify ticket state before applying a transition.
 
 CS returns `200` to AI Platform as soon as the forward is accepted (fire-and-forget with a short retry). If CRM Backend is down, CS retries up to 3 times with exponential backoff before dropping.
 
@@ -254,6 +266,25 @@ WS {ai_platform_base}/api/v1/chat/sessions/{session_id}/agent-ws?token={ai_platf
 ```
 All frames forwarded unchanged in both directions.
 
+**Post-escalation message flow:**
+
+After an agent claims a session, the customer remains on the CS chat WS (`/chat/ws/{session_id}`) and the agent is on the agent-ws (proxied to AI Platform). AI Platform is the common node that bridges them:
+
+- Customer sends `message` → CS relay → AI Platform → AI Platform fans to agent-ws → CS agent-ws proxy → agent's console
+- Agent sends `reply` → CS agent-ws proxy → AI Platform → AI Platform fans to customer relay WS → CS relay → CRM Frontend
+
+The agent-ws frame vocabulary is separate from the chat relay vocabulary:
+
+| Agent-ws frame | Direction | Meaning |
+|---|---|---|
+| `history` | AI Platform → agent | Full conversation history on connect |
+| `customer_message` | AI Platform → agent | New message from customer |
+| `reply` | Agent → AI Platform | Agent message to customer |
+| `mode_change` | AI Platform → agent | Session state changes |
+| `ended` | AI Platform → agent | Session closed |
+
+CS's role in this path is pure proxy — it does not interpret or modify agent-ws frames.
+
 ### 1.7 Voice Handoff (call_offer)
 
 The chat→voice handoff works differently depending on the voice transport. The `call_offer` frame carries a `transport` field so CRM Frontend and CS know what to do:
@@ -262,11 +293,20 @@ The chat→voice handoff works differently depending on the voice transport. The
 {
   "type": "call_offer",
   "reason": "Better handled on a call",
-  "transport": "websocket" | "webrtc" | "pstn",
+  "transport": "websocket | webrtc | pstn",
   "call_url": "wss://...",
-  "ice_servers": [{ "urls": "stun:stun.example.com" }]
+  "ice_servers": [{ "urls": "stun:stun.example.com" }],
+  "to": "+919876543210"
 }
 ```
+
+Field presence by transport:
+
+| Field | `websocket` | `webrtc` | `pstn` |
+|---|---|---|---|
+| `call_url` | ✓ PCM-16 WS audio endpoint | ✓ WebRTC signalling endpoint | ✓ AI Platform voice WS — CS passes this as `stream_url` to `initiate_call` |
+| `ice_servers` | — | ✓ STUN/TURN config | — |
+| `to` | — | — | ✓ E.164 customer phone number; CS passes to `initiate_call(to=...)` |
 
 #### Transport: `websocket` (current default)
 
@@ -283,16 +323,23 @@ CRM Frontend must have microphone access and WebRTC support. The implementation 
 This is the case where CS IS actively in the call path. The customer has provided their phone number and wants CS to call them back.
 
 Flow:
-1. AI Platform sends `call_offer` with `transport: "pstn"` and the customer's phone number in `to`.
+1. AI Platform sends `call_offer` with `transport: "pstn"`, `to` (E.164 customer number), and `call_url` (the AI Platform voice WS CS will stream audio to).
 2. **CS intercepts this frame** — it does NOT forward it to CRM Frontend.
-3. CS calls `IVoiceChannel.initiate_call(to, from_, stream_url, callback_url)` using the tenant's configured voice channel adapter (Twilio / SIP / Stringee).
-4. The provider dials the customer's phone. The RTP/audio stream connects to AI Platform's voice WS (`stream_url`).
-5. CS sends CRM Frontend a `mode_change` frame instead:
+3. CS calls `IVoiceChannel.initiate_call(to=frame.to, from_=tenant.caller_id, stream_url=frame.call_url, callback_url=cs_callback_url)` using the tenant's configured voice channel adapter.
+4. The provider dials `to`. Audio streams between the customer's phone and AI Platform's voice WS (`call_url`). CS bridges provider RTP/WS ↔ AI Platform.
+5. CS sends CRM Frontend a `mode_change` frame:
    ```json
    { "type": "mode_change", "mode": "voice_pending", "message": "Calling you now…" }
    ```
 6. CRM Frontend shows a "calling your number" state. The customer accepts on their phone.
-7. On call end, CS receives the `callback_url` POST from the provider and sends CRM Frontend an `ended` frame.
+7. On call end, the provider POSTs to `callback_url` (CS). CS then calls AI Platform to close the session:
+   ```
+   POST /api/v1/chat/sessions/{session_id}/end
+   ```
+   AI Platform emits a `session_closed` webhook → CS forwards it to CSS via the normal webhook forwarder path. CSS receives the transcript and resolves the ticket exactly as for any chat session.
+8. CS sends CRM Frontend an `ended` frame.
+
+> **Note:** The `ended` frame in step 8 is **CS-originated**, not forwarded from AI Platform. Closing the relay connection in step 7 is timed to happen after AI Platform has processed the session end and emitted the webhook — not at the moment the provider callback arrives. Do not close the AI Platform WS before this sequence completes.
 
 In this transport, CRM Frontend never handles audio — the customer's phone does. CS bridges the voice channel provider to AI Platform.
 
@@ -448,7 +495,7 @@ This bridging requires a codec transcoder (8 kHz ↔ 16 kHz resampling). Options
 
 **This implementation is out of scope for the skeleton sprint.** The stub raises `NotImplementedError`. The notes above are captured here so the implementing team has the design context when the SIP sprint begins.
 
-### 2.6 API Stubs
+### 2.5 API Stubs
 
 **Outbound call:**
 ```
@@ -515,7 +562,7 @@ tenants:
       token: "vox_..."             # AI Platform Bearer token for this tenant
 
     crm_backend:
-      webhook_url: "https://crm.acme.com/webhooks/ai"
+      webhook_url: "https://css.acme.com/webhooks/cs"
       webhook_secret: "..."        # CS signs outbound webhook with this
 
     ai_platform_webhook_secret: "..."  # CS verifies inbound AI Platform webhook with this
@@ -577,19 +624,24 @@ Tokens are never forwarded across boundaries — CS holds separate credentials f
 
 ## 6. Session State
 
+CS mints its own `session_id` distinct from AI Platform's session id. This matters because the CS `session_id` is the capability token on the customer WS path (`/chat/ws/{session_id}`) — it must be CS-controlled, not a value AI Platform could issue to a different tenant.
+
 ```
-Redis key: cs:session:{session_id}
+Redis key: cs:session:{cs_session_id}
 TTL:       86400 s (24 h)
 
 Value (JSON):
 {
-  "platform_session_id": "cs_a1b2c3d4",
-  "platform_ws_url": "wss://ai.example.com/api/v1/chat/ws/cs_a1b2c3d4",
+  "cs_session_id":      "cs_7f3a9b2e",        ← CS-minted ID (used in WS path + media proxy)
+  "platform_session_id": "plat_a1b2c3d4",     ← AI Platform's ID (used for upstream API calls)
+  "platform_ws_url": "wss://ai.example.com/api/v1/chat/ws/plat_a1b2c3d4",
   "tenant_slug": "acme",
   "operator_flag": "ai",
   "created_at": "2026-06-23T10:00:00Z"
 }
 ```
+
+CS uses `cs_session_id` in all URLs it exposes to the outside world. It uses `platform_session_id` in all calls it makes to AI Platform.
 
 Active WS connections are tracked in process memory (map from `session_id` to connection handles). On process restart, new customers must create new sessions; existing live sessions reconnect transparently (AI Platform re-sends history).
 
