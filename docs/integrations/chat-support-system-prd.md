@@ -138,7 +138,7 @@ A ticket is created immediately on session start, before the customer sends any 
 
 - `status`: `ai_active` (for ai/hybrid) or `queued` (for human)
 - `priority`: `medium` by default; rules may set it (e.g. VIP → `high`)
-- `sla_due_at`: computed from `SLAPolicy` for the priority level
+- `sla_response_due_at`, `sla_resolution_due_at`: computed from `SLAPolicy.first_response_minutes` and `SLAPolicy.resolution_minutes` for the priority level
 - `customer_id`, `customer_name`, `language` from the request
 - `metadata` stored for agent context
 
@@ -160,13 +160,15 @@ A ticket is created immediately on session start, before the customer sends any 
 | `language` | string | ISO 639-1 |
 | `assigned_agent_id` | string? | null until claimed |
 | `team_id` | string? | null if unassigned to team |
-| `sla_due_at` | datetime | first-response SLA deadline |
-| `sla_breached` | bool | set by background job if SLA missed |
+| `sla_response_due_at` | datetime | first-response SLA deadline |
+| `sla_resolution_due_at` | datetime | resolution SLA deadline |
+| `sla_response_breached` | bool | set if first response missed |
+| `sla_resolution_breached` | bool | set if resolution missed |
 | `created_at` | datetime | |
 | `first_response_at` | datetime? | set when agent first replies |
 | `resolved_at` | datetime? | |
 | `closed_at` | datetime? | |
-| `ai_session_id` | string? | CS session_id if AI was involved |
+| `abandoned` | bool | true if customer left before any agent replied |
 | `summary` | text? | AI-generated at close (from session_closed webhook) |
 | `tags` | string[] | |
 
@@ -180,9 +182,10 @@ new
  │                    (session_closed, AI resolved without escalation)        │
  │                                      ▼                                    │
  │                                   closed ◄── (24h timeout, any status)    │
+ │                                         ◄── (abandonment — no agent claimed)
  │                                                                           │
  ├──(operator_flag=human)──────────► queued ◄────────────────────────────────┘
- │                                      │
+ │                                      │   ──(abandonment)──────────────────► closed
  │                               (agent claims)
  │                                      ▼
  │                                 in_progress ◄──── (transfer)
@@ -193,7 +196,7 @@ new
  │            (by agent action)              (session_closed webhook)
  │                   │
  │               (customer reopens by starting a new chat — linked to same ticket
- │                if within N hours; configurable reopen window)
+ │                if within 24 hours; configurable reopen window, default 24 h)
  └───────────────────┘
 ```
 
@@ -202,7 +205,9 @@ new
 | Trigger | From | To |
 |---|---|---|
 | `session_closed` webhook, `mode_at_close=ai` | `ai_active` | `closed` |
+| `session_closed` webhook, `mode_at_close=ai`, no agent claimed | `queued` | `closed` (abandoned) |
 | `session_closed` webhook, `mode_at_close=human` | `in_progress` | `resolved` |
+| Customer WS disconnect (direct-human, no agent ever replied) | `queued` | `closed` (abandoned) |
 | Agent action: Resolve | `in_progress` | `resolved` |
 | Agent action: Close | any | `closed` |
 | 24h timeout (background job) | any non-terminal | `closed` |
@@ -338,11 +343,12 @@ CSS verifies the `X-CS-Signature` HMAC header on every inbound request.
 {
   "event": "session_started",
   "session_id": "cs_a1b2c3d4",
-  "customer": { "name": "Rahul", "id": "player-42" }
+  "customer": { "name": "Rahul", "id": "player-42" },
+  "event_id": "evt_2a7c4b1d"
 }
 ```
 
-CSS action: confirm ticket exists (it was created at `POST /api/chat/start`); start SLA timer.
+CSS action: deduplicate on `event_id`; confirm ticket exists (it was created at `POST /api/chat/start`); start SLA timer.
 
 ### Event: `escalation_requested`
 
@@ -412,8 +418,10 @@ Supervisor connects to `WS /api/dashboard`. CSS pushes updates as events occur.
 | Oldest wait | `enqueued_at` of the oldest unclaimed QueueEntry |
 | Agents online | Agents with status `online` |
 | Agents busy | Agents with status `busy` |
-| SLA at risk | Tickets where `sla_due_at < now + 10 min` and not resolved |
-| SLA breached | Tickets where `sla_due_at < now` and not resolved |
+| SLA response at risk | Tickets where `sla_response_due_at < now + 10 min` and `first_response_at` is null |
+| SLA response breached | Tickets where `sla_response_due_at < now` and `first_response_at` is null |
+| SLA resolution at risk | Tickets where `sla_resolution_due_at < now + 10 min` and status not in (resolved, closed) |
+| SLA resolution breached | Tickets where `sla_resolution_due_at < now` and status not in (resolved, closed) |
 
 ### Live feeds
 
@@ -492,11 +500,14 @@ Per agent, for the selected period:
 
 | Metric | Description |
 |---|---|
-| SLA compliance rate | Tickets resolved within SLA / total |
-| Breaches by priority | High / urgent breach counts |
-| Avg breach duration | How far past SLA breached tickets were resolved |
-| Breaches by agent | Which agents had the most SLA breaches |
-| Breaches by team | Which teams had the most SLA breaches |
+| First-response compliance rate | Tickets with `first_response_at ≤ sla_response_due_at` / total human sessions |
+| Resolution compliance rate | Tickets with `resolved_at ≤ sla_resolution_due_at` / total sessions |
+| First-response breaches by priority | Count of `sla_response_breached=true` by priority |
+| Resolution breaches by priority | Count of `sla_resolution_breached=true` by priority |
+| Avg first-response breach overrun | Avg (`first_response_at − sla_response_due_at`) for breached tickets |
+| Avg resolution breach overrun | Avg (`resolved_at − sla_resolution_due_at`) for breached tickets |
+| Breaches by agent | Which agents had the most SLA breaches (either type) |
+| Breaches by team | Which teams had the most SLA breaches (either type) |
 
 ---
 
@@ -759,7 +770,7 @@ GET/PUT          /api/admin/notifications
 - `POST /api/chat/start`: operator flag evaluation, CS session creation, ticket creation
 - `POST /webhooks/cs`: handle `session_started`, `escalation_requested`, `session_closed`
 - Ticket CRUD APIs (no UI yet)
-- Basic SLA timer (background job: mark `sla_breached` when overdue)
+- Basic SLA timer (background job: mark `sla_response_breached` / `sla_resolution_breached` when overdue)
 
 ### Phase 2 — Agent Queue and Console (Weeks 3–4)
 

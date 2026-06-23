@@ -201,7 +201,7 @@ Forward every frame from our WS to CRM Frontend, **except rewrite any URL fields
 | `audio_ack` | ✓ | Rewrite `media_url` |
 | `escalation` | ✓ | |
 | `mode_change` | ✓ | |
-| `call_offer` | ✓ | Rewrite `call_url` if proxying voice too |
+| `call_offer` | ✓ | Forward as-is (see Voice Handoff below — `call_url` is never rewritten) |
 | `ended` | ✓ | Close both connections after forwarding |
 | `error` | ✓ | |
 

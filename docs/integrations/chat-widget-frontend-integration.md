@@ -33,6 +33,18 @@ Your job: connect to `ws_url` and implement the message protocol below. No crede
 
 > **Important:** Your backend rewrites all platform URLs before forwarding frames to you. Use media URLs and call URLs exactly as provided — never construct platform paths or append auth parameters yourself.
 
+### Direct-human sessions
+
+When your backend decides `operator_flag = "human"`, the conversation goes directly to a human agent — the AI Platform and CS are not involved. In this case:
+
+- `session_id` in the `/api/chat/start` response is `null`
+- `ws_url` points to your backend (CSS) directly: `wss://css.example.com/api/chat/ws/{ticket_id}`
+- The same message protocol applies: `message`, `typing`, `history`, `mode_change`, `ended` frames all work the same way
+- `call_offer` frames are **not** sent in direct-human sessions (no voice handoff path)
+- `escalation` frames are **not** sent (there is no AI to escalate)
+
+Your UI code should not need to branch on session type — the same handlers work for both paths.
+
 ---
 
 ## Connecting
@@ -149,10 +161,12 @@ audioEl.src = msg.media_url; // already proxied — use as-is
 {
   "type": "escalation",
   "reason": "Customer requested human support",
-  "context_summary": "Customer asked about a pending withdrawal..."
+  "summary": "Customer asked about a pending withdrawal..."
 }
 ```
 AI has escalated. Show "Connecting you to an agent…" The session mode is now `awaiting_human`.
+
+> **Note:** This WS frame uses `summary`; the corresponding `escalation_requested` webhook your backend receives from CS also uses `summary`. The two fields are the same value delivered over different channels.
 
 ### `mode_change`
 ```json
@@ -163,8 +177,10 @@ AI has escalated. Show "Connecting you to an agent…" The session mode is now `
 |---|---|
 | `awaiting_human` | "Waiting for an agent…" |
 | `human` | "You're now chatting with Priya" |
+| `voice_pending` | "Calling your number… pick up when your phone rings." |
 
-From this point, messages from the human agent arrive as normal `message` frames — no special handling needed.
+For `human`: messages from the human agent arrive as normal `message` frames — no special handling needed.
+For `voice_pending`: no audio in the browser; see pstn transport in §Voice Handoff.
 
 ### `call_offer`
 ```json
@@ -265,7 +281,7 @@ On every WebSocket connect the server sends one `history` frame before any other
   "messages": [
     { "id": 101, "role": "customer",    "text": "Hello",          "media_url": null,                     "media_mime": null,                    "ts": "2026-06-22T10:00:00" },
     { "id": 102, "role": "agent",       "text": "Hello Rahul…",   "media_url": null,                     "media_mime": null,                    "ts": "2026-06-22T10:00:01" },
-    { "id": 103, "role": "customer",    "text": "[voice message]", "media_url": "/api/v1/chat/media/103", "media_mime": "audio/webm;codecs=opus", "ts": "2026-06-22T10:01:00" },
+    { "id": 103, "role": "customer",    "text": "[voice message]", "media_url": "https://css.example.com/proxy/media/103", "media_mime": "audio/webm;codecs=opus", "ts": "2026-06-22T10:01:00" },
     { "id": 104, "role": "human_agent", "text": "Let me check…",  "media_url": null,                     "media_mime": null,                    "ts": "2026-06-22T10:05:00" }
   ]
 }
@@ -380,7 +396,7 @@ Form fields: `file` (image/* or video/*), `text` (optional caption). Your backen
 - [ ] Mic button → record → `audio` frame → show blob `<audio>` → swap src on `audio_ack` (use `media_url` as-is)
 - [ ] Media URLs: use as provided by your backend — never construct platform paths or append `?session_id=`
 - [ ] `escalation` → show "Connecting to agent…"
-- [ ] `mode_change` mode=`human` → show agent name
+- [ ] `mode_change` mode=`awaiting_human` → "Waiting for an agent…"; mode=`human` → show agent name; mode=`voice_pending` → "Calling your number…"
 - [ ] `call_offer` → check `transport`: websocket = POST `/chat/call` → connect WS; webrtc = WebRTC peer conn using `ice_servers` + `call_url`; pstn = show "Calling your number…" and wait for `mode_change`
 - [ ] `ended` → disable composer
 - [ ] `error` → inline notice, socket stays open

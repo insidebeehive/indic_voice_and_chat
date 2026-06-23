@@ -144,11 +144,12 @@ If `operator_flag` is absent, use the tenant's `operator.default_flag` from conf
 }
 ```
 
-CS stores in Redis (`cs:session:{session_id}`, TTL 24 h):
+CS stores in Redis (`cs:session:{cs_session_id}`, TTL 24 h):
 ```json
 {
-  "platform_session_id": "cs_a1b2c3d4",
-  "platform_ws_url": "wss://ai.example.com/api/v1/chat/ws/cs_a1b2c3d4",
+  "cs_session_id":      "cs_a1b2c3d4",
+  "platform_session_id": "plat_7f3a9b2e",
+  "platform_ws_url": "wss://ai.example.com/api/v1/chat/ws/plat_7f3a9b2e",
   "tenant_slug": "acme",
   "operator_flag": "ai"
 }
@@ -230,6 +231,14 @@ X-CS-Signature: sha256=<hmac>
 X-CS-Event-ID: <uuid>
 ```
 CSS must treat `event_id` as an idempotency key — duplicate deliveries (retries) must be deduplicated. CSS should also tolerate out-of-order delivery; where ordering matters (e.g. `escalation_requested` before `session_closed`), CSS should verify ticket state before applying a transition.
+
+**Field rewrites before forwarding:** CS rewrites session-identifying fields in the forwarded body so that CSS always receives CS identifiers (not AI Platform identifiers):
+
+- `session_id` — replaced with `cs_session_id` from the Redis session record (the value that appears in all CS-exposed URLs)
+- `claim_url` (in `escalation_requested`) — rewritten from the AI Platform form (`/api/v1/chat/sessions/{platform_id}/claim`) to the CS form (`/chat/sessions/{cs_id}/claim`)
+- `agent_ws_url` (in `escalation_requested`) — rewritten from `/api/v1/chat/sessions/{platform_id}/agent-ws` to `/chat/agent-ws/{cs_id}`
+
+CSS stores and uses these CS-form values. CSS never calls AI Platform directly — all claim and agent-ws traffic goes to CS.
 
 CS returns `200` to AI Platform as soon as the forward is accepted (fire-and-forget with a short retry). If CRM Backend is down, CS retries up to 3 times with exponential backoff before dropping.
 
@@ -613,7 +622,7 @@ Sensitive fields (`cs_token`, `ai_platform.token`, secrets) should be injected v
 |---|---|---|
 | CRM Backend | HTTP endpoints | `Authorization: Bearer {cs_token}` (opaque, per-tenant) |
 | CRM Frontend / Customer | `WS /chat/ws/{session_id}` | `session_id` in path (capability token) |
-| BO Agent | `WS /chat/agent-ws/{session_id}` | `?token={cs_token}` (same Bearer as CRM Backend) |
+| Support Agent | `WS /chat/agent-ws/{session_id}` | `?token={cs_token}` (same Bearer as CRM Backend) |
 | AI Platform | `POST /internal/platform-webhook` | `X-Signature: sha256=<hmac>` |
 
 CS calls AI Platform using the per-tenant `ai_platform.token`. CS signs outbound webhooks to CRM Backend using `crm_backend.webhook_secret`.
