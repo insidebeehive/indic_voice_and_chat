@@ -44,23 +44,26 @@ CS makes the AI Platform pluggable: CRM Backend talks to CS, not directly to the
                                           (CS not in the actual call)
                        │                              │
                        ▼                              ▼
-┌──────────────────────────────────┐   ┌─────────────────────────────────────┐
-│        Coordination Service       │   │           AI Platform                │
-│                                  │   │                                     │
-│  Chat relay                      │   │  POST /chat/sessions                 │
-│  (session create, WS proxy,      │◄──┤  WS   /chat/ws/{id}                  │
-│   media rewrite)                 │   │  GET  /chat/sessions/{id}            │
-│                                  │──►│  POST /sessions/{id}/claim           │
-│  Session router                  │   │  WS   /sessions/{id}/agent-ws        │
-│  (operator flag: ai/human/hybrid)│   │  GET  /chat/media/{id}               │
-│                                  │   │                                     │
-│  Media proxy                     │   │  WS   voice/ws  ← websocket transport│
-│  Webhook forwarder               │   │  WebRTC endpoint ← webrtc transport  │
-│                                  │   └─────────────────────────────────────┘
-│  Voice channel registry          │
-│  (IVoiceChannel → adapter)       │   [3] voice: pstn transport only
-│  ── pstn transport only ──       │   CS intercepts call_offer; dials customer
-└───┬──────────────────────────────┘   via voice channel adapter; bridges
+┌──────────────────────────────────┐                ┌──────────────────────────────────────┐
+│        Coordination Service       │   CS calls ──► │           AI Platform                 │
+│                                  │────────────────►│                                      │
+│  Chat relay                      │                │  POST /api/v1/chat/sessions            │
+│  (session create, WS proxy,      │                │  WS   /api/v1/chat/ws/{id}             │
+│   media rewrite)                 │                │  GET  /api/v1/chat/sessions/{id}       │
+│                                  │                │  POST /api/v1/sessions/{id}/claim      │
+│  Session router                  │                │  WS   /api/v1/sessions/{id}/agent-ws   │
+│  (operator flag: ai/human/hybrid)│                │  GET  /api/v1/chat/media/{id}          │
+│                                  │◄────────────── │                                      │
+│  Webhook forwarder               │  ◄── webhooks  │  POST /internal/platform-webhook       │
+│  (HMAC verify + forward to CSS)  │                │  (lifecycle events: AI Platform → CS)  │
+│                                  │                │                                      │
+│  Media proxy                     │                │  WS   voice/ws   (websocket transport) │
+│  Voice channel registry          │                │  WebRTC endpoint (webrtc transport)    │
+│  (IVoiceChannel → adapter)       │                └──────────────────────────────────────┘
+│  ── pstn transport only ──       │
+│                                  │   [3] voice: pstn transport only
+└───┬──────────────────────────────┘   CS intercepts call_offer; dials customer
+    │                    │             via voice channel adapter; bridges
     │                    │             provider audio → AI Platform voice WS
     │ webhooks           │ pstn: initiate_call()
     │ (lifecycle events) │ (skeleton — 501)
