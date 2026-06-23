@@ -275,15 +275,73 @@ class IVoiceChannel(ABC):
 
 ```python
 class TwilioAdapter(IVoiceChannel):
-    async def initiate_call(self, ...): raise NotImplementedError
-    async def end_call(self, ...): raise NotImplementedError
-    async def get_call_status(self, ...): raise NotImplementedError
+    def __init__(self, account_sid: str, auth_token: str, from_number: str):
+        self.account_sid  = account_sid
+        self.auth_token   = auth_token
+        self.from_number  = from_number
+
+    async def initiate_call(self, to, from_, stream_url, callback_url) -> str:
+        raise NotImplementedError
+    async def end_call(self, call_id) -> None:
+        raise NotImplementedError
+    async def get_call_status(self, call_id) -> dict:
+        raise NotImplementedError
+
 
 class StringeeAdapter(IVoiceChannel):
-    # same
+    def __init__(self, api_key_sid: str, api_key_secret: str):
+        self.api_key_sid    = api_key_sid
+        self.api_key_secret = api_key_secret
+
+    async def initiate_call(self, to, from_, stream_url, callback_url) -> str:
+        raise NotImplementedError
+    async def end_call(self, call_id) -> None:
+        raise NotImplementedError
+    async def get_call_status(self, call_id) -> dict:
+        raise NotImplementedError
+
 
 class SIPAdapter(IVoiceChannel):
-    # same
+    """
+    SIP User Agent Client (UAC) adapter for SIP trunk providers such as DiDLogic.
+
+    Outbound call flow:
+      1. Send SIP INVITE to `server` with Digest Authentication.
+      2. Receive 180 Ringing → 200 OK → send ACK.
+      3. Negotiate RTP session via SDP in the INVITE / 200 OK exchange.
+      4. Bridge RTP audio ↔ AI Platform PCM-16 WebSocket (`stream_url`).
+      5. On hangup: send BYE; close RTP and WS connections.
+    """
+
+    def __init__(
+        self,
+        server: str,          # SIP proxy hostname  (e.g. sip.didlogic.net)
+        port: int,            # 5060 for UDP/TCP; 5061 for TLS
+        username: str,        # SIP account username / DID extension
+        password: str,        # SIP account password (Digest auth)
+        caller_id: str,       # E.164 number sent as SIP From: header
+        transport: str,       # "udp" | "tcp" | "tls"
+        realm: str = "",      # Digest auth realm; defaults to `server` if blank
+    ):
+        self.server    = server
+        self.port      = port
+        self.username  = username
+        self.password  = password
+        self.caller_id = caller_id
+        self.transport = transport
+        self.realm     = realm or server
+
+    async def initiate_call(self, to, from_, stream_url, callback_url) -> str:
+        """Send SIP INVITE; bridge RTP↔WebSocket; return call_id."""
+        raise NotImplementedError
+
+    async def end_call(self, call_id) -> None:
+        """Send SIP BYE to tear down the call."""
+        raise NotImplementedError
+
+    async def get_call_status(self, call_id) -> dict:
+        """Derive status from SIP response codes (200 OK, 486 Busy, 408 Timeout, etc.)."""
+        raise NotImplementedError
 ```
 
 ### 2.3 Provider Registry
@@ -296,7 +354,32 @@ def get_voice_channel(provider: str, config: dict) -> IVoiceChannel:
     raise ValueError(f"Unknown provider: {provider}")
 ```
 
-### 2.4 API Stubs
+### 2.4 SIP Implementation Notes
+
+SIP differs from Twilio and Stringee in a fundamental way: **there is no REST API**. The SIP adapter must implement the SIP signalling protocol directly. Key points for the team that will implement this:
+
+**Signalling library** — Use a Python SIP library (`aioSIP`, `pySIP`, or build on top of `twisted`) rather than raw socket programming. CS acts as a SIP UAC (User Agent Client): it sends INVITE, handles 1xx provisional responses, sends ACK on 200 OK, and sends BYE to hang up.
+
+**Media bridging (hardest part)** — SIP calls carry audio over RTP, not WebSocket. The SIPAdapter must bridge between:
+- The RTP session negotiated via SDP in the INVITE/200 OK exchange (G.711 µ-law or PCM, 8 kHz typically)
+- The AI Platform's PCM-16 WebSocket stream (16 kHz mono little-endian)
+
+This bridging requires a codec transcoder (8 kHz ↔ 16 kHz resampling). Options:
+- A lightweight in-process bridge using `audioop` (stdlib) for resampling
+- An external media gateway (FreeSWITCH, Asterisk) that CS connects to via AMI/ARI — more operationally complex but proven
+
+**DiDLogic specifics** — DiDLogic provides SIP trunk credentials (username, password, SIP server, DID number). The expected call flow:
+1. CS registers with DiDLogic's SIP proxy (REGISTER with Digest auth), or sends authenticated INVITE directly (trunk mode, no registration needed — DiDLogic supports both).
+2. CS sends `INVITE sip:{to}@sip.didlogic.net` with SDP offering an RTP endpoint.
+3. DiDLogic dials the destination PSTN number and replies 200 OK with SDP answer.
+4. CS opens RTP socket, bridges audio to AI Platform WS.
+5. On session end, CS sends `BYE`.
+
+**Call status** — Unlike Twilio (REST poll) or Stringee (REST poll), SIP call status is derived from SIP response codes: 180/183 = Ringing, 200 = Connected, 486 = Busy, 408 = No Answer, 487 = Cancelled. `get_call_status` must track these in memory per `call_id`.
+
+**This implementation is out of scope for the skeleton sprint.** The stub raises `NotImplementedError`. The notes above are captured here so the implementing team has the design context when the SIP sprint begins.
+
+### 2.6 API Stubs
 
 **Outbound call:**
 ```
@@ -381,10 +464,13 @@ tenants:
         api_key_sid: ""
         api_key_secret: ""
       sip:
-        server: ""
-        username: ""
-        password: ""
-        caller_id: ""
+        server: ""           # SIP proxy hostname (e.g. sip.didlogic.net)
+        port: 5060           # 5060 = UDP/TCP, 5061 = TLS
+        username: ""         # SIP account username / DID extension
+        password: ""         # Digest auth password
+        caller_id: ""        # E.164 number shown to callee (From: header)
+        transport: "udp"     # udp | tcp | tls
+        realm: ""            # Digest auth realm; leave blank to default to server
 
   # Additional tenants follow the same shape
   betcorp:
