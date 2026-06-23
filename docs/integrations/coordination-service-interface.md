@@ -263,9 +263,18 @@ For `websocket` and `webrtc` transports, CS forwards the `call_offer` frame as-i
 
 ### Audio stream (pstn bridging)
 
-For pstn calls, CS bridges provider audio to our voice WS at `call_url`:
+For pstn calls, CS bridges bidirectionally between the voice provider (customer's phone) and our voice WS at `call_url`:
 
-- **Binary frames:** PCM-16, 16 kHz, mono, little-endian (~20 ms chunks)
+```
+Customer phone ──► provider RTP ──► CS bridge ──► PCM-16 binary ──► call_url (AI Platform)
+Customer phone ◄── provider RTP ◄── CS bridge ◄── PCM-16 binary ◄── call_url (AI Platform)
+```
+
+After STT → LLM → TTS (or S2S), AI Platform sends the output audio back as PCM-16 binary frames on the same `call_url` connection. CS receives them and forwards them to the provider, which plays the audio to the customer's phone.
+
+For `websocket` and `webrtc` transports the same principle holds, but CRM Frontend is connected directly to `call_url` — CRM Frontend sends mic audio in and receives TTS/S2S output back, with no CS in the audio path.
+
+- **Binary frames (bidirectional):** PCM-16, 16 kHz, mono, little-endian (~20 ms chunks)
 - **Text frames (JSON):**
 
 | Direction | Frame | When |
