@@ -30,7 +30,7 @@ CSS integrates with the Coordination Service (CS) for all AI-powered sessions. F
 
 - Customer-facing UI (chat widget) — owned by CRM Frontend.
 - AI conversation intelligence — owned by AI Platform via CS.
-- Telephony / voice calls — owned by CS (future sprint).
+- Voice channel adapters (telephony / WebRTC) — owned by CS (future sprint).
 - Billing or subscription management.
 - A general-purpose CRM (contacts, deals, pipelines) — this is support-only.
 

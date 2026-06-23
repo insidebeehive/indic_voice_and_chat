@@ -168,9 +168,16 @@ From this point, messages from the human agent arrive as normal `message` frames
 
 ### `call_offer`
 ```json
-{ "type": "call_offer", "reason": "Better handled on a call", "call_url": "wss://..." }
+{
+  "type": "call_offer",
+  "reason": "Better handled on a call",
+  "transport": "websocket | webrtc | pstn",
+  "call_url": "wss://...",
+  "ice_servers": [{ "urls": "stun:stun.example.com" }]
+}
 ```
-Show a "Switch to voice call" button. If accepted, connect to `call_url` (see §Voice Handoff).
+
+`transport` tells you what to do. `call_url` and `ice_servers` are only present for `websocket` and `webrtc`. See §Voice Handoff for per-transport handling.
 
 ### `ended`
 ```json
@@ -283,21 +290,20 @@ function renderHistoryMessage(msg) {
 
 ## Chat → Voice Handoff
 
-When `call_offer` arrives and the customer accepts:
+Handle based on `msg.transport`:
 
-**1. Request a voice call URL from your backend:**
+### transport: `websocket`
 
+**1. Request the call URL from your backend:**
 ```
 POST /chat/call          (your backend's endpoint — not ours)
 ```
 ```json
 { "call_url": "wss://...", "call_id": "abc123" }
 ```
+Your backend calls our platform server-side and returns the `call_url`. The token expires in **10 minutes** — connect promptly.
 
-Your backend calls our platform server-side and returns the `call_url`. The `call_url` token expires in **10 minutes** — connect promptly. The URL may point directly to us or to the Coordination Service voice endpoint depending on how your backend is configured; either way, your job is the same.
-
-**2. Connect and exchange audio:**
-
+**2. Connect and exchange PCM-16 audio:**
 ```js
 const voiceWs = new WebSocket(callUrl);
 voiceWs.binaryType = "arraybuffer";
@@ -309,8 +315,44 @@ voiceWs.binaryType = "arraybuffer";
 //   {"type":"transcript","role":"agent","text":…} — live captions
 //   {"type":"state","state":"ended"}              — call over
 ```
-
 The chat history is automatically pre-loaded into the voice agent.
+
+### transport: `webrtc`
+
+Use `msg.call_url` as the WebRTC signalling endpoint and `msg.ice_servers` for STUN/TURN. No POST to your backend needed — the `call_url` and credentials come directly in the frame.
+
+```js
+const pc = new RTCPeerConnection({ iceServers: msg.ice_servers });
+const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+stream.getTracks().forEach(t => pc.addTrack(t, stream));
+
+const signalingWs = new WebSocket(msg.call_url);
+signalingWs.onmessage = async (e) => {
+  const data = JSON.parse(e.data);
+  if (data.type === "offer") {
+    await pc.setRemoteDescription(data);
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+    signalingWs.send(JSON.stringify(answer));
+  }
+  if (data.type === "candidate") {
+    await pc.addIceCandidate(data.candidate);
+  }
+};
+pc.onicecandidate = (e) => {
+  if (e.candidate) signalingWs.send(JSON.stringify({ type: "candidate", candidate: e.candidate }));
+};
+```
+
+### transport: `pstn`
+
+Your backend is calling the customer's phone. Do not show a "connect" button. Show a waiting state instead:
+
+```js
+showUI("Calling your number… pick up when your phone rings.");
+```
+
+Your backend will send a `mode_change` frame when the call connects and an `ended` frame when it finishes. No audio is handled in the browser for this transport.
 
 ---
 
@@ -339,6 +381,6 @@ Form fields: `file` (image/* or video/*), `text` (optional caption). Your backen
 - [ ] Media URLs: use as provided by your backend — never construct platform paths or append `?session_id=`
 - [ ] `escalation` → show "Connecting to agent…"
 - [ ] `mode_change` mode=`human` → show agent name
-- [ ] `call_offer` → show "Switch to call" button → on accept POST to your backend's `/chat/call` → connect to returned `call_url`
+- [ ] `call_offer` → check `transport`: websocket = POST `/chat/call` → connect WS; webrtc = WebRTC peer conn using `ice_servers` + `call_url`; pstn = show "Calling your number…" and wait for `mode_change`
 - [ ] `ended` → disable composer
 - [ ] `error` → inline notice, socket stays open

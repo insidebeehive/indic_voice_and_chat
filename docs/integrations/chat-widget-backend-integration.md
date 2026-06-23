@@ -263,12 +263,15 @@ def rewrite_url(platform_url: str, base_url: str) -> str:
 
 ### Voice handoff (`call_offer`)
 
-When we send a `call_offer` frame, the `call_url` is a WebSocket URL pointing to the voice endpoint — our platform today, or the Coordination Service's voice endpoint when CS is deployed. Two options:
+`call_offer` frames now carry a `transport` field. Your relay behaviour differs per transport:
 
-- **Forward as-is:** CRM Frontend connects to the voice WS directly (simplest; voice is binary PCM-16 and hard to proxy). This is the only case where CRM Frontend connects to a voice endpoint directly — only the voice WS, not the chat APIs.
-- **Proxy the voice WS:** Relay PCM-16 binary frames the same way as the chat relay. More work but keeps all traffic through your infra.
+| `transport` | What you receive | What to do |
+|---|---|---|
+| `websocket` | `call_url` (WS endpoint) | Forward as-is. CRM Frontend connects to `call_url` directly. Binary PCM-16 is expensive to proxy. |
+| `webrtc` | `call_url` (signalling endpoint) + `ice_servers` | Forward as-is. CRM Frontend does WebRTC ICE negotiation directly with `call_url`. |
+| `pstn` | Neither — CS intercepts this frame entirely | **This frame never reaches you.** When CS is deployed, it swallows `transport=pstn` frames, dials the customer's phone via the voice channel adapter, and sends CRM Frontend a `mode_change` frame instead. Without CS, this transport is not supported. |
 
-For most integrations, forwarding the `call_url` as-is is the right call.
+For `websocket` and `webrtc`, forwarding the frame as-is is the right call — CRM Frontend handles the rest.
 
 ---
 

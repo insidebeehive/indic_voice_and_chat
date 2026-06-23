@@ -198,7 +198,7 @@ Optionally: CRM calls our summarization API with the recording
 
 ## What CS Must Provide Us
 
-For the CS telephony option to work, CS must expose the following to us:
+For the CS voice channel adapter to work, CS must expose the following to us:
 
 ### Chat WebSocket relay
 
