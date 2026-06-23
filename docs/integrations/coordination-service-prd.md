@@ -34,41 +34,48 @@ CS makes the AI Platform pluggable: CRM Backend talks to CS, not directly to the
 ## Topology
 
 ```
-                     ┌─────────────────────────────────────────────────────┐
-                     │              Customer browser                        │
-                     │                                                     │
-                     │  [chat]  WS wss://cs.example.com/chat/ws/{id}       │
-                     │  [voice] transport=websocket → direct WS call_url   │
-                     │  [voice] transport=webrtc    → WebRTC peer conn      │
-                     │  [voice] transport=pstn      → waits for phone call  │
-                     └──────────────┬─────────────────────────────────────┘
-                                    │ chat WS (always)
-                                    │ call_url direct (websocket / webrtc only)
-                                    ▼
-┌───────────────────────────────────────────────────────────────────────────┐
-│                         Coordination Service                               │
-│                                                                           │
-│  Chat relay          (session create, WS proxy, media rewrite)            │
-│  Session router      (operator flag: ai / human / hybrid)                 │
-│  Media proxy         (GET /chat/media/{id})                               │
-│  Webhook forwarder   (AI Platform → CRM Backend, HMAC sign+verify)        │
-│  Voice channel registry  (IVoiceChannel → adapter; pstn transport only)   │
-└───┬──────────────────────────┬────────────────────────┬───────────────────┘
-    │ webhooks                  │ pstn: initiate_call()   │ chat API calls
-    │ (lifecycle events)        │ (skeleton — 501)        │
-    ▼                          ▼                         ▼
-┌──────────────┐  ┌─────────────────────────────┐  ┌──────────────────────────────┐
-│  CRM Backend  │  │  Voice Channel Providers     │  │        AI Platform            │
-│               │  │                             │  │                              │
-│  Webhook recv │  │  SIP / DiDLogic             │  │  POST /chat/sessions          │
-│  Agent console│  │  (SIP UAC + RTP bridge)     │  │  WS   /chat/ws/{id}           │
-│  Ticket system│  ├─────────────────────────────┤  │  GET  /chat/sessions/{id}     │
-│  Analytics    │  │  Twilio / Vonage / Plivo     │  │  POST /sessions/{id}/claim    │
-│  Business lgc │  │  (REST API + WS stream)     │  │  WS   /sessions/{id}/agent-ws │
-└──────────────┘  ├─────────────────────────────┤  │  GET  /chat/media/{id}         │
-                  │  Stringee                    │  │  WS   voice stream (call_url)  │
-                  │  (REST + SDK)               │  └──────────────────────────────┘
-                  └─────────────────────────────┘
+          ┌──────────────────────────────────────────────────────────────┐
+          │                    Customer browser                           │
+          └────────────┬──────────────────────────────┬─────────────────┘
+                       │                              │
+            [1] chat WS (always)          [2] voice: websocket / webrtc
+            wss://cs.example.com               direct to call_url
+            /chat/ws/{id}                  (CS not in audio path)
+                       │                              │
+                       ▼                              ▼
+┌──────────────────────────────────┐   ┌─────────────────────────────────────┐
+│        Coordination Service       │   │           AI Platform                │
+│                                  │   │                                     │
+│  Chat relay                      │   │  POST /chat/sessions                 │
+│  (session create, WS proxy,      │◄──┤  WS   /chat/ws/{id}                  │
+│   media rewrite)                 │   │  GET  /chat/sessions/{id}            │
+│                                  │──►│  POST /sessions/{id}/claim           │
+│  Session router                  │   │  WS   /sessions/{id}/agent-ws        │
+│  (operator flag: ai/human/hybrid)│   │  GET  /chat/media/{id}               │
+│                                  │   │                                     │
+│  Media proxy                     │   │  WS   voice/ws  ← websocket transport│
+│  Webhook forwarder               │   │  WebRTC endpoint ← webrtc transport  │
+│                                  │   └─────────────────────────────────────┘
+│  Voice channel registry          │
+│  (IVoiceChannel → adapter)       │   [3] voice: pstn transport only
+│  ── pstn transport only ──       │   CS intercepts call_offer; dials customer
+└───┬──────────────────────────────┘   via voice channel adapter; bridges
+    │                    │             provider audio → AI Platform voice WS
+    │ webhooks           │ pstn: initiate_call()
+    │ (lifecycle events) │ (skeleton — 501)
+    ▼                    ▼
+┌──────────────┐  ┌──────────────────────────────────┐
+│  CRM Backend  │  │    Voice Channel Providers        │
+│               │  │                                  │
+│  Webhook recv │  │  SIP / DiDLogic                  │
+│  Agent console│  │  (SIP UAC + RTP↔WS bridge)       │
+│  Ticket system│  ├──────────────────────────────────┤
+│  Analytics    │  │  Twilio / Vonage / Plivo / Telnyx │
+│  Business lgc │  │  (REST API + WS audio stream)    │
+└──────────────┘  ├──────────────────────────────────┤
+                  │  Stringee                         │
+                  │  (REST + SDK)                    │
+                  └──────────────────────────────────┘
 ```
 
 **Traffic rules:**
