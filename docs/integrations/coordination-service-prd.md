@@ -17,13 +17,13 @@ CS makes the AI Platform pluggable: CRM Backend talks to CS, not directly to the
 ## Goals
 
 - **Chat relay (Phase 1 deliverable):** CS handles all chat traffic end-to-end — session creation, WebSocket relay, media proxying, webhook forwarding, and human agent handover.
-- **Telephony framework (Phase 2 skeleton):** Define the voice channel interface and provider adapter stubs so telephony (Twilio, Stringee, SIP) can be implemented in a follow-up sprint without changing CS's core architecture.
+- **Voice channel adapter framework (Phase 2 skeleton):** Define the voice channel interface and provider adapter stubs so voice channels (Twilio, Stringee, SIP, WebRTC) can be implemented in a follow-up sprint without changing CS's core architecture.
 - **Separation of concerns:** CRM Backend talks to CS. CRM Frontend talks to CS. Neither talks to the AI Platform directly.
 - **Multi-tenancy from day one:** Every CS component is tenant-aware.
 
 ## Non-Goals
 
-- Actual telephony implementation (Twilio / Stringee / SIP dialing) — skeleton only in this PRD.
+- Actual voice channel adapter implementation (Twilio / Stringee / SIP dialing, WebRTC bridging) — skeleton only in this PRD.
 - Call recording.
 - WhatsApp, SMS, or any other channel adapter.
 - Billing, usage tracking, or rate limiting.
@@ -58,7 +58,7 @@ CS makes the AI Platform pluggable: CRM Backend talks to CS, not directly to the
     │ (lifecycle events)        │ (skeleton — 501)        │
     ▼                          ▼                         ▼
 ┌──────────────┐  ┌─────────────────────────────┐  ┌──────────────────────────────┐
-│  CRM Backend  │  │    Telephony Providers       │  │        AI Platform            │
+│  CRM Backend  │  │  Voice Channel Providers     │  │        AI Platform            │
 │               │  │                             │  │                              │
 │  Webhook recv │  │  SIP / DiDLogic             │  │  POST /chat/sessions          │
 │  Agent console│  │  (SIP UAC + RTP bridge)     │  │  WS   /chat/ws/{id}           │
@@ -75,7 +75,7 @@ CS makes the AI Platform pluggable: CRM Backend talks to CS, not directly to the
 - CRM Frontend never calls AI Platform or CRM Backend directly.
 - CRM Backend never calls AI Platform directly (CS is the bridge).
 - **Voice `transport=websocket` / `transport=webrtc`:** CS forwards the `call_offer` frame as-is. CRM Frontend connects directly to `call_url` (websocket) or performs WebRTC ICE negotiation directly. CS is not in the audio path — binary streams are too expensive to relay.
-- **Voice `transport=pstn`:** CS intercepts the `call_offer`, calls `IVoiceChannel.initiate_call()` on the tenant's telephony adapter to dial the customer's phone. CS bridges the provider's RTP/audio stream to AI Platform's voice WS. CRM Frontend receives a `mode_change` instead.
+- **Voice `transport=pstn`:** CS intercepts the `call_offer`, calls `IVoiceChannel.initiate_call()` on the tenant's voice channel adapter to dial the customer's phone. CS bridges the provider's RTP/audio stream to AI Platform's voice WS. CRM Frontend receives a `mode_change` instead.
 - The direct-connection exception applies only to `websocket` and `webrtc` transports. It cannot be extended to other frame types.
 
 ---
@@ -90,7 +90,7 @@ CS makes the AI Platform pluggable: CRM Backend talks to CS, not directly to the
 | **Webhook Forwarder** | Receive AI Platform lifecycle webhooks; verify HMAC; forward to CRM Backend |
 | **Media Proxy** | Serve `GET /chat/media/{id}`; authenticate via session_id; proxy to AI Platform |
 | **Agent Console Proxy** | Forward `POST /claim` and `WS /agent-ws` to AI Platform on behalf of CRM Backend |
-| **Voice Channel Registry** | `IVoiceChannel` interface + provider adapter stubs; skeleton for telephony |
+| **Voice Channel Registry** | `IVoiceChannel` interface + voice channel adapter stubs; skeleton only |
 
 ---
 
@@ -274,7 +274,7 @@ This is the case where CS IS actively in the call path. The customer has provide
 Flow:
 1. AI Platform sends `call_offer` with `transport: "pstn"` and the customer's phone number in `to`.
 2. **CS intercepts this frame** — it does NOT forward it to CRM Frontend.
-3. CS calls `IVoiceChannel.initiate_call(to, from_, stream_url, callback_url)` using the tenant's configured telephony adapter (Twilio / SIP / Stringee).
+3. CS calls `IVoiceChannel.initiate_call(to, from_, stream_url, callback_url)` using the tenant's configured voice channel adapter (Twilio / SIP / Stringee).
 4. The provider dials the customer's phone. The RTP/audio stream connects to AI Platform's voice WS (`stream_url`).
 5. CS sends CRM Frontend a `mode_change` frame instead:
    ```json
@@ -283,17 +283,17 @@ Flow:
 6. CRM Frontend shows a "calling your number" state. The customer accepts on their phone.
 7. On call end, CS receives the `callback_url` POST from the provider and sends CRM Frontend an `ended` frame.
 
-In this transport, CRM Frontend never handles audio — the customer's phone does. CS bridges the telephony provider to AI Platform.
+In this transport, CRM Frontend never handles audio — the customer's phone does. CS bridges the voice channel provider to AI Platform.
 
 ---
 
-## 2. Telephony Skeleton Requirements
+## 2. Voice Channel Adapter Requirements
 
-These components must exist and be wired into CS configuration, but all actual implementations raise `NotImplementedError` or return HTTP 501. The goal is that adding a real provider in a follow-up sprint requires only implementing the interface — no architectural changes.
+These components must exist and be wired into CS configuration, but all actual implementations raise `NotImplementedError` or return HTTP 501. The goal is that adding a real voice channel in a follow-up sprint requires only implementing the interface — no architectural changes.
 
 ### VoIP Provider Coverage
 
-VoIP is a category, not a protocol. All telephony providers CS will ever need fall into one of two adapter patterns already defined in this section:
+VoIP is a category, not a protocol. All voice channel providers CS will ever need fall into one of two adapter patterns already defined in this section:
 
 | Provider type | Examples | Adapter pattern |
 |---|---|---|
@@ -443,7 +443,7 @@ This bridging requires a codec transcoder (8 kHz ↔ 16 kHz resampling). Options
 ```
 POST /voice/calls
 → 501 Not Implemented
-   {"detail": "telephony not implemented — configure a provider"}
+   {"detail": "voice channel not implemented — configure a provider"}
 ```
 
 **Audio stream:**
@@ -658,14 +658,14 @@ Alternative considered: **Node.js** is more natural for event-driven WS relay at
 - `WS /chat/agent-ws/{session_id}?token={token}`: validate token; proxy WS to AI Platform agent-ws
 - Test: claim → connect → send reply → receive customer message
 
-### Phase 7 — Telephony Skeleton (Week 4)
+### Phase 7 — Voice Channel Adapter Skeleton (Week 4)
 
-**Deliverable:** Telephony framework wired in; all real calls return 501.
+**Deliverable:** Voice channel adapter framework wired in; all real calls return 501.
 
 - `src/voice/interface.py`: `IVoiceChannel` ABC
 - `src/voice/adapters/twilio.py`, `stringee.py`, `sip.py`: stubs
 - `src/voice/registry.py`: `get_voice_channel(provider, config)` factory
-- Config: telephony block added to Pydantic model
+- Config: voice channel config block added to Pydantic model
 - `POST /voice/calls` → HTTP 501 with descriptive error
 - `WS /voice/streams/{call_id}` → close with code 1001
 - Unit test: factory resolves correct adapter class; 501 returned on call attempt
