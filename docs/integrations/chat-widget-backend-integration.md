@@ -34,6 +34,8 @@ CRM Backend  handles entirely in your own system — do not call us at all
 
 **You are the only team that talks to us.** CRM Frontend never calls our APIs directly. You proxy the WebSocket and handle all media upload, download, and relay on their behalf.
 
+> **When the Coordination Service is deployed:** CS becomes the channel adapter — it owns the WebSocket relay, serves the chat widget, and calls our session creation API on your behalf. Your integration shifts: register your webhook endpoint with CS instead of directly with us, and CS will forward our lifecycle events to you. The human agent console (`claim` + `agent-ws`), media download, and all business logic (ticket system, analytics) remain with you.
+
 ---
 
 ## Auth
@@ -50,7 +52,7 @@ Send this header on every call to our management APIs. Keep it server-side — i
 
 ## 1. Session Creation
 
-When your operator flag is set to AI, create a session with us before serving the chat to the customer:
+When your operator flag is set to AI, create a session with us before serving the chat to the customer. (When the Coordination Service is deployed, CS does this on your behalf — you will configure your session parameters with CS instead.)
 
 ```
 POST /api/v1/chat/sessions
@@ -261,9 +263,9 @@ def rewrite_url(platform_url: str, base_url: str) -> str:
 
 ### Voice handoff (`call_offer`)
 
-When we send a `call_offer` frame, the `call_url` is a WebSocket URL pointing to our voice endpoint. Two options:
+When we send a `call_offer` frame, the `call_url` is a WebSocket URL pointing to the voice endpoint — our platform today, or the Coordination Service's voice endpoint when CS is deployed. Two options:
 
-- **Forward as-is:** CRM Frontend connects to our voice WS directly (simplest; voice is binary PCM-16 and hard to proxy). This is the only case where CRM Frontend talks to our platform directly — only the voice connection, not the chat APIs.
+- **Forward as-is:** CRM Frontend connects to the voice WS directly (simplest; voice is binary PCM-16 and hard to proxy). This is the only case where CRM Frontend connects to a voice endpoint directly — only the voice WS, not the chat APIs.
 - **Proxy the voice WS:** Relay PCM-16 binary frames the same way as the chat relay. More work but keeps all traffic through your infra.
 
 For most integrations, forwarding the `call_url` as-is is the right call.
