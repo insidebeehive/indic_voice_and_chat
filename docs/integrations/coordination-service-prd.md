@@ -238,17 +238,62 @@ All frames forwarded unchanged in both directions.
 
 ### 1.7 Voice Handoff (call_offer)
 
-When AI Platform sends a `call_offer` frame, the `call_url` points to the AI Platform voice WS (or future CS voice WS). CS forwards this frame as-is.
+The chat→voice handoff works differently depending on the voice transport. The `call_offer` frame carries a `transport` field so CRM Frontend and CS know what to do:
 
-CRM Frontend connects directly to `call_url`. This is the one case where CRM Frontend bypasses CS — binary PCM-16 audio streams are too expensive to relay through an extra hop.
+```json
+{
+  "type": "call_offer",
+  "reason": "Better handled on a call",
+  "transport": "websocket" | "webrtc" | "pstn",
+  "call_url": "wss://...",
+  "ice_servers": [{ "urls": "stun:stun.example.com" }]
+}
+```
 
-CS must document this exception clearly and ensure it does not expand to other frame types.
+#### Transport: `websocket` (current default)
+
+AI Platform sends `call_url` pointing to a PCM-16 WebSocket endpoint. CS forwards the frame as-is. CRM Frontend connects directly to `call_url` — this is the one case where CRM Frontend bypasses CS. Binary audio streams are too expensive to relay through an extra hop.
+
+#### Transport: `webrtc`
+
+AI Platform sends `call_url` pointing to a WebRTC signalling endpoint, plus `ice_servers` (STUN/TURN config). CS forwards the frame as-is. CRM Frontend performs the ICE negotiation and peer connection setup directly with the signalling endpoint. CS is not involved in the audio path.
+
+CRM Frontend must have microphone access and WebRTC support. The implementation is the same from CS's perspective — forward the frame, stay out of the audio path.
+
+#### Transport: `pstn` (outbound VoIP/PSTN call to customer's phone)
+
+This is the case where CS IS actively in the call path. The customer has provided their phone number and wants CS to call them back.
+
+Flow:
+1. AI Platform sends `call_offer` with `transport: "pstn"` and the customer's phone number in `to`.
+2. **CS intercepts this frame** — it does NOT forward it to CRM Frontend.
+3. CS calls `IVoiceChannel.initiate_call(to, from_, stream_url, callback_url)` using the tenant's configured telephony adapter (Twilio / SIP / Stringee).
+4. The provider dials the customer's phone. The RTP/audio stream connects to AI Platform's voice WS (`stream_url`).
+5. CS sends CRM Frontend a `mode_change` frame instead:
+   ```json
+   { "type": "mode_change", "mode": "voice_pending", "message": "Calling you now…" }
+   ```
+6. CRM Frontend shows a "calling your number" state. The customer accepts on their phone.
+7. On call end, CS receives the `callback_url` POST from the provider and sends CRM Frontend an `ended` frame.
+
+In this transport, CRM Frontend never handles audio — the customer's phone does. CS bridges the telephony provider to AI Platform.
 
 ---
 
 ## 2. Telephony Skeleton Requirements
 
 These components must exist and be wired into CS configuration, but all actual implementations raise `NotImplementedError` or return HTTP 501. The goal is that adding a real provider in a follow-up sprint requires only implementing the interface — no architectural changes.
+
+### VoIP Provider Coverage
+
+VoIP is a category, not a protocol. All telephony providers CS will ever need fall into one of two adapter patterns already defined in this section:
+
+| Provider type | Examples | Adapter pattern |
+|---|---|---|
+| REST API + webhook | Twilio, Vonage, Plivo, Telnyx Voice API | `TwilioAdapter` — call REST to initiate, receive webhook at `callback_url`, stream audio over WS |
+| SIP trunk | DiDLogic, Telnyx SIP, Bandwidth SIP, Vonage SIP | `SIPAdapter` — SIP INVITE + RTP; bridge RTP↔PCM-16 WS |
+
+Any new VoIP provider is an implementation of one of these two patterns. No interface changes are needed — add an adapter class, register it in the factory, add a config block.
 
 ### 2.1 IVoiceChannel Interface
 
