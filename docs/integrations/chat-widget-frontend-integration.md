@@ -15,10 +15,11 @@ Customer browser (you)
         │
         │  WebSocket
         ▼
-CRM Backend  ◄──── proxies ────►  AI Platform
-        │
-        │  also handles: session creation, webhooks,
-        │  media upload/download, human agent console
+Your backend  (CRM Backend today, Coordination Service in future)
+        │  proxies all platform communication
+        │  handles: session creation, webhooks, media, human agent console
+        ▼
+AI Platform (us)
 ```
 
 Your backend decides whether a conversation goes to AI or directly to a human agent. When it goes to AI, your backend creates a session with the platform and gives you two things:
@@ -29,6 +30,8 @@ ws_url      — the WebSocket URL to connect to
 ```
 
 Your job: connect to `ws_url` and implement the message protocol below. No credentials needed — the `session_id` embedded in the URL is the capability token.
+
+> **Important:** Your backend rewrites all platform URLs before forwarding frames to you. Use media URLs and call URLs exactly as provided — never construct platform paths or append auth parameters yourself.
 
 ---
 
@@ -134,11 +137,11 @@ Show a typing indicator. Remove it when the next `message` arrives.
 
 ### `audio_ack`
 ```json
-{ "type": "audio_ack", "media_url": "/api/v1/chat/media/103" }
+{ "type": "audio_ack", "media_url": "https://crm.example.com/proxy/media/103" }
 ```
-Server has uploaded the voice message. Swap the local blob URL on the `<audio>` element (append `?session_id=` for auth):
+Server has uploaded the voice message. Swap the local blob URL on the `<audio>` element with the proxied URL your backend already rewrote:
 ```js
-audioEl.src = msg.media_url + "?session_id=" + sessionId;
+audioEl.src = msg.media_url; // already proxied — use as-is
 ```
 
 ### `escalation`
@@ -221,30 +224,26 @@ const autoStop = setTimeout(() => recorder.stop(), 60_000);
 
 // Stop button: clearTimeout(autoStop); recorder.stop();
 
-// 6. On audio_ack: pendingAudio.src = msg.media_url + "?session_id=" + sessionId;
+// 6. On audio_ack: pendingAudio.src = msg.media_url; // already proxied by your backend
 ```
 
 ---
 
 ## Media Playback
 
-`<img>`, `<audio>`, and `<video>` tags can't send Authorization headers, so append `?session_id=` to every media URL. The endpoint returns a **302 redirect** to a signed URL (1-hour TTL) — the browser follows it automatically.
+Your backend rewrites every `media_url` in platform frames to its own proxy URL before forwarding to you. Use the URL exactly as provided — no auth params, no platform paths to construct.
 
 ```js
-function mediaSrc(messageId) {
-  return `/api/v1/chat/media/${messageId}?session_id=${sessionId}`;
-}
-
 // Images
-img.src = mediaSrc(id);
+img.src = msg.media_url;
 
 // Audio
 audio.controls = true;
-audio.src = mediaSrc(id);
+audio.src = msg.media_url;
 
 // Video
 video.controls = true;
-video.src = mediaSrc(id);
+video.src = msg.media_url;
 ```
 
 ---
@@ -265,15 +264,14 @@ On every WebSocket connect the server sends one `history` frame before any other
 }
 ```
 
-Render each entry based on `media_mime`:
+Render each entry based on `media_mime`. Media URLs in the history frame have already been rewritten by your backend — use them as-is:
 
 ```js
 function renderHistoryMessage(msg) {
   if (msg.media_url) {
-    const src = msg.media_url + "?session_id=" + sessionId;
-    if (msg.media_mime?.startsWith("image/")) return `<img src="${src}">`;
-    if (msg.media_mime?.startsWith("video/")) return `<video controls src="${src}"></video>`;
-    if (msg.media_mime?.startsWith("audio/")) return `<audio controls src="${src}"></audio>`;
+    if (msg.media_mime?.startsWith("image/")) return `<img src="${msg.media_url}">`;
+    if (msg.media_mime?.startsWith("video/")) return `<video controls src="${msg.media_url}"></video>`;
+    if (msg.media_mime?.startsWith("audio/")) return `<audio controls src="${msg.media_url}"></audio>`;
   }
   return `<p>${escapeHtml(msg.text)}</p>`;
 }
@@ -287,16 +285,16 @@ function renderHistoryMessage(msg) {
 
 When `call_offer` arrives and the customer accepts:
 
-**1. Get a voice call URL (no credentials — capability via session_id):**
+**1. Request a voice call URL from your backend:**
 
 ```
-POST /api/v1/chat/{session_id}/call
+POST /chat/call          (your backend's endpoint — not ours)
 ```
 ```json
-{ "call_url": "wss://platform.example.com/api/v1/chat/voice?tenant=acme&handoff=abc123", "call_id": "abc123" }
+{ "call_url": "wss://...", "call_id": "abc123" }
 ```
 
-The `call_url` token expires in **10 minutes** — connect promptly.
+Your backend calls our platform server-side and returns the `call_url`. The `call_url` token expires in **10 minutes** — connect promptly. The URL may point directly to us or to the Coordination Service voice endpoint depending on how your backend is configured; either way, your job is the same.
 
 **2. Connect and exchange audio:**
 
@@ -318,14 +316,14 @@ The chat history is automatically pre-loaded into the voice agent.
 
 ## Large File Upload (Alternative to Base64)
 
-For images or videos you can POST multipart instead of base64-encoding over the WebSocket:
+For images or videos you can POST multipart instead of base64-encoding over the WebSocket. Send to your backend's upload endpoint — it proxies to our platform:
 
 ```
-POST /api/v1/chat/{session_id}/upload
+POST /chat/upload          (your backend's endpoint — not ours)
 Content-Type: multipart/form-data
 ```
 
-No credentials needed. Form fields: `file` (image/* or video/*), `text` (optional caption). Returns the AI's reply immediately.
+Form fields: `file` (image/* or video/*), `text` (optional caption). Your backend proxies the upload and returns the AI's reply.
 
 ---
 
@@ -336,11 +334,11 @@ No credentials needed. Form fields: `file` (image/* or video/*), `text` (optiona
 - [ ] `history` frame on connect → restore prior messages; render media by `media_mime`
 - [ ] `typing` → show indicator; next `message` → hide it + render text + chips
 - [ ] Text → `{"type":"message","text":"..."}` on submit
-- [ ] Image/video attach → base64 WS frame or multipart POST
-- [ ] Mic button → record → `audio` frame → show blob `<audio>` → swap src on `audio_ack`
-- [ ] Media URLs: always append `?session_id=` — never fetch without it
+- [ ] Image/video attach → base64 WS frame or multipart POST to your backend's `/chat/upload`
+- [ ] Mic button → record → `audio` frame → show blob `<audio>` → swap src on `audio_ack` (use `media_url` as-is)
+- [ ] Media URLs: use as provided by your backend — never construct platform paths or append `?session_id=`
 - [ ] `escalation` → show "Connecting to agent…"
 - [ ] `mode_change` mode=`human` → show agent name
-- [ ] `call_offer` → show "Switch to call" button → on accept POST `/{session_id}/call` → voice WS
+- [ ] `call_offer` → show "Switch to call" button → on accept POST to your backend's `/chat/call` → connect to returned `call_url`
 - [ ] `ended` → disable composer
 - [ ] `error` → inline notice, socket stays open
