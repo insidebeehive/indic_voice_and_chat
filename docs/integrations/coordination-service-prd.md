@@ -44,20 +44,26 @@ Customer browser
 │  Session router (operator flag: ai / human / hybrid)           │  │
 │  Media proxy                                                   │  │
 │  Webhook forwarder                                             │  │
-│  Voice channel registry (skeleton)                             │  │
+│  Voice channel registry (IVoiceChannel → adapter)             │  │
 └────────────────────────────────────────────────────────────────┘  │
-        │                                          ┌───────────────┘
-        │ webhooks (lifecycle events)              │  calls AI Platform APIs
-        ▼                                          ▼
-┌─────────────────────┐               ┌─────────────────────────────┐
-│    CRM Backend       │               │       AI Platform            │
-│                      │◄─────────────│  POST /chat/sessions         │
-│  Webhook receiver    │  lifecycle   │  WS   /chat/ws/{id}          │
-│  Human agent console │◄─────────────│  GET  /chat/sessions/{id}    │
-│  Ticket system       │  claim +     │  POST /sessions/{id}/claim   │
-│  Analytics           │  agent-ws   │  WS   /sessions/{id}/agent-ws│
-│  Business logic      │              │  GET  /chat/media/{id}        │
-└─────────────────────┘               └─────────────────────────────┘
+        │                    │                     ┌───────────────┘
+        │ webhooks            │ telephony           │  calls AI Platform APIs
+        │ (lifecycle events)  │ (skeleton — 501)    │
+        ▼                    ▼                     ▼
+┌──────────────┐   ┌──────────────────────────┐   ┌─────────────────────────────┐
+│  CRM Backend  │   │   Telephony Providers     │   │       AI Platform            │
+│               │   │                          │   │                              │
+│  Webhook recv │   │  ┌──────────────────┐    │   │  POST /chat/sessions         │
+│  Agent console│   │  │ SIP / DiDLogic   │    │   │  WS   /chat/ws/{id}          │
+│  Ticket system│   │  │ (SIP UAC, RTP)   │    │   │  GET  /chat/sessions/{id}    │
+│  Analytics    │   │  ├──────────────────┤    │   │  POST /sessions/{id}/claim   │
+│  Business lgc │   │  │ Twilio           │    │   │  WS   /sessions/{id}/agent-ws│
+└──────────────┘   │  │ (REST + TwiML)   │    │   │  GET  /chat/media/{id}        │
+                   │  ├──────────────────┤    │   └─────────────────────────────┘
+                   │  │ Stringee         │    │
+                   │  │ (REST + SDK)     │    │
+                   │  └──────────────────┘    │
+                   └──────────────────────────┘
 ```
 
 **Traffic rules:**
