@@ -156,7 +156,121 @@ Returns the session summary plus the full message history:
 
 ---
 
-## 3. Webhook Events
+## 3. WebSocket Relay
+
+You open **two WebSocket connections** — one inward-facing (your frontend talks to you) and one outward-facing (you talk to us). Your job is to pipe frames between them.
+
+```
+CRM Frontend ──────► your WS server ──────► our WS (ws_url)
+             ◄──────              ◄──────
+```
+
+### Connection lifecycle
+
+1. CRM Frontend connects to your WS endpoint.
+2. You connect to our `ws_url` (from `POST /sessions`).
+3. We immediately send a `history` frame on our WS — forward it to CRM Frontend.
+4. Keep both connections alive for the duration of the session.
+5. If CRM Frontend disconnects, keep our WS open — the session stays active and the customer can reconnect.
+6. If our WS drops, reconnect using the same `ws_url` — we will re-send the `history` frame on reconnect.
+7. When the session ends (`ended` frame from us, or `end` frame from CRM Frontend), close both connections.
+
+### Frame passthrough — CRM Frontend → Us
+
+Forward every frame from CRM Frontend to our WS unchanged:
+
+| type | Forward as-is |
+|---|---|
+| `message` | ✓ |
+| `image` | ✓ (base64 data + mime) |
+| `video` | ✓ (base64 data + mime) |
+| `audio` | ✓ (base64 data + mime) |
+| `end` | ✓ |
+
+### Frame passthrough — Us → CRM Frontend
+
+Forward every frame from our WS to CRM Frontend, **except rewrite any URL fields** (see Media URLs below):
+
+| type | Forward | Notes |
+|---|---|---|
+| `history` | ✓ | Rewrite `media_url` fields |
+| `typing` | ✓ | |
+| `message` | ✓ | |
+| `audio_ack` | ✓ | Rewrite `media_url` |
+| `escalation` | ✓ | |
+| `mode_change` | ✓ | |
+| `call_offer` | ✓ | Rewrite `call_url` if proxying voice too |
+| `ended` | ✓ | Close both connections after forwarding |
+| `error` | ✓ | |
+
+### Media URLs
+
+Every `media_url` we send points to our platform (`/api/v1/chat/media/{id}`) and requires auth. Since CRM Frontend must never call our APIs directly, **rewrite these URLs to your own proxy endpoint** before forwarding to CRM Frontend.
+
+```
+We send:    "media_url": "/api/v1/chat/media/103"
+You forward: "media_url": "https://your-backend.com/chat/media/103"
+```
+
+Your proxy endpoint then fetches from us with the Bearer token and streams the response to CRM Frontend:
+
+```python
+# Your proxy route: GET /chat/media/{message_id}
+async def proxy_media(message_id: int, request: Request) -> StreamingResponse:
+    # verify your own session auth here
+    url = f"{PLATFORM_BASE_URL}/api/v1/chat/media/{message_id}"
+    async with httpx.AsyncClient() as client:
+        r = await client.get(url, headers={"Authorization": f"Bearer {PLATFORM_TOKEN}"},
+                             follow_redirects=True)
+    return StreamingResponse(r.aiter_bytes(), media_type=r.headers.get("content-type"))
+```
+
+### Connection management — reference implementation
+
+```python
+import asyncio, json, websockets
+
+async def relay_session(frontend_ws, ws_url: str, base_url: str, session_id: str):
+    """Relay frames between CRM Frontend WS and the AI platform WS."""
+    async with websockets.connect(ws_url) as platform_ws:
+
+        async def frontend_to_platform():
+            async for raw in frontend_ws:
+                await platform_ws.send(raw)  # forward unchanged
+
+        async def platform_to_frontend():
+            async for raw in platform_ws:
+                msg = json.loads(raw)
+                # Rewrite media URLs before forwarding
+                if msg.get("media_url"):
+                    msg["media_url"] = rewrite_url(msg["media_url"], base_url)
+                if msg.get("type") == "history":
+                    for m in msg.get("messages", []):
+                        if m.get("media_url"):
+                            m["media_url"] = rewrite_url(m["media_url"], base_url)
+                await frontend_ws.send(json.dumps(msg))
+                if msg.get("type") == "ended":
+                    return  # session over
+
+        await asyncio.gather(frontend_to_platform(), platform_to_frontend())
+
+def rewrite_url(platform_url: str, base_url: str) -> str:
+    # "/api/v1/chat/media/103" → "https://your-backend.com/chat/media/103"
+    return base_url + platform_url.replace("/api/v1/chat", "/chat")
+```
+
+### Voice handoff (`call_offer`)
+
+When we send a `call_offer` frame, the `call_url` is a WebSocket URL pointing to our voice endpoint. Two options:
+
+- **Forward as-is:** CRM Frontend connects to our voice WS directly (simplest; voice is binary PCM-16 and hard to proxy). This is the only case where CRM Frontend talks to our platform directly — only the voice connection, not the chat APIs.
+- **Proxy the voice WS:** Relay PCM-16 binary frames the same way as the chat relay. More work but keeps all traffic through your infra.
+
+For most integrations, forwarding the `call_url` as-is is the right call.
+
+---
+
+## 4. Webhook Events
 
 Configure your `events_webhook_url` on your tenant. We POST all lifecycle events there.
 
@@ -252,7 +366,7 @@ Use `transcript` to populate your ticket history. For media messages (`type=audi
 
 ---
 
-## 4. Human Agent Console
+## 5. Human Agent Console
 
 When you receive `escalation_requested`, route it to a human agent in your system. Your agent console needs to:
 
@@ -319,7 +433,7 @@ For media, fetch via `GET /api/v1/chat/media/{id}` with the Bearer token (see §
 
 ---
 
-## 5. Media Download
+## 6. Media Download
 
 Download media attachments (voice, images, videos) from sessions:
 
@@ -346,13 +460,22 @@ async def download_media(message_id: int, token: str) -> bytes:
 
 ---
 
-## 6. Quick-Start Checklist
+## 7. Quick-Start Checklist
 
 **Session flow:**
 - [ ] When operator flag = AI: call `POST /chat/sessions` server-side with `user_id`, `customer_name`, `language`, and your `crm_ticket_id` in `metadata`
 - [ ] Store the `session_id` ↔ `crm_ticket_id` mapping
 - [ ] Pass `session_id`, `ws_url`, `greeting` to CRM Frontend — never the Bearer token
 - [ ] When operator flag = human: don't call us; handle entirely in your own system
+
+**WebSocket relay:**
+- [ ] Open your own WS endpoint that CRM Frontend connects to
+- [ ] On CRM Frontend connect: open our `ws_url`; forward the `history` frame immediately
+- [ ] Forward all frames CRM Frontend → us unchanged (text, image, video, audio, end)
+- [ ] Forward all frames us → CRM Frontend; rewrite `media_url` fields to your proxy endpoint
+- [ ] Expose a media proxy route (`GET /chat/media/{id}`) that fetches from us with Bearer token
+- [ ] If our WS drops: reconnect and re-forward the `history` frame to CRM Frontend
+- [ ] On `ended` frame: close both connections
 
 **Webhooks (implement a receiver at `events_webhook_url`):**
 - [ ] `session_started` → create support ticket in your system, store `session_id` mapping
