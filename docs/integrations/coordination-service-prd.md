@@ -127,6 +127,18 @@ CS makes the AI Platform pluggable: CRM Backend talks to CS, not directly to the
 }
 ```
 
+**CS → AI Platform (for ai/hybrid):**
+```json
+POST /api/v1/chat/sessions
+{
+  "user_id": "player-42",
+  "customer_name": "Rahul",
+  "language": "hi",
+  "metadata": { "crm_ticket_id": "TKT-9001" }
+}
+```
+CS maps `user_name` → `customer_name` before forwarding. All other fields pass through unchanged.
+
 **Operator flag routing:**
 
 | `operator_flag` | CS action |

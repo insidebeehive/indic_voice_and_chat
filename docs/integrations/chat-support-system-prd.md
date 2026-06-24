@@ -11,7 +11,7 @@
 
 The Chat Support System (CSS) is the CRM team's full-stack product for managing customer support delivered over chat. It owns everything between the customer's message and a resolution: ticket creation, routing decisions, agent queues, live agent chat, and post-interaction analytics.
 
-CSS is what prior documents called "CRM Backend" — but it also includes CRM's own internal surfaces: the agent console (where human agents handle live chats) and the admin/supervisor dashboard (routing rules, SLA configuration, reports). The customer-facing chat widget remains a separate CRM Frontend deployment.
+CSS is what prior documents called "CRM Backend" — but it also includes CRM's own internal surfaces: the agent console (where human agents handle live chats) and the admin/supervisor dashboard (routing rules, SLA configuration, reports). The customer-facing chat widget is a **CSS-owned JS bundle**, served and maintained by CSS and embedded by CRM Frontend via a single `<script>` tag.
 
 CSS integrates with the Coordination Service (CS) for all AI-powered sessions. For direct-human sessions, CSS handles everything itself without involving CS.
 
@@ -28,7 +28,7 @@ CSS integrates with the Coordination Service (CS) for all AI-powered sessions. F
 
 ## Non-Goals
 
-- Customer-facing UI (chat widget) — owned by CRM Frontend.
+- Chat widget hosting by CRM Frontend — CSS builds and hosts the widget bundle; CRM Frontend embeds it via a `<script>` tag and config object only.
 - AI conversation intelligence — owned by AI Platform via CS.
 - Voice channel adapters (telephony / WebRTC media stack) — owned by CS (future sprint). CSS signals voice calls by sending a `call_offer` frame; the adapter infrastructure is CS's concern.
 - Billing or subscription management.
@@ -40,7 +40,7 @@ CSS integrates with the Coordination Service (CS) for all AI-powered sessions. F
 
 | Persona | Role | Primary surface |
 |---|---|---|
-| **Customer** | End user seeking support | Chat widget (CRM Frontend) — not CSS directly |
+| **Customer** | End user seeking support | Chat widget (CSS-owned, embedded by CRM Frontend) |
 | **Support Agent** | Handles live chat sessions with customers | Agent console (CSS web app) |
 | **Support Supervisor** | Monitors queue, agents, and SLA in real time | Dashboard (CSS web app) |
 | **Admin** | Configures routing, SLA, agents, teams, CS connection | Admin panel (CSS web app) |
@@ -325,7 +325,7 @@ For **direct human sessions**:
 - Agent connects via `WS /api/chat/ws/{ticket_id}` (CSS's own WS)
 - Symmetric: CSS relays messages between customer and agent
 - Same frame protocol as AI sessions so agent console code is reused
-- **Call customer** action: agent clicks "Call" → CSS sends a `call_offer{transport: webrtc}` frame to the customer widget; the agent console handles WebRTC signalling on its side. `pstn` transport is not available in direct-human sessions.
+- **Call customer** action: agent clicks "Call" → CSS sends a `call_offer{transport: webrtc | websocket}` frame to the customer widget over the direct-human WS; the agent console handles the signalling on its side. `pstn` transport is not available in direct-human sessions.
 
 ### 4.4 Customer context panel (right sidebar)
 

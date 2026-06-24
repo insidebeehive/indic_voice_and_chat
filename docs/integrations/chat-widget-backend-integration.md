@@ -79,9 +79,9 @@ Content-Type: application/json
 
 ```json
 {
-  "session_id": "cs_a1b2c3d4",
+  "session_id": "plat_7f3a9b2e",
   "greeting":   "Hello Rahul, how can I help?",
-  "ws_url":     "wss://platform.example.com/api/v1/chat/ws/cs_a1b2c3d4"
+  "ws_url":     "wss://ai.example.com/api/v1/chat/ws/plat_7f3a9b2e"
 }
 ```
 
@@ -312,7 +312,7 @@ Sent when a session is created.
 ```json
 {
   "event": "session_started",
-  "session_id": "cs_a1b2c3d4",
+  "session_id": "plat_7f3a9b2e",
   "customer": {
     "name": "Rahul",
     "id": "player-42"
@@ -329,15 +329,15 @@ Sent when the AI decides it cannot handle the conversation and needs a human.
 ```json
 {
   "event": "escalation_requested",
-  "session_id": "cs_a1b2c3d4",
+  "session_id": "plat_7f3a9b2e",
   "reason": "Customer requested human support",
   "summary": "Customer is asking about a withdrawal that has been pending for 3 days.",
   "customer": {
     "name": "Rahul",
     "id": "player-42"
   },
-  "claim_url": "/api/v1/chat/sessions/cs_a1b2c3d4/claim",
-  "agent_ws_url": "/api/v1/chat/sessions/cs_a1b2c3d4/agent-ws",
+  "claim_url": "/api/v1/chat/sessions/plat_7f3a9b2e/claim",
+  "agent_ws_url": "/api/v1/chat/sessions/plat_7f3a9b2e/agent-ws",
   "bo_available": true
 }
 ```
@@ -359,7 +359,7 @@ Sent when a session ends (by customer, agent, or AI).
 ```json
 {
   "event": "session_closed",
-  "session_id": "cs_a1b2c3d4",
+  "session_id": "plat_7f3a9b2e",
   "mode_at_close": "ai",
   "summary": "Customer asked about withdrawal delay; resolved by AI.",
   "transcript": [
@@ -479,7 +479,7 @@ import httpx
 async def download_media(message_id: int, token: str) -> bytes:
     async with httpx.AsyncClient(follow_redirects=True) as client:
         r = await client.get(
-            f"https://platform.example.com/api/v1/chat/media/{message_id}",
+            f"https://ai.example.com/api/v1/chat/media/{message_id}",
             headers={"Authorization": f"Bearer {token}"},
         )
         return r.content
@@ -513,9 +513,9 @@ async def download_media(message_id: int, token: str) -> bytes:
 - [ ] Verify `X-Signature` header if you configured a webhook secret
 
 **Human agent console:**
-- [ ] `POST /sessions/{id}/claim` with `agent_id` and `agent_name` before connecting the WS
-- [ ] `WS /sessions/{id}/agent-ws?token=` — connect; read `history` frame on open
-- [ ] Render media in history via `GET /media/{id}` with Bearer token
+- [ ] `POST /api/v1/chat/sessions/{id}/claim` with `agent_id` and `agent_name` before connecting the WS
+- [ ] `WS /api/v1/chat/sessions/{id}/agent-ws?token=` — connect; read `history` frame on open
+- [ ] Render media in history via `GET /api/v1/chat/media/{id}` with Bearer token
 - [ ] Send `{"type":"reply","text":"..."}` for agent messages
 - [ ] Send `{"type":"end"}` to close the session
 - [ ] Handle `customer_message` frames to show incoming customer messages

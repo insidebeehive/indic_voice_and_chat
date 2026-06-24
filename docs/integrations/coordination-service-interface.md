@@ -28,7 +28,7 @@ Customer (any channel)
 │             Coordination Service  (CRM team)                │
 │                                                             │
 │  Chat relay (Phase 1):                                      │
-│    Session create proxy (CRM Frontend → AI Platform)        │
+│    Session create proxy (CSS → CS → AI Platform)            │
 │    WebSocket relay (bidirectional, with media rewrite)      │
 │    Webhook forwarder (AI Platform → CS → CSS)               │
 │    Human agent console proxy (claim + agent-ws)             │
@@ -68,11 +68,11 @@ Customer (any channel)
 
 | Concern | Today | With CS |
 |---|---|---|
-| Chat WebSocket relay | CRM Backend | CS (CSS retains webhooks + agent console) |
-| Chat session creation (API call) | CRM Backend | CS on CSS's behalf |
-| Human agent console (claim + agent-ws) | CRM Backend calls AI Platform directly | CRM Backend calls CS; CS proxies to AI Platform |
-| Webhook events receiver | CRM Backend | stays with CSS (CS forwards our events) |
-| Direct-human chat WS | CRM Backend | stays with CSS (CSS-owned; CS not involved for `operator_flag=human`) |
+| Chat WebSocket relay | CSS | CS (CSS retains webhooks + agent console) |
+| Chat session creation (API call) | CSS | CS on CSS's behalf |
+| Human agent console (claim + agent-ws) | CSS calls AI Platform directly | CSS calls CS; CS proxies to AI Platform |
+| Webhook events receiver | CSS | stays with CSS (CS forwards our events) |
+| Direct-human chat WS | CSS | stays with CSS (CSS-owned; CS not involved for `operator_flag=human`) |
 | STT (Sarvam, Deepgram, Gemini) | us | stays with us |
 | LLM (Gemini) | us | stays with us |
 | TTS | us | stays with us |
