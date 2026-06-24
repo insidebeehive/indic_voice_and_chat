@@ -94,12 +94,15 @@ Authorization: Bearer {crm-frontend-css-token}
 Content-Type: application/json
 
 {
-  "user_id": "player-42",
-  "customer_name": "Rahul",
-  "language": "hi",
-  "metadata": { "account_tier": "vip", "page": "/withdraw" }
+  "operator_id": "acme",
+  "user_id":     "player-42",
+  "user_name":   "Rahul",
+  "language":    "hi",
+  "metadata":    { "account_tier": "vip", "page": "/withdraw" }
 }
 ```
+
+CSS resolves the appropriate tenant token from `operator_id` internally — CRM Frontend never handles a tenant token. `user_name` is optional; if omitted, the AI greets generically.
 
 CSS responds with everything CRM Frontend needs to open a chat:
 
@@ -173,6 +176,8 @@ A ticket is created immediately on session start, before the customer sends any 
 | `tags` | string[] | |
 
 ### 2.2 Ticket status state machine
+
+> **`hybrid` sessions:** A `hybrid` session starts identically to `ai` — ticket status is `ai_active` and the AI handles the conversation. The difference is intent: hybrid sessions are configured to escalate to a human agent whenever the AI decides to or the customer requests it. The state machine below is identical for both `ai` and `hybrid`.
 
 ```
 new
@@ -365,6 +370,8 @@ CSS action: deduplicate on `event_id`; confirm ticket exists (it was created at 
   "event_id": "evt_9f3b1a2c"
 }
 ```
+
+> **Note:** CS does not forward a `bo_available` field. CSS manages its own agent availability via business-hours config and queue depth — do not depend on `bo_available` in this webhook.
 
 CSS actions:
 1. Deduplicate on `event_id` — if already processed, return 200 and stop.
@@ -639,8 +646,10 @@ CSS registers per tenant: `POST https://css.example.com/webhooks/cs?tenant={slug
 ### Public (CRM Frontend → CSS)
 
 ```
-POST   /api/chat/start
-WS     /api/chat/ws/{ticket_id}
+POST   /api/chat/start                ← session handoff; returns {session_id, ws_url, greeting}
+WS     /api/chat/ws/{ticket_id}       ← direct-human chat WS (no CS)
+POST   /api/chat/call                 ← get ephemeral voice call URL (websocket transport)
+POST   /api/chat/upload               ← multipart media upload (alternative to base64 WS)
 ```
 
 ### Webhook (CS → CSS)

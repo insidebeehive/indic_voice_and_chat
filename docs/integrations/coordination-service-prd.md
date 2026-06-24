@@ -257,21 +257,21 @@ If AI Platform returns 404: CS returns `404 Not Found`.
 
 **Claim:**
 ```
-POST /chat/sessions/{session_id}/claim
+POST /chat/sessions/{cs_session_id}/claim
 ```
-CS validates session exists, looks up tenant, proxies to:
+CS looks up `platform_session_id` from `cs:session:{cs_session_id}`, then proxies to:
 ```
-POST {ai_platform_base}/api/v1/chat/sessions/{session_id}/claim
+POST {ai_platform_base}/api/v1/chat/sessions/{platform_session_id}/claim
 ```
 Returns AI Platform's response unchanged.
 
 **Agent WebSocket:**
 ```
-WS /chat/agent-ws/{session_id}?token={bearer_token}
+WS /chat/agent-ws/{cs_session_id}?token={bearer_token}
 ```
 CS validates the Bearer token identifies a valid CRM Backend tenant, then proxies the WebSocket connection to:
 ```
-WS {ai_platform_base}/api/v1/chat/sessions/{session_id}/agent-ws?token={ai_platform_token}
+WS {ai_platform_base}/api/v1/chat/sessions/{platform_session_id}/agent-ws?token={ai_platform_token}
 ```
 All frames forwarded unchanged in both directions.
 
@@ -319,7 +319,7 @@ Field presence by transport:
 
 #### Transport: `websocket` (current default)
 
-AI Platform sends `call_url` pointing to a PCM-16 WebSocket endpoint. CS forwards the frame as-is. CRM Frontend connects directly to `call_url` — this is the one case where CRM Frontend bypasses CS. Binary audio streams are too expensive to relay through an extra hop.
+AI Platform sends `call_url` pointing to a PCM-16 WebSocket endpoint. CS forwards the frame as-is. The CSS widget does **not** connect to `call_url` directly — it POSTs to CSS's `/api/chat/call` endpoint first to get an authenticated, ephemeral call URL, then connects to that. CSS calls AI Platform server-side to obtain this URL. This is the one case where the widget ultimately connects to an AI Platform voice endpoint; binary audio streams are too expensive to relay through an extra hop.
 
 #### Transport: `webrtc`
 

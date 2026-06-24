@@ -3,6 +3,8 @@
 **Audience:** CRM Backend team  
 **Scope:** Everything server-side — creating AI chat sessions, proxying the WebSocket to your frontend, receiving lifecycle webhooks, handling all media types, and building the human agent console for escalations.
 
+> **⚠️ Architecture note:** This document describes the **direct CRM Backend → AI Platform** integration path. If your team is deploying through the **Coordination Service (CS)**, this doc is superseded by `coordination-service-prd.md` (for CS's implementation) and `chat-support-system-prd.md` (for the Chat Support System / CSS). In the CS architecture, CRM Backend never calls AI Platform directly — all traffic goes through CS.
+
 > **Share with your frontend team:** Once you have this integration working, share `chat-widget-frontend-integration.md` with the CRM Frontend team. It documents the WebSocket message protocol (including all text, image, video, and audio message types) so they can build the customer UI. You are responsible for implementing and relaying that full protocol — including all media types — between the AI platform and your frontend.
 
 ---
@@ -273,6 +275,8 @@ def rewrite_url(platform_url: str, base_url: str) -> str:
 
 For `websocket` and `webrtc`, forwarding the frame as-is is the right call — CRM Frontend handles the rest.
 
+> **Why direct connection is allowed for voice:** Binary PCM-16 audio streams are too expensive to relay through an extra hop. The direct `call_url` connection for `websocket` and `webrtc` transports is an intentional exception to the rule that CRM Frontend never calls AI Platform directly. This exception applies only to voice transports — it cannot be extended to other frame types.
+
 ---
 
 ## 4. Webhook Events
@@ -488,7 +492,7 @@ async def download_media(message_id: int, token: str) -> bytes:
 ## 7. Quick-Start Checklist
 
 **Session flow:**
-- [ ] When operator flag = AI: call `POST /chat/sessions` server-side with `user_id`, `customer_name`, `language`, and your `crm_ticket_id` in `metadata`
+- [ ] When operator flag = AI: call `POST /api/v1/chat/sessions` server-side with `user_id`, `customer_name`, `language`, and your `crm_ticket_id` in `metadata`
 - [ ] Store the `session_id` ↔ `crm_ticket_id` mapping
 - [ ] Pass `session_id`, `ws_url`, `greeting` to CRM Frontend — never the Bearer token
 - [ ] When operator flag = human: don't call us; handle entirely in your own system

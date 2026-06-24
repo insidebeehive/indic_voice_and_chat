@@ -214,14 +214,20 @@ We generate the transcript on our side because we ran the full conversation — 
 ### 2. Human → Customer (support agent-initiated call)
 
 ```
-Support agent initiates call via softphone (CS or external)
-CS connects support agent ↔ customer
+Support agent clicks "Call customer" in the agent console
+        │
+CSS sends call_offer{transport: webrtc | websocket} over the direct-human WS
+  (/api/chat/ws/{ticket_id} — CSS's own WS)
+Widget receives call_offer and initiates the voice connection directly
+CS is NOT in this path — direct-human sessions bypass CS entirely
 We are not involved during the call
         │
    call ends
         │
 Optionally: CSS calls our summarization API with the recording
 ```
+
+> `pstn` transport is not available for direct-human sessions — CS's voice channel adapter is not in the path. For pstn support in direct-human sessions, CSS would need its own voice channel integration (deferred).
 
 ---
 
