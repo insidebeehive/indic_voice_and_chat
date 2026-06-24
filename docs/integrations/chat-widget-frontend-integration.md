@@ -48,6 +48,35 @@ The widget code does not need to branch on session type — the same handlers wo
 
 ---
 
+## Starting a Session
+
+Call this when the customer opens the chat drawer (lazy — not at page load):
+
+```
+POST /api/chat/start
+Content-Type: application/json
+
+{
+  "tenant_id": "acme",
+  "user_id":   "player-42",
+  "language":  "hi",
+  "metadata":  { "page": "/withdraw", "account_tier": "vip" }
+}
+```
+
+Response:
+```json
+{
+  "session_id":    "cs_a1b2c3d4",
+  "ws_url":        "wss://cs.example.com/chat/ws/cs_a1b2c3d4",
+  "greeting":      "Hello Rahul, how can I help?"
+}
+```
+
+`operator_flag = "human"` path: `session_id` is `null`; `ws_url` points to CSS's own WS (`wss://css.example.com/api/chat/ws/{ticket_id}`). The same message protocol applies for both paths.
+
+---
+
 ## Connecting
 
 ```js
@@ -194,7 +223,11 @@ For `voice_pending`: no audio in the browser; see pstn transport in §Voice Hand
 }
 ```
 
-`transport` tells you what to do. `call_url` and `ice_servers` are only present for `websocket` and `webrtc`. See §Voice Handoff for per-transport handling.
+`transport` tells you what to do. Field presence by transport:
+- `call_url`: present for `webrtc` (use it directly) and `websocket` (ignore it — POST `/api/chat/call` to get the actual URL); absent for `pstn`
+- `ice_servers`: present for `webrtc` only
+
+See §Voice Handoff for per-transport handling.
 
 ### `ended`
 ```json

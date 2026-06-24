@@ -16,9 +16,9 @@ CSS provides a hosted chat widget. Add two things to your page — a config obje
     user: {
       id:       "player-42",
       name:     "Rahul",
-      language: "hi"
+      language: "hi",
       // metadata: { page: "/withdraw", account_tier: "vip" }
-    }
+    },
     // appearance: { position: "bottom-left", primaryColor: "#1a73e8" }
   };
 </script>
