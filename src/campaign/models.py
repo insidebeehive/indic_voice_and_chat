@@ -61,6 +61,7 @@ class LeadCallOutcome(str, Enum):
     VOICEMAIL = "voicemail"
     BUSY = "busy"
     CALL_FAILED = "call_failed"
+    RECORDING_UNAVAILABLE = "recording-unavailable"
 
 
 # Conversational outcomes the LLM may return (the rest come from telephony).
@@ -84,6 +85,7 @@ _OUTCOME_TO_DISPOSITION = {
     LeadCallOutcome.BUSY: CallDisposition.BUSY_RETRY,
     LeadCallOutcome.CALL_FAILED: CallDisposition.BUSY_RETRY,
     LeadCallOutcome.VOICEMAIL: CallDisposition.VOICEMAIL,
+    LeadCallOutcome.RECORDING_UNAVAILABLE: CallDisposition.BUSY_RETRY,
 }
 
 _TELEPHONY_TO_OUTCOME = {

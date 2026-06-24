@@ -336,6 +336,9 @@ async def twilio_softphone_recording(
         log.warning("softphone recording webhook hit but provider registry unset")
         return Response(status_code=503)
 
+    from src.api.call_store import record_outcome
+    from src.campaign.models import LeadCallOutcome
+
     c = tenant.settings.pipeline.telephony.active_creds()
     try:
         wav = await _download_twilio_recording(
@@ -343,6 +346,13 @@ async def twilio_softphone_recording(
         left, right, sr = wav_split_stereo(wav)
     except Exception:  # noqa: BLE001 — a fetch/parse failure must not 500 Twilio
         log.exception("twilio softphone recording fetch/split failed", extra={"sid": CallSid})
+        await record_outcome(
+            session, CallSid,
+            status="ended",
+            outcome=LeadCallOutcome.RECORDING_UNAVAILABLE.value,
+            summary="Call recording could not be retrieved for analysis.",
+            duration_ms=int(float(RecordingDuration) * 1000) if RecordingDuration else None,
+        )
         return Response(status_code=200)
 
     # Twilio dual-channel <Dial>: channel 1 = the parent (human agent) leg,
@@ -514,6 +524,27 @@ def _audio_transcriber(tenant_llm):
         return None
 
 
+async def _mark_recording_unavailable(call_id: str, dur_ms: int | None) -> None:
+    """Persist recording-unavailable outcome when the recording can't be fetched or
+    transcribed. Opens its own session — used from background tasks."""
+    from src.api.call_store import record_outcome
+    from src.campaign.models import LeadCallOutcome
+    from src.models.database import get_sessionmaker
+
+    sm = _softphone_sessionmaker or get_sessionmaker()
+    try:
+        async with sm() as session:
+            await record_outcome(
+                session, call_id,
+                status="ended",
+                outcome=LeadCallOutcome.RECORDING_UNAVAILABLE.value,
+                summary="Call recording could not be retrieved for analysis.",
+                duration_ms=dur_ms,
+            )
+    except Exception:  # noqa: BLE001
+        log.exception("failed to mark recording-unavailable", extra={"call_id": call_id})
+
+
 async def _finalize_softphone_recording(
     tenant: TenantContext, call_id: str, rec_url: str, dur_ms: int | None,
 ) -> None:
@@ -531,18 +562,21 @@ async def _finalize_softphone_recording(
         audio = await _download_stringee_recording(rec_url, tenant)
     except Exception:  # noqa: BLE001 — a fetch failure must not break anything
         log.exception("stringee softphone recording fetch failed", extra={"call_id": call_id})
+        await _mark_recording_unavailable(call_id, dur_ms)
         return
 
     llm = _softphone_providers.get_llm(tenant)
     transcriber = _audio_transcriber(llm)
     if transcriber is None:
-        log.warning("softphone recording: no audio transcriber; skipping outcome",
+        log.warning("softphone recording: no audio transcriber; marking recording-unavailable",
                     extra={"call_id": call_id})
+        await _mark_recording_unavailable(call_id, dur_ms)
         return
     try:
         text = await transcriber.transcribe_audio(audio, _recording_mime(audio))
     except Exception:  # noqa: BLE001
         log.exception("stringee softphone recording transcription failed", extra={"call_id": call_id})
+        await _mark_recording_unavailable(call_id, dur_ms)
         return
     transcript = [LLMMessage(role="user", content=text)] if (text or "").strip() else []
 

@@ -15,7 +15,7 @@ from __future__ import annotations
 import logging
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -58,6 +58,14 @@ class CallStatusResponse(BaseModel):
     callback_at: str | None = None
     cost: float | None = None
     duration_ms: int | None = None
+
+
+class SummarizeOutcomeResponse(BaseModel):
+    call_id: str
+    outcome: str
+    summary: str
+    notes: str | None = None
+    callback_at: str | None = None
 
 
 # --- Routes -------------------------------------------------------------
@@ -193,4 +201,90 @@ async def get_call(
         summary=row.summary, notes=row.notes,
         callback_at=row.callback_at.isoformat() if row.callback_at else None,
         cost=row.cost, duration_ms=row.duration_ms,
+    )
+
+
+@router.post("/calls/{call_id}/summarize-outcome", response_model=SummarizeOutcomeResponse)
+async def summarize_outcome(
+    call_id: str,
+    request: Request,
+    audio: UploadFile = File(...),
+    audio_mime: str | None = Form(None),
+    session: AsyncSession = Depends(get_db_session),
+    tenant: TenantContext = Depends(current_tenant),
+) -> SummarizeOutcomeResponse:
+    """Transcribe a call recording and return (+ persist) the outcome + summary.
+
+    CRM sends the voice recording when it has the file but the platform could not
+    analyze it automatically (e.g. recording-unavailable outcome). Returns the
+    same structured outcome an AI call produces.
+    """
+    from datetime import datetime, timezone
+
+    from src.analysis.call_outcome import analyze_call
+    from src.api.call_store import record_outcome
+    from src.interfaces.llm import LLMMessage
+    from src.providers import get_llm_provider
+
+    row = await session.get(Conversation, call_id)
+    if row is None or row.tenant_id != tenant.id:
+        raise HTTPException(status_code=404, detail="call not found")
+
+    audio_bytes = await audio.read()
+    if not audio_bytes:
+        raise HTTPException(status_code=400, detail="audio file is empty")
+    mime = audio_mime or audio.content_type or "audio/mpeg"
+
+    registry = getattr(request.app.state, "registry", None)
+    if registry is None:
+        raise HTTPException(status_code=503, detail="provider registry not available")
+
+    llm = registry.get_llm(tenant)
+    # Prefer the tenant's LLM if it supports audio; fall back to platform Gemini
+    # (strong on Indian languages + handles long mono mp3 recordings).
+    transcriber = llm if getattr(llm, "transcribe_audio", None) else None
+    if transcriber is None:
+        try:
+            transcriber = get_llm_provider({"provider": "gemini"})
+        except Exception as e:
+            raise HTTPException(
+                status_code=503,
+                detail=f"no audio transcriber available; ensure GEMINI_API_KEY is set: {e}",
+            )
+
+    try:
+        text = await transcriber.transcribe_audio(audio_bytes, mime)
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=f"transcription failed: {e}")
+
+    transcript = [LLMMessage(role="user", content=text)] if (text or "").strip() else []
+    analysis = await analyze_call(
+        transcript=transcript,
+        slots={},
+        telephony_status=None,
+        final_action=None,
+        tenant_timezone=tenant.settings.timezone,
+        now=datetime.now(timezone.utc),
+        llm=llm,
+    )
+
+    sid = row.provider_call_sid or call_id
+    await record_outcome(
+        session, sid,
+        status="ended",
+        outcome=analysis.outcome.value,
+        summary=analysis.summary,
+        notes=analysis.notes or "",
+        callback_at=analysis.callback_datetime,
+    )
+    log.info("summarize-outcome complete", extra={
+        "tenant": tenant.slug, "call_id": call_id,
+        "outcome": analysis.outcome.value, "source": analysis.analysis_source,
+    })
+    return SummarizeOutcomeResponse(
+        call_id=call_id,
+        outcome=analysis.outcome.value,
+        summary=analysis.summary,
+        notes=analysis.notes or "",
+        callback_at=analysis.callback_datetime.isoformat() if analysis.callback_datetime else None,
     )
