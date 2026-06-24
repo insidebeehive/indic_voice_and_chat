@@ -59,21 +59,24 @@ Content-Type: application/json
 {
   "tenant_id": "acme",
   "user_id":   "player-42",
+  "user_name": "Rahul",
   "language":  "hi",
   "metadata":  { "page": "/withdraw", "account_tier": "vip" }
 }
 ```
 
+> These map from `window.SupportChat`: `tenantId` → `tenant_id`, `user.id` → `user_id`, `user.name` → `user_name`, `user.language` → `language`, `user.metadata` → `metadata`.
+
 Response:
 ```json
 {
-  "session_id":    "cs_a1b2c3d4",
-  "ws_url":        "wss://cs.example.com/chat/ws/cs_a1b2c3d4",
-  "greeting":      "Hello Rahul, how can I help?"
+  "session_id": "cs_a1b2c3d4",          // null when operator_flag = "human"
+  "ws_url":     "wss://cs.example.com/chat/ws/cs_a1b2c3d4",
+  "greeting":   "Hello Rahul, how can I help?"
 }
 ```
 
-`operator_flag = "human"` path: `session_id` is `null`; `ws_url` points to CSS's own WS (`wss://css.example.com/api/chat/ws/{ticket_id}`). The same message protocol applies for both paths.
+For `operator_flag = "human"`: `session_id` is `null`; `ws_url` points to CSS's own WS (`wss://css.example.com/api/chat/ws/{ticket_id}`). The same message protocol applies for both paths.
 
 ---
 
@@ -215,17 +218,17 @@ For `voice_pending`: no audio in the browser; see pstn transport in §Voice Hand
 ### `call_offer`
 ```json
 {
-  "type": "call_offer",
-  "reason": "Better handled on a call",
+  "type":      "call_offer",
+  "reason":    "Better handled on a call",
   "transport": "websocket | webrtc | pstn",
-  "call_url": "wss://...",
-  "ice_servers": [{ "urls": "stun:stun.example.com" }]
+  "call_url":  "wss://...",        // webrtc: use directly; websocket: present but not used directly; pstn: absent
+  "ice_servers": [{ "urls": "stun:stun.example.com" }]  // webrtc only; absent for websocket and pstn
 }
 ```
 
 `transport` tells you what to do. Field presence by transport:
-- `call_url`: present for `webrtc` (use it directly) and `websocket` (ignore it — POST `/api/chat/call` to get the actual URL); absent for `pstn`
-- `ice_servers`: present for `webrtc` only
+- `call_url`: present for `webrtc` (use it directly as signalling endpoint) and `websocket` (present but not used directly — POST `/api/chat/call` instead to get the actual URL); absent for `pstn`
+- `ice_servers`: present for `webrtc` only; absent for `websocket` and `pstn`
 
 See §Voice Handoff for per-transport handling.
 
@@ -334,7 +337,8 @@ function renderHistoryMessage(msg) {
 }
 ```
 
-`role` values: `customer` | `agent` | `human_agent` | `system`
+`role` values: `customer` | `agent` | `human_agent` | `system`  
+`system` messages have no `media_url`; render as a muted notice (e.g. "Session transferred to agent").
 
 ---
 
@@ -343,6 +347,8 @@ function renderHistoryMessage(msg) {
 Handle based on `msg.transport`:
 
 ### transport: `websocket`
+
+`call_url` is present in the frame but is not used directly — the widget must POST to CSS to get an authenticated, ephemeral call URL:
 
 **1. Request a call URL from CSS's voice session endpoint:**
 ```
@@ -424,13 +430,14 @@ Form fields: `file` (image/* or video/*), `text` (optional caption). CSS proxies
 
 ## Implementation Checklist
 
-- [ ] Call `POST /api/chat/start` on CSS; receive `session_id` + `ws_url` + `greeting`
-- [ ] `new WebSocket(wsUrl)` on widget open; render `greeting` immediately
-- [ ] `history` frame on connect → restore prior messages; render media by `media_mime`
+- [ ] Call `POST /api/chat/start` on CSS; receive `session_id` + `ws_url` + `greeting`; render `greeting` in the chat log immediately (it comes from the HTTP response, not the WS)
+- [ ] `new WebSocket(wsUrl)` — server pushes `history` as the first frame on every connect
+- [ ] `history` frame → restore prior messages; render media by `media_mime`
 - [ ] `typing` → show indicator; next `message` → hide it + render text + chips
 - [ ] Text → `{"type":"message","text":"..."}` on submit
 - [ ] Image/video attach → base64 WS frame or multipart POST to CSS's `/api/chat/upload` endpoint
-- [ ] Mic button → record → `audio` frame → show blob `<audio>` → swap src on `audio_ack` (use `media_url` as-is)
+- [ ] Mic button → record → `audio` frame → show local blob `<audio>` immediately
+- [ ] `audio_ack` → swap the pending `<audio>` element's `src` with `msg.media_url` (already proxied — use as-is)
 - [ ] Media URLs: use exactly as provided by CSS/CS — never construct platform paths or append `?session_id=`
 - [ ] `escalation` → show "Connecting to agent…"
 - [ ] `mode_change` mode=`awaiting_human` → "Waiting for an agent…"; mode=`human` → show agent name; mode=`voice_pending` → "Calling your number…"
