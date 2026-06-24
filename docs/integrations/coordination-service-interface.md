@@ -153,10 +153,16 @@ AI Platform sends call_offer frame over the chat relay WS:
         │
 CS handles based on transport:
 
-  transport = websocket or webrtc:
-    CS forwards call_offer as-is to CRM Frontend
-    CRM Frontend connects directly to call_url — CS is not in the audio path
-    (For webrtc: CRM Frontend uses ice_servers for ICE negotiation)
+  transport = websocket:
+    CS forwards call_offer as-is to CRM Frontend (widget)
+    Widget POSTs to CSS's /api/chat/call to get an ephemeral voice URL
+    CSS calls AI Platform server-side to obtain the URL
+    Widget connects to that URL — CS is not in the audio path
+
+  transport = webrtc:
+    CS forwards call_offer as-is to CRM Frontend (widget)
+    Widget connects directly to call_url as WebRTC signalling endpoint
+    Widget uses ice_servers for ICE negotiation — CS is not in the audio path
         │
   transport = pstn:
     CS intercepts the frame (does NOT forward to CRM Frontend)

@@ -5,7 +5,7 @@
 
 > **⚠️ Architecture note:** This document describes the **direct CRM Backend → AI Platform** integration path. If your team is deploying through the **Coordination Service (CS)**, this doc is superseded by `coordination-service-prd.md` (for CS's implementation) and `chat-support-system-prd.md` (for the Chat Support System / CSS). In the CS architecture, CRM Backend never calls AI Platform directly — all traffic goes through CS.
 
-> **Share with your frontend team:** Once you have this integration working, share `chat-widget-frontend-integration.md` with the CRM Frontend team. It documents the WebSocket message protocol (including all text, image, video, and audio message types) so they can build the customer UI. You are responsible for implementing and relaying that full protocol — including all media types — between the AI platform and your frontend.
+> **CSS/CS architecture:** In the CSS/CS architecture, the chat widget is a CSS-owned JS bundle — CRM Frontend only embeds a `<script>` tag (see `chat-widget-embed-guide.md`). The WS protocol (`chat-widget-frontend-integration.md`) is CSS's internal concern. This backend integration guide describes the legacy direct CRM Backend → AI Platform path; in the CSS/CS path, CS owns the relay and you are CSS.
 
 ---
 

@@ -41,9 +41,10 @@ CS makes the AI Platform pluggable: CRM Backend talks to CS, not directly to the
           └────────────┬──────────────────────────────┬─────────────────┘
                        │                              │
             [1] chat WS (always)          [2] voice: websocket / webrtc
-            wss://cs.example.com          CS relays call_offer with call_url
-            /chat/ws/{id}                 browser then dials call_url directly
-                                          (CS not in the actual call)
+            wss://cs.example.com          CS relays call_offer as-is
+            /chat/ws/{id}                 websocket: widget POSTs CSS /api/chat/call → gets URL → connects
+                                          webrtc: widget dials call_url directly + ICE via ice_servers
+                                          (CS not in the actual audio path for either)
                        │                              │
                        ▼                              ▼
 ┌──────────────────────────────────┐                ┌──────────────────────────────────────┐
@@ -87,7 +88,8 @@ CS makes the AI Platform pluggable: CRM Backend talks to CS, not directly to the
 **Traffic rules:**
 - CRM Frontend never calls AI Platform or CRM Backend directly.
 - CRM Backend never calls AI Platform directly (CS is the bridge).
-- **Voice `transport=websocket` / `transport=webrtc`:** CS forwards the `call_offer` frame as-is. CRM Frontend connects directly to `call_url` (websocket) or performs WebRTC ICE negotiation directly. CS is not in the audio path — binary streams are too expensive to relay.
+- **Voice `transport=websocket`:** CS forwards the `call_offer` frame as-is. The CSS widget does NOT connect to `call_url` directly — it POSTs to CSS's `/api/chat/call` to obtain an authenticated ephemeral URL, then connects to that. CSS calls AI Platform server-side. CS is not in the audio path.
+- **Voice `transport=webrtc`:** CS forwards the `call_offer` frame as-is. The widget connects to `call_url` directly as the WebRTC signalling endpoint and uses `ice_servers` for ICE negotiation. CS is not in the audio path.
 - **Voice `transport=pstn`:** CS intercepts the `call_offer`, calls `IVoiceChannel.initiate_call()` on the tenant's voice channel adapter to dial the customer's phone. CS bridges the provider's RTP/audio stream to AI Platform's voice WS. CRM Frontend receives a `mode_change` instead.
 - The direct-connection exception applies only to `websocket` and `webrtc` transports. It cannot be extended to other frame types.
 
@@ -118,7 +120,7 @@ CS makes the AI Platform pluggable: CRM Backend talks to CS, not directly to the
 ```json
 {
   "user_id": "player-42",
-  "customer_name": "Rahul",
+  "user_name": "Rahul",
   "language": "hi",
   "operator_flag": "ai",
   "metadata": { "crm_ticket_id": "TKT-9001" }
@@ -192,7 +194,7 @@ CS stores in Redis (`cs:session:{cs_session_id}`, TTL 24 h):
 | `audio_ack` | Rewrite `media_url` to CS proxy URL |
 | `escalation` | Forward as-is |
 | `mode_change` | Forward as-is |
-| `call_offer` | Forward `call_url` as-is (voice WS exception — see §1.6) |
+| `call_offer` | Forward frame as-is (see §1.7 for per-transport handling) |
 | `ended` | Forward; close both connections after delivery (see exception below) |
 | `error` | Forward as-is |
 
@@ -571,7 +573,7 @@ tenants:
       token: "vox_..."             # AI Platform Bearer token for this tenant
 
     crm_backend:
-      webhook_url: "https://css.acme.com/webhooks/cs"
+      webhook_url: "https://css.example.com/webhooks/cs"
       webhook_secret: "..."        # CS signs outbound webhook with this
 
     ai_platform_webhook_secret: "..."  # CS verifies inbound AI Platform webhook with this
@@ -758,7 +760,7 @@ The following decisions affect the design of CS but are outside the AI Platform 
 
 5. **Tenant config storage** — Static YAML file checked into the CS repo (simple; requires redeploy for new tenants) or DB-backed (dynamic onboarding without redeploy)?
 
-6. **Voice WS exception** — Is the team comfortable with CRM Frontend connecting directly to AI Platform's voice WS (the `call_url` exception)? If all traffic must go through CS, voice relay adds significant complexity and latency.
+6. **Voice WS exception** — For `webrtc` transport, the widget connects to AI Platform's `call_url` directly. For `websocket` transport, the widget goes through CSS's `/api/chat/call` (CSS→AI Platform server-side). Is the team comfortable with these direct or CSS-mediated connections bypassing CS? If all voice traffic must route through CS, relay adds significant complexity and latency.
 
 7. **Hybrid flag ownership** — When `operator_flag = "hybrid"`, the AI escalates and the session transitions to a human agent. Should CS detect this transition and do anything (e.g. notify CRM Backend separately), or is the existing `escalation_requested` webhook sufficient?
 

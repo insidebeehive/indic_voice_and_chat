@@ -30,7 +30,7 @@ CSS integrates with the Coordination Service (CS) for all AI-powered sessions. F
 
 - Customer-facing UI (chat widget) — owned by CRM Frontend.
 - AI conversation intelligence — owned by AI Platform via CS.
-- Voice channel adapters (telephony / WebRTC) — owned by CS (future sprint).
+- Voice channel adapters (telephony / WebRTC media stack) — owned by CS (future sprint). CSS signals voice calls by sending a `call_offer` frame; the adapter infrastructure is CS's concern.
 - Billing or subscription management.
 - A general-purpose CRM (contacts, deals, pipelines) — this is support-only.
 
@@ -117,9 +117,16 @@ CSS responds with everything CRM Frontend needs to open a chat:
 ```
 
 For direct-human sessions (`operator_flag = "human"`):
-- `session_id`: null
-- `ws_url`: `wss://css.example.com/api/chat/ws/TKT-9001` (CSS's own WS)
-- `greeting`: configurable auto-reply ("An agent will be with you shortly.")
+```json
+{
+  "ticket_id": "TKT-9001",
+  "operator_flag": "human",
+  "session_id": null,
+  "ws_url": "wss://css.example.com/api/chat/ws/TKT-9001",
+  "greeting": "An agent will be with you shortly."
+}
+```
+`greeting` is a configurable auto-reply set in admin. `ws_url` points to CSS's own WS — CS is not involved.
 
 ### 1.2 Operator flag decision
 
@@ -142,7 +149,7 @@ A ticket is created immediately on session start, before the customer sends any 
 - `status`: `ai_active` (for ai/hybrid) or `queued` (for human)
 - `priority`: `medium` by default; rules may set it (e.g. VIP → `high`)
 - `sla_response_due_at`, `sla_resolution_due_at`: computed from `SLAPolicy.first_response_minutes` and `SLAPolicy.resolution_minutes` for the priority level
-- `customer_id`, `customer_name`, `language` from the request
+- `customer_id` (mapped from `user_id`), `customer_name` (mapped from `user_name`), `language` from the request
 - `metadata` stored for agent context
 
 ---
