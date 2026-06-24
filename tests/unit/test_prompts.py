@@ -103,6 +103,16 @@ def test_chatbot_prompt_has_scope_guardrails() -> None:
     assert "unable to answer" in prompt or "can only help" in prompt
 
 
+def test_chatbot_prompt_hinglish_script_matching() -> None:
+    prompt = build_chatbot_system_prompt(company_name="Acme", language_default="hi")
+    # Must instruct the model to match Roman script for Hinglish input.
+    assert "ROMAN" in prompt or "roman" in prompt.lower()
+    # Must give a concrete Hinglish example so the model knows what to detect.
+    assert "mera balance" in prompt or "Hinglish" in prompt
+    # Must NOT collapse Devanagari and Roman into a single "write in Hindi" rule.
+    assert "Devanagari" in prompt
+
+
 def test_response_schemas_are_valid_json() -> None:
     # Smoke test — assert they're JSON-serializable
     json.dumps(VOICEBOT_RESPONSE_SCHEMA)

@@ -507,19 +507,23 @@ def build_chatbot_system_prompt(
         parts.append("Reference sources:\n" + rag_context)
 
     parts.append(
-        "LANGUAGE — CRITICAL RULE: detect the language of the user's LATEST message and "
-        "reply in EXACTLY that language. The user's language ALWAYS overrides the "
-        f"configured default ({language_default}). If they write in English → reply in "
-        "English. If they write in Hindi → reply in Hindi. If they switch mid-conversation "
-        "→ switch immediately. Never reply in a different language than what the user just "
-        "wrote in. The suggested_followups must also be in the same language as your reply.\n"
-        "IMPORTANT: the reference sources above may be written in Hindi or another language "
-        "— that does NOT determine your reply language. Only the user's message language does.\n"
-        "Tone: casual, warm, and friendly — like a helpful friend, not a formal call-centre "
-        "agent. For Hindi/Hinglish speakers use natural Hinglish (mix Hindi and English the "
-        "way people actually talk — avoid stiff formal Hindi). English tech terms mixed in "
-        "are always fine. Supported languages: Hindi, English, Bengali, Gujarati, Kannada, "
-        "Malayalam, Marathi, Odia, Punjabi, Tamil, Telugu."
+        "LANGUAGE — CRITICAL RULES:\n"
+        "1. Detect the language AND script of the user's LATEST message. Reply in EXACTLY "
+        "that language AND script. The user's choice always overrides the configured default "
+        f"({language_default}).\n"
+        "2. SCRIPT MATCHING — this is the most important rule: if the user writes Hindi (or "
+        "any Indic language) using ROMAN/LATIN letters (Hinglish — e.g. 'mera balance kya "
+        "hai', 'deposit karna hai'), reply in ROMAN script Hinglish. Do NOT switch to "
+        "Devanagari. If they write in Devanagari ('मेरा बैलेंस क्या है'), reply in "
+        "Devanagari. Match the script they used.\n"
+        "3. If they switch language or script mid-conversation, switch immediately.\n"
+        "4. suggested_followups must also match the user's language and script.\n"
+        "IMPORTANT: the reference sources may be in Hindi or another language — that does "
+        "NOT determine your reply language or script. Only the user's message does.\n"
+        "Tone: casual, warm, friendly — like a helpful friend. For Hinglish, mix Hindi and "
+        "English the way people actually talk (e.g. 'Aapka balance ₹500 hai, koi issue?'). "
+        "English tech terms mixed in are always fine. Supported languages: Hindi, English, "
+        "Bengali, Gujarati, Kannada, Malayalam, Marathi, Odia, Punjabi, Tamil, Telugu."
     )
 
     parts.append(
