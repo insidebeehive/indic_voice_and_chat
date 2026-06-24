@@ -65,7 +65,7 @@ Content-Type: application/json
 }
 ```
 
-> These map from `window.SupportChat`: `operatorId` → `operator_id`, `user.id` → `user_id`, `user.name` → `user_name`, `user.language` → `language`, `user.metadata` → `metadata`. CSS resolves the tenant token from `operator_id` internally — the widget never handles a tenant token.
+> These map from `window.SupportChat`: `operatorId` → `operator_id`, `user.id` → `user_id`, `user.name` → `user_name`, `user.language` → `language`, `user.metadata` → `metadata`. CSS resolves the tenant token from `operator_id` internally — the widget never handles a tenant token. If `user_name` is omitted, the AI greets the customer generically.
 
 Response:
 ```json
@@ -89,7 +89,7 @@ ws.onmessage = (e) => handleMessage(JSON.parse(e.data));
 ws.onclose   = (e) => { /* handle disconnect */ };
 ```
 
-On every connect (including reconnects) the server immediately sends a `history` frame with all prior messages — use it to restore the chat log (see §History).
+On every connect (including reconnects) the server immediately sends a `history` frame with all prior messages — use it to restore the chat log (see §History on Reconnect).
 
 ---
 
@@ -179,6 +179,7 @@ Show a typing indicator. Remove it when the next `message` arrives.
 | `text` | Render as chat bubble |
 | `suggestions` | Show as quick-reply chips below the bubble |
 | `sources` | RAG references — omit from UI if unused |
+| `action` | Behaviour hint from the AI. `"none"` = no special UI change. Other values are reserved for future use — safe to ignore unknown values. |
 
 ### `audio_ack`
 ```json
@@ -216,7 +217,7 @@ For `human`: messages from the human agent arrive as normal `message` frames —
 For `voice_pending`: no audio in the browser; see pstn transport in §Voice Handoff.
 
 ### `call_offer`
-```json
+```text
 {
   "type":      "call_offer",
   "reason":    "Better handled on a call",
@@ -441,6 +442,6 @@ Form fields: `file` (image/* or video/*), `text` (optional caption). CSS proxies
 - [ ] Media URLs: use exactly as provided by CSS/CS — never construct platform paths or append `?session_id=`
 - [ ] `escalation` → show "Connecting to agent…"
 - [ ] `mode_change` mode=`awaiting_human` → "Waiting for an agent…"; mode=`human` → show agent name; mode=`voice_pending` → "Calling your number…"
-- [ ] `call_offer` → check `transport`: websocket = POST `/api/chat/call` → connect WS; webrtc = WebRTC peer conn using `ice_servers` + `call_url`; pstn = show "Calling your number…" and wait for `mode_change`
+- [ ] `call_offer` → check `transport`: websocket = POST `/api/chat/call` → connect WS; webrtc = WebRTC peer conn using `ice_servers` + `call_url`; pstn = show "Calling your number…" and wait for `mode_change` (AI sessions only — `call_offer` is never sent in direct-human sessions)
 - [ ] `ended` → disable composer
 - [ ] `error` → inline notice, socket stays open
