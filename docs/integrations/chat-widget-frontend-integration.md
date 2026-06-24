@@ -57,15 +57,15 @@ POST /api/chat/start
 Content-Type: application/json
 
 {
-  "tenant_id": "acme",
-  "user_id":   "player-42",
-  "user_name": "Rahul",
-  "language":  "hi",
-  "metadata":  { "page": "/withdraw", "account_tier": "vip" }
+  "operator_id": "acme",
+  "user_id":     "player-42",
+  "user_name":   "Rahul",
+  "language":    "hi",
+  "metadata":    { "page": "/withdraw", "account_tier": "vip" }
 }
 ```
 
-> These map from `window.SupportChat`: `tenantId` → `tenant_id`, `user.id` → `user_id`, `user.name` → `user_name`, `user.language` → `language`, `user.metadata` → `metadata`.
+> These map from `window.SupportChat`: `operatorId` → `operator_id`, `user.id` → `user_id`, `user.name` → `user_name`, `user.language` → `language`, `user.metadata` → `metadata`. CSS resolves the tenant token from `operator_id` internally — the widget never handles a tenant token.
 
 Response:
 ```json

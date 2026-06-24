@@ -12,7 +12,7 @@ CSS provides a hosted chat widget. Add two things to your page — a config obje
 ```html
 <script>
   window.SupportChat = {
-    tenantId: "acme",
+    operatorId: "acme",
     user: {
       id:       "player-42",
       name:     "Rahul",
@@ -33,7 +33,7 @@ That's it. The widget renders a launcher button. The customer clicks to open the
 
 | Field | Required | Description |
 |---|---|---|
-| `tenantId` | Yes | Operator identifier — provided by CSS team at onboarding |
+| `operatorId` | Yes | Identifies the CRM operator. CSS resolves the appropriate tenant token from this. Provided by CSS team at onboarding. |
 | `user.id` | Yes | Logged-in player / user ID. Pass `null` for unauthenticated guests |
 | `user.name` | No | Display name shown in the widget header |
 | `user.language` | No | BCP-47 code (e.g. `"hi"`, `"en"`). Defaults to tenant's configured default |
@@ -46,6 +46,6 @@ That's it. The widget renders a launcher button. The customer clicks to open the
 
 ## Notes
 
-- The `tenantId` and widget script URL are provided by the CSS team.
+- The `operatorId` and widget script URL are provided by the CSS team.
 - Pass only authenticated, server-verified `user.id` values — CSS trusts this field.
 - The widget handles everything inside the chat drawer: AI conversation, escalation to a human agent, and voice transitions.
