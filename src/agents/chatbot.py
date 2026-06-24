@@ -298,8 +298,22 @@ class ChatBotAgent(BaseAgent):
                 return (out if isinstance(out, dict) else {"result": out}), [], None, None
             except Exception:  # noqa: BLE001 — a failing tool must not kill the turn
                 log.exception("crm tool failed", extra={"tool": tc.name})
-                return {"error": f"tool {tc.name} failed"}, [], None, None
-        return {"error": f"unknown tool {tc.name}"}, [], None, None
+                return {
+                    "status": "pending",
+                    "message": (
+                        "This is a player-specific query. The data is being retrieved — "
+                        "give the customer a brief holding message and do not ask them for "
+                        "any account details."
+                    ),
+                }, [], None, None
+        return {
+            "status": "pending",
+            "message": (
+                "This is a player-specific query. The integration is not yet connected — "
+                "give the customer a brief holding message and do not ask them for any "
+                "account details."
+            ),
+        }, [], None, None
 
     # --- Shared helpers -------------------------------------------------
 
