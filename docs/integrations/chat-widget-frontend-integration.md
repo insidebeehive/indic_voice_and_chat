@@ -1,49 +1,50 @@
-# Chat Widget — Frontend Integration Guide
+# Chat Widget — WebSocket Protocol Reference
 
-**Audience:** CRM Frontend team  
-**Shared by:** CRM Backend team  
-**Scope:** WebSocket message protocol for the AI-powered chat widget.
+**Audience:** CSS (Chat Support System) engineering team — widget implementation  
+**Scope:** WebSocket message protocol implemented internally by the CSS-owned chat widget.
 
-> **Note for CRM Frontend:** You do not interact with the AI platform directly. Your backend is the bridge — it talks to the AI platform, proxies the WebSocket connection, and handles all media. This document describes the message protocol that flows over that connection so you can build the customer-facing UI correctly.
+> **CRM Frontend teams:** You do not need this document. The chat widget is a CSS-owned, hosted JS bundle — you embed it with one `<script>` tag. See **`chat-widget-embed-guide.md`** for the embed API (config, callbacks, JS methods).
+
+> **CSS widget engineers:** This document describes the full WS message protocol your widget must implement. Your backend (CSS / CS) is the other end of every frame listed here.
 
 ---
 
 ## How It Fits Together
 
 ```
-Customer browser (you)
-        │
-        │  WebSocket
-        ▼
-Your backend  (CRM Backend today, Coordination Service in future)
-        │  proxies all platform communication
-        │  handles: session creation, webhooks, media, human agent console
-        ▼
-AI Platform (us)
+Customer browser
+  └── CSS Widget (this code)
+            │
+            │  WebSocket
+            ▼
+         CSS / CS  (your backend, via CS relay)
+            │  session creation, webhooks, media, human agent console
+            ▼
+       AI Platform
 ```
 
-Your backend decides whether a conversation goes to AI or directly to a human agent. When it goes to AI, your backend creates a session with the platform and gives you two things:
+CSS (via CS) decides whether the conversation goes to AI or directly to a human agent. After calling `POST /api/chat/start`, the widget receives:
 
 ```
 session_id  — e.g. "cs_a1b2c3d4"
 ws_url      — the WebSocket URL to connect to
 ```
 
-Your job: connect to `ws_url` and implement the message protocol below. No credentials needed — the `session_id` embedded in the URL is the capability token.
+The widget connects to `ws_url` and implements the message protocol below. No credentials are needed — the `session_id` embedded in the URL is the capability token.
 
-> **Important:** Your backend rewrites all platform URLs before forwarding frames to you. Use media URLs and call URLs exactly as provided — never construct platform paths or append auth parameters yourself.
+> **Important:** CSS / CS rewrites all platform URLs before forwarding frames to the widget. Use media URLs and call URLs exactly as provided — never construct platform paths or append auth parameters.
 
 ### Direct-human sessions
 
-When your backend decides `operator_flag = "human"`, the conversation goes directly to a human agent — the AI Platform and CS are not involved. In this case:
+When CSS decides `operator_flag = "human"`, the conversation goes directly to a human agent — the AI Platform and CS are not involved. In this case:
 
 - `session_id` in the `/api/chat/start` response is `null`
-- `ws_url` points to your backend (CSS) directly: `wss://css.example.com/api/chat/ws/{ticket_id}`
+- `ws_url` points to CSS directly: `wss://css.example.com/api/chat/ws/{ticket_id}`
 - The same message protocol applies: `message`, `typing`, `history`, `mode_change`, `ended` frames all work the same way
 - `call_offer` frames are **not** sent in direct-human sessions (no voice handoff path)
 - `escalation` frames are **not** sent (there is no AI to escalate)
 
-Your UI code should not need to branch on session type — the same handlers work for both paths.
+The widget code does not need to branch on session type — the same handlers work for both paths.
 
 ---
 
@@ -385,16 +386,16 @@ Form fields: `file` (image/* or video/*), `text` (optional caption). Your backen
 
 ---
 
-## Quick-Start Checklist
+## Implementation Checklist
 
-- [ ] Receive `session_id` + `ws_url` + `greeting` from your backend — never request them from us directly
-- [ ] `new WebSocket(wsUrl)` on page load; render `greeting` immediately
+- [ ] Call `POST /api/chat/start` on CSS; receive `session_id` + `ws_url` + `greeting`
+- [ ] `new WebSocket(wsUrl)` on widget open; render `greeting` immediately
 - [ ] `history` frame on connect → restore prior messages; render media by `media_mime`
 - [ ] `typing` → show indicator; next `message` → hide it + render text + chips
 - [ ] Text → `{"type":"message","text":"..."}` on submit
-- [ ] Image/video attach → base64 WS frame or multipart POST to your backend's `/chat/upload`
+- [ ] Image/video attach → base64 WS frame or multipart POST to CSS's `/chat/upload` endpoint
 - [ ] Mic button → record → `audio` frame → show blob `<audio>` → swap src on `audio_ack` (use `media_url` as-is)
-- [ ] Media URLs: use as provided by your backend — never construct platform paths or append `?session_id=`
+- [ ] Media URLs: use exactly as provided by CSS/CS — never construct platform paths or append `?session_id=`
 - [ ] `escalation` → show "Connecting to agent…"
 - [ ] `mode_change` mode=`awaiting_human` → "Waiting for an agent…"; mode=`human` → show agent name; mode=`voice_pending` → "Calling your number…"
 - [ ] `call_offer` → check `transport`: websocket = POST `/chat/call` → connect WS; webrtc = WebRTC peer conn using `ice_servers` + `call_url`; pstn = show "Calling your number…" and wait for `mode_change`
