@@ -313,6 +313,7 @@ For **direct human sessions**:
 - Agent connects via `WS /api/chat/ws/{ticket_id}` (CSS's own WS)
 - Symmetric: CSS relays messages between customer and agent
 - Same frame protocol as AI sessions so agent console code is reused
+- **Call customer** action: agent clicks "Call" → CSS sends a `call_offer{transport: webrtc}` frame to the customer widget; the agent console handles WebRTC signalling on its side. `pstn` transport is not available in direct-human sessions.
 
 ### 4.4 Customer context panel (right sidebar)
 

@@ -41,7 +41,7 @@ When CSS decides `operator_flag = "human"`, the conversation goes directly to a 
 - `session_id` in the `/api/chat/start` response is `null`
 - `ws_url` points to CSS directly: `wss://css.example.com/api/chat/ws/{ticket_id}`
 - The same message protocol applies: `message`, `typing`, `history`, `mode_change`, `ended` frames all work the same way
-- `call_offer` frames are **not** sent in direct-human sessions (no voice handoff path)
+- `call_offer` frames may be sent when the human agent initiates a voice call; `transport` is `webrtc` or `websocket` only (pstn is not supported in direct-human sessions)
 - `escalation` frames are **not** sent (there is no AI to escalate)
 
 The widget code does not need to branch on session type — the same handlers work for both paths.
@@ -442,6 +442,6 @@ Form fields: `file` (image/* or video/*), `text` (optional caption). CSS proxies
 - [ ] Media URLs: use exactly as provided by CSS/CS — never construct platform paths or append `?session_id=`
 - [ ] `escalation` → show "Connecting to agent…"
 - [ ] `mode_change` mode=`awaiting_human` → "Waiting for an agent…"; mode=`human` → show agent name; mode=`voice_pending` → "Calling your number…"
-- [ ] `call_offer` → check `transport`: websocket = POST `/api/chat/call` → connect WS; webrtc = WebRTC peer conn using `ice_servers` + `call_url`; pstn = show "Calling your number…" and wait for `mode_change` (AI sessions only — `call_offer` is never sent in direct-human sessions)
+- [ ] `call_offer` → check `transport`: websocket = POST `/api/chat/call` → connect WS; webrtc = WebRTC peer conn using `ice_servers` + `call_url`; pstn = show "Calling your number…" and wait for `mode_change` (pstn only in AI sessions; webrtc/websocket valid in both AI and direct-human sessions)
 - [ ] `ended` → disable composer
 - [ ] `error` → inline notice, socket stays open

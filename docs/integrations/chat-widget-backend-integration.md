@@ -438,6 +438,24 @@ For media, fetch via `GET /api/v1/chat/media/{id}` with the Bearer token (see §
 - `4004` — session not found or not in handover mode
 - `1008` — invalid/missing token
 
+### Step 3 — Initiating a voice call to the customer (optional)
+
+For direct-human sessions, the agent console can escalate from text to voice. CSS sends a `call_offer` frame directly over the customer WS (`/api/chat/ws/{ticket_id}`):
+
+```json
+{
+  "type":        "call_offer",
+  "reason":      "Agent would like to continue on a call",
+  "transport":   "webrtc",
+  "call_url":    "wss://your-signalling.example.com/call/abc123",
+  "ice_servers": [{ "urls": "stun:stun.example.com" }]
+}
+```
+
+`transport` must be `webrtc` or `websocket`. `pstn` is not supported in direct-human sessions (no voice channel adapter in this path).
+
+The widget handles the frame identically to AI-session voice handoff — the customer sees a voice call prompt and the agent console handles signalling on the other side.
+
 ---
 
 ## 6. Media Download
