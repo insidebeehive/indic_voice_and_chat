@@ -3,9 +3,9 @@
 **Audience:** CSS (Chat Support System) engineering team — widget implementation  
 **Scope:** WebSocket message protocol implemented internally by the CSS-owned chat widget.
 
-> **CRM Frontend teams:** You do not need this document. The chat widget is a CSS-owned, hosted JS bundle — you embed it with one `<script>` tag. See **`chat-widget-embed-guide.md`** for the embed API (config, callbacks, JS methods).
+> **CRM Frontend teams:** You do not need this document. The chat widget is a CSS-owned, hosted JS bundle — you embed it with one `<script>` tag. See **`chat-widget-embed-guide.md`** for the embed API (config).
 
-> **CSS widget engineers:** This document describes the full WS message protocol your widget must implement. Your backend (CSS / CS) is the other end of every frame listed here.
+> **CSS widget engineers:** This document describes the full WS message protocol your widget must implement. CSS / CS is the other end of every frame listed here.
 
 ---
 
@@ -17,7 +17,7 @@ Customer browser
             │
             │  WebSocket
             ▼
-         CSS / CS  (your backend, via CS relay)
+         CSS / CS  (CSS backend, via CS relay)
             │  session creation, webhooks, media, human agent console
             ▼
        AI Platform
@@ -52,7 +52,7 @@ The widget code does not need to branch on session type — the same handlers wo
 
 ```js
 const ws = new WebSocket(wsUrl);
-ws.onopen    = () => { /* show chat UI; render the greeting your backend also gave you */ };
+ws.onopen    = () => { /* show chat UI; render the greeting from the /api/chat/start response */ };
 ws.onmessage = (e) => handleMessage(JSON.parse(e.data));
 ws.onclose   = (e) => { /* handle disconnect */ };
 ```
@@ -152,7 +152,7 @@ Show a typing indicator. Remove it when the next `message` arrives.
 ```json
 { "type": "audio_ack", "media_url": "https://crm.example.com/proxy/media/103" }
 ```
-Server has uploaded the voice message. Swap the local blob URL on the `<audio>` element with the proxied URL your backend already rewrote:
+Server has uploaded the voice message. Swap the local blob URL on the `<audio>` element with the proxied URL CSS/CS already rewrote:
 ```js
 audioEl.src = msg.media_url; // already proxied — use as-is
 ```
@@ -167,7 +167,7 @@ audioEl.src = msg.media_url; // already proxied — use as-is
 ```
 AI has escalated. Show "Connecting you to an agent…" The session mode is now `awaiting_human`.
 
-> **Note:** This WS frame uses `summary`; the corresponding `escalation_requested` webhook your backend receives from CS also uses `summary`. The two fields are the same value delivered over different channels.
+> **Note:** This WS frame uses `summary`; the `escalation_requested` webhook CS sends to CSS also uses `summary`. Same value, two delivery channels.
 
 ### `mode_change`
 ```json
@@ -248,14 +248,14 @@ const autoStop = setTimeout(() => recorder.stop(), 60_000);
 
 // Stop button: clearTimeout(autoStop); recorder.stop();
 
-// 6. On audio_ack: pendingAudio.src = msg.media_url; // already proxied by your backend
+// 6. On audio_ack: pendingAudio.src = msg.media_url; // already proxied by CSS/CS — use as-is
 ```
 
 ---
 
 ## Media Playback
 
-Your backend rewrites every `media_url` in platform frames to its own proxy URL before forwarding to you. Use the URL exactly as provided — no auth params, no platform paths to construct.
+CSS/CS rewrites every `media_url` in platform frames to a CSS proxy URL before forwarding to the widget. Use the URL exactly as provided — no auth params, no AI Platform paths to construct.
 
 ```js
 // Images
@@ -288,7 +288,7 @@ On every WebSocket connect the server sends one `history` frame before any other
 }
 ```
 
-Render each entry based on `media_mime`. Media URLs in the history frame have already been rewritten by your backend — use them as-is:
+Render each entry based on `media_mime`. Media URLs in the history frame have already been rewritten by CSS/CS — use them as-is:
 
 ```js
 function renderHistoryMessage(msg) {
@@ -311,14 +311,14 @@ Handle based on `msg.transport`:
 
 ### transport: `websocket`
 
-**1. Request the call URL from your backend:**
+**1. Request a call URL from CSS's voice session endpoint:**
 ```
-POST /chat/call          (your backend's endpoint — not ours)
+POST /api/chat/call
 ```
 ```json
 { "call_url": "wss://...", "call_id": "abc123" }
 ```
-Your backend calls our platform server-side and returns the `call_url`. The token expires in **10 minutes** — connect promptly.
+CSS calls AI Platform server-side and returns the `call_url`. The token expires in **10 minutes** — connect promptly.
 
 **2. Connect and exchange PCM-16 audio:**
 ```js
@@ -336,7 +336,7 @@ The chat history is automatically pre-loaded into the voice agent.
 
 ### transport: `webrtc`
 
-Use `msg.call_url` as the WebRTC signalling endpoint and `msg.ice_servers` for STUN/TURN. No POST to your backend needed — the `call_url` and credentials come directly in the frame.
+Use `msg.call_url` as the WebRTC signalling endpoint and `msg.ice_servers` for STUN/TURN. No additional request needed — the `call_url` and credentials come directly in the frame.
 
 ```js
 const pc = new RTCPeerConnection({ iceServers: msg.ice_servers });
@@ -363,26 +363,26 @@ pc.onicecandidate = (e) => {
 
 ### transport: `pstn`
 
-Your backend is calling the customer's phone. Do not show a "connect" button. Show a waiting state instead:
+CS is dialing the customer's phone via the voice channel adapter. Do not show a "connect" button. Show a waiting state instead:
 
 ```js
 showUI("Calling your number… pick up when your phone rings.");
 ```
 
-Your backend will send a `mode_change` frame when the call connects and an `ended` frame when it finishes. No audio is handled in the browser for this transport.
+CS sends a `mode_change` frame when the call connects and an `ended` frame when it finishes. No audio is handled in the browser for this transport.
 
 ---
 
 ## Large File Upload (Alternative to Base64)
 
-For images or videos you can POST multipart instead of base64-encoding over the WebSocket. Send to your backend's upload endpoint — it proxies to our platform:
+For images or videos the widget can POST multipart instead of base64-encoding over the WebSocket. Send to CSS's upload endpoint — CSS proxies to AI Platform:
 
 ```
-POST /chat/upload          (your backend's endpoint — not ours)
+POST /api/chat/upload
 Content-Type: multipart/form-data
 ```
 
-Form fields: `file` (image/* or video/*), `text` (optional caption). Your backend proxies the upload and returns the AI's reply.
+Form fields: `file` (image/* or video/*), `text` (optional caption). CSS proxies the upload and returns the AI's reply.
 
 ---
 
@@ -398,6 +398,6 @@ Form fields: `file` (image/* or video/*), `text` (optional caption). Your backen
 - [ ] Media URLs: use exactly as provided by CSS/CS — never construct platform paths or append `?session_id=`
 - [ ] `escalation` → show "Connecting to agent…"
 - [ ] `mode_change` mode=`awaiting_human` → "Waiting for an agent…"; mode=`human` → show agent name; mode=`voice_pending` → "Calling your number…"
-- [ ] `call_offer` → check `transport`: websocket = POST `/chat/call` → connect WS; webrtc = WebRTC peer conn using `ice_servers` + `call_url`; pstn = show "Calling your number…" and wait for `mode_change`
+- [ ] `call_offer` → check `transport`: websocket = POST `/api/chat/call` → connect WS; webrtc = WebRTC peer conn using `ice_servers` + `call_url`; pstn = show "Calling your number…" and wait for `mode_change`
 - [ ] `ended` → disable composer
 - [ ] `error` → inline notice, socket stays open
