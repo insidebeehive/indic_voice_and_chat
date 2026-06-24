@@ -150,7 +150,7 @@ Show a typing indicator. Remove it when the next `message` arrives.
 
 ### `audio_ack`
 ```json
-{ "type": "audio_ack", "media_url": "https://crm.example.com/proxy/media/103" }
+{ "type": "audio_ack", "media_url": "https://css.example.com/proxy/media/103" }
 ```
 Server has uploaded the voice message. Swap the local blob URL on the `<audio>` element with the proxied URL CSS/CS already rewrote:
 ```js
@@ -314,6 +314,9 @@ Handle based on `msg.transport`:
 **1. Request a call URL from CSS's voice session endpoint:**
 ```
 POST /api/chat/call
+Content-Type: application/json
+
+{ "session_id": "cs_a1b2c3d4" }
 ```
 ```json
 { "call_url": "wss://...", "call_id": "abc123" }
@@ -393,7 +396,7 @@ Form fields: `file` (image/* or video/*), `text` (optional caption). CSS proxies
 - [ ] `history` frame on connect → restore prior messages; render media by `media_mime`
 - [ ] `typing` → show indicator; next `message` → hide it + render text + chips
 - [ ] Text → `{"type":"message","text":"..."}` on submit
-- [ ] Image/video attach → base64 WS frame or multipart POST to CSS's `/chat/upload` endpoint
+- [ ] Image/video attach → base64 WS frame or multipart POST to CSS's `/api/chat/upload` endpoint
 - [ ] Mic button → record → `audio` frame → show blob `<audio>` → swap src on `audio_ack` (use `media_url` as-is)
 - [ ] Media URLs: use exactly as provided by CSS/CS — never construct platform paths or append `?session_id=`
 - [ ] `escalation` → show "Connecting to agent…"
