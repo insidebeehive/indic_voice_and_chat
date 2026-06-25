@@ -269,8 +269,10 @@ def make_chatbot_factory(registry, sessionmaker=None, platform_retriever=None):
         user_id: str | None = None
         if sessionmaker is not None:
             from src.models.chat import ChatSession as _ChatSession
+            # session_id may be Redis-scoped as "{tenant_id}:{bare_id}" — strip the prefix.
+            bare_session_id = session_id.split(":", 1)[-1] if ":" in session_id else session_id
             async with sessionmaker() as _db:
-                _row = await _db.get(_ChatSession, session_id)
+                _row = await _db.get(_ChatSession, bare_session_id)
                 user_id = _row.customer_id if _row else None
 
         crm_specs, crm_execs = await _load_crm_tools(tenant)
