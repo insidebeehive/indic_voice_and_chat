@@ -26,7 +26,7 @@ async def execute_crm_tool(
     context: Optional[dict] = None,
     extra_headers: Optional[dict] = None,
     http_client: object = None,
-    timeout_s: float = 10.0,
+    timeout_s: float = 30.0,
 ) -> dict:
     context = context or {}
     values: dict = {}
