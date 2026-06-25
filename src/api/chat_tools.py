@@ -172,6 +172,7 @@ class SeedFromCatalogRequest(BaseModel):
     crm_base_url: str = Field(min_length=1, description="Base URL of the operator's CRM API")
     auth_type: Optional[str] = "bearer"  # bearer|api_key|none
     auth_token: Optional[str] = None
+    operator_id: Optional[str] = Field(None, description="CRM operator UUID — sent as operatorid header on every request")
     tools: Optional[list[str]] = None  # None → seed all catalog tools
 
 
@@ -224,6 +225,8 @@ async def seed_tools_from_catalog(
                 session.add(TenantSecret(
                     tenant_id=tenant.id, name=secret_name, value_encrypted=enc))
             auth_config["token_secret_name"] = secret_name
+        if req.operator_id:
+            auth_config["extra_headers"] = {"operatorid": req.operator_id}
 
         row = (await session.execute(
             select(ChatTool).where(ChatTool.tenant_id == tenant.id, ChatTool.name == name)
@@ -233,7 +236,7 @@ async def seed_tools_from_catalog(
             row.endpoint = endpoint
             row.method = spec.get("method", "GET")
             row.auth_type = req.auth_type
-            if auth_config or req.auth_token:
+            if auth_config or req.auth_token or req.operator_id:
                 row.auth_config = auth_config
             row.parameters = spec["parameters"]
         else:

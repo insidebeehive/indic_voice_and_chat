@@ -24,6 +24,7 @@ async def execute_crm_tool(
     token: Optional[str],
     args: dict,
     context: Optional[dict] = None,
+    extra_headers: Optional[dict] = None,
     http_client: object = None,
     timeout_s: float = 10.0,
 ) -> dict:
@@ -42,7 +43,7 @@ async def execute_crm_tool(
             path_used.add(k)
     rest = {k: v for k, v in values.items() if k not in path_used and v is not None}
 
-    headers: dict = {}
+    headers: dict = dict(extra_headers or {})
     if token and auth_type == "bearer":
         headers["Authorization"] = f"Bearer {token}"
     elif token and auth_type == "api_key":

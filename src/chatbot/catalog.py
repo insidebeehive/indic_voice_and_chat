@@ -20,10 +20,8 @@ PLAYER_TOOLS: dict[str, dict] = {
             "amounts or statuses."
         ),
         "parameters": {
-            "operator_id": {"type": "string", "source": "session",
-                            "description": "Operator identifier"},
-            "user_id":     {"type": "string", "source": "session",
-                            "description": "Player identifier"},
+            "user_id": {"type": "string", "source": "session",
+                        "description": "Player identifier"},
         },
         "default_path": "/players/{user_id}/wallet",
         "method": "GET",
@@ -36,14 +34,12 @@ PLAYER_TOOLS: dict[str, dict] = {
             "deposit go through?' or 'show my recent withdrawals'."
         ),
         "parameters": {
-            "operator_id": {"type": "string", "source": "session",
-                            "description": "Operator identifier"},
-            "user_id":     {"type": "string", "source": "session",
-                            "description": "Player identifier"},
-            "type":        {"type": "string", "source": "llm",
-                            "description": "Filter: deposit | withdrawal | casino | sports | all (default: all)"},
-            "limit":       {"type": "integer", "source": "llm",
-                            "description": "Max records to return (default: 10)"},
+            "user_id": {"type": "string", "source": "session",
+                        "description": "Player identifier"},
+            "type":    {"type": "string", "source": "llm",
+                        "description": "Filter: deposit | withdrawal | casino | sports | all (default: all)"},
+            "limit":   {"type": "integer", "source": "llm",
+                        "description": "Max records to return (default: 20)"},
         },
         "default_path": "/players/{user_id}/transactions",
         "method": "GET",
@@ -55,14 +51,12 @@ PLAYER_TOOLS: dict[str, dict] = {
             "open bets. Use for questions about active bets, bet history, winnings."
         ),
         "parameters": {
-            "operator_id": {"type": "string", "source": "session",
-                            "description": "Operator identifier"},
-            "user_id":     {"type": "string", "source": "session",
-                            "description": "Player identifier"},
-            "status":      {"type": "string", "source": "llm",
-                            "description": "Filter: open | settled | all (default: all)"},
-            "limit":       {"type": "integer", "source": "llm",
-                            "description": "Max records to return (default: 10)"},
+            "user_id": {"type": "string", "source": "session",
+                        "description": "Player identifier"},
+            "status":  {"type": "string", "source": "llm",
+                        "description": "Filter: WON | LOST | SETTLED | all (default: all)"},
+            "limit":   {"type": "integer", "source": "llm",
+                        "description": "Max records to return (default: 20)"},
         },
         "default_path": "/players/{user_id}/bets",
         "method": "GET",
@@ -75,10 +69,8 @@ PLAYER_TOOLS: dict[str, dict] = {
             "eligibility, referral count, and referral bonus earnings."
         ),
         "parameters": {
-            "operator_id": {"type": "string", "source": "session",
-                            "description": "Operator identifier"},
-            "user_id":     {"type": "string", "source": "session",
-                            "description": "Player identifier"},
+            "user_id": {"type": "string", "source": "session",
+                        "description": "Player identifier"},
         },
         "default_path": "/players/{user_id}/bonuses",
         "method": "GET",
@@ -91,10 +83,8 @@ PLAYER_TOOLS: dict[str, dict] = {
             "date, and recent login history."
         ),
         "parameters": {
-            "operator_id": {"type": "string", "source": "session",
-                            "description": "Operator identifier"},
-            "user_id":     {"type": "string", "source": "session",
-                            "description": "Player identifier"},
+            "user_id": {"type": "string", "source": "session",
+                        "description": "Player identifier"},
         },
         "default_path": "/players/{user_id}/profile",
         "method": "GET",
@@ -107,10 +97,8 @@ PLAYER_TOOLS: dict[str, dict] = {
             "their limits."
         ),
         "parameters": {
-            "operator_id": {"type": "string", "source": "session",
-                            "description": "Operator identifier"},
-            "user_id":     {"type": "string", "source": "session",
-                            "description": "Player identifier"},
+            "user_id": {"type": "string", "source": "session",
+                        "description": "Player identifier"},
         },
         "default_path": "/players/{user_id}/responsible-gaming",
         "method": "GET",

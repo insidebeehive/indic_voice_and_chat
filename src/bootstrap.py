@@ -259,7 +259,8 @@ def make_chatbot_factory(registry, sessionmaker=None, platform_retriever=None):
                             token = None
                 execs[r.name] = {
                     "endpoint": r.endpoint, "method": r.method,
-                    "parameters": r.parameters or {}, "auth_type": r.auth_type, "token": token}
+                    "parameters": r.parameters or {}, "auth_type": r.auth_type, "token": token,
+                    "extra_headers": (r.auth_config or {}).get("extra_headers")}
         return specs, execs
 
     async def factory(tenant: TenantContext, session_id: str) -> ChatBotAgent:
@@ -290,7 +291,8 @@ def make_chatbot_factory(registry, sessionmaker=None, platform_retriever=None):
             return await execute_crm_tool(
                 endpoint=spec["endpoint"], method=spec["method"],
                 parameters=spec["parameters"], auth_type=spec["auth_type"],
-                token=spec["token"], args=tc.arguments or {}, context=_crm_context)
+                token=spec["token"], args=tc.arguments or {}, context=_crm_context,
+                extra_headers=spec.get("extra_headers"))
 
         return ChatBotAgent(
             session=AgentSession(session_id=session_id),
