@@ -55,6 +55,10 @@ async def execute_crm_tool(
     if own:
         import httpx
         client = httpx.AsyncClient(timeout=httpx.Timeout(timeout_s, connect=5.0))
+    log.info("crm tool call", extra={
+        "url": url, "method": method, "params": rest,
+        "header_keys": list(headers.keys()),  # keys only — never log token values
+    })
     try:
         if method == "GET":
             resp = await client.get(url, params=rest, headers=headers)
@@ -64,6 +68,7 @@ async def execute_crm_tool(
             body = resp.json()
         except Exception:  # noqa: BLE001 — non-JSON response
             body = {"text": resp.text}
+        log.info("crm tool response", extra={"url": url, "status_code": resp.status_code})
         return {"status_code": resp.status_code, "data": body}
     except Exception as e:  # noqa: BLE001 — a failing CRM call must not kill the turn
         log.exception("crm tool http call failed", extra={"endpoint": endpoint})
