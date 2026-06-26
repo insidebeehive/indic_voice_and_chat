@@ -20,6 +20,7 @@ Auth: ``Authorization: Bearer <tenant-token>`` on both endpoints.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any, Optional
 
@@ -30,6 +31,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.api.deps import get_db_session
 from src.auth import TenantContext, current_tenant
 from src.models.chat import ChatSession
+from src.models.database import get_sessionmaker
 
 log = logging.getLogger(__name__)
 router = APIRouter(prefix="/integrations", tags=["integrations"])
@@ -220,7 +222,6 @@ async def openai_chat_completions(
 async def chatwoot_webhook(
     payload: dict,
     request: Request,
-    db: AsyncSession = Depends(get_db_session),
 ) -> dict:
     """Chatwoot Agent Bot webhook — no bearer token required.
 
@@ -308,21 +309,50 @@ async def chatwoot_webhook(
         "user_id": user_id, "text_len": len(text),
     })
 
-    result = await external_message(
-        ExternalMessageRequest(
-            conversation_id=f"chatwoot:{conversation_id}",
-            text=text,
-            user_id=user_id,
-            customer_name=customer_name,
-        ),
-        tenant=tenant,
-        db=db,
+    # Return 200 to Chatwoot immediately — Chatwoot has a ~10 s webhook timeout,
+    # but LLM + CRM tool call + second LLM round easily exceeds that.
+    # Processing runs in a background task with its own DB session.
+    asyncio.get_event_loop().create_task(
+        _process_chatwoot_turn(tenant, conversation_id, text, user_id, customer_name)
     )
+    return {"accepted": True}
 
-    # Deliver the reply back to Chatwoot via their API.
-    await _chatwoot_send(tenant, conversation_id, result.text)
 
-    return {"text": result.text, "suggestions": result.suggestions, "session_id": result.session_id}
+async def _process_chatwoot_turn(
+    tenant: TenantContext,
+    conversation_id: str,
+    text: str,
+    user_id: Optional[str],
+    customer_name: Optional[str],
+) -> None:
+    """Background task: run the agent turn and deliver the reply to Chatwoot.
+
+    Uses its own DB session so the webhook handler can return 200 immediately
+    without waiting for LLM + tool-call round-trips (which can exceed Chatwoot's
+    10 s webhook timeout).
+    """
+    try:
+        sm = get_sessionmaker()
+        async with sm() as db:
+            result = await external_message(
+                ExternalMessageRequest(
+                    conversation_id=f"chatwoot:{conversation_id}",
+                    text=text,
+                    user_id=user_id,
+                    customer_name=customer_name,
+                ),
+                tenant=tenant,
+                db=db,
+            )
+        log.info("chatwoot turn complete", extra={
+            "tenant": tenant.slug, "conversation_id": conversation_id,
+            "response_len": len(result.text),
+        })
+        await _chatwoot_send(tenant, conversation_id, result.text)
+    except Exception:
+        log.exception("chatwoot background turn failed", extra={
+            "tenant": tenant.slug, "conversation_id": conversation_id,
+        })
 
 
 async def _chatwoot_send(tenant: TenantContext, conversation_id: str, text: str) -> None:
