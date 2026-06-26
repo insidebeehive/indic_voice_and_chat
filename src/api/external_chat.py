@@ -251,7 +251,10 @@ async def chatwoot_webhook(
     if message_type not in (0, "incoming"):
         return {"ignored": True, "reason": f"message_type={message_type}"}
 
-    if sender.get("type") != "contact":
+    # Skip outgoing messages from agents/bots (e.g. our own replies triggering a webhook).
+    # Chatwoot Agent Bot webhooks often omit sender.type for customer messages, so we
+    # don't gate on sender.type == "contact" — message_type="incoming" is sufficient.
+    if sender.get("type") in ("agent", "agent_bot"):
         return {"ignored": True, "reason": f"sender_type={sender.get('type')}"}
 
     text = (payload.get("content") or "").strip()
