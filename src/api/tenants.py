@@ -607,6 +607,66 @@ async def tenant_analytics(
     )
 
 
+class ChatAnalytics(BaseModel):
+    tenant_id: str
+    total_sessions: int
+    total_messages: int
+    avg_messages_per_session: float
+    escalation_rate_pct: float        # % of sessions that reached awaiting_human or human
+    by_status: dict[str, int]         # active / ended
+    by_mode: dict[str, int]           # ai / awaiting_human / human / closed
+    by_source: dict[str, int]         # widget / external / chatwoot / unknown
+
+
+@router.get("/{tenant_id}/chat-analytics", response_model=ChatAnalytics)
+async def tenant_chat_analytics(
+    tenant_id: str,
+    session: AsyncSession = Depends(get_db_session),
+    _: None = Depends(require_admin),
+) -> ChatAnalytics:
+    """Chat session analytics for one tenant."""
+    from src.models.chat import ChatMessage, ChatSession
+    await _require_tenant(session, tenant_id)
+
+    rows = (await session.execute(
+        select(ChatSession.status, ChatSession.mode,
+               ChatSession.message_count, ChatSession.extra_data)
+        .where(ChatSession.tenant_id == tenant_id)
+    )).all()
+
+    by_status: dict[str, int] = {}
+    by_mode: dict[str, int] = {}
+    by_source: dict[str, int] = {}
+    total_messages = 0
+    escalated = 0
+
+    def _bump(d: dict[str, int], k: str) -> None:
+        d[k] = d.get(k, 0) + 1
+
+    for status, mode, msg_count, extra_data in rows:
+        _bump(by_status, status or "unknown")
+        _bump(by_mode, mode or "unknown")
+        source = ((extra_data or {}).get("source") or "widget")
+        _bump(by_source, source)
+        total_messages += int(msg_count or 0)
+        if mode in ("awaiting_human", "human", "closed") and status != "active":
+            escalated += 1
+        elif mode in ("awaiting_human", "human"):
+            escalated += 1
+
+    n = len(rows)
+    return ChatAnalytics(
+        tenant_id=tenant_id,
+        total_sessions=n,
+        total_messages=total_messages,
+        avg_messages_per_session=round(total_messages / n, 1) if n else 0.0,
+        escalation_rate_pct=round(escalated * 100 / n, 1) if n else 0.0,
+        by_status=by_status,
+        by_mode=by_mode,
+        by_source=by_source,
+    )
+
+
 class TenantBilling(BaseModel):
     tenant_id: str
     total_calls: int
