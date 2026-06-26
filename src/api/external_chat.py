@@ -23,7 +23,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -219,10 +219,20 @@ async def openai_chat_completions(
 @router.post("/chatwoot/webhook")
 async def chatwoot_webhook(
     payload: dict,
-    tenant: TenantContext = Depends(current_tenant),
+    request: Request,
     db: AsyncSession = Depends(get_db_session),
 ) -> dict:
+    """Chatwoot Agent Bot webhook — no bearer token required.
+
+    Tenant is resolved from the Chatwoot inbox_id embedded in the payload
+    (``conversation.inbox_id`` or ``inbox.id``). Configure ``chatwoot:inbox_id``
+    for each tenant via the backoffice Chat tab or PATCH /tenants/{id}.
+    """
+    # --- Always log the full payload at DEBUG so we can diagnose missing fields ---
+    log.debug("chatwoot webhook raw payload", extra={"payload": payload})
+
     event = payload.get("event", "")
+    log.info("chatwoot webhook received", extra={"event": event, "payload_keys": list(payload.keys())})
 
     # Only act on incoming customer messages.
     if event != "message_created":
@@ -240,10 +250,43 @@ async def chatwoot_webhook(
     if not text:
         return {"ignored": True, "reason": "empty content"}
 
-    conversation_id = str((payload.get("conversation") or {}).get("id", ""))
+    conversation = payload.get("conversation") or {}
+    conversation_id = str(conversation.get("id", ""))
     if not conversation_id:
-        log.warning("chatwoot webhook missing conversation.id", extra={"tenant": tenant.slug})
+        log.warning("chatwoot webhook missing conversation.id")
         return {"ignored": True, "reason": "missing conversation.id"}
+
+    # Resolve tenant from inbox_id (no bearer token required).
+    # inbox_id may be in payload.inbox.id or payload.conversation.inbox_id
+    raw_inbox_id = (
+        str((payload.get("inbox") or {}).get("id", ""))
+        or str(conversation.get("inbox_id", ""))
+    )
+    log.info("chatwoot inbox_id extracted", extra={"inbox_id": raw_inbox_id})
+
+    tenant: TenantContext | None = None
+    if raw_inbox_id:
+        resolver = getattr(request.app.state, "tenant_resolver", None)
+        if resolver is not None and hasattr(resolver, "resolve_by_chatwoot_inbox"):
+            tenant = await resolver.resolve_by_chatwoot_inbox(raw_inbox_id)
+
+    if tenant is None:
+        log.warning(
+            "chatwoot webhook: no tenant mapped to inbox_id — "
+            "set chatwoot:inbox_id via backoffice Chat tab",
+            extra={"inbox_id": raw_inbox_id},
+        )
+        # Return 200 so Chatwoot doesn't retry; we just can't process it yet.
+        return {"ignored": True, "reason": "inbox_id not mapped to any tenant"}
+
+    # Log secrets_resolved keys (not values) to help diagnose missing credentials.
+    log.info(
+        "chatwoot tenant resolved",
+        extra={
+            "tenant": tenant.slug,
+            "secrets_keys": list(tenant.secrets_resolved.keys()),
+        },
+    )
 
     # sender.identifier = contact's external_id (player UUID set by BetStudio)
     user_id = sender.get("identifier") or None
@@ -266,8 +309,6 @@ async def chatwoot_webhook(
     )
 
     # Deliver the reply back to Chatwoot via their API.
-    # Credentials stored as TenantSecrets: chatwoot:api_token, chatwoot:account_id,
-    # chatwoot:api_url (optional, defaults to cloud).
     await _chatwoot_send(tenant, conversation_id, result.text)
 
     return {"text": result.text, "suggestions": result.suggestions, "session_id": result.session_id}
@@ -279,12 +320,22 @@ async def _chatwoot_send(tenant: TenantContext, conversation_id: str, text: str)
     sr = tenant.secrets_resolved
     api_token = sr.get("chatwoot:api_token")
     account_id = sr.get("chatwoot:account_id")
+    log.info(
+        "chatwoot_send: credential check",
+        extra={
+            "tenant": tenant.slug,
+            "has_api_token": bool(api_token),
+            "has_account_id": bool(account_id),
+            "all_secret_keys": list(sr.keys()),
+        },
+    )
     if not api_token or not account_id:
         log.warning("chatwoot credentials not configured — reply not delivered",
                     extra={"tenant": tenant.slug})
         return
     api_url = (sr.get("chatwoot:api_url") or "https://app.chatwoot.com").rstrip("/")
     url = f"{api_url}/api/v1/accounts/{account_id}/conversations/{conversation_id}/messages"
+    log.info("chatwoot_send: calling API", extra={"tenant": tenant.slug, "url": url})
     try:
         import httpx
         async with httpx.AsyncClient(timeout=10.0) as client:
@@ -295,6 +346,11 @@ async def _chatwoot_send(tenant: TenantContext, conversation_id: str, text: str)
             }, headers={"api_access_token": api_token})
         if resp.status_code >= 300:
             log.error("chatwoot delivery failed", extra={
+                "tenant": tenant.slug, "status": resp.status_code,
+                "conversation_id": conversation_id, "body": resp.text[:500],
+            })
+        else:
+            log.info("chatwoot delivery ok", extra={
                 "tenant": tenant.slug, "status": resp.status_code,
                 "conversation_id": conversation_id,
             })

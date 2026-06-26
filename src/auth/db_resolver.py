@@ -83,6 +83,7 @@ class DbTenantResolver:
         self._by_slug: dict[str, TenantContext] = {}
         self._by_phone: dict[str, TenantContext] = {}
         self._by_id: dict[str, TenantContext] = {}
+        self._by_chatwoot_inbox: dict[str, TenantContext] = {}
         # Optional callback fired after a (re)load so cached per-tenant provider
         # clients can be evicted (e.g. providers.evict) — otherwise a key/config
         # update leaves stale clients behind.
@@ -98,7 +99,7 @@ class DbTenantResolver:
                     selectinload(Tenant.secrets),
                 )
             )).scalars().all()
-            by_token, by_slug, by_phone, by_id = {}, {}, {}, {}
+            by_token, by_slug, by_phone, by_id, by_cw_inbox = {}, {}, {}, {}, {}
             for t in rows:
                 ctx = tenant_context_from_row(t)
                 by_slug[t.slug] = ctx
@@ -107,8 +108,12 @@ class DbTenantResolver:
                     by_token[k.token_hash] = ctx
                 for p in t.phone_numbers:
                     by_phone[p.phone_number] = ctx
+                inbox_id = ctx.secrets_resolved.get("chatwoot:inbox_id")
+                if inbox_id:
+                    by_cw_inbox[str(inbox_id)] = ctx
             self._by_token, self._by_slug, self._by_phone = by_token, by_slug, by_phone
             self._by_id = by_id
+            self._by_chatwoot_inbox = by_cw_inbox
         log.info("tenant resolver loaded from DB", extra={"count": len(self._by_slug)})
         if self.on_reload is not None:
             self.on_reload()   # drop stale per-tenant provider clients
@@ -133,3 +138,6 @@ class DbTenantResolver:
 
     async def resolve_by_id(self, tenant_id: str) -> Optional[TenantContext]:
         return self._by_id.get(tenant_id)
+
+    async def resolve_by_chatwoot_inbox(self, inbox_id: str) -> Optional[TenantContext]:
+        return self._by_chatwoot_inbox.get(str(inbox_id))

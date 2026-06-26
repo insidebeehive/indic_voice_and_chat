@@ -294,6 +294,7 @@ class ChatwootUpdateIn(BaseModel):
     api_url: Optional[str] = None          # defaults to https://app.chatwoot.com
     account_id: Optional[str] = None
     api_token: Optional[str] = None        # write-only; never returned
+    inbox_id: Optional[str] = None         # Chatwoot inbox ID for webhook tenant lookup (no bearer needed)
 
 
 class UpdateTenantRequest(BaseModel):
@@ -418,6 +419,8 @@ async def update_tenant(
             cw_secrets["chatwoot:account_id"] = cw.account_id
         if cw.api_token is not None:
             cw_secrets["chatwoot:api_token"] = cw.api_token
+        if cw.inbox_id is not None:
+            cw_secrets["chatwoot:inbox_id"] = cw.inbox_id
         for name, value in cw_secrets.items():
             existing = (await session.execute(
                 select(TenantSecret).where(

@@ -471,15 +471,18 @@ async function loadChat(id, slug) {
     <h2 style="margin-top:1.2rem;">Chatwoot integration</h2>
     <div class="hint" style="margin-bottom:.5rem;">
       Credentials used to deliver bot replies back to Chatwoot (Agent Bot mode).
-      Webhook URL to set in Chatwoot:
-      <code>/api/v1/integrations/chatwoot/webhook</code> with this tenant's bearer token.
+      Webhook URL to set in Chatwoot: <code>/api/v1/integrations/chatwoot/webhook</code>
+      — no Authorization header needed; tenant is identified via the <strong>Inbox ID</strong> below.
     </div>
     <div class="creds" style="gap:.6rem;flex-wrap:wrap;">
-      <label>Chatwoot URL <small class="hint">(blank = app.chatwoot.com)</small>
-        <input id="cw_url" style="width:20rem" placeholder="https://app.chatwoot.com" />
+      <label>Inbox ID <small class="hint">(from Chatwoot Settings → Inboxes)</small>
+        <input id="cw_inbox" style="width:10rem" placeholder="42" />
       </label>
       <label>Account ID
         <input id="cw_account" style="width:10rem" placeholder="123" />
+      </label>
+      <label>Chatwoot URL <small class="hint">(blank = app.chatwoot.com)</small>
+        <input id="cw_url" style="width:20rem" placeholder="https://app.chatwoot.com" />
       </label>
       <label>API access token <small class="hint">(encrypted at rest)</small>
         <input id="cw_token" type="password" style="width:20rem" placeholder="token value" />
@@ -492,11 +495,13 @@ async function loadChat(id, slug) {
 }
 
 async function saveChatwootConfig(slug) {
+  const inbox_id   = $("cw_inbox").value.trim();
   const api_url    = $("cw_url").value.trim();
   const account_id = $("cw_account").value.trim();
   const api_token  = $("cw_token").value.trim();
+  if (!inbox_id)   { $("cw_result").textContent = "Inbox ID is required"; return; }
   if (!account_id) { $("cw_result").textContent = "Account ID is required"; return; }
-  const cw = { account_id };
+  const cw = { inbox_id, account_id };
   if (api_url)   cw.api_url   = api_url;
   if (api_token) cw.api_token = api_token;
   $("cw_result").textContent = "saving…";
