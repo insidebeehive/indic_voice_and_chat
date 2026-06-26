@@ -65,11 +65,13 @@
       <div class="tab" id="tab_bill" onclick="showTab('bill')">Billing</div>
       <div class="tab" id="tab_tel" onclick="showTab('tel')">Telephony</div>
       <div class="tab" id="tab_camp" onclick="showTab('camp')">Campaign</div>
+      <div class="tab" id="tab_chat" onclick="showTab('chat')">Chat</div>
     </div>
     <div id="pane_an"></div>
     <div id="pane_bill" hidden></div>
     <div id="pane_tel" hidden></div>
     <div id="pane_camp" hidden></div>
+    <div id="pane_chat" hidden></div>
   </div>
 </div>
 
@@ -143,9 +145,10 @@ async function selectTenant(id, slug) {
   await loadBilling(id);
   loadTelephony(id);
   loadCampaigns(id);
+  loadChat(id, slug);
 }
 function showTab(which) {
-  for (const k of ["an", "bill", "tel", "camp"]) {
+  for (const k of ["an", "bill", "tel", "camp", "chat"]) {
     $("tab_" + k).classList.toggle("active", which === k);
     $("pane_" + k).hidden = which !== k;
   }
@@ -373,6 +376,101 @@ async function saveCampaign(tenantId, campId) {
     $("c_result").textContent = "✓ saved — live on the next call";
   } else {
     $("c_result").textContent = `✗ ${r.status}: ${r.json.detail || r.json.error || "error"}`;
+  }
+}
+
+// --- Chat tab -----------------------------------------------------------
+
+async function apiTenant(method, path, body, slug) {
+  const headers = { "Content-Type": "application/json", "X-Tenant-Slug": slug };
+  const t = $("adminToken").value.trim();
+  if (t) headers["Authorization"] = "Bearer " + t;
+  try {
+    const res = await fetch(base() + path, { method, headers, body: body ? JSON.stringify(body) : undefined });
+    const json = await res.json().catch(() => ({}));
+    return { ok: res.ok, status: res.status, json };
+  } catch (e) { return { ok: false, status: 0, json: { error: String(e) } }; }
+}
+
+async function loadChat(id, slug) {
+  const r = await apiTenant("GET", "/api/v1/chat/tools", null, slug);
+  const tools = r.ok ? (r.json.tools || []) : [];
+  const toolRows = tools.length
+    ? tools.map(t => `<tr>
+        <td>${escT(t.name)}</td>
+        <td style="max-width:22rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escAttr(t.endpoint)}">${escT(t.endpoint)}</td>
+        <td>${escT(t.auth_type || "—")}</td>
+        <td>${t.auth_configured ? "✓" : "—"}</td>
+        <td><button class="ghost sm" onclick="deleteTool('${escAttr(slug)}','${escAttr(t.name)}')">Remove</button></td>
+      </tr>`).join("")
+    : `<tr><td colspan="5" class="hint">No tools registered yet.</td></tr>`;
+
+  $("pane_chat").innerHTML = `
+    <div class="hint" style="margin-bottom:.6rem;">
+      Register CRM API tools the chatbot may call. Use <b>Seed from catalog</b> to register all
+      standard betting-platform tools at once (wallet, bets, transactions, bonuses, profile,
+      operator config, etc.).
+    </div>
+
+    <h2>Registered tools</h2>
+    <table style="margin-bottom:.8rem;">
+      <thead><tr><th>Name</th><th>Endpoint</th><th>Auth type</th><th>Token set</th><th></th></tr></thead>
+      <tbody id="ch_toolrows">${toolRows}</tbody>
+    </table>
+
+    <h2>Seed from catalog</h2>
+    <div class="hint" style="margin-bottom:.5rem;">
+      Registers all standard CRM tools for this tenant. Existing tools with the same name are updated (upsert).
+    </div>
+    <div class="creds" style="gap:.6rem;flex-wrap:wrap;">
+      <label>CRM base URL
+        <input id="ch_base" style="width:22rem" placeholder="https://apistage.betstudio.io/api" />
+      </label>
+      <label>Auth type
+        <select id="ch_authtype">
+          <option value="api_key">api_key (X-API-Key header)</option>
+          <option value="bearer">bearer (Authorization: Bearer)</option>
+        </select>
+      </label>
+      <label>CRM API token <small class="hint">(encrypted at rest)</small>
+        <input id="ch_token" type="password" style="width:18rem" placeholder="token value" />
+      </label>
+      <label>Operator ID <small class="hint">(sent as operatorid header)</small>
+        <input id="ch_opid" style="width:16rem" placeholder="ab858a8c-7ad4-47d2-a0b7-…" />
+      </label>
+    </div>
+    <div style="margin-top:.8rem;">
+      <button onclick="saveCrmConfig('${escAttr(slug)}')">Seed / update CRM tools</button>
+      <span id="ch_result" class="hint" style="margin-left:.6rem;"></span>
+    </div>`;
+}
+
+async function saveCrmConfig(slug) {
+  const crm_base_url = $("ch_base").value.trim();
+  const auth_type    = $("ch_authtype").value;
+  const auth_token   = $("ch_token").value.trim();
+  const operator_id  = $("ch_opid").value.trim();
+  if (!crm_base_url) { $("ch_result").textContent = "CRM base URL is required"; return; }
+  const body = { crm_base_url, auth_type };
+  if (auth_token)  body.auth_token  = auth_token;
+  if (operator_id) body.operator_id = operator_id;
+  $("ch_result").textContent = "saving…";
+  const r = await apiTenant("POST", "/api/v1/chat/tools/from-catalog", body, slug);
+  if (r.ok) {
+    $("ch_result").textContent = `✓ ${r.json.registered} tools registered: ${(r.json.tool_names || []).join(", ")}`;
+  } else {
+    $("ch_result").textContent = `Error ${r.status}: ${r.json.detail || JSON.stringify(r.json)}`;
+  }
+}
+
+async function deleteTool(slug, name) {
+  if (!confirm(`Remove tool "${name}"?`)) return;
+  const r = await apiTenant("DELETE", `/api/v1/chat/tools/${encodeURIComponent(name)}`, null, slug);
+  if (r.ok) {
+    const row = document.querySelector(`#ch_toolrows tr td:first-child`);
+    // Reload the whole pane — find the tenant id from SELECTED
+    const t = (window.TENANTS || {})[SELECTED] || {};
+    loadChat(SELECTED, t.slug || slug);
   }
 }
 
