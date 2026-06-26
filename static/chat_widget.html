@@ -28,6 +28,9 @@
   #mic-btn { background:none; border:none; font-size:1.2rem; cursor:pointer; padding:.3rem; color:#6b7280; line-height:1; }
   #mic-btn:hover { color:#111827; }
   #mic-btn.recording { color:#dc2626; }
+  #call-btn { background:none; border:none; font-size:1.2rem; cursor:pointer; padding:.3rem; color:#6b7280; line-height:1; }
+  #call-btn:hover { color:#16a34a; }
+  #call-btn:disabled { opacity:.4; cursor:not-allowed; }
   #rec-timer { display:none; color:#dc2626; font-size:.85em; font-weight:600; }
   #file-input { display:none; }
   #preview-bar { display:none; align-items:center; gap:.5rem; padding:.4rem .7rem; background:#f0f9ff; border-top:1px solid #bae6fd; font-size:.8rem; color:#0369a1; }
@@ -54,6 +57,7 @@
     <button id="preview-clear" title="Remove">✕</button>
   </div>
   <div id="composer" class="hidden">
+    <button id="call-btn" title="Start voice call" disabled>📞</button>
     <button id="attach-btn" title="Attach image or video">📎</button>
     <input id="file-input" type="file" accept="image/*,video/*" />
     <button id="mic-btn" title="Record voice message" onclick="toggleRecording()">🎤</button>
@@ -91,9 +95,12 @@
     });
   }
 
+  function _base() { return ($("base").value || window.location.origin).replace(/\/$/, ""); }
+  function _token() { return $("token").value.trim(); }
+
   async function start() {
-    const base = ($("base").value || window.location.origin).replace(/\/$/, "");
-    const token = $("token").value.trim();
+    const base = _base();
+    const token = _token();
     const resp = await fetch(base + "/api/v1/chat/sessions", {
       method: "POST",
       headers: { "Content-Type": "application/json", "Authorization": "Bearer " + token },
@@ -109,6 +116,7 @@
     $("log").classList.remove("hidden");
     $("composer").classList.remove("hidden");
     if (data.greeting) add("agent", data.greeting);
+    $("call-btn").disabled = false;
     connect(data.ws_url);
   }
 
@@ -203,6 +211,7 @@
         });
       } else if (m.type === "ended") {
         _sessionEnded = true;
+        $("call-btn").disabled = true;
         add("agent", "— chat ended —"); $("composer").classList.add("hidden");
       } else if (m.type === "error") {
         meta("error: " + m.message);
@@ -339,6 +348,30 @@ registerProcessor('capture-processor', CaptureProcessor);
     voiceWs.onclose = () => { add("agent", "— voice call disconnected —"); teardown(false); };
     voiceWs.onerror = () => { add("agent", "⚠️ Voice connection error."); teardown(true); };
   }
+
+  // --- Direct call button --------------------------------------------------
+  async function initiateCall() {
+    if (!sessionId) return;
+    const btn = $("call-btn");
+    btn.disabled = true;
+    btn.textContent = "⏳";
+    try {
+      const r = await fetch(`${_base()}/api/v1/chat/${sessionId}/call`, { method: "POST" });
+      if (!r.ok) {
+        add("agent", "⚠️ Could not set up voice call (" + r.status + ").");
+        btn.textContent = "📞"; btn.disabled = false;
+        return;
+      }
+      const { call_url } = await r.json();
+      btn.textContent = "📞";
+      startVoiceCall(call_url);
+    } catch (e) {
+      add("agent", "⚠️ Call error: " + e.message);
+      btn.textContent = "📞"; btn.disabled = false;
+    }
+  }
+
+  $("call-btn").onclick = initiateCall;
 
   // --- Attachment handling ------------------------------------------------
   let pendingFile = null;
