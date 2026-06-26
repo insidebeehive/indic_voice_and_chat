@@ -306,13 +306,13 @@ async def chatwoot_webhook(
 
     log.info("chatwoot message received", extra={
         "tenant": tenant.slug, "conversation_id": conversation_id,
-        "user_id": user_id, "text_len": len(text),
+        "user_id": user_id, "has_user_id": user_id is not None, "text_len": len(text),
     })
 
     # Return 200 to Chatwoot immediately — Chatwoot has a ~10 s webhook timeout,
     # but LLM + CRM tool call + second LLM round easily exceeds that.
     # Processing runs in a background task with its own DB session.
-    asyncio.get_event_loop().create_task(
+    asyncio.create_task(
         _process_chatwoot_turn(tenant, conversation_id, text, user_id, customer_name)
     )
     return {"accepted": True}
