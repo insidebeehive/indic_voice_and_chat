@@ -193,3 +193,75 @@ async def openai_chat_completions(
         "message": {"role": "assistant", "content": ext_result.text},
         "finish_reason": "stop",
     }])
+
+
+# ---------------------------------------------------------------------------
+# Thin Chatwoot webhook adapter
+# ---------------------------------------------------------------------------
+# Chatwoot fires a webhook for EVERY event (message_created, conversation_created,
+# agent_assigned, label_added, …).  This endpoint absorbs them all and acts only
+# on incoming customer messages (message_type == 0, sender.type == "contact").
+# All other events receive a 200 with {"ignored": true} and no further work.
+#
+# Chatwoot webhook payload shape (message_created):
+#   {
+#     "event": "message_created",
+#     "message_type": 0,          // 0 incoming, 1 outgoing, 2 activity
+#     "content": "Hello",
+#     "conversation": { "id": 456 },
+#     "sender": { "name": "Ravi", "identifier": "<external_id>", "type": "contact" }
+#   }
+#
+# Auth: same tenant Bearer token as the generic endpoint.
+# ---------------------------------------------------------------------------
+
+
+@router.post("/chatwoot/webhook")
+async def chatwoot_webhook(
+    payload: dict,
+    tenant: TenantContext = Depends(current_tenant),
+    db: AsyncSession = Depends(get_db_session),
+) -> dict:
+    event = payload.get("event", "")
+
+    # Only act on incoming customer messages.
+    if event != "message_created":
+        return {"ignored": True, "reason": f"event={event}"}
+
+    message_type = payload.get("message_type")
+    if message_type != 0:  # 0 = incoming from customer
+        return {"ignored": True, "reason": f"message_type={message_type}"}
+
+    sender = payload.get("sender") or {}
+    if sender.get("type") != "contact":
+        return {"ignored": True, "reason": "sender is not a contact"}
+
+    text = (payload.get("content") or "").strip()
+    if not text:
+        return {"ignored": True, "reason": "empty content"}
+
+    conversation_id = str((payload.get("conversation") or {}).get("id", ""))
+    if not conversation_id:
+        log.warning("chatwoot webhook missing conversation.id", extra={"tenant": tenant.slug})
+        return {"ignored": True, "reason": "missing conversation.id"}
+
+    # sender.identifier = contact's external_id (player UUID set by BetStudio)
+    user_id = sender.get("identifier") or None
+    customer_name = sender.get("name") or None
+
+    log.info("chatwoot message received", extra={
+        "tenant": tenant.slug, "conversation_id": conversation_id,
+        "user_id": user_id, "text_len": len(text),
+    })
+
+    result = await external_message(
+        ExternalMessageRequest(
+            conversation_id=f"chatwoot:{conversation_id}",
+            text=text,
+            user_id=user_id,
+            customer_name=customer_name,
+        ),
+        tenant=tenant,
+        db=db,
+    )
+    return {"text": result.text, "suggestions": result.suggestions, "session_id": result.session_id}
