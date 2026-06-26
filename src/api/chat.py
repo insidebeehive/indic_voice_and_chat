@@ -134,8 +134,12 @@ def _scoped_session(tenant: TenantContext, session_id: str) -> str:
     return f"{tenant.id}:{session_id}"
 
 
-def _new_session_id() -> str:
+def new_session_id() -> str:
     return f"cs_{uuid.uuid4().hex[:16]}"
+
+
+# Keep private alias so existing callers don't break.
+_new_session_id = new_session_id
 
 
 def _ws_base(conn) -> str:
@@ -1117,6 +1121,18 @@ async def _send_close_webhook(
         })
     except Exception:  # noqa: BLE001
         log.exception("session_closed webhook failed", extra={"session_id": session_id})
+
+
+async def process_message(
+    tenant: TenantContext, session_id: str, text: str,
+) -> ChatMessageResponse:
+    """Single-turn chat: get agent, handle message, persist, emit events.
+    Shared by the HTTP /message endpoint and the external integrations adapter."""
+    agent = await _get_agent(tenant, _scoped_session(tenant, session_id))
+    result = await agent.handle_message(text)
+    await _persist_turn(session_id, text, result)
+    await _emit_escalation(tenant.id, session_id, result)
+    return _to_message_response(session_id, result)
 
 
 def _to_message_response(session_id: str, result: ChatTurnResult) -> ChatMessageResponse:

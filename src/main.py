@@ -42,6 +42,7 @@ from sqlalchemy import text
 from src.api import (
     api_router,
     chat as chat_api,
+    external_chat as ext_chat_api,
     knowledge as knowledge_api,
     telephony_hooks,
 )
@@ -350,6 +351,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                              platform_retriever=platform_retriever))
     chat_api.set_chat_sessionmaker(sessionmaker)
     chat_api.set_chat_handoff_store(base_session_store)
+    ext_chat_api.set_ext_redis(redis_client)
     if settings.media_storage is not None:
         from src.providers.media.s3 import S3MediaStorage
         ms = settings.media_storage
@@ -383,6 +385,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         chat_api.set_chat_sessionmaker(None)
         chat_api.set_chat_handoff_store(None)
         chat_api.set_media_store(None)
+        ext_chat_api.set_ext_redis(None)
         knowledge_api.set_retriever_factory(None)
         knowledge_api.set_platform_retriever(None)
         set_browser_bridge_factory(None)
