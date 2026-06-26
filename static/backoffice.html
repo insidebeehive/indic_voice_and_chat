@@ -442,7 +442,43 @@ async function loadChat(id, slug) {
     <div style="margin-top:.8rem;">
       <button onclick="saveCrmConfig('${escAttr(slug)}')">Seed / update CRM tools</button>
       <span id="ch_result" class="hint" style="margin-left:.6rem;"></span>
+    </div>
+
+    <h2 style="margin-top:1.2rem;">Chatwoot integration</h2>
+    <div class="hint" style="margin-bottom:.5rem;">
+      Credentials used to deliver bot replies back to Chatwoot (Agent Bot mode).
+      Webhook URL to set in Chatwoot:
+      <code>/api/v1/integrations/chatwoot/webhook</code> with this tenant's bearer token.
+    </div>
+    <div class="creds" style="gap:.6rem;flex-wrap:wrap;">
+      <label>Chatwoot URL <small class="hint">(blank = app.chatwoot.com)</small>
+        <input id="cw_url" style="width:20rem" placeholder="https://app.chatwoot.com" />
+      </label>
+      <label>Account ID
+        <input id="cw_account" style="width:10rem" placeholder="123" />
+      </label>
+      <label>API access token <small class="hint">(encrypted at rest)</small>
+        <input id="cw_token" type="password" style="width:20rem" placeholder="token value" />
+      </label>
+    </div>
+    <div style="margin-top:.8rem;">
+      <button onclick="saveChatwootConfig('${escAttr(slug)}')">Save Chatwoot config</button>
+      <span id="cw_result" class="hint" style="margin-left:.6rem;"></span>
     </div>`;
+}
+
+async function saveChatwootConfig(slug) {
+  const api_url    = $("cw_url").value.trim();
+  const account_id = $("cw_account").value.trim();
+  const api_token  = $("cw_token").value.trim();
+  if (!account_id) { $("cw_result").textContent = "Account ID is required"; return; }
+  const cw = { account_id };
+  if (api_url)   cw.api_url   = api_url;
+  if (api_token) cw.api_token = api_token;
+  $("cw_result").textContent = "saving…";
+  const tid = SELECTED;
+  const r = await apiSend("PATCH", `/api/v1/tenants/${tid}`, { chatwoot: cw });
+  $("cw_result").textContent = r.ok ? "✓ Chatwoot config saved" : `Error ${r.status}: ${r.json.detail || JSON.stringify(r.json)}`;
 }
 
 async function saveCrmConfig(slug) {

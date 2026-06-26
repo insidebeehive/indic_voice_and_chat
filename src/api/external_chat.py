@@ -264,4 +264,41 @@ async def chatwoot_webhook(
         tenant=tenant,
         db=db,
     )
+
+    # Deliver the reply back to Chatwoot via their API.
+    # Credentials stored as TenantSecrets: chatwoot:api_token, chatwoot:account_id,
+    # chatwoot:api_url (optional, defaults to cloud).
+    await _chatwoot_send(tenant, conversation_id, result.text)
+
     return {"text": result.text, "suggestions": result.suggestions, "session_id": result.session_id}
+
+
+async def _chatwoot_send(tenant: TenantContext, conversation_id: str, text: str) -> None:
+    """POST the bot reply to Chatwoot's messages API. Fails silently — a delivery
+    error must not break the webhook acknowledgment Chatwoot is waiting for."""
+    sr = tenant.secrets_resolved
+    api_token = sr.get("chatwoot:api_token")
+    account_id = sr.get("chatwoot:account_id")
+    if not api_token or not account_id:
+        log.warning("chatwoot credentials not configured — reply not delivered",
+                    extra={"tenant": tenant.slug})
+        return
+    api_url = (sr.get("chatwoot:api_url") or "https://app.chatwoot.com").rstrip("/")
+    url = f"{api_url}/api/v1/accounts/{account_id}/conversations/{conversation_id}/messages"
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(url, json={
+                "content": text,
+                "message_type": "outgoing",
+                "private": False,
+            }, headers={"api_access_token": api_token})
+        if resp.status_code >= 300:
+            log.error("chatwoot delivery failed", extra={
+                "tenant": tenant.slug, "status": resp.status_code,
+                "conversation_id": conversation_id,
+            })
+    except Exception:
+        log.exception("chatwoot delivery error", extra={
+            "tenant": tenant.slug, "conversation_id": conversation_id,
+        })

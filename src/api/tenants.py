@@ -289,10 +289,18 @@ class TelephonyUpdateIn(BaseModel):
     phone_numbers: Optional[list[str]] = None
 
 
+class ChatwootUpdateIn(BaseModel):
+    """Chatwoot Agent Bot credentials — stored encrypted as TenantSecrets."""
+    api_url: Optional[str] = None          # defaults to https://app.chatwoot.com
+    account_id: Optional[str] = None
+    api_token: Optional[str] = None        # write-only; never returned
+
+
 class UpdateTenantRequest(BaseModel):
     status: Optional[str] = Field(default=None, pattern="^(active|suspended)$")
     events_webhook_url: Optional[str] = None
     telephony: Optional[TelephonyUpdateIn] = None
+    chatwoot: Optional[ChatwootUpdateIn] = None
 
 
 class UpdateTenantResponse(BaseModel):
@@ -397,7 +405,33 @@ async def update_tenant(
                 session.add(TenantPhoneNumber(
                     phone_number=ph, tenant_id=tenant_id, provider=tel_cfg.get("provider")))
 
-    if req.status is not None or req.events_webhook_url is not None or req.telephony is not None:
+    if req.chatwoot is not None:
+        cw = req.chatwoot
+        if not crypto.has_key():
+            raise HTTPException(
+                status_code=503,
+                detail="VOX_SECRET_KEY is not set — cannot encrypt Chatwoot credentials")
+        cw_secrets = {}
+        if cw.api_url is not None:
+            cw_secrets["chatwoot:api_url"] = cw.api_url
+        if cw.account_id is not None:
+            cw_secrets["chatwoot:account_id"] = cw.account_id
+        if cw.api_token is not None:
+            cw_secrets["chatwoot:api_token"] = cw.api_token
+        for name, value in cw_secrets.items():
+            existing = (await session.execute(
+                select(TenantSecret).where(
+                    TenantSecret.tenant_id == tenant_id, TenantSecret.name == name)
+            )).scalar_one_or_none()
+            if existing is not None:
+                existing.value_encrypted = crypto.encrypt(value)
+            else:
+                session.add(TenantSecret(
+                    tenant_id=tenant_id, name=name,
+                    value_encrypted=crypto.encrypt(value)))
+
+    if req.status is not None or req.events_webhook_url is not None \
+            or req.telephony is not None or req.chatwoot is not None:
         t.pipeline_config = pc  # reassign (new object) so the JSON column is marked dirty
 
     await session.commit()
