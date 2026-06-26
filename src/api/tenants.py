@@ -547,6 +547,30 @@ async def _require_tenant(session: AsyncSession, tenant_id: str) -> Tenant:
     return t
 
 
+@router.get("/{tenant_id}/chat-config")
+async def get_chat_config(
+    tenant_id: str,
+    request: Request,
+    _: None = Depends(require_admin),
+) -> dict:
+    """Return non-secret Chatwoot config for the tenant.  api_token is '...' if set."""
+    resolver = getattr(request.app.state, "tenant_resolver", None)
+    ctx = None
+    if resolver and hasattr(resolver, "resolve_by_id"):
+        ctx = await resolver.resolve_by_id(tenant_id)
+    if ctx is None:
+        raise HTTPException(status_code=404, detail="tenant not found")
+    sr = ctx.secrets_resolved
+    return {
+        "chatwoot": {
+            "inbox_id":   sr.get("chatwoot:inbox_id") or "",
+            "account_id": sr.get("chatwoot:account_id") or "",
+            "api_url":    sr.get("chatwoot:api_url") or "",
+            "api_token":  "..." if sr.get("chatwoot:api_token") else "",
+        },
+    }
+
+
 class TenantAnalytics(BaseModel):
     tenant_id: str
     total_calls: int

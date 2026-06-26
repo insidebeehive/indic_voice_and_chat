@@ -65,6 +65,7 @@ class ToolInfo(BaseModel):
     auth_type: Optional[str] = None
     parameters: dict
     auth_configured: bool
+    operator_id: Optional[str] = None
 
 
 class ToolsListResponse(BaseModel):
@@ -137,6 +138,7 @@ async def list_tools(
             name=r.name, description=r.description, endpoint=r.endpoint, method=r.method,
             auth_type=r.auth_type, parameters=r.parameters or {},
             auth_configured=bool((r.auth_config or {}).get("token_secret_name")),
+            operator_id=((r.auth_config or {}).get("extra_headers") or {}).get("operatorid"),
         ) for r in rows
     ])
 

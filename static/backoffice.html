@@ -417,8 +417,15 @@ async function apiTenant(method, path, body, slug) {
 }
 
 async function loadChat(id, slug) {
-  const r = await apiTenant("GET", "/api/v1/chat/tools", null, slug);
-  const tools = r.ok ? (r.json.tools || []) : [];
+  // Fetch tools + existing chat config in parallel
+  const [tr, cr] = await Promise.all([
+    apiTenant("GET", "/api/v1/chat/tools", null, slug),
+    apiSend("GET", `/api/v1/tenants/${id}/chat-config`),
+  ]);
+  const tools = tr.ok ? (tr.json.tools || []) : [];
+  const cfg   = cr.ok ? cr.json : {};
+  const cw    = cfg.chatwoot || {};
+
   const toolRows = tools.length
     ? tools.map(t => `<tr>
         <td>${escT(t.name)}</td>
@@ -428,6 +435,22 @@ async function loadChat(id, slug) {
         <td><button class="ghost sm" onclick="deleteTool('${escAttr(slug)}','${escAttr(t.name)}')">Remove</button></td>
       </tr>`).join("")
     : `<tr><td colspan="5" class="hint">No tools registered yet.</td></tr>`;
+
+  // Derive CRM seed hints from existing tools
+  const firstTool = tools[0];
+  let crmBase = "";
+  if (firstTool) {
+    // Longest common URL prefix across all tool endpoints (= crm_base_url at seed time)
+    let common = firstTool.endpoint;
+    for (const t of tools) {
+      while (common && !t.endpoint.startsWith(common))
+        common = common.slice(0, common.lastIndexOf("/"));
+    }
+    crmBase = common || "";
+  }
+  const crmAuthType  = firstTool?.auth_type || "api_key";
+  const crmHasToken  = tools.some(t => t.auth_configured);
+  const crmOpId      = tools.find(t => t.operator_id)?.operator_id || "";
 
   $("pane_chat").innerHTML = `
     <div class="hint" style="margin-bottom:.6rem;">
@@ -492,6 +515,18 @@ async function loadChat(id, slug) {
       <button onclick="saveChatwootConfig('${escAttr(slug)}')">Save Chatwoot config</button>
       <span id="cw_result" class="hint" style="margin-left:.6rem;"></span>
     </div>`;
+
+  // Pre-populate CRM seed form from existing tools
+  if (crmBase)    $("ch_base").value = crmBase;
+  if (crmAuthType) $("ch_authtype").value = crmAuthType;
+  if (crmHasToken) $("ch_token").placeholder = "... (already set — leave blank to keep)";
+  if (crmOpId)    $("ch_opid").value = crmOpId;
+
+  // Pre-populate Chatwoot form from existing config
+  if (cw.inbox_id)   $("cw_inbox").value   = cw.inbox_id;
+  if (cw.account_id) $("cw_account").value = cw.account_id;
+  if (cw.api_url)    $("cw_url").value     = cw.api_url;
+  if (cw.api_token)  $("cw_token").placeholder = "... (already set — leave blank to keep)";
 }
 
 async function saveChatwootConfig(slug) {
