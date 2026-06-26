@@ -232,19 +232,27 @@ async def chatwoot_webhook(
     log.debug("chatwoot webhook raw payload", extra={"payload": payload})
 
     event = payload.get("event", "")
-    log.info("chatwoot webhook received", extra={"event": event, "payload_keys": list(payload.keys())})
+    sender = payload.get("sender") or {}
+    log.info("chatwoot webhook received", extra={
+        "event": event,
+        "message_type": payload.get("message_type"),
+        "sender_type": sender.get("type"),
+        "private": payload.get("private"),
+        "payload_keys": list(payload.keys()),
+    })
 
     # Only act on incoming customer messages.
     if event != "message_created":
         return {"ignored": True, "reason": f"event={event}"}
 
+    # Chatwoot serializes message_type as int (0=incoming) in most versions,
+    # but some versions/serializers use the string "incoming".
     message_type = payload.get("message_type")
-    if message_type != 0:  # 0 = incoming from customer
+    if message_type not in (0, "incoming"):
         return {"ignored": True, "reason": f"message_type={message_type}"}
 
-    sender = payload.get("sender") or {}
     if sender.get("type") != "contact":
-        return {"ignored": True, "reason": "sender is not a contact"}
+        return {"ignored": True, "reason": f"sender_type={sender.get('type')}"}
 
     text = (payload.get("content") or "").strip()
     if not text:
