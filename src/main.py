@@ -362,6 +362,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             bucket=ms.bucket,
             region=ms.region,
         ))
+    else:
+        from src.providers.media.local import LocalMediaStorage
+        log.info("media storage: using local filesystem fallback (/tmp/chat_media)")
+        chat_api.set_media_store(LocalMediaStorage())
     # Knowledge ingest/query resolve the SAME per-tenant retriever the chatbot
     # uses (registry.retrievers), so ingested docs are retrievable in chat.
     knowledge_api.set_retriever_factory(lambda t: runtime_registry.retrievers.get(t))
