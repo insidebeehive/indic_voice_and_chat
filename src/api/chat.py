@@ -760,17 +760,18 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
                         transcript = ""
                         try:
                             upload_coro = _media_store.upload(audio_bytes, object_key, mime.split(";")[0])
-                            if hasattr(agent.llm, "transcribe_audio"):
+                            _transcriber = getattr(agent, "_llm", None) or getattr(agent, "llm", None)
+                            if _transcriber and hasattr(_transcriber, "transcribe_audio"):
                                 transcript, _ = await asyncio.gather(
-                                    agent.llm.transcribe_audio(audio_bytes, mime.split(";")[0]),
+                                    _transcriber.transcribe_audio(audio_bytes, mime.split(";")[0]),
                                     upload_coro,
                                 )
                             else:
                                 await upload_coro
-                        except Exception as _exc:
+                        except Exception:
                             log.exception("audio upload/transcription failed", extra={"session_id": session_id})
                             await websocket.send_text(json.dumps(
-                                {"type": "error", "message": f"voice message failed: {type(_exc).__name__}: {_exc}"}))
+                                {"type": "error", "message": "Could not save voice message — please try again."}))
                             continue
 
                         # If transcription succeeded, get AI response; else inform customer
