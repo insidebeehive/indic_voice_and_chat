@@ -200,7 +200,7 @@
         }
       } else if (m.type === "audio_ack") {
         if (pendingAudioBubble) {
-          pendingAudioBubble.el.src = m.media_url;
+          pendingAudioBubble.el.src = m.media_url + "?session_id=" + sessionId;
           URL.revokeObjectURL(pendingAudioBubble.localUrl);
           pendingAudioBubble = null;
         }
