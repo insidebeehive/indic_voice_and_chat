@@ -501,24 +501,19 @@ async def get_media(
 
 @router.get("/local-media/{key:path}", include_in_schema=False)
 async def serve_local_media(key: str = Path(...)):
-    """Serve a media file from local filesystem storage (used when S3 is not configured)."""
-    from fastapi.responses import FileResponse
+    """Serve a media blob from in-memory storage (used when S3 is not configured)."""
+    from fastapi.responses import Response
     from src.providers.media.local import LocalMediaStorage
 
     if not isinstance(_media_store, LocalMediaStorage):
         raise HTTPException(status_code=404, detail="local media not available")
 
-    try:
-        path = _media_store._safe_path(key)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="invalid key")
-
-    if not path.exists():
+    entry = _media_store.get(key)
+    if entry is None:
         raise HTTPException(status_code=404, detail="media not found")
 
-    import mimetypes
-    content_type, _ = mimetypes.guess_type(str(path))
-    return FileResponse(path=str(path), media_type=content_type or "application/octet-stream")
+    data, content_type = entry
+    return Response(content=data, media_type=content_type)
 
 
 # --- BO handover: claim + agent WebSocket --------------------------------
