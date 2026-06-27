@@ -767,10 +767,10 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
                                 )
                             else:
                                 await upload_coro
-                        except Exception:
+                        except Exception as _exc:
                             log.exception("audio upload/transcription failed", extra={"session_id": session_id})
                             await websocket.send_text(json.dumps(
-                                {"type": "error", "message": "Could not save voice message — please try again."}))
+                                {"type": "error", "message": f"voice message failed: {type(_exc).__name__}: {_exc}"}))
                             continue
 
                         # If transcription succeeded, get AI response; else inform customer
