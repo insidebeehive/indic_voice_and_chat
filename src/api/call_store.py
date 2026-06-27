@@ -18,7 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.auth.context import TenantContext
 from src.integration.tenant_events import build_envelope, channel_label
-from src.models.conversation import Conversation
+from src.models.conversation import Conversation, Turn
 from src.models.tenant import ProviderCost
 
 log = logging.getLogger(__name__)
@@ -337,3 +337,35 @@ async def reap_stale_calls(
     if rows:
         await session.commit()
     return len(rows)
+
+
+async def save_turns(
+    session: AsyncSession,
+    *,
+    conversation_id: str,
+    turns: list,
+) -> int:
+    """Persist the in-memory transcript (list of LLMMessage) to the turns table.
+
+    Skips the system-prompt turn (role='system') — it's reconstructable from
+    the tenant config and would bloat the table. Returns the number of rows
+    written. Safe to call even if the conversation row doesn't exist (rows
+    simply get orphaned and the caller logs a warning).
+    """
+    num = 0
+    for msg in turns:
+        role = getattr(msg, "role", None)
+        content = getattr(msg, "content", None)
+        if role == "system" or not content:
+            continue
+        num += 1
+        session.add(Turn(
+            conversation_id=conversation_id,
+            turn_number=num,
+            role=role,
+            content=content if isinstance(content, str) else str(content),
+        ))
+    if num:
+        await session.commit()
+        log.info("saved %d turns for conversation %s", num, conversation_id)
+    return num

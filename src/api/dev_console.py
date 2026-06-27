@@ -349,7 +349,7 @@ async def _run_billed_session(tenant, bridge, *, mode: str) -> None:
     is excluded from the cost (the browser path uses no telephony). Failures here
     never break the call.
     """
-    from src.api.call_store import insert_call, record_outcome
+    from src.api.call_store import insert_call, record_outcome, save_turns
     from src.models.database import get_sessionmaker
 
     sm = get_sessionmaker()
@@ -373,6 +373,15 @@ async def _run_billed_session(tenant, bridge, *, mode: str) -> None:
                     callback_at=_parse_iso(payload.get("callback_datetime")))
         except Exception:  # noqa: BLE001
             log.exception("webconsole: failed to finalize call record")
+        # Persist the in-memory transcript so it can be re-analyzed later.
+        try:
+            agent = getattr(bridge, "_agent", None)
+            turns = list(getattr(getattr(agent, "session", None), "turns", []))
+            if turns:
+                async with sm() as s:
+                    await save_turns(s, conversation_id=call_id, turns=turns)
+        except Exception:  # noqa: BLE001
+            log.exception("webconsole: failed to save turns")
 
 
 @ws_router.websocket("/voice")
