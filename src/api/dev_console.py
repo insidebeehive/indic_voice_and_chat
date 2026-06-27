@@ -118,9 +118,10 @@ async def dev_voices(request: Request, tenant: str = "dev") -> dict:
     the list matches the active stack instead of a hardcoded one:
 
     - ``layered`` (cascade): the configured TTS provider's voice roster.
-    - ``s2s`` (Gemini Live): the tenant's realtime ``allowed_voices``.
+    - ``s2s`` (Gemini Live): full catalog of 30 voices with metadata (gender, style).
     """
     from src.auth.middleware import tenant_from_slug
+    from src.providers.voice_catalog import list_voices
 
     try:
         tctx = await tenant_from_slug(tenant)
@@ -128,9 +129,11 @@ async def dev_voices(request: Request, tenant: str = "dev") -> dict:
         raise HTTPException(status_code=404, detail=f"unknown tenant: {e}")
     p = tctx.settings.pipeline
 
-    # S2S: the tenant's allowed realtime voices (default = pipeline.realtime.voice).
+    # S2S: always show the full 30-voice catalog so devs can try any voice.
+    # The configured voice (or first catalog voice) is the default selection.
     rt = p.realtime
-    s2s_voices = list(rt.allowed_voices) if (rt and rt.allowed_voices) else []
+    all_s2s = list_voices("gemini_live")
+    s2s_voices = [v["voice_id"] for v in all_s2s]
     s2s_default = (rt.voice if rt else "") or (s2s_voices[0] if s2s_voices else "")
 
     # Layered: the configured TTS provider's roster (default = pipeline.tts.voice_id).
@@ -151,7 +154,7 @@ async def dev_voices(request: Request, tenant: str = "dev") -> dict:
 
     return {
         "layered": {"voices": layered_voices, "default": layered_default},
-        "s2s": {"voices": s2s_voices, "default": s2s_default},
+        "s2s": {"voices": s2s_voices, "default": s2s_default, "catalog": all_s2s},
     }
 
 
@@ -649,9 +652,12 @@ def make_live_bridge_factory(
             engine=engine, store=None, kb_context=kb_ctx,
         )
 
-        # Voice: ?voice= overrides the config default (validated against allowed_voices).
+        # Voice: ?voice= overrides the config default. In the dev console any voice
+        # from the full catalog is allowed (not just the tenant's allowed_voices).
+        from src.providers.voice_catalog import list_voices as _lv
+        _catalog_voices = {v["voice_id"] for v in _lv("gemini_live")}
         voice = (qp.get("voice") or "").strip() or rt.voice
-        if rt.allowed_voices and voice not in rt.allowed_voices:
+        if voice and voice not in _catalog_voices:
             voice = rt.voice
         # Platform-level key: connect() reads GEMINI_API_KEY / GOOGLE_API_KEY.
         key = None

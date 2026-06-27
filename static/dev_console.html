@@ -336,8 +336,8 @@ $("telephony").addEventListener("change", syncTelephonyUI);
 syncTelephonyUI();
 
 // Voice dropdown is per-mode: layered shows the configured TTS provider's voice
-// roster, s2s shows the realtime allowed voices. Fetched so it tracks config.
-let _voiceData = { layered: { voices: [], default: "" }, s2s: { voices: [], default: "" } };
+// roster, s2s shows all 30 Gemini Live voices with gender + style metadata.
+let _voiceData = { layered: { voices: [], default: "" }, s2s: { voices: [], default: "", catalog: [] } };
 // Console dropdown default voice per mode (UI only — overrides the config-derived
 // default for the selector; falls back to the server default if the preferred
 // voice isn't in the roster). Does NOT change the tenant's configured voice.
@@ -346,12 +346,17 @@ function populateVoices(mode) {
   const d = _voiceData[mode] || { voices: [], default: "" };
   const preferred = _preferredVoice[mode];
   const def = d.voices.includes(preferred) ? preferred : d.default;
+  // Build a lookup from voice_id → {gender, style} from the catalog (s2s only).
+  const meta = {};
+  for (const v of (d.catalog || [])) meta[v.voice_id] = v;
   const sel = $("voice");
   sel.innerHTML = "";
-  for (const v of d.voices) {
+  for (const id of d.voices) {
     const o = document.createElement("option");
-    o.value = v; o.textContent = v;
-    if (v === def) o.selected = true;
+    o.value = id;
+    const m = meta[id];
+    o.textContent = m ? `${id} — ${m.gender} · ${m.style}` : id;
+    if (id === def) o.selected = true;
     sel.appendChild(o);
   }
 }
