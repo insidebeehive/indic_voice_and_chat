@@ -30,10 +30,9 @@ class GeminiLiveBridge(_BaseLiveBridge):
     (injectable for tests; defaults to GeminiLiveSession.connect bound to the key).
     """
 
-    # proactive_audio=True in the Live session config makes the model speak first
-    # natively — no send_client_content kickoff needed (that disrupted VAD for
-    # subsequent turns, causing the model to go silent after the greeting).
-    _greets_first = False
+    # The console agent greets first: warms the Live session so the caller's first
+    # reply is answered instantly (avoids the cold turn-1 "first hello lag").
+    _greets_first = True
 
     def __init__(self, *, websocket, agent, config: RealtimeConfig, connect_session,
                  llm=None, tenant_timezone: str = "Asia/Kolkata") -> None:

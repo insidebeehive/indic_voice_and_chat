@@ -117,10 +117,6 @@ class GeminiLiveSession(IRealtimeSession):
                 activity_handling=types.ActivityHandling.START_OF_ACTIVITY_INTERRUPTS,
                 turn_coverage=types.TurnCoverage.TURN_INCLUDES_ONLY_ACTIVITY,
             ),
-            # Proactive audio: model speaks first without waiting for user input.
-            # This replaces the send_client_content kickoff, which took the session
-            # out of realtime-input mode and broke VAD for subsequent turns.
-            proactivity=types.ProactivityConfig(proactive_audio=True),
         )
         last_err: Exception | None = None
         for attempt in range(_OPEN_RETRIES):
