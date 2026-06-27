@@ -315,8 +315,11 @@ function endCall() {
   $("start").textContent = "Start";
   setStatus("ending…");
   ws.send(JSON.stringify({ type: "end" }));
-  // Fallback: if the server hasn't closed within 6s, force teardown.
-  setTimeout(() => { if (ws && ws.readyState === WebSocket.OPEN) stop(true); }, 6000);
+  // Fallback: force-close if the server hasn't sent the outcome and closed within
+  // 20s. Server-side outcome analysis (analyze_call) has a 15s LLM timeout + a
+  // few seconds of teardown, so 6s was too short and the outcome arrived after the
+  // socket was already gone.
+  setTimeout(() => { if (ws && ws.readyState === WebSocket.OPEN) stop(true); }, 20000);
 }
 
 // --- Telephony: place an outbound call + poll its status ----------------------
