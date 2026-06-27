@@ -319,6 +319,82 @@ async def dev_place_call(req: PlaceCallRequest) -> dict:
             "provider_call_sid": session.session_id}
 
 
+@dev_router.post("/dev/reanalyze")
+async def dev_reanalyze(call_id: str, request: Request, tenant: str = "dev") -> dict:
+    """Re-run outcome analysis for a finished webconsole call.
+
+    Used by the dev console Reanalyze button — no Bearer auth required (gated
+    by VOX_DEV_CONSOLE). Reads stored turns from the DB, re-runs analyze_call,
+    updates the conversation row, and returns the new outcome + summary.
+    """
+    from src.auth.middleware import tenant_from_slug
+    from src.analysis.call_outcome import analyze_call
+    from src.interfaces.llm import LLMMessage
+    from src.models.conversation import Conversation, Turn
+    from src.models.database import get_sessionmaker
+
+    try:
+        tctx = await tenant_from_slug(tenant)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=404, detail=f"unknown tenant: {e}")
+
+    providers = getattr(request.app.state, "providers", None)
+    if providers is None:
+        raise HTTPException(status_code=503, detail="provider registry not available")
+
+    from sqlalchemy import select
+    sm = get_sessionmaker()
+    async with sm() as db:
+        row = (await db.execute(
+            select(Conversation).where(
+                Conversation.id == call_id,
+                Conversation.tenant_id == tctx.id,
+            )
+        )).scalar_one_or_none()
+        if row is None:
+            raise HTTPException(status_code=404, detail="conversation not found")
+
+        turn_rows = (await db.execute(
+            select(Turn).where(Turn.conversation_id == call_id).order_by(Turn.turn_number)
+        )).scalars().all()
+        if not turn_rows:
+            raise HTTPException(status_code=422, detail="no transcript stored — cannot reanalyze")
+
+        transcript = [LLMMessage(role=t.role, content=t.content) for t in turn_rows]
+        slots = row.slots_data or {}
+        from datetime import UTC, datetime as _dt
+        try:
+            llm = providers.get_llm(tctx)
+            analysis = await analyze_call(
+                transcript=transcript, slots=slots, telephony_status=None,
+                final_action=None,
+                tenant_timezone=getattr(tctx.settings, "timezone", "Asia/Kolkata"),
+                now=_dt.now(UTC), llm=llm,
+            )
+        except Exception as e:  # noqa: BLE001
+            log.exception("dev reanalyze failed for %s", call_id)
+            raise HTTPException(status_code=502, detail=f"analysis failed: {e}")
+
+        row.outcome = analysis.outcome.value
+        row.summary = analysis.summary
+        row.notes = analysis.notes
+        if analysis.callback_datetime:
+            row.callback_at = analysis.callback_datetime.replace(tzinfo=None)
+        await db.commit()
+
+    log.info("dev reanalyzed call", extra={"call_id": call_id, "outcome": row.outcome})
+    cb = analysis.callback_datetime
+    return {
+        "type": "outcome",
+        "outcome": row.outcome,
+        "summary": row.summary,
+        "notes": row.notes,
+        "source": analysis.analysis_source,
+        "callback_datetime": cb.isoformat() if cb else None,
+        "callback_phrase": analysis.callback_phrase,
+    }
+
+
 @dev_router.get("/dev/call-status/{call_sid}")
 async def dev_call_status(call_sid: str) -> dict:
     from src.api import dev_call_control
@@ -360,6 +436,12 @@ async def _run_billed_session(tenant, bridge, *, mode: str) -> None:
                               provider_call_sid=call_id, channel="webconsole", mode=mode)
     except Exception:  # noqa: BLE001
         log.exception("webconsole: failed to start call record")
+    # Push call_id to the browser before the session starts so the dev console
+    # can offer a Reanalyze button once the call ends.
+    try:
+        await bridge._send_json({"type": "session", "call_id": call_id})
+    except Exception:  # noqa: BLE001
+        pass
     try:
         await bridge.run()
     finally:

@@ -71,6 +71,10 @@
         <div style="margin-top:4px;"><b>Summary:</b> <span id="outcomeSummary"></span></div>
         <div style="margin-top:4px;"><b>Notes:</b> <span id="outcomeNotes"></span></div>
         <div id="outcomeCallback" style="margin-top:4px;"></div>
+        <div style="margin-top:8px;">
+          <button id="reanalyze" style="display:none; padding:.3rem .8rem; background:#6366f1; color:#fff; border:0; border-radius:.4rem; cursor:pointer; font-size:.8rem;" onclick="reanalyzeCall()">Reanalyze</button>
+          <span id="reanalyzeStatus" style="font-size:.8rem; color:#94a3b8; margin-left:.5rem;"></span>
+        </div>
       </div>
     </div>
   </div>
@@ -82,6 +86,7 @@ const activeSources = new Set();   // scheduled playback nodes, so we can stop t
 
 const $ = (id) => document.getElementById(id);
 const setStatus = (s) => { $("status").textContent = s; };
+let _currentCallId = null;
 
 // Render an outcome payload into the outcome panel. Works for both the WS
 // message (S2S/WebConsole) and the polled telephony monitor payload — same field
@@ -96,6 +101,27 @@ function renderOutcome(o) {
   $("outcomeCallback").textContent = o.callback_datetime
     ? "Callback: " + o.callback_datetime
     : (o.callback_phrase ? "Callback (unresolved): " + o.callback_phrase : "");
+  if (_currentCallId) {
+    $("reanalyze").style.display = "inline-block";
+    $("reanalyzeStatus").textContent = "";
+  }
+}
+
+async function reanalyzeCall() {
+  if (!_currentCallId) return;
+  $("reanalyze").disabled = true;
+  $("reanalyzeStatus").textContent = "analyzing…";
+  try {
+    const r = await fetch("/dev/reanalyze?call_id=" + encodeURIComponent(_currentCallId) + "&tenant=dev", { method: "POST" });
+    const data = await r.json();
+    if (!r.ok) { $("reanalyzeStatus").textContent = "failed: " + (data.detail || r.status); return; }
+    renderOutcome(data);
+    $("reanalyzeStatus").textContent = "done";
+  } catch (e) {
+    $("reanalyzeStatus").textContent = "error: " + e.message;
+  } finally {
+    $("reanalyze").disabled = false;
+  }
 }
 
 function addTranscript(role, text) {
@@ -248,7 +274,11 @@ async function start() {
       return;
     }
     const msg = JSON.parse(e.data);
-    if (msg.type === "status") {
+    if (msg.type === "session") {
+      _currentCallId = msg.call_id;
+      $("reanalyze").style.display = "none";   // reset for new call
+      $("reanalyzeStatus").textContent = "";
+    } else if (msg.type === "status") {
       setStatus(msg.status);
       // Mute the mic whenever the agent is busy (synthesizing the opening,
       // thinking, or speaking) — not only while audio streams. Otherwise the
