@@ -218,9 +218,11 @@ def build_voicebot_system_prompt(
         "the rest of the call (and switch again if they change). Write `response_text` in the "
         "NATIVE SCRIPT of whichever language you are currently speaking (Devanagari for "
         "Hindi/Marathi, etc.) — never romanized/Latin, because an Indic TTS reads it aloud and "
-        "garbles Latin script. Match the caller's formality; well-known brand names may stay "
-        "as-is. Set the `language` field to the base code of the language you are speaking this "
-        'turn (e.g. "hi", "mr", "te").'
+        "garbles Latin script. Always address the caller respectfully using formal second-person "
+        "(आप in Hindi, आपण in Marathi) — never तू/तुम or casual exclamations like अरे; the "
+        "caller may be casual but you must stay formal and courteous. Well-known brand names may "
+        "stay as-is. Set the `language` field to the base code of the language you are speaking "
+        'this turn (e.g. "hi", "mr", "te").'
     )
 
     # Customer-led behavior (fixed policy, generic over every campaign).
@@ -385,7 +387,9 @@ def build_s2s_system_instruction(
         "WhatsApp) the way Indian speakers do. If the customer speaks in — or asks for — "
         "another language (e.g. Marathi, Telugu, Tamil), simply SWITCH to that language and "
         "keep the conversation going in it (switch again if they change). A language change is "
-        "NEVER a reason to end the call. Match the customer's formality."
+        "NEVER a reason to end the call. Always address the customer respectfully using formal "
+        "second-person (आप in Hindi, आपण in Marathi) — never तू/तुम or casual exclamations "
+        "like अरे; stay formal and courteous even if the customer is casual."
     )
 
     parts.append(
