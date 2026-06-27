@@ -231,36 +231,68 @@ def make_chatbot_factory(registry, sessionmaker=None, platform_retriever=None):
     from src.models.tenant import TenantSecret
 
     async def _load_crm_tools(tenant: TenantContext):
-        """Return (tool_specs, {name: exec_spec}) for the tenant's CRM tools."""
-        if sessionmaker is None:
-            return [], {}
+        """Return (tool_specs, {name: exec_spec}) for the tenant's CRM tools.
+
+        Priority:
+        1. Tenant-specific tools registered in the chat_tools DB table.
+        2. Platform catalog (catalog.ALL_TOOLS) built from the tenant's
+           ``crm:*`` secrets + ``PLATFORM_CRM_BASE_URL`` env fallback — no
+           per-tenant DB registration required.
+        """
+        import os
+        from src.chatbot.catalog import ALL_TOOLS
+
         specs: list[ToolSpec] = []
         execs: dict[str, dict] = {}
-        async with sessionmaker() as db:
-            rows = (await db.execute(
-                select(ChatTool).where(ChatTool.tenant_id == tenant.id)
-            )).scalars().all()
-            for r in rows:
-                specs.append(ToolSpec(
-                    name=r.name, description=r.description,
-                    parameters=_crm_params_to_schema(r.parameters)))
-                token = None
-                secret_name = (r.auth_config or {}).get("token_secret_name")
-                if secret_name:
-                    sec = (await db.execute(
-                        select(TenantSecret).where(
-                            TenantSecret.tenant_id == tenant.id,
-                            TenantSecret.name == secret_name)
-                    )).scalar_one_or_none()
-                    if sec is not None:
-                        try:
-                            token = crypto.decrypt(sec.value_encrypted)
-                        except Exception:  # noqa: BLE001 — bad/again token → unauth call
-                            token = None
-                execs[r.name] = {
-                    "endpoint": r.endpoint, "method": r.method,
-                    "parameters": r.parameters or {}, "auth_type": r.auth_type, "token": token,
-                    "extra_headers": (r.auth_config or {}).get("extra_headers")}
+        if sessionmaker is not None:
+            async with sessionmaker() as db:
+                rows = (await db.execute(
+                    select(ChatTool).where(ChatTool.tenant_id == tenant.id)
+                )).scalars().all()
+                for r in rows:
+                    specs.append(ToolSpec(
+                        name=r.name, description=r.description,
+                        parameters=_crm_params_to_schema(r.parameters)))
+                    token = None
+                    secret_name = (r.auth_config or {}).get("token_secret_name")
+                    if secret_name:
+                        sec = (await db.execute(
+                            select(TenantSecret).where(
+                                TenantSecret.tenant_id == tenant.id,
+                                TenantSecret.name == secret_name)
+                        )).scalar_one_or_none()
+                        if sec is not None:
+                            try:
+                                token = crypto.decrypt(sec.value_encrypted)
+                            except Exception:  # noqa: BLE001
+                                token = None
+                    execs[r.name] = {
+                        "endpoint": r.endpoint, "method": r.method,
+                        "parameters": r.parameters or {}, "auth_type": r.auth_type,
+                        "token": token,
+                        "extra_headers": (r.auth_config or {}).get("extra_headers")}
+
+        if specs:
+            return specs, execs  # tenant-specific tools take precedence
+
+        # ── Platform catalog fallback ─────────────────────────────────────
+        sr = tenant.secrets_resolved
+        base_url = (sr.get("crm:base_url") or os.environ.get("PLATFORM_CRM_BASE_URL", "")).rstrip("/")
+        if not base_url:
+            return [], {}
+
+        api_token = sr.get("crm:api_token")
+        auth_type = sr.get("crm:auth_type") or "api_key"
+        for name, spec in ALL_TOOLS.items():
+            endpoint = base_url + spec["default_path"]
+            specs.append(ToolSpec(
+                name=name, description=spec["description"],
+                parameters=_crm_params_to_schema(spec["parameters"])))
+            execs[name] = {
+                "endpoint": endpoint, "method": spec.get("method", "GET"),
+                "parameters": spec["parameters"], "auth_type": auth_type,
+                "token": api_token, "extra_headers": None,
+            }
         return specs, execs
 
     async def factory(tenant: TenantContext, session_id: str) -> ChatBotAgent:

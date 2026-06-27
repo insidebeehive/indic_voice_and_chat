@@ -438,39 +438,21 @@ async function loadChat(id, slug) {
 
   // Derive CRM seed hints from existing tools
   const firstTool = tools[0];
-  let crmBase = "";
-  if (firstTool) {
-    // Longest common URL prefix across all tool endpoints (= crm_base_url at seed time)
-    let common = firstTool.endpoint;
-    for (const t of tools) {
-      while (common && !t.endpoint.startsWith(common))
-        common = common.slice(0, common.lastIndexOf("/"));
-    }
-    crmBase = common || "";
-  }
-  const crmAuthType  = firstTool?.auth_type || "api_key";
-  const crmHasToken  = tools.some(t => t.auth_configured);
-  const crmOpId      = tools.find(t => t.operator_id)?.operator_id || "";
+  const crmCfg = cfg.crm || {};
 
   $("pane_chat").innerHTML = `
     <div class="hint" style="margin-bottom:.6rem;">
-      Register CRM API tools the chatbot may call. Use <b>Seed from catalog</b> to register all
-      standard betting-platform tools at once (wallet, bets, transactions, bonuses, profile,
-      operator config, etc.).
+      CRM tools (wallet, bets, transactions, bonuses, profile, operator config) are built in
+      at the platform level. Set the API credentials below — no per-tenant seeding required.
     </div>
 
-    <h2>Registered tools</h2>
-    <table style="margin-bottom:.8rem;">
-      <thead><tr><th>Name</th><th>Endpoint</th><th>Auth type</th><th>Token set</th><th></th></tr></thead>
-      <tbody id="ch_toolrows">${toolRows}</tbody>
-    </table>
-
-    <h2>Seed from catalog</h2>
+    <h2>CRM API credentials</h2>
     <div class="hint" style="margin-bottom:.5rem;">
-      Registers all standard CRM tools for this tenant. Existing tools with the same name are updated (upsert).
+      Credentials used when the chatbot calls the BetStudio CRM APIs on behalf of this operator.
+      Leave <b>Base URL</b> blank to use the platform default (<code>PLATFORM_CRM_BASE_URL</code>).
     </div>
     <div class="creds" style="gap:.6rem;flex-wrap:wrap;">
-      <label>CRM base URL
+      <label>Base URL <small class="hint">(blank = platform default)</small>
         <input id="ch_base" style="width:22rem" placeholder="https://apistage.betstudio.io/api" />
       </label>
       <label>Auth type
@@ -479,17 +461,24 @@ async function loadChat(id, slug) {
           <option value="bearer">bearer (Authorization: Bearer)</option>
         </select>
       </label>
-      <label>CRM API token <small class="hint">(encrypted at rest)</small>
+      <label>API token <small class="hint">(encrypted at rest)</small>
         <input id="ch_token" type="password" style="width:18rem" placeholder="token value" />
       </label>
-      <label>Operator ID <small class="hint">(sent as operatorid header)</small>
+      <label>Operator ID
         <input id="ch_opid" style="width:16rem" placeholder="ab858a8c-7ad4-47d2-a0b7-…" />
       </label>
     </div>
     <div style="margin-top:.8rem;">
-      <button onclick="saveCrmConfig('${escAttr(slug)}')">Seed / update CRM tools</button>
+      <button onclick="saveCrmConfig('${escAttr(slug)}')">Save CRM credentials</button>
       <span id="ch_result" class="hint" style="margin-left:.6rem;"></span>
     </div>
+
+    <h2 style="margin-top:1.2rem;">Registered tools <small class="hint">(per-tenant overrides)</small></h2>
+    <div class="hint" style="margin-bottom:.4rem;">Platform catalog tools are used automatically. Tools here override or extend the catalog.</div>
+    <table style="margin-bottom:.8rem;">
+      <thead><tr><th>Name</th><th>Endpoint</th><th>Auth type</th><th>Token set</th><th></th></tr></thead>
+      <tbody id="ch_toolrows">${toolRows}</tbody>
+    </table>
 
     <h2 style="margin-top:1.2rem;">Chatwoot integration</h2>
     <div class="hint" style="margin-bottom:.5rem;">
@@ -516,11 +505,11 @@ async function loadChat(id, slug) {
       <span id="cw_result" class="hint" style="margin-left:.6rem;"></span>
     </div>`;
 
-  // Pre-populate CRM seed form from existing tools
-  if (crmBase)    $("ch_base").value = crmBase;
-  if (crmAuthType) $("ch_authtype").value = crmAuthType;
-  if (crmHasToken) $("ch_token").placeholder = "... (already set — leave blank to keep)";
-  if (crmOpId)    $("ch_opid").value = crmOpId;
+  // Pre-populate CRM credentials form from chat-config
+  if (crmCfg.base_url)    $("ch_base").value       = crmCfg.base_url;
+  if (crmCfg.auth_type)   $("ch_authtype").value   = crmCfg.auth_type;
+  if (crmCfg.api_token)   $("ch_token").placeholder = "... (already set — leave blank to keep)";
+  if (crmCfg.operator_id) $("ch_opid").value        = crmCfg.operator_id;
 
   // Pre-populate Chatwoot form from existing config
   if (cw.inbox_id)   $("cw_inbox").value   = cw.inbox_id;
@@ -546,21 +535,18 @@ async function saveChatwootConfig(slug) {
 }
 
 async function saveCrmConfig(slug) {
-  const crm_base_url = $("ch_base").value.trim();
-  const auth_type    = $("ch_authtype").value;
-  const auth_token   = $("ch_token").value.trim();
-  const operator_id  = $("ch_opid").value.trim();
-  if (!crm_base_url) { $("ch_result").textContent = "CRM base URL is required"; return; }
-  const body = { crm_base_url, auth_type };
-  if (auth_token)  body.auth_token  = auth_token;
-  if (operator_id) body.operator_id = operator_id;
+  const base_url    = $("ch_base").value.trim();
+  const auth_type   = $("ch_authtype").value;
+  const api_token   = $("ch_token").value.trim();
+  const operator_id = $("ch_opid").value.trim();
+  const crm = { auth_type };
+  if (base_url)    crm.base_url    = base_url;
+  if (api_token)   crm.api_token   = api_token;
+  if (operator_id) crm.operator_id = operator_id;
   $("ch_result").textContent = "saving…";
-  const r = await apiTenant("POST", "/api/v1/chat/tools/from-catalog", body, slug);
-  if (r.ok) {
-    $("ch_result").textContent = `✓ ${r.json.registered} tools registered: ${(r.json.tool_names || []).join(", ")}`;
-  } else {
-    $("ch_result").textContent = `Error ${r.status}: ${r.json.detail || JSON.stringify(r.json)}`;
-  }
+  const tid = SELECTED;
+  const r = await apiSend("PATCH", `/api/v1/tenants/${tid}`, { crm });
+  $("ch_result").textContent = r.ok ? "✓ CRM credentials saved" : `Error ${r.status}: ${r.json.detail || JSON.stringify(r.json)}`;
 }
 
 async function deleteTool(slug, name) {

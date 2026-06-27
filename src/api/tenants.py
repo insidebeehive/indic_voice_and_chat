@@ -297,11 +297,20 @@ class ChatwootUpdateIn(BaseModel):
     inbox_id: Optional[str] = None         # Chatwoot inbox ID for webhook tenant lookup (no bearer needed)
 
 
+class CrmCredentialsIn(BaseModel):
+    """Platform-catalog CRM credentials — stored as TenantSecrets / pipeline_config."""
+    base_url: Optional[str] = None       # per-tenant override; falls back to PLATFORM_CRM_BASE_URL env
+    auth_type: Optional[str] = None      # api_key | bearer  (default: api_key)
+    api_token: Optional[str] = None      # write-only; never returned
+    operator_id: Optional[str] = None    # stored in pipeline_config.crm.operator_id
+
+
 class UpdateTenantRequest(BaseModel):
     status: Optional[str] = Field(default=None, pattern="^(active|suspended)$")
     events_webhook_url: Optional[str] = None
     telephony: Optional[TelephonyUpdateIn] = None
     chatwoot: Optional[ChatwootUpdateIn] = None
+    crm: Optional[CrmCredentialsIn] = None
 
 
 class UpdateTenantResponse(BaseModel):
@@ -433,8 +442,38 @@ async def update_tenant(
                     tenant_id=tenant_id, name=name,
                     value_encrypted=crypto.encrypt(value)))
 
+    if req.crm is not None:
+        crm = req.crm
+        if not crypto.has_key():
+            raise HTTPException(
+                status_code=503,
+                detail="VOX_SECRET_KEY is not set — cannot encrypt CRM credentials")
+        crm_secrets = {}
+        if crm.base_url is not None:
+            crm_secrets["crm:base_url"] = crm.base_url
+        if crm.auth_type is not None:
+            crm_secrets["crm:auth_type"] = crm.auth_type
+        if crm.api_token is not None:
+            crm_secrets["crm:api_token"] = crm.api_token
+        for name, value in crm_secrets.items():
+            existing = (await session.execute(
+                select(TenantSecret).where(
+                    TenantSecret.tenant_id == tenant_id, TenantSecret.name == name)
+            )).scalar_one_or_none()
+            if existing is not None:
+                existing.value_encrypted = crypto.encrypt(value)
+            else:
+                session.add(TenantSecret(
+                    tenant_id=tenant_id, name=name,
+                    value_encrypted=crypto.encrypt(value)))
+        if crm.operator_id is not None:
+            crm_cfg = dict(pc.get("crm") or {})
+            crm_cfg["operator_id"] = crm.operator_id
+            pc["crm"] = crm_cfg
+
     if req.status is not None or req.events_webhook_url is not None \
-            or req.telephony is not None or req.chatwoot is not None:
+            or req.telephony is not None or req.chatwoot is not None \
+            or req.crm is not None:
         t.pipeline_config = pc  # reassign (new object) so the JSON column is marked dirty
 
     await session.commit()
@@ -567,6 +606,12 @@ async def get_chat_config(
             "account_id": sr.get("chatwoot:account_id") or "",
             "api_url":    sr.get("chatwoot:api_url") or "",
             "api_token":  "..." if sr.get("chatwoot:api_token") else "",
+        },
+        "crm": {
+            "base_url":   sr.get("crm:base_url") or "",
+            "auth_type":  sr.get("crm:auth_type") or "api_key",
+            "api_token":  "..." if sr.get("crm:api_token") else "",
+            "operator_id": ctx.settings.crm.operator_id or "",
         },
     }
 
