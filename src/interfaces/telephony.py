@@ -49,3 +49,12 @@ class ITelephonyProvider(ABC):
     @abstractmethod
     async def transfer(self, session_id: str, to_number: str) -> None:
         """Transfer the call to another number (warm transfer)."""
+
+    @abstractmethod
+    async def redirect_to_stream(self, call_sid: str, stream_wss_url: str) -> None:
+        """Redirect a live in-progress call to stream audio to ``stream_wss_url``.
+
+        Used by the CRM patch-in handoff: the CRM holds a customer on a live
+        call, then calls our handoff endpoint which calls this method to
+        transition the media stream to our AI bridge WebSocket.
+        """

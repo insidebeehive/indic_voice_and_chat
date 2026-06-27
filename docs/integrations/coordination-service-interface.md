@@ -40,7 +40,7 @@ Customer (any channel)
 │                                                             │  │
 │  Voice channel adapters (Phase 2 — skeleton only):          │  │
 │    Intercepts call_offer (pstn transport)                    │  │
-│    Bridges provider audio ↔ AI Platform voice WS            │  │
+│    Dials out via provider; hands off to AI Platform          │  │
 └────────────────────────────────────────────────────────────┘  │
         │                                     ┌───────────────────┘
         │ webhooks + escalation events         ▼
@@ -73,6 +73,8 @@ Customer (any channel)
 | Human agent console (claim + agent-ws) | CSS calls AI Platform directly | CSS calls CS; CS proxies to AI Platform |
 | Webhook events receiver | CSS | stays with CSS (CS forwards our events) |
 | Direct-human chat WS | CSS | stays with CSS (CSS-owned; CS not involved for `operator_flag=human`) |
+| Outbound pstn dialing | us (Call Lead API) | CS dials, uses our answer URL — we handle audio |
+| Pstn audio bridge | us | stays with us (CS is NOT in the audio path) |
 | STT (Sarvam, Deepgram, Gemini) | us | stays with us |
 | LLM (Gemini) | us | stays with us |
 | TTS | us | stays with us |
@@ -166,17 +168,23 @@ CS handles based on transport:
         │
   transport = pstn:
     CS intercepts the frame (does NOT forward to CRM Frontend)
-    CS calls IVoiceChannel.initiate_call(to, from_, stream_url=call_url, callback_url)
-    CS bridges provider audio ↔ AI Platform voice WS (call_url)
-    CRM Frontend receives mode_change{mode:"voice_pending"} instead
+    CS sends CRM Frontend: {"type":"mode_change","mode":"voice_pending","message":"Calling you now…"}
+    CS pre-registers the call:
+      POST /api/v1/telephony/register-call  { provider, provider_call_sid, lead_id }
+      → receives call_id; call.initiated fires → CS webhook
+    CS dials the customer via the telephony provider, setting our answer URL:
+      https://{host}/api/v1/telephony/{provider}/voice/{tenant_slug}
+    Customer answers → our AI bridge takes over automatically
+      call.answered fires → CS webhook
         │
-   call ends (pstn only):
+   call ends:
         │
-    Provider POSTs callback ──► CS
-    CS calls: POST /api/v1/chat/sessions/{session_id}/end
-    AI Platform emits session_closed webhook ──► CS ──► CSS
-    CS sends CRM Frontend an ended frame
+    call.completed (outcome + summary) fires → CS webhook → CSS
+    CS sends CRM Frontend: {"type":"ended"}
 ```
+
+CS is NOT in the audio path for pstn calls — we handle the media stream directly
+once the provider fires our answer URL. CS just dials and waits for webhooks.
 
 Chat transcript (before the voice call) is already in our DB.  
 Voice recording — if any — is an optional concern for the CRM team.  
@@ -205,17 +213,22 @@ AI is in an active chat session via CS relay
 AI decides to call the customer back
         │
 AI Platform sends call_offer with transport=pstn over the relay WS
-CS intercepts; calls IVoiceChannel.initiate_call(to, ...)
-CS dials the customer; bridges provider audio ↔ AI Platform voice WS (call_url)
+CS intercepts; pre-registers the call:
+  POST /api/v1/telephony/register-call  { provider, provider_call_sid, lead_id }
+  → call.initiated fires → CS webhook
+CS dials the customer via the telephony provider, setting our answer URL:
+  https://{host}/api/v1/telephony/{provider}/voice/{tenant_slug}
+Customer answers → our AI bridge takes over automatically
+  call.answered fires → CS webhook
         │
    call ends
         │
-Provider POSTs callback ──► CS
-CS calls: POST /api/v1/chat/sessions/{session_id}/end
-AI Platform emits session_closed webhook (with transcript + summary) ──► CS ──► CSS
+call.completed (outcome + summary) fires → CS webhook → CSS
 ```
 
-We generate the transcript on our side because we ran the full conversation — CSS receives it via the `session_closed` webhook.
+CS is NOT in the audio path — we handle media streaming directly.
+We generate the transcript because we ran the full conversation — CSS receives
+the outcome and summary via the `call.completed` webhook.
 
 ### 2. Human → Customer (support agent-initiated call)
 
@@ -252,101 +265,138 @@ CS must also:
 
 ### Voice handoff (pstn transport)
 
+Applies to Twilio and Exotel. Stringee is turn-based IVR and does not support
+live call redirect.
+
 When AI Platform sends a `call_offer` frame with `transport=pstn` over the chat relay:
 
 ```json
 {
   "type": "call_offer",
   "transport": "pstn",
-  "call_url": "wss://ai.example.com/voice/ws/plat_7f3a9b2e",
   "to": "+919876543210"
 }
 ```
 
-CS must:
-1. **Intercept** this frame — do not forward to CRM Frontend.
-2. Call `IVoiceChannel.initiate_call(to=frame.to, from_=tenant.caller_id, stream_url=frame.call_url, callback_url=cs_callback_url)`.
-3. Bridge provider audio ↔ `frame.call_url` (AI Platform voice WS).
-4. Send CRM Frontend: `{"type":"mode_change","mode":"voice_pending","message":"Calling you now…"}`
-5. When call ends: call `POST /api/v1/chat/sessions/{session_id}/end` on AI Platform.
-6. Send CRM Frontend: `{"type":"ended"}`
+**CS is not in the audio path.** CS dials the customer and hands the media stream
+to us via the answer URL. Choose one of the two patterns below.
 
-For `websocket` and `webrtc` transports, CS forwards the `call_offer` frame as-is — CS is not in the audio path.
+---
 
-### Audio stream (pstn bridging)
+#### Pattern A — Answer URL (recommended)
 
-For pstn calls, CS bridges bidirectionally between the voice provider (customer's phone) and our voice WS at `call_url`:
+CS places the call and our answer URL fires when the customer answers.
 
-```
-Customer phone ──► provider RTP ──► CS bridge ──► PCM-16 binary ──► call_url (AI Platform)
-Customer phone ◄── provider RTP ◄── CS bridge ◄── PCM-16 binary ◄── call_url (AI Platform)
-```
+1. **Intercept** the `call_offer` frame — do not forward to CRM Frontend.
+2. Send CRM Frontend: `{"type":"mode_change","mode":"voice_pending","message":"Calling you now…"}`
+3. **Dial** via the telephony provider, setting our slug-scoped answer URL as the webhook:
+   ```
+   https://{host}/api/v1/telephony/{provider}/voice/{tenant_slug}
+   ```
+   The provider returns the call SID synchronously in its response.
+4. **Register** the SID with us so we have a conversation row before the webhook fires:
+   ```
+   POST /api/v1/telephony/register-call
+   Authorization: Bearer <tenant-token>
+   Content-Type: application/json
 
-After STT → LLM → TTS (or S2S), AI Platform sends the output audio back as PCM-16 binary frames on the same `call_url` connection. CS receives them and forwards them to the provider, which plays the audio to the customer's phone.
+   {
+     "provider": "twilio",
+     "provider_call_sid": "<sid-from-step-3>",
+     "lead_id": "..."
+   }
+   ```
+   Response `201`: `{ "call_id": "call_...", "status": "in_progress" }`  
+   Fires `call.initiated` (with `"source": "crm_register"`) to the CS webhook immediately.
 
-For `websocket` and `webrtc` transports the same principle holds, but CRM Frontend is connected directly to `call_url` — CRM Frontend sends mic audio in and receives TTS/S2S output back, with no CS in the audio path.
+5. Customer answers → provider fires our answer URL → AI bridge starts → `call.answered` fires.
+6. When `call.completed` arrives on the CS webhook, send CRM Frontend: `{"type":"ended"}`
 
-- **Binary frames (bidirectional):** PCM-16, 16 kHz, mono, little-endian (~20 ms chunks)
-- **Text frames (JSON):**
+---
 
-| Direction | Frame | When |
-|---|---|---|
-| CS → us | `{"type":"start"}` | Stream ready |
-| CS → us | `{"type":"barge_in"}` | Customer started speaking (CS VAD detected) |
-| CS → us | `{"type":"end"}` | CS terminating the call |
-| Us → CS | `{"type":"escalation","reason":"...","summary":"..."}` | AI requests human handover |
-| Us → CS | `{"type":"ended","summary":"..."}` | AI ended the call |
+#### Pattern B — Mid-call patch-in
 
-### Session end (pstn call completion)
+Use when CS needs to hold the customer (play a disclosure, route through its own
+IVR) before engaging the AI.
 
-When a pstn call ends, CS calls:
+1. CS dials the customer; holds them on IVR/hold music.
+2. When ready, call the handoff endpoint with the **live** call SID:
+   ```
+   POST /api/v1/telephony/handoff
+   Authorization: Bearer <tenant-token>
+   Content-Type: application/json
 
-```
-POST /api/v1/chat/sessions/{session_id}/end
-Authorization: Bearer <tenant-token>
-Content-Type: application/json
+   {
+     "provider": "twilio",
+     "call_sid": "CAxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+     "lead_id": "...",
+     "crm_account_sid": null,   // omit if using the tenant's stored credentials
+     "crm_auth_token": null
+   }
+   ```
+   Response `200`: `{ "call_id": "call_...", "status": "answered", "provider_call_sid": "..." }`
 
-{
-  "call_id":    "cs-call-xyz",
-  "status":    "completed | failed | no_answer",
-  "duration_s": 142
-}
-```
+   We call the provider's live-call update API to redirect the active call's media
+   stream to our AI bridge WebSocket. Both `call.initiated` and `call.answered` fire
+   immediately. `call.completed` fires at teardown.
 
-We respond by emitting the `session_closed` webhook (which CS then forwards to CSS).
+3. Send CRM Frontend: `{"type":"ended"}` when `call.completed` arrives.
+
+**Credential ownership for Pattern B:** by default we use the tenant's stored
+telephony credentials. If CS holds the call on a **separate** Twilio/Exotel
+account, pass `crm_account_sid` + `crm_auth_token` in the request, or redirect the
+call to our answer URL using CS's own Twilio client and use Pattern A instead.
+
+---
+
+#### Pattern B error responses
+
+| Status | Meaning |
+|---|---|
+| 400 | Provider unsupported (e.g. `stringee`) or credentials unresolvable |
+| 409 | SID already registered — return the existing `call_id` |
+| 502 | Provider rejected redirect (call already ended, SID invalid) |
+| 503 | AI bridge not ready — retry in a few seconds |
+
+---
+
+For `websocket` and `webrtc` transports, CS forwards the `call_offer` frame as-is
+— CS is not in the audio path for those either.
 
 ---
 
 ## Summarization API
 
-Voice-only. For call recordings where audio is the only record of what was said.
+Voice-only. For softphone calls where the human agent handled the conversation
+and a recording is the only record of what was said (the AI was not on the call).
 
 ```
-POST /api/v1/summarize/call
+POST /api/v1/calls/{call_id}/summarize-outcome
 Authorization: Bearer <tenant-token>
 Content-Type: multipart/form-data
 
 Fields:
-  audio      — call recording file
-  audio_mime — MIME type (audio/mpeg, audio/wav, audio/webm, audio/ogg)
-  metadata   — optional JSON: { "session_id", "participants": ["ai","human_agent","customer"] }
+  audio      — call recording file (required)
+  audio_mime — MIME type, e.g. audio/mpeg, audio/wav (optional; inferred from file if omitted)
 ```
+
+`call_id` is the platform call identifier returned by `POST /telephony/register-call`
+or present in `call.initiated` webhook events. The call row must already exist (it
+is created by the normal softphone flow or register-call).
 
 Response `200`:
 ```json
 {
-  "transcript": [
-    { "role": "customer",     "text": "My withdrawal has been pending for 3 days.", "ts": 0.0  },
-    { "role": "ai",           "text": "I can see your withdrawal of ₹5,000...",    "ts": 4.2  },
-    { "role": "human_agent",  "text": "I'll escalate this to our finance team.",   "ts": 38.1 }
-  ],
-  "summary": "Customer raised a 3-day withdrawal delay. AI clarified status. Human agent escalated to finance team.",
-  "outcome": "resolved | escalated | no_resolution",
-  "action_items": [
-    "Finance team to follow up on withdrawal within 24 hours"
-  ]
+  "call_id": "call_4a3f2b1c8d9e0f1a",
+  "outcome": "callback_requested",
+  "summary": "Customer asked to be called back tomorrow morning.",
+  "notes": "Mentioned competitor pricing; prefers Hindi.",
+  "callback_at": "2026-06-20T04:30:00+00:00"
 }
 ```
+
+The response also persists the outcome to the call row and emits `call.completed`
+to the tenant's `events_webhook_url`.
 
 **When to call it:**
 
@@ -354,9 +404,9 @@ Response `200`:
 |---|---|
 | Customer → AI (chat only) | No — text transcript already in DB |
 | Customer → AI → Human (chat) | No — text transcript already in DB |
-| Customer → AI → Voice (pstn) | Optional — CRM's choice |
-| AI → Customer outbound (pstn) | Not needed — transcript in session_closed webhook |
-| Human → Customer (outbound) | Optional — CRM's choice |
+| Customer → AI → Voice (pstn) | No — AI transcript available via `GET /conversations` |
+| AI → Customer outbound (pstn) | No — outcome in `call.completed` webhook |
+| Human → Customer softphone | Yes — when `outcome` is `null` or `recording-unavailable` |
 
 ---
 
@@ -371,7 +421,44 @@ Validate every inbound and outbound scenario end-to-end through CS. Run in paral
 **Phase 3 — Cut over**  
 Once CS is proven, switch production tenants to route through CS. Direct CRM Backend → AI Platform calls are retired.
 
-**Phase 4 — Voice channel adapters**  
-With chat relay stable, implement real voice channel adapters (Twilio, SIP/DiDLogic, WebRTC) so `pstn`-transport calls go live. Each adapter is independent — add one, register it, test it. No architectural changes to the chat relay.
+**Phase 4 — Voice channel (pstn)**  
+With chat relay stable, wire up pstn voice for CS. CS places calls via the tenant's
+telephony provider and uses our slug-scoped answer URL — no audio bridge needed on
+the CS side. CS only needs: (a) outbound dialing via the provider SDK, (b) a call
+to `POST /api/v1/telephony/register-call`, and (c) reception of `call.completed`
+webhooks. See the "Voice handoff" section above.
 
 Each phase is independently deployable. Rollback at any phase = switch tenant config back to previous path.
+
+---
+
+## Reconciliation
+
+If `events_webhook_url` is not configured, or webhook delivery fails, CS can
+recover outcomes via polling or re-analysis.
+
+**List recent calls** (poll for `outcome: null`):
+```
+GET /api/v1/conversations?limit=20&offset=0
+Authorization: Bearer <tenant-token>
+```
+
+**Re-run outcome analysis** from the stored transcript (AI voicebot calls):
+```
+POST /api/v1/conversations/{call_id}/reanalyze
+Authorization: Bearer <tenant-token>
+```
+Returns `{ call_id, outcome, summary, notes, analysis_source }` and updates the row.
+
+**Upload recording for analysis** (softphone / human-agent calls):
+```
+POST /api/v1/calls/{call_id}/summarize-outcome
+Authorization: Bearer <tenant-token>
+Content-Type: multipart/form-data
+
+Fields:
+  audio      — recording file (required)
+  audio_mime — MIME type, e.g. audio/mpeg (optional)
+```
+Returns `{ call_id, outcome, summary, notes, callback_at }` and also emits
+`call.completed` to the tenant's `events_webhook_url`.

@@ -131,6 +131,25 @@ class ExotelAdapter(ITelephonyProvider):
             resp = await client.post(self._account_url("Calls", session_id), data=data)
             resp.raise_for_status()
 
+    async def redirect_to_stream(self, call_sid: str, stream_wss_url: str) -> None:
+        """Redirect a live call's media to our Voicebot Streaming WebSocket.
+
+        Exotel's live-call update endpoint accepts an ``Xml`` body parameter
+        containing ExotelML. We pass the same ``<Connect><Stream>`` XML that
+        the answer webhook returns, which causes Exotel to transition the
+        active call onto the streaming WS.
+        """
+        xml = (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            "<Response>"
+            f'<Connect><Stream url="{stream_wss_url}"/></Connect>'
+            "</Response>"
+        )
+        data = {"Xml": xml}
+        async with httpx.AsyncClient(auth=self._auth, timeout=self._timeout) as client:
+            resp = await client.post(self._account_url("Calls", call_sid), data=data)
+            resp.raise_for_status()
+
     # --- Media Streams stubs --------------------------------------------
     # The canonical bridge lives in ``src/bootstrap.py``; see
     # ``ExotelMediaBridge``. These remain unimplemented at the adapter

@@ -39,6 +39,7 @@ async def insert_call(
     voice: Optional[str] = None,
     mode: Optional[str] = None,
     agent_type: str = "voicebot",
+    extra_event_data: Optional[dict] = None,
 ) -> Conversation:
     """Insert an ``in_progress`` conversation row snapshotting the config used.
 
@@ -70,11 +71,13 @@ async def insert_call(
     )
     session.add(row)
     await session.commit()
+    event_data: dict = {"provider_call_sid": provider_call_sid, "mode": eff_mode,
+                        "campaign_id": campaign_id, "lead_id": lead_id}
+    if extra_event_data:
+        event_data.update(extra_event_data)
     await emit_tenant_event(build_envelope(
         event_type="call.initiated", call_id=call_id, tenant_id=tenant.id,
-        channel=channel_label(agent_type),
-        data={"provider_call_sid": provider_call_sid, "mode": eff_mode,
-              "campaign_id": campaign_id, "lead_id": lead_id}))
+        channel=channel_label(agent_type), data=event_data))
     return row
 
 

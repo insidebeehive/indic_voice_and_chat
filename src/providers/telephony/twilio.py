@@ -92,3 +92,16 @@ class TwilioAdapter(ITelephonyProvider):
             self._client.calls(session_id).update(twiml=twiml)
 
         await asyncio.to_thread(_transfer)
+
+    async def redirect_to_stream(self, call_sid: str, stream_wss_url: str) -> None:
+        twiml = (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            "<Response>"
+            f'<Connect><Stream url="{stream_wss_url}"/></Connect>'
+            "</Response>"
+        )
+
+        def _redirect() -> None:
+            self._client.calls(call_sid).update(twiml=twiml)
+
+        await asyncio.to_thread(_redirect)

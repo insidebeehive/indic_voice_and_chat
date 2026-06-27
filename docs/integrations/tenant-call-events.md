@@ -71,11 +71,13 @@ Every event has this shape:
   "provider_call_sid": "<telephony provider call id>",
   "mode": "layered",
   "campaign_id": "c_123",
-  "lead_id": "l_456"
+  "lead_id": "l_456",
+  "source": null
 }
 ```
 - `mode`: `layered` (STT→LLM→TTS cascade) or `s2s` (speech-to-speech).
 - `campaign_id` / `lead_id`: `null` for ad-hoc/dev-console calls.
+- `source`: how the call was created. `null` = platform initiated via `POST /campaigns/{id}/calls`; `"crm_register"` = CRM pre-registered a call it placed; `"crm_handoff"` = CRM patched a live call into the AI bridge.
 
 ### `call.answered` — callee picked up
 ```json
@@ -112,10 +114,24 @@ Every event has this shape:
 #### `outcome` values
 ```
 interested · callback_requested · not_interested · refused ·
-escalated · angry_hostile · no_answer · voicemail · busy · call_failed
+escalated · angry_hostile · no_answer · voicemail · busy · call_failed ·
+recording-unavailable
 ```
-The first six are AI-classified from the conversation; the last four are derived
-from telephony status when the call never connected.
+The first six are AI-classified from the conversation. The next four
+(`no_answer`, `voicemail`, `busy`, `call_failed`) are derived from telephony
+status when the call never connected. `recording-unavailable` is set on softphone
+(human-agent) calls when the recording webhook never arrives — the CRM can recover
+the outcome by calling `POST /calls/{call_id}/summarize-outcome` with the audio
+file once it has it.
+
+## Reconciliation
+
+If `call.completed` is never received (webhook delivery failed, or outcome analysis
+timed out), recover via `GET /api/v1/conversations` (poll for `outcome: null`) or
+`POST /api/v1/conversations/{call_id}/reanalyze` (re-run LLM analysis from stored
+transcript). For softphone calls without a transcript, use
+`POST /api/v1/calls/{call_id}/summarize-outcome` with the recording. See
+`coordination-service-interface.md` for full endpoint details.
 
 ## Notes
 - Match events to a call via `call_id` (stable) or `data.provider_call_sid`.

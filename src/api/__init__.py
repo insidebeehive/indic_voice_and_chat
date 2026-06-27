@@ -15,6 +15,7 @@ from src.api import (
     knowledge,
     sessions,
     softphone,
+    telephony_crm,
     telephony_hooks,
     tenants,
     webhooks_routes,
@@ -36,3 +37,4 @@ api_router.include_router(chat.router)
 api_router.include_router(chat_tools.router)
 api_router.include_router(external_chat.router)
 api_router.include_router(telephony_hooks.router)
+api_router.include_router(telephony_crm.router)

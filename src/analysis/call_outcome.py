@@ -130,15 +130,18 @@ async def analyze_call(
             analysis_source="telephony",
         )
 
-    # Empty transcript (the line dropped before anything was said / committed) —
-    # there is nothing to classify. Don't run the LLM, which otherwise guesses
-    # "refused" on an empty transcript. Treat it as NO_ANSWER (a neutral,
-    # non-conversational outcome), never as a lead-driven refusal.
-    has_content = any((m.content or "").strip() for m in transcript if m.role != "system")
-    if not has_content:
+    # If the lead never spoke (empty transcript, or agent greeted but got silence),
+    # skip the LLM — it would pick "refused" on a one-sided transcript, which is
+    # semantically wrong. Return NO_ANSWER instead.
+    has_lead_content = any(
+        (m.content or "").strip()
+        for m in transcript
+        if m.role not in ("system", "assistant")
+    )
+    if not has_lead_content:
         return CallAnalysis(
             outcome=LeadCallOutcome.NO_ANSWER,
-            summary="Call ended with no conversation.",
+            summary="Call ended with no response from the lead.",
             analysis_source="fallback",
         )
 
