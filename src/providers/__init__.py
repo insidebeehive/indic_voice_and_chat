@@ -19,6 +19,7 @@ from src.providers.llm.anthropic_claude import AnthropicClaudeAdapter
 from src.providers.llm.gemini import GeminiLLMAdapter
 from src.providers.llm.groq import GroqLLMAdapter
 from src.providers.stt.deepgram import DeepgramSTTAdapter
+from src.providers.stt.gemini import GeminiSTTAdapter
 from src.providers.stt.groq_whisper import GroqSTTAdapter
 from src.providers.stt.sarvam import SarvamSTTAdapter
 from src.providers.telephony.exotel import ExotelAdapter
@@ -35,6 +36,7 @@ from src.providers.vector_store.faiss_store import FAISSAdapter
 STT_PROVIDERS: dict[str, type[ISTTProvider]] = {
     "sarvam": SarvamSTTAdapter,
     "groq": GroqSTTAdapter,
+    "gemini": GeminiSTTAdapter,
 }
 
 STREAMING_STT_PROVIDERS: dict[str, type[IStreamingSTTProvider]] = {

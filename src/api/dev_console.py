@@ -186,7 +186,7 @@ async def dev_providers() -> dict:
     from src.providers import LLM_PROVIDERS, STREAMING_STT_PROVIDERS, STT_PROVIDERS, TTS_PROVIDERS
 
     _labels: dict[str, dict[str, str]] = {
-        "stt": {"sarvam": "Sarvam AI", "groq": "Groq Whisper"},
+        "stt": {"sarvam": "Sarvam AI", "groq": "Groq Whisper", "gemini": "Gemini Flash"},
         "stt_streaming": {"deepgram": "Deepgram (streaming)"},
         "llm": {"gemini": "Gemini Flash", "groq": "Groq Llama-3", "anthropic": "Claude", "claude": "Claude"},
     }
