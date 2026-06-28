@@ -21,7 +21,7 @@ import httpx
 from src.interfaces.stt import ISTTProvider, STTConfig, STTResult
 
 _BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"
-_DEFAULT_MODEL = "gemini-2.0-flash"
+_DEFAULT_MODEL = "gemini-2.5-flash"
 _TIMEOUT = 30.0
 
 SUPPORTED_LANGUAGES = [
