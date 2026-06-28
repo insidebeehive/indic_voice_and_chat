@@ -291,3 +291,9 @@ class StringeeAdapter(ITelephonyProvider):
             "call through a Stringee conference + bot-user client SDK bridge. "
             "See docs/stringee-streaming.md for the integration recipe."
         )
+
+    async def redirect_to_stream(self, call_sid: str, stream_wss_url: str) -> None:
+        raise NotImplementedError(
+            "Stringee does not support server-side media stream redirect. "
+            "See docs/stringee-streaming.md for the conference + bot-user bridge recipe."
+        )
