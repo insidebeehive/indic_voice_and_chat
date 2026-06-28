@@ -164,8 +164,13 @@ _TTS_META: dict[str, dict] = {
         "languages": ["hi-IN", "en-IN", "bn-IN", "gu-IN", "kn-IN", "ml-IN",
                       "mr-IN", "od-IN", "pa-IN", "ta-IN", "te-IN"],
     },
+    "gemini": {
+        "label": "Gemini TTS",
+        "languages": ["hi-IN", "en-IN", "bn-IN", "gu-IN", "ta-IN", "te-IN",
+                      "mr-IN", "kn-IN", "ml-IN", "pa-IN", "en-US", "40+ more"],
+    },
     "google": {
-        "label": "Google Neural2",
+        "label": "Google Neural2 (Cloud TTS API required)",
         "languages": ["hi-IN", "en-IN"],
     },
     "azure": {

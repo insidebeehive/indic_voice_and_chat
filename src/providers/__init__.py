@@ -27,6 +27,7 @@ from src.providers.telephony.stringee import StringeeAdapter
 from src.providers.telephony.telnyx import TelnyxAdapter
 from src.providers.telephony.twilio import TwilioAdapter
 from src.providers.tts.azure import AzureTTSAdapter
+from src.providers.tts.gemini import GeminiTTSAdapter
 from src.providers.tts.google import GoogleTTSAdapter
 from src.providers.tts.sarvam import SarvamTTSAdapter
 from src.providers.vector_store.faiss_store import FAISSAdapter
@@ -49,6 +50,7 @@ LLM_PROVIDERS: dict[str, type[ILLMProvider]] = {
 
 TTS_PROVIDERS: dict[str, type[ITTSProvider]] = {
     "sarvam": SarvamTTSAdapter,
+    "gemini": GeminiTTSAdapter,
     "google": GoogleTTSAdapter,
     "azure": AzureTTSAdapter,
 }
