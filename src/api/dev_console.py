@@ -16,6 +16,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
 
+import asyncio
+
 from fastapi import APIRouter, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
@@ -373,7 +375,14 @@ async def dev_place_call(req: PlaceCallRequest) -> dict:
         webhook_url=f"{webhook_base.rstrip('/')}/{answer_path}",
     )
     try:
-        session = await adapter.initiate_call(cfg)
+        # Hard 20-second cap so Northflank's 30-second proxy timeout is never
+        # reached — ensures a JSON error always makes it back to the browser.
+        session = await asyncio.wait_for(adapter.initiate_call(cfg), timeout=20.0)
+    except asyncio.TimeoutError:
+        if provider in _STREAM_PROVIDERS:
+            dev_call_control.pop_override(tenant.slug)
+        log.error("dev place-call timed out", extra={"tenant": tenant.slug, "provider": provider})
+        raise HTTPException(status_code=502, detail=f"call timed out after 20s — check {provider} API reachability from Northflank")
     except Exception as e:  # noqa: BLE001 - don't leave a stale override on failure
         if provider in _STREAM_PROVIDERS:
             dev_call_control.pop_override(tenant.slug)

@@ -108,7 +108,7 @@ class StringeeAdapter(ITelephonyProvider):
             or os.environ.get("STRINGEE_BASE_URL")
             or STRINGEE_BASE_URL
         ).rstrip("/")
-        self._timeout = config.get("timeout", 30.0)
+        self._timeout = config.get("timeout", 15.0)
         # ``userId`` is included in the callout body when set, but be aware:
         # a SERVER REST callout (/v1/call2/callout) is treated by Stringee as an
         # EXTERNAL phone->phone call regardless of this body field — it does NOT
