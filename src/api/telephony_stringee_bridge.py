@@ -171,13 +171,12 @@ class StringeeIvrBridge(OutcomeRecorderMixin):
     async def _synthesize_opening(self) -> list[dict]:
         try:
             await self._agent.start()
-            # Diagnostic: use talk (Stringee native TTS) to confirm IVR works
-            # before switching back to play + external audio URL.
-            script = getattr(self._agent, "_script", None)
-            opening_text = (getattr(script, "opening", None) or "").strip()
-            talk_text = opening_text or _REPROMPT_TEXT
+            # Diagnostic: hardcoded text to confirm talk works end-to-end.
+            # (Raw script.opening has unrendered {agent_name} etc. tokens that
+            # break Stringee's TTS and cause a silent immediate hangup.)
+            talk_text = "Namaste, kya aap baat kar sakte hain?"
             log.info("stringee opening (talk)", extra={
-                "call_id": self.call_id, "text_len": len(talk_text)})
+                "call_id": self.call_id, "text": talk_text})
             return [
                 {"action": "talk", "text": talk_text, "bargeIn": True},
                 {"action": "recordMessage", "eventUrl": self._event_url(),
