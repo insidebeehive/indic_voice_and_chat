@@ -333,17 +333,28 @@ async def dev_place_call(req: PlaceCallRequest) -> dict:
                     f"pipeline.telephony.outbound_from.{provider} in config/tenants/{req.tenant}.yaml."))
 
     # Build the adapter with the SELECTED provider's per-tenant creds (the dropdown
-    # provider may differ from the tenant's default) — no platform-env fallback.
-    # Stringee's server adapter reads api_key_sid/api_key_secret (stored as the
-    # account_sid/auth_token), the others account_sid/auth_token.
+    # provider may differ from the tenant's default).
     def _cred(name):
         try:
             return tenant.secret(name) if name else None
         except Exception:  # noqa: BLE001 - missing env → let the adapter decide
             return None
 
+    import os as _os
     pcreds = tel.creds_for(provider)
     acct, auth = _cred(pcreds.account_sid_env), _cred(pcreds.auth_token_env)
+    # Stringee: dev.yaml intentionally names account_sid_env/auth_token_env with
+    # Twilio-shaped vars (TENANT_DEV_TWILIO_SID) so flipping back to Twilio only
+    # needs a provider change. The actual Stringee API key SID/secret live in
+    # STRINGEE_API_KEY_SID / STRINGEE_API_KEY_SECRET (platform env, always set when
+    # Stringee is the active telephony provider). Prefer those for Stringee.
+    if provider == "stringee":
+        acct = (_cred(pcreds.api_key_sid_env)
+                or _os.environ.get("STRINGEE_API_KEY_SID")
+                or acct)
+        auth = (_cred(pcreds.api_key_secret_env)
+                or _os.environ.get("STRINGEE_API_KEY_SECRET")
+                or auth)
     # Stringee: the callout needs a non-null userId, or it goes out as a
     # phone->phone external call and the Answer URL/SCCO never runs (silent bot).
     uid = _cred(pcreds.user_id_env)
