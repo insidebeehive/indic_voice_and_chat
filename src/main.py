@@ -65,7 +65,7 @@ from src.api.call_store import (
 from src.integration.tenant_events import deliver as deliver_tenant_event
 from src.auth.db_resolver import DbTenantResolver
 from src.auth.middleware import set_admin_tokens, set_tenant_resolver
-from src.auth.seed import seed_campaigns_if_empty, seed_if_empty, seed_provider_costs
+from src.auth.seed import seed_campaigns_if_empty, seed_if_empty, seed_provider_costs, seed_tenants_from_yaml
 from src.bootstrap import (
     build_platform_retriever,
     build_provider_registry,
@@ -206,11 +206,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.redis = redis_client
     app.state.settings = settings
 
-    # --- Tenants: DB-backed (YAML is migrated in on first boot, then ignored) ---
+    # --- Tenants: DB-backed (YAML upserted on every boot so config changes land) ---
     sessionmaker = get_sessionmaker()
-    seeded = await seed_if_empty(sessionmaker)
+    async with sessionmaker() as _seed_session:
+        seeded = await seed_tenants_from_yaml(_seed_session)
     if seeded:
-        log.info("seeded tenants from YAML into DB", extra={"count": seeded})
+        log.info("upserted tenants from YAML into DB", extra={"count": seeded})
     await seed_provider_costs(sessionmaker)
     seeded_campaigns = await seed_campaigns_if_empty(sessionmaker)
     if seeded_campaigns:
