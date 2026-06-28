@@ -120,6 +120,7 @@ pipeline:
     # and dials FROM the matching owned number below.
     outbound_from:
       twilio: "+15705255679"       # Twilio-owned number (also in phone_numbers)
+      stringee: "+918204267969"    # Stringee DID / caller-ID
       # exotel: "+91XXXXXXXXXX"     # set your Exotel ExoPhone to place Exotel calls
 
   vector_store:
