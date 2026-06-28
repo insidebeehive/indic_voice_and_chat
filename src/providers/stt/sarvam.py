@@ -11,12 +11,27 @@ Endpoint reference: https://docs.sarvam.ai/api-reference-docs/speech-to-text
 
 from __future__ import annotations
 
+import io
 import os
+import wave
 from typing import Any, AsyncIterator, Optional
 
 import httpx
 
 from src.interfaces.stt import ISTTProvider, STTConfig, STTResult
+
+
+def _ensure_wav(audio: bytes, sample_rate: int) -> bytes:
+    """Wrap raw PCM16 mono bytes in a WAV container; pass real WAV through unchanged."""
+    if len(audio) >= 12 and audio[:4] == b"RIFF" and audio[8:12] == b"WAVE":
+        return audio
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(sample_rate)
+        w.writeframes(audio)
+    return buf.getvalue()
 
 
 SARVAM_BASE_URL = "https://api.sarvam.ai"
@@ -45,7 +60,8 @@ class SarvamSTTAdapter(ISTTProvider):
         return {"api-subscription-key": self._api_key}
 
     async def transcribe(self, audio: bytes, config: STTConfig) -> STTResult:
-        files = {"file": ("audio.wav", audio, "audio/wav")}
+        wav = _ensure_wav(audio, config.sample_rate or 16000)
+        files = {"file": ("audio.wav", wav, "audio/wav")}
         data: dict[str, str] = {"model": config.model or self._model}
         if config.language:
             data["language_code"] = config.language

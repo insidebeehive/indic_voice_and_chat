@@ -627,16 +627,32 @@ def make_browser_bridge_factory(
         _stream_override = None
         if stt_sel in STREAMING_STT_PROVIDERS:
             stt = providers.get_stt(tenant)
-            _stream_override = get_streaming_stt_provider({"provider": stt_sel})
+            try:
+                _stream_override = get_streaming_stt_provider({"provider": stt_sel})
+            except Exception as e:  # noqa: BLE001 - missing key etc.
+                log.warning("dev console: streaming STT override '%s' failed (%s); using default", stt_sel, e)
+                _stream_override = _build_stream_provider(tenant)
         elif stt_sel in STT_PROVIDERS:
-            stt = get_stt_provider({"provider": stt_sel})
+            try:
+                stt = get_stt_provider({"provider": stt_sel})
+            except Exception as e:  # noqa: BLE001
+                log.warning("dev console: STT override '%s' failed (%s); using default", stt_sel, e)
+                stt = providers.get_stt(tenant)
             _stream_override = None   # batch selected — disable streaming path
         else:
             stt = providers.get_stt(tenant)
             _stream_override = _build_stream_provider(tenant)
 
-        llm = get_llm_provider({"provider": llm_sel}) if llm_sel in LLM_PROVIDERS else providers.get_llm(tenant)
-        tts = get_tts_provider({"provider": tts_sel}) if tts_sel in TTS_PROVIDERS else providers.get_tts(tenant)
+        try:
+            llm = get_llm_provider({"provider": llm_sel}) if llm_sel in LLM_PROVIDERS else providers.get_llm(tenant)
+        except Exception as e:  # noqa: BLE001
+            log.warning("dev console: LLM override '%s' failed (%s); using default", llm_sel, e)
+            llm = providers.get_llm(tenant)
+        try:
+            tts = get_tts_provider({"provider": tts_sel}) if tts_sel in TTS_PROVIDERS else providers.get_tts(tenant)
+        except Exception as e:  # noqa: BLE001
+            log.warning("dev console: TTS override '%s' failed (%s); using default", tts_sel, e)
+            tts = providers.get_tts(tenant)
 
         tts_language = tenant.settings.pipeline.tts.language or "hi-IN"
         # Voice: ?voice= overrides the configured default (validated against the
