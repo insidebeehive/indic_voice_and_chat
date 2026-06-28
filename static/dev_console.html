@@ -188,19 +188,19 @@
     <div class="card">
       <div class="card-label">Mode</div>
       <div class="mode-tabs">
-        <button class="mode-tab active" data-mode="s2s"     onclick="setMode('s2s')">S2S — Gemini Live</button>
-        <button class="mode-tab"        data-mode="layered" onclick="setMode('layered')">Layered</button>
+        <button class="mode-tab active" data-mode="layered" onclick="setMode('layered')">Layered</button>
+        <button class="mode-tab"        data-mode="s2s"     onclick="setMode('s2s')">S2S — Gemini Live</button>
       </div>
       <!-- S2S voice (hidden in Layered mode) -->
-      <div class="field" id="s2s-voice-field">
+      <div class="field hidden" id="s2s-voice-field">
         <label>Voice</label>
         <select id="voice"></select>
-        <div style="font-size:.68rem;color:var(--muted);margin-top:.2rem">Languages: hi-IN, en-IN, bn-IN, gu-IN, kn-IN, ml-IN, mr-IN, ta-IN, te-IN + 40 more</div>
+        <div style="font-size:.68rem;color:var(--muted);margin-top:.2rem">Languages: hi-IN, en-IN, en-US, bn-IN, gu-IN, kn-IN, ml-IN, mr-IN, ta-IN, te-IN, ur-IN, ar-XA, zh-CN, zh-TW, nl-NL, fr-FR, de-DE, id-ID, it-IT, ja-JP, ko-KR, pl-PL, pt-BR, ru-RU, es-ES + 15 more</div>
       </div>
     </div>
 
     <!-- Layered: STT / LLM / TTS / Voice -->
-    <div class="card hidden" id="layered-providers">
+    <div class="card" id="layered-providers">
       <div class="card-label">Providers</div>
       <div class="field">
         <label>STT — speech recognition</label>
@@ -294,7 +294,7 @@ const activeSources = new Set();
 const $ = (id) => document.getElementById(id);
 const setStatus = (s) => { $("status").textContent = s; };
 let _currentCallId = null;
-let _mode = "s2s";   // tracks current mode selection
+let _mode = "layered";   // tracks current mode selection
 
 // ── Mode ──────────────────────────────────────────────────────
 function setMode(mode) {
