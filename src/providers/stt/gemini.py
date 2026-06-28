@@ -28,11 +28,22 @@ _TIMEOUT = 30.0
 # audio is silent or unclear. These patterns indicate "no speech" — we return
 # empty so the pipeline treats the turn as silence rather than user input.
 _NO_SPEECH_PHRASES = (
-    "no speech", "no audio", "is silent", "are silent",
-    "contains no", "contain no", "cannot transcribe", "unable to transcribe",
-    "there is no", "there are no", "inaudible", "background noise",
+    "no speech", "no audio", "no words", "no sound",
+    "is silent", "are silent", "is empty", "are empty",
+    "contains no", "contain no",
+    "cannot transcribe", "unable to transcribe",
+    "cannot detect", "unable to detect",
+    "cannot hear", "unable to hear",
+    "not detect", "not recogni",
+    "there is no", "there are no",
+    "nothing was said", "nothing is said", "nothing spoken",
+    "inaudible", "background noise", "background only",
+    "appears to be empty", "appears empty", "appears silent",
     "[silence]", "(silence)", "[no speech]", "(no speech)",
-    "the audio is", "this audio is", "audio clip",
+    "the audio is", "this audio is", "audio clip", "audio file",
+    "the recording", "this recording",
+    "empty audio", "silent audio",
+    "no discernible", "no clear speech",
 )
 
 SUPPORTED_LANGUAGES = [

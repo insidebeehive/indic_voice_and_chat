@@ -308,7 +308,12 @@ class BrowserVoiceBridge:
                 self._stream_session = None
             return
 
-        # Batch mode (unchanged): accumulate + local VAD endpointing.
+        # Batch mode: echo gate — discard mic frames while agent TTS is still
+        # playing (mirrors the streaming path). Without this, opening audio picked
+        # up by the mic (speakers, not headphones) is transcribed as a user turn.
+        if not self._barge_enabled and time.monotonic() < self._play_until:
+            return
+
         self._inbound.extend(pcm16)
         while not self._stopped and len(self._inbound) >= self._frame_bytes:
             frame = bytes(self._inbound[: self._frame_bytes])
@@ -356,6 +361,9 @@ class BrowserVoiceBridge:
 
         if getattr(self._agent.state, "is_terminal", False):
             self._stopped = True
+            # Surface the terminal action so devs can see why the call ended.
+            action = outcome.response.action
+            await self._send_json({"type": "error", "message": f"call ended: action={action}"})
             # The call is ending: let the browser finish playing the closing
             # line before run() returns and the socket closes (closing the
             # socket tears down playback and cuts the line off).
