@@ -837,9 +837,7 @@ async def _stringee_answer(request: Request, tenant: "TenantContext | None"):
     # reading from request headers, which can resolve to internal/container
     # addresses under Northflank's reverse-proxy and break Stringee's audio fetch.
     from src.config_tenant import platform_webhook_base_url as _plat_wb
-    _raw_base = (
-        (tenant.settings.pipeline.telephony.webhook_base_url or _plat_wb()) or None
-    )
+    _raw_base = _plat_wb() or None
     stringee_base = (_raw_base.rstrip("/") + "/stringee") if _raw_base else _stringee_base(request)
     log.info("stringee answer base", extra={"base": stringee_base, "tenant": tenant.slug})
     bridge = _stringee_bridge_factory(
