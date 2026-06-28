@@ -140,12 +140,12 @@
   }
   #outcome b { color: var(--muted); font-weight: 600; }
   #reanalyze {
-    padding: .28rem .75rem;
+    padding: .22rem .65rem;
     background: #6366f1; color: #fff;
-    border: 0; border-radius: .38rem;
-    cursor: pointer; font-size: .77rem; display: none;
+    border: 0; border-radius: .35rem;
+    cursor: pointer; font-size: .75rem;
   }
-  #reanalyzeStatus { font-size: .77rem; color: var(--muted); margin-left: .4rem; }
+  #reanalyze:disabled { opacity: .5; cursor: default; }
 
   /* ── Hidden ──────────────────────────────── */
   .hidden { display: none !important; }
@@ -266,17 +266,19 @@
     </div>
 
     <div class="pane">
-      <div class="pane-label">Dialogue State &amp; Slots</div>
+      <div class="pane-label" style="display:flex;align-items:center;justify-content:space-between">
+        Dialogue State &amp; Slots
+        <span id="reanalyze-wrap" style="display:none">
+          <button id="reanalyze" onclick="reanalyzeCall()">↺ Reanalyze</button>
+          <span id="reanalyzeStatus" style="font-size:.72rem;color:var(--muted);margin-left:.4rem"></span>
+        </span>
+      </div>
       <pre id="state">—</pre>
       <div id="outcome">
         <div><b>Outcome:</b> <span id="outcomeType"></span> <span id="outcomeSource" style="color:#6b7280;margin-left:.3rem"></span></div>
         <div><b>Summary:</b> <span id="outcomeSummary"></span></div>
         <div><b>Notes:</b>   <span id="outcomeNotes"></span></div>
         <div id="outcomeCallback"></div>
-        <div style="margin-top:.4rem">
-          <button id="reanalyze" onclick="reanalyzeCall()">Reanalyze</button>
-          <span id="reanalyzeStatus"></span>
-        </div>
       </div>
     </div>
 
@@ -316,7 +318,7 @@ function renderOutcome(o) {
   $("outcomeCallback").textContent = o.callback_datetime
     ? "Callback: " + o.callback_datetime
     : (o.callback_phrase ? "Callback (unresolved): " + o.callback_phrase : "");
-  if (_currentCallId) { $("reanalyze").style.display = "inline-block"; $("reanalyzeStatus").textContent = ""; }
+  if (_currentCallId) { $("reanalyze-wrap").style.display = "inline-flex"; $("reanalyzeStatus").textContent = ""; }
 }
 
 async function reanalyzeCall() {
@@ -480,7 +482,7 @@ async function start() {
   ws.onmessage = (e) => {
     if (e.data instanceof ArrayBuffer) { playPcm16(new Int16Array(e.data)); return; }
     const msg = JSON.parse(e.data);
-    if      (msg.type === "session")    { _currentCallId = msg.call_id; $("reanalyze").style.display = "none"; $("reanalyzeStatus").textContent = ""; }
+    if      (msg.type === "session")    { _currentCallId = msg.call_id; $("reanalyze-wrap").style.display = "inline-flex"; $("reanalyzeStatus").textContent = ""; }
     else if (msg.type === "status")     { setStatus(msg.status); agentSpeaking = (msg.status !== "listening"); }
     else if (msg.type === "interrupt")  { stopPlayback(); agentSpeaking = false; }
     else if (msg.type === "partial")    { renderPartial(msg.text); }
