@@ -97,6 +97,35 @@ async def seed_if_empty(sessionmaker, tenant_dir=None) -> int:
         return await seed_tenants_from_yaml(session, tenant_dir)
 
 
+async def patch_telephony_outbound_from(sessionmaker) -> None:
+    """One-time patch: copy telephony.from_number into outbound_from[provider] when missing.
+
+    Rows seeded before outbound_from was introduced have from_number set but
+    outbound_from empty. The dev-console place-call path checks outbound_from
+    first; without this the fallback to from_number only works when provider
+    matches, and only if provider is stored in the row (old rows may have it
+    null). This runs on every boot but is a cheap SELECT + conditional UPDATE.
+    """
+    async with sessionmaker() as session:
+        rows = (await session.execute(select(Tenant))).scalars().all()
+        patched = 0
+        for row in rows:
+            pc = row.pipeline_config or {}
+            tel = pc.get("telephony") or {}
+            provider = (tel.get("provider") or "").lower()
+            from_number = tel.get("from_number") or ""
+            outbound_from = tel.get("outbound_from") or {}
+            if provider and from_number and provider not in outbound_from:
+                outbound_from[provider] = from_number
+                tel["outbound_from"] = outbound_from
+                pc["telephony"] = tel
+                row.pipeline_config = dict(pc)  # force SQLAlchemy to detect the change
+                patched += 1
+        if patched:
+            await session.commit()
+            log.info("patched telephony outbound_from", extra={"count": patched})
+
+
 async def seed_campaigns_if_empty(sessionmaker, campaigns_dir=None) -> int:
     """Give every tenant a DB campaign migrated from the global ``VOX_CAMPAIGN``
     file, when they have none. Campaigns then diverge per-tenant via the
