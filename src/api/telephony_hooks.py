@@ -832,14 +832,25 @@ async def _stringee_answer(request: Request, tenant: "TenantContext | None"):
         return Response(status_code=404)
     if _stringee_bridge_factory is None:
         return Response(status_code=503)
+    # Derive the base URL for audio/event webhook links. Prefer the tenant's
+    # configured webhook_base_url (always the public-internet address) over
+    # reading from request headers, which can resolve to internal/container
+    # addresses under Northflank's reverse-proxy and break Stringee's audio fetch.
+    from src.config_tenant import platform_webhook_base_url as _plat_wb
+    _raw_base = (
+        (tenant.settings.pipeline.telephony.webhook_base_url or _plat_wb()) or None
+    )
+    stringee_base = (_raw_base.rstrip("/") + "/stringee") if _raw_base else _stringee_base(request)
+    log.info("stringee answer base", extra={"base": stringee_base, "tenant": tenant.slug})
     bridge = _stringee_bridge_factory(
         call_id=call_id, tenant=tenant,
-        base_url=_stringee_base(request), fetch=_download,
+        base_url=stringee_base, fetch=_download,
     )
     if inspect.isawaitable(bridge):
         bridge = await bridge
     registry.put(bridge)
     scco = await bridge.start_call()
+    log.info("stringee answer SCCO", extra={"call_id": call_id, "scco": scco})
     if call_id:
         from src.api import dev_call_control
         dev_call_control.monitor.set_status(call_id, "answered")
