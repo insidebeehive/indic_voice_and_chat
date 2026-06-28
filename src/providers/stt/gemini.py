@@ -24,6 +24,17 @@ _BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"
 _DEFAULT_MODEL = "gemini-2.5-flash"
 _TIMEOUT = 30.0
 
+# Gemini sometimes returns meta-commentary instead of an empty string when the
+# audio is silent or unclear. These patterns indicate "no speech" — we return
+# empty so the pipeline treats the turn as silence rather than user input.
+_NO_SPEECH_PHRASES = (
+    "no speech", "no audio", "is silent", "are silent",
+    "contains no", "contain no", "cannot transcribe", "unable to transcribe",
+    "there is no", "there are no", "inaudible", "background noise",
+    "[silence]", "(silence)", "[no speech]", "(no speech)",
+    "the audio is", "this audio is", "audio clip",
+)
+
 SUPPORTED_LANGUAGES = [
     "hi-IN", "en-IN", "en-US", "bn-IN", "gu-IN", "kn-IN", "ml-IN",
     "mr-IN", "pa-IN", "ta-IN", "te-IN", "ur-IN",
@@ -68,6 +79,11 @@ class GeminiSTTAdapter(ISTTProvider):
             text = payload["candidates"][0]["content"]["parts"][0]["text"].strip()
         except (KeyError, IndexError):
             pass
+
+        # If Gemini returned meta-commentary about the audio instead of a
+        # transcript (e.g. "No speech detected"), treat it as silence.
+        if text and any(p in text.lower() for p in _NO_SPEECH_PHRASES):
+            text = ""
 
         return STTResult(
             text=text,
