@@ -158,6 +158,23 @@ async def dev_voices(request: Request, tenant: str = "dev") -> dict:
     }
 
 
+_TTS_META: dict[str, dict] = {
+    "sarvam": {
+        "label": "Sarvam AI",
+        "languages": ["hi-IN", "en-IN", "bn-IN", "gu-IN", "kn-IN", "ml-IN",
+                      "mr-IN", "od-IN", "pa-IN", "ta-IN", "te-IN"],
+    },
+    "google": {
+        "label": "Google Neural2",
+        "languages": ["hi-IN", "en-IN"],
+    },
+    "azure": {
+        "label": "Azure Neural",
+        "languages": ["hi-IN", "en-IN", "mr-IN", "ta-IN", "te-IN", "bn-IN", "gu-IN", "kn-IN", "ml-IN"],
+    },
+}
+
+
 @dev_router.get("/dev/providers")
 async def dev_providers() -> dict:
     """STT/LLM/TTS provider lists for the layered-mode selectors."""
@@ -167,7 +184,6 @@ async def dev_providers() -> dict:
         "stt": {"sarvam": "Sarvam AI", "groq": "Groq Whisper"},
         "stt_streaming": {"deepgram": "Deepgram (streaming)"},
         "llm": {"gemini": "Gemini Flash", "groq": "Groq Llama-3", "anthropic": "Claude", "claude": "Claude"},
-        "tts": {"sarvam": "Sarvam AI"},
     }
     seen_cls: set = set()
     llm_opts = []
@@ -181,11 +197,32 @@ async def dev_providers() -> dict:
     def _opts(registry, label_map):
         return [{"id": k, "label": label_map.get(k, k)} for k in sorted(registry)]
 
+    tts_opts = []
+    for k in sorted(TTS_PROVIDERS):
+        meta = _TTS_META.get(k, {})
+        tts_opts.append({
+            "id": k,
+            "label": meta.get("label", k),
+            "languages": meta.get("languages", []),
+        })
+
     return {
         "stt": _opts(STT_PROVIDERS, _labels["stt"]) + _opts(STREAMING_STT_PROVIDERS, _labels["stt_streaming"]),
         "llm": llm_opts,
-        "tts": _opts(TTS_PROVIDERS, _labels["tts"]),
+        "tts": tts_opts,
     }
+
+
+@dev_router.get("/dev/tts-voices")
+async def dev_tts_voices(provider: str = "sarvam", language: str = "hi-IN") -> dict:
+    """Voice roster for a specific TTS provider (for the cascading voice dropdown)."""
+    from src.providers import TTS_PROVIDERS
+
+    if provider not in TTS_PROVIDERS:
+        raise HTTPException(status_code=400, detail=f"unknown TTS provider '{provider}'")
+    adapter = TTS_PROVIDERS[provider]({})          # constructors no longer raise on missing key
+    voices = adapter.get_available_voices(language)
+    return {"provider": provider, "language": language, "voices": voices}
 
 
 @dev_router.get("/dev/campaigns")

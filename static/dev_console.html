@@ -191,13 +191,14 @@
         <button class="mode-tab active" data-mode="s2s"     onclick="setMode('s2s')">S2S — Gemini Live</button>
         <button class="mode-tab"        data-mode="layered" onclick="setMode('layered')">Layered</button>
       </div>
-      <div class="field">
+      <!-- S2S voice (hidden in Layered mode) -->
+      <div class="field" id="s2s-voice-field">
         <label>Voice</label>
         <select id="voice"></select>
       </div>
     </div>
 
-    <!-- Layered: STT / LLM / TTS -->
+    <!-- Layered: STT / LLM / TTS / Voice -->
     <div class="card hidden" id="layered-providers">
       <div class="card-label">Providers</div>
       <div class="field">
@@ -210,7 +211,12 @@
       </div>
       <div class="field">
         <label>TTS — voice synthesis</label>
-        <select id="tts-select"></select>
+        <select id="tts-select" onchange="onTTSChange()"></select>
+        <div id="tts-langs" style="font-size:.68rem;color:var(--muted);margin-top:.2rem"></div>
+      </div>
+      <div class="field">
+        <label>Voice</label>
+        <select id="voice-layered"></select>
       </div>
     </div>
 
@@ -294,6 +300,7 @@ function setMode(mode) {
     t.classList.toggle("active", t.dataset.mode === mode);
   });
   $("layered-providers").classList.toggle("hidden", mode !== "layered");
+  $("s2s-voice-field").classList.toggle("hidden", mode !== "s2s");
   populateVoices(mode);
 }
 
@@ -418,10 +425,14 @@ async function start() {
   const wsProto = location.protocol === "https:" ? "wss" : "ws";
   const leadName = ($("leadName").value || "").trim();
   const path = _mode === "s2s" ? "/api/v1/dev/voice-live" : "/api/v1/dev/voice";
+  const voiceSel = _mode === "s2s" ? $("voice") : $("voice-layered");
+  const selectedVoice = voiceSel ? voiceSel.value : "";
+  const selectedGender = voiceSel ? (voiceSel.options[voiceSel.selectedIndex]?.dataset.gender || "") : "";
   let qs = "tenant=dev";
-  if (leadName)           qs += "&lead_name=" + encodeURIComponent(leadName);
-  if ($("voice").value)   qs += "&voice="     + encodeURIComponent($("voice").value);
-  if ($("campaign").value) qs += "&campaign=" + encodeURIComponent($("campaign").value);
+  if (leadName)            qs += "&lead_name=" + encodeURIComponent(leadName);
+  if (selectedVoice)       qs += "&voice="     + encodeURIComponent(selectedVoice);
+  if (selectedGender)      qs += "&gender="    + encodeURIComponent(selectedGender);
+  if ($("campaign").value) qs += "&campaign="  + encodeURIComponent($("campaign").value);
   // Layered-specific provider overrides
   if (_mode === "layered") {
     const stt = $("stt-select").value;
@@ -543,7 +554,8 @@ async function placeCall(provider) {
     const resp = await fetch("/dev/place-call", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        provider, to_number: to, mode: _mode, voice: $("voice").value,
+        provider, to_number: to, mode: _mode,
+        voice: (_mode === "s2s" ? $("voice") : $("voice-layered") || $("voice"))?.value || "",
         lead_name: ($("leadName").value || "").trim(), tenant: "dev",
       }),
     });
@@ -653,6 +665,8 @@ async function loadCampaigns() {
 loadCampaigns();
 
 // ── Providers (STT / LLM / TTS) ────────────────────────────────
+let _ttsProviderMeta = [];   // [{id, label, languages}]
+
 async function loadProviders() {
   try {
     const r = await fetch("/dev/providers");
@@ -668,9 +682,53 @@ async function loadProviders() {
     };
     fill("stt-select", data.stt);
     fill("llm-select", data.llm);
-    fill("tts-select", data.tts);
+    // TTS: populate and store meta for language hints
+    _ttsProviderMeta = data.tts || [];
+    const ttsSel = $("tts-select"); if (ttsSel) ttsSel.innerHTML = "";
+    for (const { id, label } of _ttsProviderMeta) {
+      const o = document.createElement("option");
+      o.value = id; o.textContent = label;
+      if (ttsSel) ttsSel.appendChild(o);
+    }
+    // Load voices for the initially selected TTS
+    await onTTSChange();
   } catch (e) { console.warn("[devconsole] providers fetch failed", e); }
 }
+
+async function onTTSChange() {
+  const provider = ($("tts-select") || {}).value || "sarvam";
+  // Show supported languages hint
+  const meta = _ttsProviderMeta.find(m => m.id === provider);
+  const hint = $("tts-langs");
+  if (hint && meta && meta.languages && meta.languages.length) {
+    hint.textContent = "Languages: " + meta.languages.join(", ");
+  } else if (hint) {
+    hint.textContent = "";
+  }
+  await loadTTSVoices(provider);
+}
+
+async function loadTTSVoices(provider) {
+  const language = "hi-IN";   // always show hi-IN voices in dev console
+  const sel = $("voice-layered");
+  if (!sel) return;
+  try {
+    const r = await fetch("/dev/tts-voices?provider=" + encodeURIComponent(provider) + "&language=" + language);
+    if (!r.ok) return;
+    const data = await r.json();
+    sel.innerHTML = "";
+    for (const v of (data.voices || [])) {
+      const o = document.createElement("option");
+      o.value = v.voice_id;
+      o.dataset.gender = v.gender || "";
+      // Strip language prefix for display (hi-IN-Neural2-A → Neural2-A)
+      const shortId = v.voice_id.replace(/^[a-z]{2}-[A-Z]{2}-/, "");
+      o.textContent = shortId + (v.gender ? " — " + v.gender : "");
+      sel.appendChild(o);
+    }
+  } catch (e) { console.warn("[devconsole] tts-voices fetch failed", e); }
+}
+
 loadProviders();
 </script>
 </body>
