@@ -171,17 +171,10 @@ class StringeeIvrBridge(OutcomeRecorderMixin):
     async def _synthesize_opening(self) -> list[dict]:
         try:
             await self._agent.start()
-            # Diagnostic: hardcoded text to confirm talk works end-to-end.
-            # (Raw script.opening has unrendered {agent_name} etc. tokens that
-            # break Stringee's TTS and cause a silent immediate hangup.)
-            talk_text = "Namaste, kya aap baat kar sakte hain?"
-            log.info("stringee opening (talk)", extra={
-                "call_id": self.call_id, "text": talk_text})
-            return [
-                {"action": "talk", "text": talk_text, "bargeIn": True},
-                {"action": "recordMessage", "eventUrl": self._event_url(),
-                 "format": "wav", "silenceTimeout": SILENCE_TIMEOUT_MS, "beepStart": False},
-            ]
+            # Minimal SCCO: just talk, no recordMessage, no bargeIn.
+            # Tests whether talk works at all or recordMessage is the culprit.
+            log.info("stringee opening (talk-only)", extra={"call_id": self.call_id})
+            return [{"action": "talk", "text": "hello", "language": "en-US"}]
         except Exception:  # noqa: BLE001 - never answer with a 500 / dead line
             log.exception("stringee start_call failed")
             return reprompt_scco(text=_REPROMPT_TEXT, event_url=self._event_url())
