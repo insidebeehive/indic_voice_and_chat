@@ -31,10 +31,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 import time
 from dataclasses import dataclass, field, replace
 from typing import Awaitable, Callable, Optional
+
+log = logging.getLogger(__name__)
 
 from src.interfaces.llm import ILLMProvider, LLMConfig, LLMMessage
 from src.interfaces.stt import ISTTProvider, STTConfig
@@ -314,7 +317,8 @@ class PipelineEngine:
                     continue
                 try:
                     result = await self._tts.synthesize(sentence, tts_cfg)
-                except Exception:  # noqa: BLE001
+                except Exception as _tts_err:  # noqa: BLE001
+                    log.error("TTS synthesize failed: %s", _tts_err)
                     continue
                 if cancel_event.is_set():
                     continue

@@ -10,11 +10,14 @@ Google Cloud project has both Generative Language and TTS APIs enabled).
 from __future__ import annotations
 
 import base64
+import logging
 import os
 import struct
 from typing import Any, AsyncIterator
 
 import httpx
+
+log = logging.getLogger(__name__)
 
 from src.interfaces.tts import ITTSProvider, TTSConfig, TTSResult
 
@@ -68,6 +71,12 @@ class GoogleTTSAdapter(ITTSProvider):
         }
         async with httpx.AsyncClient(timeout=self._timeout) as client:
             resp = await client.post(_TTS_URL, params={"key": self._api_key}, json=body)
+            if not resp.is_success:
+                log.error(
+                    "Google TTS API error %d: %s",
+                    resp.status_code,
+                    resp.text[:500],
+                )
             resp.raise_for_status()
         raw = base64.b64decode(resp.json()["audioContent"])
         pcm, rate = _extract_pcm(raw, fallback_rate=config.sample_rate)
