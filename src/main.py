@@ -208,10 +208,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     # --- Tenants: DB-backed (YAML upserted on every boot so config changes land) ---
     sessionmaker = get_sessionmaker()
-    async with sessionmaker() as _seed_session:
-        seeded = await seed_tenants_from_yaml(_seed_session)
-    if seeded:
-        log.info("upserted tenants from YAML into DB", extra={"count": seeded})
+    try:
+        async with sessionmaker() as _seed_session:
+            seeded = await seed_tenants_from_yaml(_seed_session)
+        if seeded:
+            log.info("upserted tenants from YAML into DB", extra={"count": seeded})
+    except Exception:
+        log.exception("YAML→DB upsert failed; keeping existing DB state")
     await seed_provider_costs(sessionmaker)
     seeded_campaigns = await seed_campaigns_if_empty(sessionmaker)
     if seeded_campaigns:
