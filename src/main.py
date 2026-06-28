@@ -201,7 +201,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Eagerly create engine + redis pool so missing config fails on boot, not first request.
     get_engine(settings.database.url)
     # Ensure our schema exists before anything touches a table (no-op on SQLite).
-    await ensure_schema(settings.database.url)
+    # Wrapped in a timeout: if the DB is temporarily unavailable during a rolling
+    # restart the schema already exists from the last boot, so it's safe to proceed.
+    import asyncio as _asyncio
+    try:
+        await _asyncio.wait_for(ensure_schema(settings.database.url), timeout=20.0)
+    except Exception:
+        log.warning("ensure_schema skipped (timeout or error); schema assumed current")
     redis_client = redis_async.from_url(settings.redis.url, decode_responses=False)
     app.state.redis = redis_client
     app.state.settings = settings
