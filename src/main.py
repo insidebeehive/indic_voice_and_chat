@@ -65,7 +65,7 @@ from src.api.call_store import (
 from src.integration.tenant_events import deliver as deliver_tenant_event
 from src.auth.db_resolver import DbTenantResolver
 from src.auth.middleware import set_admin_tokens, set_tenant_resolver
-from src.auth.seed import seed_campaigns_if_empty, seed_if_empty, seed_provider_costs
+from src.auth.seed import seed_campaigns_if_empty, seed_if_empty, seed_provider_costs, sync_telephony_from_yaml
 from src.bootstrap import (
     build_platform_retriever,
     build_provider_registry,
@@ -217,6 +217,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     seeded = await seed_if_empty(sessionmaker)
     if seeded:
         log.info("seeded tenants from YAML into DB", extra={"count": seeded})
+    try:
+        await _asyncio.wait_for(sync_telephony_from_yaml(sessionmaker), timeout=10.0)
+    except Exception:
+        log.warning("sync_telephony_from_yaml skipped (timeout or error)")
     await seed_provider_costs(sessionmaker)
     seeded_campaigns = await seed_campaigns_if_empty(sessionmaker)
     if seeded_campaigns:

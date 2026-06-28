@@ -97,6 +97,46 @@ async def seed_if_empty(sessionmaker, tenant_dir=None) -> int:
         return await seed_tenants_from_yaml(session, tenant_dir)
 
 
+async def sync_telephony_from_yaml(sessionmaker, tenant_dir=None) -> int:
+    """Sync telephony.from_number and outbound_from from YAML into existing tenant rows.
+
+    Called on every boot so YAML caller-ID changes are picked up without requiring
+    a DB wipe. Only writes rows that differ. Safe under rolling restart because it
+    only touches pipeline_config (no secret rows or phone-number rows that could
+    conflict with inbound-call lookups).
+    """
+    base = _resolve_dir(tenant_dir)
+    patched = 0
+    async with sessionmaker() as session:
+        rows = (await session.execute(select(Tenant))).scalars().all()
+        for row in rows:
+            try:
+                yaml_cfg = load_tenant(row.slug, base)
+            except Exception:
+                continue
+            yaml_tel = yaml_cfg.pipeline.telephony
+            pc = dict(row.pipeline_config or {})
+            tel = dict(pc.get("telephony") or {})
+            changed = False
+            if yaml_tel.from_number and tel.get("from_number") != yaml_tel.from_number:
+                tel["from_number"] = yaml_tel.from_number
+                changed = True
+            if yaml_tel.outbound_from:
+                current_of = dict(tel.get("outbound_from") or {})
+                merged = {**current_of, **yaml_tel.outbound_from}
+                if merged != current_of:
+                    tel["outbound_from"] = merged
+                    changed = True
+            if changed:
+                pc["telephony"] = tel
+                row.pipeline_config = dict(pc)
+                patched += 1
+        if patched:
+            await session.commit()
+            log.info("synced telephony caller-IDs from YAML", extra={"count": patched})
+    return patched
+
+
 async def patch_telephony_outbound_from(sessionmaker) -> None:
     """One-time patch: copy telephony.from_number into outbound_from[provider] when missing.
 
