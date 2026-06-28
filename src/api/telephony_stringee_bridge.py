@@ -7,6 +7,7 @@ See docs/superpowers/specs/2026-06-09-stringee-ivr-design.md.
 
 from __future__ import annotations
 
+import asyncio
 import audioop
 import io
 import logging
@@ -148,6 +149,8 @@ class StringeeIvrBridge(OutcomeRecorderMixin):
         self._last_action: str | None = None
         self._outcome_recorded = False
         self.touched = time.monotonic()
+        self._prewarmed_scco: list[dict] | None = None
+        self._prewarm_lock = asyncio.Lock()
 
     # -- url builders --
     def _event_url(self) -> str:
@@ -164,7 +167,7 @@ class StringeeIvrBridge(OutcomeRecorderMixin):
         return f"{self._base}/audio/{token}"
 
     # -- lifecycle --
-    async def start_call(self) -> list[dict]:
+    async def _synthesize_opening(self) -> list[dict]:
         try:
             await self._agent.start()
             sink = BufferingAudioSink()
@@ -174,6 +177,21 @@ class StringeeIvrBridge(OutcomeRecorderMixin):
             log.exception("stringee start_call failed")
             return reprompt_scco(text=_REPROMPT_TEXT, event_url=self._event_url())
         return answer_scco(audio_url=url, event_url=self._event_url())
+
+    async def prewarm(self) -> None:
+        """Synthesize the opening audio during the ringing phase so start_call()
+        returns instantly when the callee picks up."""
+        async with self._prewarm_lock:
+            if self._prewarmed_scco is None:
+                self._prewarmed_scco = await self._synthesize_opening()
+                log.info("stringee bridge prewarmed", extra={"call_id": self.call_id})
+
+    async def start_call(self) -> list[dict]:
+        async with self._prewarm_lock:
+            if self._prewarmed_scco is not None:
+                log.info("stringee start_call (prewarmed)", extra={"call_id": self.call_id})
+                return self._prewarmed_scco
+            return await self._synthesize_opening()
 
     async def handle_turn(self, *, recording_url: str) -> list[dict]:
         self.touched = time.monotonic()

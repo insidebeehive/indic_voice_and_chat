@@ -401,6 +401,11 @@ async def dev_place_call(req: PlaceCallRequest) -> dict:
         raise HTTPException(status_code=502, detail=f"call failed: {e}")
 
     dev_call_control.monitor.set_status(session.session_id, "calling")
+    # Stringee IVR: pre-warm the bridge during the ringing phase so the opening
+    # audio is ready when the callee picks up (eliminates ~1s silence on answer).
+    if provider == "stringee" and session.session_id:
+        from src.api import telephony_hooks as _th
+        asyncio.create_task(_th.prewarm_stringee_call(session.session_id, tenant))
     # Register the conversation for the tenant that PLACED the call (not derived
     # from the number) — a real outbound voicebot/voice call, mirroring the
     # campaign path so the outcome persists + it shows in analytics. Best-effort:

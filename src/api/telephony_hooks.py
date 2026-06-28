@@ -99,6 +99,33 @@ def set_stringee_bridge_factory(factory) -> None:
     _stringee_bridge_factory = factory
 
 
+async def prewarm_stringee_call(call_id: str, tenant) -> None:
+    """Pre-synthesize the opening audio during the ringing phase so it's instant on answer.
+
+    Called as a background task right after a Stringee outbound call is placed.
+    The ringing window (~8-15s) is enough to synthesize the greeting TTS; the
+    bridge is stored in the registry so _stringee_answer reuses it.
+    """
+    if _stringee_bridge_factory is None:
+        return
+    from src.config_tenant import platform_webhook_base_url as _plat_wb
+    raw_base = _plat_wb() or None
+    if not raw_base:
+        log.warning("stringee prewarm: no platform webhook_base_url set, skipping")
+        return
+    stringee_base = raw_base.rstrip("/") + "/stringee"
+    try:
+        bridge = _stringee_bridge_factory(
+            call_id=call_id, tenant=tenant, base_url=stringee_base, fetch=_download)
+        if inspect.isawaitable(bridge):
+            bridge = await bridge
+        from src.api.telephony_stringee_bridge import registry
+        registry.put(bridge)
+        await bridge.prewarm()
+    except Exception:
+        log.exception("stringee prewarm failed", extra={"call_id": call_id})
+
+
 def _ws_stream_url(request: Request, path: str) -> str:
     """Build the media-stream WSS URL for ``/api/v1/telephony/{path}``, honoring
     the reverse-proxy forwarded host/proto (Northflank terminates TLS upstream)."""
@@ -832,21 +859,26 @@ async def _stringee_answer(request: Request, tenant: "TenantContext | None"):
         return Response(status_code=404)
     if _stringee_bridge_factory is None:
         return Response(status_code=503)
-    # Derive the base URL for audio/event webhook links. Prefer the tenant's
-    # configured webhook_base_url (always the public-internet address) over
-    # reading from request headers, which can resolve to internal/container
-    # addresses under Northflank's reverse-proxy and break Stringee's audio fetch.
+    # Derive the base URL for audio/event webhook links. Prefer the platform
+    # webhook_base_url (always the public-internet address) over request headers,
+    # which can resolve to internal/container addresses under Northflank's proxy.
     from src.config_tenant import platform_webhook_base_url as _plat_wb
     _raw_base = _plat_wb() or None
     stringee_base = (_raw_base.rstrip("/") + "/stringee") if _raw_base else _stringee_base(request)
     log.info("stringee answer base", extra={"base": stringee_base, "tenant": tenant.slug})
-    bridge = _stringee_bridge_factory(
-        call_id=call_id, tenant=tenant,
-        base_url=stringee_base, fetch=_download,
-    )
-    if inspect.isawaitable(bridge):
-        bridge = await bridge
-    registry.put(bridge)
+    # Reuse a pre-warmed bridge (synthesized during ringing) if available;
+    # otherwise build a fresh one and synthesize on-demand.
+    bridge = registry.get(call_id) if call_id else None
+    if bridge is not None:
+        log.info("stringee answer: reusing prewarmed bridge", extra={"call_id": call_id})
+    else:
+        bridge = _stringee_bridge_factory(
+            call_id=call_id, tenant=tenant,
+            base_url=stringee_base, fetch=_download,
+        )
+        if inspect.isawaitable(bridge):
+            bridge = await bridge
+        registry.put(bridge)
     scco = await bridge.start_call()
     log.info("stringee answer SCCO", extra={"call_id": call_id, "scco": scco})
     if call_id:
