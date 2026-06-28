@@ -158,6 +158,36 @@ async def dev_voices(request: Request, tenant: str = "dev") -> dict:
     }
 
 
+@dev_router.get("/dev/providers")
+async def dev_providers() -> dict:
+    """STT/LLM/TTS provider lists for the layered-mode selectors."""
+    from src.providers import LLM_PROVIDERS, STREAMING_STT_PROVIDERS, STT_PROVIDERS, TTS_PROVIDERS
+
+    _labels: dict[str, dict[str, str]] = {
+        "stt": {"sarvam": "Sarvam AI", "groq": "Groq Whisper"},
+        "stt_streaming": {"deepgram": "Deepgram (streaming)"},
+        "llm": {"gemini": "Gemini Flash", "groq": "Groq Llama-3", "anthropic": "Claude", "claude": "Claude"},
+        "tts": {"sarvam": "Sarvam AI"},
+    }
+    seen_cls: set = set()
+    llm_opts = []
+    for k in sorted(LLM_PROVIDERS):
+        cls = LLM_PROVIDERS[k]
+        if cls in seen_cls:
+            continue
+        seen_cls.add(cls)
+        llm_opts.append({"id": k, "label": _labels["llm"].get(k, k)})
+
+    def _opts(registry, label_map):
+        return [{"id": k, "label": label_map.get(k, k)} for k in sorted(registry)]
+
+    return {
+        "stt": _opts(STT_PROVIDERS, _labels["stt"]) + _opts(STREAMING_STT_PROVIDERS, _labels["stt_streaming"]),
+        "llm": llm_opts,
+        "tts": _opts(TTS_PROVIDERS, _labels["tts"]),
+    }
+
+
 @dev_router.get("/dev/campaigns")
 async def dev_campaigns(tenant: str = "dev") -> dict:
     """The tenant's campaigns, for the console's campaign selector. The selected
@@ -583,15 +613,37 @@ def make_browser_bridge_factory(
             lc = await campaign_resolver.resolve(tenant.id, qp0.get("campaign") or None)
             cur_script, cur_slots = lc.script, lc.slots
 
-        stt = providers.get_stt(tenant)
-        llm = providers.get_llm(tenant)
-        tts = providers.get_tts(tenant)
+        from src.providers import (
+            LLM_PROVIDERS, STREAMING_STT_PROVIDERS, STT_PROVIDERS, TTS_PROVIDERS,
+            get_llm_provider, get_stt_provider, get_streaming_stt_provider, get_tts_provider,
+        )
+
+        query_params = getattr(websocket, "query_params", {}) or {}
+        stt_sel = (query_params.get("stt") or "").strip().lower()
+        llm_sel = (query_params.get("llm") or "").strip().lower()
+        tts_sel = (query_params.get("tts") or "").strip().lower()
+
+        # STT override — deepgram is streaming; sarvam/groq are batch.
+        _stream_override = None
+        if stt_sel in STREAMING_STT_PROVIDERS:
+            stt = providers.get_stt(tenant)
+            _stream_override = get_streaming_stt_provider({"provider": stt_sel})
+        elif stt_sel in STT_PROVIDERS:
+            stt = get_stt_provider({"provider": stt_sel})
+            _stream_override = None   # batch selected — disable streaming path
+        else:
+            stt = providers.get_stt(tenant)
+            _stream_override = _build_stream_provider(tenant)
+
+        llm = get_llm_provider({"provider": llm_sel}) if llm_sel in LLM_PROVIDERS else providers.get_llm(tenant)
+        tts = get_tts_provider({"provider": tts_sel}) if tts_sel in TTS_PROVIDERS else providers.get_tts(tenant)
+
         tts_language = tenant.settings.pipeline.tts.language or "hi-IN"
         # Voice: ?voice= overrides the configured default (validated against the
         # TTS provider's roster), so the console's Voice dropdown applies in
         # layered mode just like it does for S2S.
         tts_voice = tenant.settings.pipeline.tts.voice_id
-        sel_voice = ((getattr(websocket, "query_params", {}) or {}).get("voice") or "").strip()
+        sel_voice = (query_params.get("voice") or "").strip()
         if sel_voice:
             try:
                 roster = {v.get("voice_id") for v in tts.get_available_voices(tts_language)}
@@ -614,10 +666,6 @@ def make_browser_bridge_factory(
         )
         engine = PipelineEngine(stt, llm, tts, pipeline_cfg)
         session_id = f"web_{uuid.uuid4().hex[:12]}"
-        # The dev console has no CRM lead, so let the page supply a test lead
-        # name via the WS query string (?lead_name=...). This feeds the spoken
-        # opening, the rendered opening in the prompt, and "Known lead data".
-        query_params = getattr(websocket, "query_params", {}) or {}
         lead_name = (query_params.get("lead_name") or "").strip()
         lead_data = {"lead_name": lead_name, "name": lead_name} if lead_name else {}
         # Chat→voice handoff: a ?handoff=<token> resolves a short-lived Redis blob
@@ -689,7 +737,7 @@ def make_browser_bridge_factory(
             agent=agent,
             vad=_build_browser_vad(),
             config=BrowserBridgeConfig(),
-            stream_provider=_build_stream_provider(tenant),
+            stream_provider=_stream_override,
             llm=llm,
             tenant_timezone=getattr(tenant.settings, "timezone", "Asia/Kolkata"),
         )

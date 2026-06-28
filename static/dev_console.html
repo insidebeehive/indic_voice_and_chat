@@ -4,107 +4,311 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Voice Dev Console</title>
+<title>Voice Demo Console</title>
 <style>
-  body { font-family: system-ui, sans-serif; margin: 0; padding: 1rem; background:#0f172a; color:#e2e8f0; }
-  h1 { font-size: 1.2rem; }
-  .row { display:flex; gap:1rem; align-items:center; margin-bottom:1rem; flex-wrap:wrap; }
-  button { padding:.5rem 1rem; border-radius:.4rem; border:0; cursor:pointer; font-weight:600; }
-  #start { background:#22c55e; color:#06210f; }
-  #start.stop { background:#ef4444; color:#2a0606; }
-  #status { font-weight:600; }
-  .panes { display:flex; gap:1rem; flex-wrap:wrap; }
-  .pane { flex:1 1 320px; background:#1e293b; border-radius:.5rem; padding:.75rem; min-height:240px; }
-  .pane h2 { font-size:.9rem; margin:.2rem 0 .6rem; color:#94a3b8; }
-  .turn { margin:.3rem 0; }
-  .turn.user { color:#7dd3fc; }
-  .turn.agent { color:#86efac; }
-  pre { white-space:pre-wrap; word-break:break-word; margin:0; font-size:.85rem; }
-  .hint { color:#94a3b8; font-size:.8rem; }
-  label { font-size:.85rem; }
+  :root {
+    --bg:     #0f172a;
+    --card:   #1e293b;
+    --border: #334155;
+    --text:   #e2e8f0;
+    --muted:  #94a3b8;
+    --accent: #3b82f6;
+    --green:  #22c55e;
+    --red:    #ef4444;
+    --user:   #7dd3fc;
+    --agent:  #86efac;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: system-ui, sans-serif;
+    background: var(--bg); color: var(--text);
+    padding: 1rem; min-height: 100vh;
+  }
+
+  /* ── Header ─────────────────────────────── */
+  .header {
+    display: flex; align-items: center; gap: .75rem;
+    padding-bottom: .75rem; margin-bottom: 1rem;
+    border-bottom: 1px solid var(--border);
+  }
+  .header h1 { font-size: 1.05rem; font-weight: 700; }
+  .header .hint { font-size: .75rem; color: var(--muted); }
+  #status {
+    margin-left: auto;
+    font-size: .8rem; font-weight: 600;
+    padding: .25rem .75rem; border-radius: 999px;
+    background: var(--card); border: 1px solid var(--border);
+    min-width: 6rem; text-align: center;
+  }
+
+  /* ── Layout ──────────────────────────────── */
+  .layout { display: flex; gap: 1rem; align-items: flex-start; }
+  .sidebar {
+    width: 270px; flex-shrink: 0;
+    display: flex; flex-direction: column; gap: .6rem;
+  }
+  .panes { flex: 1; display: flex; flex-direction: column; gap: .75rem; min-width: 0; }
+
+  /* ── Cards ───────────────────────────────── */
+  .card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: .55rem;
+    padding: .7rem .75rem;
+  }
+  .card-label {
+    font-size: .6rem; font-weight: 700; letter-spacing: .1em;
+    text-transform: uppercase; color: var(--muted);
+    margin-bottom: .5rem;
+  }
+
+  /* ── Form controls ───────────────────────── */
+  .field { margin-bottom: .45rem; }
+  .field:last-child { margin-bottom: 0; }
+  .field label { display: block; font-size: .75rem; color: var(--muted); margin-bottom: .2rem; }
+  .field-row { display: flex; gap: .45rem; }
+  .field-row .field { flex: 1; }
+  input[type="text"], select {
+    width: 100%; padding: .38rem .55rem;
+    background: #0f172a; border: 1px solid var(--border);
+    border-radius: .38rem; color: var(--text); font-size: .82rem;
+  }
+  input[type="text"]:focus, select:focus {
+    outline: none; border-color: var(--accent);
+  }
+
+  /* ── Mode tabs ───────────────────────────── */
+  .mode-tabs { display: flex; gap: .4rem; margin-bottom: .6rem; }
+  .mode-tab {
+    flex: 1; padding: .45rem .3rem; text-align: center;
+    border: 1px solid var(--border); border-radius: .38rem;
+    cursor: pointer; font-size: .8rem; font-weight: 600;
+    background: transparent; color: var(--muted);
+    transition: background .12s, color .12s, border-color .12s;
+  }
+  .mode-tab.active {
+    background: var(--accent); border-color: var(--accent); color: #fff;
+  }
+
+  /* ── Checkboxes ──────────────────────────── */
+  .check-label {
+    display: flex; align-items: center; gap: .45rem;
+    font-size: .8rem; cursor: pointer; padding: .2rem 0; color: var(--text);
+  }
+  .check-label input { cursor: pointer; width: auto; accent-color: var(--accent); }
+  .check-label .hint { font-size: .72rem; color: var(--muted); }
+
+  /* ── Start button ────────────────────────── */
+  #start {
+    width: 100%; padding: .6rem;
+    background: var(--green); color: #052e16;
+    border: 0; border-radius: .45rem;
+    font-size: .9rem; font-weight: 700; cursor: pointer;
+    letter-spacing: .03em;
+    transition: opacity .12s;
+  }
+  #start:hover { opacity: .88; }
+  #start.stop { background: var(--red); color: #fff; }
+
+  /* ── Transcript pane ─────────────────────── */
+  .pane {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: .55rem; padding: .7rem .75rem;
+  }
+  .pane-label {
+    font-size: .6rem; font-weight: 700; letter-spacing: .1em;
+    text-transform: uppercase; color: var(--muted); margin-bottom: .5rem;
+  }
+  #transcript { height: 300px; overflow-y: auto; }
+  .turn { margin: .25rem 0; font-size: .875rem; line-height: 1.4; }
+  .turn.user  { color: var(--user); }
+  .turn.agent { color: var(--agent); }
+
+  /* ── State pane ──────────────────────────── */
+  pre#state {
+    white-space: pre-wrap; word-break: break-word;
+    font-size: .78rem; color: var(--muted);
+    max-height: 110px; overflow-y: auto;
+  }
+
+  /* ── Outcome ─────────────────────────────── */
+  #outcome {
+    display: none; margin-top: .6rem;
+    padding: .55rem .65rem;
+    border: 1px solid var(--border); border-radius: .4rem;
+    font-size: .82rem; line-height: 1.5;
+  }
+  #outcome b { color: var(--muted); font-weight: 600; }
+  #reanalyze {
+    padding: .28rem .75rem;
+    background: #6366f1; color: #fff;
+    border: 0; border-radius: .38rem;
+    cursor: pointer; font-size: .77rem; display: none;
+  }
+  #reanalyzeStatus { font-size: .77rem; color: var(--muted); margin-left: .4rem; }
+
+  /* ── Hidden ──────────────────────────────── */
+  .hidden { display: none !important; }
+
+  @media (max-width: 680px) {
+    .layout { flex-direction: column; }
+    .sidebar { width: 100%; }
+  }
 </style>
 </head>
 <body>
-  <h1>Voice Dev Console <span class="hint">— use headphones to avoid echo</span></h1>
-  <div class="row">
-    <button id="start">Start</button>
-    <label>Lead name <input id="leadName" value="Raju" placeholder="e.g. Raju" style="width:8rem" /></label>
-    <label><input type="checkbox" id="halfDuplex" /> Mute mic while agent speaks <span class="hint">(turn on for speakers)</span></label>
-    <label><input type="checkbox" id="bargeIn" /> Allow interruptions (experimental)</label>
-    <label>Mode
-      <select id="mode">
-        <option value="s2s" selected>S2S (Gemini Live)</option>
-        <option value="layered">Layered (cascade)</option>
-      </select>
-    </label>
-    <label>Voice
-      <!-- Populated per mode from /dev/voices: layered = configured TTS voices,
-           s2s = realtime allowed voices. -->
-      <select id="voice"></select>
-    </label>
-    <label>Campaign
-      <!-- The tenant's campaigns (from /dev/campaigns); the call runs the selected
-           one's script + slots. -->
-      <select id="campaign"></select>
-    </label>
-    <label>Telephony
-      <select id="telephony">
-        <option value="WebConsole">WebConsole (browser)</option>
-        <option value="twilio">Twilio (place call)</option>
-        <option value="exotel">Exotel (place call)</option>
-        <option value="stringee">Stringee (place call)</option>
-      </select>
-    </label>
-    <label id="toNumberLabel" style="display:none">Call <input id="toNumber" value="+918618795697" placeholder="+9199…" style="width:9rem" /></label>
-    <span id="status">idle</span>
-  </div>
-  <div class="panes">
-    <div class="pane">
-      <h2>Transcript</h2>
-      <div id="transcript"></div>
-    </div>
-    <div class="pane">
-      <h2>Dialogue state &amp; slots</h2>
-      <pre id="state">—</pre>
-      <div id="outcome" style="margin-top:12px; padding:8px; border:1px solid #333; border-radius:6px; display:none;">
-        <div><b>Outcome:</b> <span id="outcomeType"></span> <span id="outcomeSource" style="color:#888;"></span></div>
-        <div style="margin-top:4px;"><b>Summary:</b> <span id="outcomeSummary"></span></div>
-        <div style="margin-top:4px;"><b>Notes:</b> <span id="outcomeNotes"></span></div>
-        <div id="outcomeCallback" style="margin-top:4px;"></div>
-        <div style="margin-top:8px;">
-          <button id="reanalyze" style="display:none; padding:.3rem .8rem; background:#6366f1; color:#fff; border:0; border-radius:.4rem; cursor:pointer; font-size:.8rem;" onclick="reanalyzeCall()">Reanalyze</button>
-          <span id="reanalyzeStatus" style="font-size:.8rem; color:#94a3b8; margin-left:.5rem;"></span>
+
+<div class="header">
+  <h1>🎙 Voice Demo Console</h1>
+  <span class="hint">— use headphones to avoid echo</span>
+  <span id="status">idle</span>
+</div>
+
+<div class="layout">
+
+  <!-- ═══ SIDEBAR ═══════════════════════════════════════════ -->
+  <div class="sidebar">
+
+    <!-- Call Setup -->
+    <div class="card">
+      <div class="card-label">Call Setup</div>
+      <div class="field-row">
+        <div class="field">
+          <label>Lead name</label>
+          <input type="text" id="leadName" value="Raju" placeholder="e.g. Raju" />
+        </div>
+        <div class="field">
+          <label>Campaign</label>
+          <select id="campaign"></select>
         </div>
       </div>
     </div>
-  </div>
+
+    <!-- Mode -->
+    <div class="card">
+      <div class="card-label">Mode</div>
+      <div class="mode-tabs">
+        <button class="mode-tab active" data-mode="s2s"     onclick="setMode('s2s')">S2S — Gemini Live</button>
+        <button class="mode-tab"        data-mode="layered" onclick="setMode('layered')">Layered</button>
+      </div>
+      <div class="field">
+        <label>Voice</label>
+        <select id="voice"></select>
+      </div>
+    </div>
+
+    <!-- Layered: STT / LLM / TTS -->
+    <div class="card hidden" id="layered-providers">
+      <div class="card-label">Providers</div>
+      <div class="field">
+        <label>STT — speech recognition</label>
+        <select id="stt-select"></select>
+      </div>
+      <div class="field">
+        <label>LLM — language model</label>
+        <select id="llm-select"></select>
+      </div>
+      <div class="field">
+        <label>TTS — voice synthesis</label>
+        <select id="tts-select"></select>
+      </div>
+    </div>
+
+    <!-- Options -->
+    <div class="card">
+      <div class="card-label">Options</div>
+      <label class="check-label">
+        <input type="checkbox" id="halfDuplex" />
+        Mute mic while agent speaks <span class="hint">(speakers)</span>
+      </label>
+      <label class="check-label" style="margin-top:.15rem">
+        <input type="checkbox" id="bargeIn" />
+        Allow interruptions <span class="hint">(experimental)</span>
+      </label>
+    </div>
+
+    <!-- Telephony -->
+    <div class="card">
+      <div class="card-label">Telephony</div>
+      <div class="field">
+        <label>Provider</label>
+        <select id="telephony">
+          <option value="WebConsole">WebConsole (browser mic)</option>
+          <option value="twilio">Twilio — outbound call</option>
+          <option value="exotel">Exotel — outbound call</option>
+          <option value="stringee">Stringee — outbound call</option>
+        </select>
+      </div>
+      <div class="field hidden" id="toNumberLabel">
+        <label>Call number</label>
+        <input type="text" id="toNumber" value="+918618795697" placeholder="+9199…" />
+      </div>
+    </div>
+
+    <!-- Start -->
+    <button id="start">▶ &nbsp;Start Call</button>
+
+  </div><!-- /sidebar -->
+
+  <!-- ═══ PANES ══════════════════════════════════════════════ -->
+  <div class="panes">
+
+    <div class="pane">
+      <div class="pane-label">Transcript</div>
+      <div id="transcript"></div>
+    </div>
+
+    <div class="pane">
+      <div class="pane-label">Dialogue State &amp; Slots</div>
+      <pre id="state">—</pre>
+      <div id="outcome">
+        <div><b>Outcome:</b> <span id="outcomeType"></span> <span id="outcomeSource" style="color:#6b7280;margin-left:.3rem"></span></div>
+        <div><b>Summary:</b> <span id="outcomeSummary"></span></div>
+        <div><b>Notes:</b>   <span id="outcomeNotes"></span></div>
+        <div id="outcomeCallback"></div>
+        <div style="margin-top:.4rem">
+          <button id="reanalyze" onclick="reanalyzeCall()">Reanalyze</button>
+          <span id="reanalyzeStatus"></span>
+        </div>
+      </div>
+    </div>
+
+  </div><!-- /panes -->
+
+</div><!-- /layout -->
 
 <script>
 const TARGET_RATE = 16000;
 let ws, audioCtx, micStream, workletNode, playCursor = 0, agentSpeaking = false, running = false;
-const activeSources = new Set();   // scheduled playback nodes, so we can stop them
+const activeSources = new Set();
 
 const $ = (id) => document.getElementById(id);
 const setStatus = (s) => { $("status").textContent = s; };
 let _currentCallId = null;
+let _mode = "s2s";   // tracks current mode selection
 
-// Render an outcome payload into the outcome panel. Works for both the WS
-// message (S2S/WebConsole) and the polled telephony monitor payload — same field
-// names ({outcome, source, summary, notes, callback_datetime, callback_phrase}).
+// ── Mode ──────────────────────────────────────────────────────
+function setMode(mode) {
+  _mode = mode;
+  document.querySelectorAll(".mode-tab").forEach(t => {
+    t.classList.toggle("active", t.dataset.mode === mode);
+  });
+  $("layered-providers").classList.toggle("hidden", mode !== "layered");
+  populateVoices(mode);
+}
+
+// ── Outcome ────────────────────────────────────────────────────
 function renderOutcome(o) {
   if (!o) return;
   $("outcome").style.display = "block";
-  $("outcomeType").textContent = o.outcome || "—";
-  $("outcomeSource").textContent = o.source ? "(" + o.source + ")" : "";
+  $("outcomeType").textContent    = o.outcome || "—";
+  $("outcomeSource").textContent  = o.source ? "(" + o.source + ")" : "";
   $("outcomeSummary").textContent = o.summary || "—";
-  $("outcomeNotes").textContent = o.notes || "—";
+  $("outcomeNotes").textContent   = o.notes   || "—";
   $("outcomeCallback").textContent = o.callback_datetime
     ? "Callback: " + o.callback_datetime
     : (o.callback_phrase ? "Callback (unresolved): " + o.callback_phrase : "");
-  if (_currentCallId) {
-    $("reanalyze").style.display = "inline-block";
-    $("reanalyzeStatus").textContent = "";
-  }
+  if (_currentCallId) { $("reanalyze").style.display = "inline-block"; $("reanalyzeStatus").textContent = ""; }
 }
 
 async function reanalyzeCall() {
@@ -124,6 +328,7 @@ async function reanalyzeCall() {
   }
 }
 
+// ── Transcript ─────────────────────────────────────────────────
 function addTranscript(role, text) {
   const div = document.createElement("div");
   div.className = "turn " + role;
@@ -134,22 +339,18 @@ function addTranscript(role, text) {
 
 let _partialEl = null;
 function renderPartial(text) {
-  if (!text) {
-    if (_partialEl) { _partialEl.remove(); _partialEl = null; }
-    return;
-  }
+  if (!text) { if (_partialEl) { _partialEl.remove(); _partialEl = null; } return; }
   if (!_partialEl) {
     _partialEl = document.createElement("div");
     _partialEl.className = "turn user";
-    _partialEl.style.opacity = "0.55";
-    _partialEl.style.fontStyle = "italic";
+    _partialEl.style.cssText = "opacity:.5;font-style:italic";
     $("transcript").appendChild(_partialEl);
   }
   _partialEl.textContent = "🎙 " + text;
   $("transcript").scrollTop = $("transcript").scrollHeight;
 }
 
-// Downsample Float32 @ctxRate -> Int16 @16k via nearest-neighbour sampling.
+// ── Audio engine ───────────────────────────────────────────────
 function downsampleToInt16(float32, inRate) {
   if (inRate === TARGET_RATE) {
     const out = new Int16Array(float32.length);
@@ -169,16 +370,13 @@ function downsampleToInt16(float32, inRate) {
   return out;
 }
 
-// Schedule Int16 PCM @16k for gapless playback.
 let _playN = 0;
 function playPcm16(int16) {
   const buf = audioCtx.createBuffer(1, int16.length, TARGET_RATE);
   const ch = buf.getChannelData(0);
   for (let i = 0; i < int16.length; i++) ch[i] = int16[i] / 0x8000;
   const src = audioCtx.createBufferSource();
-  src.buffer = buf;
-  src.connect(audioCtx.destination);
-  // Free the node when it finishes so a long call doesn't accumulate nodes.
+  src.buffer = buf; src.connect(audioCtx.destination);
   src.onended = () => { activeSources.delete(src); try { src.disconnect(); } catch (_) {} };
   activeSources.add(src);
   const now = audioCtx.currentTime;
@@ -186,23 +384,24 @@ function playPcm16(int16) {
   if (underrun) playCursor = now;
   src.start(playCursor);
   playCursor += buf.duration;
-  if ((++_playN) % 25 === 0) {
-    console.log(`[playback] n=${_playN} ctxRate=${audioCtx.sampleRate} gap=${(playCursor - now).toFixed(2)}s${underrun ? " UNDERRUN" : ""}`);
-  }
+  if ((++_playN) % 25 === 0)
+    console.log(`[playback] n=${_playN} gap=${(playCursor - now).toFixed(2)}s${underrun ? " UNDERRUN" : ""}`);
 }
 
 function stopPlayback() {
   for (const s of activeSources) { try { s.stop(); s.disconnect(); } catch (_) {} }
   activeSources.clear();
-  playCursor = audioCtx.currentTime;   // nothing scheduled ahead anymore
+  playCursor = audioCtx.currentTime;
 }
 
+// ── Config events ──────────────────────────────────────────────
 function sendBargeConfig() {
   if (ws && ws.readyState === WebSocket.OPEN)
     ws.send(JSON.stringify({ type: "config", barge: $("bargeIn").checked }));
 }
 $("bargeIn").addEventListener("change", sendBargeConfig);
 
+// ── Worklet ────────────────────────────────────────────────────
 const WORKLET_CODE = `
 class CaptureProcessor extends AudioWorkletProcessor {
   process(inputs) {
@@ -214,27 +413,34 @@ class CaptureProcessor extends AudioWorkletProcessor {
 registerProcessor('capture-processor', CaptureProcessor);
 `;
 
+// ── WS session ─────────────────────────────────────────────────
 async function start() {
   const wsProto = location.protocol === "https:" ? "wss" : "ws";
   const leadName = ($("leadName").value || "").trim();
-  const mode = $("mode").value;
-  // S2S (Gemini Live) uses a sibling endpoint + a voice; layered = the cascade.
-  const path = mode === "s2s" ? "/api/v1/dev/voice-live" : "/api/v1/dev/voice";
-  let qs = "tenant=dev" + (leadName ? "&lead_name=" + encodeURIComponent(leadName) : "");
-  // Voice applies to both modes now: layered overrides the TTS voice, s2s the
-  // realtime voice (both validated server-side against the allowed set).
-  if ($("voice").value) qs += "&voice=" + encodeURIComponent($("voice").value);
-  // The selected campaign drives the agent's script + slots for this call.
+  const path = _mode === "s2s" ? "/api/v1/dev/voice-live" : "/api/v1/dev/voice";
+  let qs = "tenant=dev";
+  if (leadName)           qs += "&lead_name=" + encodeURIComponent(leadName);
+  if ($("voice").value)   qs += "&voice="     + encodeURIComponent($("voice").value);
   if ($("campaign").value) qs += "&campaign=" + encodeURIComponent($("campaign").value);
+  // Layered-specific provider overrides
+  if (_mode === "layered") {
+    const stt = $("stt-select").value;
+    const llm = $("llm-select").value;
+    const tts = $("tts-select").value;
+    if (stt) qs += "&stt=" + encodeURIComponent(stt);
+    if (llm) qs += "&llm=" + encodeURIComponent(llm);
+    if (tts) qs += "&tts=" + encodeURIComponent(tts);
+  }
   ws = new WebSocket(`${wsProto}://${location.host}${path}?${qs}`);
   ws.binaryType = "arraybuffer";
 
   ws.onopen = async () => {
-    console.log("[devconsole] ws open; sending hello + wiring audio");
     ws.send(JSON.stringify({ type: "hello", tenant: "dev" }));
     sendBargeConfig();
     try {
-      // micStream + audioCtx were already acquired during the click gesture.
+      try { audioCtx = new AudioContext({ sampleRate: TARGET_RATE }); }
+      catch (_) { audioCtx = new AudioContext(); }
+      if (audioCtx.state === "suspended") await audioCtx.resume();
       const blobUrl = URL.createObjectURL(new Blob([WORKLET_CODE], { type: "application/javascript" }));
       await audioCtx.audioWorklet.addModule(blobUrl);
       const srcNode = audioCtx.createMediaStreamSource(micStream);
@@ -243,86 +449,53 @@ async function start() {
         if (!running) return;
         const stillPlaying = playCursor > audioCtx.currentTime + 0.05;
         const speaking = agentSpeaking || stillPlaying;
-        // Half-duplex (speakers): mute the mic while the agent speaks. Skipped
-        // when barge-in is on — the server needs the mic to hear interruptions
-        // (headphones, no echo). Server-side detection replaces the old client VAD.
-        // S2S (Gemini Live) is always full-duplex: the model does its own VAD +
-        // native barge-in, so the mic must stream continuously.
-        const s2s = $("mode").value === "s2s";
+        const s2s = _mode === "s2s";
         if (!s2s && $("halfDuplex").checked && speaking && !$("bargeIn").checked) return;
         const int16 = downsampleToInt16(e.data, audioCtx.sampleRate);
         if (ws.readyState === WebSocket.OPEN) ws.send(int16.buffer);
       };
       srcNode.connect(workletNode);
-      // Worklet needs a sink to pull; route through a muted gain so we don't echo.
-      const sink = audioCtx.createGain();
-      sink.gain.value = 0;
+      const sink = audioCtx.createGain(); sink.gain.value = 0;
       workletNode.connect(sink).connect(audioCtx.destination);
       running = true;
-      console.log("[devconsole] audio ready; mic streaming, listening");
       setStatus("connected");
     } catch (err) {
-      console.error("[devconsole] audio worklet setup FAILED:", err);
       setStatus("audio error: " + (err && err.message ? err.message : err));
       stop();
     }
   };
 
   ws.onmessage = (e) => {
-    if (e.data instanceof ArrayBuffer) {
-      playPcm16(new Int16Array(e.data));
-      return;
-    }
+    if (e.data instanceof ArrayBuffer) { playPcm16(new Int16Array(e.data)); return; }
     const msg = JSON.parse(e.data);
-    if (msg.type === "session") {
-      _currentCallId = msg.call_id;
-      $("reanalyze").style.display = "none";   // reset for new call
-      $("reanalyzeStatus").textContent = "";
-    } else if (msg.type === "status") {
-      setStatus(msg.status);
-      // Mute the mic whenever the agent is busy (synthesizing the opening,
-      // thinking, or speaking) — not only while audio streams. Otherwise the
-      // mic captures noise during those windows and the agent answers itself.
-      agentSpeaking = (msg.status !== "listening");
-    } else if (msg.type === "interrupt") {
-      stopPlayback();            // server detected a barge: flush buffered audio now
-      agentSpeaking = false;
-    } else if (msg.type === "partial") {
-      renderPartial(msg.text);
-    } else if (msg.type === "transcript") {
-      if (msg.role === "user") renderPartial("");  // final replaces the live line
-      addTranscript(msg.role, msg.text);
-    } else if (msg.type === "state") {
-      $("state").textContent =
-        "state: " + msg.state + "\nslots: " + JSON.stringify(msg.slots, null, 2);
-    } else if (msg.type === "outcome") {
-      renderOutcome(msg);
-    } else if (msg.type === "error") {
-      console.error("[devconsole] turn error:", msg.message);
+    if      (msg.type === "session")    { _currentCallId = msg.call_id; $("reanalyze").style.display = "none"; $("reanalyzeStatus").textContent = ""; }
+    else if (msg.type === "status")     { setStatus(msg.status); agentSpeaking = (msg.status !== "listening"); }
+    else if (msg.type === "interrupt")  { stopPlayback(); agentSpeaking = false; }
+    else if (msg.type === "partial")    { renderPartial(msg.text); }
+    else if (msg.type === "transcript") { if (msg.role === "user") renderPartial(""); addTranscript(msg.role, msg.text); }
+    else if (msg.type === "state")      { $("state").textContent = "state: " + msg.state + "\nslots: " + JSON.stringify(msg.slots, null, 2); }
+    else if (msg.type === "outcome")    { renderOutcome(msg); }
+    else if (msg.type === "error") {
       const div = document.createElement("div");
-      div.className = "turn";
-      div.style.color = "#fca5a5";
+      div.className = "turn"; div.style.color = "#fca5a5";
       div.textContent = "⚠ " + msg.message;
       $("transcript").appendChild(div);
       $("transcript").scrollTop = $("transcript").scrollHeight;
     }
   };
 
-  ws.onclose = (e) => { console.warn("[devconsole] ws CLOSED code=", e.code, "reason=", e.reason, "wasClean=", e.wasClean); stop(false); setStatus("closed"); };
-  ws.onerror = (e) => { console.error("[devconsole] ws ERROR", e); setStatus("connection error"); };
+  ws.onclose = (e) => { stop(false); setStatus("closed"); };
+  ws.onerror = ()  => { setStatus("connection error"); };
 }
 
 function stop(immediate) {
   running = false;
-  if (workletNode) { try { workletNode.disconnect(); } catch (_) {} }
-  workletNode = null;
-  if (micStream) micStream.getTracks().forEach((t) => t.stop());
-  micStream = null;
+  if (workletNode) { try { workletNode.disconnect(); } catch (_) {} workletNode = null; }
+  if (micStream) micStream.getTracks().forEach(t => t.stop()); micStream = null;
   agentSpeaking = false;
   if (ws && ws.readyState === WebSocket.OPEN) ws.close();
   $("start").classList.remove("stop");
-  $("start").textContent = "Start";
-  // Delay closing AudioContext so any already-scheduled audio finishes playing.
+  $("start").textContent = "▶  Start Call";
   if (audioCtx) {
     const ctx = audioCtx; audioCtx = null;
     const waitMs = immediate ? 0 : Math.max(300, (playCursor - ctx.currentTime + 0.5) * 1000);
@@ -330,60 +503,118 @@ function stop(immediate) {
   }
 }
 
-// Graceful end: ask the server to finalize and push the outcome while the
-// socket is still open, then let the server close it (onclose -> stop()).
-// Halts the mic immediately but keeps the ws open to receive the outcome panel.
 function endCall() {
   if (!ws || ws.readyState !== WebSocket.OPEN) { stop(); return; }
-  running = false;  // stop streaming mic frames at once
-  if (workletNode) { try { workletNode.disconnect(); } catch (_) {} }
-  workletNode = null;
-  if (micStream) micStream.getTracks().forEach((t) => t.stop());
-  micStream = null;
+  running = false;
+  if (workletNode) { try { workletNode.disconnect(); } catch (_) {} workletNode = null; }
+  if (micStream) micStream.getTracks().forEach(t => t.stop()); micStream = null;
   agentSpeaking = false;
   $("start").classList.remove("stop");
-  $("start").textContent = "Start";
+  $("start").textContent = "▶  Start Call";
   setStatus("ending…");
   ws.send(JSON.stringify({ type: "end" }));
-  // Fallback: force-close if the server hasn't sent the outcome and closed within
-  // 20s. Server-side outcome analysis (analyze_call) has a 15s LLM timeout + a
-  // few seconds of teardown, so 6s was too short and the outcome arrived after the
-  // socket was already gone.
   setTimeout(() => { if (ws && ws.readyState === WebSocket.OPEN) stop(true); }, 20000);
 }
 
-// --- Telephony: place an outbound call + poll its status ----------------------
-let callPoll = null;                       // setInterval handle while watching a call
-const NO_ANSWER_MS = 75000;                // give up waiting for an answer after ~75s
-
-function resetStartButton() {
-  $("start").classList.remove("stop");
-  $("start").textContent = "Start";
-}
+// ── Telephony ──────────────────────────────────────────────────
+let callPoll = null;
+const NO_ANSWER_MS = 75000;
 
 function syncTelephonyUI() {
   const tel = $("telephony").value;
-  $("toNumberLabel").style.display = (tel === "WebConsole") ? "none" : "inline-block";
+  $("toNumberLabel").classList.toggle("hidden", tel === "WebConsole");
 }
 $("telephony").addEventListener("change", syncTelephonyUI);
 syncTelephonyUI();
 
-// Voice dropdown is per-mode: layered shows the configured TTS provider's voice
-// roster, s2s shows all 30 Gemini Live voices with gender + style metadata.
+function resetStartButton() {
+  $("start").classList.remove("stop");
+  $("start").textContent = "▶  Start Call";
+}
+
+async function placeCall(provider) {
+  const to = ($("toNumber").value || "").trim();
+  if (!to) { setStatus("enter a number to call"); return; }
+  $("outcome").style.display = "none";
+  $("start").classList.add("stop"); $("start").textContent = "■  Stop";
+  setStatus("placing call…");
+  let body;
+  try {
+    const resp = await fetch("/dev/place-call", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        provider, to_number: to, mode: _mode, voice: $("voice").value,
+        lead_name: ($("leadName").value || "").trim(), tenant: "dev",
+      }),
+    });
+    body = await resp.json().catch(() => ({}));
+    if (!resp.ok) { setStatus("place-call failed: " + (body.detail || resp.status)); resetStartButton(); return; }
+  } catch (err) {
+    setStatus("error: " + (err && err.message ? err.message : err));
+    resetStartButton(); return;
+  }
+  const sid = body.provider_call_sid || body.call_sid;
+  if (!sid) { setStatus("no call id returned"); resetStartButton(); return; }
+  pollCall(sid);
+}
+
+function pollCall(callSid) {
+  const startedAt = Date.now();
+  callPoll = setInterval(async () => {
+    let data;
+    try {
+      const r = await fetch("/dev/call-status/" + encodeURIComponent(callSid));
+      if (!r.ok) return;
+      data = await r.json();
+    } catch (_) { return; }
+    setStatus(data.status);
+    if (data.outcome) { renderOutcome(data.outcome); stopWatching(); }
+    else if ((data.status === "calling" || data.status === "unknown") && Date.now() - startedAt > NO_ANSWER_MS)
+      { setStatus("no answer (timed out)"); stopWatching(); }
+    else if (data.status === "failed") { stopWatching(); }
+  }, 1500);
+}
+
+function stopWatching() {
+  if (callPoll) { clearInterval(callPoll); callPoll = null; }
+  resetStartButton();
+}
+
+// ── Start button ───────────────────────────────────────────────
+$("start").onclick = async () => {
+  if (callPoll) { stopWatching(); setStatus("stopped watching"); return; }
+  const tel = $("telephony").value;
+  if (tel === "twilio" || tel === "exotel" || tel === "stringee") { placeCall(tel); return; }
+  if (running) { endCall(); return; }
+  setStatus("requesting microphone…");
+  try {
+    try { audioCtx = new AudioContext({ sampleRate: TARGET_RATE }); }
+    catch (_) { audioCtx = new AudioContext(); }
+    if (audioCtx.state === "suspended") await audioCtx.resume();
+    micStream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, channelCount: 1 },
+    });
+  } catch (err) {
+    setStatus("microphone blocked (" + (err && err.name ? err.name : err) + ") — allow mic in browser settings");
+    if (audioCtx) { try { audioCtx.close(); } catch (_) {} audioCtx = null; }
+    return;
+  }
+  playCursor = audioCtx.currentTime;
+  $("start").classList.add("stop"); $("start").textContent = "■  End Call";
+  start();
+};
+
+// ── Voices ─────────────────────────────────────────────────────
 let _voiceData = { layered: { voices: [], default: "" }, s2s: { voices: [], default: "", catalog: [] } };
-// Console dropdown default voice per mode (UI only — overrides the config-derived
-// default for the selector; falls back to the server default if the preferred
-// voice isn't in the roster). Does NOT change the tenant's configured voice.
 const _preferredVoice = { s2s: "Leda", layered: "arya" };
+
 function populateVoices(mode) {
   const d = _voiceData[mode] || { voices: [], default: "" };
   const preferred = _preferredVoice[mode];
   const def = d.voices.includes(preferred) ? preferred : d.default;
-  // Build a lookup from voice_id → {gender, style} from the catalog (s2s only).
   const meta = {};
   for (const v of (d.catalog || [])) meta[v.voice_id] = v;
-  const sel = $("voice");
-  sel.innerHTML = "";
+  const sel = $("voice"); sel.innerHTML = "";
   for (const id of d.voices) {
     const o = document.createElement("option");
     o.value = id;
@@ -393,17 +624,17 @@ function populateVoices(mode) {
     sel.appendChild(o);
   }
 }
+
 async function loadVoices() {
   try {
     const r = await fetch("/dev/voices?tenant=dev");
     if (r.ok) _voiceData = await r.json();
   } catch (e) { console.warn("[devconsole] voices fetch failed", e); }
-  populateVoices($("mode").value);
+  populateVoices(_mode);
 }
-$("mode").addEventListener("change", () => populateVoices($("mode").value));
 loadVoices();
 
-// Campaign selector: the tenant's campaigns drive the agent's script per call.
+// ── Campaigns ──────────────────────────────────────────────────
 async function loadCampaigns() {
   const sel = $("campaign");
   try {
@@ -421,100 +652,26 @@ async function loadCampaigns() {
 }
 loadCampaigns();
 
-async function placeCall(provider) {
-  const to = ($("toNumber").value || "").trim();
-  if (!to) { setStatus("enter a number to call"); return; }
-  $("outcome").style.display = "none";
-  $("start").classList.add("stop"); $("start").textContent = "Stop";
-  setStatus("placing call…");
-  let body;
+// ── Providers (STT / LLM / TTS) ────────────────────────────────
+async function loadProviders() {
   try {
-    const resp = await fetch("/dev/place-call", {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        provider, to_number: to, mode: $("mode").value, voice: $("voice").value,
-        lead_name: ($("leadName").value || "").trim(), tenant: "dev",
-      }),
-    });
-    body = await resp.json().catch(() => ({}));
-    if (!resp.ok) { setStatus("place-call failed: " + (body.detail || resp.status)); resetStartButton(); return; }
-  } catch (err) {
-    setStatus("place-call error: " + (err && err.message ? err.message : err));
-    resetStartButton();
-    return;
-  }
-  const sid = body.provider_call_sid || body.call_sid;   // unified shape; call_sid kept as fallback
-  if (!sid) { setStatus("no call id returned"); resetStartButton(); return; }
-  pollCall(sid);
+    const r = await fetch("/dev/providers");
+    if (!r.ok) return;
+    const data = await r.json();
+    const fill = (selId, opts) => {
+      const sel = $(selId); if (!sel) return; sel.innerHTML = "";
+      for (const { id, label } of (opts || [])) {
+        const o = document.createElement("option");
+        o.value = id; o.textContent = label;
+        sel.appendChild(o);
+      }
+    };
+    fill("stt-select", data.stt);
+    fill("llm-select", data.llm);
+    fill("tts-select", data.tts);
+  } catch (e) { console.warn("[devconsole] providers fetch failed", e); }
 }
-
-function pollCall(callSid) {
-  const startedAt = Date.now();
-  callPoll = setInterval(async () => {
-    let data;
-    try {
-      const r = await fetch("/dev/call-status/" + encodeURIComponent(callSid));
-      if (!r.ok) return;
-      data = await r.json();
-    } catch (_) { return; }
-    setStatus(data.status);
-    if (data.outcome) {
-      renderOutcome(data.outcome);
-      stopWatching();                                    // outcome in hand: done
-    } else if ((data.status === "calling" || data.status === "unknown")
-               && Date.now() - startedAt > NO_ANSWER_MS) {
-      setStatus("no answer (timed out)");
-      stopWatching();
-    } else if (data.status === "failed") {
-      stopWatching();
-    }
-  }, 1500);
-}
-
-function stopWatching() {
-  if (callPoll) { clearInterval(callPoll); callPoll = null; }
-  resetStartButton();
-}
-
-$("start").onclick = async () => {
-  if (callPoll) { stopWatching(); setStatus("stopped watching"); return; }
-  const tel = $("telephony").value;
-  if (tel === "twilio" || tel === "exotel" || tel === "stringee") { placeCall(tel); return; }
-  if (running) { endCall(); return; }
-  // Acquire the mic + audio context DURING the click gesture, before opening the
-  // WebSocket. This ties the permission prompt to the user gesture (strict
-  // browsers deny a mic request made later, from ws.onopen) and lets us surface
-  // a denial clearly without opening a doomed connection.
-  setStatus("requesting microphone…");
-  try {
-    // Run the context AT 16 kHz so the agent's 16 kHz audio plays with NO
-    // per-chunk resampling (resampling many tiny buffers warbles over time) and
-    // the mic is captured at 16 kHz directly. Fall back if the browser refuses
-    // a forced rate.
-    try {
-      audioCtx = new AudioContext({ sampleRate: TARGET_RATE });
-    } catch (_) {
-      audioCtx = new AudioContext();
-    }
-    console.log("[playback] AudioContext sampleRate =", audioCtx.sampleRate);
-    if (audioCtx.state === "suspended") await audioCtx.resume();
-    micStream = await navigator.mediaDevices.getUserMedia({
-      audio: { echoCancellation: true, noiseSuppression: true, channelCount: 1 },
-    });
-  } catch (err) {
-    console.error("[devconsole] mic/audio init failed:", err);
-    setStatus(
-      "microphone blocked (" + (err && err.name ? err.name : err) +
-      ") — click the site icon in the address bar, set Microphone to Allow, then click Start again"
-    );
-    if (audioCtx) { try { audioCtx.close(); } catch (_) {} audioCtx = null; }
-    return;  // do NOT open the websocket when the mic is unavailable
-  }
-  playCursor = audioCtx.currentTime;
-  $("start").classList.add("stop");
-  $("start").textContent = "Stop";
-  start();
-};
+loadProviders();
 </script>
 </body>
 </html>
