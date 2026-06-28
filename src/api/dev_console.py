@@ -313,6 +313,18 @@ async def dev_place_call(req: PlaceCallRequest) -> dict:
     if not from_number and (tel.provider or "").lower() == provider:
         from_number = tel.from_number          # default block's number, if it matches
     if not from_number:
+        # DB config may be from an old seed that lacked outbound_from / provider.
+        # Fall back to the YAML (always present in the Docker image) as source of truth.
+        try:
+            from src.config_tenant import load_tenant as _load_tenant
+            _yaml = _load_tenant(req.tenant)
+            _yaml_tel = _yaml.pipeline.telephony
+            from_number = (_yaml_tel.outbound_from or {}).get(provider)
+            if not from_number and (_yaml_tel.provider or "").lower() == provider:
+                from_number = _yaml_tel.from_number
+        except Exception:
+            pass
+    if not from_number:
         raise HTTPException(
             status_code=400,
             detail=(f"no caller-ID configured for '{provider}'. Set "
