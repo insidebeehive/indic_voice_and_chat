@@ -125,17 +125,22 @@ class VoiceBotAgent(BaseAgent):
         the conversation history, and stay in LISTENING for the user's
         reply. Skips silently if there's no opening configured.
         """
-        gender = (self._script.gender or "").strip().lower()
-        if gender == "male" and self._script.opening_male:
+        # Use LEAD gender (from lead_data) to select the appropriate opening variant.
+        # Agent grammatical gender is handled by the system-prompt directive — not here.
+        lead_gender = (self.session.lead_data or {}).get("lead_gender", "").strip().lower()
+        if lead_gender == "male" and self._script.opening_male:
             opening = self._script.opening_male.strip()
-        elif gender == "female" and self._script.opening_female:
+        elif lead_gender == "female" and self._script.opening_female:
             opening = self._script.opening_female.strip()
         else:
             opening = (self._script.opening or "").strip()
         if not opening:
             return
         # Substitute simple template tokens with known lead data.
-        rendered = opening.format(**self._template_vars())
+        import re as _re
+        raw = opening.format(**self._template_vars())
+        # Collapse extra spaces that arise when a name token is empty.
+        rendered = _re.sub(r"  +", " ", raw).strip()
 
         # The TTS goes through the pipeline engine's TTS provider so the
         # adapter-level streaming + sample-rate handling stays consistent
@@ -166,7 +171,7 @@ class VoiceBotAgent(BaseAgent):
     def _template_vars(self) -> dict[str, str]:
         data = dict(self.session.lead_data or {})
         # Common fallbacks so f-string substitution doesn't KeyError.
-        data.setdefault("lead_name", data.get("name", "ji"))
+        data.setdefault("lead_name", data.get("name", ""))
         data.setdefault("agent_name", self._script.agent_name)
         data.setdefault("company_name", self._script.company_name)
         return {k: str(v) for k, v in data.items()}

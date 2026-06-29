@@ -37,7 +37,7 @@ def _render_opening(script: "VoiceBotScript", lead_data: dict[str, Any]) -> str:
     variables = {
         "agent_name": script.agent_name,
         "company_name": script.company_name,
-        "lead_name": (lead_data or {}).get("lead_name", "ji"),
+        "lead_name": (lead_data or {}).get("lead_name", ""),
         **(lead_data or {}),
     }
     try:
@@ -147,8 +147,8 @@ class VoiceBotScript:
             closing=closing,
             personality=script.get("personality", "") or "",
             gender=script.get("gender", "") or "",
-            opening_male=script.get("opening_male", "") or "",
-            opening_female=script.get("opening_female", "") or "",
+            opening_male=pick("opening_male", "greeting_male", default=""),
+            opening_female=pick("opening_female", "greeting_female", default=""),
             objective=script.get("objective", "") or "",
             knowledge=dict(script.get("knowledge") or {}),
             dos=list(script.get("dos") or []),
@@ -195,8 +195,9 @@ def _lead_address_directive(lead_data: dict) -> Optional[str]:
     lines: list[str] = []
     if not name:
         lines.append(
-            "You do NOT know the lead's name — never invent or guess one. "
-            "Address them as 'ji' or 'aap ji' throughout the call."
+            "The lead's name is unknown — never invent or guess one, and do NOT call them "
+            "'ji' as if it were their name. Use second-person forms ('aap', 'aapka') naturally. "
+            "'ji' is only a respectful particle (e.g., 'haan ji', 'bilkul ji') — never a name."
         )
     if not gender:
         lines.append(

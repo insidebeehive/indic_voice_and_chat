@@ -12,7 +12,9 @@ campaign:
     gender: "female"
 
   script:
-    greeting: "हेलो, नमस्ते सर! मैं {agent_name} बात कर रही हूं भारत मटका Official App से। क्या मेरी बात {lead_name} जी से हो रही है?"
+    greeting: "हेलो, नमस्ते! मैं {agent_name} बात कर रही हूं भारत मटका Official App से। आपका एक मिनट हो सकता है?"
+    greeting_male: "हेलो, नमस्ते सर! मैं {agent_name} बात कर रही हूं भारत मटका Official App से। सर, क्या आपका एक मिनट हो सकता है?"
+    greeting_female: "हेलो, नमस्ते मैम! मैं {agent_name} बात कर रही हूं भारत मटका Official App से। मैम, क्या आपका एक मिनट हो सकता है?"
 
     objective: |
       Establish trust immediately and convey the 'Official' status. The eventual goal
