@@ -34,11 +34,16 @@ def _render_opening(script: "VoiceBotScript", lead_data: dict[str, Any]) -> str:
     ({agent_name}, {lead_name}, company_name, plus any lead_data keys).
     Unknown tokens are left as-is so a bad template never raises.
     """
+    ld = lead_data or {}
+    ag = (getattr(script, "gender", "") or "").strip().lower()
+    lg = (ld.get("lead_gender") or "").strip().lower()
     variables = {
         "agent_name": script.agent_name,
         "company_name": script.company_name,
-        "lead_name": (lead_data or {}).get("lead_name", ""),
-        **(lead_data or {}),
+        "lead_name": ld.get("lead_name", ""),
+        "agent_raha_rahi": "रहा" if ag == "male" else "रही" if ag == "female" else "",
+        "lead_salutation": " Sir" if lg == "male" else " Ma'am" if lg == "female" else "",
+        **ld,
     }
     try:
         return script.opening.strip().format_map(_SafeDict(variables))

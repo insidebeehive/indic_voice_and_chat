@@ -125,12 +125,13 @@ class VoiceBotAgent(BaseAgent):
         the conversation history, and stay in LISTENING for the user's
         reply. Skips silently if there's no opening configured.
         """
-        # Use LEAD gender (from lead_data) to select the appropriate opening variant.
-        # Agent grammatical gender is handled by the system-prompt directive — not here.
-        lead_gender = (self.session.lead_data or {}).get("lead_gender", "").strip().lower()
-        if lead_gender == "male" and self._script.opening_male:
+        # opening_male/opening_female are keyed on AGENT gender (they carry the
+        # agent's own verb inflection — raha/rahi). Lead address is handled via
+        # the {lead_salutation} template token computed in _template_vars().
+        agent_gender = (self._script.gender or "").strip().lower()
+        if agent_gender == "male" and self._script.opening_male:
             opening = self._script.opening_male.strip()
-        elif lead_gender == "female" and self._script.opening_female:
+        elif agent_gender == "female" and self._script.opening_female:
             opening = self._script.opening_female.strip()
         else:
             opening = (self._script.opening or "").strip()
@@ -170,10 +171,16 @@ class VoiceBotAgent(BaseAgent):
 
     def _template_vars(self) -> dict[str, str]:
         data = dict(self.session.lead_data or {})
-        # Common fallbacks so f-string substitution doesn't KeyError.
         data.setdefault("lead_name", data.get("name", ""))
         data.setdefault("agent_name", self._script.agent_name)
         data.setdefault("company_name", self._script.company_name)
+        # Agent grammatical gender token — use in opening templates instead of
+        # hardcoding "rahi"/"raha": e.g. "baat kar {agent_raha_rahi} hoon".
+        ag = (self._script.gender or "").strip().lower()
+        data.setdefault("agent_raha_rahi", "रहा" if ag == "male" else "रही" if ag == "female" else "")
+        # Lead salutation token — inserts " Sir"/" Ma'am"/"" based on lead gender.
+        lg = (data.get("lead_gender") or "").strip().lower()
+        data.setdefault("lead_salutation", " Sir" if lg == "male" else " Ma'am" if lg == "female" else "")
         return {k: str(v) for k, v in data.items()}
 
     async def handle_turn(self, captured_audio: bytes, audio_sink: AudioSink) -> TurnOutcome:
