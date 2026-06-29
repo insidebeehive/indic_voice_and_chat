@@ -464,24 +464,8 @@ def make_bridge_factory(
             cid = (getattr(websocket, "query_params", {}) or {}).get("campaign") or None
             lc = await campaign_resolver.resolve(tenant.id, cid)
             cur_script, cur_slots = lc.script, lc.slots
-        # Speech-to-speech path: when the tenant is in s2s mode, drive Gemini Live
-        # over the Twilio media stream instead of the STT->LLM->TTS cascade.
-        kb_ctx = _build_kb_context(platform_retriever, None)
-        if mode == "s2s":
-            return _build_s2s_telephony_bridge(
-                providers, tenant, cur_script, cur_slots, websocket, session_store,
-                encoding="mulaw", sid_field="streamSid", supports_clear=True,
-                call_sid_field="callSid", voice_override=(override or {}).get("voice"),
-                lead_data=_override_lead_data(override), kb_context=kb_ctx)
-        # Build a fresh agent per call; provider clients are cached on the
-        # registry so we don't pay reconstruction cost.
-        stt = providers.get_stt(tenant)
-        llm = providers.get_llm(tenant)
-        tts = providers.get_tts(tenant)
-
-        # Dev-console voice override: use selected voice_id and align the
-        # script's grammatical gender with it (so Hindi inflection matches
-        # the TTS voice, not just the script's gender field).
+        # Dev-console voice override: derive gender from the selected voice and
+        # align the script's grammatical gender (applies to both s2s and layered).
         voice_override = (override or {}).get("voice", "").strip()
         tts_voice_id = voice_override or tenant.settings.pipeline.tts.voice_id
         if voice_override:
@@ -490,6 +474,20 @@ def make_bridge_factory(
             derived_gender = gender_from_voice_id(voice_override)
             if derived_gender:
                 cur_script = _dc_replace(cur_script, gender=derived_gender)
+        # Speech-to-speech path: when the tenant is in s2s mode, drive Gemini Live
+        # over the Twilio media stream instead of the STT->LLM->TTS cascade.
+        kb_ctx = _build_kb_context(platform_retriever, None)
+        if mode == "s2s":
+            return _build_s2s_telephony_bridge(
+                providers, tenant, cur_script, cur_slots, websocket, session_store,
+                encoding="mulaw", sid_field="streamSid", supports_clear=True,
+                call_sid_field="callSid", voice_override=voice_override or None,
+                lead_data=_override_lead_data(override), kb_context=kb_ctx)
+        # Build a fresh agent per call; provider clients are cached on the
+        # registry so we don't pay reconstruction cost.
+        stt = providers.get_stt(tenant)
+        llm = providers.get_llm(tenant)
+        tts = providers.get_tts(tenant)
 
         # Tenant-namespaced Redis session store (one per tenant; the same
         # instance is fine across calls since the keys carry session_id).
@@ -629,19 +627,6 @@ def make_exotel_bridge_factory(
             cid = (getattr(websocket, "query_params", {}) or {}).get("campaign") or None
             lc = await campaign_resolver.resolve(tenant.id, cid)
             cur_script, cur_slots = lc.script, lc.slots
-        # S2S path: drive Gemini Live over the Exotel media stream (raw PCM16@8k,
-        # snake_case stream_sid, no `clear` frame) when the tenant is in s2s mode.
-        kb_ctx = _build_kb_context(platform_retriever, None)
-        if mode == "s2s":
-            return _build_s2s_telephony_bridge(
-                providers, tenant, cur_script, cur_slots, websocket, session_store,
-                encoding="pcm", sid_field="stream_sid", supports_clear=False,
-                call_sid_field="call_sid", voice_override=(override or {}).get("voice"),
-                lead_data=_override_lead_data(override), kb_context=kb_ctx)
-        stt = providers.get_stt(tenant)
-        llm = providers.get_llm(tenant)
-        tts = providers.get_tts(tenant)
-
         voice_override = (override or {}).get("voice", "").strip()
         tts_voice_id = voice_override or tenant.settings.pipeline.tts.voice_id
         if voice_override:
@@ -650,6 +635,18 @@ def make_exotel_bridge_factory(
             derived_gender = gender_from_voice_id(voice_override)
             if derived_gender:
                 cur_script = _dc_replace(cur_script, gender=derived_gender)
+        # S2S path: drive Gemini Live over the Exotel media stream (raw PCM16@8k,
+        # snake_case stream_sid, no `clear` frame) when the tenant is in s2s mode.
+        kb_ctx = _build_kb_context(platform_retriever, None)
+        if mode == "s2s":
+            return _build_s2s_telephony_bridge(
+                providers, tenant, cur_script, cur_slots, websocket, session_store,
+                encoding="pcm", sid_field="stream_sid", supports_clear=False,
+                call_sid_field="call_sid", voice_override=voice_override or None,
+                lead_data=_override_lead_data(override), kb_context=kb_ctx)
+        stt = providers.get_stt(tenant)
+        llm = providers.get_llm(tenant)
+        tts = providers.get_tts(tenant)
 
         store: SessionStore | None = None
         if session_store is not None:
