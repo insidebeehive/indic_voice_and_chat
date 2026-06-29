@@ -237,6 +237,25 @@ async def patch_campaign_remove_sir(sessionmaker) -> int:
     return patched
 
 
+async def patch_campaign_replace_text(sessionmaker, find: str, replace: str) -> int:
+    """Generic one-time text patch across all campaign config_yaml blobs.
+
+    Idempotent — skips rows where ``find`` is not present.
+    """
+    patched = 0
+    async with sessionmaker() as session:
+        rows = (await session.execute(select(Campaign))).scalars().all()
+        for row in rows:
+            if find not in (row.config_yaml or ""):
+                continue
+            row.config_yaml = row.config_yaml.replace(find, replace)
+            patched += 1
+        if patched:
+            await session.commit()
+            log.info("patched campaign text", extra={"find": find, "replace": replace, "count": patched})
+    return patched
+
+
 async def seed_campaigns_if_empty(sessionmaker, campaigns_dir=None) -> int:
     """Give every tenant a DB campaign migrated from the global ``VOX_CAMPAIGN``
     file, when they have none. Campaigns then diverge per-tenant via the
