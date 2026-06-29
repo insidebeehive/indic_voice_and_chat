@@ -18,7 +18,6 @@ from collections.abc import Awaitable, Callable
 
 from src.api.outcome_recorder import OutcomeRecorderMixin
 from src.api.telephony_stringee import (
-    SILENCE_TIMEOUT_MS,
     answer_scco,
     closing_scco,
     reply_scco,
@@ -171,13 +170,13 @@ class StringeeIvrBridge(OutcomeRecorderMixin):
     async def _synthesize_opening(self) -> list[dict]:
         try:
             await self._agent.start()
-            # Minimal SCCO: just talk, no recordMessage, no bargeIn.
-            # Tests whether talk works at all or recordMessage is the culprit.
-            log.info("stringee opening (talk-only)", extra={"call_id": self.call_id})
-            return [{"action": "talk", "text": "hello", "language": "en-US"}]
+            sink = BufferingAudioSink()
+            await self._agent.play_opening(sink)
+            url = self._host(sink.pcm)
         except Exception:  # noqa: BLE001 - never answer with a 500 / dead line
             log.exception("stringee start_call failed")
             return reprompt_scco(text=_REPROMPT_TEXT, event_url=self._event_url())
+        return answer_scco(audio_url=url, event_url=self._event_url())
 
     async def prewarm(self) -> None:
         """Synthesize the opening audio during the ringing phase so start_call()
