@@ -206,8 +206,9 @@ def _lead_address_directive(lead_data: dict) -> Optional[str]:
         )
     if not gender:
         lines.append(
-            "The lead's gender is unknown. Use gender-neutral forms and avoid "
-            "gendered inflections when addressing or referring to the lead."
+            "The lead's gender is UNKNOWN. NEVER use 'Sir', 'Ma'am', 'सर', 'मैम', or any "
+            "gendered title when addressing them — even if the script examples use 'Sir'. "
+            "Use only gender-neutral address ('aap', 'aapko', 'aapka') throughout."
         )
     if not lines:
         return None
