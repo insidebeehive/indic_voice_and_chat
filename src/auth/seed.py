@@ -166,6 +166,77 @@ async def patch_telephony_outbound_from(sessionmaker) -> None:
             log.info("patched telephony outbound_from", extra={"count": patched})
 
 
+async def patch_campaign_remove_sir(sessionmaker) -> int:
+    """One-time patch: remove hardcoded 'Sir' from knowledge/closing in bharat_matka
+    campaigns and update the greeting to use {agent_raha_rahi}/{lead_salutation} tokens.
+
+    Idempotent — skips rows that no longer contain 'Sir,' or 'Sir ' in the script body.
+    """
+    _KNOWLEDGE = {
+        "safety": (
+            "Main samajh sakti hun aapka concern. Par ye OFFICIAL Bharat Matka app hai. "
+            "Hazaron log roz khel rahe hain. Aap befikar rahiye."
+        ),
+        "scam_concerns": (
+            "Trust kijiye, main aapko PERSONALLY GUIDE karungi. Aap chote amount se, "
+            "bas 100 rupay se check karke dekhiye. Withdrawal turant milega."
+        ),
+        "withdrawal": (
+            "Withdrawal ki koi tension nahi. 500 se lekar jitna marzi nikal lijiye, sab instant hai."
+        ),
+        "deposit": (
+            "Minimum Deposit bas 100 rupay hai. Aap try karne ke liye chota amount daal sakte hain."
+        ),
+        "transaction_speed": (
+            "Deposit aur Withdrawal dono AUTOMATIC aur FAST hain. 5 minute mein paisa aa jata hai."
+        ),
+        "support": (
+            "Main hun na. Koi bhi dikkat aayi toh hamara WhatsApp Support 24 ghante on rehta hai. "
+            "Turant reply milega."
+        ),
+        "referral": (
+            "Doston ko refer karne par 3% COMMISSION milega har Monday. "
+            "Khelne ka bhi paisa, refer karne ka bhi."
+        ),
+    }
+    _CLOSING = "Ok, Thank you time dene ke liye. Aapka din shubh rahe!"
+    _GREETING = (
+        "हेलो, नमस्ते{lead_salutation}! मैं {agent_name} बात कर {agent_raha_rahi} हूं "
+        "भारत मटका Official App से। क्या आपका एक मिनट हो सकता है?"
+    )
+
+    patched = 0
+    async with sessionmaker() as session:
+        rows = (await session.execute(select(Campaign))).scalars().all()
+        for row in rows:
+            raw = row.config_yaml or ""
+            if "Sir" not in raw and "सर" not in raw:
+                continue
+            try:
+                data = yaml.safe_load(raw) or {}
+            except Exception:
+                continue
+            camp = data.get("campaign", data)
+            script = camp.get("script") or {}
+            script["greeting"] = _GREETING
+            script["knowledge"] = _KNOWLEDGE
+            script["closing"] = _CLOSING
+            # Strip greeting_male/greeting_female variants that hardcoded Sir/Ma'am
+            script.pop("greeting_male", None)
+            script.pop("greeting_female", None)
+            camp["script"] = script
+            if "campaign" in data:
+                data["campaign"] = camp
+            else:
+                data = camp
+            row.config_yaml = yaml.dump(data, allow_unicode=True, sort_keys=False)
+            patched += 1
+        if patched:
+            await session.commit()
+            log.info("patched campaign: removed Sir, updated greeting tokens", extra={"count": patched})
+    return patched
+
+
 async def seed_campaigns_if_empty(sessionmaker, campaigns_dir=None) -> int:
     """Give every tenant a DB campaign migrated from the global ``VOX_CAMPAIGN``
     file, when they have none. Campaigns then diverge per-tenant via the

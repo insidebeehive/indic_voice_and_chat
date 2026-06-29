@@ -65,7 +65,7 @@ from src.api.call_store import (
 from src.integration.tenant_events import deliver as deliver_tenant_event
 from src.auth.db_resolver import DbTenantResolver
 from src.auth.middleware import set_admin_tokens, set_tenant_resolver
-from src.auth.seed import seed_campaigns_if_empty, seed_if_empty, seed_provider_costs, sync_telephony_from_yaml
+from src.auth.seed import patch_campaign_remove_sir, seed_campaigns_if_empty, seed_if_empty, seed_provider_costs, sync_telephony_from_yaml
 from src.bootstrap import (
     build_platform_retriever,
     build_provider_registry,
@@ -225,6 +225,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     seeded_campaigns = await seed_campaigns_if_empty(sessionmaker)
     if seeded_campaigns:
         log.info("seeded default campaigns from VOX_CAMPAIGN", extra={"count": seeded_campaigns})
+    await patch_campaign_remove_sir(sessionmaker)
     resolver = DbTenantResolver(sessionmaker)
     await resolver.reload()
     set_tenant_resolver(resolver)
