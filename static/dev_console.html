@@ -444,11 +444,13 @@ async function start() {
   const path = _mode === "s2s" ? "/api/v1/dev/voice-live" : "/api/v1/dev/voice";
   const voiceSel = _mode === "s2s" ? $("voice") : $("voice-layered");
   const selectedVoice = voiceSel ? voiceSel.value : "";
-  const selectedGender = voiceSel ? (voiceSel.options[voiceSel.selectedIndex]?.dataset.gender || "") : "";
+  const explicitGender = ($("genderSelect").value || "").trim();
+  const callerName = ($("callerName").value || "").trim();
   let qs = "tenant=dev";
-  if (leadName)            qs += "&lead_name=" + encodeURIComponent(leadName);
-  if (selectedVoice)       qs += "&voice="     + encodeURIComponent(selectedVoice);
-  if (selectedGender)      qs += "&gender="    + encodeURIComponent(selectedGender);
+  if (leadName)        qs += "&lead_name="   + encodeURIComponent(leadName);
+  if (selectedVoice)   qs += "&voice="       + encodeURIComponent(selectedVoice);
+  if (explicitGender)  qs += "&gender="      + encodeURIComponent(explicitGender);
+  if (callerName)      qs += "&caller_name=" + encodeURIComponent(callerName);
   if ($("campaign").value) qs += "&campaign="  + encodeURIComponent($("campaign").value);
   // Layered-specific provider overrides
   if (_mode === "layered") {

@@ -764,6 +764,23 @@ def make_browser_bridge_factory(
             ),
         )
         engine = PipelineEngine(stt, llm, tts, pipeline_cfg)
+        # Apply gender + caller_name overrides before building the agent so both
+        # the LLM prompt and the opening template use the console-selected values.
+        gender_override = (query_params.get("gender") or "").strip()
+        caller_name_override = (query_params.get("caller_name") or "").strip()
+        if gender_override or caller_name_override:
+            from dataclasses import replace as _dc_replace
+            if not gender_override and sel_voice:
+                from src.providers.voice_catalog import gender_from_voice_id
+                gender_override = gender_from_voice_id(sel_voice)
+            replacements: dict = {}
+            if gender_override:
+                replacements["gender"] = gender_override
+            if caller_name_override:
+                replacements["agent_name"] = caller_name_override
+            if replacements:
+                cur_script = _dc_replace(cur_script, **replacements)
+
         session_id = f"web_{uuid.uuid4().hex[:12]}"
         lead_name = (query_params.get("lead_name") or "").strip()
         lead_data = {"lead_name": lead_name, "name": lead_name} if lead_name else {}
@@ -880,6 +897,29 @@ def make_live_bridge_factory(
         qp = getattr(websocket, "query_params", {}) or {}
         lead_name = (qp.get("lead_name") or "").strip()
         lead_data = {"lead_name": lead_name, "name": lead_name} if lead_name else {}
+
+        # Voice: ?voice= overrides the config default. In the dev console any voice
+        # from the full catalog is allowed (not just the tenant's allowed_voices).
+        from src.providers.voice_catalog import list_voices as _lv
+        _catalog_voices = {v["voice_id"] for v in _lv("gemini_live")}
+        voice = (qp.get("voice") or "").strip() or rt.voice
+        if voice and voice not in _catalog_voices:
+            voice = rt.voice
+
+        # Apply gender + caller_name overrides so LLM prompt and opening line
+        # use the console-selected values (not just what the script says).
+        gender_override = (qp.get("gender") or "").strip()
+        caller_name_override = (qp.get("caller_name") or "").strip()
+        if gender_override or caller_name_override:
+            from dataclasses import replace as _dc_replace
+            replacements: dict = {}
+            if gender_override:
+                replacements["gender"] = gender_override
+            if caller_name_override:
+                replacements["agent_name"] = caller_name_override
+            if replacements:
+                cur_script = _dc_replace(cur_script, **replacements)
+
         session_id = f"live_{uuid.uuid4().hex[:12]}"
         from src.bootstrap import _build_kb_context  # noqa: PLC0415
 
@@ -890,13 +930,6 @@ def make_live_bridge_factory(
             engine=engine, store=None, kb_context=kb_ctx,
         )
 
-        # Voice: ?voice= overrides the config default. In the dev console any voice
-        # from the full catalog is allowed (not just the tenant's allowed_voices).
-        from src.providers.voice_catalog import list_voices as _lv
-        _catalog_voices = {v["voice_id"] for v in _lv("gemini_live")}
-        voice = (qp.get("voice") or "").strip() or rt.voice
-        if voice and voice not in _catalog_voices:
-            voice = rt.voice
         # Platform-level key: connect() reads GEMINI_API_KEY / GOOGLE_API_KEY.
         key = None
         config = RealtimeConfig(
