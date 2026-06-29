@@ -77,16 +77,16 @@ def set_override(
     *,
     mode: str,
     voice: str = "",
-    gender: str = "",
     caller_name: str = "",
     lead_name: str = "",
+    lead_gender: str = "",
 ) -> None:
     _overrides[tenant_slug] = {
         "mode": mode,
         "voice": voice,
-        "gender": gender,
         "caller_name": caller_name,
         "lead_name": lead_name,
+        "lead_gender": lead_gender,
     }
 
 

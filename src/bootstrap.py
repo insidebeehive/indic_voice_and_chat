@@ -357,9 +357,17 @@ class _CallSpec:
 
 
 def _override_lead_data(override: dict | None) -> dict:
-    """Build agent lead_data from a dev-console override's lead_name (if any)."""
-    name = (override or {}).get("lead_name", "").strip()
-    return {"lead_name": name, "name": name} if name else {}
+    """Build agent lead_data from a dev-console override (lead_name, lead_gender)."""
+    d = override or {}
+    name = d.get("lead_name", "").strip()
+    gender = d.get("lead_gender", "").strip()
+    data: dict = {}
+    if name:
+        data["lead_name"] = name
+        data["name"] = name
+    if gender:
+        data["lead_gender"] = gender
+    return data
 
 
 def _build_s2s_telephony_bridge(
@@ -464,22 +472,17 @@ def make_bridge_factory(
             cid = (getattr(websocket, "query_params", {}) or {}).get("campaign") or None
             lc = await campaign_resolver.resolve(tenant.id, cid)
             cur_script, cur_slots = lc.script, lc.slots
-        # Dev-console overrides: voice, gender, and caller (agent) name all come
-        # from the console — not from the script — so a single campaign can be
-        # tested with different personas without editing YAML.
+        # Dev-console overrides: voice (caller/agent name, gender auto-derived from voice).
         voice_override = (override or {}).get("voice", "").strip()
-        gender_override = (override or {}).get("gender", "").strip()
         caller_name_override = (override or {}).get("caller_name", "").strip()
         tts_voice_id = voice_override or tenant.settings.pipeline.tts.voice_id
-        if gender_override or voice_override or caller_name_override:
+        if voice_override or caller_name_override:
             from dataclasses import replace as _dc_replace
-            # Explicit gender wins; fall back to catalog lookup from voice name.
-            if not gender_override and voice_override:
-                from src.providers.voice_catalog import gender_from_voice_id
-                gender_override = gender_from_voice_id(voice_override)
+            from src.providers.voice_catalog import gender_from_voice_id
             replacements: dict = {}
-            if gender_override:
-                replacements["gender"] = gender_override
+            derived_gender = gender_from_voice_id(voice_override) if voice_override else ""
+            if derived_gender:
+                replacements["gender"] = derived_gender
             if caller_name_override:
                 replacements["agent_name"] = caller_name_override
             if replacements:
@@ -638,17 +641,15 @@ def make_exotel_bridge_factory(
             lc = await campaign_resolver.resolve(tenant.id, cid)
             cur_script, cur_slots = lc.script, lc.slots
         voice_override = (override or {}).get("voice", "").strip()
-        gender_override = (override or {}).get("gender", "").strip()
         caller_name_override = (override or {}).get("caller_name", "").strip()
         tts_voice_id = voice_override or tenant.settings.pipeline.tts.voice_id
-        if gender_override or voice_override or caller_name_override:
+        if voice_override or caller_name_override:
             from dataclasses import replace as _dc_replace
-            if not gender_override and voice_override:
-                from src.providers.voice_catalog import gender_from_voice_id
-                gender_override = gender_from_voice_id(voice_override)
+            from src.providers.voice_catalog import gender_from_voice_id
             replacements: dict = {}
-            if gender_override:
-                replacements["gender"] = gender_override
+            derived_gender = gender_from_voice_id(voice_override) if voice_override else ""
+            if derived_gender:
+                replacements["gender"] = derived_gender
             if caller_name_override:
                 replacements["agent_name"] = caller_name_override
             if replacements:

@@ -280,10 +280,10 @@ class PlaceCallRequest(BaseModel):
     provider: str               # "twilio" | "exotel"
     to_number: str
     mode: str = "s2s"           # "s2s" | "layered" — drives the placed call
-    voice: str = ""             # TTS/S2S voice id; "" -> tenant default
-    gender: str = ""            # "male" | "female" | ""; overrides script gender
+    voice: str = ""             # TTS/S2S voice id; "" -> tenant default; gender auto-derived
     caller_name: str = ""       # agent name (Indian name); overrides script agent_name
     lead_name: str = ""
+    lead_gender: str = ""       # "male" | "female" | ""; added to lead_data for LLM
     tenant: str = "dev"
 
 
@@ -376,8 +376,9 @@ async def dev_place_call(req: PlaceCallRequest) -> dict:
     if provider in _STREAM_PROVIDERS:
         dev_call_control.set_override(
             tenant.slug, mode=req.mode, voice=req.voice.strip(),
-            gender=req.gender.strip(), caller_name=req.caller_name.strip(),
-            lead_name=req.lead_name.strip())
+            caller_name=req.caller_name.strip(),
+            lead_name=req.lead_name.strip(),
+            lead_gender=req.lead_gender.strip())
     # Scope the answer URL to the placing tenant's slug for ALL providers: this is
     # an outbound call WE place, so the tenant is known — the answer webhook resolves
     # by slug and the bridge is built with THIS tenant's config, instead of reverse-
@@ -764,18 +765,15 @@ def make_browser_bridge_factory(
             ),
         )
         engine = PipelineEngine(stt, llm, tts, pipeline_cfg)
-        # Apply gender + caller_name overrides before building the agent so both
-        # the LLM prompt and the opening template use the console-selected values.
-        gender_override = (query_params.get("gender") or "").strip()
+        # Apply caller_name + voice-derived gender to script before building agent.
         caller_name_override = (query_params.get("caller_name") or "").strip()
-        if gender_override or caller_name_override:
+        if sel_voice or caller_name_override:
             from dataclasses import replace as _dc_replace
-            if not gender_override and sel_voice:
-                from src.providers.voice_catalog import gender_from_voice_id
-                gender_override = gender_from_voice_id(sel_voice)
+            from src.providers.voice_catalog import gender_from_voice_id
             replacements: dict = {}
-            if gender_override:
-                replacements["gender"] = gender_override
+            derived_gender = gender_from_voice_id(sel_voice) if sel_voice else ""
+            if derived_gender:
+                replacements["gender"] = derived_gender
             if caller_name_override:
                 replacements["agent_name"] = caller_name_override
             if replacements:
@@ -783,7 +781,13 @@ def make_browser_bridge_factory(
 
         session_id = f"web_{uuid.uuid4().hex[:12]}"
         lead_name = (query_params.get("lead_name") or "").strip()
-        lead_data = {"lead_name": lead_name, "name": lead_name} if lead_name else {}
+        lead_gender = (query_params.get("lead_gender") or "").strip()
+        lead_data: dict = {}
+        if lead_name:
+            lead_data["lead_name"] = lead_name
+            lead_data["name"] = lead_name
+        if lead_gender:
+            lead_data["lead_gender"] = lead_gender
         # Chat→voice handoff: a ?handoff=<token> resolves a short-lived Redis blob
         # (chat summary + customer context) so the voice agent continues the chat.
         handoff_token = (query_params.get("handoff") or "").strip()
@@ -895,30 +899,36 @@ def make_live_bridge_factory(
             PipelineConfig(stt=STTConfig(), llm=LLMConfig(), tts=TTSConfig(sample_rate=16000)),
         )
         qp = getattr(websocket, "query_params", {}) or {}
-        lead_name = (qp.get("lead_name") or "").strip()
-        lead_data = {"lead_name": lead_name, "name": lead_name} if lead_name else {}
 
-        # Voice: ?voice= overrides the config default. In the dev console any voice
-        # from the full catalog is allowed (not just the tenant's allowed_voices).
+        # Voice: ?voice= overrides the config default. Any catalog voice allowed.
         from src.providers.voice_catalog import list_voices as _lv
         _catalog_voices = {v["voice_id"] for v in _lv("gemini_live")}
         voice = (qp.get("voice") or "").strip() or rt.voice
         if voice and voice not in _catalog_voices:
             voice = rt.voice
 
-        # Apply gender + caller_name overrides so LLM prompt and opening line
-        # use the console-selected values (not just what the script says).
-        gender_override = (qp.get("gender") or "").strip()
+        # Derive agent gender from selected voice; apply caller_name override.
         caller_name_override = (qp.get("caller_name") or "").strip()
-        if gender_override or caller_name_override:
+        if voice or caller_name_override:
             from dataclasses import replace as _dc_replace
+            from src.providers.voice_catalog import gender_from_voice_id
             replacements: dict = {}
-            if gender_override:
-                replacements["gender"] = gender_override
+            derived_gender = gender_from_voice_id(voice) if voice else ""
+            if derived_gender:
+                replacements["gender"] = derived_gender
             if caller_name_override:
                 replacements["agent_name"] = caller_name_override
             if replacements:
                 cur_script = _dc_replace(cur_script, **replacements)
+
+        lead_name = (qp.get("lead_name") or "").strip()
+        lead_gender = (qp.get("lead_gender") or "").strip()
+        lead_data: dict = {}
+        if lead_name:
+            lead_data["lead_name"] = lead_name
+            lead_data["name"] = lead_name
+        if lead_gender:
+            lead_data["lead_gender"] = lead_gender
 
         session_id = f"live_{uuid.uuid4().hex[:12]}"
         from src.bootstrap import _build_kb_context  # noqa: PLC0415

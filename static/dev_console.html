@@ -188,11 +188,11 @@
           <input type="text" id="callerName" placeholder="e.g. Priya, Arjun" />
         </div>
         <div class="field">
-          <label>Gender</label>
-          <select id="genderSelect">
-            <option value="">— from script —</option>
-            <option value="female">Female</option>
+          <label>Lead gender</label>
+          <select id="leadGender">
+            <option value="">— unknown —</option>
             <option value="male">Male</option>
+            <option value="female">Female</option>
           </select>
         </div>
       </div>
@@ -444,13 +444,15 @@ async function start() {
   const path = _mode === "s2s" ? "/api/v1/dev/voice-live" : "/api/v1/dev/voice";
   const voiceSel = _mode === "s2s" ? $("voice") : $("voice-layered");
   const selectedVoice = voiceSel ? voiceSel.value : "";
-  const explicitGender = ($("genderSelect").value || "").trim();
+  const voiceGender = voiceSel ? (voiceSel.options[voiceSel.selectedIndex]?.dataset.gender || "") : "";
   const callerName = ($("callerName").value || "").trim();
+  const leadGender = ($("leadGender").value || "").trim();
   let qs = "tenant=dev";
-  if (leadName)        qs += "&lead_name="   + encodeURIComponent(leadName);
-  if (selectedVoice)   qs += "&voice="       + encodeURIComponent(selectedVoice);
-  if (explicitGender)  qs += "&gender="      + encodeURIComponent(explicitGender);
-  if (callerName)      qs += "&caller_name=" + encodeURIComponent(callerName);
+  if (leadName)      qs += "&lead_name="   + encodeURIComponent(leadName);
+  if (selectedVoice) qs += "&voice="       + encodeURIComponent(selectedVoice);
+  if (voiceGender)   qs += "&gender="      + encodeURIComponent(voiceGender);
+  if (callerName)    qs += "&caller_name=" + encodeURIComponent(callerName);
+  if (leadGender)    qs += "&lead_gender=" + encodeURIComponent(leadGender);
   if ($("campaign").value) qs += "&campaign="  + encodeURIComponent($("campaign").value);
   // Layered-specific provider overrides
   if (_mode === "layered") {
@@ -575,9 +577,10 @@ async function placeCall(provider) {
       body: JSON.stringify({
         provider, to_number: to, mode: _mode,
         voice: (_mode === "s2s" ? $("voice") : $("voice-layered") || $("voice"))?.value || "",
-        gender: ($("genderSelect").value || "").trim(),
         caller_name: ($("callerName").value || "").trim(),
-        lead_name: ($("leadName").value || "").trim(), tenant: "dev",
+        lead_name: ($("leadName").value || "").trim(),
+        lead_gender: ($("leadGender").value || "").trim(),
+        tenant: "dev",
       }),
     });
     body = await resp.json().catch(() => ({}));
