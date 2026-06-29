@@ -166,43 +166,6 @@ async def patch_telephony_outbound_from(sessionmaker) -> None:
             log.info("patched telephony outbound_from", extra={"count": patched})
 
 
-async def sync_campaign_from_yaml(sessionmaker, campaigns_dir=None) -> int:
-    """Push the YAML campaign file into every tenant's seeded (default) DB campaign.
-
-    Called on every boot so script edits in the YAML (opening lines, talking
-    points, etc.) take effect without a DB wipe. Only updates the campaign row
-    that was created by seed_campaigns_if_empty (id = camp_{tid}_default).
-    Tenants that manage campaigns via the API are unaffected — their custom
-    campaign IDs don't match the default pattern.
-    """
-    from src.dialogue.campaign_loader import DEFAULT_CAMPAIGNS_DIR, active_campaign_slug
-
-    base = campaigns_dir or DEFAULT_CAMPAIGNS_DIR
-    slug = active_campaign_slug()
-    path = base / f"{slug}.yaml"
-    if not path.exists():
-        log.warning("campaign sync: %s not found; skipping", path)
-        return 0
-    raw = path.read_text()
-
-    patched = 0
-    async with sessionmaker() as session:
-        tenant_ids = (await session.execute(select(Tenant.id))).scalars().all()
-        for tid in tenant_ids:
-            default_id = f"camp_{tid}_default"
-            row = await session.get(Campaign, default_id)
-            if row is None:
-                continue
-            if row.config_yaml == raw:
-                continue
-            row.config_yaml = raw
-            patched += 1
-        if patched:
-            await session.commit()
-            log.info("synced campaign YAML to DB", extra={"count": patched})
-    return patched
-
-
 async def seed_campaigns_if_empty(sessionmaker, campaigns_dir=None) -> int:
     """Give every tenant a DB campaign migrated from the global ``VOX_CAMPAIGN``
     file, when they have none. Campaigns then diverge per-tenant via the
