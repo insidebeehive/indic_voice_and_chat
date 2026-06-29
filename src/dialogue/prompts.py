@@ -183,6 +183,31 @@ def _gender_directive(gender: str) -> Optional[str]:
     return None
 
 
+def _lead_address_directive(lead_data: dict) -> Optional[str]:
+    """Directive for how the agent should address the LEAD based on what is known.
+
+    Covers the two unknowns: name and gender. Returns None when both are known
+    (no special instruction needed — the LLM reads them from the lead_data block).
+    """
+    name = (lead_data.get("lead_name") or lead_data.get("name") or "").strip()
+    gender = (lead_data.get("lead_gender") or "").strip().lower()
+
+    lines: list[str] = []
+    if not name:
+        lines.append(
+            "You do NOT know the lead's name — never invent or guess one. "
+            "Address them as 'ji' or 'aap ji' throughout the call."
+        )
+    if not gender:
+        lines.append(
+            "The lead's gender is unknown. Use gender-neutral forms and avoid "
+            "gendered inflections when addressing or referring to the lead."
+        )
+    if not lines:
+        return None
+    return "Addressing the lead:\n" + "\n".join(f"- {l}" for l in lines)
+
+
 def build_voicebot_system_prompt(
     script: VoiceBotScript,
     schema: SlotSchema,
@@ -300,6 +325,9 @@ def build_voicebot_system_prompt(
 
     if lead_data:
         parts.append("Known lead data: " + json.dumps(lead_data, ensure_ascii=False))
+    _lad = _lead_address_directive(lead_data)
+    if _lad:
+        parts.append(_lad)
 
     # Terse field spec instead of dumping the full JSON Schema (~50 lines) — keeps
     # every field name, the required set, and all enum values, at a fraction of the
@@ -452,6 +480,9 @@ def build_s2s_system_instruction(
 
     if lead_data:
         parts.append("Known lead data: " + json.dumps(lead_data, ensure_ascii=False))
+    _lad = _lead_address_directive(lead_data)
+    if _lad:
+        parts.append(_lad)
 
     if kb_context:
         parts.append(

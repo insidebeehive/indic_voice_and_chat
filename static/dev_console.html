@@ -172,20 +172,14 @@
     <!-- Call Setup -->
     <div class="card">
       <div class="card-label">Call Setup</div>
-      <div class="field-row">
+      <div class="field">
+        <label>Campaign</label>
+        <select id="campaign"></select>
+      </div>
+      <div class="field-row" style="margin-top:.5rem">
         <div class="field">
           <label>Lead name</label>
-          <input type="text" id="leadName" value="Raju" placeholder="e.g. Raju" />
-        </div>
-        <div class="field">
-          <label>Campaign</label>
-          <select id="campaign"></select>
-        </div>
-      </div>
-      <div class="field-row">
-        <div class="field">
-          <label>Caller name <span class="hint">(agent)</span></label>
-          <input type="text" id="callerName" placeholder="e.g. Priya, Arjun" />
+          <input type="text" id="leadName" placeholder="e.g. Raju" />
         </div>
         <div class="field">
           <label>Lead gender</label>
@@ -195,6 +189,10 @@
             <option value="female">Female</option>
           </select>
         </div>
+      </div>
+      <div class="field" style="margin-top:.5rem">
+        <label>Caller name <span class="hint">(agent)</span></label>
+        <input type="text" id="callerName" placeholder="e.g. Priya, Arjun" />
       </div>
     </div>
 
