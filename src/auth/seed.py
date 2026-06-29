@@ -256,6 +256,75 @@ async def patch_campaign_replace_text(sessionmaker, find: str, replace: str) -> 
     return patched
 
 
+async def patch_campaign_parameterize_company(sessionmaker) -> int:
+    """Replace hardcoded company name in script text fields with {company_name} token.
+
+    Reads the company name from each campaign's agent.company field and replaces
+    every occurrence in script text fields (greeting, knowledge, closing, objective,
+    talking_points) with the {company_name} template token. The agent.company field
+    itself is left unchanged — it remains the source of truth.
+
+    Idempotent — skips rows where no script field contains the literal company name.
+    """
+    def _replace_in_script(script: dict, company: str) -> bool:
+        changed = False
+        for key in ("greeting", "opening", "objective"):
+            if isinstance(script.get(key), str) and company in script[key]:
+                script[key] = script[key].replace(company, "{company_name}")
+                changed = True
+        for key in ("knowledge", "objection_responses"):
+            block = script.get(key) or {}
+            if isinstance(block, dict):
+                for k, v in block.items():
+                    if isinstance(v, str) and company in v:
+                        block[k] = v.replace(company, "{company_name}")
+                        changed = True
+        closing = script.get("closing")
+        if isinstance(closing, str) and company in closing:
+            script["closing"] = closing.replace(company, "{company_name}")
+            changed = True
+        elif isinstance(closing, dict):
+            for k, v in closing.items():
+                if isinstance(v, str) and company in v:
+                    closing[k] = v.replace(company, "{company_name}")
+                    changed = True
+        tps = script.get("talking_points") or []
+        for i, tp in enumerate(tps):
+            if isinstance(tp, str) and company in tp:
+                tps[i] = tp.replace(company, "{company_name}")
+                changed = True
+        return changed
+
+    patched = 0
+    async with sessionmaker() as session:
+        rows = (await session.execute(select(Campaign))).scalars().all()
+        for row in rows:
+            raw = row.config_yaml or ""
+            try:
+                data = yaml.safe_load(raw) or {}
+            except Exception:
+                continue
+            camp = data.get("campaign", data)
+            agent = camp.get("agent") or {}
+            company = (agent.get("company") or camp.get("company_name") or "").strip()
+            if not company or company == "{company_name}":
+                continue
+            script = camp.get("script") or {}
+            if not _replace_in_script(script, company):
+                continue
+            camp["script"] = script
+            if "campaign" in data:
+                data["campaign"] = camp
+            else:
+                data = camp
+            row.config_yaml = yaml.dump(data, allow_unicode=True, sort_keys=False)
+            patched += 1
+        if patched:
+            await session.commit()
+            log.info("parameterized {company_name} in campaign scripts", extra={"count": patched})
+    return patched
+
+
 async def seed_campaigns_if_empty(sessionmaker, campaigns_dir=None) -> int:
     """Give every tenant a DB campaign migrated from the global ``VOX_CAMPAIGN``
     file, when they have none. Campaigns then diverge per-tenant via the

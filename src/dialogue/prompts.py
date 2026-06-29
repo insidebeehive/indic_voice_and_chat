@@ -27,6 +27,14 @@ class _SafeDict(dict):
         return "{" + key + "}"
 
 
+def _render_script_text(text: str, script: "VoiceBotScript") -> str:
+    """Substitute {agent_name} and {company_name} tokens in any script text field."""
+    try:
+        return text.format_map(_SafeDict({"agent_name": script.agent_name, "company_name": script.company_name}))
+    except Exception:
+        return text
+
+
 def _render_opening(script: "VoiceBotScript", lead_data: dict[str, Any]) -> str:
     """Substitute known template tokens in the opening for the prompt context.
 
@@ -274,7 +282,7 @@ def build_voicebot_system_prompt(
     )
 
     if script.objective:
-        parts.append("Your objective on this call:\n" + script.objective.strip())
+        parts.append("Your objective on this call:\n" + _render_script_text(script.objective.strip(), script))
 
     if script.opening:
         parts.append(
@@ -283,7 +291,7 @@ def build_voicebot_system_prompt(
         )
 
     if script.talking_points:
-        bullets = "\n".join(f"- {p}" for p in script.talking_points)
+        bullets = "\n".join(f"- {_render_script_text(p, script)}" for p in script.talking_points)
         parts.append("Talking points (material, not a checklist):\n" + bullets)
 
     if script.qualifying_questions:
@@ -294,14 +302,14 @@ def build_voicebot_system_prompt(
     # reference set the agent uses to answer questions/concerns.
     knowledge_items = {**(script.knowledge or {}), **(script.objection_responses or {})}
     if knowledge_items:
-        bullets = "\n".join(f"- {tag}: {resp}" for tag, resp in knowledge_items.items())
+        bullets = "\n".join(f"- {tag}: {_render_script_text(resp, script)}" for tag, resp in knowledge_items.items())
         parts.append(
             "Knowledge for answering the customer's questions and concerns (use the "
             "substance in your own words, not verbatim):\n" + bullets
         )
 
     if script.closing:
-        bullets = "\n".join(f"- {tag}: {resp}" for tag, resp in script.closing.items())
+        bullets = "\n".join(f"- {tag}: {_render_script_text(resp, script)}" for tag, resp in script.closing.items())
         parts.append("Closing lines:\n" + bullets)
 
     if script.dos:
@@ -456,7 +464,7 @@ def build_s2s_system_instruction(
         )
     if script.talking_points:
         parts.append("Talking points (material, not a checklist):\n"
-                     + "\n".join(f"- {p}" for p in script.talking_points))
+                     + "\n".join(f"- {_render_script_text(p, script)}" for p in script.talking_points))
     if script.qualifying_questions:
         parts.append("Qualifying questions to ask when natural:\n"
                      + "\n".join(f"- {q}" for q in script.qualifying_questions))
@@ -464,9 +472,9 @@ def build_s2s_system_instruction(
     if knowledge_items:
         parts.append(
             "Knowledge for answering the customer's questions and concerns (use the substance "
-            "in your own words):\n" + "\n".join(f"- {t}: {r}" for t, r in knowledge_items.items()))
+            "in your own words):\n" + "\n".join(f"- {t}: {_render_script_text(r, script)}" for t, r in knowledge_items.items()))
     if script.closing:
-        parts.append("Closing lines:\n" + "\n".join(f"- {t}: {r}" for t, r in script.closing.items()))
+        parts.append("Closing lines:\n" + "\n".join(f"- {t}: {_render_script_text(r, script)}" for t, r in script.closing.items()))
     if script.dos:
         parts.append("Do:\n" + "\n".join(f"- {d}" for d in script.dos))
     if script.donts:
