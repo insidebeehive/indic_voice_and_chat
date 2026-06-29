@@ -181,6 +181,17 @@ class VoiceBotAgent(BaseAgent):
         # Lead salutation token — inserts " Sir"/" Ma'am"/"" based on lead gender.
         lg = (data.get("lead_gender") or "").strip().lower()
         data.setdefault("lead_salutation", " Sir" if lg == "male" else " Ma'am" if lg == "female" else "")
+        # lead_address = combined "Name Sir" / "Name Ma'am" / "Name जी" / "Sir" / ""
+        # Use {lead_address} in greeting templates instead of separate tokens.
+        _name = (data.get("lead_name") or "").strip()
+        _sal = data.get("lead_salutation", "")
+        if _name and _sal:
+            _addr = f" {_name}{_sal}"
+        elif _name:
+            _addr = f" {_name} जी"
+        else:
+            _addr = _sal  # " Sir" / " Ma'am" / ""
+        data.setdefault("lead_address", _addr)
         return {k: str(v) for k, v in data.items()}
 
     async def handle_turn(self, captured_audio: bytes, audio_sink: AudioSink) -> TurnOutcome:

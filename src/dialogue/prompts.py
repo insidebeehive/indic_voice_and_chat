@@ -53,6 +53,14 @@ def _render_opening(script: "VoiceBotScript", lead_data: dict[str, Any]) -> str:
         "lead_salutation": " Sir" if lg == "male" else " Ma'am" if lg == "female" else "",
         **ld,
     }
+    _name = variables.get("lead_name", "")
+    _sal = variables.get("lead_salutation", "")
+    if _name and _sal:
+        variables["lead_address"] = f" {_name}{_sal}"
+    elif _name:
+        variables["lead_address"] = f" {_name} जी"
+    else:
+        variables["lead_address"] = _sal
     try:
         return script.opening.strip().format_map(_SafeDict(variables))
     except Exception:
