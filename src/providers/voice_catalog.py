@@ -7,6 +7,9 @@ provider it's the available voices.
 
 from __future__ import annotations
 
+from src.providers.tts.azure import _VOICES as _AZURE_VOICES
+from src.providers.tts.gemini import _VOICES as _GEMINI_TTS_VOICES
+from src.providers.tts.google import _VOICES as _GOOGLE_VOICES
 from src.providers.tts.sarvam import LANGUAGE_VOICES as _SARVAM_VOICES
 
 # Gemini Live (S2S) realtime voices — full set of 30.
@@ -64,3 +67,21 @@ def list_voices(provider: str, language: str = "hi-IN") -> list[dict]:
 
 def supported_providers() -> list[str]:
     return ["sarvam", "gemini_live"]
+
+
+def gender_from_voice_id(voice_id: str) -> str:
+    """Return 'male', 'female', or '' for a voice_id across all known TTS catalogs."""
+    vid = (voice_id or "").strip().lower()
+    if not vid:
+        return ""
+    all_lists: list[list[dict]] = (
+        list(_SARVAM_VOICES.values())
+        + list(_GOOGLE_VOICES.values())
+        + list(_AZURE_VOICES.values())
+        + [_GEMINI_TTS_VOICES, _GEMINI_LIVE_VOICES]
+    )
+    for voices in all_lists:
+        for v in voices:
+            if (v.get("voice_id") or "").lower() == vid:
+                return v.get("gender", "")
+    return ""

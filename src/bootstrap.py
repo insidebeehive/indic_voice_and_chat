@@ -479,6 +479,18 @@ def make_bridge_factory(
         llm = providers.get_llm(tenant)
         tts = providers.get_tts(tenant)
 
+        # Dev-console voice override: use selected voice_id and align the
+        # script's grammatical gender with it (so Hindi inflection matches
+        # the TTS voice, not just the script's gender field).
+        voice_override = (override or {}).get("voice", "").strip()
+        tts_voice_id = voice_override or tenant.settings.pipeline.tts.voice_id
+        if voice_override:
+            from dataclasses import replace as _dc_replace
+            from src.providers.voice_catalog import gender_from_voice_id
+            derived_gender = gender_from_voice_id(voice_override)
+            if derived_gender:
+                cur_script = _dc_replace(cur_script, gender=derived_gender)
+
         # Tenant-namespaced Redis session store (one per tenant; the same
         # instance is fine across calls since the keys carry session_id).
         store: SessionStore | None = None
@@ -500,7 +512,7 @@ def make_bridge_factory(
             ),
             tts=TTSConfig(
                 language=tenant.settings.pipeline.tts.language or "hi-IN",
-                voice_id=tenant.settings.pipeline.tts.voice_id,
+                voice_id=tts_voice_id,
                 sample_rate=16000,
             ),
         )
@@ -630,6 +642,15 @@ def make_exotel_bridge_factory(
         llm = providers.get_llm(tenant)
         tts = providers.get_tts(tenant)
 
+        voice_override = (override or {}).get("voice", "").strip()
+        tts_voice_id = voice_override or tenant.settings.pipeline.tts.voice_id
+        if voice_override:
+            from dataclasses import replace as _dc_replace
+            from src.providers.voice_catalog import gender_from_voice_id
+            derived_gender = gender_from_voice_id(voice_override)
+            if derived_gender:
+                cur_script = _dc_replace(cur_script, gender=derived_gender)
+
         store: SessionStore | None = None
         if session_store is not None:
             store = SessionStore(
@@ -647,7 +668,7 @@ def make_exotel_bridge_factory(
             ),
             tts=TTSConfig(
                 language=tenant.settings.pipeline.tts.language or "hi-IN",
-                voice_id=tenant.settings.pipeline.tts.voice_id,
+                voice_id=tts_voice_id,
                 sample_rate=16000,
             ),
         )
