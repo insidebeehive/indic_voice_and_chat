@@ -464,16 +464,26 @@ def make_bridge_factory(
             cid = (getattr(websocket, "query_params", {}) or {}).get("campaign") or None
             lc = await campaign_resolver.resolve(tenant.id, cid)
             cur_script, cur_slots = lc.script, lc.slots
-        # Dev-console voice override: derive gender from the selected voice and
-        # align the script's grammatical gender (applies to both s2s and layered).
+        # Dev-console overrides: voice, gender, and caller (agent) name all come
+        # from the console — not from the script — so a single campaign can be
+        # tested with different personas without editing YAML.
         voice_override = (override or {}).get("voice", "").strip()
+        gender_override = (override or {}).get("gender", "").strip()
+        caller_name_override = (override or {}).get("caller_name", "").strip()
         tts_voice_id = voice_override or tenant.settings.pipeline.tts.voice_id
-        if voice_override:
+        if gender_override or voice_override or caller_name_override:
             from dataclasses import replace as _dc_replace
-            from src.providers.voice_catalog import gender_from_voice_id
-            derived_gender = gender_from_voice_id(voice_override)
-            if derived_gender:
-                cur_script = _dc_replace(cur_script, gender=derived_gender)
+            # Explicit gender wins; fall back to catalog lookup from voice name.
+            if not gender_override and voice_override:
+                from src.providers.voice_catalog import gender_from_voice_id
+                gender_override = gender_from_voice_id(voice_override)
+            replacements: dict = {}
+            if gender_override:
+                replacements["gender"] = gender_override
+            if caller_name_override:
+                replacements["agent_name"] = caller_name_override
+            if replacements:
+                cur_script = _dc_replace(cur_script, **replacements)
         # Speech-to-speech path: when the tenant is in s2s mode, drive Gemini Live
         # over the Twilio media stream instead of the STT->LLM->TTS cascade.
         kb_ctx = _build_kb_context(platform_retriever, None)
@@ -628,13 +638,21 @@ def make_exotel_bridge_factory(
             lc = await campaign_resolver.resolve(tenant.id, cid)
             cur_script, cur_slots = lc.script, lc.slots
         voice_override = (override or {}).get("voice", "").strip()
+        gender_override = (override or {}).get("gender", "").strip()
+        caller_name_override = (override or {}).get("caller_name", "").strip()
         tts_voice_id = voice_override or tenant.settings.pipeline.tts.voice_id
-        if voice_override:
+        if gender_override or voice_override or caller_name_override:
             from dataclasses import replace as _dc_replace
-            from src.providers.voice_catalog import gender_from_voice_id
-            derived_gender = gender_from_voice_id(voice_override)
-            if derived_gender:
-                cur_script = _dc_replace(cur_script, gender=derived_gender)
+            if not gender_override and voice_override:
+                from src.providers.voice_catalog import gender_from_voice_id
+                gender_override = gender_from_voice_id(voice_override)
+            replacements: dict = {}
+            if gender_override:
+                replacements["gender"] = gender_override
+            if caller_name_override:
+                replacements["agent_name"] = caller_name_override
+            if replacements:
+                cur_script = _dc_replace(cur_script, **replacements)
         # S2S path: drive Gemini Live over the Exotel media stream (raw PCM16@8k,
         # snake_case stream_sid, no `clear` frame) when the tenant is in s2s mode.
         kb_ctx = _build_kb_context(platform_retriever, None)

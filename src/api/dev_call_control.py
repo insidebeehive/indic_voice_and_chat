@@ -72,8 +72,22 @@ monitor = _Monitor()
 _overrides: dict[str, dict] = {}
 
 
-def set_override(tenant_slug: str, *, mode: str, voice: str = "", lead_name: str = "") -> None:
-    _overrides[tenant_slug] = {"mode": mode, "voice": voice, "lead_name": lead_name}
+def set_override(
+    tenant_slug: str,
+    *,
+    mode: str,
+    voice: str = "",
+    gender: str = "",
+    caller_name: str = "",
+    lead_name: str = "",
+) -> None:
+    _overrides[tenant_slug] = {
+        "mode": mode,
+        "voice": voice,
+        "gender": gender,
+        "caller_name": caller_name,
+        "lead_name": lead_name,
+    }
 
 
 def pop_override(tenant_slug: str) -> dict | None:

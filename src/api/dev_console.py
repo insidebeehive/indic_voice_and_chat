@@ -280,7 +280,9 @@ class PlaceCallRequest(BaseModel):
     provider: str               # "twilio" | "exotel"
     to_number: str
     mode: str = "s2s"           # "s2s" | "layered" — drives the placed call
-    voice: str = ""             # S2S voice; "" -> tenant default
+    voice: str = ""             # TTS/S2S voice id; "" -> tenant default
+    gender: str = ""            # "male" | "female" | ""; overrides script gender
+    caller_name: str = ""       # agent name (Indian name); overrides script agent_name
     lead_name: str = ""
     tenant: str = "dev"
 
@@ -373,7 +375,9 @@ async def dev_place_call(req: PlaceCallRequest) -> dict:
     # Stringee ignores it (turn-based IVR), so don't leave a stale override.
     if provider in _STREAM_PROVIDERS:
         dev_call_control.set_override(
-            tenant.slug, mode=req.mode, voice=req.voice.strip(), lead_name=req.lead_name.strip())
+            tenant.slug, mode=req.mode, voice=req.voice.strip(),
+            gender=req.gender.strip(), caller_name=req.caller_name.strip(),
+            lead_name=req.lead_name.strip())
     # Scope the answer URL to the placing tenant's slug for ALL providers: this is
     # an outbound call WE place, so the tenant is known — the answer webhook resolves
     # by slug and the bridge is built with THIS tenant's config, instead of reverse-

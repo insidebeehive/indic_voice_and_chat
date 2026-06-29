@@ -182,6 +182,20 @@
           <select id="campaign"></select>
         </div>
       </div>
+      <div class="field-row">
+        <div class="field">
+          <label>Caller name <span class="hint">(agent)</span></label>
+          <input type="text" id="callerName" placeholder="e.g. Priya, Arjun" />
+        </div>
+        <div class="field">
+          <label>Gender</label>
+          <select id="genderSelect">
+            <option value="">— from script —</option>
+            <option value="female">Female</option>
+            <option value="male">Male</option>
+          </select>
+        </div>
+      </div>
     </div>
 
     <!-- Mode -->
@@ -559,6 +573,8 @@ async function placeCall(provider) {
       body: JSON.stringify({
         provider, to_number: to, mode: _mode,
         voice: (_mode === "s2s" ? $("voice") : $("voice-layered") || $("voice"))?.value || "",
+        gender: ($("genderSelect").value || "").trim(),
+        caller_name: ($("callerName").value || "").trim(),
         lead_name: ($("leadName").value || "").trim(), tenant: "dev",
       }),
     });
