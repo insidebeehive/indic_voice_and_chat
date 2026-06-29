@@ -227,6 +227,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         log.info("seeded default campaigns from VOX_CAMPAIGN", extra={"count": seeded_campaigns})
     await patch_campaign_remove_sir(sessionmaker)
     await patch_campaign_replace_text(sessionmaker, "Bharat Matka", "XYZ")
+    await patch_campaign_replace_text(sessionmaker, "भारत मटका", "XYZ")
     resolver = DbTenantResolver(sessionmaker)
     await resolver.reload()
     set_tenant_resolver(resolver)

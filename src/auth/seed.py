@@ -202,7 +202,7 @@ async def patch_campaign_remove_sir(sessionmaker) -> int:
     _CLOSING = "Ok, Thank you time dene ke liye. Aapka din shubh rahe!"
     _GREETING = (
         "हेलो, नमस्ते{lead_salutation}! मैं {agent_name} बात कर {agent_raha_rahi} हूं "
-        "भारत मटका Official App से। क्या आपका एक मिनट हो सकता है?"
+        "{company_name} से। क्या आपका एक मिनट हो सकता है?"
     )
 
     patched = 0
