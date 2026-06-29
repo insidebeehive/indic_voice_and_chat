@@ -125,7 +125,13 @@ class VoiceBotAgent(BaseAgent):
         the conversation history, and stay in LISTENING for the user's
         reply. Skips silently if there's no opening configured.
         """
-        opening = (self._script.opening or "").strip()
+        gender = (self._script.gender or "").strip().lower()
+        if gender == "male" and self._script.opening_male:
+            opening = self._script.opening_male.strip()
+        elif gender == "female" and self._script.opening_female:
+            opening = self._script.opening_female.strip()
+        else:
+            opening = (self._script.opening or "").strip()
         if not opening:
             return
         # Substitute simple template tokens with known lead data.

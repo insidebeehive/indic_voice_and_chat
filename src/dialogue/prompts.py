@@ -112,6 +112,8 @@ class VoiceBotScript:
     # whatever these contain — no campaign-specific assumptions live in code.
     personality: str = ""
     gender: str = ""
+    opening_male: str = ""
+    opening_female: str = ""
     objective: str = ""
     knowledge: dict[str, str] = field(default_factory=dict)
     dos: list[str] = field(default_factory=list)
@@ -145,6 +147,8 @@ class VoiceBotScript:
             closing=closing,
             personality=script.get("personality", "") or "",
             gender=script.get("gender", "") or "",
+            opening_male=script.get("opening_male", "") or "",
+            opening_female=script.get("opening_female", "") or "",
             objective=script.get("objective", "") or "",
             knowledge=dict(script.get("knowledge") or {}),
             dos=list(script.get("dos") or []),
