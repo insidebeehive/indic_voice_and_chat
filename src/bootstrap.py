@@ -461,15 +461,25 @@ def make_bridge_factory(
     async def factory(websocket: WebSocket, tenant: TenantContext):
         from src.api import dev_call_control
 
-        # A dev-console "place call" can override mode/voice for this one call.
-        override = dev_call_control.pop_override(tenant.slug)
+        # Per-call overrides: SID-keyed (production outbound) takes priority;
+        # tenant-slug-keyed is the dev-console fallback (single call at a time).
+        call_sid = (getattr(websocket, "path_params", {}) or {}).get("call_sid")
+        override = (
+            dev_call_control.pop_sid_override(call_sid) if call_sid else None
+        ) or dev_call_control.pop_override(tenant.slug)
         mode = (override or {}).get("mode") or getattr(
             tenant.settings.pipeline, "mode", "layered")
         # Per-tenant campaign: resolve this call's script + slots from the DB
-        # (?campaign=<id> on the stream URL, else the tenant's active campaign).
+        # (?campaign=<id> on the stream URL, else from SID override, else active campaign).
+        # Note: Twilio strips query strings from stream URLs, so the SID override
+        # is the only way to pass campaign_id for outbound telephony calls.
         cur_script, cur_slots = script, slots
         if campaign_resolver is not None:
-            cid = (getattr(websocket, "query_params", {}) or {}).get("campaign") or None
+            cid = (
+                (override or {}).get("campaign_id")
+                or (getattr(websocket, "query_params", {}) or {}).get("campaign")
+                or None
+            )
             lc = await campaign_resolver.resolve(tenant.id, cid)
             cur_script, cur_slots = lc.script, lc.slots
         # Dev-console overrides: voice (caller/agent name, gender auto-derived from voice).

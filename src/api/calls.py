@@ -39,7 +39,10 @@ router = APIRouter(tags=["calls"])
 class CallLeadRequest(BaseModel):
     to_number: str = Field(min_length=1)
     from_number: str | None = None
-    voice: str | None = None
+    voice: str = ""            # S2S / TTS voice ID; gender auto-derived
+    caller_name: str = ""      # agent display name ({agent_name} token)
+    lead_name: str = ""        # optional; passed to LLM as lead context
+    lead_gender: str = ""      # "male" | "female" | ""
     lead_id: str | None = None
 
 
@@ -175,10 +178,25 @@ async def call_lead(
         log.exception("call lead failed", extra={"tenant": tenant.slug, "provider": provider})
         raise HTTPException(status_code=502, detail=f"call failed: {e}")
 
+    # Store per-call overrides keyed by provider SID so the bridge factory
+    # can pick them up when Twilio's answer webhook fires. SID-keyed (not
+    # tenant-keyed) so concurrent calls for the same tenant don't collide.
+    from src.api.dev_call_control import set_sid_override
+    if req.voice or req.caller_name or req.lead_name or req.lead_gender:
+        set_sid_override(
+            call_session.session_id,
+            voice=req.voice,
+            caller_name=req.caller_name,
+            lead_name=req.lead_name,
+            lead_gender=req.lead_gender,
+            campaign_id=campaign_id,
+        )
+
     call_id = f"call_{uuid.uuid4().hex[:16]}"
     await insert_call(
         session, call_id=call_id, tenant=tenant, provider_call_sid=call_session.session_id,
-        channel="voice", campaign_id=campaign_id, lead_id=req.lead_id, voice=req.voice,
+        channel="voice", campaign_id=campaign_id, lead_id=req.lead_id,
+        voice=req.voice or None,
     )
     log.info("call lead placed", extra={
         "tenant": tenant.slug, "campaign": campaign_id, "call_id": call_id,

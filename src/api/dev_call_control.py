@@ -93,3 +93,33 @@ def set_override(
 def pop_override(tenant_slug: str) -> dict | None:
     """Return and clear the pending override for a tenant (one-shot)."""
     return _overrides.pop(tenant_slug, None)
+
+
+# --- per-call SID overrides (production outbound; keyed by provider call SID) ---
+# Unlike the tenant-slug store above (single-call dev console), these are safe
+# for concurrent calls because each entry is keyed by the unique provider SID.
+
+_sid_overrides: dict[str, dict] = {}
+
+
+def set_sid_override(
+    call_sid: str,
+    *,
+    voice: str = "",
+    caller_name: str = "",
+    lead_name: str = "",
+    lead_gender: str = "",
+    campaign_id: str = "",
+) -> None:
+    _sid_overrides[call_sid] = {
+        "voice": voice,
+        "caller_name": caller_name,
+        "lead_name": lead_name,
+        "lead_gender": lead_gender,
+        "campaign_id": campaign_id,
+    }
+
+
+def pop_sid_override(call_sid: str) -> dict | None:
+    """Return and clear the SID-keyed override (one-shot)."""
+    return _sid_overrides.pop(call_sid, None)

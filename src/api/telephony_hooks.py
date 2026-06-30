@@ -190,7 +190,12 @@ async def twilio_voice_for_tenant(
     from src.auth.middleware import tenant_from_slug
 
     tenant = await tenant_from_slug(tenant_slug)
-    stream_url = _ws_stream_url(request, f"twilio/stream/{tenant.slug}")
+    # Embed CallSid in the stream path so the bridge factory can look up
+    # per-call overrides (voice/caller_name/lead_name/lead_gender). Twilio
+    # strips query strings from <Stream url=...> so the SID must be in the path.
+    stream_path = (f"twilio/stream/{tenant.slug}/{CallSid}"
+                   if CallSid else f"twilio/stream/{tenant.slug}")
+    stream_url = _ws_stream_url(request, stream_path)
     log.info(
         "twilio voice webhook (slug-scoped)",
         extra={
@@ -216,6 +221,43 @@ async def twilio_stream(websocket: WebSocket, tenant_slug: str) -> None:
         tenant = await tenant_from_slug(tenant_slug)
     except HTTPException as e:
         log.warning("twilio stream tenant resolution failed: %s", e.detail)
+        await websocket.close(code=1008 if e.status_code == 404 else 1011, reason=str(e.detail))
+        return
+
+    if _bridge_factory is None:
+        log.warning("twilio stream connected but no bridge factory registered")
+        await websocket.close(code=1011, reason="bridge factory unset")
+        return
+
+    bridge = _bridge_factory(websocket, tenant)
+    if inspect.isawaitable(bridge):
+        bridge = await bridge
+    try:
+        await bridge.run()
+    except WebSocketDisconnect:
+        log.info("twilio stream client disconnected", extra={"tenant": tenant.slug})
+    except Exception:  # noqa: BLE001
+        log.exception("twilio stream bridge crashed", extra={"tenant": tenant.slug})
+    finally:
+        try:
+            await websocket.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+@router.websocket("/twilio/stream/{tenant_slug}/{call_sid}")
+async def twilio_stream_with_sid(
+    websocket: WebSocket, tenant_slug: str, call_sid: str
+) -> None:
+    """Outbound-call variant: call_sid in path lets the factory look up
+    per-call overrides (voice / caller_name / lead params) keyed by SID."""
+    from src.auth.middleware import tenant_from_slug
+
+    await websocket.accept()
+    try:
+        tenant = await tenant_from_slug(tenant_slug)
+    except HTTPException as e:
+        log.warning("twilio stream (sid) tenant resolution failed: %s", e.detail)
         await websocket.close(code=1008 if e.status_code == 404 else 1011, reason=str(e.detail))
         return
 
