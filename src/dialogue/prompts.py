@@ -343,7 +343,10 @@ def build_voicebot_system_prompt(
             slot_lines.append(f"  {mark} {name}{extra}")
         parts.append(
             "Slots to fill (* = required). Update them via the JSON `updated_slots` field "
-            "as you learn from the user:\n" + "\n".join(slot_lines)
+            "as you learn from the user. Infer don't ask — pick them up from natural speech "
+            "(e.g. lead_gender: 'male' if the caller says 'bhaiya', 'yaar', or uses male "
+            "verb forms; 'female' for 'didi', 'aunty', or female verb forms):\n"
+            + "\n".join(slot_lines)
         )
 
     if lead_data:
@@ -504,7 +507,9 @@ def build_s2s_system_instruction(
         parts.append(
             "Information to capture passively as you learn it from the conversation "
             "(* = required) — report via record_turn_signal's updated_slots. Do NOT "
-            "interrogate the customer to fill these; infer them from what they say:\n"
+            "interrogate the customer to fill these; infer them from what they say "
+            "(e.g. lead_gender: 'male' if the caller says 'bhaiya'/'yaar' or uses male "
+            "verb forms; 'female' for 'didi'/'aunty' or female verb forms):\n"
             + "\n".join(slot_lines))
 
     if lead_data:

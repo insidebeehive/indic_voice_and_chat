@@ -71,6 +71,12 @@ class VoiceBotAgent(BaseAgent):
         extra_directives: Optional[list[str]] = None,
         kb_context: Optional[str] = None,
     ) -> None:
+        # Always recognise lead_gender so the LLM can infer and report it even
+        # when the campaign YAML doesn't define it as a slot.
+        if "lead_gender" not in slot_schema.specs:
+            from src.dialogue.slots import SlotSpec, SlotType
+            slot_schema.specs["lead_gender"] = SlotSpec(
+                name="lead_gender", type=SlotType.ENUM, values=["male", "female"])
         slots = SlotFiller(slot_schema)
         super().__init__(session=session, state_machine=state_machine, slots=slots, store=store)
         self._script = script
@@ -306,6 +312,11 @@ class VoiceBotAgent(BaseAgent):
         await self.state.fire(Event.LLM_RESPONSE_READY)
 
         applied = self.slots.apply_updates(updated_slots or {})
+
+        # Merge lead_gender back into session.lead_data so _template_vars()
+        # picks it up immediately for the next turn's greeting tokens.
+        if "lead_gender" in applied and self.session.lead_data is not None:
+            self.session.lead_data["lead_gender"] = applied["lead_gender"]
 
         if agent_text:
             self.session.turns.append(LLMMessage(role="assistant", content=agent_text))
