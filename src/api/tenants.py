@@ -624,8 +624,8 @@ class TenantAnalytics(BaseModel):
     # Manual (human softphone) vs AI (voicebot) call counts, keyed by agent_type.
     by_agent_type: dict[str, int]
     by_campaign: dict[str, int]    # keyed by campaign name ("none" for ad-hoc calls)
-    by_channel: dict[str, int]     # voice / webconsole / softphone
-    by_provider: dict[str, int]    # telephony provider ("none" if unset)
+    by_channel: dict[str, int]     # voice / softphone (webconsole remapped to voice)
+    by_provider: dict[str, int]    # real telephony provider only (webconsole excluded)
     total_duration_ms: int
     avg_duration_ms: int
 
@@ -667,8 +667,12 @@ async def tenant_analytics(
         _bump(by_outcome, outcome or "no_outcome")
         _bump(by_agent_type, agent_type or "unknown")
         _bump(by_campaign, camp_names.get(campaign_id, campaign_id) if campaign_id else "none")
-        _bump(by_channel, channel or "unknown")
-        _bump(by_provider, provider or "none")
+        # webconsole is a browser transport, not a channel — treat as "voice"
+        effective_channel = "voice" if channel == "webconsole" else (channel or "unknown")
+        _bump(by_channel, effective_channel)
+        # only count real telephony providers; webconsole has no provider
+        if channel != "webconsole" and provider and provider != "webconsole":
+            _bump(by_provider, provider)
         total_dur += int(dur or 0)
     n = len(rows)
     return TenantAnalytics(
