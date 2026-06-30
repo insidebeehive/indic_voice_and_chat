@@ -230,7 +230,64 @@ CS is NOT in the audio path — we handle media streaming directly.
 We generate the transcript because we ran the full conversation — CSS receives
 the outcome and summary via the `call.completed` webhook.
 
-### 2. Human → Customer (support agent-initiated call)
+### 2. CS triggers an outbound AI voicebot call (campaign dial)
+
+The simplest outbound pattern — CS requests the call and we handle dialing,
+audio, and outcome. CS does not need to integrate with the telephony provider
+at all.
+
+```
+CS decides to call a lead (campaign dial, follow-up, etc.)
+        │
+CS calls our campaign call endpoint:
+
+  POST /api/v1/campaigns/{campaign_id}/calls
+  Authorization: Bearer <tenant-token>
+  Content-Type: application/json
+
+  {
+    "to_number": "+91XXXXXXXXXX",
+    "voice": "Leda",           // S2S / TTS voice; agent gender auto-derived
+    "caller_name": "Priya",    // {agent_name} token in the script
+    "lead_name": "Rahul",      // optional — passed to LLM as lead context
+    "lead_gender": "male"      // optional: "male" | "female" | ""
+  }
+
+Response 202:
+  {
+    "call_id": "call_4a3f2b1c8d9e0f1a",
+    "status": "in_progress",
+    "provider_call_sid": "CAxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+  }
+        │
+We dial the lead via the tenant's telephony provider.
+Lead answers → our AI bridge starts automatically.
+  call.answered fires → CS webhook
+        │
+   call ends
+        │
+  call.completed (outcome + summary) fires → CS webhook → CSS
+```
+
+**CS does not need a telephony integration for this pattern.** We own the
+dial, the audio bridge, and the outcome. CS only needs to make one API call
+and receive one webhook.
+
+**campaign_id** maps to the script, slots, knowledge base, and LLM behaviour
+configured for that campaign in our system.
+
+**voice + caller_name** override the campaign's default agent persona for this
+specific call. Gender is auto-derived from the voice ID and drives grammatical
+agreement in the script (e.g. "बात कर रही हूं" vs "बात कर रहा हूं").
+
+**lead_name / lead_gender** are optional context passed to the LLM. If
+lead_gender is omitted or unknown, the agent uses gender-neutral address.
+The LLM also infers gender on the fly from the caller's speech (verb forms)
+and adjusts mid-call.
+
+---
+
+### 3. Human → Customer (support agent-initiated call)
 
 ```
 Support agent clicks "Call customer" in the agent console
