@@ -620,6 +620,14 @@ def build_chatbot_system_prompt(
     )
 
     parts.append(
+        "RESPONSE LENGTH — CRITICAL:\n"
+        "Keep replies short: 1–2 sentences for conversational answers and simple lookups. "
+        "Only write more when a tool/API result genuinely requires it (e.g. listing multiple "
+        "transactions, step-by-step instructions). Never pad, summarise, or repeat what you "
+        "just said. If you can say it in one sentence, use one sentence."
+    )
+
+    parts.append(
         "Respond with a single JSON object matching this schema:\n"
         + json.dumps(CHATBOT_RESPONSE_SCHEMA, indent=2)
     )
