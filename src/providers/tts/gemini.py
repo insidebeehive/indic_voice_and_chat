@@ -36,7 +36,7 @@ _TIMEOUT = 15.0
 _VOICES = [
     {"voice_id": "Aoede",   "gender": "female"},
     {"voice_id": "Charon",  "gender": "male"},
-    {"voice_id": "Fenrir",  "gender": "male"},
+    {"voice_id": "Fenrir",  "gender": "female"},
     {"voice_id": "Kore",    "gender": "female"},
     {"voice_id": "Leda",    "gender": "female"},
     {"voice_id": "Orus",    "gender": "male"},
