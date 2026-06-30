@@ -343,9 +343,10 @@ def build_voicebot_system_prompt(
             slot_lines.append(f"  {mark} {name}{extra}")
         parts.append(
             "Slots to fill (* = required). Update them via the JSON `updated_slots` field "
-            "as you learn from the user. Infer don't ask — pick them up from natural speech "
-            "(e.g. lead_gender: 'male' if the caller says 'bhaiya', 'yaar', or uses male "
-            "verb forms; 'female' for 'didi', 'aunty', or female verb forms):\n"
+            "as you learn from the user. Infer don't ask — pick up lead_gender from the "
+            "caller's OWN grammatical forms only (e.g. 'kar raha hun' / 'gaya' → male; "
+            "'kar rahi hun' / 'gayi' → female). Address words like 'bhaiya'/'didi' tell "
+            "you nothing about the caller's gender — ignore them for inference:\n"
             + "\n".join(slot_lines)
         )
 
@@ -507,9 +508,10 @@ def build_s2s_system_instruction(
         parts.append(
             "Information to capture passively as you learn it from the conversation "
             "(* = required) — report via record_turn_signal's updated_slots. Do NOT "
-            "interrogate the customer to fill these; infer them from what they say "
-            "(e.g. lead_gender: 'male' if the caller says 'bhaiya'/'yaar' or uses male "
-            "verb forms; 'female' for 'didi'/'aunty' or female verb forms):\n"
+            "interrogate the customer to fill these; infer them from what they say. "
+            "For lead_gender: use the caller's OWN grammatical forms only — 'kar raha hun'/"
+            "'gaya' → male; 'kar rahi hun'/'gayi' → female. Address words like "
+            "'bhaiya'/'didi' say nothing about the caller's gender — ignore them:\n"
             + "\n".join(slot_lines))
 
     if lead_data:
