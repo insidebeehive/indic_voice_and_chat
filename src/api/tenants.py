@@ -670,9 +670,9 @@ async def tenant_analytics(
         # webconsole is a browser transport, not a channel — treat as "voice"
         effective_channel = "voice" if channel == "webconsole" else (channel or "unknown")
         _bump(by_channel, effective_channel)
-        # only count real telephony providers; webconsole has no provider
-        if channel != "webconsole" and provider and provider != "webconsole":
-            _bump(by_provider, provider)
+        # webconsole has no telephony provider — bucket it explicitly so totals match
+        effective_provider = "webconsole" if channel == "webconsole" else (provider or "none")
+        _bump(by_provider, effective_provider)
         total_dur += int(dur or 0)
     n = len(rows)
     return TenantAnalytics(
