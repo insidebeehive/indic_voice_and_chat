@@ -582,10 +582,12 @@ def build_chatbot_system_prompt(
         player_scope = (
             "2. PLAYER-SPECIFIC questions (balance, transactions, bets, bonuses, KYC status, "
             "account issues, bank/payment details): you do NOT have real-time account lookup "
-            "tools. Do NOT attempt to look up or invent account-specific data. "
-            "Tell the customer honestly that you cannot access their account details in this "
-            "chat, then call the `escalate_to_human` tool so a human agent can help them "
-            "directly.\n"
+            "tools. Do NOT attempt to look up, guess, or invent any account-specific data — "
+            "no balances, no bank details, no transaction IDs, nothing. Instead, tell the "
+            "customer honestly that you don't have access to their account details through "
+            "this chat and guide them to find it themselves (e.g. check the Wallet or "
+            "Profile section in the app). Only escalate to a human agent if the customer "
+            "explicitly asks to speak to a human or cannot resolve the issue on their own.\n"
         )
 
     parts.append(
