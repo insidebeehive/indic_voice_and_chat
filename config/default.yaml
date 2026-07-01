@@ -25,8 +25,8 @@ pipeline:
     fallback_provider: groq
 
   llm:
-    provider: groq
-    model: llama-3.3-70b-versatile
+    provider: gemini
+    model: gemini-2.5-flash
     temperature: 0.7
     max_tokens: 512
     response_format: json

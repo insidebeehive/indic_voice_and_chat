@@ -214,9 +214,8 @@ def _crm_params_to_schema(params: dict) -> dict:
 def make_chatbot_factory(registry, sessionmaker=None, platform_retriever=None):
     """Per-(tenant, session) ChatBotAgent factory for ``chat.set_chatbot_factory``.
 
-    Reuses the tenant's LLM, per-tenant hybrid retriever, and Redis session store
-    from the runtime registry — the same per-tenant wiring the voice bridges use,
-    so a chat and a call for one tenant share providers + the knowledge index.
+    Uses the platform-level LLM (global defaults, no tenant override) so all chat
+    sessions use the same model regardless of per-tenant pipeline_config.llm.
     Loads the tenant's registered CRM tools (chat_tools) and enables the agentic
     tool loop (builtin search/escalate/offer + CRM tools).
     """
@@ -330,7 +329,7 @@ def make_chatbot_factory(registry, sessionmaker=None, platform_retriever=None):
 
         return ChatBotAgent(
             session=AgentSession(session_id=session_id),
-            llm=registry.providers.get_llm(tenant),
+            llm=registry.providers.get_platform_llm(),
             retriever=registry.retrievers.get(tenant),
             platform_retriever=platform_retriever,
             company_name=tenant.name,

@@ -45,6 +45,7 @@ class TenantProviders:
     vector_store_factory: Callable[[dict[str, Any]], Any]
     base_vector_path: Path = Path("data/faiss")
     _cache: dict[tuple[str, str], Any] = field(default_factory=dict)
+    _platform_llm: Any = field(default=None, init=False)
 
     def _config_for(self, tenant: TenantContext, layer: str) -> dict[str, Any]:
         tenant_layer = getattr(tenant.settings.pipeline, layer)
@@ -68,6 +69,16 @@ class TenantProviders:
             tenant_path.mkdir(parents=True, exist_ok=True)
             merged["index_path"] = str(tenant_path / "index")
         return merged
+
+    def get_platform_llm(self) -> Any:
+        """Return a single platform-level LLM built from global defaults only (no tenant overlay).
+
+        Chat agents use this so they always run on the platform's configured LLM regardless of
+        per-tenant pipeline_config.llm overrides.
+        """
+        if self._platform_llm is None:
+            self._platform_llm = self.llm_factory(self.global_defaults.get("llm", {}))
+        return self._platform_llm
 
     def get_stt(self, tenant: TenantContext) -> Any:
         return self._get_or_build(tenant, "stt", self.stt_factory)
