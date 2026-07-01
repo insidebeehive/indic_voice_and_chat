@@ -192,7 +192,7 @@
       </div>
       <div class="field" style="margin-top:.5rem">
         <label>Caller name <span class="hint">(agent)</span></label>
-        <input type="text" id="callerName" placeholder="e.g. Priya, Arjun" />
+        <input type="text" id="callerName" placeholder="e.g. Priya, Arjun" value="Priya" />
       </div>
     </div>
 
@@ -200,8 +200,8 @@
     <div class="card">
       <div class="card-label">Mode</div>
       <div class="mode-tabs">
-        <button class="mode-tab active" data-mode="layered" onclick="setMode('layered')">Layered</button>
-        <button class="mode-tab"        data-mode="s2s"     onclick="setMode('s2s')">S2S — Gemini Live</button>
+        <button class="mode-tab"        data-mode="layered" onclick="setMode('layered')">Layered</button>
+        <button class="mode-tab active" data-mode="s2s"     onclick="setMode('s2s')">S2S — Gemini Live</button>
       </div>
       <!-- S2S voice (hidden in Layered mode) -->
       <div class="field hidden" id="s2s-voice-field">
@@ -306,7 +306,7 @@ const activeSources = new Set();
 const $ = (id) => document.getElementById(id);
 const setStatus = (s) => { $("status").textContent = s; };
 let _currentCallId = null;
-let _mode = "layered";   // tracks current mode selection
+let _mode = "s2s";   // tracks current mode selection
 
 // ── Mode ──────────────────────────────────────────────────────
 function setMode(mode) {
@@ -642,6 +642,18 @@ $("start").onclick = async () => {
 let _voiceData = { layered: { voices: [], default: "" }, s2s: { voices: [], default: "", catalog: [] } };
 const _preferredVoice = { s2s: "Leda", layered: "arya" };
 
+const _defaultNames = { female: "Priya", male: "Arjun" };
+
+function _syncCallerNameToGender(newGender) {
+  const nameEl = $("callerName");
+  const current = (nameEl.value || "").trim();
+  if (newGender === "male") {
+    if (current === "Priya" || current === "Arjun") nameEl.value = "Arjun";
+  } else if (newGender === "female") {
+    if (current === "Priya" || current === "Arjun") nameEl.value = "Priya";
+  }
+}
+
 function populateVoices(mode) {
   const d = _voiceData[mode] || { voices: [], default: "" };
   const preferred = _preferredVoice[mode];
@@ -653,11 +665,22 @@ function populateVoices(mode) {
     const o = document.createElement("option");
     o.value = id;
     const m = meta[id];
+    o.dataset.gender = m?.gender || "";
     o.textContent = m ? `${id} — ${m.gender} · ${m.style}` : id;
     if (id === def) o.selected = true;
     sel.appendChild(o);
   }
 }
+
+// Sync caller name when voice selection changes gender
+document.addEventListener("DOMContentLoaded", () => {
+  $("voice").addEventListener("change", function() {
+    const gender = (this.options[this.selectedIndex]?.dataset.gender || "").toLowerCase();
+    _syncCallerNameToGender(gender);
+  });
+  // Apply default mode (s2s) on load — fixes tab highlight + panel visibility
+  setMode("s2s");
+});
 
 async function loadVoices() {
   try {
