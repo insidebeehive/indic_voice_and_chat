@@ -65,7 +65,7 @@
       <div class="tab" id="tab_bill" onclick="showTab('bill')">Billing</div>
       <div class="tab" id="tab_tel" onclick="showTab('tel')">Telephony</div>
       <div class="tab" id="tab_camp" onclick="showTab('camp')">Campaign</div>
-      <div class="tab" id="tab_chat" onclick="showTab('chat')">Chat</div>
+      <!-- <div class="tab" id="tab_chat" onclick="showTab('chat')">Chat</div> -->
     </div>
     <div id="pane_an"></div>
     <div id="pane_bill" hidden></div>
@@ -148,7 +148,7 @@ async function selectTenant(id, slug) {
   loadChat(id, slug);
 }
 function showTab(which) {
-  for (const k of ["an", "bill", "tel", "camp", "chat"]) {
+  for (const k of ["an", "bill", "tel", "camp"]) {
     $("tab_" + k).classList.toggle("active", which === k);
     $("pane_" + k).hidden = which !== k;
   }
@@ -157,33 +157,14 @@ function showTab(which) {
 function statBox(k, v, cls) { return `<div class="stat ${cls || ""}"><div class="v">${v}</div><div class="k">${k}</div></div>`; }
 
 async function loadAnalytics(id) {
-  const [r, rc] = await Promise.all([
-    api(`/api/v1/tenants/${id}/analytics`),
-    api(`/api/v1/tenants/${id}/chat-analytics`),
-  ]);
+  const r = await api(`/api/v1/tenants/${id}/analytics`);
   if (!r.ok) { $("pane_an").innerHTML = `<span class="hint">analytics error ${r.status}</span>`; return; }
   const a = r.json;
   const rows = (obj) => Object.keys(obj).length
     ? Object.entries(obj).map(([k, v]) => `<div>${k}: <b>${v}</b></div>`).join("") : '<span class="hint">none</span>';
 
-  let chatHtml = "";
-  if (rc.ok) {
-    const c = rc.json;
-    chatHtml = `
-    <hr style="border:0;border-top:1px solid #1f2937;margin:1rem 0;" />
-    <h2 style="margin:0 0 .6rem;">Chat</h2>
-    <div class="stats">
-      ${statBox("Sessions", c.total_sessions)}
-      ${statBox("Messages", c.total_messages)}
-      ${statBox("Avg msgs/session", c.avg_messages_per_session)}
-      ${statBox("Escalation rate", c.escalation_rate_pct + "%")}
-    </div>
-    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:1rem;margin-top:.8rem;">
-      <div><h2>By status</h2><div class="kv">${rows(c.by_status)}</div></div>
-      <div><h2>By mode</h2><div class="kv">${rows(c.by_mode)}</div></div>
-      <div><h2>By source</h2><div class="kv">${rows(c.by_source)}</div></div>
-    </div>`;
-  }
+  // TODO: restore chat analytics section when chat is re-enabled
+  const chatHtml = "";
 
   $("pane_an").innerHTML = `
     <h2 style="margin:0 0 .6rem;">Voice calls</h2>
