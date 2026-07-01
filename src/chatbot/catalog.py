@@ -124,6 +124,38 @@ PLAYER_TOOLS: dict[str, dict] = {
 # ---------------------------------------------------------------------------
 
 OPERATOR_TOOLS: dict[str, dict] = {
+    "get_game": {
+        "description": (
+            "Get details about a specific game by name: rules, availability, "
+            "minimum/maximum bet limits, RTP, and any active promotions for that game. "
+            "Call this whenever the customer asks about a specific game by name "
+            "(e.g. 'how do I play Teen Patti?', 'is Andar Bahar available?', "
+            "'what are the limits for roulette?')."
+        ),
+        "parameters": {
+            "operator_id": {"type": "string", "source": "session",
+                            "description": "Operator identifier"},
+            "name": {"type": "string", "source": "llm",
+                     "description": "Name of the game the customer is asking about"},
+        },
+        "default_path": "/operators/{operator_id}/games",
+        "method": "GET",
+    },
+    "get_game_providers": {
+        "description": (
+            "Get the list of game providers available on the platform along with "
+            "the game count per provider. Use this when the customer asks general "
+            "questions about available games or providers without naming a specific "
+            "game (e.g. 'what games do you have?', 'which providers are available?', "
+            "'how many games are there?')."
+        ),
+        "parameters": {
+            "operator_id": {"type": "string", "source": "session",
+                            "description": "Operator identifier"},
+        },
+        "default_path": "/operators/{operator_id}/providers",
+        "method": "GET",
+    },
     "get_operator_games_config": {
         "description": (
             "Get the operator's product and games configuration: enabled casino "
