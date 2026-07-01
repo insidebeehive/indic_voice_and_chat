@@ -549,6 +549,7 @@ def build_chatbot_system_prompt(
     language_default: str = "en",
     rag_context: Optional[str] = None,
     extra_directives: Optional[list[str]] = None,
+    has_player_tools: bool = False,
 ) -> str:
     """System prompt for the RAG-powered ChatBot agent (Phase 4)."""
     parts: list[str] = []
@@ -559,22 +560,41 @@ def build_chatbot_system_prompt(
         "Answer from the provided knowledge base sources. Do NOT mention source names or "
         "filenames in your replies — just answer naturally. "
         "You are female: use feminine grammatical forms whenever the language requires it "
-        "(e.g. Hindi: 'मैं कर सकती हूँ', not 'कर सकता हूँ')."
+        "(e.g. Hindi: 'मैं कर सकती हूँ', not 'कर सकता हूँ').\n"
+        "CRITICAL — NEVER invent or fabricate data: do not make up account balances, "
+        "transaction IDs, bank details, bonus amounts, or any other specific numbers or "
+        "values. If you do not have the real data from a tool call or the sources, say so "
+        "honestly and escalate to a human agent."
     )
+
+    if has_player_tools:
+        player_scope = (
+            "2. PLAYER-SPECIFIC questions (balance, transactions, bets, bonuses, KYC status, "
+            "account issues): ALWAYS call the relevant player tool — it already has the "
+            "customer's account ID and operator ID from the session, so you NEVER need to ask "
+            "the customer for those. Do NOT ask the customer for their account ID, transaction "
+            "ID, screenshot, or error message. If the tool is unavailable or returns an error, "
+            "reply with a brief holding message (e.g. 'I'm looking into your account right now, "
+            "please give me a moment') and do not interrogate the customer further. Only "
+            "escalate to a human agent as the absolute last resort.\n"
+        )
+    else:
+        player_scope = (
+            "2. PLAYER-SPECIFIC questions (balance, transactions, bets, bonuses, KYC status, "
+            "account issues, bank/payment details): you do NOT have real-time account lookup "
+            "tools. Do NOT attempt to look up or invent account-specific data. "
+            "Tell the customer honestly that you cannot access their account details in this "
+            "chat, then call the `escalate_to_human` tool so a human agent can help them "
+            "directly.\n"
+        )
+
     parts.append(
         "SCOPE — follow strictly:\n"
         f"1. GENERAL questions about {company_name}'s platform/services (registration, "
         "KYC, wallet, deposits, withdrawals, games, bonuses, responsible gaming, "
         "security, technical help): answer from the sources.\n"
-        "2. PLAYER-SPECIFIC questions (balance, transactions, bets, bonuses, KYC status, "
-        "account issues): ALWAYS call the relevant player tool — it already has the "
-        "customer's account ID and operator ID from the session, so you NEVER need to ask "
-        "the customer for those. Do NOT ask the customer for their account ID, transaction "
-        "ID, screenshot, or error message. If the tool is unavailable or returns an error, "
-        "reply with a brief holding message (e.g. 'I'm looking into your account right now, "
-        "please give me a moment') and do not interrogate the customer further. Only "
-        "escalate to a human agent as the absolute last resort.\n"
-        "WITHDRAWAL STATUS RULES — follow precisely when a player asks about a withdrawal:\n"
+        + player_scope
+        + "WITHDRAWAL STATUS RULES — follow precisely when a player asks about a withdrawal:\n"
         "  - Status SUBMITTED/PENDING: tell them it is under review and being processed.\n"
         "  - Status APPROVED and approved within the last 48 hours: reassure them — "
         "'Your withdrawal has been approved and is being processed. It typically takes "

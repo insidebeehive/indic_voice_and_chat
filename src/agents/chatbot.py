@@ -327,6 +327,7 @@ class ChatBotAgent(BaseAgent):
             language_default=self._language,
             rag_context=rag_text,
             extra_directives=extra,
+            has_player_tools=bool(self._crm_tools),
         )
         messages: list[LLMMessage] = [LLMMessage(role="system", content=system_prompt)]
         # Replay prior user/assistant turns (system is rebuilt each turn).
