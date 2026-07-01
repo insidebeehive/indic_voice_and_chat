@@ -500,7 +500,7 @@ async function start() {
     const msg = JSON.parse(e.data);
     if      (msg.type === "session")    { _currentCallId = msg.call_id; $("reanalyze-wrap").style.display = "inline-flex"; $("reanalyzeStatus").textContent = ""; }
     else if (msg.type === "status")     { setStatus(msg.status); agentSpeaking = (msg.status !== "listening"); }
-    else if (msg.type === "interrupt")  { stopPlayback(); agentSpeaking = false; }
+    else if (msg.type === "interrupt")  { stopPlayback(); agentSpeaking = false; setStatus("listening — go ahead"); }
     else if (msg.type === "partial")    { renderPartial(msg.text); }
     else if (msg.type === "transcript") { if (msg.role === "user") renderPartial(""); addTranscript(msg.role, msg.text); }
     else if (msg.type === "state")      { $("state").textContent = "state: " + msg.state + "\nslots: " + JSON.stringify(msg.slots, null, 2); }

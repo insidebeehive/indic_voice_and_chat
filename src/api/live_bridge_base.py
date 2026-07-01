@@ -219,6 +219,7 @@ class _BaseLiveBridge:
                 elif ev.type == "interrupted":
                     self._speaking = False
                     await self._send_interrupt()
+                    await self._emit_status("listening")
                 elif ev.type == "turn_complete":
                     await self._commit_turn()
         except asyncio.CancelledError:
