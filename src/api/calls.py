@@ -71,7 +71,34 @@ class SummarizeOutcomeResponse(BaseModel):
     callback_at: str | None = None
 
 
+class TransferResultRequest(BaseModel):
+    status: str  # "success" | "failure"
+
+
 # --- Routes -------------------------------------------------------------
+
+
+@router.post("/calls/{provider_call_sid}/transfer-result", status_code=200)
+async def transfer_result(
+    provider_call_sid: str,
+    req: TransferResultRequest,
+    tenant: TenantContext = Depends(current_tenant),
+) -> dict:
+    """Coordination server posts here after attempting to find a human agent.
+
+    The AI voicebot is waiting on this call after firing the 'transfer' action.
+    ``status`` must be ``"success"`` (human found — bridge tears down, caller
+    handed off) or ``"failure"`` (no human — bridge plays an apology and ends).
+    """
+    if req.status not in ("success", "failure"):
+        raise HTTPException(status_code=400, detail="status must be 'success' or 'failure'")
+    from src.api.transfer_store import resolve
+    resolved = resolve(provider_call_sid, req.status)
+    if not resolved:
+        raise HTTPException(
+            status_code=404,
+            detail="no in-flight transfer waiting for this call SID")
+    return {"resolved": True, "call_sid": provider_call_sid, "status": req.status}
 
 
 @router.post("/campaigns/{campaign_id}/calls", response_model=CallLeadResponse, status_code=202)

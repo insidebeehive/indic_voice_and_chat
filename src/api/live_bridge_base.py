@@ -274,6 +274,8 @@ class _BaseLiveBridge:
         self._pending_slots = {}
         self._speaking = False
         if getattr(self._agent.state, "is_terminal", False):
+            if action == "transfer":
+                await self._on_transfer_hold()
             self._stopped = True
             await self._emit_outcome()
         else:
@@ -328,6 +330,12 @@ class _BaseLiveBridge:
 
     async def _emit_transcript(self, role: str, text: str, *, partial: bool) -> None:
         """Optional: surface a transcript to the transport (browser UI)."""
+
+    async def _on_transfer_hold(self) -> None:
+        """Called when the 'transfer' action fires, before final bridge teardown.
+        Override to pause here while the coordination server looks for a human agent.
+        The Twilio WebSocket stays open (caller stays on hold); only the AI session
+        should be closed here."""
 
     async def _deliver_outcome(self, payload: dict) -> None:
         """Optional: deliver the post-call outcome to the transport (browser UI)."""

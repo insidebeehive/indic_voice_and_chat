@@ -426,11 +426,20 @@ def _build_s2s_telephony_bridge(
     log.info("s2s telephony bridge built call", extra={
         "tenant": tenant.slug, "session_id": session_id, "voice": voice,
         "model": rt.model, "encoding": encoding})
+    # Transfer-hold: TTS for failure apology; webhook so CS learns to look for a human.
+    tts = providers.get_tts(tenant)
+    _wh_url = getattr(tenant.settings, "events_webhook_url", None)
+    _wh_sec_env = getattr(tenant.settings, "events_webhook_secret_env", None)
+    _wh_secret = (tenant.secret_optional(_wh_sec_env)
+                  if _wh_sec_env and hasattr(tenant, "secret_optional") else None)
     return TelephonyLiveBridge(
         websocket=websocket, agent=agent, config=config, connect_session=connect, llm=llm,
+        tts=tts,
         tenant_timezone=getattr(tenant.settings, "timezone", "Asia/Kolkata"),
         encoding=encoding, sid_field=sid_field, supports_clear=supports_clear,
-        call_sid_field=call_sid_field)
+        call_sid_field=call_sid_field,
+        transfer_webhook_url=_wh_url,
+        transfer_webhook_secret=_wh_secret)
 
 
 def _build_kb_context(platform_retriever, tenant_retriever) -> str:

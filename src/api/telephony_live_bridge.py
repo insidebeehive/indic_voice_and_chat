@@ -32,22 +32,30 @@ _TEL_RATE = 8000        # telephony is 8kHz mono
 _FRAME_S = 0.02         # 20ms per media frame
 # 20ms @ 8kHz mono: 160 bytes μ-law (1 B/sample) or 320 bytes PCM16 (2 B/sample).
 _CHUNK = {"mulaw": 160, "pcm": 320}
+_TRANSFER_TIMEOUT_S = 30.0   # how long we wait for CS to respond before giving up
 
 
 class TelephonyLiveBridge(_BaseLiveBridge):
     """One bridge per phone call. ``encoding``: 'mulaw' (Twilio) | 'pcm' (Exotel)."""
 
     def __init__(self, *, websocket, agent, config: RealtimeConfig, connect_session,
-                 llm=None, tenant_timezone: str = "Asia/Kolkata",
+                 llm=None, tts=None, tenant_timezone: str = "Asia/Kolkata",
                  encoding: str = "mulaw", sid_field: str = "streamSid",
-                 supports_clear: bool = True, call_sid_field: str = "callSid") -> None:
+                 supports_clear: bool = True, call_sid_field: str = "callSid",
+                 transfer_webhook_url: str | None = None,
+                 transfer_webhook_secret: str | None = None,
+                 transfer_failure_text: str | None = None) -> None:
         super().__init__(agent=agent, config=config, connect_session=connect_session,
                          llm=llm, tenant_timezone=tenant_timezone)
         self._ws = websocket
+        self._tts = tts
         self._encoding = encoding
         self._sid_field = sid_field
         self._supports_clear = supports_clear
         self._call_sid_field = call_sid_field   # Twilio: "callSid" / Exotel: "call_sid"
+        self._transfer_webhook_url = transfer_webhook_url
+        self._transfer_webhook_secret = transfer_webhook_secret
+        self._transfer_failure_text = transfer_failure_text
         self._stream_sid: str | None = None
         self._call_sid: str | None = None        # provider Call SID (dev-console monitor key)
         self._up_state = None        # 8k->16k resample state (inbound)
@@ -168,3 +176,78 @@ class TelephonyLiveBridge(_BaseLiveBridge):
             raise
         except Exception:  # noqa: BLE001 - WS closed mid-send (teardown race); stop quietly
             self._stopped = True
+
+    # --- transfer hold ---------------------------------------------------
+
+    async def _on_transfer_hold(self) -> None:
+        """AI disconnects (Gemini Live session closes); Twilio WS stays open so
+        the caller stays on hold. Waits for CS to post the transfer result.
+        On failure, plays a TTS apology before tearing down."""
+        from src.api import transfer_store
+
+        call_sid = self._call_sid
+        if not call_sid:
+            return
+
+        # Close the Gemini Live session — AI stops. Inbound audio will be
+        # discarded (_on_media checks self._session is None).
+        if self._session is not None:
+            try:
+                await self._session.aclose()
+            except Exception:  # noqa: BLE001
+                log.exception("live session close during transfer hold")
+            self._session = None
+
+        # Notify the coordination server so it can start finding a human.
+        await self._fire_transfer_webhook(call_sid)
+
+        # Wait for CS result. Timeout → treat as failure (no human found).
+        fut = transfer_store.register(call_sid)
+        try:
+            result = await asyncio.wait_for(fut, timeout=_TRANSFER_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            log.info("transfer hold timed out; treating as failure",
+                     extra={"call_sid": call_sid})
+            result = "failure"
+        except asyncio.CancelledError:
+            transfer_store.cancel_pending(call_sid)
+            return
+
+        log.info("transfer hold resolved", extra={"call_sid": call_sid, "result": result})
+        if result != "success":
+            await self._play_transfer_failure_apology()
+
+    async def _fire_transfer_webhook(self, call_sid: str) -> None:
+        if not self._transfer_webhook_url:
+            return
+        from src.config_tenant import platform_webhook_base_url
+        from src.integration.tenant_events import deliver
+        base = (platform_webhook_base_url() or "").rstrip("/")
+        body = {
+            "event": "call.transfer_requested",
+            "call_sid": call_sid,
+            "transfer_result_url": f"{base}/api/v1/calls/{call_sid}/transfer-result",
+        }
+        try:
+            await deliver(self._transfer_webhook_url, body, self._transfer_webhook_secret)
+        except Exception:  # noqa: BLE001
+            log.exception("call.transfer_requested webhook failed",
+                          extra={"call_sid": call_sid})
+
+    async def _play_transfer_failure_apology(self) -> None:
+        if self._tts is None or self._stream_sid is None:
+            return
+        text = (self._transfer_failure_text
+                or "Maaf kijiye, abhi koi agent uplabdh nahi hai. Dhanyavaad.")
+        from src.interfaces.tts import TTSConfig
+        try:
+            result = await self._tts.synthesize(text, TTSConfig(sample_rate=16000))
+            pcm8k, self._down_state = resample_pcm16(
+                result.audio, result.sample_rate, _TEL_RATE, self._down_state)
+            self._audio_q.put_nowait(pcm8k)
+            # Sleep for real-time audio duration so the sender task can drain the queue
+            # before _on_teardown cancels it.
+            duration_s = len(pcm8k) / (_TEL_RATE * 2)
+            await asyncio.sleep(duration_s + 1.0)
+        except Exception:  # noqa: BLE001
+            log.exception("transfer failure apology TTS failed")
