@@ -103,6 +103,20 @@ PLAYER_TOOLS: dict[str, dict] = {
         "default_path": "/players/{user_id}/responsible-gaming",
         "method": "GET",
     },
+    "get_payment_config": {
+        "description": (
+            "Get the player's available payment configuration: deposit methods "
+            "(UPI, net banking, cards, wallets), withdrawal channels, "
+            "minimum and maximum deposit/withdrawal limits, supported banks, "
+            "blocked/unsupported banks, and withdrawal processing SLA / expected time."
+        ),
+        "parameters": {
+            "user_id": {"type": "string", "source": "session",
+                        "description": "Player identifier"},
+        },
+        "default_path": "/players/{user_id}/payment-config",
+        "method": "GET",
+    },
 }
 
 # ---------------------------------------------------------------------------
@@ -110,21 +124,6 @@ PLAYER_TOOLS: dict[str, dict] = {
 # ---------------------------------------------------------------------------
 
 OPERATOR_TOOLS: dict[str, dict] = {
-    "get_operator_payment_config": {
-        "description": (
-            "Get the operator's payment configuration: available deposit methods "
-            "(UPI, net banking, cards, wallets), available withdrawal channels, "
-            "minimum and maximum deposit/withdrawal limits, list of supported "
-            "banks, list of blocked/unsupported banks, and withdrawal processing "
-            "SLA / expected time."
-        ),
-        "parameters": {
-            "operator_id": {"type": "string", "source": "session",
-                            "description": "Operator identifier"},
-        },
-        "default_path": "/operators/{operator_id}/payment-config",
-        "method": "GET",
-    },
     "get_operator_games_config": {
         "description": (
             "Get the operator's product and games configuration: enabled casino "
