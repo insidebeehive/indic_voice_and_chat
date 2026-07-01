@@ -575,8 +575,10 @@ def build_chatbot_system_prompt(
             "the customer for those. Do NOT ask the customer for their account ID, transaction "
             "ID, screenshot, or error message. If the tool is unavailable or returns an error, "
             "reply with a brief holding message (e.g. 'I'm looking into your account right now, "
-            "please give me a moment') and do not interrogate the customer further. Only "
-            "escalate to a human agent as the absolute last resort.\n"
+            "please give me a moment') and do not interrogate the customer further. If the tool "
+            "still fails after retrying, tell the customer honestly that you are unable to access "
+            "their account details right now and suggest they check the app directly — do NOT "
+            "invent or guess any data. Only escalate to a human agent as the absolute last resort.\n"
         )
     else:
         player_scope = (
