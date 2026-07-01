@@ -206,7 +206,62 @@ CSS owns the direct-human chat path end-to-end. CS returns `{"handled_by": "crm"
 
 ## Outbound Scenarios
 
-### 1. AI → Customer (AI-initiated voice via chat session)
+### 1. AI voice call — transfer to human agent
+
+When the AI decides to transfer a live voice call to a human, we pause the AI
+and wait for CS to find one. **The telephony call stays active** — the caller
+hears silence while CS looks.
+
+```
+AI is on a live voice call (S2S or cascade bridge)
+AI decides to escalate → fires 'transfer' action
+        │
+We:
+  1. Close the Gemini Live session (AI goes silent)
+  2. POST call.transfer_requested to events_webhook_url:
+       {
+         "event": "call.transfer_requested",
+         "call_sid": "CAxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+         "transfer_result_url": "https://{host}/api/v1/calls/{call_sid}/transfer-result"
+       }
+  3. Wait up to 30 s for CS to call back
+        │
+CS receives the webhook and tries to find an available agent.
+        │
+  ┌─── human found? ─────────────────────────────────────────────────────┐
+  │                                                                      │
+  Yes                                                                   No (or timeout)
+  │                                                                      │
+CS POSTs:                                                            CS POSTs:
+  POST {transfer_result_url}                                           POST {transfer_result_url}
+  Authorization: Bearer <tenant-token>                                 Authorization: Bearer <tenant-token>
+  {"status": "success"}                                                {"status": "failure"}
+        │                                                                      │
+We drop the Twilio WebSocket                                          We synthesize a TTS apology
+(call ends on our side).                                              and play it to the caller,
+CS connects the caller to the                                         then drop the WebSocket.
+human agent through its own                                           (call.completed fires with
+telephony infrastructure.                                              outcome = "escalated")
+        │                                                                      │
+        └──────────────────────────────┬───────────────────────────────────────┘
+                                       │
+                          call.completed fires → CS webhook
+```
+
+**CS does not need to be in the audio path.** CS only needs to:
+1. Receive the `call.transfer_requested` webhook.
+2. POST `{"status": "success" | "failure"}` to `transfer_result_url` within **30 s**.
+3. On success: connect the caller to a human via CS's own telephony infrastructure
+   (SIP transfer, warm transfer, etc.) once the call ends on our side.
+
+> If CS does not call back within 30 s, the platform treats it as `"failure"` —
+> plays the apology and ends the call automatically.
+
+See `tenant-call-events.md` → `call.transfer_requested` for the full event payload.
+
+---
+
+### 3. AI → Customer (AI-initiated voice via chat session)
 
 ```
 AI is in an active chat session via CS relay
@@ -230,7 +285,7 @@ CS is NOT in the audio path — we handle media streaming directly.
 We generate the transcript because we ran the full conversation — CSS receives
 the outcome and summary via the `call.completed` webhook.
 
-### 2. CS triggers an outbound AI voicebot call (campaign dial)
+### 4. CS triggers an outbound AI voicebot call (campaign dial)
 
 The simplest outbound pattern — CS requests the call and we handle dialing,
 audio, and outcome. CS does not need to integrate with the telephony provider
@@ -287,7 +342,7 @@ and adjusts mid-call.
 
 ---
 
-### 3. Human → Customer (support agent-initiated call)
+### 5. Human → Customer (support agent-initiated call)
 
 ```
 Support agent clicks "Call customer" in the agent console

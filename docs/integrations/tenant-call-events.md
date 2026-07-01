@@ -65,6 +65,43 @@ Every event has this shape:
 
 ## Events
 
+### `call.transfer_requested` — AI handed off to a human agent
+
+Fired when the AI voicebot decides to transfer the call to a human agent. At
+this point the Gemini Live session has already closed (AI stops talking) but
+the telephony call is **still active** — the caller is on hold waiting.
+
+The receiver (typically the Coordination Service) must try to find an available
+human agent and POST the result to `transfer_result_url` within 30 seconds.
+
+```json
+"data": {
+  "call_sid": "CAxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+  "transfer_result_url": "https://{host}/api/v1/calls/{call_sid}/transfer-result"
+}
+```
+
+| Field | Notes |
+|---|---|
+| `call_sid` | Provider Call SID (same as `provider_call_sid` in other events) |
+| `transfer_result_url` | POST here with `{"status": "success"}` or `{"status": "failure"}` |
+
+**After receiving this event, the CS must call back within 30 s:**
+
+```
+POST {transfer_result_url}
+Authorization: Bearer <tenant-token>
+Content-Type: application/json
+
+{"status": "success"}   // human found — platform drops the call (human takes over)
+{"status": "failure"}   // no human — platform plays apology and ends the call
+```
+
+If no callback arrives within 30 s, the platform treats it as `"failure"`.
+
+> `call.completed` always fires after the hold resolves — either immediately
+> after CS posts `"success"`, or after the apology finishes on `"failure"`.
+
 ### `call.initiated` — call row created / dialing
 ```json
 "data": {
