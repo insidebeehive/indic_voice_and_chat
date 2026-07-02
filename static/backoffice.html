@@ -15,6 +15,8 @@
   label { font-size:.8rem; color:#cbd5e1; display:flex; flex-direction:column; gap:.2rem; }
   input { background:#0b1220; color:#e2e8f0; border:1px solid #334155; border-radius:.35rem; padding:.4rem; font:inherit; }
   button { padding:.4rem .8rem; border-radius:.4rem; border:0; cursor:pointer; font-weight:600; background:#ea580c; color:#fff; }
+  .btn-sm { padding:.2rem .5rem; font-size:.78rem; }
+  .btn-danger { background:#dc2626; }
   button.ghost { background:#334155; color:#e2e8f0; }
   button.sm { padding:.25rem .5rem; font-size:.75rem; }
   .wrap { padding:1rem; }
@@ -66,12 +68,14 @@
       <div class="tab" id="tab_tel" onclick="showTab('tel')">Telephony</div>
       <div class="tab" id="tab_camp" onclick="showTab('camp')">Campaign</div>
       <!-- <div class="tab" id="tab_chat" onclick="showTab('chat')">Chat</div> -->
+      <div class="tab" id="tab_kb" onclick="showTab('kb')">Knowledge Base</div>
     </div>
     <div id="pane_an"></div>
     <div id="pane_bill" hidden></div>
     <div id="pane_tel" hidden></div>
     <div id="pane_camp" hidden></div>
     <div id="pane_chat" hidden></div>
+    <div id="pane_kb" hidden></div>
   </div>
 </div>
 
@@ -146,9 +150,10 @@ async function selectTenant(id, slug) {
   loadTelephony(id);
   loadCampaigns(id);
   loadChat(id, slug);
+  loadKB(id, slug);
 }
 function showTab(which) {
-  for (const k of ["an", "bill", "tel", "camp"]) {
+  for (const k of ["an", "bill", "tel", "camp", "kb"]) {
     $("tab_" + k).classList.toggle("active", which === k);
     $("pane_" + k).hidden = which !== k;
   }
@@ -541,7 +546,96 @@ async function deleteTool(slug, name) {
   }
 }
 
+// ── Knowledge Base ─────────────────────────────────────────────
+function _kbDocRow(doc, onDelete) {
+  const lang = doc.language ? ` <span class="hint">${doc.language}</span>` : "";
+  return `<tr>
+    <td>${escA(doc.filename)}</td>
+    <td style="text-align:right">${doc.chunk_count}</td>
+    <td>${lang}</td>
+    <td><button class="btn-sm btn-danger" onclick="${onDelete}('${escA(doc.id)}')">Delete</button></td>
+  </tr>`;
+}
+
+function _kbTable(rows) {
+  if (!rows.length) return '<span class="hint">No documents.</span>';
+  return `<table style="width:100%;border-collapse:collapse;font-size:.85rem;">
+    <thead><tr><th style="text-align:left">File</th><th style="text-align:right">Chunks</th><th>Lang</th><th></th></tr></thead>
+    <tbody>${rows}</tbody></table>`;
+}
+
+async function deletePlatformDoc(docId) {
+  if (!confirm("Delete this platform document?")) return;
+  const r = await apiSend("DELETE", `/api/v1/knowledge/platform-documents/${docId}`);
+  if (r.ok) { const t = (window.TENANTS || {})[SELECTED] || {}; loadKB(SELECTED, t.slug); }
+  else alert("Delete failed: " + (r.json?.detail || r.status));
+}
+
+async function deleteTenantDoc(docId) {
+  if (!confirm("Delete this document?")) return;
+  const t = (window.TENANTS || {})[SELECTED] || {};
+  const r = await apiTenant("DELETE", `/api/v1/knowledge/documents/${docId}`, null, t.slug);
+  if (r.ok) loadKB(SELECTED, t.slug);
+  else alert("Delete failed: " + (r.json?.detail || r.status));
+}
+
+async function uploadKBDoc(isPlatform, slug) {
+  const inputId = isPlatform ? "kb_platform_file" : "kb_tenant_file";
+  const fileEl = $(inputId);
+  if (!fileEl.files.length) return;
+  const fd = new FormData(); fd.append("file", fileEl.files[0]);
+  const headers = {};
+  const tok = $("adminToken").value.trim();
+  if (tok) headers["Authorization"] = "Bearer " + tok;
+  if (!isPlatform) headers["X-Tenant-Slug"] = slug;
+  const path = isPlatform ? "/api/v1/knowledge/platform-ingest" : "/api/v1/knowledge/ingest";
+  const res = await fetch(base() + path, { method: "POST", headers, body: fd });
+  const json = await res.json().catch(() => ({}));
+  if (res.ok) {
+    fileEl.value = "";
+    const t = (window.TENANTS || {})[SELECTED] || {};
+    loadKB(SELECTED, t.slug);
+  } else {
+    alert("Upload failed: " + (json?.detail || res.status));
+  }
+}
+
+async function loadKB(id, slug) {
+  const pane = $("pane_kb");
+  pane.innerHTML = '<span class="hint">Loading…</span>';
+
+  const [pr, tr] = await Promise.all([
+    api("/api/v1/knowledge/platform-documents"),
+    slug ? apiTenant("GET", "/api/v1/knowledge/documents", null, slug) : Promise.resolve({ ok: false }),
+  ]);
+
+  const platformRows = (pr.ok ? pr.json.documents || [] : [])
+    .map(d => _kbDocRow(d, "deletePlatformDoc")).join("");
+  const tenantRows = (tr.ok ? tr.json.documents || [] : [])
+    .map(d => _kbDocRow(d, "deleteTenantDoc")).join("");
+
+  pane.innerHTML = `
+    <div class="card" style="margin-bottom:1rem;">
+      <div class="card-label">Platform Knowledge Base <span class="hint">(shared across all tenants)</span></div>
+      ${_kbTable(platformRows)}
+      <div style="margin-top:.8rem;display:flex;gap:.5rem;align-items:center;">
+        <input type="file" id="kb_platform_file" accept=".pdf,.docx,.txt,.md" style="flex:1;font-size:.8rem;" />
+        <button class="btn-sm" onclick="uploadKBDoc(true,'${slug}')">Upload</button>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-label">Tenant Knowledge Base <span class="hint">(${escA(slug || id)})</span></div>
+      ${tr.ok ? _kbTable(tenantRows) : '<span class="hint">Select a tenant to view its documents.</span>'}
+      ${slug ? `<div style="margin-top:.8rem;display:flex;gap:.5rem;align-items:center;">
+        <input type="file" id="kb_tenant_file" accept=".pdf,.docx,.txt,.md" style="flex:1;font-size:.8rem;" />
+        <button class="btn-sm" onclick="uploadKBDoc(false,'${slug}')">Upload</button>
+      </div>` : ""}
+    </div>`;
+}
+
 loadCreds(); loadTenants();
+// Load platform KB immediately (doesn't need a tenant selected)
+loadKB(null, null);
 </script>
 </body>
 </html>

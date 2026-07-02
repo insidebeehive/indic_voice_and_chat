@@ -19,13 +19,14 @@ import uuid
 from pathlib import Path
 from typing import Callable, Optional
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import get_db_session
 from src.auth import TenantContext, current_tenant
+from src.auth.middleware import require_admin
 from src.interfaces.vector_store import Document
 from src.models.benchmark import KBDocument, PlatformKBDocument
 from src.rag.context_builder import search_combined
@@ -228,6 +229,97 @@ async def delete_document(
     await session.delete(row)
     await session.commit()
     n = await retriever.delete(chunk_ids)
+    return {"document_id": document_id, "chunks_removed": n}
+
+
+@router.get("/platform-documents", response_model=DocumentsResponse)
+async def list_platform_documents(
+    request: Request,
+    session: AsyncSession = Depends(get_db_session),
+) -> DocumentsResponse:
+    """Admin: list all documents in the platform (global) knowledge base."""
+    await require_admin(request)
+    rows = (await session.execute(
+        select(PlatformKBDocument).order_by(PlatformKBDocument.ingested_at.desc())
+    )).scalars().all()
+    items = [
+        DocumentInfo(id=r.id, filename=r.filename or r.id,
+                     language=r.language, chunk_count=r.chunk_count or 0)
+        for r in rows
+    ]
+    return DocumentsResponse(documents=items, total=len(items))
+
+
+@router.post("/platform-ingest", response_model=IngestResponse)
+async def platform_ingest_document(
+    request: Request,
+    file: UploadFile = File(...),
+    document_id: Optional[str] = Form(None),
+    session: AsyncSession = Depends(get_db_session),
+) -> IngestResponse:
+    """Admin: upload a document into the platform (global) knowledge base."""
+    await require_admin(request)
+    if _platform_retriever is None:
+        raise HTTPException(status_code=503, detail="platform retriever not initialised")
+    data = await file.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="empty upload")
+    text = parse_document(file.filename or "uploaded", data)
+    if not text.strip():
+        raise HTTPException(status_code=400, detail="document parsed to empty text")
+
+    doc_id = document_id or f"platform_{_new_id()}"
+    language = detect_language(text)
+    chunker = get_chunker(_chunk_config)
+    raw_chunks = chunker(text, {
+        "filename": file.filename,
+        "document_id": doc_id,
+        "language": language,
+    })
+    if not raw_chunks:
+        raise HTTPException(status_code=400, detail="no chunks produced")
+
+    docs = [
+        Document(
+            id=f"{doc_id}::chunk-{c.index}",
+            content=c.text,
+            metadata={**c.metadata, "section": c.index, "page": c.index},
+        )
+        for c in raw_chunks
+    ]
+    indexed = await _platform_retriever.index(docs)
+    session.add(PlatformKBDocument(
+        id=doc_id,
+        filename=file.filename or doc_id,
+        source_type=(Path(file.filename).suffix.lstrip(".").lower() if file.filename else None),
+        language=language,
+        chunk_count=indexed,
+        extra_data={"chunk_ids": [d.id for d in docs]},
+    ))
+    await session.commit()
+    log.info("platform: ingested document", extra={"document_id": doc_id, "chunks": indexed})
+    return IngestResponse(document_id=doc_id, filename=file.filename or "",
+                          chunks_indexed=indexed, language=language)
+
+
+@router.delete("/platform-documents/{document_id}")
+async def delete_platform_document(
+    document_id: str,
+    request: Request,
+    session: AsyncSession = Depends(get_db_session),
+) -> dict:
+    """Admin: delete a document from the platform (global) knowledge base."""
+    await require_admin(request)
+    if _platform_retriever is None:
+        raise HTTPException(status_code=503, detail="platform retriever not initialised")
+    row = await session.get(PlatformKBDocument, document_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="platform document not found")
+    chunk_ids = (row.extra_data or {}).get("chunk_ids") or [
+        f"{document_id}::chunk-{i}" for i in range(row.chunk_count or 0)]
+    await session.delete(row)
+    await session.commit()
+    n = await _platform_retriever.delete(chunk_ids)
     return {"document_id": document_id, "chunks_removed": n}
 
 
