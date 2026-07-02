@@ -32,6 +32,7 @@ from src.providers.tts.gemini import GeminiTTSAdapter
 from src.providers.tts.google import GoogleTTSAdapter
 from src.providers.tts.sarvam import SarvamTTSAdapter
 from src.providers.vector_store.faiss_store import FAISSAdapter
+from src.providers.vector_store.pgvector_store import PGVectorAdapter
 
 STT_PROVIDERS: dict[str, type[ISTTProvider]] = {
     "sarvam": SarvamSTTAdapter,
@@ -67,6 +68,7 @@ TELEPHONY_PROVIDERS: dict[str, type[ITelephonyProvider]] = {
 
 VECTOR_STORE_PROVIDERS: dict[str, type[IVectorStore]] = {
     "faiss": FAISSAdapter,
+    "pgvector": PGVectorAdapter,
 }
 
 

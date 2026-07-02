@@ -22,6 +22,7 @@ dependencies = [
     "alembic>=1.13",
     "faiss-cpu>=1.7.4",
     "numpy>=1.26",
+    "pgvector>=0.3",
     "httpx>=0.27",
     "groq>=0.11",
     "google-genai>=0.3",

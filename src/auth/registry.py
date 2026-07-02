@@ -63,11 +63,13 @@ class TenantProviders:
             creds = tenant_layer.active_creds()
             merged["account_sid"] = tenant.secret(creds.account_sid_env)
             merged["auth_token"] = tenant.secret(creds.auth_token_env)
-        # Vector store gets its own per-tenant directory.
+        # Vector store: FAISS gets a per-tenant directory; pgvector gets tenant_id
+        # for row-level scoping. Both keys are set so switching providers is config-only.
         if layer == "vector_store":
             tenant_path = self.base_vector_path / tenant.id
             tenant_path.mkdir(parents=True, exist_ok=True)
             merged["index_path"] = str(tenant_path / "index")
+            merged["tenant_id"] = tenant.id
         return merged
 
     def get_platform_llm(self) -> Any:

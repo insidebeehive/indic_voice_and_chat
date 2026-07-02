@@ -83,18 +83,32 @@ DEFAULT_DEMO_SCRIPT = VoiceBotScript(
 # --- Per-tenant runtime builders ---------------------------------------
 
 
-def build_platform_retriever(base_vector_path: Path = Path("data/faiss")) -> "HybridRetriever":
-    """One shared FAISS+BM25 retriever for the global KB (all tenants)."""
-    from src.providers.vector_store.faiss_store import FAISSAdapter
+def build_platform_retriever(
+    global_defaults: dict | None = None,
+    base_vector_path: Path = Path("data/faiss"),
+) -> "HybridRetriever":
+    """One shared retriever for the global KB (all tenants).
+
+    Provider is driven by global_defaults["vector_store"]["provider"]:
+    - "faiss"    → FAISS files at data/faiss/platform/
+    - "pgvector" → knowledge_chunks table with tenant_id IS NULL
+    Defaults to faiss if global_defaults is not supplied.
+    """
+    from src.providers import get_vector_store
     from src.rag.embeddings import GeminiEmbedder
     from src.rag.retriever import HybridRetriever, RetrievalConfig
 
-    platform_path = base_vector_path / "platform"
-    platform_path.mkdir(parents=True, exist_ok=True)
-    vector_store = FAISSAdapter({
-        "embedding_dim": 384,
-        "index_path": str(platform_path / "index"),
-    })
+    vs_cfg = dict((global_defaults or {}).get("vector_store", {}))
+    vs_cfg.setdefault("provider", "faiss")
+    vs_cfg.setdefault("embedding_dim", 384)
+    vs_cfg["tenant_id"] = None  # platform chunks are unscoped
+
+    if vs_cfg["provider"] == "faiss":
+        platform_path = base_vector_path / "platform"
+        platform_path.mkdir(parents=True, exist_ok=True)
+        vs_cfg["index_path"] = str(platform_path / "index")
+
+    vector_store = get_vector_store(vs_cfg)
     return HybridRetriever(
         embedder=GeminiEmbedder(dim=384),
         vector_store=vector_store,

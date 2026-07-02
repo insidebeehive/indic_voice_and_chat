@@ -43,10 +43,11 @@ pipeline:
     webhook_base_url: https://your-domain.example.com/api/v1/telephony
 
   vector_store:
-    provider: faiss
-    index_path: ./data/faiss_index
-    embedding_model: sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
+    provider: pgvector
     embedding_dim: 384
+    # To use FAISS instead (file-backed, no DB required):
+    # provider: faiss
+    # index_path: ./data/faiss_index
 
 voice_pipeline:
   vad:

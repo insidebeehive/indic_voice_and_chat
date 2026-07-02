@@ -295,7 +295,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # webhooks. Real where impls exist, honest stubs for the fake-only ones.
     runtime_registry = build_runtime_registry(providers, base_session_store)
     app.state.registry = runtime_registry
-    platform_retriever = build_platform_retriever()
+    platform_retriever = build_platform_retriever(
+        global_defaults={"vector_store": settings.pipeline.vector_store.model_dump()},
+    )
     # Drop ALL cached per-tenant instances (providers + sub-registries) whenever
     # tenants reload (e.g. a key/config update via the tenant API) so the new
     # config takes effect.
