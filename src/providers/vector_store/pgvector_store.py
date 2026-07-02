@@ -62,6 +62,8 @@ async def _get_pool(database_url: str) -> Any:
 
 
 async def _ensure_schema(pool: Any, dim: int) -> None:
+    """Verify the table exists; do NOT attempt CREATE EXTENSION (needs superuser).
+    Run the setup SQL from docs/pgvector_setup.sql once as the postgres user."""
     global _schema_ready, _schema_lock
     if _schema_ready:
         return
@@ -71,36 +73,17 @@ async def _ensure_schema(pool: Any, dim: int) -> None:
         if _schema_ready:
             return
         async with pool.acquire() as conn:
-            await conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
-            await conn.execute(f"""
-                CREATE TABLE IF NOT EXISTS knowledge_chunks (
-                    id TEXT PRIMARY KEY,
-                    content TEXT NOT NULL,
-                    metadata JSONB NOT NULL DEFAULT '{{}}',
-                    embedding vector({dim}),
-                    tenant_id TEXT
+            exists = await conn.fetchval(
+                "SELECT 1 FROM information_schema.tables "
+                "WHERE table_name = 'knowledge_chunks'"
+            )
+            if not exists:
+                raise RuntimeError(
+                    "knowledge_chunks table not found. "
+                    "Run docs/pgvector_setup.sql as the postgres superuser first."
                 )
-            """)
-            await conn.execute("""
-                CREATE INDEX IF NOT EXISTS knowledge_chunks_tenant_idx
-                    ON knowledge_chunks (tenant_id)
-            """)
-            # HNSW — better recall than IVFFlat, requires pgvector >= 0.5
-            try:
-                await conn.execute("""
-                    CREATE INDEX IF NOT EXISTS knowledge_chunks_emb_hnsw
-                        ON knowledge_chunks USING hnsw (embedding vector_cosine_ops)
-                """)
-            except Exception:
-                log.warning("HNSW index creation failed (pgvector < 0.5?); "
-                            "falling back to IVFFlat")
-                await conn.execute("""
-                    CREATE INDEX IF NOT EXISTS knowledge_chunks_emb_ivf
-                        ON knowledge_chunks USING ivfflat (embedding vector_cosine_ops)
-                        WITH (lists = 100)
-                """)
         _schema_ready = True
-        log.info("pgvector schema ready (dim=%d)", dim)
+        log.info("pgvector schema verified (dim=%d)", dim)
 
 
 class PGVectorAdapter(IVectorStore):
