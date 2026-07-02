@@ -565,6 +565,35 @@ async def claim_session(
     return ClaimResponse(status="claimed", agent_id=req.agent_id)
 
 
+class DeclineResponse(BaseModel):
+    status: str
+
+
+@router.post("/sessions/{session_id}/decline", response_model=DeclineResponse)
+async def decline_session(
+    session_id: str,
+    tenant: TenantContext = Depends(current_tenant),
+    session: AsyncSession = Depends(get_db_session),
+) -> DeclineResponse:
+    """CRM calls this when it cannot assign a human agent to an awaiting_human session.
+    Reverts the session to bot mode and signals the customer WS to resume bot conversation."""
+    row = await session.get(ChatSession, session_id)
+    if row is None or row.tenant_id != tenant.id:
+        raise HTTPException(status_code=404, detail="chat session not found")
+    if row.mode != "awaiting_human":
+        raise HTTPException(
+            status_code=400,
+            detail=f"session is not awaiting handover (mode: {row.mode})",
+        )
+    row.mode = "bot"
+    await session.commit()
+    cq = _customer_queues.get(session_id)
+    if cq:
+        await cq.put(json.dumps({"type": "declined"}))
+    log.info("session declined by CRM", extra={"session_id": session_id})
+    return DeclineResponse(status="declined")
+
+
 @router.websocket("/sessions/{session_id}/agent-ws")
 async def agent_websocket(websocket: WebSocket, session_id: str) -> None:
     """BO agent WebSocket. Auth via ?token= query param (tenant bearer token).
@@ -714,174 +743,176 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
         async with _sm()() as db:
             cur_row = await db.get(ChatSession, session_id)
         if cur_row and cur_row.mode in ("awaiting_human", "human"):
-            await _run_human_mode(websocket, session_id, tenant)
-        else:
-            while True:
-                raw = await websocket.receive_text()
-                try:
-                    msg = json.loads(raw)
-                except json.JSONDecodeError:
-                    await websocket.send_text(json.dumps({"type": "error", "message": "invalid json"}))
-                    continue
+            if await _run_human_mode(websocket, session_id, tenant):
+                return  # session fully ended
+            # CRM declined — fall through to bot loop below
 
-                mtype = msg.get("type", "message")
-                if mtype == "end":
-                    summary = await agent.summarize_session()
-                    await _end_session(session_id, summary)
-                    await _send_close_webhook(tenant, session_id, "ai", summary)
-                    await websocket.send_text(json.dumps({"type": "ended", "summary": summary}))
-                    break
+        while True:
+            raw = await websocket.receive_text()
+            try:
+                msg = json.loads(raw)
+            except json.JSONDecodeError:
+                await websocket.send_text(json.dumps({"type": "error", "message": "invalid json"}))
+                continue
 
-                # A single turn's failure must not black-hole the conversation: send an
-                # error frame and keep the socket open (a real disconnect re-raises).
-                try:
-                    if mtype == "audio":
-                        raw_data = msg.get("data")
-                        mime = (msg.get("mime") or "").strip()
-                        if not raw_data or not mime or not mime.startswith("audio/"):
-                            await websocket.send_text(json.dumps(
-                                {"type": "error", "message": "audio needs 'data' (base64) + 'mime' (audio/*)"}))
-                            continue
-                        if _media_store is None:
-                            await websocket.send_text(json.dumps(
-                                {"type": "error", "message": "voice messages not available — media storage not configured"}))
-                            continue
-                        try:
-                            audio_bytes = base64.b64decode(raw_data)
-                        except Exception:
-                            await websocket.send_text(json.dumps(
-                                {"type": "error", "message": "invalid base64 in audio data"}))
-                            continue
+            mtype = msg.get("type", "message")
+            if mtype == "end":
+                summary = await agent.summarize_session()
+                await _end_session(session_id, summary)
+                await _send_close_webhook(tenant, session_id, "ai", summary)
+                await websocket.send_text(json.dumps({"type": "ended", "summary": summary}))
+                break
 
-                        await websocket.send_text(json.dumps({"type": "typing"}))
-
-                        object_key = _media_key(tenant.id, session_id, mime)
-                        # Upload to S3 and transcribe in parallel
-                        transcript = ""
-                        try:
-                            upload_coro = _media_store.upload(audio_bytes, object_key, mime.split(";")[0])
-                            _transcriber = getattr(agent, "_llm", None) or getattr(agent, "llm", None)
-                            if _transcriber and hasattr(_transcriber, "transcribe_audio"):
-                                transcript, _ = await asyncio.gather(
-                                    _transcriber.transcribe_audio(audio_bytes, mime.split(";")[0]),
-                                    upload_coro,
-                                )
-                            else:
-                                await upload_coro
-                        except Exception:
-                            log.exception("audio upload/transcription failed", extra={"session_id": session_id})
-                            await websocket.send_text(json.dumps(
-                                {"type": "error", "message": "Could not save voice message — please try again."}))
-                            continue
-
-                        # If transcription succeeded, get AI response; else inform customer
-                        if transcript:
-                            result = await agent.handle_message(transcript)
-                            msg_id = await _persist_turn(
-                                session_id, transcript, result,
-                                user_type="audio", media_mime=mime, media_url=object_key,
-                            )
-                            if msg_id is not None:
-                                await websocket.send_text(json.dumps({
-                                    "type": "audio_ack",
-                                    "media_url": f"/api/v1/chat/media/{msg_id}",
-                                }))
-                            await _send_reply(websocket, session_id, result, tenant.id)
-                            if result.escalation:
-                                if await _handle_escalation(websocket, session_id, tenant, row, result):
-                                    await _run_human_mode(websocket, session_id, tenant)
-                                    break
-                        else:
-                            # Persist audio without agent reply
-                            async with _sm()() as db:
-                                r = await db.get(ChatSession, session_id)
-                                if r:
-                                    audio_msg = ChatMessage(
-                                        session_id=session_id, role="customer", type="audio",
-                                        content="[audio]", media_mime=mime, media_url=object_key,
-                                    )
-                                    db.add(audio_msg)
-                                    r.message_count = (r.message_count or 0) + 1
-                                    await db.flush()
-                                    msg_id = audio_msg.id
-                                    await db.commit()
-                                else:
-                                    msg_id = None
-                            if msg_id is not None:
-                                await websocket.send_text(json.dumps({
-                                    "type": "audio_ack",
-                                    "media_url": f"/api/v1/chat/media/{msg_id}",
-                                }))
-                            await websocket.send_text(json.dumps({
-                                "type": "error",
-                                "message": "Could not transcribe voice message — please type your message instead.",
-                            }))
+            # A single turn's failure must not black-hole the conversation: send an
+            # error frame and keep the socket open (a real disconnect re-raises).
+            try:
+                if mtype == "audio":
+                    raw_data = msg.get("data")
+                    mime = (msg.get("mime") or "").strip()
+                    if not raw_data or not mime or not mime.startswith("audio/"):
+                        await websocket.send_text(json.dumps(
+                            {"type": "error", "message": "audio needs 'data' (base64) + 'mime' (audio/*)"}))
                         continue
-
-                    if mtype in ("image", "video"):
-                        data = msg.get("data")
-                        mime = msg.get("mime") or ""
-                        if not data or not mime:
-                            await websocket.send_text(json.dumps(
-                                {"type": "error", "message": "image/video needs 'data' + 'mime'"}))
-                            continue
-                        caption = (msg.get("text") or "").strip()
-                        await websocket.send_text(json.dumps({"type": "typing"}))
-
-                        # Upload to S3 if storage is configured
-                        object_key: Optional[str] = None
-                        if _media_store is not None:
-                            try:
-                                raw_bytes = base64.b64decode(data)
-                                object_key = _media_key(tenant.id, session_id, mime)
-                                await _media_store.upload(raw_bytes, object_key, mime.split(";")[0])
-                            except Exception:
-                                log.exception("media upload failed", extra={"session_id": session_id})
-                                object_key = None
-
-                        result = await agent.handle_image(data, mime, caption)
-                        await _persist_turn(session_id, caption or f"[{mtype}]", result,
-                                            user_type=mtype, media_mime=mime, media_url=object_key)
-                        await _send_reply(websocket, session_id, result, tenant.id)
-                        if result.escalation:
-                            if await _handle_escalation(websocket, session_id, tenant, row, result):
-                                await _run_human_mode(websocket, session_id, tenant)
-                                break
+                    if _media_store is None:
+                        await websocket.send_text(json.dumps(
+                            {"type": "error", "message": "voice messages not available — media storage not configured"}))
                         continue
-
-                    user_text = (msg.get("text") or msg.get("message") or "").strip()
-                    if not user_text:
-                        await websocket.send_text(json.dumps({"type": "error", "message": "missing 'text'"}))
+                    try:
+                        audio_bytes = base64.b64decode(raw_data)
+                    except Exception:
+                        await websocket.send_text(json.dumps(
+                            {"type": "error", "message": "invalid base64 in audio data"}))
                         continue
 
                     await websocket.send_text(json.dumps({"type": "typing"}))
-                    result = await agent.handle_message(user_text)
-                    await _persist_turn(session_id, user_text, result)
-                    call_url: Optional[str] = None
-                    if result.call_offer and _handoff_store is not None:
-                        summary = await agent.summarize_session()
-                        token = uuid.uuid4().hex
-                        context = {
-                            "chat_session_id": session_id,
-                            "customer_name": row.customer_name,
-                            "customer_id": row.customer_id,
-                            "language": row.language,
-                            "chat_summary": summary,
-                        }
-                        await _handoff_store.redis.set(
-                            f"chat_handoff:{token}", json.dumps(context), ex=600)
-                        call_url = _voice_call_url(websocket, tenant.slug, token)
-                    await _send_reply(websocket, session_id, result, tenant.id, call_url=call_url)
+
+                    object_key = _media_key(tenant.id, session_id, mime)
+                    # Upload to S3 and transcribe in parallel
+                    transcript = ""
+                    try:
+                        upload_coro = _media_store.upload(audio_bytes, object_key, mime.split(";")[0])
+                        _transcriber = getattr(agent, "_llm", None) or getattr(agent, "llm", None)
+                        if _transcriber and hasattr(_transcriber, "transcribe_audio"):
+                            transcript, _ = await asyncio.gather(
+                                _transcriber.transcribe_audio(audio_bytes, mime.split(";")[0]),
+                                upload_coro,
+                            )
+                        else:
+                            await upload_coro
+                    except Exception:
+                        log.exception("audio upload/transcription failed", extra={"session_id": session_id})
+                        await websocket.send_text(json.dumps(
+                            {"type": "error", "message": "Could not save voice message — please try again."}))
+                        continue
+
+                    # If transcription succeeded, get AI response; else inform customer
+                    if transcript:
+                        result = await agent.handle_message(transcript)
+                        msg_id = await _persist_turn(
+                            session_id, transcript, result,
+                            user_type="audio", media_mime=mime, media_url=object_key,
+                        )
+                        if msg_id is not None:
+                            await websocket.send_text(json.dumps({
+                                "type": "audio_ack",
+                                "media_url": f"/api/v1/chat/media/{msg_id}",
+                            }))
+                        await _send_reply(websocket, session_id, result, tenant.id)
+                        if result.escalation:
+                            if await _handle_escalation(websocket, session_id, tenant, row, result):
+                                if await _run_human_mode(websocket, session_id, tenant):
+                                    break
+                    else:
+                        # Persist audio without agent reply
+                        async with _sm()() as db:
+                            r = await db.get(ChatSession, session_id)
+                            if r:
+                                audio_msg = ChatMessage(
+                                    session_id=session_id, role="customer", type="audio",
+                                    content="[audio]", media_mime=mime, media_url=object_key,
+                                )
+                                db.add(audio_msg)
+                                r.message_count = (r.message_count or 0) + 1
+                                await db.flush()
+                                msg_id = audio_msg.id
+                                await db.commit()
+                            else:
+                                msg_id = None
+                        if msg_id is not None:
+                            await websocket.send_text(json.dumps({
+                                "type": "audio_ack",
+                                "media_url": f"/api/v1/chat/media/{msg_id}",
+                            }))
+                        await websocket.send_text(json.dumps({
+                            "type": "error",
+                            "message": "Could not transcribe voice message — please type your message instead.",
+                        }))
+                    continue
+
+                if mtype in ("image", "video"):
+                    data = msg.get("data")
+                    mime = msg.get("mime") or ""
+                    if not data or not mime:
+                        await websocket.send_text(json.dumps(
+                            {"type": "error", "message": "image/video needs 'data' + 'mime'"}))
+                        continue
+                    caption = (msg.get("text") or "").strip()
+                    await websocket.send_text(json.dumps({"type": "typing"}))
+
+                    # Upload to S3 if storage is configured
+                    object_key: Optional[str] = None
+                    if _media_store is not None:
+                        try:
+                            raw_bytes = base64.b64decode(data)
+                            object_key = _media_key(tenant.id, session_id, mime)
+                            await _media_store.upload(raw_bytes, object_key, mime.split(";")[0])
+                        except Exception:
+                            log.exception("media upload failed", extra={"session_id": session_id})
+                            object_key = None
+
+                    result = await agent.handle_image(data, mime, caption)
+                    await _persist_turn(session_id, caption or f"[{mtype}]", result,
+                                        user_type=mtype, media_mime=mime, media_url=object_key)
+                    await _send_reply(websocket, session_id, result, tenant.id)
                     if result.escalation:
                         if await _handle_escalation(websocket, session_id, tenant, row, result):
-                            await _run_human_mode(websocket, session_id, tenant)
+                            if await _run_human_mode(websocket, session_id, tenant):
+                                break
+                    continue
+
+                user_text = (msg.get("text") or msg.get("message") or "").strip()
+                if not user_text:
+                    await websocket.send_text(json.dumps({"type": "error", "message": "missing 'text'"}))
+                    continue
+
+                await websocket.send_text(json.dumps({"type": "typing"}))
+                result = await agent.handle_message(user_text)
+                await _persist_turn(session_id, user_text, result)
+                call_url: Optional[str] = None
+                if result.call_offer and _handoff_store is not None:
+                    summary = await agent.summarize_session()
+                    token = uuid.uuid4().hex
+                    context = {
+                        "chat_session_id": session_id,
+                        "customer_name": row.customer_name,
+                        "customer_id": row.customer_id,
+                        "language": row.language,
+                        "chat_summary": summary,
+                    }
+                    await _handoff_store.redis.set(
+                        f"chat_handoff:{token}", json.dumps(context), ex=600)
+                    call_url = _voice_call_url(websocket, tenant.slug, token)
+                await _send_reply(websocket, session_id, result, tenant.id, call_url=call_url)
+                if result.escalation:
+                    if await _handle_escalation(websocket, session_id, tenant, row, result):
+                        if await _run_human_mode(websocket, session_id, tenant):
                             break
-                except WebSocketDisconnect:
-                    raise
-                except Exception:  # noqa: BLE001 — one bad turn must not drop the chat
-                    log.exception("chat turn failed", extra={"session_id": session_id})
-                    await websocket.send_text(json.dumps(
-                        {"type": "error", "message": "Sorry, something went wrong — please try again."}))
+            except WebSocketDisconnect:
+                raise
+            except Exception:  # noqa: BLE001 — one bad turn must not drop the chat
+                log.exception("chat turn failed", extra={"session_id": session_id})
+                await websocket.send_text(json.dumps(
+                    {"type": "error", "message": "Sorry, something went wrong — please try again."}))
     except WebSocketDisconnect:
         log.info("chat ws client disconnected", extra={"session_id": session_id})
     except Exception:  # noqa: BLE001 — never let the websocket task escape
@@ -1066,9 +1097,10 @@ async def _run_human_mode(
     websocket: WebSocket,
     session_id: str,
     tenant: TenantContext,
-) -> None:
+) -> bool:
     """Handle the customer WS while mode is awaiting_human or human.
-    Races between messages from the customer and replies from the BO agent WS."""
+    Returns True when the session ended normally (agent closed it / customer left).
+    Returns False when the CRM declined the escalation — caller should resume bot loop."""
     bq: asyncio.Queue = _bo_queues.setdefault(session_id, asyncio.Queue())
     cq: asyncio.Queue = _customer_queues.setdefault(session_id, asyncio.Queue())
     try:
@@ -1087,8 +1119,23 @@ async def _run_human_mode(
 
             if cq_task in done:
                 item = cq_task.result()
+                frame = json.loads(item)
+                if frame.get("type") == "declined":
+                    # CRM could not assign an agent — revert to bot and let caller resume
+                    async with _sm()() as db:
+                        r = await db.get(ChatSession, session_id)
+                        if r:
+                            r.mode = "bot"
+                            await db.commit()
+                    await websocket.send_text(json.dumps({"type": "mode_change", "mode": "bot"}))
+                    await websocket.send_text(json.dumps({
+                        "type": "message",
+                        "text": "Looks like no one is available at this time but am happy to help you again.",
+                        "sources": [], "suggestions": [], "action": "continue",
+                    }))
+                    return False
                 await websocket.send_text(item)
-                if json.loads(item).get("type") == "ended":
+                if frame.get("type") == "ended":
                     break
 
             if ws_task in done:
@@ -1132,6 +1179,7 @@ async def _run_human_mode(
     except WebSocketDisconnect:
         await bq.put(None)
         raise
+    return True
 
 
 async def _send_close_webhook(

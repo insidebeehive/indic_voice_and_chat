@@ -211,9 +211,11 @@ AI has escalated. Show "Connecting you to an agent…" The session mode is now `
 |---|---|
 | `awaiting_human` | "Waiting for an agent…" |
 | `human` | "You're now chatting with Priya" |
+| `bot` | "Looks like no one is available at this time but am happy to help you again." (CRM declined the escalation — no agents available) |
 | `voice_pending` | "Calling your number… pick up when your phone rings." |
 
 For `human`: messages from the human agent arrive as normal `message` frames — no special handling needed.
+For `bot`: the AI bot has resumed — re-enable the composer and treat the session as a normal bot session.
 For `voice_pending`: no audio in the browser; see pstn transport in §Voice Handoff.
 
 ### `call_offer`
@@ -441,7 +443,7 @@ Form fields: `file` (image/* or video/*), `text` (optional caption). CSS proxies
 - [ ] `audio_ack` → swap the pending `<audio>` element's `src` with `msg.media_url` (already proxied — use as-is)
 - [ ] Media URLs: use exactly as provided by CSS/CS — never construct platform paths or append `?session_id=`
 - [ ] `escalation` → show "Connecting to agent…"
-- [ ] `mode_change` mode=`awaiting_human` → "Waiting for an agent…"; mode=`human` → show agent name; mode=`voice_pending` → "Calling your number…"
+- [ ] `mode_change` mode=`awaiting_human` → "Waiting for an agent…"; mode=`human` → show agent name; mode=`bot` → re-enable composer and resume bot UX (CRM declined); mode=`voice_pending` → "Calling your number…"
 - [ ] `call_offer` → check `transport`: websocket = POST `/api/chat/call` → connect WS; webrtc = WebRTC peer conn using `ice_servers` + `call_url`; pstn = show "Calling your number…" and wait for `mode_change` (pstn only in AI sessions; webrtc/websocket valid in both AI and direct-human sessions)
 - [ ] `ended` → disable composer
 - [ ] `error` → inline notice, socket stays open

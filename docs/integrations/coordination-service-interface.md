@@ -373,7 +373,12 @@ CS must implement our existing chat WS protocol — the same protocol currently 
 CS must also:
 - Call `POST /api/v1/chat/sessions` with a tenant Bearer token to create sessions.
 - Forward our lifecycle webhook events (`session_started`, `escalation_requested`, `session_closed`) to CSS's configured webhook endpoint. Before forwarding, CS adds `event_id` (UUID) and rewrites `session_id` to the `cs_session_id` form, and rewrites `claim_url` / `agent_ws_url` from AI Platform paths to CS paths (see CS PRD §1.4).
-- Proxy the human agent console path: `POST /chat/sessions/{cs_id}/claim` → proxied to `POST /api/v1/chat/sessions/{platform_id}/claim`; `WS /chat/agent-ws/{cs_id}` → proxied to `WS /api/v1/chat/sessions/{platform_id}/agent-ws`. CSS calls these CS-form paths; CS does the translation. CSS never reaches AI Platform directly.
+- Proxy the human agent console paths:
+  - `POST /chat/sessions/{cs_id}/claim` → `POST /api/v1/chat/sessions/{platform_id}/claim`
+  - `POST /chat/sessions/{cs_id}/decline` → `POST /api/v1/chat/sessions/{platform_id}/decline`
+  - `WS /chat/agent-ws/{cs_id}` → `WS /api/v1/chat/sessions/{platform_id}/agent-ws`
+
+  CSS calls these CS-form paths; CS does the translation. CSS never reaches AI Platform directly.
 
 ### Voice handoff (pstn transport)
 

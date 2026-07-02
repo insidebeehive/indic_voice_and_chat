@@ -350,7 +350,9 @@ Sent when the AI decides it cannot handle the conversation and needs a human.
 | `agent_ws_url` | Relative URL — prepend the appropriate base URL; your agent console connects here |
 | `bo_available` | `false` means outside support hours — customer is already informed and waiting. **Note:** when CS is deployed, agent availability is managed by CSS's own business-hours config; CS does not guarantee this field is forwarded. |
 
-> **When the Coordination Service is deployed:** CS rewrites `claim_url` and `agent_ws_url` to its own path format before forwarding (`/chat/sessions/{cs_id}/claim` and `/chat/agent-ws/{cs_id}`). Call these against the CS base URL — not our platform URL. CSS never calls us directly.
+After receiving this webhook you **must** call exactly one of: `claim_url` (agent available) or the decline endpoint (no agents). If neither is called, the customer is left waiting indefinitely.
+
+> **When the Coordination Service is deployed:** CS rewrites `claim_url` and `agent_ws_url` to its own path format before forwarding (`/chat/sessions/{cs_id}/claim` and `/chat/agent-ws/{cs_id}`). The decline path is similarly rewritten to `/chat/sessions/{cs_id}/decline`. Call all three against the CS base URL — not our platform URL. CSS never calls us directly.
 
 ### `session_closed`
 
@@ -400,6 +402,21 @@ Responses:
 - `200` — claimed; session mode is now `human`; customer WS receives a `mode_change` frame with the agent name
 - `409` — already claimed by another agent
 - `400` — session is not in `awaiting_human` mode
+
+### Alternative — Decline the session (no agents available)
+
+If your system cannot assign an agent (outside business hours, queue full, etc.), call the decline endpoint instead of claim:
+
+```
+POST /api/v1/chat/sessions/{session_id}/decline
+Authorization: Bearer <your-token>
+```
+
+Responses:
+- `200` → `{ "status": "declined" }`; the customer receives an apology message and the AI bot resumes the conversation; customer WS receives a `mode_change mode=bot` frame
+- `400` — session is not in `awaiting_human` mode (e.g. already claimed)
+
+Do not call both claim and decline for the same session.
 
 ### Step 2 — Connect the agent WebSocket
 
@@ -508,12 +525,12 @@ async def download_media(message_id: int, token: str) -> bytes:
 
 **Webhooks (implement a receiver at `events_webhook_url`):**
 - [ ] `session_started` → create support ticket in your system, store `session_id` mapping
-- [ ] `escalation_requested` → assign to available agent; pass `reason`, `summary`, `claim_url`, `agent_ws_url` to their console
+- [ ] `escalation_requested` → if agent available: pass `reason`, `summary`, `claim_url`, `agent_ws_url` to their console; if no agent: `POST` the decline endpoint immediately so the bot resumes
 - [ ] `session_closed` → update ticket status, store transcript
 - [ ] Verify `X-Signature` header if you configured a webhook secret
 
 **Human agent console:**
-- [ ] `POST /api/v1/chat/sessions/{id}/claim` with `agent_id` and `agent_name` before connecting the WS
+- [ ] `POST /api/v1/chat/sessions/{id}/claim` with `agent_id` and `agent_name` before connecting the WS (or `POST /api/v1/chat/sessions/{id}/decline` if no agent is available)
 - [ ] `WS /api/v1/chat/sessions/{id}/agent-ws?token=` — connect; read `history` frame on open
 - [ ] Render media in history via `GET /api/v1/chat/media/{id}` with Bearer token
 - [ ] Send `{"type":"reply","text":"..."}` for agent messages

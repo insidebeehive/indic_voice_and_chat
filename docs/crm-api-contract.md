@@ -353,7 +353,7 @@ GET /operators/{operator_id}/platform-config
 
 ---
 
-## Escalation (No API needed)
+## Escalation
 
 The following query types are **not handled by API lookups** — the chatbot escalates to a human agent via the built-in escalation flow:
 
@@ -366,6 +366,64 @@ The following query types are **not handled by API lookups** — the chatbot esc
 | "I want to dispute a bet settlement" | Manual review against provider data |
 | "I was charged twice" | Payment reconciliation required |
 | "I want to remove my self-exclusion early" | Responsible gaming policy review |
+
+When the bot decides to escalate, it posts an `escalation_requested` event to your configured `events_webhook_url`:
+
+```json
+{
+  "event": "escalation_requested",
+  "session_id": "cs_a1b2c3d4",
+  "reason": "Customer requested human support",
+  "summary": "Customer is asking about a 3-day withdrawal delay.",
+  "customer": { "name": "Rahul", "id": "player-42" },
+  "claim_url": "/api/v1/chat/sessions/cs_a1b2c3d4/claim",
+  "agent_ws_url": "/api/v1/chat/sessions/cs_a1b2c3d4/agent-ws",
+  "bo_available": true,
+  "event_id": "evt_9f3b1a2c"
+}
+```
+
+`bo_available` reflects our knowledge of your support-hours config. Your system makes the final availability decision.
+
+After receiving this webhook you **must** call exactly one of the two endpoints below. If neither is called, the customer is left waiting indefinitely.
+
+### Claim the session (agent available)
+
+```
+POST /api/v1/chat/sessions/{session_id}/claim
+Authorization: Bearer <tenant-token>
+Content-Type: application/json
+
+{
+  "agent_id": "agent_007",
+  "agent_name": "Priya"
+}
+```
+
+**Response:**
+```json
+{ "status": "claimed", "agent_id": "agent_007" }
+```
+
+The customer is immediately notified that an agent has joined. The agent then connects to `agent_ws_url` to exchange messages.
+
+Returns `409` if already claimed, `400` if the session is not in `awaiting_human` state.
+
+### Decline the session (no agents available)
+
+If you cannot assign an agent (outside business hours, queue full, etc.), POST to the decline endpoint so the bot resumes the conversation:
+
+```
+POST /api/v1/chat/sessions/{session_id}/decline
+Authorization: Bearer <tenant-token>
+```
+
+**Response:**
+```json
+{ "status": "declined" }
+```
+
+The customer receives an apology message and the AI bot resumes the conversation. Returns `400` if the session is not in `awaiting_human` state.
 
 ---
 

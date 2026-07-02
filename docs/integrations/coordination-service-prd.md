@@ -104,7 +104,7 @@ CS makes the AI Platform pluggable: CRM Backend talks to CS, not directly to the
 | **Chat Relay** | Bidirectional WS proxy between CRM Frontend and AI Platform; rewrite media URLs |
 | **Webhook Forwarder** | Receive AI Platform lifecycle webhooks; verify HMAC; forward to CRM Backend |
 | **Media Proxy** | Serve `GET /chat/media/{id}`; authenticate via session_id; proxy to AI Platform |
-| **Agent Console Proxy** | Forward `POST /claim` and `WS /agent-ws` to AI Platform on behalf of CRM Backend |
+| **Agent Console Proxy** | Forward `POST /claim`, `POST /decline`, and `WS /agent-ws` to AI Platform on behalf of CRM Backend |
 | **Voice Channel Registry** | `IVoiceChannel` interface + voice channel adapter stubs; skeleton only |
 
 ---
@@ -251,8 +251,9 @@ CSS must treat `event_id` as an idempotency key — duplicate deliveries (retrie
 - `session_id` — replaced with `cs_session_id` from the Redis session record (the value that appears in all CS-exposed URLs)
 - `claim_url` (in `escalation_requested`) — rewritten from the AI Platform form (`/api/v1/chat/sessions/{platform_id}/claim`) to the CS form (`/chat/sessions/{cs_id}/claim`)
 - `agent_ws_url` (in `escalation_requested`) — rewritten from `/api/v1/chat/sessions/{platform_id}/agent-ws` to `/chat/agent-ws/{cs_id}`
+- `decline_url` — CS constructs and adds this field (not present in the original AI Platform webhook): `/chat/sessions/{cs_id}/decline`. CSS calls this when no agent is available; CS proxies it to `POST /api/v1/chat/sessions/{platform_id}/decline`.
 
-CSS stores and uses these CS-form values. CSS never calls AI Platform directly — all claim and agent-ws traffic goes to CS.
+CSS stores and uses these CS-form values. CSS never calls AI Platform directly — all claim, decline, and agent-ws traffic goes to CS.
 
 CS returns `200` to AI Platform as soon as the forward is accepted (fire-and-forget with a short retry). If CRM Backend is down, CS retries up to 3 times with exponential backoff before dropping.
 
@@ -278,6 +279,16 @@ CS looks up `platform_session_id` from `cs:session:{cs_session_id}`, then proxie
 POST {ai_platform_base}/api/v1/chat/sessions/{platform_session_id}/claim
 ```
 Returns AI Platform's response unchanged.
+
+**Decline:**
+```
+POST /chat/sessions/{cs_session_id}/decline
+```
+Called by CSS when it cannot assign an agent. CS proxies to:
+```
+POST {ai_platform_base}/api/v1/chat/sessions/{platform_session_id}/decline
+```
+Returns AI Platform's response unchanged. AI Platform reverts the session to bot mode and notifies the customer.
 
 **Agent WebSocket:**
 ```
@@ -545,6 +556,7 @@ WS /voice/streams/{call_id}
 | `GET` | `/chat/sessions` | Bearer (CS token) | Full (proxy) |
 | `GET` | `/chat/sessions/{session_id}` | Bearer (CS token) | Full (proxy) |
 | `POST` | `/chat/sessions/{session_id}/claim` | Bearer (CS token) | Full (proxy) |
+| `POST` | `/chat/sessions/{session_id}/decline` | Bearer (CS token) | Full (proxy) |
 | `WS` | `/chat/ws/{session_id}` | session_id in path | Full |
 | `WS` | `/chat/agent-ws/{session_id}` | Bearer in ?token= | Full (proxy) |
 | `GET` | `/chat/media/{message_id}` | ?session_id= | Full |
@@ -563,6 +575,7 @@ WS /voice/streams/{call_id}
 | AI Platform | `GET /api/v1/chat/sessions` | Session list proxy |
 | AI Platform | `GET /api/v1/chat/media/{id}` | Media proxy |
 | AI Platform | `POST /api/v1/chat/sessions/{id}/claim` | Agent claim proxy |
+| AI Platform | `POST /api/v1/chat/sessions/{id}/decline` | Escalation decline proxy |
 | AI Platform | `WS /api/v1/chat/sessions/{id}/agent-ws` | Agent WS proxy |
 | CRM Backend | `POST {webhook_url}` | Lifecycle event forward |
 
@@ -741,8 +754,9 @@ Alternative considered: **Node.js** is more natural for event-driven WS relay at
 **Deliverable:** Human agents can claim sessions and chat through CS.
 
 - `POST /chat/sessions/{session_id}/claim`: validate session; proxy to AI Platform
+- `POST /chat/sessions/{session_id}/decline`: validate session; proxy to AI Platform
 - `WS /chat/agent-ws/{session_id}?token={token}`: validate token; proxy WS to AI Platform agent-ws
-- Test: claim → connect → send reply → receive customer message
+- Test: claim → connect → send reply → receive customer message; test decline → verify customer WS gets `mode_change mode=bot`
 
 ### Phase 7 — Voice Channel Adapter Skeleton (Week 4)
 
