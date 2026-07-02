@@ -221,23 +221,16 @@ async def delete_document(
     tenant: TenantContext = Depends(current_tenant),
     session: AsyncSession = Depends(get_db_session),
 ) -> dict:
-    import traceback as _tb
-    try:
-        retriever = _retriever_for(tenant)
-        row = await session.get(KBDocument, document_id)
-        if row is None or row.tenant_id != tenant.id:
-            raise HTTPException(status_code=404, detail="document not found")
-        chunk_ids = (row.extra_data or {}).get("chunk_ids") or [
-            f"{document_id}::chunk-{i}" for i in range(row.chunk_count or 0)]
-        await session.delete(row)
-        await session.commit()
-        n = await retriever.delete(chunk_ids)
-        return {"document_id": document_id, "chunks_removed": n}
-    except HTTPException:
-        raise
-    except Exception as exc:
-        log.exception("delete_document failed")
-        raise HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}\n{_tb.format_exc()}")
+    retriever = _retriever_for(tenant)
+    row = await session.get(KBDocument, document_id)
+    if row is None or row.tenant_id != tenant.id:
+        raise HTTPException(status_code=404, detail="document not found")
+    chunk_ids = (row.extra_data or {}).get("chunk_ids") or [
+        f"{document_id}::chunk-{i}" for i in range(row.chunk_count or 0)]
+    await session.delete(row)
+    await session.commit()
+    n = await retriever.delete(chunk_ids)
+    return {"document_id": document_id, "chunks_removed": n}
 
 
 def _chunks_for_doc(retriever: HybridRetriever, document_id: str) -> str:
