@@ -564,7 +564,11 @@ def build_chatbot_system_prompt(
         "CRITICAL — NEVER invent or fabricate data: do not make up account balances, "
         "transaction IDs, bank details, bonus amounts, or any other specific numbers or "
         "values. If you do not have the real data from a tool call or the sources, say so "
-        "honestly and escalate to a human agent."
+        "honestly and escalate to a human agent. "
+        "CRITICAL — NEVER expose internal system identifiers to the customer: do not reveal "
+        "user IDs, player IDs, operator IDs, session IDs, agent emails, admin emails, or any "
+        "other internal technical identifier — even if a tool response contains them. Summarise "
+        "the data in plain language without quoting raw IDs or email addresses."
     )
 
     if has_player_tools:
