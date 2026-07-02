@@ -19,13 +19,17 @@ from src.integration.tenant_events import deliver
 log = logging.getLogger(__name__)
 
 
-async def send_bo_webhook(tenant, event_type: str, payload: dict) -> None:
-    """POST event_type + payload to the tenant's webhook URL. Fire-and-forget."""
+async def send_bo_webhook(tenant, event_type: str, payload: dict) -> bool:
+    """POST event_type + payload to the tenant's webhook URL.
+    Returns True if the CRM acknowledged (2xx), False on failure or no URL configured."""
     settings = getattr(tenant, "settings", tenant)
     url = getattr(settings, "events_webhook_url", None)
     if not url:
-        return
+        return False
     secret_env = getattr(settings, "events_webhook_secret_env", None)
     secret = tenant.secret_optional(secret_env) if secret_env and hasattr(tenant, "secret_optional") else None
     body: dict[str, Any] = {"event": event_type, **payload}
-    await deliver(url, body, secret)
+    ok = await deliver(url, body, secret)
+    if not ok:
+        log.warning("bo webhook delivery failed", extra={"event_type": event_type})
+    return ok

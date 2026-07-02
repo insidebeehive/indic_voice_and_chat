@@ -788,9 +788,9 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
                                 }))
                             await _send_reply(websocket, session_id, result, tenant.id)
                             if result.escalation:
-                                await _handle_escalation(websocket, session_id, tenant, row, result)
-                                await _run_human_mode(websocket, session_id, tenant)
-                                break
+                                if await _handle_escalation(websocket, session_id, tenant, row, result):
+                                    await _run_human_mode(websocket, session_id, tenant)
+                                    break
                         else:
                             # Persist audio without agent reply
                             async with _sm()() as db:
@@ -844,9 +844,9 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
                                             user_type=mtype, media_mime=mime, media_url=object_key)
                         await _send_reply(websocket, session_id, result, tenant.id)
                         if result.escalation:
-                            await _handle_escalation(websocket, session_id, tenant, row, result)
-                            await _run_human_mode(websocket, session_id, tenant)
-                            break
+                            if await _handle_escalation(websocket, session_id, tenant, row, result):
+                                await _run_human_mode(websocket, session_id, tenant)
+                                break
                         continue
 
                     user_text = (msg.get("text") or msg.get("message") or "").strip()
@@ -873,9 +873,9 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
                         call_url = _voice_call_url(websocket, tenant.slug, token)
                     await _send_reply(websocket, session_id, result, tenant.id, call_url=call_url)
                     if result.escalation:
-                        await _handle_escalation(websocket, session_id, tenant, row, result)
-                        await _run_human_mode(websocket, session_id, tenant)
-                        break
+                        if await _handle_escalation(websocket, session_id, tenant, row, result):
+                            await _run_human_mode(websocket, session_id, tenant)
+                            break
                 except WebSocketDisconnect:
                     raise
                 except Exception:  # noqa: BLE001 — one bad turn must not drop the chat
@@ -997,9 +997,10 @@ async def _handle_escalation(
     tenant: TenantContext,
     row: ChatSession,
     result: ChatTurnResult,
-) -> None:
+) -> bool:
     """Flip session to awaiting_human, notify BO, inform customer of queue status.
-    Checks support hours: outside hours the customer is queued and told when BO opens."""
+    Returns True if the CRM acknowledged and the session entered human-agent mode.
+    Returns False if the webhook failed — caller should keep the bot running."""
     from src.api.chat_webhooks import send_bo_webhook
     from src.chatbot.support_hours import is_bo_available
 
@@ -1016,7 +1017,7 @@ async def _handle_escalation(
     _bo_queues.setdefault(session_id, asyncio.Queue())
     _customer_queues.setdefault(session_id, asyncio.Queue())
 
-    await send_bo_webhook(tenant, "escalation_requested", {
+    ok = await send_bo_webhook(tenant, "escalation_requested", {
         "session_id": session_id,
         "reason": reason,
         "summary": summary,
@@ -1025,6 +1026,24 @@ async def _handle_escalation(
         "agent_ws_url": f"/api/v1/chat/sessions/{session_id}/agent-ws",
         "bo_available": available,
     })
+
+    if not ok:
+        # CRM couldn't accept the transfer — revert to bot mode and let the
+        # bot continue so the customer isn't left with no one to talk to.
+        log.warning("escalation webhook failed; reverting session to bot mode",
+                    extra={"session_id": session_id})
+        async with _sm()() as db:
+            r = await db.get(ChatSession, session_id)
+            if r:
+                r.mode = "bot"
+                await db.commit()
+        await websocket.send_text(json.dumps({
+            "type": "message",
+            "text": ("I'm sorry, I wasn't able to connect you to a human agent right now. "
+                     "Let me continue helping you — what would you like to know?"),
+            "sources": [], "suggestions": [], "action": "continue",
+        }))
+        return False
 
     await websocket.send_text(json.dumps({"type": "mode_change", "mode": "awaiting_human"}))
 
@@ -1040,6 +1059,7 @@ async def _handle_escalation(
         }))
 
     await _emit_escalation(tenant.id, session_id, result)
+    return True
 
 
 async def _run_human_mode(
