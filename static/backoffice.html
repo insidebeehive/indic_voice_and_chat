@@ -547,13 +547,32 @@ async function deleteTool(slug, name) {
 }
 
 // ── Knowledge Base ─────────────────────────────────────────────
-function _kbDocRow(doc, onDelete) {
-  const lang = doc.language ? ` <span class="hint">${doc.language}</span>` : "";
+async function downloadKBDoc(path, filename, slug) {
+  const headers = {};
+  const tok = $("adminToken").value.trim();
+  if (tok) headers["Authorization"] = "Bearer " + tok;
+  if (slug) headers["X-Tenant-Slug"] = slug;
+  const res = await fetch(base() + path, { headers });
+  if (!res.ok) { alert("Download failed: " + res.status); return; }
+  const blob = await res.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = filename; a.click();
+  URL.revokeObjectURL(url);
+}
+
+function _kbDocRow(doc, onDelete, downloadPath, slug) {
+  const lang = doc.language ? `<span class="hint">${doc.language}</span>` : "—";
+  const dlName = escA(doc.filename).replace(/\.[^.]+$/, "") + ".txt";
+  const slugArg = slug ? `,'${escA(slug)}'` : ",null";
   return `<tr>
     <td>${escA(doc.filename)}</td>
     <td style="text-align:right">${doc.chunk_count}</td>
     <td>${lang}</td>
-    <td><button class="btn-sm btn-danger" onclick="${onDelete}('${escA(doc.id)}')">Delete</button></td>
+    <td style="white-space:nowrap;display:flex;gap:.3rem;">
+      <button class="btn-sm" onclick="downloadKBDoc('${downloadPath}','${dlName}'${slugArg})">↓ Download</button>
+      <button class="btn-sm btn-danger" onclick="${onDelete}('${escA(doc.id)}')">Delete</button>
+    </td>
   </tr>`;
 }
 
@@ -610,9 +629,9 @@ async function loadKB(id, slug) {
   ]);
 
   const platformRows = (pr.ok ? pr.json.documents || [] : [])
-    .map(d => _kbDocRow(d, "deletePlatformDoc")).join("");
+    .map(d => _kbDocRow(d, "deletePlatformDoc", `/api/v1/knowledge/platform-documents/${d.id}/download`, null)).join("");
   const tenantRows = (tr.ok ? tr.json.documents || [] : [])
-    .map(d => _kbDocRow(d, "deleteTenantDoc")).join("");
+    .map(d => _kbDocRow(d, "deleteTenantDoc", `/api/v1/knowledge/documents/${d.id}/download`, slug)).join("");
 
   pane.innerHTML = `
     <div class="card" style="margin-bottom:1rem;">

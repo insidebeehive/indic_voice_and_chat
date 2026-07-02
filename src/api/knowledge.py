@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import Response
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -230,6 +231,52 @@ async def delete_document(
     await session.commit()
     n = await retriever.delete(chunk_ids)
     return {"document_id": document_id, "chunks_removed": n}
+
+
+def _chunks_for_doc(retriever: HybridRetriever, document_id: str) -> str:
+    """Reconstruct document text from stored chunks, sorted by section index."""
+    all_chunks = retriever.list_all(max_chunks=50000)
+    doc_chunks = [c for c in all_chunks
+                  if c.id.startswith(f"{document_id}::") or
+                  (c.metadata or {}).get("document_id") == document_id]
+    doc_chunks.sort(key=lambda c: (c.metadata or {}).get("section", 0))
+    return "\n\n".join(c.content for c in doc_chunks)
+
+
+@router.get("/documents/{document_id}/download")
+async def download_document(
+    document_id: str,
+    tenant: TenantContext = Depends(current_tenant),
+    session: AsyncSession = Depends(get_db_session),
+) -> Response:
+    """Download a tenant KB document as reconstructed text."""
+    row = await session.get(KBDocument, document_id)
+    if row is None or row.tenant_id != tenant.id:
+        raise HTTPException(status_code=404, detail="document not found")
+    retriever = _retriever_for(tenant)
+    text = _chunks_for_doc(retriever, document_id)
+    filename = (row.filename or document_id).rsplit(".", 1)[0] + ".txt"
+    return Response(content=text, media_type="text/plain; charset=utf-8",
+                    headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+
+
+@router.get("/platform-documents/{document_id}/download")
+async def download_platform_document(
+    document_id: str,
+    request: Request,
+    session: AsyncSession = Depends(get_db_session),
+) -> Response:
+    """Admin: download a platform KB document as reconstructed text."""
+    await require_admin(request)
+    if _platform_retriever is None:
+        raise HTTPException(status_code=503, detail="platform retriever not initialised")
+    row = await session.get(PlatformKBDocument, document_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="platform document not found")
+    text = _chunks_for_doc(_platform_retriever, document_id)
+    filename = (row.filename or document_id).rsplit(".", 1)[0] + ".txt"
+    return Response(content=text, media_type="text/plain; charset=utf-8",
+                    headers={"Content-Disposition": f'attachment; filename="{filename}"'})
 
 
 @router.get("/platform-documents", response_model=DocumentsResponse)
