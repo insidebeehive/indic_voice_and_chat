@@ -253,7 +253,9 @@ class ChatBotAgent(BaseAgent):
         if parsed.raw and not parsed.parse_error:
             response = parsed   # a real JSON envelope with a response_text
         else:
-            response = ChatBotResponse(response_text=(text or "").strip(), language=self._language)
+            # Parse failed or response_text missing — use the safe fallback the
+            # parser already extracted (never expose raw LLM JSON to the customer).
+            response = ChatBotResponse(response_text=parsed.response_text, language=self._language)
         if not response.language:
             response.language = self._language
         response.sources_used = list(dict.fromkeys([*sources, *(response.sources_used or [])]))

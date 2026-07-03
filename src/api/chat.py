@@ -71,6 +71,11 @@ _bo_queues: dict = {}
 _customer_queues: dict = {}
 _media_store: Optional[IMediaStorage] = None
 
+# Active voice-call WebSockets keyed by chat_session_id.
+# Populated by chat_voice_ws; cleared by _end_session so ending the chat
+# also terminates any live voice call for the same session.
+_active_voice_ws: dict[str, WebSocket] = {}
+
 
 def set_chat_handoff_store(store: object | None) -> None:
     """Inject the Redis-backed store the chat→voice handoff uses to pass the
@@ -431,7 +436,24 @@ async def chat_voice_ws(websocket: WebSocket) -> None:
     except Exception:  # noqa: BLE001
         await websocket.close(code=1008, reason="unknown tenant")
         return
-    await run_browser_voice(websocket, tenant)
+
+    # Resolve chat_session_id from the handoff token so we can register this WS.
+    # If the chat session ends while the call is live, _end_session will close us.
+    chat_session_id: Optional[str] = None
+    handoff_token = (websocket.query_params.get("handoff") or "").strip()
+    if handoff_token and _handoff_store is not None:
+        try:
+            raw = await _handoff_store.redis.get(f"chat_handoff:{handoff_token}")
+            if raw:
+                chat_session_id = json.loads(raw).get("chat_session_id")
+        except Exception:  # noqa: BLE001
+            pass
+    if chat_session_id:
+        _active_voice_ws[chat_session_id] = websocket
+    try:
+        await run_browser_voice(websocket, tenant)
+    finally:
+        _active_voice_ws.pop(chat_session_id, None)
 
 
 @router.get("/history/{session_id}", response_model=HistoryResponse)
@@ -1020,6 +1042,13 @@ async def _end_session(session_id: str, summary: str = "") -> None:
             await db.commit()
     except Exception:  # noqa: BLE001
         log.exception("chat session end failed", extra={"session_id": session_id})
+    # Close any live voice call that was started from this chat session.
+    voice_ws = _active_voice_ws.pop(session_id, None)
+    if voice_ws:
+        try:
+            await voice_ws.close(code=1000, reason="chat session ended")
+        except Exception:  # noqa: BLE001
+            pass
 
 
 async def _handle_escalation(
