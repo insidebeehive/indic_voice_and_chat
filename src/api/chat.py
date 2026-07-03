@@ -1093,6 +1093,24 @@ async def _handle_escalation(
     return True
 
 
+_AWAIT_HUMAN_TIMEOUT_S = 300.0  # revert to bot after 5 min with no claim/decline
+
+
+async def _revert_to_bot(websocket: WebSocket, session_id: str) -> None:
+    """Revert session to bot mode and notify the customer. Used on decline and timeout."""
+    async with _sm()() as db:
+        r = await db.get(ChatSession, session_id)
+        if r:
+            r.mode = "bot"
+            await db.commit()
+    await websocket.send_text(json.dumps({"type": "mode_change", "mode": "bot"}))
+    await websocket.send_text(json.dumps({
+        "type": "message",
+        "text": "Looks like no one is available at this time but am happy to help you again.",
+        "sources": [], "suggestions": [], "action": "continue",
+    }))
+
+
 async def _run_human_mode(
     websocket: WebSocket,
     session_id: str,
@@ -1100,15 +1118,23 @@ async def _run_human_mode(
 ) -> bool:
     """Handle the customer WS while mode is awaiting_human or human.
     Returns True when the session ended normally (agent closed it / customer left).
-    Returns False when the CRM declined the escalation — caller should resume bot loop."""
+    Returns False when the CRM declined or timed out — caller should resume bot loop.
+
+    A deadline of _AWAIT_HUMAN_TIMEOUT_S applies while awaiting a claim/decline.
+    The countdown stops as soon as an agent claims (mode_change → human)."""
     bq: asyncio.Queue = _bo_queues.setdefault(session_id, asyncio.Queue())
     cq: asyncio.Queue = _customer_queues.setdefault(session_id, asyncio.Queue())
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + _AWAIT_HUMAN_TIMEOUT_S
+    claimed = False  # True once mode_change → human received; disables deadline
     try:
         while True:
             ws_task = asyncio.ensure_future(websocket.receive_text())
             cq_task = asyncio.ensure_future(cq.get())
+            timeout = None if claimed else max(0.0, deadline - loop.time())
             done, pending = await asyncio.wait(
-                {ws_task, cq_task}, return_when=asyncio.FIRST_COMPLETED
+                {ws_task, cq_task}, return_when=asyncio.FIRST_COMPLETED,
+                timeout=timeout,
             )
             for t in pending:
                 t.cancel()
@@ -1117,23 +1143,21 @@ async def _run_human_mode(
                 except (asyncio.CancelledError, Exception):  # noqa: BLE001
                     pass
 
+            if not done:
+                # Timeout — CRM never called claim or decline
+                log.warning("await_human timed out; reverting to bot",
+                            extra={"session_id": session_id})
+                await _revert_to_bot(websocket, session_id)
+                return False
+
             if cq_task in done:
                 item = cq_task.result()
                 frame = json.loads(item)
                 if frame.get("type") == "declined":
-                    # CRM could not assign an agent — revert to bot and let caller resume
-                    async with _sm()() as db:
-                        r = await db.get(ChatSession, session_id)
-                        if r:
-                            r.mode = "bot"
-                            await db.commit()
-                    await websocket.send_text(json.dumps({"type": "mode_change", "mode": "bot"}))
-                    await websocket.send_text(json.dumps({
-                        "type": "message",
-                        "text": "Looks like no one is available at this time but am happy to help you again.",
-                        "sources": [], "suggestions": [], "action": "continue",
-                    }))
+                    await _revert_to_bot(websocket, session_id)
                     return False
+                if frame.get("type") == "mode_change" and frame.get("mode") == "human":
+                    claimed = True  # agent joined — stop the countdown
                 await websocket.send_text(item)
                 if frame.get("type") == "ended":
                     break

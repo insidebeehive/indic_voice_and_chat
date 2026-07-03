@@ -244,8 +244,10 @@ def build_voicebot_system_prompt(
     declare. The customer-led policy is fixed (applies to every campaign);
     all campaign-specific content comes from the script fields.
     """
+    from datetime import UTC, datetime
     lead_data = lead_data or {}
     parts: list[str] = []
+    parts.append(f"Current date (UTC): {datetime.now(UTC).strftime('%Y-%m-%d')}.")
 
     # Identity + persona.
     parts.append(
@@ -552,7 +554,9 @@ def build_chatbot_system_prompt(
     has_player_tools: bool = False,
 ) -> str:
     """System prompt for the RAG-powered ChatBot agent (Phase 4)."""
+    from datetime import UTC, datetime
     parts: list[str] = []
+    parts.append(f"Current date (UTC): {datetime.now(UTC).strftime('%Y-%m-%d')}.")
     parts.append(
         f"You are the customer-support agent for {company_name}. YOU are the support — "
         "never tell the customer to 'contact support' or 'reach out to the team', because "
