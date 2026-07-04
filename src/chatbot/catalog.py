@@ -161,10 +161,13 @@ OPERATOR_TOOLS: dict[str, dict] = {
     },
     "get_operator_games_config": {
         "description": (
-            "Get the operator's product and games configuration: enabled casino "
-            "game providers/aggregators, available sports and leagues, whether "
+            "Get the operator's product and games configuration: which casino game "
+            "providers/aggregators are enabled, available sports and leagues, whether "
             "live casino is enabled, Matka/lottery/virtual-sports availability, "
-            "in-play betting support, and cashout availability on sports bets."
+            "in-play betting support, and cashout availability on sports bets. "
+            "Call this whenever the customer asks which games are available, what "
+            "game types the platform offers, whether a specific category (live casino, "
+            "sports, lottery, Matka) is available, or asks for a list of games."
         ),
         "parameters": {
             "operator_id": {"type": "string", "source": "session",
