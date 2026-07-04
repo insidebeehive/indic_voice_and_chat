@@ -114,10 +114,12 @@ PLAYER_TOOLS: dict[str, dict] = {
             "where to send money, what their deposit options are, or what UPI ID to use."
         ),
         "parameters": {
+            "operator_id": {"type": "string", "source": "session",
+                            "description": "Operator identifier"},
             "user_id": {"type": "string", "source": "session",
                         "description": "Player identifier"},
         },
-        "default_path": "/players/{user_id}/payment-config",
+        "default_path": "/operators/{operator_id}/players/{user_id}/payment-config",
         "method": "GET",
     },
 }
