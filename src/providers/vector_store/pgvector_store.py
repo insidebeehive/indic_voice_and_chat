@@ -165,18 +165,21 @@ class PGVectorAdapter(IVectorStore):
         filter_params: list = []
         if filters:
             import json as _json
-            next_pos = 2 + len(tenant_params) + 1  # $1=query, $2[opt]=tenant, next=filters
+            # $1=query, $2[opt]=tenant_id, then filter is next
+            next_pos = 2 + len(tenant_params)
             filter_clause = f" AND metadata @> ${next_pos}::jsonb"
             filter_params = [_json.dumps(filters)]
 
-        limit_pos = 2 + len(tenant_params) + len(filter_params) + 1
+        # params = [q] + tenant_params + filter_params + [top_k]
+        # top_k is the last element → position = 1 + len(tenant) + len(filter) + 1
+        limit_pos = 2 + len(tenant_params) + len(filter_params)
         sql = f"""
             SELECT id, content, metadata,
                    1 - (embedding <=> $1::vector) AS score
             FROM knowledge_chunks
             WHERE {tenant_clause}{filter_clause}
             ORDER BY embedding <=> $1::vector
-            LIMIT ${limit_pos}
+            LIMIT ${limit_pos}::integer
         """
         params = [q] + tenant_params + filter_params + [top_k]
 
