@@ -105,10 +105,13 @@ PLAYER_TOOLS: dict[str, dict] = {
     },
     "get_payment_config": {
         "description": (
-            "Get the player's available payment configuration: deposit methods "
-            "(UPI, net banking, cards, wallets), withdrawal channels, "
-            "minimum and maximum deposit/withdrawal limits, supported banks, "
-            "blocked/unsupported banks, and withdrawal processing SLA / expected time."
+            "Get the player's personalised payment configuration: the bank account "
+            "number or UPI ID the player should deposit money into (varies by player "
+            "tier/rating), available deposit methods (UPI, net banking, cards, wallets), "
+            "withdrawal channels, minimum and maximum deposit/withdrawal limits, "
+            "supported banks, blocked/unsupported banks, and withdrawal processing SLA. "
+            "Call this whenever the player asks which bank account to deposit into, "
+            "where to send money, what their deposit options are, or what UPI ID to use."
         ),
         "parameters": {
             "user_id": {"type": "string", "source": "session",
