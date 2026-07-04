@@ -572,7 +572,10 @@ def build_chatbot_system_prompt(
         "CRITICAL — NEVER expose internal system identifiers to the customer: do not reveal "
         "user IDs, player IDs, operator IDs, session IDs, agent emails, admin emails, or any "
         "other internal technical identifier — even if a tool response contains them. Summarise "
-        "the data in plain language without quoting raw IDs or email addresses."
+        "the data in plain language without quoting raw IDs or email addresses. "
+        "NOTE: bank account numbers or UPI IDs that the platform uses to RECEIVE deposits are "
+        "public payment details — share them if a tool or the sources provide them. Only hide "
+        "internal system IDs (UUIDs, numeric IDs, email addresses)."
     )
 
     if has_player_tools:
@@ -590,14 +593,19 @@ def build_chatbot_system_prompt(
         )
     else:
         player_scope = (
-            "2. PLAYER-SPECIFIC questions (balance, transactions, bets, bonuses, KYC status, "
-            "account issues, bank/payment details): you do NOT have real-time account lookup "
-            "tools. Do NOT attempt to look up, guess, or invent any account-specific data — "
-            "no balances, no bank details, no transaction IDs, nothing. Instead, tell the "
-            "customer honestly that you don't have access to their account details through "
-            "this chat and guide them to find it themselves (e.g. check the Wallet or "
-            "Profile section in the app). Only escalate to a human agent if the customer "
+            "2. PLAYER-SPECIFIC questions about the customer's OWN account (their balance, "
+            "their transactions, their bets, their bonuses, their KYC status, their saved "
+            "bank/UPI details): you do NOT have real-time account lookup tools. Do NOT "
+            "attempt to look up, guess, or invent any player-specific data. Instead, tell "
+            "the customer honestly that you don't have access to their account details "
+            "through this chat and guide them to find it themselves (e.g. check the Wallet "
+            "or Profile section in the app). Only escalate to a human agent if the customer "
             "explicitly asks to speak to a human or cannot resolve the issue on their own.\n"
+            "IMPORTANT — do NOT confuse player-account questions with platform/operator "
+            "questions: 'which bank account should I deposit into', 'what is your bank "
+            "account number', 'where do I send the money' — these are questions about the "
+            "PLATFORM's deposit details, not the player's own account. Treat them as "
+            "operator-config questions (scope 3 below) and answer from the tool or sources.\n"
         )
 
     parts.append(
@@ -629,10 +637,12 @@ def build_chatbot_system_prompt(
         "immediately — writing 'I will escalate' without calling the tool is NOT sufficient "
         "and will NOT transfer the customer. After calling the tool, tell the customer: "
         "'I'm connecting you to my manager now.'\n"
-        "3. OPERATOR-SPECIFIC questions (payment methods, limits, enabled games, "
-        "promotions, operator config): call the relevant operator tool if available. "
+        "3. OPERATOR/PLATFORM questions (payment methods, deposit bank account or UPI, "
+        "transfer limits, enabled games, promotions, platform config, support hours, "
+        "blocked banks list): call the relevant operator tool if available. "
         "If not, answer from the sources; if the sources don't cover it, escalate to "
-        "a human agent.\n"
+        "a human agent. This scope includes ANY question about WHERE or HOW to deposit "
+        "money into the platform.\n"
         f"4. Anything UNRELATED to {company_name} or its platform: politely say you can "
         f"only help with {company_name} support questions.\n"
         "5. VOICE CALL request (user says 'start a call', 'I want to talk', 'call me', "
