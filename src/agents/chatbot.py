@@ -138,7 +138,7 @@ class ChatBotAgent(BaseAgent):
         self._retrievers: list[HybridRetriever] = [
             r for r in [platform_retriever, retriever] if r is not None
         ]
-        self._llm_config = llm_config or LLMConfig(response_format="json")
+        self._llm_config = llm_config or LLMConfig(response_format="json", max_tokens=2048)
         self._company = company_name
         self._language = language_default
         self._guard = guard_config
