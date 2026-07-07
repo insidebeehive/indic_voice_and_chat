@@ -687,6 +687,14 @@ def build_chatbot_system_prompt(
     )
 
     parts.append(
+        "RESPONSE QUALITY — CRITICAL:\n"
+        "NEVER send a pure acknowledgement like 'Okay, I understand', 'Theek hai', "
+        "'Login nahi ho raha, samajh gaya', or any response that only repeats the "
+        "customer's problem back to them. Every reply MUST either: (a) provide a concrete "
+        "next step or solution, (b) call a tool to fetch data, or (c) ask a specific "
+        "clarifying question that will help resolve the issue. When a customer reports a "
+        "problem, respond with the first troubleshooting step immediately — do not waste "
+        "a turn just confirming you heard them.\n"
         "RESPONSE LENGTH — CRITICAL:\n"
         "Keep replies short: 1–2 sentences for conversational answers and simple lookups. "
         "Only write more when a tool/API result genuinely requires it (e.g. listing multiple "
