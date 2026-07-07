@@ -84,7 +84,7 @@ async def bridge_place_call(req: PlaceBridgeCallRequest) -> dict:
     from src.auth.middleware import tenant_from_slug
     from src.api import dev_call_control
     from src.api.answer_paths import ANSWER_PATHS
-    from src.pipeline.telephony.providers import get_telephony_provider
+    from src.providers import get_telephony_provider
     from src.interfaces.telephony import CallConfig
     from src.config_tenant import platform_webhook_base_url
 
@@ -127,15 +127,25 @@ async def bridge_place_call(req: PlaceBridgeCallRequest) -> dict:
         except Exception:
             return None
 
+    import os as _os
     pcreds = tel.creds_for(provider)
     acct = _cred(pcreds.account_sid_env)
     auth = _cred(pcreds.auth_token_env)
+    if provider == "stringee":
+        acct = (_cred(getattr(pcreds, "api_key_sid_env", None))
+                or _os.environ.get("STRINGEE_API_KEY_SID") or acct)
+        auth = (_cred(getattr(pcreds, "api_key_secret_env", None))
+                or _os.environ.get("STRINGEE_API_KEY_SECRET") or auth)
+    uid = _cred(getattr(pcreds, "user_id_env", None))
 
     # Build telephony adapter
     try:
         adapter = get_telephony_provider({
             "provider": provider,
             "account_sid": acct, "auth_token": auth,
+            "api_key_sid": acct, "api_key_secret": auth,
+            "user_id": uid,
+            "base_url": getattr(tel, "stringee_base_url", None),
         })
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"telephony adapter unavailable: {e}")
