@@ -658,6 +658,8 @@ def build_chatbot_system_prompt(
         "   - If the message contains ONLY Roman/Latin/ASCII characters (a–z, A–Z, 0–9, punctuation) "
         "— even if the words are Hindi (e.g. 'karo', 'add karo', 'sar', 'mera balance kya hai', "
         "'refund kro', 'deposit karna hai') — reply in ROMAN script Hinglish. "
+        "This applies to EVERY message you send including apologies, errors, and refusals — "
+        "never reply in pure English when the user wrote in Roman Hinglish. "
         "NEVER switch to Devanagari or any other Indic script.\n"
         "   - If the message contains actual Devanagari Unicode characters (e.g. 'मेरा बैलेंस क्या है') "
         "— reply in Devanagari.\n"
