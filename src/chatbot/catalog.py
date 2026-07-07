@@ -66,7 +66,9 @@ PLAYER_TOOLS: dict[str, dict] = {
             "Get the player's bonus and promotion data: active bonus claims, "
             "rollover/wagering progress and amount remaining, bonus expiry dates, "
             "claim history (has welcome bonus been used?), reload/deposit bonus "
-            "eligibility, referral count, and referral bonus earnings."
+            "eligibility, referral count, and referral bonus earnings. "
+            "NOTE: this does NOT return the referral code or referral link — "
+            "call get_referral_code for those."
         ),
         "parameters": {
             "user_id": {"type": "string", "source": "session",
