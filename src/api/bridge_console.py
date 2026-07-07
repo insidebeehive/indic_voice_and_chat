@@ -65,6 +65,37 @@ async def bridge_console_page() -> FileResponse:
     return FileResponse(_STATIC / "bridge_console.html")
 
 
+@router.get("/dev/bridge/tenants")
+async def bridge_tenants() -> dict:
+    """Return all active tenants with their from-numbers per telephony provider."""
+    from sqlalchemy import select
+    from src.models.tenant import Tenant
+    from src.models.database import get_sessionmaker
+    from src.config_tenant import load_tenant
+
+    async with get_sessionmaker()() as db:
+        rows = (await db.execute(
+            select(Tenant).where(Tenant.status == "active").order_by(Tenant.slug)
+        )).scalars().all()
+
+    tenants = []
+    for row in rows:
+        from_numbers: dict[str, str] = {}
+        try:
+            cfg = load_tenant(row.slug)
+            tel = cfg.pipeline.telephony
+            outbound = tel.outbound_from or {}
+            for prov in ("twilio", "exotel", "stringee"):
+                num = outbound.get(prov) or (tel.from_number if (tel.provider or "").lower() == prov else "")
+                if num:
+                    from_numbers[prov] = num
+        except Exception:
+            pass
+        tenants.append({"slug": row.slug, "name": row.name, "from_numbers": from_numbers})
+
+    return {"tenants": tenants}
+
+
 @router.get("/dev/bridge/events")
 async def bridge_events(token: str = Query(...)) -> StreamingResponse:
     """SSE stream — pushes JSON events to the browser as calls progress."""
@@ -95,6 +126,10 @@ class PlaceBridgeCallRequest(BaseModel):
     agent_phone: str
     tenant: str = "dev"
     mode: str = "s2s"
+    voice: str = ""
+    caller_name: str = ""
+    lead_name: str = ""
+    lead_gender: str = ""
 
 
 @router.post("/dev/bridge/place-call")
@@ -180,10 +215,10 @@ async def bridge_place_call(req: PlaceBridgeCallRequest) -> dict:
     dev_call_control.set_override(
         tenant.slug,
         mode=req.mode,
-        voice="",
-        caller_name="",
-        lead_name="",
-        lead_gender="",
+        voice=req.voice.strip(),
+        caller_name=req.caller_name.strip(),
+        lead_name=req.lead_name.strip(),
+        lead_gender=req.lead_gender.strip(),
         transfer_webhook_url=transfer_webhook_url,
     )
 

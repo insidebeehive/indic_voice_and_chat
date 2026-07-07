@@ -16,6 +16,8 @@
     --green:  #22c55e;
     --red:    #ef4444;
     --amber:  #f59e0b;
+    --user:   #7dd3fc;
+    --agent:  #86efac;
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body {
@@ -32,18 +34,18 @@
   }
   .header h1 { font-size: 1.05rem; font-weight: 700; }
   .header .hint { font-size: .75rem; color: var(--muted); }
-  #status-badge {
+  #status {
     margin-left: auto;
     font-size: .8rem; font-weight: 600;
     padding: .25rem .75rem; border-radius: 999px;
     background: var(--card); border: 1px solid var(--border);
-    min-width: 7rem; text-align: center;
+    min-width: 6rem; text-align: center;
   }
 
   /* ── Layout ── */
   .layout { display: flex; gap: 1rem; align-items: flex-start; }
-  .sidebar { width: 260px; flex-shrink: 0; display: flex; flex-direction: column; gap: .6rem; }
-  .main { flex: 1; display: flex; flex-direction: column; gap: .75rem; min-width: 0; }
+  .sidebar { width: 270px; flex-shrink: 0; display: flex; flex-direction: column; gap: .6rem; }
+  .panes   { flex: 1; display: flex; flex-direction: column; gap: .75rem; min-width: 0; }
 
   /* ── Cards ── */
   .card {
@@ -59,311 +61,807 @@
   .field { margin-bottom: .45rem; }
   .field:last-child { margin-bottom: 0; }
   .field label { display: block; font-size: .75rem; color: var(--muted); margin-bottom: .2rem; }
+  .field-row { display: flex; gap: .45rem; }
+  .field-row .field { flex: 1; }
   input[type="text"], select {
     width: 100%; padding: .38rem .55rem;
     background: #0f172a; border: 1px solid var(--border);
     border-radius: .38rem; color: var(--text); font-size: .82rem;
   }
   input[type="text"]:focus, select:focus { outline: none; border-color: var(--accent); }
+  .from-hint { font-size: .68rem; color: var(--muted); margin-top: .2rem; }
 
-  /* ── Buttons ── */
-  .btn {
-    width: 100%; padding: .55rem; border-radius: .42rem;
-    font-size: .88rem; font-weight: 600; cursor: pointer; border: none;
-    transition: opacity .15s;
+  /* ── Mode tabs ── */
+  .mode-tabs { display: flex; gap: .4rem; margin-bottom: .6rem; }
+  .mode-tab {
+    flex: 1; padding: .45rem .3rem; text-align: center;
+    border: 1px solid var(--border); border-radius: .38rem;
+    cursor: pointer; font-size: .8rem; font-weight: 600;
+    background: transparent; color: var(--muted);
+    transition: background .12s, color .12s, border-color .12s;
   }
-  .btn:disabled { opacity: .4; cursor: not-allowed; }
-  .btn-green  { background: var(--green);  color: #052e16; }
-  .btn-red    { background: var(--red);    color: #fff; }
-  .btn-blue   { background: var(--accent); color: #fff; }
-  .btn-row { display: flex; gap: .5rem; }
-  .btn-row .btn { flex: 1; }
+  .mode-tab.active { background: var(--accent); border-color: var(--accent); color: #fff; }
 
-  /* ── Call info ── */
-  .kv { display: flex; gap: .5rem; align-items: baseline; font-size: .82rem; margin-bottom: .3rem; }
-  .kv:last-child { margin-bottom: 0; }
-  .kv .k { color: var(--muted); min-width: 90px; }
-  .kv .v { font-family: monospace; word-break: break-all; }
+  /* ── Checkboxes ── */
+  .check-label {
+    display: flex; align-items: center; gap: .45rem;
+    font-size: .8rem; cursor: pointer; padding: .2rem 0; color: var(--text);
+  }
+  .check-label input { cursor: pointer; width: auto; accent-color: var(--accent); }
+  .check-label .hint { font-size: .72rem; color: var(--muted); }
+
+  /* ── Start button ── */
+  #start {
+    width: 100%; padding: .6rem;
+    background: var(--green); color: #052e16;
+    border: 0; border-radius: .45rem;
+    font-size: .9rem; font-weight: 700; cursor: pointer;
+    transition: opacity .12s;
+  }
+  #start:hover { opacity: .88; }
+  #start.stop { background: var(--red); color: #fff; }
+
+  /* ── Transcript ── */
+  .pane {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: .55rem; padding: .7rem .75rem;
+  }
+  .pane-label {
+    font-size: .6rem; font-weight: 700; letter-spacing: .1em;
+    text-transform: uppercase; color: var(--muted); margin-bottom: .5rem;
+  }
+  #transcript { height: 220px; overflow-y: auto; }
+  .turn { margin: .25rem 0; font-size: .875rem; line-height: 1.4; }
+  .turn.user  { color: var(--user); }
+  .turn.agent { color: var(--agent); }
+
+  /* ── State pane ── */
+  pre#state {
+    white-space: pre-wrap; word-break: break-word;
+    font-size: .78rem; color: var(--muted);
+    max-height: 110px; overflow-y: auto;
+  }
+
+  /* ── Outcome ── */
+  #outcome {
+    display: none; margin-top: .6rem;
+    padding: .55rem .65rem;
+    border: 1px solid var(--border); border-radius: .4rem;
+    font-size: .82rem; line-height: 1.5;
+  }
+  #outcome b { color: var(--muted); font-weight: 600; }
+  #reanalyze {
+    padding: .22rem .65rem;
+    background: #6366f1; color: #fff;
+    border: 0; border-radius: .35rem;
+    cursor: pointer; font-size: .75rem;
+  }
+  #reanalyze:disabled { opacity: .5; cursor: default; }
 
   /* ── Transfer panel ── */
   #transfer-panel { display: none; }
   #transfer-panel.visible { display: block; }
-  .transfer-badge {
+  .xfer-badge {
     display: inline-block; font-size: .72rem; font-weight: 700;
     padding: .2rem .6rem; border-radius: 999px;
     background: #78350f; color: var(--amber); margin-bottom: .6rem;
   }
-
-  /* ── Event log ── */
-  #event-log {
-    font-family: monospace; font-size: .78rem; color: var(--muted);
-    max-height: 260px; overflow-y: auto;
-    display: flex; flex-direction: column; gap: .2rem;
+  .btn-row { display: flex; gap: .5rem; margin-top: .6rem; }
+  .btn-row button {
+    flex: 1; padding: .5rem; border: none; border-radius: .42rem;
+    font-size: .85rem; font-weight: 600; cursor: pointer;
   }
-  .log-row { display: flex; gap: .6rem; }
-  .log-row .ts { color: #475569; white-space: nowrap; }
-  .log-row .msg { word-break: break-all; }
-  .log-ok   .msg { color: var(--green); }
-  .log-warn .msg { color: var(--amber); }
-  .log-err  .msg { color: var(--red); }
-  .log-info .msg { color: var(--text); }
+  .btn-row button:disabled { opacity: .4; cursor: not-allowed; }
+  .btn-accept { background: var(--green); color: #052e16; }
+  .btn-reject { background: var(--red);   color: #fff; }
+
+  /* ── Misc ── */
+  .hidden { display: none !important; }
+  .kv { display: flex; gap: .5rem; font-size: .82rem; margin-bottom: .25rem; }
+  .kv .k { color: var(--muted); min-width: 80px; }
+
+  @media (max-width: 680px) {
+    .layout { flex-direction: column; }
+    .sidebar { width: 100%; }
+  }
 </style>
 </head>
 <body>
 
 <div class="header">
-  <h1>Bridge Console</h1>
-  <span class="hint">Place call → voicebot runs → transfer fires → bridge to your phone</span>
-  <span id="status-badge">Idle</span>
+  <h1>🌉 Bridge Console</h1>
+  <span class="hint">— AI voicebot calls → transfer fires → bridge to your phone</span>
+  <span id="status">idle</span>
 </div>
 
 <div class="layout">
 
-  <!-- ── Sidebar ── -->
+  <!-- ═══ SIDEBAR ═══════════════════════════════════════════ -->
   <div class="sidebar">
 
+    <!-- Tenant -->
     <div class="card">
-      <div class="card-label">Setup</div>
+      <div class="card-label">Tenant</div>
       <div class="field">
-        <label>Tenant</label>
-        <input id="tenant" type="text" value="dev" />
+        <select id="tenant" onchange="onTenantChange()"></select>
+      </div>
+    </div>
+
+    <!-- Call Setup -->
+    <div class="card">
+      <div class="card-label">Call Setup</div>
+      <div class="field">
+        <label>Campaign</label>
+        <select id="campaign"></select>
+      </div>
+      <div class="field-row" style="margin-top:.5rem">
+        <div class="field">
+          <label>Lead name</label>
+          <input type="text" id="leadName" placeholder="e.g. Raju" />
+        </div>
+        <div class="field">
+          <label>Lead gender</label>
+          <select id="leadGender">
+            <option value="">— unknown —</option>
+            <option value="male">Male</option>
+            <option value="female">Female</option>
+          </select>
+        </div>
+      </div>
+      <div class="field" style="margin-top:.5rem">
+        <label>Caller name <span style="font-size:.68rem;color:var(--muted)">(agent)</span></label>
+        <input type="text" id="callerName" placeholder="e.g. Priya, Arjun" value="Priya" />
+      </div>
+    </div>
+
+    <!-- Mode -->
+    <div class="card">
+      <div class="card-label">Mode</div>
+      <div class="mode-tabs">
+        <button class="mode-tab"        data-mode="layered" onclick="setMode('layered')">Layered</button>
+        <button class="mode-tab active" data-mode="s2s"     onclick="setMode('s2s')">S2S — Gemini Live</button>
+      </div>
+      <div class="field hidden" id="s2s-voice-field">
+        <label>Voice</label>
+        <select id="voice"></select>
+      </div>
+    </div>
+
+    <!-- Layered providers -->
+    <div class="card hidden" id="layered-providers">
+      <div class="card-label">Providers</div>
+      <div class="field">
+        <label>STT</label>
+        <select id="stt-select"></select>
       </div>
       <div class="field">
-        <label>Telephony provider</label>
-        <select id="provider">
-          <option value="twilio">Twilio</option>
-          <option value="exotel">Exotel</option>
+        <label>LLM</label>
+        <select id="llm-select"></select>
+      </div>
+      <div class="field">
+        <label>TTS</label>
+        <select id="tts-select" onchange="onTTSChange()"></select>
+        <div id="tts-langs" class="from-hint"></div>
+      </div>
+      <div class="field">
+        <label>Voice</label>
+        <select id="voice-layered"></select>
+      </div>
+    </div>
+
+    <!-- Options -->
+    <div class="card">
+      <div class="card-label">Options</div>
+      <label class="check-label">
+        <input type="checkbox" id="halfDuplex" />
+        Mute mic while agent speaks <span class="hint">(speakers)</span>
+      </label>
+      <label class="check-label" style="margin-top:.15rem">
+        <input type="checkbox" id="bargeIn" />
+        Allow interruptions <span class="hint">(experimental)</span>
+      </label>
+    </div>
+
+    <!-- Telephony -->
+    <div class="card">
+      <div class="card-label">Telephony</div>
+      <div class="field">
+        <label>Provider</label>
+        <select id="telephony" onchange="onTelephonyChange()">
+          <option value="twilio">Twilio — outbound call</option>
+          <option value="exotel">Exotel — outbound call</option>
+          <option value="stringee">Stringee — outbound call</option>
         </select>
       </div>
       <div class="field">
-        <label>Caller number (who to call)</label>
-        <input id="to-number" type="text" placeholder="+91XXXXXXXXXX" />
+        <label>Call number <span style="font-size:.68rem;color:var(--muted)">(destination)</span></label>
+        <input type="text" id="toNumber" value="+918618795697" placeholder="+9199…" />
       </div>
       <div class="field">
-        <label>Bridge to (your phone)</label>
-        <input id="agent-phone" type="text" placeholder="+91XXXXXXXXXX" />
+        <label>From number</label>
+        <input type="text" id="fromNumberDisplay" placeholder="auto from tenant config" readonly
+               style="opacity:.6;cursor:default" />
+      </div>
+      <div class="field">
+        <label>Bridge to <span style="font-size:.68rem;color:var(--muted)">(your phone)</span></label>
+        <input type="text" id="agentPhone" placeholder="+91XXXXXXXXXX" />
       </div>
     </div>
 
-    <button id="btn-place" class="btn btn-green" onclick="placeCall()">▶ Place Call</button>
-    <button id="btn-stop"  class="btn btn-red"   onclick="stopCall()" style="display:none">■ End / Reset</button>
+    <button id="start">▶ &nbsp;Start Call</button>
 
-  </div>
+  </div><!-- /sidebar -->
 
-  <!-- ── Main ── -->
-  <div class="main">
+  <!-- ═══ PANES ══════════════════════════════════════════════ -->
+  <div class="panes">
 
-    <!-- Call status -->
-    <div class="card">
-      <div class="card-label">Active Call</div>
-      <div class="kv"><span class="k">Call SID</span><span class="v" id="info-sid">—</span></div>
-      <div class="kv"><span class="k">Provider</span><span class="v" id="info-provider">—</span></div>
-      <div class="kv"><span class="k">State</span><span class="v" id="info-state">idle</span></div>
-    </div>
-
-    <!-- Transfer panel (shown when voicebot fires transfer) -->
-    <div class="card" id="transfer-panel">
-      <div class="card-label">Transfer Request</div>
-      <span class="transfer-badge">⚡ Transfer Requested</span>
-      <div class="kv"><span class="k">Call SID</span><span class="v" id="xfer-sid">—</span></div>
-      <div class="kv" style="margin-bottom:.75rem"><span class="k">Status</span><span class="v" id="xfer-status">waiting for your action</span></div>
+    <!-- Transfer panel — shown when voicebot fires transfer -->
+    <div class="pane" id="transfer-panel">
+      <div class="pane-label">Transfer Request</div>
+      <span class="xfer-badge">⚡ Transfer Requested</span>
+      <div class="kv"><span class="k">Call SID</span><span id="xfer-sid">—</span></div>
+      <div class="kv"><span class="k">Status</span><span id="xfer-status">waiting for your action</span></div>
       <div class="btn-row">
-        <button class="btn btn-green" id="btn-accept" onclick="executeTransfer()">
-          ✓ Accept &amp; Bridge to my phone
-        </button>
-        <button class="btn btn-red" id="btn-reject" onclick="rejectTransfer()">
-          ✗ Reject
-        </button>
+        <button class="btn-accept" id="btn-accept" onclick="executeTransfer()">✓ Accept &amp; Bridge to my phone</button>
+        <button class="btn-reject" id="btn-reject" onclick="rejectTransfer()">✗ Reject</button>
       </div>
     </div>
 
-    <!-- Event log -->
-    <div class="card">
-      <div class="card-label">Event Log</div>
-      <div id="event-log"></div>
+    <!-- Transcript -->
+    <div class="pane">
+      <div class="pane-label">Transcript</div>
+      <div id="transcript"></div>
     </div>
 
-  </div>
-</div>
+    <!-- State / outcome -->
+    <div class="pane">
+      <div class="pane-label" style="display:flex;align-items:center;justify-content:space-between">
+        Dialogue State &amp; Slots
+        <span id="reanalyze-wrap" style="display:none">
+          <button id="reanalyze" onclick="reanalyzeCall()">↺ Reanalyze</button>
+          <span id="reanalyzeStatus" style="font-size:.72rem;color:var(--muted);margin-left:.4rem"></span>
+        </span>
+      </div>
+      <pre id="state">—</pre>
+      <div id="outcome">
+        <div><b>Outcome:</b> <span id="outcomeType"></span> <span id="outcomeSource" style="color:#6b7280;margin-left:.3rem"></span></div>
+        <div><b>Summary:</b> <span id="outcomeSummary"></span></div>
+        <div><b>Notes:</b>   <span id="outcomeNotes"></span></div>
+        <div id="outcomeCallback"></div>
+      </div>
+    </div>
+
+  </div><!-- /panes -->
+
+</div><!-- /layout -->
 
 <script>
-// ── State ──────────────────────────────────────────────────────────────────
+// ── Constants ──────────────────────────────────────────────────────────────
+const TARGET_RATE = 16000;
 const TOKEN = crypto.randomUUID();
-let callSid   = null;
-let eventSrc  = null;
-let state     = 'idle';   // idle | calling | in_call | transfer_pending | bridged | ended
 
-// ── SSE ───────────────────────────────────────────────────────────────────
-function startSSE() {
-  eventSrc = new EventSource(`/dev/bridge/events?token=${TOKEN}`);
-  eventSrc.onmessage = e => {
-    const ev = JSON.parse(e.data);
-    handleServerEvent(ev);
-  };
-  eventSrc.onerror = () => addLog('SSE connection error', 'err');
+// ── State ──────────────────────────────────────────────────────────────────
+let ws, audioCtx, micStream, workletNode, playCursor = 0;
+let agentSpeaking = false, running = false;
+const activeSources = new Set();
+let _currentCallId = null;
+let _mode = "s2s";
+let _callSid = null;
+let _eventSrc = null;
+let _callPoll = null;
+let _tenantData = {};   // slug → {from_numbers: {twilio:..., exotel:...}}
+let _ttsProviderMeta = [];
+
+const $ = id => document.getElementById(id);
+const setStatus = s => { $("status").textContent = s; };
+
+// ── Tenant ─────────────────────────────────────────────────────────────────
+async function loadTenants() {
+  try {
+    const r = await fetch("/dev/bridge/tenants");
+    if (!r.ok) return;
+    const data = await r.json();
+    const sel = $("tenant");
+    sel.innerHTML = "";
+    for (const t of (data.tenants || [])) {
+      _tenantData[t.slug] = t;
+      const o = document.createElement("option");
+      o.value = t.slug;
+      o.textContent = t.name + " (" + t.slug + ")";
+      if (t.slug === "dev" || t.slug === "stage") o.selected = true;
+      sel.appendChild(o);
+    }
+    onTenantChange();
+  } catch (e) { console.warn("[bridge] tenants fetch failed", e); }
 }
 
-function handleServerEvent(ev) {
-  if (ev.type === 'transfer_requested') {
-    callSid = ev.call_sid || callSid;
-    showTransferPanel(ev.call_sid);
-    setState('transfer_pending');
-    addLog(`Transfer requested — call_sid: ${ev.call_sid}`, 'warn');
-  } else if (ev.type === 'bridge_created') {
-    document.getElementById('xfer-status').textContent =
-      `Conference: ${ev.conference} | Agent SID: ${ev.agent_call_sid}`;
-    setState('bridged');
-    addLog(`Bridge created — conference: ${ev.conference}`, 'ok');
-    disableTransferButtons();
-  } else if (ev.type === 'transfer_rejected') {
-    document.getElementById('xfer-status').textContent = 'Rejected — voicebot will play apology';
-    setState('ended');
-    addLog('Transfer rejected', 'warn');
-    disableTransferButtons();
+function currentTenant() { return $("tenant").value || "dev"; }
+
+function onTenantChange() {
+  const slug = currentTenant();
+  loadCampaigns(slug);
+  loadVoices(slug);
+  loadProviders(slug);
+  updateFromNumber();
+}
+
+function onTelephonyChange() {
+  updateFromNumber();
+}
+
+function updateFromNumber() {
+  const slug = currentTenant();
+  const prov = $("telephony").value;
+  const t = _tenantData[slug];
+  const num = (t && t.from_numbers && t.from_numbers[prov]) || "";
+  $("fromNumberDisplay").value = num || "";
+  $("fromNumberDisplay").placeholder = num ? "" : "auto from tenant config";
+}
+
+// ── Mode ───────────────────────────────────────────────────────────────────
+function setMode(mode) {
+  _mode = mode;
+  document.querySelectorAll(".mode-tab").forEach(t => {
+    t.classList.toggle("active", t.dataset.mode === mode);
+  });
+  $("layered-providers").classList.toggle("hidden", mode !== "layered");
+  $("s2s-voice-field").classList.toggle("hidden", mode !== "s2s");
+  populateVoices(mode);
+}
+
+// ── Outcome ────────────────────────────────────────────────────────────────
+function renderOutcome(o) {
+  if (!o) return;
+  $("outcome").style.display = "block";
+  $("outcomeType").textContent    = o.outcome || "—";
+  $("outcomeSource").textContent  = o.source ? "(" + o.source + ")" : "";
+  $("outcomeSummary").textContent = o.summary || "—";
+  $("outcomeNotes").textContent   = o.notes   || "—";
+  $("outcomeCallback").textContent = o.callback_datetime
+    ? "Callback: " + o.callback_datetime
+    : (o.callback_phrase ? "Callback (unresolved): " + o.callback_phrase : "");
+  if (_currentCallId) { $("reanalyze-wrap").style.display = "inline-flex"; $("reanalyzeStatus").textContent = ""; }
+}
+
+async function reanalyzeCall() {
+  if (!_currentCallId) return;
+  $("reanalyze").disabled = true;
+  $("reanalyzeStatus").textContent = "analyzing…";
+  try {
+    const r = await fetch("/dev/reanalyze?call_id=" + encodeURIComponent(_currentCallId) + "&tenant=" + currentTenant(), { method: "POST" });
+    const data = await r.json();
+    if (!r.ok) { $("reanalyzeStatus").textContent = "failed: " + (data.detail || r.status); return; }
+    renderOutcome(data);
+    $("reanalyzeStatus").textContent = "done";
+  } finally { $("reanalyze").disabled = false; }
+}
+
+// ── Transcript ─────────────────────────────────────────────────────────────
+function addTranscript(role, text) {
+  const div = document.createElement("div");
+  div.className = "turn " + role;
+  div.textContent = (role === "user" ? "🧑 " : "🤖 ") + text;
+  $("transcript").appendChild(div);
+  $("transcript").scrollTop = $("transcript").scrollHeight;
+}
+let _partialEl = null;
+function renderPartial(text) {
+  if (!text) { if (_partialEl) { _partialEl.remove(); _partialEl = null; } return; }
+  if (!_partialEl) {
+    _partialEl = document.createElement("div");
+    _partialEl.className = "turn user";
+    _partialEl.style.cssText = "opacity:.5;font-style:italic";
+    $("transcript").appendChild(_partialEl);
+  }
+  _partialEl.textContent = "🎙 " + text;
+  $("transcript").scrollTop = $("transcript").scrollHeight;
+}
+
+// ── Audio engine ───────────────────────────────────────────────────────────
+function downsampleToInt16(float32, inRate) {
+  if (inRate === TARGET_RATE) {
+    const out = new Int16Array(float32.length);
+    for (let i = 0; i < float32.length; i++) {
+      const s = Math.max(-1, Math.min(1, float32[i]));
+      out[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+    }
+    return out;
+  }
+  const ratio = inRate / TARGET_RATE;
+  const outLen = Math.floor(float32.length / ratio);
+  const out = new Int16Array(outLen);
+  for (let i = 0; i < outLen; i++) {
+    const s = Math.max(-1, Math.min(1, float32[Math.floor(i * ratio)]));
+    out[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+  }
+  return out;
+}
+let _playN = 0;
+function playPcm16(int16) {
+  const buf = audioCtx.createBuffer(1, int16.length, TARGET_RATE);
+  const ch = buf.getChannelData(0);
+  for (let i = 0; i < int16.length; i++) ch[i] = int16[i] / 0x8000;
+  const src = audioCtx.createBufferSource();
+  src.buffer = buf; src.connect(audioCtx.destination);
+  src.onended = () => { activeSources.delete(src); try { src.disconnect(); } catch (_) {} };
+  activeSources.add(src);
+  const now = audioCtx.currentTime;
+  const underrun = playCursor < now;
+  if (underrun) playCursor = now;
+  src.start(playCursor);
+  playCursor += buf.duration;
+}
+function stopPlayback() {
+  for (const s of activeSources) { try { s.stop(); s.disconnect(); } catch (_) {} }
+  activeSources.clear();
+  if (audioCtx) playCursor = audioCtx.currentTime;
+}
+
+// ── Config ─────────────────────────────────────────────────────────────────
+function sendBargeConfig() {
+  if (ws && ws.readyState === WebSocket.OPEN)
+    ws.send(JSON.stringify({ type: "config", barge: $("bargeIn").checked }));
+}
+$("bargeIn").addEventListener("change", sendBargeConfig);
+
+const WORKLET_CODE = `
+class CaptureProcessor extends AudioWorkletProcessor {
+  process(inputs) {
+    const input = inputs[0];
+    if (input && input[0]) this.port.postMessage(input[0].slice(0));
+    return true;
+  }
+}
+registerProcessor('capture-processor', CaptureProcessor);
+`;
+
+// ── WS session (WebConsole mode) ───────────────────────────────────────────
+async function startWS() {
+  const wsProto = location.protocol === "https:" ? "wss" : "ws";
+  const tenant  = currentTenant();
+  const path    = _mode === "s2s" ? "/api/v1/dev/voice-live" : "/api/v1/dev/voice";
+  const voiceSel = _mode === "s2s" ? $("voice") : $("voice-layered");
+  const selectedVoice = voiceSel ? voiceSel.value : "";
+  const voiceGender   = voiceSel ? (voiceSel.options[voiceSel.selectedIndex]?.dataset.gender || "") : "";
+  let qs = "tenant=" + encodeURIComponent(tenant);
+  const leadName   = ($("leadName").value   || "").trim();
+  const callerName = ($("callerName").value || "").trim();
+  const leadGender = ($("leadGender").value || "").trim();
+  const campaign   = ($("campaign").value   || "").trim();
+  if (leadName)      qs += "&lead_name="   + encodeURIComponent(leadName);
+  if (selectedVoice) qs += "&voice="       + encodeURIComponent(selectedVoice);
+  if (voiceGender)   qs += "&gender="      + encodeURIComponent(voiceGender);
+  if (callerName)    qs += "&caller_name=" + encodeURIComponent(callerName);
+  if (leadGender)    qs += "&lead_gender=" + encodeURIComponent(leadGender);
+  if (campaign)      qs += "&campaign="    + encodeURIComponent(campaign);
+  if (_mode === "layered") {
+    const stt = $("stt-select").value, llm = $("llm-select").value, tts = $("tts-select").value;
+    if (stt) qs += "&stt=" + encodeURIComponent(stt);
+    if (llm) qs += "&llm=" + encodeURIComponent(llm);
+    if (tts) qs += "&tts=" + encodeURIComponent(tts);
+  }
+  ws = new WebSocket(`${wsProto}://${location.host}${path}?${qs}`);
+  ws.binaryType = "arraybuffer";
+  ws.onopen = async () => {
+    ws.send(JSON.stringify({ type: "hello", tenant }));
+    sendBargeConfig();
+    try {
+      try { audioCtx = new AudioContext({ sampleRate: TARGET_RATE }); }
+      catch (_) { audioCtx = new AudioContext(); }
+      if (audioCtx.state === "suspended") await audioCtx.resume();
+      const blobUrl = URL.createObjectURL(new Blob([WORKLET_CODE], { type: "application/javascript" }));
+      await audioCtx.audioWorklet.addModule(blobUrl);
+      const srcNode = audioCtx.createMediaStreamSource(micStream);
+      workletNode = new AudioWorkletNode(audioCtx, "capture-processor");
+      workletNode.port.onmessage = e => {
+        if (!running) return;
+        const stillPlaying = playCursor > audioCtx.currentTime + 0.05;
+        if (!(_mode === "s2s") && $("halfDuplex").checked && (agentSpeaking || stillPlaying) && !$("bargeIn").checked) return;
+        const int16 = downsampleToInt16(e.data, audioCtx.sampleRate);
+        if (ws.readyState === WebSocket.OPEN) ws.send(int16.buffer);
+      };
+      srcNode.connect(workletNode);
+      const sink = audioCtx.createGain(); sink.gain.value = 0;
+      workletNode.connect(sink).connect(audioCtx.destination);
+      running = true; setStatus("connected");
+    } catch (err) { setStatus("audio error: " + (err?.message || err)); stopAll(); }
+  };
+  ws.onmessage = e => {
+    if (e.data instanceof ArrayBuffer) { playPcm16(new Int16Array(e.data)); return; }
+    const msg = JSON.parse(e.data);
+    if      (msg.type === "session")    { _currentCallId = msg.call_id; $("reanalyze-wrap").style.display = "inline-flex"; $("reanalyzeStatus").textContent = ""; }
+    else if (msg.type === "status")     { setStatus(msg.status); agentSpeaking = (msg.status !== "listening"); }
+    else if (msg.type === "interrupt")  { stopPlayback(); agentSpeaking = false; setStatus("listening — go ahead"); }
+    else if (msg.type === "partial")    { renderPartial(msg.text); }
+    else if (msg.type === "transcript") { if (msg.role === "user") renderPartial(""); addTranscript(msg.role, msg.text); }
+    else if (msg.type === "state")      { $("state").textContent = "state: " + msg.state + "\nslots: " + JSON.stringify(msg.slots, null, 2); }
+    else if (msg.type === "outcome")    { renderOutcome(msg); }
+    else if (msg.type === "error") {
+      const d = document.createElement("div");
+      d.className = "turn"; d.style.color = "#fca5a5";
+      d.textContent = "⚠ " + msg.message;
+      $("transcript").appendChild(d);
+      $("transcript").scrollTop = $("transcript").scrollHeight;
+    }
+  };
+  ws.onclose = () => { stopAll(false); setStatus("closed"); };
+  ws.onerror = ()  => { setStatus("connection error"); };
+}
+
+function stopAll(immediate) {
+  running = false;
+  if (workletNode) { try { workletNode.disconnect(); } catch (_) {} workletNode = null; }
+  if (micStream) micStream.getTracks().forEach(t => t.stop()); micStream = null;
+  agentSpeaking = false;
+  if (ws && ws.readyState === WebSocket.OPEN) ws.close();
+  resetStartBtn();
+  if (audioCtx) {
+    const ctx = audioCtx; audioCtx = null;
+    const waitMs = immediate ? 0 : Math.max(300, (playCursor - ctx.currentTime + 0.5) * 1000);
+    setTimeout(() => ctx.close(), waitMs);
   }
 }
 
-// ── Place call ────────────────────────────────────────────────────────────
+function endCall() {
+  if (!ws || ws.readyState !== WebSocket.OPEN) { stopAll(); return; }
+  running = false;
+  if (workletNode) { try { workletNode.disconnect(); } catch (_) {} workletNode = null; }
+  if (micStream) micStream.getTracks().forEach(t => t.stop()); micStream = null;
+  agentSpeaking = false;
+  resetStartBtn(); setStatus("ending…");
+  ws.send(JSON.stringify({ type: "end" }));
+  setTimeout(() => { if (ws && ws.readyState === WebSocket.OPEN) stopAll(true); }, 20000);
+}
+
+function resetStartBtn() {
+  $("start").classList.remove("stop");
+  $("start").textContent = "▶  Start Call";
+}
+
+// ── Telephony (outbound) call ──────────────────────────────────────────────
+const NO_ANSWER_MS = 75000;
+
 async function placeCall() {
-  const provider   = document.getElementById('provider').value;
-  const toNumber   = document.getElementById('to-number').value.trim();
-  const agentPhone = document.getElementById('agent-phone').value.trim();
-  const tenant     = document.getElementById('tenant').value.trim() || 'dev';
+  const provider   = $("telephony").value;
+  const to         = ($("toNumber").value  || "").trim();
+  const agentPhone = ($("agentPhone").value || "").trim();
+  const tenant     = currentTenant();
+  if (!to)         { setStatus("enter a destination number"); return; }
+  if (!agentPhone) { setStatus("enter your bridge-to phone"); return; }
 
-  if (!toNumber)   { addLog('Caller number is required', 'err'); return; }
-  if (!agentPhone) { addLog('Bridge-to phone is required', 'err'); return; }
-
-  document.getElementById('btn-place').disabled = true;
-  document.getElementById('btn-stop').style.display = 'block';
-  setState('calling');
-  addLog(`Placing ${provider} call to ${toNumber}…`);
+  $("outcome").style.display = "none";
+  $("start").classList.add("stop"); $("start").textContent = "■  Stop";
+  setStatus("placing call…");
 
   startSSE();
 
+  let body;
   try {
-    const resp = await post('/dev/bridge/place-call', {
-      token: TOKEN, provider, to_number: toNumber,
-      agent_phone: agentPhone, tenant, mode: 's2s',
+    const resp = await fetch("/dev/bridge/place-call", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        token: TOKEN,
+        provider, to_number: to, agent_phone: agentPhone,
+        tenant, mode: _mode,
+        voice: (_mode === "s2s" ? $("voice") : $("voice-layered"))?.value || "",
+        caller_name: ($("callerName").value || "").trim(),
+        lead_name:   ($("leadName").value   || "").trim(),
+        lead_gender: ($("leadGender").value || "").trim(),
+      }),
     });
-    callSid = resp.call_sid;
-    document.getElementById('info-sid').textContent      = resp.call_sid;
-    document.getElementById('info-provider').textContent = resp.provider;
-    setState('in_call');
-    addLog(`Call placed — SID: ${resp.call_sid}`, 'ok');
+    body = await resp.json().catch(() => ({}));
+    if (!resp.ok) { setStatus("place-call failed: " + (body.detail || resp.status)); resetStartBtn(); return; }
   } catch (err) {
-    addLog(`Place call failed: ${err}`, 'err');
-    reset();
+    setStatus("error: " + (err?.message || err));
+    resetStartBtn(); return;
   }
+  _callSid = body.call_sid;
+  pollCall(_callSid);
 }
 
-// ── Execute transfer ──────────────────────────────────────────────────────
-async function executeTransfer() {
-  if (!callSid) { addLog('No call SID', 'err'); return; }
-  disableTransferButtons();
-  document.getElementById('xfer-status').textContent = 'Creating conference…';
-  addLog('Creating Twilio conference and calling your phone…');
-  try {
-    const resp = await post('/dev/bridge/execute-transfer', {
-      token: TOKEN, call_sid: callSid,
-    });
-    addLog(`Conference created: ${resp.conference}`, 'ok');
-  } catch (err) {
-    addLog(`Execute transfer failed: ${err}`, 'err');
-    document.getElementById('xfer-status').textContent = `Error: ${err}`;
-    enableTransferButtons();
-  }
+function pollCall(callSid) {
+  const startedAt = Date.now();
+  _callPoll = setInterval(async () => {
+    let data;
+    try {
+      const r = await fetch("/dev/call-status/" + encodeURIComponent(callSid));
+      if (!r.ok) return;
+      data = await r.json();
+    } catch (_) { return; }
+    setStatus(data.status);
+    if (data.outcome) { renderOutcome(data.outcome); stopWatching(); }
+    else if ((data.status === "calling" || data.status === "unknown") && Date.now() - startedAt > NO_ANSWER_MS)
+      { setStatus("no answer (timed out)"); stopWatching(); }
+    else if (data.status === "failed") { stopWatching(); }
+  }, 1500);
 }
 
-// ── Reject transfer ───────────────────────────────────────────────────────
-async function rejectTransfer() {
-  if (!callSid) return;
-  disableTransferButtons();
-  addLog('Rejecting transfer…', 'warn');
-  try {
-    await post('/dev/bridge/reject-transfer', { token: TOKEN, call_sid: callSid });
-  } catch (err) {
-    addLog(`Reject failed: ${err}`, 'err');
-  }
+function stopWatching() {
+  if (_callPoll) { clearInterval(_callPoll); _callPoll = null; }
+  resetStartBtn();
 }
 
-// ── Reset ─────────────────────────────────────────────────────────────────
-function stopCall() {
-  if (eventSrc) { eventSrc.close(); eventSrc = null; }
-  reset();
-}
-
-function reset() {
-  callSid = null;
-  setState('idle');
-  document.getElementById('info-sid').textContent      = '—';
-  document.getElementById('info-provider').textContent = '—';
-  document.getElementById('btn-place').disabled = false;
-  document.getElementById('btn-stop').style.display = 'none';
-  document.getElementById('transfer-panel').classList.remove('visible');
-  document.getElementById('xfer-sid').textContent    = '—';
-  document.getElementById('xfer-status').textContent = 'waiting for your action';
-}
-
-// ── UI helpers ────────────────────────────────────────────────────────────
-function setState(s) {
-  state = s;
-  document.getElementById('info-state').textContent = s;
-
-  const badge = document.getElementById('status-badge');
-  const colors = {
-    idle:             { bg: '#1e293b', color: '#94a3b8', text: 'Idle' },
-    calling:          { bg: '#1e3a5f', color: '#7dd3fc', text: 'Calling…' },
-    in_call:          { bg: '#14532d', color: '#86efac', text: 'In Call' },
-    transfer_pending: { bg: '#78350f', color: '#fcd34d', text: 'Transfer ⚡' },
-    bridged:          { bg: '#14532d', color: '#86efac', text: 'Bridged ✓' },
-    ended:            { bg: '#1e293b', color: '#94a3b8', text: 'Ended' },
+// ── SSE (bridge transfer events) ──────────────────────────────────────────
+function startSSE() {
+  if (_eventSrc) { _eventSrc.close(); _eventSrc = null; }
+  _eventSrc = new EventSource(`/dev/bridge/events?token=${TOKEN}`);
+  _eventSrc.onmessage = e => {
+    const ev = JSON.parse(e.data);
+    if (ev.type === "transfer_requested") {
+      _callSid = ev.call_sid || _callSid;
+      $("xfer-sid").textContent    = ev.call_sid || "—";
+      $("xfer-status").textContent = "waiting for your action";
+      $("btn-accept").disabled     = false;
+      $("btn-reject").disabled     = false;
+      $("transfer-panel").classList.add("visible");
+      setStatus("⚡ transfer requested");
+    } else if (ev.type === "bridge_created") {
+      $("xfer-status").textContent = "Bridged — conf: " + ev.conference;
+      $("btn-accept").disabled = true;
+      $("btn-reject").disabled = true;
+      setStatus("bridged ✓");
+    } else if (ev.type === "transfer_rejected") {
+      $("xfer-status").textContent = "Rejected";
+      $("btn-accept").disabled = true;
+      $("btn-reject").disabled = true;
+      setStatus("transfer rejected");
+    }
   };
-  const c = colors[s] || colors.idle;
-  badge.style.background = c.bg;
-  badge.style.color      = c.color;
-  badge.textContent      = c.text;
+  _eventSrc.onerror = () => console.warn("[bridge] SSE error");
 }
 
-function showTransferPanel(sid) {
-  document.getElementById('xfer-sid').textContent = sid || callSid || '—';
-  document.getElementById('transfer-panel').classList.add('visible');
-  enableTransferButtons();
-}
-
-function disableTransferButtons() {
-  document.getElementById('btn-accept').disabled = true;
-  document.getElementById('btn-reject').disabled = true;
-}
-
-function enableTransferButtons() {
-  document.getElementById('btn-accept').disabled = false;
-  document.getElementById('btn-reject').disabled = false;
-}
-
-function addLog(msg, level = 'info') {
-  const el = document.getElementById('event-log');
-  const row = document.createElement('div');
-  row.className = `log-row log-${level}`;
-  const now = new Date();
-  const ts = `${String(now.getHours()).padStart(2,'0')}:${String(now.getMinutes()).padStart(2,'0')}:${String(now.getSeconds()).padStart(2,'0')}`;
-  row.innerHTML = `<span class="ts">${ts}</span><span class="msg">${msg}</span>`;
-  el.appendChild(row);
-  el.scrollTop = el.scrollHeight;
-}
-
-// ── HTTP helper ───────────────────────────────────────────────────────────
-async function post(url, body) {
-  const r = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-  if (!r.ok) {
-    const detail = (await r.json().catch(() => ({}))).detail || r.statusText;
-    throw new Error(detail);
+async function executeTransfer() {
+  if (!_callSid) return;
+  $("btn-accept").disabled = true;
+  $("btn-reject").disabled = true;
+  $("xfer-status").textContent = "Creating conference…";
+  try {
+    const resp = await fetch("/dev/bridge/execute-transfer", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ token: TOKEN, call_sid: _callSid }),
+    });
+    if (!resp.ok) {
+      const err = (await resp.json().catch(() => ({}))).detail || resp.statusText;
+      $("xfer-status").textContent = "Error: " + err;
+      $("btn-accept").disabled = false;
+      $("btn-reject").disabled = false;
+    }
+  } catch (e) {
+    $("xfer-status").textContent = "Error: " + e.message;
+    $("btn-accept").disabled = false;
+    $("btn-reject").disabled = false;
   }
-  return r.json();
 }
+
+async function rejectTransfer() {
+  if (!_callSid) return;
+  $("btn-accept").disabled = true;
+  $("btn-reject").disabled = true;
+  await fetch("/dev/bridge/reject-transfer", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ token: TOKEN, call_sid: _callSid }),
+  });
+}
+
+// ── Start button ───────────────────────────────────────────────────────────
+$("start").onclick = async () => {
+  if (_callPoll) { stopWatching(); setStatus("stopped watching"); return; }
+  placeCall();
+};
+
+// ── Voices ─────────────────────────────────────────────────────────────────
+let _voiceData = { layered: { voices: [], default: "" }, s2s: { voices: [], default: "", catalog: [] } };
+const _preferredVoice = { s2s: "Leda", layered: "arya" };
+
+function _syncCallerNameToGender(g) {
+  const el = $("callerName");
+  const cur = (el.value || "").trim();
+  if (g === "male"   && (cur === "Priya" || cur === "Arjun")) el.value = "Arjun";
+  if (g === "female" && (cur === "Priya" || cur === "Arjun")) el.value = "Priya";
+}
+
+function populateVoices(mode) {
+  const d   = _voiceData[mode] || { voices: [], default: "" };
+  const pref = _preferredVoice[mode];
+  const def  = d.voices.includes(pref) ? pref : d.default;
+  const meta = {};
+  for (const v of (d.catalog || [])) meta[v.voice_id] = v;
+  const sel = $("voice"); sel.innerHTML = "";
+  for (const id of d.voices) {
+    const o = document.createElement("option");
+    o.value = id;
+    const m = meta[id];
+    o.dataset.gender = m?.gender || "";
+    o.textContent = m ? `${id} — ${m.gender} · ${m.style}` : id;
+    if (id === def) o.selected = true;
+    sel.appendChild(o);
+  }
+}
+
+async function loadVoices(tenant) {
+  try {
+    const r = await fetch("/dev/voices?tenant=" + encodeURIComponent(tenant));
+    if (r.ok) _voiceData = await r.json();
+  } catch (e) { console.warn("[bridge] voices fetch failed", e); }
+  populateVoices(_mode);
+}
+
+// ── Campaigns ──────────────────────────────────────────────────────────────
+async function loadCampaigns(tenant) {
+  const sel = $("campaign");
+  try {
+    const r = await fetch("/dev/campaigns?tenant=" + encodeURIComponent(tenant));
+    if (!r.ok) return;
+    const data = await r.json();
+    sel.innerHTML = "";
+    for (const c of (data.campaigns || [])) {
+      const o = document.createElement("option");
+      o.value = c.id;
+      o.textContent = c.name + (c.status !== "active" ? " (" + c.status + ")" : "");
+      sel.appendChild(o);
+    }
+  } catch (e) { console.warn("[bridge] campaigns fetch failed", e); }
+}
+
+// ── Providers ──────────────────────────────────────────────────────────────
+async function loadProviders(tenant) {
+  try {
+    const r = await fetch("/dev/providers");
+    if (!r.ok) return;
+    const data = await r.json();
+    const fill = (selId, opts) => {
+      const sel = $(selId); if (!sel) return; sel.innerHTML = "";
+      for (const { id, label } of (opts || [])) {
+        const o = document.createElement("option"); o.value = id; o.textContent = label;
+        sel.appendChild(o);
+      }
+    };
+    fill("stt-select", data.stt);
+    fill("llm-select", data.llm);
+    _ttsProviderMeta = data.tts || [];
+    const ttsSel = $("tts-select"); if (ttsSel) ttsSel.innerHTML = "";
+    for (const { id, label } of _ttsProviderMeta) {
+      const o = document.createElement("option"); o.value = id; o.textContent = label;
+      if (ttsSel) ttsSel.appendChild(o);
+    }
+    await onTTSChange();
+  } catch (e) { console.warn("[bridge] providers fetch failed", e); }
+}
+
+async function onTTSChange() {
+  const provider = ($("tts-select") || {}).value || "sarvam";
+  const meta = _ttsProviderMeta.find(m => m.id === provider);
+  const hint = $("tts-langs");
+  if (hint && meta?.languages?.length) hint.textContent = "Languages: " + meta.languages.join(", ");
+  else if (hint) hint.textContent = "";
+  await loadTTSVoices(provider);
+}
+
+async function loadTTSVoices(provider) {
+  const sel = $("voice-layered"); if (!sel) return;
+  try {
+    const r = await fetch("/dev/tts-voices?provider=" + encodeURIComponent(provider) + "&language=hi-IN");
+    if (!r.ok) return;
+    const data = await r.json();
+    sel.innerHTML = "";
+    for (const v of (data.voices || [])) {
+      const o = document.createElement("option");
+      o.value = v.voice_id; o.dataset.gender = v.gender || "";
+      const shortId = v.voice_id.replace(/^[a-z]{2}-[A-Z]{2}-/, "");
+      o.textContent = shortId + (v.gender ? " — " + v.gender : "");
+      sel.appendChild(o);
+    }
+  } catch (e) { console.warn("[bridge] tts-voices fetch failed", e); }
+}
+
+// ── Init ───────────────────────────────────────────────────────────────────
+document.addEventListener("DOMContentLoaded", () => {
+  $("voice").addEventListener("change", function() {
+    _syncCallerNameToGender((this.options[this.selectedIndex]?.dataset.gender || "").toLowerCase());
+  });
+  setMode("s2s");
+  loadTenants();
+});
 </script>
 </body>
 </html>
