@@ -251,7 +251,9 @@ OPERATOR_TOOLS: dict[str, dict] = {
             "Get the operator's current promotions and bonus configuration: "
             "active promotions list, welcome/first-deposit bonus details and "
             "wagering requirements, cashback or losing bonus config, referral "
-            "program details, VIP/loyalty tier definitions and per-tier benefits."
+            "program details, VIP/loyalty tier definitions and per-tier benefits. "
+            "NOTE: this does NOT return the player's personal referral code or "
+            "link — call get_referral_code for those."
         ),
         "parameters": {
             "operator_id": {"type": "string", "source": "session",
