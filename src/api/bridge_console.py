@@ -179,5 +179,7 @@ async def bridge_place_call(req: PlaceBridgeCallRequest) -> dict:
     _dcc.monitor.set_status(session.session_id, "calling")
 
     log.info("bridge console: call placed",
-             extra={"call_sid": session.session_id, "provider": provider})
+             extra={"call_sid": session.session_id, "provider": provider,
+                    "webhook_url": cfg.webhook_url, "to": req.to_number,
+                    "from": from_number})
     return {"call_sid": session.session_id, "provider": provider}
