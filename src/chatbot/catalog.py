@@ -122,6 +122,72 @@ PLAYER_TOOLS: dict[str, dict] = {
         "default_path": "/operators/{operator_id}/players/{user_id}/payment-config",
         "method": "GET",
     },
+    "get_referral_code": {
+        "description": (
+            "Get the player's personal referral code and shareable referral link. "
+            "Call this when the player asks for their referral code, referral link, "
+            "invite link, or wants to refer a friend "
+            "(e.g. 'mera referral code kya hai', 'invite link bhejo', "
+            "'dost ko refer karna hai')."
+        ),
+        "parameters": {
+            "user_id": {"type": "string", "source": "session",
+                        "description": "Player identifier"},
+        },
+        "default_path": "/players/{user_id}/referral-code",
+        "method": "GET",
+    },
+    "get_sports_open_bets": {
+        "description": (
+            "Get the player's currently open / pending sports bets with match details "
+            "and live cashout valuation. Use when the player asks to see their open "
+            "bets, active bets, or wants to know how many bets are pending "
+            "(e.g. 'open bets dikhao', 'pending bet kitne hain', 'live bet status')."
+        ),
+        "parameters": {
+            "user_id": {"type": "string", "source": "session",
+                        "description": "Player identifier"},
+            "limit": {"type": "integer", "source": "llm",
+                      "description": "Max records to return (default: 10)"},
+        },
+        "default_path": "/players/{user_id}/sports-bets/open",
+        "method": "GET",
+    },
+    "get_sports_match_status": {
+        "description": (
+            "Get today's sports markets where the player has placed bets, along with "
+            "the market result and whether the player won or lost each bet. Use when "
+            "the player asks about a match result or whether their bet won or lost "
+            "(e.g. 'match jeeta ya haara', 'bet result kya aaya', 'kya main jeeta', "
+            "'aaj ka bet settle hua')."
+        ),
+        "parameters": {
+            "user_id": {"type": "string", "source": "session",
+                        "description": "Player identifier"},
+        },
+        "default_path": "/players/{user_id}/sports-bets/today-results",
+        "method": "GET",
+    },
+    "get_casino_game_history": {
+        "description": (
+            "Get the player's history for a specific casino game: sessions played, "
+            "total wagered, total won, net P&L, and recent session results. "
+            "Call this when the player asks about their performance or history in a "
+            "named casino game (e.g. 'Teen Patti mein kitna jeeta', "
+            "'Andar Bahar ka history dikhao', 'slots ka record kya hai'). "
+            "Always extract the game name from the player's message and pass it as game_name."
+        ),
+        "parameters": {
+            "user_id": {"type": "string", "source": "session",
+                        "description": "Player identifier"},
+            "game_name": {"type": "string", "source": "llm",
+                          "description": "Name of the casino game (e.g. Teen Patti, Andar Bahar, Roulette, Slots)"},
+            "limit": {"type": "integer", "source": "llm",
+                      "description": "Max session records to return (default: 10)"},
+        },
+        "default_path": "/players/{user_id}/casino-game-history",
+        "method": "GET",
+    },
 }
 
 # ---------------------------------------------------------------------------

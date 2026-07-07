@@ -6,8 +6,8 @@
 -- 1. Extension (requires superuser)
 CREATE EXTENSION IF NOT EXISTS vector;
 
--- 2. Table
-CREATE TABLE IF NOT EXISTS knowledge_chunks (
+-- 2. Table (in the voicebot schema, same as all other app tables)
+CREATE TABLE IF NOT EXISTS voicebot.knowledge_chunks (
     id        TEXT  PRIMARY KEY,
     content   TEXT  NOT NULL,
     metadata  JSONB NOT NULL DEFAULT '{}',
@@ -17,11 +17,11 @@ CREATE TABLE IF NOT EXISTS knowledge_chunks (
 
 -- 3. Indexes
 CREATE INDEX IF NOT EXISTS knowledge_chunks_tenant_idx
-    ON knowledge_chunks (tenant_id);
+    ON voicebot.knowledge_chunks (tenant_id);
 
 -- HNSW requires pgvector >= 0.5 (Northflank managed Postgres ships with it)
 CREATE INDEX IF NOT EXISTS knowledge_chunks_emb_hnsw
-    ON knowledge_chunks USING hnsw (embedding vector_cosine_ops);
+    ON voicebot.knowledge_chunks USING hnsw (embedding vector_cosine_ops);
 
 -- 4. App user grants
-GRANT SELECT, INSERT, UPDATE, DELETE ON knowledge_chunks TO <app_user>;
+GRANT SELECT, INSERT, UPDATE, DELETE ON voicebot.knowledge_chunks TO <app_user>;

@@ -1,0 +1,369 @@
+<!-- static/bridge_console.html -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Bridge Console</title>
+<style>
+  :root {
+    --bg:     #0f172a;
+    --card:   #1e293b;
+    --border: #334155;
+    --text:   #e2e8f0;
+    --muted:  #94a3b8;
+    --accent: #3b82f6;
+    --green:  #22c55e;
+    --red:    #ef4444;
+    --amber:  #f59e0b;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: system-ui, sans-serif;
+    background: var(--bg); color: var(--text);
+    padding: 1rem; min-height: 100vh;
+  }
+
+  /* ── Header ── */
+  .header {
+    display: flex; align-items: center; gap: .75rem;
+    padding-bottom: .75rem; margin-bottom: 1rem;
+    border-bottom: 1px solid var(--border);
+  }
+  .header h1 { font-size: 1.05rem; font-weight: 700; }
+  .header .hint { font-size: .75rem; color: var(--muted); }
+  #status-badge {
+    margin-left: auto;
+    font-size: .8rem; font-weight: 600;
+    padding: .25rem .75rem; border-radius: 999px;
+    background: var(--card); border: 1px solid var(--border);
+    min-width: 7rem; text-align: center;
+  }
+
+  /* ── Layout ── */
+  .layout { display: flex; gap: 1rem; align-items: flex-start; }
+  .sidebar { width: 260px; flex-shrink: 0; display: flex; flex-direction: column; gap: .6rem; }
+  .main { flex: 1; display: flex; flex-direction: column; gap: .75rem; min-width: 0; }
+
+  /* ── Cards ── */
+  .card {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: .55rem; padding: .7rem .75rem;
+  }
+  .card-label {
+    font-size: .6rem; font-weight: 700; letter-spacing: .1em;
+    text-transform: uppercase; color: var(--muted); margin-bottom: .5rem;
+  }
+
+  /* ── Form ── */
+  .field { margin-bottom: .45rem; }
+  .field:last-child { margin-bottom: 0; }
+  .field label { display: block; font-size: .75rem; color: var(--muted); margin-bottom: .2rem; }
+  input[type="text"], select {
+    width: 100%; padding: .38rem .55rem;
+    background: #0f172a; border: 1px solid var(--border);
+    border-radius: .38rem; color: var(--text); font-size: .82rem;
+  }
+  input[type="text"]:focus, select:focus { outline: none; border-color: var(--accent); }
+
+  /* ── Buttons ── */
+  .btn {
+    width: 100%; padding: .55rem; border-radius: .42rem;
+    font-size: .88rem; font-weight: 600; cursor: pointer; border: none;
+    transition: opacity .15s;
+  }
+  .btn:disabled { opacity: .4; cursor: not-allowed; }
+  .btn-green  { background: var(--green);  color: #052e16; }
+  .btn-red    { background: var(--red);    color: #fff; }
+  .btn-blue   { background: var(--accent); color: #fff; }
+  .btn-row { display: flex; gap: .5rem; }
+  .btn-row .btn { flex: 1; }
+
+  /* ── Call info ── */
+  .kv { display: flex; gap: .5rem; align-items: baseline; font-size: .82rem; margin-bottom: .3rem; }
+  .kv:last-child { margin-bottom: 0; }
+  .kv .k { color: var(--muted); min-width: 90px; }
+  .kv .v { font-family: monospace; word-break: break-all; }
+
+  /* ── Transfer panel ── */
+  #transfer-panel { display: none; }
+  #transfer-panel.visible { display: block; }
+  .transfer-badge {
+    display: inline-block; font-size: .72rem; font-weight: 700;
+    padding: .2rem .6rem; border-radius: 999px;
+    background: #78350f; color: var(--amber); margin-bottom: .6rem;
+  }
+
+  /* ── Event log ── */
+  #event-log {
+    font-family: monospace; font-size: .78rem; color: var(--muted);
+    max-height: 260px; overflow-y: auto;
+    display: flex; flex-direction: column; gap: .2rem;
+  }
+  .log-row { display: flex; gap: .6rem; }
+  .log-row .ts { color: #475569; white-space: nowrap; }
+  .log-row .msg { word-break: break-all; }
+  .log-ok   .msg { color: var(--green); }
+  .log-warn .msg { color: var(--amber); }
+  .log-err  .msg { color: var(--red); }
+  .log-info .msg { color: var(--text); }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>Bridge Console</h1>
+  <span class="hint">Place call → voicebot runs → transfer fires → bridge to your phone</span>
+  <span id="status-badge">Idle</span>
+</div>
+
+<div class="layout">
+
+  <!-- ── Sidebar ── -->
+  <div class="sidebar">
+
+    <div class="card">
+      <div class="card-label">Setup</div>
+      <div class="field">
+        <label>Tenant</label>
+        <input id="tenant" type="text" value="dev" />
+      </div>
+      <div class="field">
+        <label>Telephony provider</label>
+        <select id="provider">
+          <option value="twilio">Twilio</option>
+          <option value="exotel">Exotel</option>
+        </select>
+      </div>
+      <div class="field">
+        <label>Caller number (who to call)</label>
+        <input id="to-number" type="text" placeholder="+91XXXXXXXXXX" />
+      </div>
+      <div class="field">
+        <label>Bridge to (your phone)</label>
+        <input id="agent-phone" type="text" placeholder="+91XXXXXXXXXX" />
+      </div>
+    </div>
+
+    <button id="btn-place" class="btn btn-green" onclick="placeCall()">▶ Place Call</button>
+    <button id="btn-stop"  class="btn btn-red"   onclick="stopCall()" style="display:none">■ End / Reset</button>
+
+  </div>
+
+  <!-- ── Main ── -->
+  <div class="main">
+
+    <!-- Call status -->
+    <div class="card">
+      <div class="card-label">Active Call</div>
+      <div class="kv"><span class="k">Call SID</span><span class="v" id="info-sid">—</span></div>
+      <div class="kv"><span class="k">Provider</span><span class="v" id="info-provider">—</span></div>
+      <div class="kv"><span class="k">State</span><span class="v" id="info-state">idle</span></div>
+    </div>
+
+    <!-- Transfer panel (shown when voicebot fires transfer) -->
+    <div class="card" id="transfer-panel">
+      <div class="card-label">Transfer Request</div>
+      <span class="transfer-badge">⚡ Transfer Requested</span>
+      <div class="kv"><span class="k">Call SID</span><span class="v" id="xfer-sid">—</span></div>
+      <div class="kv" style="margin-bottom:.75rem"><span class="k">Status</span><span class="v" id="xfer-status">waiting for your action</span></div>
+      <div class="btn-row">
+        <button class="btn btn-green" id="btn-accept" onclick="executeTransfer()">
+          ✓ Accept &amp; Bridge to my phone
+        </button>
+        <button class="btn btn-red" id="btn-reject" onclick="rejectTransfer()">
+          ✗ Reject
+        </button>
+      </div>
+    </div>
+
+    <!-- Event log -->
+    <div class="card">
+      <div class="card-label">Event Log</div>
+      <div id="event-log"></div>
+    </div>
+
+  </div>
+</div>
+
+<script>
+// ── State ──────────────────────────────────────────────────────────────────
+const TOKEN = crypto.randomUUID();
+let callSid   = null;
+let eventSrc  = null;
+let state     = 'idle';   // idle | calling | in_call | transfer_pending | bridged | ended
+
+// ── SSE ───────────────────────────────────────────────────────────────────
+function startSSE() {
+  eventSrc = new EventSource(`/dev/bridge/events?token=${TOKEN}`);
+  eventSrc.onmessage = e => {
+    const ev = JSON.parse(e.data);
+    handleServerEvent(ev);
+  };
+  eventSrc.onerror = () => addLog('SSE connection error', 'err');
+}
+
+function handleServerEvent(ev) {
+  if (ev.type === 'transfer_requested') {
+    callSid = ev.call_sid || callSid;
+    showTransferPanel(ev.call_sid);
+    setState('transfer_pending');
+    addLog(`Transfer requested — call_sid: ${ev.call_sid}`, 'warn');
+  } else if (ev.type === 'bridge_created') {
+    document.getElementById('xfer-status').textContent =
+      `Conference: ${ev.conference} | Agent SID: ${ev.agent_call_sid}`;
+    setState('bridged');
+    addLog(`Bridge created — conference: ${ev.conference}`, 'ok');
+    disableTransferButtons();
+  } else if (ev.type === 'transfer_rejected') {
+    document.getElementById('xfer-status').textContent = 'Rejected — voicebot will play apology';
+    setState('ended');
+    addLog('Transfer rejected', 'warn');
+    disableTransferButtons();
+  }
+}
+
+// ── Place call ────────────────────────────────────────────────────────────
+async function placeCall() {
+  const provider   = document.getElementById('provider').value;
+  const toNumber   = document.getElementById('to-number').value.trim();
+  const agentPhone = document.getElementById('agent-phone').value.trim();
+  const tenant     = document.getElementById('tenant').value.trim() || 'dev';
+
+  if (!toNumber)   { addLog('Caller number is required', 'err'); return; }
+  if (!agentPhone) { addLog('Bridge-to phone is required', 'err'); return; }
+
+  document.getElementById('btn-place').disabled = true;
+  document.getElementById('btn-stop').style.display = 'block';
+  setState('calling');
+  addLog(`Placing ${provider} call to ${toNumber}…`);
+
+  startSSE();
+
+  try {
+    const resp = await post('/dev/bridge/place-call', {
+      token: TOKEN, provider, to_number: toNumber,
+      agent_phone: agentPhone, tenant, mode: 's2s',
+    });
+    callSid = resp.call_sid;
+    document.getElementById('info-sid').textContent      = resp.call_sid;
+    document.getElementById('info-provider').textContent = resp.provider;
+    setState('in_call');
+    addLog(`Call placed — SID: ${resp.call_sid}`, 'ok');
+  } catch (err) {
+    addLog(`Place call failed: ${err}`, 'err');
+    reset();
+  }
+}
+
+// ── Execute transfer ──────────────────────────────────────────────────────
+async function executeTransfer() {
+  if (!callSid) { addLog('No call SID', 'err'); return; }
+  disableTransferButtons();
+  document.getElementById('xfer-status').textContent = 'Creating conference…';
+  addLog('Creating Twilio conference and calling your phone…');
+  try {
+    const resp = await post('/dev/bridge/execute-transfer', {
+      token: TOKEN, call_sid: callSid,
+    });
+    addLog(`Conference created: ${resp.conference}`, 'ok');
+  } catch (err) {
+    addLog(`Execute transfer failed: ${err}`, 'err');
+    document.getElementById('xfer-status').textContent = `Error: ${err}`;
+    enableTransferButtons();
+  }
+}
+
+// ── Reject transfer ───────────────────────────────────────────────────────
+async function rejectTransfer() {
+  if (!callSid) return;
+  disableTransferButtons();
+  addLog('Rejecting transfer…', 'warn');
+  try {
+    await post('/dev/bridge/reject-transfer', { token: TOKEN, call_sid: callSid });
+  } catch (err) {
+    addLog(`Reject failed: ${err}`, 'err');
+  }
+}
+
+// ── Reset ─────────────────────────────────────────────────────────────────
+function stopCall() {
+  if (eventSrc) { eventSrc.close(); eventSrc = null; }
+  reset();
+}
+
+function reset() {
+  callSid = null;
+  setState('idle');
+  document.getElementById('info-sid').textContent      = '—';
+  document.getElementById('info-provider').textContent = '—';
+  document.getElementById('btn-place').disabled = false;
+  document.getElementById('btn-stop').style.display = 'none';
+  document.getElementById('transfer-panel').classList.remove('visible');
+  document.getElementById('xfer-sid').textContent    = '—';
+  document.getElementById('xfer-status').textContent = 'waiting for your action';
+}
+
+// ── UI helpers ────────────────────────────────────────────────────────────
+function setState(s) {
+  state = s;
+  document.getElementById('info-state').textContent = s;
+
+  const badge = document.getElementById('status-badge');
+  const colors = {
+    idle:             { bg: '#1e293b', color: '#94a3b8', text: 'Idle' },
+    calling:          { bg: '#1e3a5f', color: '#7dd3fc', text: 'Calling…' },
+    in_call:          { bg: '#14532d', color: '#86efac', text: 'In Call' },
+    transfer_pending: { bg: '#78350f', color: '#fcd34d', text: 'Transfer ⚡' },
+    bridged:          { bg: '#14532d', color: '#86efac', text: 'Bridged ✓' },
+    ended:            { bg: '#1e293b', color: '#94a3b8', text: 'Ended' },
+  };
+  const c = colors[s] || colors.idle;
+  badge.style.background = c.bg;
+  badge.style.color      = c.color;
+  badge.textContent      = c.text;
+}
+
+function showTransferPanel(sid) {
+  document.getElementById('xfer-sid').textContent = sid || callSid || '—';
+  document.getElementById('transfer-panel').classList.add('visible');
+  enableTransferButtons();
+}
+
+function disableTransferButtons() {
+  document.getElementById('btn-accept').disabled = true;
+  document.getElementById('btn-reject').disabled = true;
+}
+
+function enableTransferButtons() {
+  document.getElementById('btn-accept').disabled = false;
+  document.getElementById('btn-reject').disabled = false;
+}
+
+function addLog(msg, level = 'info') {
+  const el = document.getElementById('event-log');
+  const row = document.createElement('div');
+  row.className = `log-row log-${level}`;
+  const now = new Date();
+  const ts = `${String(now.getHours()).padStart(2,'0')}:${String(now.getMinutes()).padStart(2,'0')}:${String(now.getSeconds()).padStart(2,'0')}`;
+  row.innerHTML = `<span class="ts">${ts}</span><span class="msg">${msg}</span>`;
+  el.appendChild(row);
+  el.scrollTop = el.scrollHeight;
+}
+
+// ── HTTP helper ───────────────────────────────────────────────────────────
+async function post(url, body) {
+  const r = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) {
+    const detail = (await r.json().catch(() => ({}))).detail || r.statusText;
+    throw new Error(detail);
+  }
+  return r.json();
+}
+</script>
+</body>
+</html>

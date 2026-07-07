@@ -225,6 +225,148 @@ GET /players/{user_id}/responsible-gaming?operator_id={operator_id}
 
 ---
 
+### 7. Player Referral Code
+
+```
+GET /players/{user_id}/referral-code
+```
+
+**When called:** Player asks for their referral code, invite link, or wants to refer a friend.
+
+**Expected response:**
+```json
+{
+  "referral_code": "RAHUL2026",
+  "referral_link": "https://yourplatform.com/join?ref=RAHUL2026",
+  "referral_bonus_per_invite": 100
+}
+```
+
+`referral_bonus_per_invite` may be `null` if the platform does not offer a fixed per-invite reward.
+
+---
+
+### 8. Player Sports Open Bets
+
+```
+GET /players/{user_id}/sports-bets/open?limit={limit}
+```
+
+**When called:** Player asks to see their open / pending sports bets, active bets, or live bet status.
+
+**Query params set by AI:**
+- `limit` — integer, default `10`
+
+**Expected response:**
+```json
+{
+  "open_bets": [
+    {
+      "bet_id": "bet_001",
+      "sport": "Cricket",
+      "league": "IPL 2026",
+      "match": "MI vs CSK",
+      "selection": "MI Win",
+      "stake": 500.00,
+      "odds": 1.85,
+      "cashout_value": 480.00,
+      "placed_at": "2026-07-06T09:00:00Z"
+    }
+  ],
+  "total_open": 1
+}
+```
+
+`cashout_value` is `null` if live cashout is not available for that bet.
+
+---
+
+### 9. Player Sports Match Status (Today's Results)
+
+```
+GET /players/{user_id}/sports-bets/today-results
+```
+
+**When called:** Player asks whether their match/bet won or lost, or about today's bet results.
+
+**Expected response:**
+```json
+{
+  "results": [
+    {
+      "bet_id": "bet_002",
+      "sport": "Cricket",
+      "match": "RCB vs KKR",
+      "market": "Match Winner",
+      "player_selection": "RCB Win",
+      "market_result": "RCB Win",
+      "outcome": "won",
+      "stake": 300.00,
+      "returns": 630.00,
+      "settled_at": "2026-07-06T14:00:00Z"
+    },
+    {
+      "bet_id": "bet_003",
+      "sport": "Football",
+      "match": "Manchester City vs Arsenal",
+      "market": "Match Winner",
+      "player_selection": "Arsenal Win",
+      "market_result": "pending",
+      "outcome": "pending",
+      "stake": 200.00,
+      "returns": null,
+      "settled_at": null
+    }
+  ]
+}
+```
+
+`outcome` is one of: `won` | `lost` | `void` | `pending`.  
+Include all main-market bets placed today (settled and still pending).
+
+---
+
+### 10. Player Casino Game History
+
+```
+GET /players/{user_id}/casino-game-history?game_name={game_name}&limit={limit}
+```
+
+**When called:** Player asks about their performance or history in a specific casino game (e.g. "Teen Patti mein kitna jeeta", "slots ka record").
+
+**Query params set by AI:**
+- `game_name` — name of the game (e.g. `Teen Patti`, `Andar Bahar`, `Roulette`, `Slots`)
+- `limit` — integer, default `10`
+
+**Expected response:**
+```json
+{
+  "game": "Teen Patti",
+  "sessions_played": 42,
+  "total_wagered": 15000.00,
+  "total_won": 16200.00,
+  "net_pnl": 1200.00,
+  "recent_sessions": [
+    {
+      "played_at": "2026-07-06T11:30:00Z",
+      "wagered": 500.00,
+      "won": 750.00,
+      "net": 250.00
+    },
+    {
+      "played_at": "2026-07-05T20:15:00Z",
+      "wagered": 400.00,
+      "won": 0.00,
+      "net": -400.00
+    }
+  ]
+}
+```
+
+Return `null` (or 404) if the player has no history for the requested game.
+
+---
+
 ## Operator Endpoints
 
 These are called for any question about how the platform works — payment methods, games, promotions, platform settings. Only `operator_id` is injected (no `user_id`).

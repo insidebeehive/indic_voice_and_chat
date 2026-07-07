@@ -285,6 +285,7 @@ class PlaceCallRequest(BaseModel):
     lead_name: str = ""
     lead_gender: str = ""       # "male" | "female" | ""; added to lead_data for LLM
     tenant: str = "dev"
+    transfer_webhook_url: str = ""  # override transfer webhook (e.g. bridge console)
 
 
 @dev_router.post("/dev/place-call")
@@ -378,7 +379,8 @@ async def dev_place_call(req: PlaceCallRequest) -> dict:
             tenant.slug, mode=req.mode, voice=req.voice.strip(),
             caller_name=req.caller_name.strip(),
             lead_name=req.lead_name.strip(),
-            lead_gender=req.lead_gender.strip())
+            lead_gender=req.lead_gender.strip(),
+            transfer_webhook_url=req.transfer_webhook_url.strip())
     # Scope the answer URL to the placing tenant's slug for ALL providers: this is
     # an outbound call WE place, so the tenant is known — the answer webhook resolves
     # by slug and the bridge is built with THIS tenant's config, instead of reverse-

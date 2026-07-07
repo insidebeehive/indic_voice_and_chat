@@ -80,6 +80,7 @@ def set_override(
     caller_name: str = "",
     lead_name: str = "",
     lead_gender: str = "",
+    transfer_webhook_url: str = "",
 ) -> None:
     _overrides[tenant_slug] = {
         "mode": mode,
@@ -87,6 +88,7 @@ def set_override(
         "caller_name": caller_name,
         "lead_name": lead_name,
         "lead_gender": lead_gender,
+        "transfer_webhook_url": transfer_webhook_url,
     }
 
 

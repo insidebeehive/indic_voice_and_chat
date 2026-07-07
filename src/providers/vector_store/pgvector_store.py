@@ -1,7 +1,7 @@
 """PGVector adapter for the IVectorStore interface.
 
-Stores all knowledge chunks in a single ``knowledge_chunks`` Postgres table,
-scoped by ``tenant_id`` column (NULL = platform / global docs).  Uses the
+Stores all knowledge chunks in a single ``voicebot.knowledge_chunks`` Postgres
+table, scoped by ``tenant_id`` column (NULL = platform / global docs).  Uses the
 ``pgvector`` extension's cosine-distance operator (``<=>``) with an HNSW index.
 
 Configuration keys (config dict passed from TenantProviders._config_for):
@@ -75,11 +75,11 @@ async def _ensure_schema(pool: Any, dim: int) -> None:
         async with pool.acquire() as conn:
             exists = await conn.fetchval(
                 "SELECT 1 FROM information_schema.tables "
-                "WHERE table_name = 'knowledge_chunks'"
+                "WHERE table_schema = 'voicebot' AND table_name = 'knowledge_chunks'"
             )
             if not exists:
                 raise RuntimeError(
-                    "knowledge_chunks table not found. "
+                    "voicebot.knowledge_chunks table not found. "
                     "Run docs/pgvector_setup.sql as the postgres superuser first."
                 )
         _schema_ready = True
@@ -133,7 +133,7 @@ class PGVectorAdapter(IVectorStore):
         async with pool.acquire() as conn:
             await conn.executemany(
                 """
-                INSERT INTO knowledge_chunks (id, content, metadata, embedding, tenant_id)
+                INSERT INTO voicebot.knowledge_chunks (id, content, metadata, embedding, tenant_id)
                 VALUES ($1, $2, $3::jsonb, $4, $5)
                 ON CONFLICT (id) DO UPDATE
                     SET content = EXCLUDED.content,
@@ -176,7 +176,7 @@ class PGVectorAdapter(IVectorStore):
         sql = f"""
             SELECT id, content, metadata,
                    1 - (embedding <=> $1::vector) AS score
-            FROM knowledge_chunks
+            FROM voicebot.knowledge_chunks
             WHERE {tenant_clause}{filter_clause}
             ORDER BY embedding <=> $1::vector
             LIMIT ${limit_pos}::integer
@@ -201,7 +201,7 @@ class PGVectorAdapter(IVectorStore):
             "tenant_id = $2" if self._tenant_id is not None else "tenant_id IS NULL"
         )
         tenant_params = [self._tenant_id] if self._tenant_id is not None else []
-        sql = f"DELETE FROM knowledge_chunks WHERE id = ANY($1) AND {tenant_clause}"
+        sql = f"DELETE FROM voicebot.knowledge_chunks WHERE id = ANY($1) AND {tenant_clause}"
         async with pool.acquire() as conn:
             result = await conn.execute(sql, doc_ids, *tenant_params)
         # asyncpg returns "DELETE N" as a string
@@ -216,7 +216,7 @@ class PGVectorAdapter(IVectorStore):
             "tenant_id = $1" if self._tenant_id is not None else "tenant_id IS NULL"
         )
         tenant_params = [self._tenant_id] if self._tenant_id is not None else []
-        sql = f"SELECT count(*) FROM knowledge_chunks WHERE {tenant_clause}"
+        sql = f"SELECT count(*) FROM voicebot.knowledge_chunks WHERE {tenant_clause}"
         async with pool.acquire() as conn:
             row = await conn.fetchrow(sql, *tenant_params)
         return int(row["count"]) if row else 0

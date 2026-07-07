@@ -91,7 +91,7 @@ def build_platform_retriever(
 
     Provider is driven by global_defaults["vector_store"]["provider"]:
     - "faiss"    → FAISS files at data/faiss/platform/
-    - "pgvector" → knowledge_chunks table with tenant_id IS NULL
+    - "pgvector" → voicebot.knowledge_chunks table with tenant_id IS NULL
     Defaults to faiss if global_defaults is not supplied.
     """
     from src.providers import get_vector_store
@@ -389,6 +389,7 @@ def _build_s2s_telephony_bridge(
     *, encoding: str, sid_field: str, supports_clear: bool,
     call_sid_field: str = "callSid", voice_override: str | None = None,
     lead_data: dict | None = None, kb_context: str | None = None,
+    transfer_webhook_url_override: str | None = None,
 ):
     """Build a TelephonyLiveBridge (Gemini Live over the media stream) for a call
     whose tenant has pipeline.mode == 's2s'. Mirrors the cascade agent assembly
@@ -440,8 +441,9 @@ def _build_s2s_telephony_bridge(
         "tenant": tenant.slug, "session_id": session_id, "voice": voice,
         "model": rt.model, "encoding": encoding})
     # Transfer-hold: TTS for failure apology; webhook so CS learns to look for a human.
+    # A per-call override (e.g. bridge console) takes priority over tenant config.
     tts = providers.get_tts(tenant)
-    _wh_url = getattr(tenant.settings, "events_webhook_url", None)
+    _wh_url = transfer_webhook_url_override or getattr(tenant.settings, "events_webhook_url", None)
     _wh_sec_env = getattr(tenant.settings, "events_webhook_secret_env", None)
     _wh_secret = (tenant.secret_optional(_wh_sec_env)
                   if _wh_sec_env and hasattr(tenant, "secret_optional") else None)
@@ -527,7 +529,8 @@ def make_bridge_factory(
                 providers, tenant, cur_script, cur_slots, websocket, session_store,
                 encoding="mulaw", sid_field="streamSid", supports_clear=True,
                 call_sid_field="callSid", voice_override=voice_override or None,
-                lead_data=_override_lead_data(override), kb_context=kb_ctx)
+                lead_data=_override_lead_data(override), kb_context=kb_ctx,
+                transfer_webhook_url_override=(override or {}).get("transfer_webhook_url") or None)
         # Build a fresh agent per call; provider clients are cached on the
         # registry so we don't pay reconstruction cost.
         stt = providers.get_stt(tenant)
@@ -694,7 +697,8 @@ def make_exotel_bridge_factory(
                 providers, tenant, cur_script, cur_slots, websocket, session_store,
                 encoding="pcm", sid_field="stream_sid", supports_clear=False,
                 call_sid_field="call_sid", voice_override=voice_override or None,
-                lead_data=_override_lead_data(override), kb_context=kb_ctx)
+                lead_data=_override_lead_data(override), kb_context=kb_ctx,
+                transfer_webhook_url_override=(override or {}).get("transfer_webhook_url") or None)
         stt = providers.get_stt(tenant)
         llm = providers.get_llm(tenant)
         tts = providers.get_tts(tenant)

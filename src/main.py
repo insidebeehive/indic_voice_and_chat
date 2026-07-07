@@ -57,6 +57,7 @@ from src.api.dev_console import (
 from src.api.dev_console import (
     ws_router as dev_ws_router,
 )
+from src.api.bridge_console import router as bridge_router
 from src.api.call_store import (
     record_outcome,
     set_call_outcome_persister,
@@ -426,6 +427,7 @@ app.include_router(api_router)
 
 if dev_console_enabled():
     app.include_router(dev_router)              # GET /dev/voice
+    app.include_router(bridge_router)           # GET /dev/bridge
 
 
 _STATIC_DIR = Path(__file__).resolve().parents[1] / "static"
