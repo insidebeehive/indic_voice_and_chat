@@ -94,13 +94,13 @@ class RegisterTenantRequest(BaseModel):
     slug: Optional[str] = None
     timezone: str = "Asia/Kolkata"
     default_language: str = "hi"
-    mode: str = Field(default="layered", pattern="^(layered|s2s)$")
-    max_concurrent_calls: int = Field(default=1, ge=1)
+    mode: str = Field(default="s2s", pattern="^(layered|s2s)$")
+    max_concurrent_calls: int = Field(default=10, ge=1)
     stt: Optional[LayerChoice] = None
     llm: Optional[LayerChoice] = None
     tts: Optional[LayerChoice] = None
     realtime: Optional[RealtimeChoice] = None
-    telephony: TelephonyConfigIn
+    telephony: TelephonyConfigIn = Field(default_factory=lambda: TelephonyConfigIn(provider="none"))
     # Outbound event webhook — receives call + chat handover lifecycle events,
     # signed when events_webhook_secret is provided (pass as keys["events_webhook_secret"]).
     events_webhook_url: Optional[str] = None
