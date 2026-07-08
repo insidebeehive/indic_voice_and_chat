@@ -85,13 +85,10 @@
           <input id="t_slug" placeholder="e.g. acme" /></label>
       </div>
 
-      <!-- S2S voice -->
+      <!-- S2S model -->
       <div class="grid" style="margin-top:.2rem">
-        <label>S2S model
+        <label>S2S provider
           <select id="sel_s2s" onchange="onS2SProvider()"></select>
-        </label>
-        <label>Voice
-          <select id="voi_s2s"></select>
         </label>
         <label>S2S model variant
           <select id="mdl_s2s" onchange="recompute()"></select>
@@ -111,10 +108,10 @@
 
       <!-- CRM integration -->
       <div class="grid">
-        <label>Events webhook URL
+        <label>Events webhook URL <span class="hint" style="display:inline">(optional — can set later in backoffice)</span>
           <input id="t_webhook" placeholder="https://crm.example.com/vox-events" />
         </label>
-        <label>CRM operator ID
+        <label>CRM operator ID <span class="hint" style="display:inline">(optional)</span>
           <input id="t_crm_op" placeholder="CRM's operator/brand identifier" />
         </label>
         <label>Webhook secret <span class="hint" style="display:inline">(optional — platform default used if blank)</span>
@@ -215,16 +212,9 @@ function setOptions(sel, values, selected) {
   }
 }
 
-async function fillS2SVoices() {
-  const prov = $("sel_s2s").value;
-  const r = await api("GET", `/api/v1/voices?provider=${encodeURIComponent(prov)}&language=hi-IN`);
-  setOptions($("voi_s2s"), (r.ok && r.json.voices ? r.json.voices : []).map(v => v.voice_id));
-}
-
 function onS2SProvider() {
   const prov = $("sel_s2s").value;
   setOptions($("mdl_s2s"), (MODELS.s2s && MODELS.s2s[prov]) || []);
-  fillS2SVoices();
   recompute();
 }
 
@@ -241,7 +231,7 @@ async function loadCatalog() {
   if (!r.ok) return;
   MODELS = r.json.models || {};
   setOptions($("sel_s2s"), Object.keys(MODELS.s2s || {}), "gemini_live");
-  onS2SProvider();
+  onS2SProvider();  // fills model variant dropdown + recomputes cost
 }
 
 function rowKey(kind, provider, model) { return `${kind}|${provider}|${model}`; }
@@ -283,8 +273,6 @@ async function registerTenant() {
     realtime: {
       provider: $("sel_s2s").value,
       model: $("mdl_s2s").value,
-      voice: $("voi_s2s").value,
-      language_code: "hi-IN",
     },
   };
   if ($("t_slug").value.trim())      body.slug              = $("t_slug").value.trim();
