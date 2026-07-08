@@ -64,18 +64,18 @@
     <h2 id="detailTitle">Tenant</h2>
     <div class="tabs">
       <div class="tab active" id="tab_an" onclick="showTab('an')">Analytics</div>
-      <div class="tab" id="tab_bill" onclick="showTab('bill')">Billing</div>
-      <div class="tab" id="tab_tel" onclick="showTab('tel')">Telephony</div>
+      <div class="tab" id="tab_crm" onclick="showTab('crm')">CRM</div>
       <div class="tab" id="tab_camp" onclick="showTab('camp')">Campaign</div>
       <div class="tab" id="tab_chat" onclick="showTab('chat')">Chat</div>
       <div class="tab" id="tab_kb" onclick="showTab('kb')">Knowledge Base</div>
     </div>
     <div id="pane_an"></div>
-    <div id="pane_bill" hidden></div>
-    <div id="pane_tel" hidden></div>
+    <div id="pane_crm" hidden></div>
     <div id="pane_camp" hidden></div>
     <div id="pane_chat" hidden></div>
     <div id="pane_kb" hidden></div>
+    <div id="pane_bill" hidden></div>
+    <div id="pane_tel" hidden></div>
   </div>
 </div>
 
@@ -146,15 +146,17 @@ async function selectTenant(id, slug) {
   $("detailTitle").textContent = `Tenant: ${slug}`;
   showTab("an");
   await loadAnalytics(id);
-  await loadBilling(id);
+  loadBilling(id);
   loadTelephony(id);
+  loadCRM(id, slug);
   loadCampaigns(id);
   loadChat(id, slug);
   loadKB(id, slug);
 }
 function showTab(which) {
-  for (const k of ["an", "bill", "tel", "camp", "chat", "kb"]) {
-    $("tab_" + k).classList.toggle("active", which === k);
+  for (const k of ["an", "crm", "camp", "chat", "kb", "bill", "tel"]) {
+    const tabEl = $("tab_" + k);
+    if (tabEl) tabEl.classList.toggle("active", which === k);
     $("pane_" + k).hidden = which !== k;
   }
 }
@@ -402,7 +404,7 @@ async function saveCampaign(tenantId, campId) {
   }
 }
 
-// --- Chat tab -----------------------------------------------------------
+// --- CRM tab ------------------------------------------------------------
 
 async function apiTenant(method, path, body, slug) {
   const headers = { "Content-Type": "application/json", "X-Tenant-Slug": slug };
@@ -415,39 +417,19 @@ async function apiTenant(method, path, body, slug) {
   } catch (e) { return { ok: false, status: 0, json: { error: String(e) } }; }
 }
 
-async function loadChat(id, slug) {
-  // Fetch tools + existing chat config in parallel
-  const [tr, cr] = await Promise.all([
-    apiTenant("GET", "/api/v1/chat/tools", null, slug),
-    apiSend("GET", `/api/v1/tenants/${id}/chat-config`),
-  ]);
-  const tools = tr.ok ? (tr.json.tools || []) : [];
-  const cfg   = cr.ok ? cr.json : {};
-  const cw    = cfg.chatwoot || {};
-
-  const toolRows = tools.length
-    ? tools.map(t => `<tr>
-        <td>${escT(t.name)}</td>
-        <td style="max-width:22rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escAttr(t.endpoint)}">${escT(t.endpoint)}</td>
-        <td>${escT(t.auth_type || "—")}</td>
-        <td>${t.auth_configured ? "✓" : "—"}</td>
-        <td><button class="ghost sm" onclick="deleteTool('${escAttr(slug)}','${escAttr(t.name)}')">Remove</button></td>
-      </tr>`).join("")
-    : `<tr><td colspan="5" class="hint">No tools registered yet.</td></tr>`;
-
-  // Derive CRM seed hints from existing tools
-  const firstTool = tools[0];
+async function loadCRM(id, slug) {
+  const cr = await apiSend("GET", `/api/v1/tenants/${id}/chat-config`);
+  const cfg    = cr.ok ? cr.json : {};
   const crmCfg = cfg.crm || {};
 
-  $("pane_chat").innerHTML = `
+  $("pane_crm").innerHTML = `
     <div class="hint" style="margin-bottom:.6rem;">
       CRM tools (wallet, bets, transactions, bonuses, profile, operator config) are built in
       at the platform level. Set the API credentials below — no per-tenant seeding required.
     </div>
-
     <h2>CRM API credentials</h2>
     <div class="hint" style="margin-bottom:.5rem;">
-      Credentials used when the chatbot calls the BetStudio CRM APIs on behalf of this operator.
+      Credentials used when the voicebot and chatbot call the BetStudio CRM APIs on behalf of this operator.
       Leave <b>Base URL</b> blank to use the platform default (<code>PLATFORM_CRM_BASE_URL</code>).
     </div>
     <div class="creds" style="gap:.6rem;flex-wrap:wrap;">
@@ -470,9 +452,37 @@ async function loadChat(id, slug) {
     <div style="margin-top:.8rem;">
       <button onclick="saveCrmConfig('${escAttr(slug)}')">Save CRM credentials</button>
       <span id="ch_result" class="hint" style="margin-left:.6rem;"></span>
-    </div>
+    </div>`;
 
-    <h2 style="margin-top:1.2rem;">Registered tools <small class="hint">(per-tenant overrides)</small></h2>
+  if (crmCfg.base_url)    $("ch_base").value        = crmCfg.base_url;
+  if (crmCfg.auth_type)   $("ch_authtype").value    = crmCfg.auth_type;
+  if (crmCfg.api_token)   $("ch_token").placeholder = "... (already set — leave blank to keep)";
+  if (crmCfg.operator_id) $("ch_opid").value        = crmCfg.operator_id;
+}
+
+// --- Chat tab ------------------------------------------------------------
+
+async function loadChat(id, slug) {
+  const [tr, cr] = await Promise.all([
+    apiTenant("GET", "/api/v1/chat/tools", null, slug),
+    apiSend("GET", `/api/v1/tenants/${id}/chat-config`),
+  ]);
+  const tools = tr.ok ? (tr.json.tools || []) : [];
+  const cfg   = cr.ok ? cr.json : {};
+  const cw    = cfg.chatwoot || {};
+
+  const toolRows = tools.length
+    ? tools.map(t => `<tr>
+        <td>${escT(t.name)}</td>
+        <td style="max-width:22rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escAttr(t.endpoint)}">${escT(t.endpoint)}</td>
+        <td>${escT(t.auth_type || "—")}</td>
+        <td>${t.auth_configured ? "✓" : "—"}</td>
+        <td><button class="ghost sm" onclick="deleteTool('${escAttr(slug)}','${escAttr(t.name)}')">Remove</button></td>
+      </tr>`).join("")
+    : `<tr><td colspan="5" class="hint">No tools registered yet.</td></tr>`;
+
+  $("pane_chat").innerHTML = `
+    <h2>Registered tools <small class="hint">(per-tenant overrides)</small></h2>
     <div class="hint" style="margin-bottom:.4rem;">Platform catalog tools are used automatically. Tools here override or extend the catalog.</div>
     <table style="margin-bottom:.8rem;">
       <thead><tr><th>Name</th><th>Endpoint</th><th>Auth type</th><th>Token set</th><th></th></tr></thead>
@@ -504,17 +514,10 @@ async function loadChat(id, slug) {
       <span id="cw_result" class="hint" style="margin-left:.6rem;"></span>
     </div>`;
 
-  // Pre-populate CRM credentials form from chat-config
-  if (crmCfg.base_url)    $("ch_base").value       = crmCfg.base_url;
-  if (crmCfg.auth_type)   $("ch_authtype").value   = crmCfg.auth_type;
-  if (crmCfg.api_token)   $("ch_token").placeholder = "... (already set — leave blank to keep)";
-  if (crmCfg.operator_id) $("ch_opid").value        = crmCfg.operator_id;
-
-  // Pre-populate Chatwoot form from existing config
-  if (cw.inbox_id)   $("cw_inbox").value   = cw.inbox_id;
-  if (cw.account_id) $("cw_account").value = cw.account_id;
-  if (cw.api_url)    $("cw_url").value     = cw.api_url;
-  if (cw.api_token)  $("cw_token").placeholder = "... (already set — leave blank to keep)";
+  if (cw.inbox_id)   $("cw_inbox").value        = cw.inbox_id;
+  if (cw.account_id) $("cw_account").value       = cw.account_id;
+  if (cw.api_url)    $("cw_url").value           = cw.api_url;
+  if (cw.api_token)  $("cw_token").placeholder   = "... (already set — leave blank to keep)";
 }
 
 async function saveChatwootConfig(slug) {
