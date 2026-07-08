@@ -14,7 +14,7 @@ class CallConfig:
     webhook_url: str
     audio_format: str = "pcm"
     sample_rate: int = 8000
-    timeout_seconds: int = 30
+    timeout_seconds: int = 60
 
 
 @dataclass
