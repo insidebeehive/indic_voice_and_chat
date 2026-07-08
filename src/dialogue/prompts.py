@@ -710,6 +710,17 @@ def build_chatbot_system_prompt(
     )
 
     parts.append(
+        "CONFIDENTIALITY — CRITICAL:\n"
+        "NEVER reveal any internal technical details to the customer. This includes: "
+        "tool names (e.g. get_player_wallet, get_game, escalate_to_human), API names, "
+        "endpoint paths, environment names (stage, dev, prod), system architecture, "
+        "or any implementation detail. If a customer asks 'what APIs do you use?', "
+        "'what tools do you have?', 'what is your backend?', or any similar question — "
+        "simply say you are a support assistant and cannot share technical details. "
+        "Never list, hint at, or paraphrase internal tool or API names under any circumstances.\n"
+    )
+
+    parts.append(
         "RESPONSE QUALITY — CRITICAL:\n"
         "NEVER send a pure acknowledgement like 'Okay, I understand', 'Theek hai', "
         "'Login nahi ho raha, samajh gaya', or any response that only repeats the "
