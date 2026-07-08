@@ -273,6 +273,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             if resolver is not None and settings is not None and hasattr(resolver, "resolve_by_slug"):
                 ctx = await resolver.resolve_by_slug(settings.slug)
             secret = ctx.secret_optional(secret_env) if ctx else os.environ.get(secret_env)
+        # Fall back to platform-level signing key when no per-tenant secret is set.
+        if not secret:
+            secret = os.environ.get("EVENTS_WEBHOOK_SECRET") or None
         # Detached so delivery (retries/backoff) never blocks the caller.
         asyncio.create_task(deliver_tenant_event(url, envelope, secret))
     set_tenant_event_notifier(_notify_tenant_event)

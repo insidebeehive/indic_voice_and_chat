@@ -28,6 +28,9 @@ async def send_bo_webhook(tenant, event_type: str, payload: dict) -> bool:
         return False
     secret_env = getattr(settings, "events_webhook_secret_env", None)
     secret = tenant.secret_optional(secret_env) if secret_env and hasattr(tenant, "secret_optional") else None
+    if not secret:
+        import os
+        secret = os.environ.get("EVENTS_WEBHOOK_SECRET") or None
     body: dict[str, Any] = {"event": event_type, **payload}
     ok = await deliver(url, body, secret)
     if not ok:

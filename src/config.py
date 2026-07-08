@@ -241,6 +241,7 @@ class Secrets(BaseSettings):
 
     # Misc
     WEBHOOK_BASE_URL: Optional[str] = None
+    EVENTS_WEBHOOK_SECRET: Optional[str] = None  # platform-level HMAC signing key for outbound webhooks
     SECRET_KEY: str = "change-me-in-prod"
     VOX_CONFIG_PATH: str = "config/default.yaml"
 
