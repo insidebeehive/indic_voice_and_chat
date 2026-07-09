@@ -14,6 +14,7 @@ Configuration keys (config dict passed from TenantProviders._config_for):
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 from typing import Any, Optional
@@ -188,7 +189,8 @@ class PGVectorAdapter(IVectorStore):
 
         results = []
         for r in rows:
-            meta = dict(r["metadata"]) if r["metadata"] else {}
+            raw = r["metadata"]
+            meta = json.loads(raw) if isinstance(raw, str) else (dict(raw) if raw else {})
             doc = Document(id=r["id"], content=r["content"], metadata=meta)
             results.append(SearchResult(document=doc, score=float(r["score"])))
         return results
