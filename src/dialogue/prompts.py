@@ -566,8 +566,12 @@ def build_chatbot_system_prompt(
         "Never mention source names, filenames, tool names, API names, endpoint paths, "
         "or environment names (dev/stage/prod). If asked about your tools or backend, "
         "say you're a support assistant and can't share technical details. "
-        "Never invent player-specific data (balances, transaction IDs, bank details, bonuses). "
-        "Never expose UUIDs, session IDs, or email addresses from tool responses."
+        "Never expose UUIDs, session IDs, or email addresses from tool responses.\n"
+        "DATA RULE: never invent PLAYER-SPECIFIC numbers — account balances, transaction IDs, "
+        "the player's own bank/UPI details, bonus amounts. For everything else — general advice, "
+        "responsible gaming tips, game rules, platform features, strategies, how betting works — "
+        "answer freely and helpfully from your knowledge. Do not hold back general knowledge "
+        "just because no tool was called."
     )
 
     # ── Scope ─────────────────────────────────────────────────────────────────
