@@ -199,17 +199,21 @@ PLAYER_TOOLS: dict[str, dict] = {
 OPERATOR_TOOLS: dict[str, dict] = {
     "get_game": {
         "description": (
-            "Get details about a specific game by name: rules, availability, "
-            "minimum/maximum bet limits, RTP, and any active promotions for that game. "
-            "Call this whenever the customer asks about a specific game by name "
-            "(e.g. 'how do I play Teen Patti?', 'is Andar Bahar available?', "
-            "'what are the limits for roulette?')."
+            "Search for games by name and return a list of matching games with details "
+            "(title, provider, availability, bet limits, RTP). Returns multiple results "
+            "when the name matches several variants — e.g. searching 'Andar Bahar' "
+            "returns every Andar Bahar variant across all providers. "
+            "Call this whenever the customer asks about a named game, wants to know "
+            "how many variants exist, or wants to list games of a specific type "
+            "(e.g. 'how many Andar Bahar games?', 'list all roulette variants', "
+            "'what Teen Patti games are available?', 'is Andar Bahar available?', "
+            "'how do I play Teen Patti?', 'what are the limits for roulette?')."
         ),
         "parameters": {
             "operator_id": {"type": "string", "source": "session",
                             "description": "Operator identifier"},
             "name": {"type": "string", "source": "llm",
-                     "description": "Name of the game the customer is asking about"},
+                     "description": "Name or type of game to search for (e.g. 'Andar Bahar', 'Roulette', 'Teen Patti') — returns all matching variants"},
         },
         "default_path": "/operators/{operator_id}/games",
         "method": "GET",
@@ -235,9 +239,12 @@ OPERATOR_TOOLS: dict[str, dict] = {
             "providers/aggregators are enabled, available sports and leagues, whether "
             "live casino is enabled, Matka/lottery/virtual-sports availability, "
             "in-play betting support, and cashout availability on sports bets. "
-            "Call this whenever the customer asks which games are available, what "
-            "game types the platform offers, whether a specific category (live casino, "
-            "sports, lottery, Matka) is available, or asks for a list of games."
+            "Call this when the customer asks which game CATEGORIES or product types "
+            "are available on the platform (e.g. 'do you have live casino?', "
+            "'is sports betting available?', 'do you have Matka?', "
+            "'what types of games are there?'). "
+            "For questions about a specific named game or how many variants exist, "
+            "use get_game instead."
         ),
         "parameters": {
             "operator_id": {"type": "string", "source": "session",

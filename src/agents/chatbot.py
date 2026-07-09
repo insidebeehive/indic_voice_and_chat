@@ -223,6 +223,10 @@ class ChatBotAgent(BaseAgent):
         )
         for _ in range(self._max_tool_rounds):
             result = await self._llm.generate(messages, cfg)
+            log.debug(
+                "chatbot llm turn: finish=%s usage=%s text_len=%d tool_calls=%d",
+                result.finish_reason, result.usage, len(result.text or ""), len(result.tool_calls),
+            )
             if not result.tool_calls:
                 text = result.text
                 break

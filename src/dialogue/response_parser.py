@@ -65,7 +65,7 @@ def parse_voicebot_response(text: str) -> VoiceBotResponse:
     obj, error = _extract_json(text)
     if obj is None:
         return VoiceBotResponse(
-            response_text=_fallback_text(text),
+            response_text=_fallback_text(text, speakable=True),
             action="clarify",
             parse_error=error,
         )
@@ -173,12 +173,18 @@ def _largest_balanced_block(text: str) -> Optional[str]:
     return text[start : end + 1]
 
 
-def _fallback_text(text: str) -> str:
-    """When parsing fails, salvage *something* speakable."""
+def _fallback_text(text: str, speakable: bool = False) -> str:
+    """When parsing fails, salvage *something* from the raw LLM output.
+
+    speakable=True (voicebot): cut to the first sentence so JSON is never
+    read aloud.  speakable=False (chatbot): return the full cleaned text.
+    """
     cleaned = text.strip().replace("```json", "").replace("```", "").strip()
     if not cleaned:
         return "Maaf kijiye, ek minute de dijiye."
-    # Take the first sentence-ish chunk so we don't read JSON aloud.
+    if not speakable:
+        return cleaned
+    # Voice path: take the first sentence-ish chunk so JSON isn't spoken.
     for sep in (". ", "! ", "? ", "।"):
         idx = cleaned.find(sep)
         if idx != -1:
