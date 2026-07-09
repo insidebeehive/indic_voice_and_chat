@@ -44,7 +44,7 @@
   #preview-bar button { background:none; border:none; cursor:pointer; color:#64748b; font-size:1rem; line-height:1; }
   .hidden { display:none; }
 </style>
-<script src="https://cdn.jsdelivr.net/npm/qrcode@1.5.3/build/qrcode.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js"></script>
 </head>
 <body>
 <div id="app">
@@ -125,15 +125,19 @@
   function _renderQrBlock(upiUrl) {
     const wrap = document.createElement("div");
     wrap.className = "qr-block";
-    const canvas = document.createElement("canvas");
+    const qrTarget = document.createElement("div");
     const label = document.createElement("div");
     label.className = "qr-label";
     label.textContent = "Scan to pay via UPI";
-    wrap.appendChild(canvas);
+    wrap.appendChild(qrTarget);
     wrap.appendChild(label);
-    QRCode.toCanvas(canvas, upiUrl, { width: 180, margin: 2 }, (err) => {
-      if (err) { wrap.remove(); }
-    });
+    try {
+      new QRCode(qrTarget, { text: upiUrl, width: 180, height: 180, correctLevel: QRCode.CorrectLevel.M });
+    } catch (e) {
+      // Fallback: show the UPI URL as a tappable link if library unavailable
+      qrTarget.innerHTML = `<a href="${upiUrl}" style="font-size:.75rem;color:#2563eb;word-break:break-all;">${upiUrl}</a>`;
+      label.textContent = "Tap to open in UPI app";
+    }
     return wrap;
   }
 
