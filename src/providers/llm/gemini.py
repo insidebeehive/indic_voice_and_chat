@@ -110,6 +110,9 @@ class GeminiLLMAdapter(ILLMProvider):
         cfg: dict[str, Any] = {
             "temperature": config.temperature,
             "max_output_tokens": config.max_tokens,
+            # Gemini 2.5 Flash thinking tokens count against max_output_tokens.
+            # Cap thinking at 1024 so the bulk of the budget goes to actual output.
+            "thinking_config": {"thinking_budget": 1024},
         }
         if config.tools:
             # Function declarations as plain dicts — the SDK coerces them.
