@@ -21,6 +21,9 @@
   .msg.agent strong { font-weight:600; }
   .msg.agent em { font-style:italic; }
   .msg.customer { background:var(--cust); color:var(--cust-fg); align-self:flex-end; white-space:pre-wrap; }
+  .qr-block { margin:.5rem 0 .2rem; text-align:center; }
+  .qr-block canvas { display:block; margin:0 auto; border-radius:8px; border:1px solid #e5e7eb; }
+  .qr-block .qr-label { font-size:.72rem; color:#6b7280; margin-top:.3rem; }
   .meta { font-size:.7rem; color:#6b7280; align-self:flex-start; }
   #typing { font-style:italic; color:#6b7280; padding:0 1rem .4rem; height:1.1rem; }
   #suggestions { display:flex; gap:.4rem; flex-wrap:wrap; padding:0 1rem .4rem; }
@@ -41,6 +44,7 @@
   #preview-bar button { background:none; border:none; cursor:pointer; color:#64748b; font-size:1rem; line-height:1; }
   .hidden { display:none; }
 </style>
+<script src="https://cdn.jsdelivr.net/npm/qrcode@1.5.3/build/qrcode.min.js"></script>
 </head>
 <body>
 <div id="app">
@@ -108,13 +112,40 @@
     return html.replace(/(<br>\s*)+$/, "");
   }
 
+  // Extract all upi:// URLs from text, return {upiUrls, cleanedText}
+  function _extractUpi(text) {
+    const upiUrls = [];
+    const cleaned = text.replace(/(?:QR\s*Code\s*:\s*)?(upi:\/\/[^\s\n]+)/gi, (_, url) => {
+      upiUrls.push(url);
+      return "";
+    }).replace(/\n{3,}/g, "\n\n").trim();
+    return { upiUrls, cleaned };
+  }
+
+  function _renderQrBlock(upiUrl) {
+    const wrap = document.createElement("div");
+    wrap.className = "qr-block";
+    const canvas = document.createElement("canvas");
+    const label = document.createElement("div");
+    label.className = "qr-label";
+    label.textContent = "Scan to pay via UPI";
+    wrap.appendChild(canvas);
+    wrap.appendChild(label);
+    QRCode.toCanvas(canvas, upiUrl, { width: 180, margin: 2 }, (err) => {
+      if (err) { wrap.remove(); }
+    });
+    return wrap;
+  }
+
   function add(role, text) {
     const el = document.createElement("div");
     el.className = "msg " + (role === "customer" ? "customer" : "agent");
     if (role === "customer") {
       el.textContent = text;
     } else {
-      el.innerHTML = renderMd(text);
+      const { upiUrls, cleaned } = _extractUpi(text);
+      if (cleaned) el.innerHTML = renderMd(cleaned);
+      upiUrls.forEach(url => el.appendChild(_renderQrBlock(url)));
     }
     $("log").appendChild(el);
     $("log").scrollTop = $("log").scrollHeight;
