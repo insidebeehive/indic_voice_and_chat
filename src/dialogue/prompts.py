@@ -623,6 +623,18 @@ def build_chatbot_system_prompt(
     if rag_context:
         parts.append("Reference sources:\n" + rag_context)
 
+    # ── Tool use ──────────────────────────────────────────────────────────────
+    parts.append(
+        "TOOL USE — REASON FIRST:\n"
+        "Before every reply, reason about what the customer is actually asking given the full "
+        "conversation context. Short or vague messages ('which ones?', 'list all', 'more', '?', "
+        "'tell me', 'what variety') carry intent from the conversation — infer it and act on it. "
+        "If any available tool could give real, specific data relevant to the current topic, call "
+        "it. Pick the tool that gives the deepest answer for the inferred intent — not necessarily "
+        "the same tool as before; a follow-up may warrant a different tool that goes deeper. "
+        "Never give a vague generic response when a tool call would give real data."
+    )
+
     # ── Escalation ────────────────────────────────────────────────────────────
     parts.append(
         "ESCALATION:\n"
