@@ -457,12 +457,12 @@ def build_s2s_system_instruction(
 
     parts.append(
         "Core behavior every turn:\n"
-        "1. CRITICAL — BE BRIEF: reply in ONE short sentence (two at the very most), then STOP "
+        "1. CRITICAL — BE BRIEF: reply in one to two short sentences (three at the very most), then STOP "
         "and let the customer talk. This is a fast back-and-forth phone call — never give long "
         "explanations, lists, or monologues. If you have more to say, say it across turns.\n"
         "2. LISTEN FIRST: answer what the customer actually said, directly, in your own warm "
         "words (draw on the knowledge below — never recite).\n"
-        "3. THEN nudge gently toward your objective with ONE short line; talking points are "
+        "3. THEN nudge gently toward your objective with one to two short sentences; talking points are "
         "material, not a checklist to read out.\n"
         "4. REDIRECT ONLY WHEN the input is unrelated: briefly acknowledge, then steer back. "
         "On-topic questions or concerns get a real answer (e.g., 'is this safe?' → answer it "
