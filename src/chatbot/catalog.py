@@ -190,6 +190,32 @@ PLAYER_TOOLS: dict[str, dict] = {
         "default_path": "/players/{user_id}/casino-game-history",
         "method": "GET",
     },
+    "get_matka_bids": {
+        "description": (
+            "Get the player's Matka bid data: open/pending bids, full bid history, "
+            "settlement results per market, bid acceptance status, cancellation and "
+            "refund status for cancelled markets, payout/credit status for winnings, "
+            "and Matka P&L summary. "
+            "Call this for ANY player Matka query about their own bids or results "
+            "(e.g. 'Matka mein open bets dikhao', 'meri Matka history dikhao', "
+            "'All Bids dikhao', 'kya mera bet accept hua?', "
+            "'Kalyan ka result kya aaya mera bet ka?', 'mera bet history mein nahi dikh raha', "
+            "'market cancel hua toh refund milega?', 'is hafte Matka mein kitna jeeta/haara?', "
+            "'meri jeet credit kyu nahi hui?', 'bet accept kyu nahi hua?')."
+        ),
+        "parameters": {
+            "user_id": {"type": "string", "source": "session",
+                        "description": "Player identifier"},
+            "status": {"type": "string", "source": "llm",
+                       "description": "Filter: open | settled | cancelled | all (default: all)"},
+            "market": {"type": "string", "source": "llm",
+                       "description": "Optional: filter to a specific market name (e.g. 'Kalyan', 'Milan Day', 'Starline')"},
+            "limit": {"type": "integer", "source": "llm",
+                      "description": "Max records to return (default: 20)"},
+        },
+        "default_path": "/players/{user_id}/matka-bids",
+        "method": "GET",
+    },
 }
 
 # ---------------------------------------------------------------------------
@@ -243,14 +269,39 @@ OPERATOR_TOOLS: dict[str, dict] = {
             "are available on the platform (e.g. 'do you have live casino?', "
             "'is sports betting available?', 'do you have Matka?', "
             "'what types of games are there?'). "
-            "For questions about a specific named game or how many variants exist, "
-            "use get_game instead."
+            "For specific named game or variant questions use get_game instead. "
+            "For Matka-specific details (markets, odds, timing, bet types) use get_matka_config instead."
         ),
         "parameters": {
             "operator_id": {"type": "string", "source": "session",
                             "description": "Operator identifier"},
         },
         "default_path": "/operators/{operator_id}/games-config",
+        "method": "GET",
+    },
+    "get_matka_config": {
+        "description": (
+            "Get the operator's Matka configuration: available markets (e.g. Kalyan, "
+            "Milan Day, Rajdhani Night), whether Starline and Jackpot Matka are enabled, "
+            "supported bet types per market (Single, Jodi, Patti, Half/Full Sangam, "
+            "SP/DP/TP, Red Bracket), payout odds for each bet type, market session timings "
+            "(open bid / close bid / open result / close result times), minimum and maximum "
+            "stake limits per bet type, whether Panna/Jodi charts and result history are "
+            "accessible, and legacy Matka rounds availability. "
+            "Call this for ANY Matka question about platform config, game types, odds, "
+            "timing, or limits (e.g. 'which Matka markets are available?', "
+            "'is Starline available?', 'is Jackpot Matka available?', "
+            "'what bet types are supported?', 'what are the payout rates for Jodi?', "
+            "'when does Kalyan close?', 'what is the minimum Matka bet?', "
+            "'can I see past results or charts?')."
+        ),
+        "parameters": {
+            "operator_id": {"type": "string", "source": "session",
+                            "description": "Operator identifier"},
+            "market_name": {"type": "string", "source": "llm",
+                            "description": "Optional: filter to a specific market (e.g. 'Kalyan', 'Milan Day', 'Starline'). Omit to get full Matka config."},
+        },
+        "default_path": "/operators/{operator_id}/matka-config",
         "method": "GET",
     },
     "get_operator_promotions": {
