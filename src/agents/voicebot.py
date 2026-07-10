@@ -82,6 +82,7 @@ class VoiceBotAgent(BaseAgent):
         self._script = script
         self._engine = engine
         self._extra_directives = extra_directives
+        self._kb_context = kb_context
         # The conversation's active language. Starts at the campaign default and
         # switches when the caller speaks/asks for another language (resolved each
         # turn from the LLM-reported + STT-detected signals). Drives per-turn
@@ -317,6 +318,20 @@ class VoiceBotAgent(BaseAgent):
         # picks it up immediately for the next turn's greeting tokens.
         if "lead_gender" in applied and self.session.lead_data is not None:
             self.session.lead_data["lead_gender"] = applied["lead_gender"]
+            # Rebuild the system prompt so the "gender unknown → skip gendered
+            # titles" directive is replaced with the now-known gender.  In
+            # layered mode the prompt is sent per-turn (as turns[0]), so we must
+            # update it in-place; otherwise the LLM keeps ignoring the salutation.
+            updated_prompt = build_voicebot_system_prompt(
+                script=self._script,
+                schema=self.slots.schema,
+                lead_data=self.session.lead_data,
+                extra_directives=self._extra_directives,
+                kb_context=self._kb_context,
+            )
+            self._system_prompt = updated_prompt
+            if self.session.turns:
+                self.session.turns[0] = LLMMessage(role="system", content=updated_prompt)
 
         if agent_text:
             self.session.turns.append(LLMMessage(role="assistant", content=agent_text))

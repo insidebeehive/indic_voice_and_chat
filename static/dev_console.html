@@ -766,9 +766,9 @@ async function loadTTSVoices(provider) {
       const o = document.createElement("option");
       o.value = v.voice_id;
       o.dataset.gender = v.gender || "";
-      // Strip language prefix for display (hi-IN-Neural2-A → Neural2-A)
-      const shortId = v.voice_id.replace(/^[a-z]{2}-[A-Z]{2}-/, "");
-      o.textContent = shortId + (v.gender ? " — " + v.gender : "");
+      // Use name when present (e.g. ElevenLabs "Rachel"); else strip language prefix
+      const label = v.name || v.voice_id.replace(/^[a-z]{2}-[A-Z]{2}-/, "");
+      o.textContent = label + (v.gender ? " — " + v.gender : "");
       sel.appendChild(o);
     }
   } catch (e) { console.warn("[devconsole] tts-voices fetch failed", e); }

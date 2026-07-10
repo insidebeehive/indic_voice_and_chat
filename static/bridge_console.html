@@ -744,8 +744,8 @@ async function loadTTSVoices(provider) {
     for (const v of (data.voices || [])) {
       const o = document.createElement("option");
       o.value = v.voice_id; o.dataset.gender = v.gender || "";
-      const shortId = v.voice_id.replace(/^[a-z]{2}-[A-Z]{2}-/, "");
-      o.textContent = shortId + (v.gender ? " — " + v.gender : "");
+      const label = v.name || v.voice_id.replace(/^[a-z]{2}-[A-Z]{2}-/, "");
+      o.textContent = label + (v.gender ? " — " + v.gender : "");
       sel.appendChild(o);
     }
   } catch (e) { console.warn("[bridge] tts-voices fetch failed", e); }

@@ -778,6 +778,10 @@ def make_browser_bridge_factory(
             from src.providers.voice_catalog import gender_from_voice_id
             replacements: dict = {}
             derived_gender = gender_from_voice_id(sel_voice) if sel_voice else ""
+            if not derived_gender:
+                # Frontend sends &gender= from the selected voice option's data-gender;
+                # covers providers absent from the static catalog (e.g. ElevenLabs).
+                derived_gender = (query_params.get("gender") or "").strip().lower()
             if derived_gender:
                 replacements["gender"] = derived_gender
             if caller_name_override:
