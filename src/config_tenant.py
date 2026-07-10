@@ -254,6 +254,9 @@ class ChatSupportConfig(BaseModel):
     # Keyed by day-range string ("mon-fri", "sat", "sun"); value = "HH:MM-HH:MM".
     # Absent key = closed that day. Empty dict = check disabled (always available).
     support_hours: dict = Field(default_factory=dict)
+    # Seconds of customer silence before the AI chat auto-closes and fires
+    # session_closed to the CRM. 0 disables the timeout entirely.
+    chat_idle_timeout_seconds: int = 300
 
 
 class TenantSettings(BaseModel):

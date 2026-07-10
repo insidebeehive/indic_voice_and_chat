@@ -769,12 +769,14 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
                 return  # session fully ended
             # CRM declined — fall through to bot loop below
 
+        idle_timeout = getattr(tenant.settings.chat_support, "chat_idle_timeout_seconds", 300) or None
+
         while True:
             try:
                 raw = await asyncio.wait_for(
-                    websocket.receive_text(), timeout=CHAT_IDLE_TIMEOUT_S)
+                    websocket.receive_text(), timeout=idle_timeout)
             except asyncio.TimeoutError:
-                # Customer silent for CHAT_IDLE_TIMEOUT_S — close gracefully and
+                # Customer silent for idle_timeout seconds — close gracefully and
                 # fire session_closed so the CRM can auto-close the ticket.
                 farewell = (
                     "It looks like you've stepped away. I'll close this chat now — "
