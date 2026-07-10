@@ -179,6 +179,10 @@ _TTS_META: dict[str, dict] = {
         "label": "Azure Neural",
         "languages": ["hi-IN", "en-IN", "mr-IN", "ta-IN", "te-IN", "bn-IN", "gu-IN", "kn-IN", "ml-IN"],
     },
+    "elevenlabs": {
+        "label": "ElevenLabs (custom voice)",
+        "languages": ["en-IN", "hi-IN", "en-US", "multilingual"],
+    },
 }
 
 
