@@ -59,12 +59,9 @@ def _pcm_output_format(sample_rate: int) -> str:
 
 class ElevenLabsTTSAdapter(ITTSProvider):
     def __init__(self, config: dict[str, Any]) -> None:
-        self._api_key = config.get("api_key") or os.environ.get("ELEVENLABS_API_KEY")
-        if not self._api_key:
-            raise ValueError(
-                "ElevenLabsTTSAdapter requires an API key "
-                "(config 'api_key' or ELEVENLABS_API_KEY env var)"
-            )
+        # Defer missing-key error to synthesis time so get_available_voices()
+        # works without a key (used by /dev/tts-voices for the voice dropdown).
+        self._api_key = config.get("api_key") or os.environ.get("ELEVENLABS_API_KEY") or ""
         self._model = config.get("model") or DEFAULT_MODEL
         self._default_voice_id = config.get("voice_id") or DEFAULT_VOICE_ID
         self._timeout = float(config.get("timeout", _DEFAULT_TIMEOUT_S))
@@ -79,6 +76,11 @@ class ElevenLabsTTSAdapter(ITTSProvider):
         return config.voice_id or self._default_voice_id
 
     async def synthesize(self, text: str, config: TTSConfig) -> TTSResult:
+        if not self._api_key:
+            raise ValueError(
+                "ElevenLabsTTSAdapter requires an API key "
+                "(config 'api_key' or ELEVENLABS_API_KEY env var)"
+            )
         voice_id = self._voice(config)
         output_format = _pcm_output_format(config.sample_rate)
         url = (
@@ -156,6 +158,28 @@ class ElevenLabsTTSAdapter(ITTSProvider):
                 raise
 
     def get_available_voices(self, language: str) -> list[dict]:
-        # Preset list — custom/cloned voices are fetched from the ElevenLabs
-        # dashboard and passed in as voice_id directly.
-        return list(_PRESET_VOICES)
+        # If a key is configured, fetch the account's actual voices (includes
+        # cloned/custom voices). Fall back to preset list when no key is set.
+        if not self._api_key:
+            return list(_PRESET_VOICES)
+        try:
+            import httpx as _httpx
+            resp = _httpx.get(
+                f"{ELEVENLABS_BASE_URL}/voices",
+                headers={"xi-api-key": self._api_key},
+                timeout=8.0,
+            )
+            resp.raise_for_status()
+            voices = resp.json().get("voices", [])
+            return [
+                {
+                    "voice_id": v["voice_id"],
+                    "name": v.get("name", v["voice_id"]),
+                    "gender": (v.get("labels") or {}).get("gender", ""),
+                    "category": v.get("category", ""),
+                }
+                for v in voices
+            ]
+        except Exception:
+            log.warning("elevenlabs: failed to fetch voices, falling back to preset list")
+            return list(_PRESET_VOICES)
