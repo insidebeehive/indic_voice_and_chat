@@ -770,7 +770,27 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
             # CRM declined — fall through to bot loop below
 
         while True:
-            raw = await websocket.receive_text()
+            try:
+                raw = await asyncio.wait_for(
+                    websocket.receive_text(), timeout=CHAT_IDLE_TIMEOUT_S)
+            except asyncio.TimeoutError:
+                # Customer silent for CHAT_IDLE_TIMEOUT_S — close gracefully and
+                # fire session_closed so the CRM can auto-close the ticket.
+                farewell = (
+                    "It looks like you've stepped away. I'll close this chat now — "
+                    "feel free to start a new conversation anytime!"
+                )
+                await websocket.send_text(json.dumps({
+                    "type": "message", "session_id": session_id,
+                    "text": farewell, "sources": [], "suggestions": [], "action": "end",
+                }))
+                summary = await agent.summarize_session()
+                await _end_session(session_id, summary)
+                await _send_close_webhook(tenant, session_id, "ai", summary)
+                await websocket.send_text(json.dumps({
+                    "type": "ended", "summary": summary, "reason": "idle_timeout",
+                }))
+                break
             try:
                 msg = json.loads(raw)
             except json.JSONDecodeError:
@@ -1123,6 +1143,7 @@ async def _handle_escalation(
 
 
 _AWAIT_HUMAN_TIMEOUT_S = 300.0  # revert to bot after 5 min with no claim/decline
+CHAT_IDLE_TIMEOUT_S = 300.0  # close AI-mode chat if customer silent for 5 min
 
 
 async def _revert_to_bot(websocket: WebSocket, session_id: str) -> None:
