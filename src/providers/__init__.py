@@ -28,6 +28,7 @@ from src.providers.telephony.stringee import StringeeAdapter
 from src.providers.telephony.telnyx import TelnyxAdapter
 from src.providers.telephony.twilio import TwilioAdapter
 from src.providers.tts.azure import AzureTTSAdapter
+from src.providers.tts.elevenlabs import ElevenLabsTTSAdapter
 from src.providers.tts.gemini import GeminiTTSAdapter
 from src.providers.tts.google import GoogleTTSAdapter
 from src.providers.tts.sarvam import SarvamTTSAdapter
@@ -56,6 +57,7 @@ TTS_PROVIDERS: dict[str, type[ITTSProvider]] = {
     "gemini": GeminiTTSAdapter,
     "google": GoogleTTSAdapter,
     "azure": AzureTTSAdapter,
+    "elevenlabs": ElevenLabsTTSAdapter,
 }
 
 TELEPHONY_PROVIDERS: dict[str, type[ITelephonyProvider]] = {

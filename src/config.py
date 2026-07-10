@@ -219,6 +219,7 @@ class Secrets(BaseSettings):
     GROQ_API_KEY: Optional[str] = None
     GEMINI_API_KEY: Optional[str] = None
     DEEPGRAM_API_KEY: Optional[str] = None
+    ELEVENLABS_API_KEY: Optional[str] = None
     GOOGLE_TTS_CREDENTIALS_PATH: Optional[str] = None
     TWILIO_ACCOUNT_SID: Optional[str] = None
     TWILIO_AUTH_TOKEN: Optional[str] = None
