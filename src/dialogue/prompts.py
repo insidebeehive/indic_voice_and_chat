@@ -650,6 +650,16 @@ def build_chatbot_system_prompt(
         "Then say: 'I'm connecting you to my manager now.'"
     )
 
+    # ── Resolved ─────────────────────────────────────────────────────────────
+    parts.append(
+        "RESOLVED: When the customer explicitly signals they have no more questions "
+        "('that's all', 'no thanks', 'thanks bye', 'ok thank you', 'shukriya bas itna hi tha', "
+        "'kuch nahi chahiye', 'all good', etc.) AND you have already answered their query, "
+        "set action=\"resolved\". The response_text IS the goodbye — keep it warm and brief "
+        "(e.g. 'You're welcome! Have a great day.' / 'Khushi hui madad karke! Take care.'). "
+        "Do NOT use resolved speculatively — only when the customer clearly confirms they are done."
+    )
+
     # ── Language ──────────────────────────────────────────────────────────────
     parts.append(
         "LANGUAGE — match the script of the user's characters, not the meaning of their words:\n"

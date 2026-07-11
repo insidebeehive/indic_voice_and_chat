@@ -804,7 +804,7 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
                 summary = await agent.summarize_session()
                 await _end_session(session_id, summary)
                 await _send_close_webhook(tenant, session_id, "ai", summary)
-                await websocket.send_text(json.dumps({"type": "ended", "summary": summary}))
+                await websocket.send_text(json.dumps({"type": "ended", "summary": summary, "reason": "customer_ended"}))
                 break
 
             # A single turn's failure must not black-hole the conversation: send an
@@ -947,6 +947,16 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
                         f"chat_handoff:{token}", json.dumps(context), ex=600)
                     call_url = _voice_call_url(websocket, tenant.slug, token)
                 await _send_reply(websocket, session_id, result, tenant.id, call_url=call_url)
+                if result.response.action == "resolved":
+                    # Agent confirmed the user has no more questions — close immediately
+                    # without waiting for the idle timeout.
+                    summary = await agent.summarize_session()
+                    await _end_session(session_id, summary)
+                    await _send_close_webhook(tenant, session_id, "ai", summary)
+                    await websocket.send_text(json.dumps({
+                        "type": "ended", "summary": summary, "reason": "resolved",
+                    }))
+                    break
                 if result.escalation:
                     if await _handle_escalation(websocket, session_id, tenant, row, result):
                         if await _run_human_mode(websocket, session_id, tenant):

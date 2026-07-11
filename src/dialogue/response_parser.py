@@ -56,7 +56,7 @@ _VOICEBOT_ACTIONS = {
 _VOICEBOT_PHASES = {"opening", "pitch", "qualification", "objection", "closing"}
 _SENTIMENTS = {"positive", "neutral", "negative", "frustrated"}
 
-_CHATBOT_ACTIONS = {"none", "schedule_callback", "send_info", "create_ticket", "escalate"}
+_CHATBOT_ACTIONS = {"none", "schedule_callback", "send_info", "create_ticket", "escalate", "resolved"}
 _CONFIDENCES = {"high", "medium", "low"}
 
 
