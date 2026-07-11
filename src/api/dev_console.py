@@ -831,21 +831,35 @@ def make_browser_bridge_factory(
                 language_default=lang,
             )
             cur_slots = SlotSchema()
+            _scope_directive = (
+                f"SCOPE — SUPPORT CALL: You are customer support for {cur_script.company_name}, "
+                "NOT a sales agent. Only help with platform topics: registration, KYC, wallet, "
+                "deposits, withdrawals, casino games, sports betting (including exposure), "
+                "Matka/lottery, bonuses, account security, and technical issues. "
+                "Use the knowledge base to answer platform questions. "
+                "For topics completely unrelated to this platform, give one brief "
+                "warm acknowledgement ('That's a bit outside what I can help with here') "
+                "and steer back to the platform topic. "
+                "NEVER invent account-specific data — balances, transaction IDs, "
+                "personal bank/UPI details."
+            )
             chat_summary = lead_data.get("chat_summary", "")
             if chat_summary:
                 extra_directives = [
+                    _scope_directive,
                     "CONTEXT — CHAT HANDOFF: The customer just switched from a support "
                     "chat conversation to this voice call. Summary of that chat:\n"
                     f"{chat_summary}\n\n"
                     "Continue helping them from where the chat left off. "
                     "Do NOT run a sales script. Do NOT ask them to repeat what they already "
                     "told you in the chat. Greet them briefly (e.g. 'I can hear you now, '  "
-                    "'how can I help?') and pick up the conversation."
+                    "'how can I help?') and pick up the conversation.",
                 ]
             else:
                 extra_directives = [
+                    _scope_directive,
                     "CONTEXT — CHAT HANDOFF: The customer switched from a support chat to "
-                    "this voice call. Greet them briefly and ask how you can help."
+                    "this voice call. Greet them briefly and ask how you can help.",
                 ]
 
         from src.bootstrap import _build_kb_context  # noqa: PLC0415
