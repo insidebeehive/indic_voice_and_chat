@@ -238,12 +238,13 @@ def make_chatbot_factory(registry, sessionmaker=None, platform_retriever=None):
     from src.agents.base import AgentSession
     from src.agents.chatbot import ChatBotAgent
     from src.auth import secrets as crypto
+    from src.auth.registry import _AsyncPerTenantRegistry
     from src.chatbot.tool_executor import execute_crm_tool
     from src.interfaces.llm import ToolSpec
     from src.models.chat import ChatTool
     from src.models.tenant import TenantSecret
 
-    async def _load_crm_tools(tenant: TenantContext):
+    async def _load_crm_tools_uncached(tenant: TenantContext):
         """Return (tool_specs, {name: exec_spec}) for the tenant's CRM tools.
 
         Priority:
@@ -262,23 +263,34 @@ def make_chatbot_factory(registry, sessionmaker=None, platform_retriever=None):
                 rows = (await db.execute(
                     select(ChatTool).where(ChatTool.tenant_id == tenant.id)
                 )).scalars().all()
+                # One batched query for every tool's token secret instead of one
+                # query per tool (this loop used to be N+1 — with tenants
+                # registering a dozen-plus tools, that's a dozen-plus sequential
+                # round-trips on every single new chat session).
+                secret_names = {
+                    (r.auth_config or {}).get("token_secret_name")
+                    for r in rows
+                    if (r.auth_config or {}).get("token_secret_name")
+                }
+                secrets_by_name: dict[str, str] = {}
+                if secret_names:
+                    sec_rows = (await db.execute(
+                        select(TenantSecret).where(
+                            TenantSecret.tenant_id == tenant.id,
+                            TenantSecret.name.in_(secret_names))
+                    )).scalars().all()
+                    secrets_by_name = {s.name: s.value_encrypted for s in sec_rows}
                 for r in rows:
                     specs.append(ToolSpec(
                         name=r.name, description=r.description,
                         parameters=_crm_params_to_schema(r.parameters)))
                     token = None
                     secret_name = (r.auth_config or {}).get("token_secret_name")
-                    if secret_name:
-                        sec = (await db.execute(
-                            select(TenantSecret).where(
-                                TenantSecret.tenant_id == tenant.id,
-                                TenantSecret.name == secret_name)
-                        )).scalar_one_or_none()
-                        if sec is not None:
-                            try:
-                                token = crypto.decrypt(sec.value_encrypted)
-                            except Exception:  # noqa: BLE001
-                                token = None
+                    if secret_name and secret_name in secrets_by_name:
+                        try:
+                            token = crypto.decrypt(secrets_by_name[secret_name])
+                        except Exception:  # noqa: BLE001
+                            token = None
                     execs[r.name] = {
                         "endpoint": r.endpoint, "method": r.method,
                         "parameters": r.parameters or {}, "auth_type": r.auth_type,
@@ -307,6 +319,19 @@ def make_chatbot_factory(registry, sessionmaker=None, platform_retriever=None):
                 "token": api_token, "extra_headers": None,
             }
         return specs, execs
+
+    # A tenant's registered CRM tools rarely change, but _load_crm_tools_uncached
+    # was being re-run from scratch on EVERY new chat session (N+1 DB queries
+    # each) — under concurrent session bursts this exhausts the DB connection
+    # pool and new sessions hang waiting for a connection. Cache per tenant,
+    # invalidated via the same registry.evict_all/evict_tenant path a tenant
+    # config reload already uses (src/main.py: resolver.on_reload).
+    if registry.crm_tools is None:
+        registry.crm_tools = _AsyncPerTenantRegistry(_load_crm_tools_uncached)
+    crm_tools_registry = registry.crm_tools
+
+    async def _load_crm_tools(tenant: TenantContext):
+        return await crm_tools_registry.get(tenant)
 
     async def factory(tenant: TenantContext, session_id: str) -> ChatBotAgent:
         # Load the chat session so we have customer_id (= logged-in user/player ID)

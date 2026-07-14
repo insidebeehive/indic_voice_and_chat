@@ -82,6 +82,12 @@ class DatabaseConfig(BaseModel):
     # NB: named ``db_schema`` (not ``schema``) to avoid shadowing
     # ``pydantic.BaseModel.schema``.
     db_schema: str = "voicebot"
+    # SQLAlchemy/asyncpg's library defaults (pool_size=5, max_overflow=10 = 15
+    # total) are too small for concurrent chat session bursts — new sessions
+    # started under load queue for a free connection and can hang. Ignored on
+    # SQLite (tests), which has no connection pool.
+    pool_size: int = 20
+    max_overflow: int = 30
 
     @field_validator("url")
     @classmethod

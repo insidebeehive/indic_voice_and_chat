@@ -74,13 +74,18 @@ def get_engine(url: Optional[str] = None) -> AsyncEngine:
     """Return the process-wide async engine, creating it on first call."""
     global _engine, _sessionmaker
     if _engine is None:
-        if url is None:
-            from src.config import get_settings
+        from src.config import get_settings
 
-            url = get_settings().database.url
+        db_config = get_settings().database
+        if url is None:
+            url = db_config.url
+        pool_kwargs = {} if _is_sqlite(url) else {
+            "pool_size": db_config.pool_size, "max_overflow": db_config.max_overflow,
+        }
         _engine = create_async_engine(
             url, future=True, pool_pre_ping=True,
             connect_args=search_path_connect_args(url),
+            **pool_kwargs,
         )
         _sessionmaker = async_sessionmaker(_engine, expire_on_commit=False)
     return _engine

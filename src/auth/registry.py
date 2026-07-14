@@ -17,9 +17,10 @@ goes elsewhere.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 from src.auth.context import TenantContext
 from src.config_tenant import merge_provider_config
@@ -157,12 +158,17 @@ class TenantRuntimeRegistry:
     chat_channels: _PerTenantRegistry
     session_stores: _PerTenantRegistry
     crms: _PerTenantRegistry
+    # Set lazily by make_chatbot_factory (the only place that knows how to
+    # load a tenant's chat CRM tools) — None until then, e.g. in tests that
+    # build a TenantRuntimeRegistry directly without going through it.
+    crm_tools: Optional[_AsyncPerTenantRegistry] = None
 
     def _subregistries(self) -> tuple:
-        return (
+        base = (
             self.retrievers, self.dnd, self.schedulers, self.webhooks,
             self.chat_channels, self.session_stores, self.crms,
         )
+        return base + ((self.crm_tools,) if self.crm_tools is not None else ())
 
     def evict_tenant(self, tenant_id: str) -> None:
         self.providers.evict(tenant_id)
@@ -179,3 +185,35 @@ class TenantRuntimeRegistry:
 
 def make_per_tenant_registry(factory: Callable[[TenantContext], Any]) -> _PerTenantRegistry:
     return _PerTenantRegistry(factory)
+
+
+class _AsyncPerTenantRegistry:
+    """Generic ``tenant_id -> instance`` cache with a lazy ASYNC factory.
+
+    Like ``_PerTenantRegistry`` but for factories that need to await (e.g. a
+    DB load) — a per-tenant lock ensures concurrent first-time callers for the
+    same tenant await one shared load instead of each triggering their own
+    (the "thundering herd" case: many new sessions for the same tenant
+    starting at once with a cold cache)."""
+
+    def __init__(self, factory: Callable[[TenantContext], Awaitable[Any]]) -> None:
+        self._factory = factory
+        self._items: dict[str, Any] = {}
+        self._locks: dict[str, asyncio.Lock] = {}
+
+    async def get(self, tenant: TenantContext) -> Any:
+        if tenant.id in self._items:
+            return self._items[tenant.id]
+        lock = self._locks.setdefault(tenant.id, asyncio.Lock())
+        async with lock:
+            if tenant.id not in self._items:
+                self._items[tenant.id] = await self._factory(tenant)
+            return self._items[tenant.id]
+
+    def evict(self, tenant_id: str) -> None:
+        self._items.pop(tenant_id, None)
+        self._locks.pop(tenant_id, None)
+
+    def clear(self) -> None:
+        self._items.clear()
+        self._locks.clear()

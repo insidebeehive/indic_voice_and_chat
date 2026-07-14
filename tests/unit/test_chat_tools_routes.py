@@ -150,13 +150,65 @@ async def test_factory_loads_crm_tools_and_enables_loop(monkeypatch) -> None:
         await s.commit()
 
     registry = SimpleNamespace(
-        providers=SimpleNamespace(get_llm=lambda t: object()),
+        providers=SimpleNamespace(get_llm=lambda t: object(), get_platform_llm=lambda: object()),
         retrievers=SimpleNamespace(get=lambda t: object()),
         session_stores=SimpleNamespace(get=lambda t: None),
+        crm_tools=None,
     )
     factory = make_chatbot_factory(registry, sm)
     tenant = TenantContext(settings=TenantSettings(id="t1", slug="t1", name="T1"))
     agent = await factory(tenant, "s1")
     assert agent._enable_tools is True
     assert any(t.name == "check_order_status" for t in agent._crm_tools)
+    await engine.dispose()
+
+
+async def test_factory_caches_crm_tools_across_sessions(monkeypatch) -> None:
+    # New chat sessions used to re-run the (N+1-query) CRM tool load from
+    # scratch every time (src/bootstrap.py _load_crm_tools) — under a burst of
+    # concurrent new sessions this exhausts the DB connection pool. Confirm a
+    # second session for the same tenant is served from cache: deleting the
+    # ChatTool row between calls, the second factory() call must still see it.
+    from types import SimpleNamespace
+
+    from src.auth import TenantContext
+    from src.bootstrap import make_chatbot_factory
+
+    monkeypatch.setenv("VOX_SECRET_KEY", crypto.generate_key())
+    crypto.reset_cache_for_tests()
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:", future=True)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    sm = async_sessionmaker(engine, expire_on_commit=False)
+    async with sm() as s:
+        s.add(Tenant(id="t1", slug="t1", name="T1"))
+        s.add(ChatTool(
+            tenant_id="t1", name="check_order_status", description="check order",
+            endpoint="https://crm/api/orders/{order_id}", method="GET", auth_type="bearer",
+            auth_config={"token_secret_name": "chat_tool:check_order_status:token"},
+            parameters={"order_id": {"type": "string", "source": "llm"}}))
+        s.add(TenantSecret(tenant_id="t1", name="chat_tool:check_order_status:token",
+                           value_encrypted=crypto.encrypt("tok-123")))
+        await s.commit()
+
+    registry = SimpleNamespace(
+        providers=SimpleNamespace(get_llm=lambda t: object(), get_platform_llm=lambda: object()),
+        retrievers=SimpleNamespace(get=lambda t: object()),
+        session_stores=SimpleNamespace(get=lambda t: None),
+        crm_tools=None,
+    )
+    factory = make_chatbot_factory(registry, sm)
+    tenant = TenantContext(settings=TenantSettings(id="t1", slug="t1", name="T1"))
+
+    agent1 = await factory(tenant, "s1")
+    assert any(t.name == "check_order_status" for t in agent1._crm_tools)
+
+    async with sm() as s:
+        await s.execute(ChatTool.__table__.delete())
+        await s.commit()
+
+    agent2 = await factory(tenant, "s2")
+    assert any(t.name == "check_order_status" for t in agent2._crm_tools), (
+        "second session should be served from the per-tenant cache, not re-query the DB"
+    )
     await engine.dispose()

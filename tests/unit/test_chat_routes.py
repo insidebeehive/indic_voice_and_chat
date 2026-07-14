@@ -184,6 +184,25 @@ def test_websocket_unknown_session_closes(app: FastAPI) -> None:
             ws.receive_text()
 
 
+def test_websocket_factory_failure_closes_cleanly(app: FastAPI) -> None:
+    # A factory failure (e.g. DB connection pool exhausted under concurrent
+    # session load) must close the socket with a clear code instead of
+    # leaving the client waiting forever for a response that never comes.
+    from starlette.websockets import WebSocketDisconnect
+
+    client = TestClient(app)
+    sid = _create_session(client)
+
+    async def _broken_factory(tenant, session_id):
+        raise RuntimeError("DB connection pool exhausted")
+
+    chat.set_chatbot_factory(_broken_factory)
+    with pytest.raises(WebSocketDisconnect) as exc_info:
+        with client.websocket_connect(f"/chat/ws/{sid}") as ws:
+            ws.receive_text()
+    assert exc_info.value.code == 1011
+
+
 def test_websocket_invalid_json_returns_error(app: FastAPI) -> None:
     client = TestClient(app)
     sid = _create_session(client)

@@ -813,7 +813,15 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
         await websocket.close(code=1011, reason="tenant unavailable")
         return
 
-    agent = await _factory(tenant, _scoped_session(tenant, session_id))
+    try:
+        agent = await _factory(tenant, _scoped_session(tenant, session_id))
+    except Exception:
+        # A failure here (e.g. a DB connection pool exhausted under a burst of
+        # concurrent new sessions) must not leave the client waiting forever
+        # with no response — close with a clear code instead of hanging.
+        log.exception("chatbot factory failed", extra={"session_id": session_id})
+        await websocket.close(code=1011, reason="chatbot unavailable — please retry")
+        return
     try:
         # Handle reconnect: session may already be in human/awaiting_human mode.
         async with _sm()() as db:
