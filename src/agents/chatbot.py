@@ -40,6 +40,14 @@ from src.rag.retriever import HybridRetriever, RetrievedChunk
 
 log = logging.getLogger(__name__)
 
+# Sliding-window context, mirroring VoiceBotAgent.MAX_HISTORY_TURNS
+# (src/agents/voicebot.py): the full transcript lives in ``session.turns``
+# (used for the UI and history), but only the last MAX_HISTORY_TURNS
+# exchanges are replayed to the LLM each turn. Without this the message list
+# grows ~2 messages per turn, so per-turn latency/cost climbs over a long
+# chat session.
+MAX_HISTORY_TURNS = 10
+
 # Executes a tenant-registered (CRM) tool call → a JSON-able result dict.
 CrmExecutor = Callable[[ToolCall], Awaitable[dict]]
 
@@ -118,11 +126,11 @@ class ChatBotAgent(BaseAgent):
         language_default: str = "en",
         store: Optional[SessionStore] = None,
         guard_config: Optional[GuardConfig] = None,
-        max_context_chars: int = 4000,
+        max_context_chars: int = 2000,
         enable_tools: bool = False,
         crm_tools: Optional[list[ToolSpec]] = None,
         crm_executor: Optional[CrmExecutor] = None,
-        max_tool_rounds: int = 4,
+        max_tool_rounds: int = 2,
     ) -> None:
         # ChatBot doesn't need slots — pass an empty schema so BaseAgent is happy.
         super().__init__(
@@ -336,8 +344,9 @@ class ChatBotAgent(BaseAgent):
             has_player_tools=bool(self._crm_tools),
         )
         messages: list[LLMMessage] = [LLMMessage(role="system", content=system_prompt)]
-        # Replay prior user/assistant turns (system is rebuilt each turn).
-        for m in self.session.turns:
+        # Replay the last MAX_HISTORY_TURNS exchanges (system is rebuilt each
+        # turn); session.turns itself is kept full for history/UI purposes.
+        for m in self.session.turns[-(2 * MAX_HISTORY_TURNS):]:
             if m.role in ("user", "assistant"):
                 messages.append(m)
         messages.append(user_msg)
