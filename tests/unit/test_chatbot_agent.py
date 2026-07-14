@@ -6,7 +6,7 @@ from typing import AsyncIterator
 import pytest
 
 from src.agents.base import AgentSession
-from src.agents.chatbot import ChatBotAgent
+from src.agents.chatbot import ChatBotAgent, _detect_script
 from src.dialogue.context import SessionStore
 from src.interfaces.llm import ILLMProvider, LLMConfig, LLMMessage, LLMResult
 from src.interfaces.vector_store import Document
@@ -102,6 +102,36 @@ async def test_handle_message_empty_input_returns_early(retriever) -> None:
     result = await agent.handle_message("   ")
     assert result.response.parse_error == "empty user input"
     assert llm.calls == []
+
+
+def test_detect_script_leaves_romanized_indic_undetected() -> None:
+    # Romanized Hindi ("mera withdrawal kahan hai") is pure Latin script but
+    # not English — this used to return "English" and force a "MUST be in
+    # English" directive, overriding the prompt's own correct Roman-Hinglish
+    # rule and causing the bot to ignore customers writing in Hinglish.
+    assert _detect_script("mera withdrawal kahan hai") is None
+    assert _detect_script("kya bol rahi ho madam") is None
+    assert _detect_script("What is my balance?") is None  # ambiguous too — same script
+
+
+def test_detect_script_still_detects_native_script() -> None:
+    assert _detect_script("मेरा बैलेंस क्या है") == "Hindi"
+    assert _detect_script("আমার ব্যালেন্স কত") == "Bengali"
+
+
+@pytest.mark.asyncio
+async def test_romanized_hindi_message_does_not_force_english_directive(retriever) -> None:
+    llm = FakeLLM({
+        "response_text": "Aapka koi pending withdrawal nahi hai abhi.",
+        "language": "hi",
+        "sources_used": [],
+        "confidence": "high",
+        "action": "none",
+    })
+    agent = _make_agent(llm, retriever)
+    await agent.handle_message("mera withdrawal kahan hai")
+    system_prompt = llm.calls[0][0].content
+    assert "MUST be in English" not in system_prompt
 
 
 @pytest.mark.asyncio

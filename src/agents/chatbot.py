@@ -66,12 +66,19 @@ _SCRIPT_RANGES: list[tuple[int, int, str]] = [
 
 
 def _detect_script(text: str) -> Optional[str]:
-    """Return a language name from the dominant Unicode script in *text*.
+    """Return an Indic language name when *text* is dominantly written in that
+    language's own script (e.g. Devanagari for Hindi). Returns None for
+    empty/purely numeric/punctuation text, for mixed script, AND for pure
+    Latin/ASCII text.
 
-    Counts Indic-script characters vs ASCII-alpha characters.  Returns None
-    when the text is empty, purely numeric/punctuation, or too mixed to call
-    (Hinglish).  The result is used to inject an unambiguous language
-    directive into the system prompt so the LLM never has to guess.
+    Pure-Latin text is deliberately left undetected rather than assumed to be
+    English: it's ambiguous between real English and a romanized Indic
+    language (Hinglish — "mera balance kya hai"). This used to return
+    "English" for any Latin-dominant message, which injected a hard "MUST be
+    in English" directive into the prompt that overrode the system prompt's
+    own (correct) LANGUAGE rule — reply in Roman Hinglish for Roman-script
+    input, never force English/Devanagari onto it. Returning None here lets
+    that rule govern instead of contradicting it.
     """
     if not text:
         return None
@@ -93,9 +100,8 @@ def _detect_script(text: str) -> Optional[str]:
         return None
     if indic_count / total >= 0.6:
         return indic_lang
-    if latin_count / total >= 0.6:
-        return "English"
-    return None  # mixed / Hinglish — let the model decide
+    return None  # pure/majority Latin, or too mixed to call — the prompt's
+    # LANGUAGE section already handles script-matching for these
 
 
 def _chunk_source(chunk: RetrievedChunk) -> str:
