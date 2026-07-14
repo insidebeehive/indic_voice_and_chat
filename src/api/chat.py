@@ -21,11 +21,15 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import ipaddress
 import json
 import logging
+import socket
 import uuid
 from typing import Awaitable, Callable, Optional
+from urllib.parse import urlsplit
 
+import httpx
 from fastapi import (
     APIRouter,
     Depends,
@@ -105,6 +109,56 @@ def _mime_ext(mime: str) -> str:
 def _media_key(tenant_id: str, session_id: str, mime: str) -> str:
     ext = _mime_ext(mime)
     return f"chat/{tenant_id}/{session_id}/{uuid.uuid4().hex}.{ext}"
+
+
+_MAX_MEDIA_FETCH_BYTES = 10 * 1024 * 1024  # cap for media pulled via media_url
+_MEDIA_FETCH_TIMEOUT = httpx.Timeout(20.0, connect=10.0)
+
+
+def _is_public_host(hostname: str) -> bool:
+    """Reject hostnames resolving to private/loopback/link-local addresses —
+    media_url is untrusted client input (unlike vendor recording URLs
+    elsewhere in this codebase), so this guards against using it to probe
+    internal network services."""
+    try:
+        infos = socket.getaddrinfo(hostname, None)
+    except socket.gaierror:
+        return False
+    for info in infos:
+        addr = info[4][0]
+        ip = ipaddress.ip_address(addr)
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
+            return False
+    return True
+
+
+async def _fetch_media_url(url: str) -> tuple[bytes, str]:
+    """Fetch a caller-supplied media URL (e.g. a presigned R2/S3 URL) server-side.
+
+    Streams the body with a byte-size cap and requires the response
+    Content-Type to be image/* or video/* before accepting it. Redirects are
+    not followed (the default httpx behavior) to avoid an SSRF bypass via a
+    redirect chain."""
+    parts = urlsplit(url)
+    if parts.scheme != "https" or not parts.hostname:
+        raise ValueError("media_url must be an https URL")
+    if not _is_public_host(parts.hostname):
+        raise ValueError("media_url resolves to a non-public address")
+
+    async with httpx.AsyncClient(timeout=_MEDIA_FETCH_TIMEOUT) as client:
+        async with client.stream("GET", url) as resp:
+            if resp.is_redirect:
+                raise ValueError("media_url redirects are not followed")
+            resp.raise_for_status()
+            content_type = resp.headers.get("content-type", "").split(";")[0].strip().lower()
+            if not (content_type.startswith("image/") or content_type.startswith("video/")):
+                raise ValueError(f"unsupported content-type: {content_type or 'unknown'}")
+            chunks = bytearray()
+            async for chunk in resp.aiter_bytes(chunk_size=65536):
+                chunks.extend(chunk)
+                if len(chunks) > _MAX_MEDIA_FETCH_BYTES:
+                    raise ValueError("media_url content exceeds size limit")
+            return bytes(chunks), content_type
 
 
 def set_chatbot_factory(factory: Optional[ChatBotFactory]) -> None:
@@ -895,26 +949,44 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
 
                 if mtype in ("image", "video"):
                     data = msg.get("data")
+                    media_url = (msg.get("media_url") or "").strip()
                     mime = msg.get("mime") or ""
-                    if not data or not mime:
+                    if not data and not media_url:
                         await websocket.send_text(json.dumps(
-                            {"type": "error", "message": "image/video needs 'data' + 'mime'"}))
+                            {"type": "error", "message": "image/video needs 'data' (base64) or 'media_url'"}))
                         continue
                     caption = (msg.get("text") or "").strip()
                     await websocket.send_text(json.dumps({"type": "typing"}))
+
+                    fetched_bytes: Optional[bytes] = None
+                    if media_url:
+                        try:
+                            fetched_bytes, fetched_mime = await _fetch_media_url(media_url)
+                            mime = mime or fetched_mime
+                        except Exception:
+                            log.exception("media_url fetch failed", extra={"session_id": session_id})
+                            await websocket.send_text(json.dumps({
+                                "type": "error",
+                                "message": "Could not fetch media_url — check it's reachable and points at an image/video.",
+                            }))
+                            continue
+                    if not mime:
+                        await websocket.send_text(json.dumps(
+                            {"type": "error", "message": "image/video needs 'mime'"}))
+                        continue
 
                     # Upload to S3 if storage is configured
                     object_key: Optional[str] = None
                     if _media_store is not None:
                         try:
-                            raw_bytes = base64.b64decode(data)
+                            raw_bytes = fetched_bytes if fetched_bytes is not None else base64.b64decode(data)
                             object_key = _media_key(tenant.id, session_id, mime)
                             await _media_store.upload(raw_bytes, object_key, mime.split(";")[0])
                         except Exception:
                             log.exception("media upload failed", extra={"session_id": session_id})
                             object_key = None
 
-                    result = await agent.handle_image(data, mime, caption)
+                    result = await agent.handle_image(fetched_bytes if fetched_bytes is not None else data, mime, caption)
                     await _persist_turn(session_id, caption or f"[{mtype}]", result,
                                         user_type=mtype, media_mime=mime, media_url=object_key)
                     await _send_reply(websocket, session_id, result, tenant.id)

@@ -59,6 +59,7 @@ async def ws_ctx():
 
     fake_agent = MagicMock()
     fake_agent.handle_message = AsyncMock(return_value=_FakeTurnResult())
+    fake_agent._llm = None  # bare MagicMock() would auto-vivify a truthy _llm and win over .llm below
     fake_agent.llm = MagicMock()
     fake_agent.llm.transcribe_audio = AsyncMock(return_value="hello there")
     fake_agent.session = MagicMock()
@@ -66,6 +67,7 @@ async def ws_ctx():
     fake_tenant = MagicMock()
     fake_tenant.id = "t1"
     fake_tenant.slug = "demo"
+    fake_tenant.settings.chat_support.chat_idle_timeout_seconds = 300
 
     async def fake_factory(tenant, scoped_id):
         return fake_agent
@@ -89,6 +91,7 @@ async def test_audio_ws_uploads_and_acks(ws_ctx):
     fake_tenant = MagicMock()
     fake_tenant.id = "t1"
     fake_tenant.slug = "demo"
+    fake_tenant.settings.chat_support.chat_idle_timeout_seconds = 300
 
     with patch.object(mw, "tenant_from_id", AsyncMock(return_value=fake_tenant)):
         app = FastAPI()
@@ -135,6 +138,7 @@ async def test_audio_ws_no_media_store_returns_error(ws_ctx):
     fake_tenant = MagicMock()
     fake_tenant.id = "t1"
     fake_tenant.slug = "demo"
+    fake_tenant.settings.chat_support.chat_idle_timeout_seconds = 300
 
     # Temporarily clear the media store
     chat_api.set_media_store(None)
@@ -170,6 +174,7 @@ async def test_audio_ws_missing_mime_returns_error(ws_ctx):
     fake_tenant = MagicMock()
     fake_tenant.id = "t1"
     fake_tenant.slug = "demo"
+    fake_tenant.settings.chat_support.chat_idle_timeout_seconds = 300
 
     with patch.object(mw, "tenant_from_id", AsyncMock(return_value=fake_tenant)):
         app = FastAPI()
@@ -199,6 +204,7 @@ async def test_audio_ws_no_transcribe_method_uploads_only(ws_ctx):
     fake_tenant = MagicMock()
     fake_tenant.id = "t1"
     fake_tenant.slug = "demo"
+    fake_tenant.settings.chat_support.chat_idle_timeout_seconds = 300
 
     # Remove transcribe_audio from the llm mock
     del fake_agent.llm.transcribe_audio

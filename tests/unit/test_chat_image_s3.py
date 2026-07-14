@@ -58,6 +58,7 @@ async def test_image_ws_uploads_to_s3():
     fake_tenant = MagicMock()
     fake_tenant.id = "t1"
     fake_tenant.slug = "demo"
+    fake_tenant.settings.chat_support.chat_idle_timeout_seconds = 300
 
     chat_api.set_chatbot_factory(AsyncMock(return_value=fake_agent))
 
