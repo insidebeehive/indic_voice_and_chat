@@ -6,8 +6,17 @@ from src.rag.context_builder import (
     GuardConfig,
     apply_hallucination_guard,
     build_rag_context,
+    build_voicebot_kb_context,
 )
 from src.rag.retriever import RetrievedChunk
+
+
+class _FakeRetriever:
+    def __init__(self, docs: list[Document]) -> None:
+        self._docs = docs
+
+    def list_all(self, max_chunks: int = 200) -> list[Document]:
+        return self._docs
 
 
 def _chunk(doc_id: str, content: str, **md) -> RetrievedChunk:
@@ -41,6 +50,64 @@ def test_build_rag_context_uses_filename_section_tag() -> None:
 def test_build_rag_context_falls_back_to_id_when_no_metadata() -> None:
     out = build_rag_context([_chunk("doc-42", "content")])
     assert "doc-42" in out.source_tags
+
+
+# --- Voicebot KB context (static, one-shot, priority-ordered) ----------
+
+
+def _doc(filename: str, content: str) -> Document:
+    return Document(id=filename, content=content, metadata={"filename": filename})
+
+
+def test_voicebot_kb_context_prioritizes_product_docs_over_filename_order() -> None:
+    # This is the exact bug: casino-games (06) used to lose out to earlier
+    # filename-sorted docs (01-05) crowding the char budget before it was
+    # ever reached, even though it's core sales-call content.
+    docs = [
+        _doc("01-account-registration-login.md", "x" * 100),
+        _doc("06-casino-games.md", "Casino games include slots, live dealer..."),
+    ]
+    retriever = _FakeRetriever(docs)
+    ctx = build_voicebot_kb_context([retriever], max_chars=1000)
+    assert "casino-games" in ctx
+    assert "account-registration-login" in ctx
+    # Casino comes first despite registration-login sorting first by filename.
+    assert ctx.index("06-casino-games") < ctx.index("01-account-registration-login")
+
+
+def test_voicebot_kb_context_excludes_technical_help() -> None:
+    docs = [_doc("12-technical-help.md", "Troubleshooting steps...")]
+    retriever = _FakeRetriever(docs)
+    ctx = build_voicebot_kb_context([retriever])
+    assert ctx == ""
+
+
+def test_voicebot_kb_context_includes_unranked_docs_after_priority_list() -> None:
+    # A future KB doc not in the curated priority list must still be
+    # included (not silently dropped), just ranked after known-priority docs.
+    docs = [
+        _doc("99-new-feature.md", "Something new."),
+        _doc("06-casino-games.md", "Casino content."),
+    ]
+    retriever = _FakeRetriever(docs)
+    ctx = build_voicebot_kb_context([retriever])
+    assert "99-new-feature" in ctx
+    assert ctx.index("06-casino-games") < ctx.index("99-new-feature")
+
+
+def test_voicebot_kb_context_default_cap_fits_all_tier_one_product_docs() -> None:
+    # Regression guard for the actual reported bug: with the real KB doc
+    # sizes, all Tier-1 product docs (casino/sports/matka/bonuses) must fit
+    # under the default cap, not just the first couple by filename order.
+    tier1 = [
+        "06-casino-games.md", "07-sports-betting.md",
+        "08-matka-lottery-games.md", "09-bonuses-and-promotions.md",
+    ]
+    docs = [_doc(fn, "y" * 3000) for fn in tier1]  # ~12k, close to real doc sizes
+    retriever = _FakeRetriever(docs)
+    ctx = build_voicebot_kb_context([retriever])
+    for fn in tier1:
+        assert fn in ctx
 
 
 def test_build_rag_context_truncates_at_max_chars() -> None:

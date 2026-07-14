@@ -61,6 +61,17 @@ def test_voicebot_prompt_includes_all_sections() -> None:
         assert s in prompt
 
 
+def test_voicebot_prompt_defers_link_offer_to_call_end() -> None:
+    # The link/bonus must never be pitched proactively — only acknowledged
+    # once genuine interest is shown, and deferred to the closing turn rather
+    # than pushed mid-call.
+    script = VoiceBotScript.from_campaign_yaml(SCRIPT)
+    schema = SlotSchema.from_campaign_yaml(yaml.safe_load(SLOT_YAML))
+    prompt = build_voicebot_system_prompt(script, schema)
+    assert "Don't proactively push the link/bonus/next step" in prompt
+    assert "share it at the end of the call" in prompt
+
+
 def test_voicebot_prompt_mentions_required_slots_with_marker() -> None:
     script = VoiceBotScript.from_campaign_yaml(SCRIPT)
     schema = SlotSchema.from_campaign_yaml(yaml.safe_load(SLOT_YAML))
@@ -202,16 +213,16 @@ def test_s2s_system_instruction_has_persona_tool_no_envelope() -> None:
     assert "Devanagari" not in instr
 
 
-def test_s2s_instruction_warns_against_repeating_offers() -> None:
-    # The S2S model kept re-asking "shall I send the WhatsApp link?" every turn.
-    # The instruction must carry the same don't-repeat-a-CTA restraint the cascade
-    # has, so an offer is made once, not pitched every turn.
+def test_s2s_instruction_defers_link_offer_to_call_end() -> None:
+    # The link/bonus must never be pitched proactively on the S2S path either —
+    # only acknowledged once genuine interest is shown, deferred to the closing
+    # turn, matching the cascade path's rule.
     from src.dialogue.prompts import build_s2s_system_instruction
     script = VoiceBotScript.from_campaign_yaml(SCRIPT)
     schema = SlotSchema.from_campaign_yaml(yaml.safe_load(SLOT_YAML))
-    instr = build_s2s_system_instruction(script, schema).lower()
-    assert "don't repeat an offer" in instr
-    assert "once" in instr and "unless the customer asks" in instr
+    instr = build_s2s_system_instruction(script, schema)
+    assert "Don't proactively push the link/bonus/next step" in instr
+    assert "share it at the end of the call" in instr
 
 
 def test_gender_directive_enforces_feminine_in_both_prompts() -> None:

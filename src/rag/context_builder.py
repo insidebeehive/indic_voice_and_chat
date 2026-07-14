@@ -105,14 +105,42 @@ async def search_combined(
     return merged[:top_k]
 
 
+# Priority order for the voicebot's one-shot KB dump (src/agents/voicebot.py has
+# no per-turn retrieval — this context is built once at call start, before the
+# customer has said anything, so there's no query to rank against; this is a
+# manually curated stand-in for "what's likely to come up on a sales call").
+# Product/game content comes first since a customer asking "what casino games
+# do you have" needs an actual answer, not just a link — followed by common
+# trust objections, then lower-priority account-admin topics. Docs not listed
+# here (e.g. a newly added KB file) still get included, ranked after these.
+_VOICE_KB_PRIORITY: list[str] = [
+    "06-casino-games.md",
+    "07-sports-betting.md",
+    "08-matka-lottery-games.md",
+    "09-bonuses-and-promotions.md",
+    "05-withdrawals.md",
+    "04-deposits.md",
+    "11-account-security.md",
+    "10-responsible-gaming.md",
+    "01-account-registration-login.md",
+    "03-wallet-and-transactions.md",
+    "02-kyc-identity-verification.md",
+]
+# Troubleshooting/support content — not a sales-call topic, excluded outright
+# rather than left to crowd out product content by filename-sort luck.
+_VOICE_KB_EXCLUDED: set[str] = {"12-technical-help.md"}
+
+
 def build_voicebot_kb_context(
     retrievers: list["HybridRetriever"],
-    max_chars: int = 8000,
+    max_chars: int = 15000,
 ) -> str:
     """Build a static KB context string from all docs in the given retrievers.
 
     Intended for injection into the voicebot system prompt at call start so the
     agent has factual KB content for the full call without per-turn retrieval.
+    Docs are ordered by _VOICE_KB_PRIORITY (not filename/insertion order) so
+    higher-value content is guaranteed to fit within max_chars.
     """
     seen: set[str] = set()
     all_docs: list[Document] = []
@@ -123,11 +151,20 @@ def build_voicebot_kb_context(
                 all_docs.append(doc)
     if not all_docs:
         return ""
+
+    def _filename(doc: Document) -> str:
+        return (doc.metadata or {}).get("filename") or doc.id
+
+    all_docs = [d for d in all_docs if _filename(d) not in _VOICE_KB_EXCLUDED]
+    all_docs.sort(key=lambda d: (
+        _VOICE_KB_PRIORITY.index(_filename(d))
+        if _filename(d) in _VOICE_KB_PRIORITY else len(_VOICE_KB_PRIORITY)
+    ))
+
     parts: list[str] = []
     total = 0
     for doc in all_docs:
-        md = doc.metadata or {}
-        fn = md.get("filename") or doc.id
+        fn = _filename(doc)
         entry = f"[{fn}]\n{doc.content.strip()}"
         if total + len(entry) + 2 > max_chars:
             break
