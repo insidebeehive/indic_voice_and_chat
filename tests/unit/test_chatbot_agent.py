@@ -6,7 +6,7 @@ from typing import AsyncIterator
 import pytest
 
 from src.agents.base import AgentSession
-from src.agents.chatbot import ChatBotAgent, _detect_script
+from src.agents.chatbot import ChatBotAgent, _detect_script, _latin_language_hint
 from src.dialogue.context import SessionStore
 from src.interfaces.llm import ILLMProvider, LLMConfig, LLMMessage, LLMResult
 from src.interfaces.vector_store import Document
@@ -119,8 +119,21 @@ def test_detect_script_still_detects_native_script() -> None:
     assert _detect_script("আমার ব্যালেন্স কত") == "Bengali"
 
 
+def test_latin_language_hint_classifies_deterministically() -> None:
+    # Hinglish markers → Hinglish; marker-free with 3+ words → English;
+    # short marker-free acks → None (follow the conversation, don't force).
+    assert _latin_language_hint("mera withdrawal kahan hai") == "Hinglish"
+    assert _latin_language_hint("kya bol rahi ho madam") == "Hinglish"
+    assert _latin_language_hint("balance check karo please") == "Hinglish"
+    assert _latin_language_hint("tell me about this site") == "English"
+    assert _latin_language_hint("whats my balance") == "English"
+    assert _latin_language_hint("ok") is None
+    assert _latin_language_hint("thanks") is None
+    assert _latin_language_hint("") is None
+
+
 @pytest.mark.asyncio
-async def test_romanized_hindi_message_does_not_force_english_directive(retriever) -> None:
+async def test_romanized_hindi_message_gets_firm_hinglish_directive(retriever) -> None:
     llm = FakeLLM({
         "response_text": "Aapka koi pending withdrawal nahi hai abhi.",
         "language": "hi",
@@ -132,17 +145,18 @@ async def test_romanized_hindi_message_does_not_force_english_directive(retrieve
     await agent.handle_message("mera withdrawal kahan hai")
     system_prompt = llm.calls[0][0].content
     assert "MUST be in English" not in system_prompt
-    assert "Reply in Roman script too" in system_prompt
+    assert "romanized Hindi (Hinglish)" in system_prompt
+    assert "NEVER Devanagari" in system_prompt
 
 
 @pytest.mark.asyncio
-async def test_english_message_forces_roman_script_not_devanagari(retriever) -> None:
-    # Regression: a tenant with default_language="hi" was replying in
-    # Devanagari to plain English ("whats my balance") once the romanized-
-    # Hindi fix (above) stopped forcing "English" for all Latin-script text —
-    # the system prompt's "Default language: hi" fallback won instead with no
-    # per-turn signal to override it. The Roman-script directive must still
-    # fire for unambiguous English, ruling out a script switch.
+async def test_english_message_gets_firm_english_directive(retriever) -> None:
+    # Regression chain: (1) romanized Hindi was forced into English; (2) the
+    # fix left Latin text signal-less, so default_language="hi" answered
+    # English in Devanagari; (3) the advisory Roman-script directive let
+    # Hinglish history momentum answer plain English ("tell me about this
+    # site") in Hinglish. The directive must now NAME English firmly and
+    # explicitly override earlier turns' language.
     llm = FakeLLM({
         "response_text": "Your balance is 100.",
         "language": "en",
@@ -151,10 +165,28 @@ async def test_english_message_forces_roman_script_not_devanagari(retriever) -> 
         "action": "none",
     })
     agent = _make_agent(llm, retriever)
-    await agent.handle_message("whats my balance")
+    await agent.handle_message("tell me about this site")
     system_prompt = llm.calls[0][0].content
-    assert "Reply in Roman script too" in system_prompt
-    assert "Do NOT switch to Devanagari" in system_prompt
+    assert "MUST be in English" in system_prompt
+    assert "language of earlier turns" in system_prompt
+
+
+@pytest.mark.asyncio
+async def test_short_ack_gets_no_language_directive(retriever) -> None:
+    # A bare "ok" carries no language signal — forcing English would flip a
+    # Hinglish conversation mid-stream. No directive: history governs.
+    llm = FakeLLM({
+        "response_text": "Theek hai!",
+        "language": "hi",
+        "sources_used": [],
+        "confidence": "high",
+        "action": "none",
+    })
+    agent = _make_agent(llm, retriever)
+    await agent.handle_message("ok")
+    system_prompt = llm.calls[0][0].content
+    assert "MUST be in" not in system_prompt
+    assert "romanized Hindi (Hinglish)" not in system_prompt
 
 
 @pytest.mark.asyncio

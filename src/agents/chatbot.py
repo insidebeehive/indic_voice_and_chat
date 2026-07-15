@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Optional
 
@@ -102,6 +103,42 @@ def _detect_script(text: str) -> Optional[str]:
         return indic_lang
     return None  # pure/majority Latin, or too mixed to call — the prompt's
     # LANGUAGE section already handles script-matching for these
+
+
+# Common romanized-Hindi tokens. Deliberately excludes anything that collides
+# with English words ("do", "ho", "par", "se", "the", "kar"…) — a false
+# positive would flip an English reply into Hinglish. Word-boundary matched,
+# lowercase.
+_HINGLISH_MARKERS = frozenset({
+    "kya", "hai", "hain", "mera", "mere", "meri", "nahi", "nahin", "kaise",
+    "kaisa", "karo", "raha", "rahi", "rahe", "aap", "aapka", "aapki", "kab",
+    "kyu", "kyun", "kyon", "batao", "bataiye", "chahiye", "hua", "hoga",
+    "hogi", "gaya", "gayi", "kitna", "kitni", "kitne", "wala", "wale",
+    "mein", "bhai", "bhaiya", "didi", "paisa", "paise", "rupay", "rupaye",
+    "jaldi", "madad", "shukriya", "dhanyavaad", "haan", "theek", "thik",
+    "accha", "acha", "bolo", "suno", "dekho", "milega", "milegi", "karna",
+    "kahan", "kaun", "kaunsa", "toh", "abhi", "kardo", "krdo", "karde",
+})
+
+
+def _latin_language_hint(text: str) -> Optional[str]:
+    """Classify a Roman-script message as "Hinglish" or "English" — or None
+    when it's too short to carry a signal (bare "ok"/"thanks", which should
+    follow the conversation's existing language, not force a switch).
+
+    An advisory "pick whichever fits" directive proved too weak: with a
+    Hinglish conversation history and default_language="hi", the model kept
+    replying in Hinglish even to plain English ("tell me about this site").
+    The classification must be deterministic so the directive can be firm.
+    """
+    words = [w for w in re.findall(r"[a-z']+", text.lower()) if w]
+    if not words:
+        return None
+    if any(w in _HINGLISH_MARKERS for w in words):
+        return "Hinglish"
+    if len(words) >= 3:
+        return "English"
+    return None  # short, marker-free ("ok", "yes") — no signal either way
 
 
 def _chunk_source(chunk: RetrievedChunk) -> str:
@@ -340,28 +377,32 @@ class ChatBotAgent(BaseAgent):
     def _compose(
         self, rag_text: str, user_msg: LLMMessage, query_text: str = "",
     ) -> list[LLMMessage]:
+        # Per-turn language directive. History of this logic (three real bugs):
+        # 1. All-Latin text was labeled "English" → romanized Hindi got forced
+        #    into English replies.
+        # 2. Then Latin text got NO signal → the "Default language: hi"
+        #    fallback answered plain English in Devanagari.
+        # 3. Then an advisory "pick English or Hinglish yourself" directive →
+        #    Hinglish history momentum kept answering plain English in
+        #    Hinglish. Hence the deterministic marker-based classification:
+        #    the directive must NAME the language, firmly, each turn.
         lang = _detect_script(query_text)
-        if lang:
-            extra = [f"The user's current message is in {lang}. Your response_text MUST be in {lang}."]
-        elif any(ch.isascii() and ch.isalpha() for ch in query_text):
-            # Pure/majority-Latin text is ambiguous between English and a
-            # romanized Indic language (Hinglish) — _detect_script deliberately
-            # leaves it undetected rather than guessing wrong (see its
-            # docstring). But leaving NO signal at all let the system prompt's
-            # "Default language: {language_default}" fallback win instead,
-            # replying in Devanagari for a tenant with default_language="hi"
-            # even to plain English text. Force the SCRIPT (Roman), not a
-            # specific language — the model reads the actual words to pick
-            # English vs. Hinglish, but must never switch to Devanagari here.
+        if lang is None:
+            lang = _latin_language_hint(query_text)
+        if lang == "Hinglish":
             extra = [
-                "The user's current message is written in Roman/Latin script. Reply in Roman "
-                "script too — English if the words are English, Roman Hinglish if they're "
-                "romanized Hindi/Indic — matching whatever the actual words are. Do NOT switch "
-                "to Devanagari or any other native script for this turn, regardless of the "
-                "conversation's default language."
+                "The user's current message is romanized Hindi (Hinglish). Reply in Roman-"
+                "script Hinglish — NEVER Devanagari, regardless of the conversation's "
+                "default language or the language of earlier turns."
+            ]
+        elif lang:
+            extra = [
+                f"The user's current message is in {lang}. Your response_text MUST be in "
+                f"{lang} — regardless of the conversation's default language or the "
+                "language of earlier turns."
             ]
         else:
-            extra = None
+            extra = None  # no signal (empty/short/ambiguous) — follow the conversation
         system_prompt = build_chatbot_system_prompt(
             company_name=self._company,
             language_default=self._language,
