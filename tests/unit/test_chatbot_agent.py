@@ -132,6 +132,29 @@ async def test_romanized_hindi_message_does_not_force_english_directive(retrieve
     await agent.handle_message("mera withdrawal kahan hai")
     system_prompt = llm.calls[0][0].content
     assert "MUST be in English" not in system_prompt
+    assert "Reply in Roman script too" in system_prompt
+
+
+@pytest.mark.asyncio
+async def test_english_message_forces_roman_script_not_devanagari(retriever) -> None:
+    # Regression: a tenant with default_language="hi" was replying in
+    # Devanagari to plain English ("whats my balance") once the romanized-
+    # Hindi fix (above) stopped forcing "English" for all Latin-script text —
+    # the system prompt's "Default language: hi" fallback won instead with no
+    # per-turn signal to override it. The Roman-script directive must still
+    # fire for unambiguous English, ruling out a script switch.
+    llm = FakeLLM({
+        "response_text": "Your balance is 100.",
+        "language": "en",
+        "sources_used": [],
+        "confidence": "high",
+        "action": "none",
+    })
+    agent = _make_agent(llm, retriever)
+    await agent.handle_message("whats my balance")
+    system_prompt = llm.calls[0][0].content
+    assert "Reply in Roman script too" in system_prompt
+    assert "Do NOT switch to Devanagari" in system_prompt
 
 
 @pytest.mark.asyncio

@@ -341,7 +341,27 @@ class ChatBotAgent(BaseAgent):
         self, rag_text: str, user_msg: LLMMessage, query_text: str = "",
     ) -> list[LLMMessage]:
         lang = _detect_script(query_text)
-        extra = [f"The user's current message is in {lang}. Your response_text MUST be in {lang}."] if lang else None
+        if lang:
+            extra = [f"The user's current message is in {lang}. Your response_text MUST be in {lang}."]
+        elif any(ch.isascii() and ch.isalpha() for ch in query_text):
+            # Pure/majority-Latin text is ambiguous between English and a
+            # romanized Indic language (Hinglish) — _detect_script deliberately
+            # leaves it undetected rather than guessing wrong (see its
+            # docstring). But leaving NO signal at all let the system prompt's
+            # "Default language: {language_default}" fallback win instead,
+            # replying in Devanagari for a tenant with default_language="hi"
+            # even to plain English text. Force the SCRIPT (Roman), not a
+            # specific language — the model reads the actual words to pick
+            # English vs. Hinglish, but must never switch to Devanagari here.
+            extra = [
+                "The user's current message is written in Roman/Latin script. Reply in Roman "
+                "script too — English if the words are English, Roman Hinglish if they're "
+                "romanized Hindi/Indic — matching whatever the actual words are. Do NOT switch "
+                "to Devanagari or any other native script for this turn, regardless of the "
+                "conversation's default language."
+            ]
+        else:
+            extra = None
         system_prompt = build_chatbot_system_prompt(
             company_name=self._company,
             language_default=self._language,
