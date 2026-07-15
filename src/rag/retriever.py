@@ -211,7 +211,11 @@ class HybridRetriever:
         k: int,
         filters: Optional[dict],
     ) -> list[SearchResult]:
-        q_vec = self._embedder.embed_query(query)
+        # Embedders are sync (Gemini REST call); run in a thread to avoid
+        # blocking the event loop — same treatment as the ingest path above.
+        # On a single-worker deployment a blocking call here freezes every
+        # concurrent session, not just this one.
+        q_vec = await asyncio.to_thread(self._embedder.embed_query, query)
         return await self._dense.search(q_vec, top_k=k, filters=filters)
 
 

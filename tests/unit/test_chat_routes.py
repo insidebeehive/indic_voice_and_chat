@@ -70,7 +70,7 @@ async def app(tmp_faiss_index: str, fake_redis):
         async with sm() as session:
             yield session
 
-    async def factory(tenant: TenantContext, session_id: str) -> ChatBotAgent:
+    async def factory(tenant: TenantContext, session_id: str, *, customer_id=None) -> ChatBotAgent:
         return ChatBotAgent(
             session=AgentSession(session_id=session_id),
             llm=_FakeLLM({
@@ -193,7 +193,7 @@ def test_websocket_factory_failure_closes_cleanly(app: FastAPI) -> None:
     client = TestClient(app)
     sid = _create_session(client)
 
-    async def _broken_factory(tenant, session_id):
+    async def _broken_factory(tenant, session_id, *, customer_id=None):
         raise RuntimeError("DB connection pool exhausted")
 
     chat.set_chatbot_factory(_broken_factory)
@@ -201,6 +201,81 @@ def test_websocket_factory_failure_closes_cleanly(app: FastAPI) -> None:
         with client.websocket_connect(f"/chat/ws/{sid}") as ws:
             ws.receive_text()
     assert exc_info.value.code == 1011
+
+
+def test_websocket_passes_customer_id_to_factory(app: FastAPI) -> None:
+    # The WS connect path already fetched the ChatSession row — it must hand
+    # customer_id to the factory so the factory doesn't re-query the same row
+    # on another pool checkout (part of the concurrent-session-burst fixes).
+    client = TestClient(app)
+    sid = _create_session(client, user_id="cust-7")
+
+    seen: dict = {}
+    orig_factory = chat._factory
+
+    async def _recording_factory(tenant, session_id, *, customer_id=None):
+        seen["customer_id"] = customer_id
+        return await orig_factory(tenant, session_id)
+
+    chat.set_chatbot_factory(_recording_factory)
+    with client.websocket_connect(f"/chat/ws/{sid}") as ws:
+        ws.send_text(json.dumps({"type": "message", "text": "hi"}))
+        ws.receive_text()  # typing
+        ws.receive_text()  # reply
+    assert seen["customer_id"] == "cust-7"
+
+
+def test_websocket_turn_timeout_sends_error_keeps_socket(app: FastAPI, monkeypatch) -> None:
+    # A hung provider call must not black-hole the turn: the wait_for ceiling
+    # fires, the customer gets an error frame, and the socket stays usable.
+    import asyncio as aio
+
+    monkeypatch.setattr(chat, "_TURN_TIMEOUT_S", 0.05)
+    client = TestClient(app)
+    sid = _create_session(client)
+
+    class _HangingAgent:
+        async def handle_message(self, text):
+            await aio.sleep(5)
+
+        async def summarize_session(self):
+            return "summary"
+
+    async def _factory(tenant, session_id, *, customer_id=None):
+        return _HangingAgent()
+
+    chat.set_chatbot_factory(_factory)
+    with client.websocket_connect(f"/chat/ws/{sid}") as ws:
+        ws.send_text(json.dumps({"type": "message", "text": "hi"}))
+        assert json.loads(ws.receive_text())["type"] == "typing"
+        err = json.loads(ws.receive_text())
+        assert err["type"] == "error"
+        # Socket still alive — a clean end works.
+        ws.send_text(json.dumps({"type": "end"}))
+        ended = json.loads(ws.receive_text())
+        assert ended["type"] == "ended"
+
+
+def test_create_session_returns_fast_when_webhook_slow(app: FastAPI, monkeypatch) -> None:
+    # The session_started BO webhook is fire-and-forget: a slow/unreachable
+    # tenant CRM endpoint must not stall session creation (it used to block
+    # up to ~16s inline, wedging session bursts).
+    import asyncio as aio
+    import time
+
+    import src.api.chat_webhooks as chat_webhooks
+
+    async def _slow_webhook(tenant, event_type, payload):
+        await aio.sleep(1.5)
+        return True
+
+    monkeypatch.setattr(chat_webhooks, "send_bo_webhook", _slow_webhook)
+    client = TestClient(app)
+    t0 = time.monotonic()
+    resp = client.post("/chat/sessions", json={}, headers=HEADERS)
+    elapsed = time.monotonic() - t0
+    assert resp.status_code == 201
+    assert elapsed < 1.0, f"session create blocked on webhook ({elapsed:.2f}s)"
 
 
 def test_websocket_invalid_json_returns_error(app: FastAPI) -> None:
@@ -397,7 +472,7 @@ async def escalating_app(tmp_faiss_index: str, fake_redis, tmp_path):
         async with sm() as session:
             yield session
 
-    async def factory(tenant: TenantContext, session_id: str) -> ChatBotAgent:
+    async def factory(tenant: TenantContext, session_id: str, *, customer_id=None) -> ChatBotAgent:
         return ChatBotAgent(
             session=AgentSession(session_id=session_id),
             llm=_FakeLLMEscalating(),

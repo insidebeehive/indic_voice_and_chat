@@ -63,6 +63,11 @@ router = APIRouter(prefix="/chat", tags=["chat"])
 # --- DI -----------------------------------------------------------------
 
 
+# Factories may additionally accept an optional keyword-only ``customer_id``:
+# the WS connect path passes it (from the ChatSession row it already fetched)
+# so the factory can skip re-querying the same row on another pool checkout.
+# Callers that don't have the row omit it and the factory falls back to a
+# DB lookup.
 ChatBotFactory = Callable[[TenantContext, str], Awaitable[ChatBotAgent]]
 _factory: Optional[ChatBotFactory] = None
 _sessionmaker: object | None = None
@@ -109,6 +114,32 @@ def _mime_ext(mime: str) -> str:
 def _media_key(tenant_id: str, session_id: str, mime: str) -> str:
     ext = _mime_ext(mime)
     return f"chat/{tenant_id}/{session_id}/{uuid.uuid4().hex}.{ext}"
+
+
+# Ceiling on processing one chat turn (LLM + tools + RAG). Without it a hung
+# provider call under load piles up pending tasks indefinitely — the only other
+# timeout in the WS flow guards waiting for INPUT, not processing. Timeouts
+# surface through the existing per-turn error handler (socket stays open).
+# Sized above the LLM adapter's worst-case escalating 429 schedule (~35s of
+# backoff + several request RTTs across a multi-round tool turn): at 60s, a
+# 200-parallel load test still timed out 10/200 turns that would have
+# succeeded moments later; at 90s all 200 complete.
+_TURN_TIMEOUT_S = 90.0
+
+
+async def _run_turn(coro: Awaitable):
+    return await asyncio.wait_for(coro, timeout=_TURN_TIMEOUT_S)
+
+
+# Background webhook deliveries. Tasks must be referenced until done or the
+# event loop may GC them mid-flight.
+_webhook_tasks: set[asyncio.Task] = set()
+
+
+def _spawn_webhook_task(coro: Awaitable) -> None:
+    task = asyncio.ensure_future(coro)
+    _webhook_tasks.add(task)
+    task.add_done_callback(_webhook_tasks.discard)
 
 
 _MAX_MEDIA_FETCH_BYTES = 10 * 1024 * 1024  # cap for media pulled via media_url
@@ -313,10 +344,15 @@ async def create_session(
     ))
     await session.commit()
     from src.api.chat_webhooks import send_bo_webhook
-    await send_bo_webhook(tenant, "session_started", {
+    # Fire-and-forget: the webhook is a notification, not a dependency of
+    # session creation. Awaiting it inline stalls every create for up to
+    # ~16s (3 attempts × 5s) when a tenant's CRM endpoint is slow/down —
+    # under a session burst that alone wedges the whole flow. Delivery
+    # failures are logged inside send_bo_webhook.
+    _spawn_webhook_task(send_bo_webhook(tenant, "session_started", {
         "session_id": session_id,
         "customer": {"name": req.customer_name, "id": req.user_id},
-    })
+    }))
     return CreateSessionResponse(
         session_id=session_id,
         greeting=_greeting(tenant.name, req.customer_name, language),
@@ -814,7 +850,10 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
         return
 
     try:
-        agent = await _factory(tenant, _scoped_session(tenant, session_id))
+        # Pass customer_id from the row already fetched above so the factory
+        # doesn't re-query the same ChatSession row on another pool checkout.
+        agent = await _factory(tenant, _scoped_session(tenant, session_id),
+                               customer_id=row.customer_id)
     except Exception:
         # A failure here (e.g. a DB connection pool exhausted under a burst of
         # concurrent new sessions) must not leave the client waiting forever
@@ -823,10 +862,9 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
         await websocket.close(code=1011, reason="chatbot unavailable — please retry")
         return
     try:
-        # Handle reconnect: session may already be in human/awaiting_human mode.
-        async with _sm()() as db:
-            cur_row = await db.get(ChatSession, session_id)
-        if cur_row and cur_row.mode in ("awaiting_human", "human"):
+        # Handle reconnect: session may already be in human/awaiting_human mode
+        # (reuse the row fetched at connect — no second lookup for the same row).
+        if row.mode in ("awaiting_human", "human"):
             if await _run_human_mode(websocket, session_id, tenant):
                 return  # session fully ended
             # CRM declined — fall through to bot loop below
@@ -913,7 +951,7 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
 
                     # If transcription succeeded, get AI response; else inform customer
                     if transcript:
-                        result = await agent.handle_message(transcript)
+                        result = await _run_turn(agent.handle_message(transcript))
                         msg_id = await _persist_turn(
                             session_id, transcript, result,
                             user_type="audio", media_mime=mime, media_url=object_key,
@@ -994,7 +1032,8 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
                             log.exception("media upload failed", extra={"session_id": session_id})
                             object_key = None
 
-                    result = await agent.handle_image(fetched_bytes if fetched_bytes is not None else data, mime, caption)
+                    result = await _run_turn(
+                        agent.handle_image(fetched_bytes if fetched_bytes is not None else data, mime, caption))
                     await _persist_turn(session_id, caption or f"[{mtype}]", result,
                                         user_type=mtype, media_mime=mime, media_url=object_key)
                     await _send_reply(websocket, session_id, result, tenant.id)
@@ -1010,7 +1049,7 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
                     continue
 
                 await websocket.send_text(json.dumps({"type": "typing"}))
-                result = await agent.handle_message(user_text)
+                result = await _run_turn(agent.handle_message(user_text))
                 await _persist_turn(session_id, user_text, result)
                 call_url: Optional[str] = None
                 if result.call_offer and _handoff_store is not None:

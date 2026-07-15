@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import random
 from typing import Any, AsyncIterator, Callable, Optional
 
 import json
@@ -37,9 +38,42 @@ DEFAULT_MODEL = "gemini-2.5-flash"
 # for well-formed requests. Google's own error body tells callers to retry, so
 # we transparently retry these before any audio is spoken. A live turn must not
 # die on a provider blip.
-_RETRIABLE_STATUS = frozenset({429, 500, 502, 503, 504})
-_MAX_RETRIES = 2  # total attempts = 1 + _MAX_RETRIES
+#
+# 429 (quota) is handled separately from 5xx: under quota exhaustion, fast
+# multi-retry AMPLIFIES the request rate against an already-throttled API (a
+# retry storm — 200 concurrent chat sessions × 3 attempts each at 0.4s/0.8s).
+# Gemini's dominant quota is TOKENS PER MINUTE, so a saturated window clears on
+# a ~minute cadence: retries must ESCALATE across that window, not hammer
+# inside it. Verified under a 200-parallel load test: a single short 2-4s
+# retry still failed 42/200 turns (both attempts landed in the same saturated
+# minute); escalating jittered waits let queued turns land as the window
+# rolls. Worst-case cumulative wait ≈ 35s, inside the 60s chat turn ceiling.
+_RETRIABLE_STATUS = frozenset({500, 502, 503, 504})
+_MAX_RETRIES = 2  # total attempts = 1 + _MAX_RETRIES (5xx only)
 _BACKOFF_BASE_S = 0.4
+_RATE_LIMIT_BACKOFF_S = ((1.0, 2.0), (4.0, 8.0), (15.0, 25.0))  # jitter window per retry
+_RATE_LIMIT_MAX_RETRIES = len(_RATE_LIMIT_BACKOFF_S)
+
+# Cap on concurrent in-flight Gemini requests per process. Without it, a burst
+# of sessions (e.g. a 200-parallel-chat stress test) fans out unbounded and
+# blows the per-minute quota, turning every turn into a 429. The cap is at the
+# adapter layer so chat, voice, and analysis all share it without call-site
+# changes. Streaming holds a slot only until the first chunk arrives (the
+# rate-limited unit is the request, not the stream's lifetime).
+_DEFAULT_MAX_CONCURRENCY = 24
+# Semaphores bind to the running event loop on first await; tests spin up a
+# fresh loop per test, so key the semaphore by loop instead of one module global.
+_sem_by_loop: dict[int, asyncio.Semaphore] = {}
+
+
+def _concurrency_sem() -> asyncio.Semaphore:
+    loop = asyncio.get_running_loop()
+    sem = _sem_by_loop.get(id(loop))
+    if sem is None:
+        limit = int(os.environ.get("GEMINI_MAX_CONCURRENCY", _DEFAULT_MAX_CONCURRENCY))
+        sem = asyncio.Semaphore(max(1, limit))
+        _sem_by_loop[id(loop)] = sem
+    return sem
 
 
 class GeminiLLMAdapter(ILLMProvider):
@@ -131,19 +165,34 @@ class GeminiLLMAdapter(ILLMProvider):
 
     @staticmethod
     async def _call_with_retry(fn: Callable[[], Any], *, what: str) -> Any:
-        """Await ``fn()``, retrying transient 5xx/429 errors with backoff.
+        """Await ``fn()``, retrying transient errors with backoff.
 
-        Only errors whose HTTP status is in ``_RETRIABLE_STATUS`` are retried;
-        everything else (and ``CancelledError``, which is a ``BaseException``)
-        propagates immediately. The caller must ensure no side effects have been
-        committed yet — for streaming, that means no token has been yielded.
+        5xx errors in ``_RETRIABLE_STATUS`` get up to ``_MAX_RETRIES`` fast
+        retries; a 429 gets a single retry after a long jittered backoff (fast
+        multi-retry on quota exhaustion amplifies the storm). Everything else
+        (and ``CancelledError``, which is a ``BaseException``) propagates
+        immediately. Each attempt holds a concurrency-cap slot only while the
+        request is in flight — not across backoff sleeps. The caller must
+        ensure no side effects have been committed yet — for streaming, that
+        means no token has been yielded.
         """
         attempt = 0
+        rate_limit_attempt = 0
         while True:
             try:
-                return await fn()
+                async with _concurrency_sem():
+                    return await fn()
             except Exception as exc:  # noqa: BLE001 - re-raised unless retriable
                 code = getattr(exc, "code", None)
+                if code == 429 and rate_limit_attempt < _RATE_LIMIT_MAX_RETRIES:
+                    delay = random.uniform(*_RATE_LIMIT_BACKOFF_S[rate_limit_attempt])
+                    rate_limit_attempt += 1
+                    log.warning(
+                        "gemini rate-limited (429) on %s; retry %d/%d in %.1fs",
+                        what, rate_limit_attempt, _RATE_LIMIT_MAX_RETRIES, delay,
+                    )
+                    await asyncio.sleep(delay)
+                    continue
                 if code in _RETRIABLE_STATUS and attempt < _MAX_RETRIES:
                     attempt += 1
                     log.warning(

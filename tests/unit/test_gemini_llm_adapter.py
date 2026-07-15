@@ -272,6 +272,85 @@ async def test_generate_retries_transient_then_succeeds() -> None:
     assert calls["generate"] == 2
 
 
+# --- 429 rate-limit policy (single long-backoff retry, no storm) --------
+
+
+@pytest.mark.asyncio
+async def test_generate_429_uses_escalating_retry_schedule() -> None:
+    # Gemini's quota is tokens-per-MINUTE: retries must escalate across the
+    # window, and stop after the schedule is exhausted (no unbounded storm).
+    import src.providers.llm.gemini as gemini_mod
+    client, calls = _flaky_client(
+        fail_times=99, code=429, generate_return=_response("never"),
+    )
+    adapter = GeminiLLMAdapter({"client": client})
+    with pytest.raises(_FakeAPIError):
+        await adapter.generate([LLMMessage(role="user", content="hi")], LLMConfig())
+    assert calls["generate"] == 1 + gemini_mod._RATE_LIMIT_MAX_RETRIES
+
+
+@pytest.mark.asyncio
+async def test_generate_429_backoff_escalates_and_is_jittered(monkeypatch) -> None:
+    import src.providers.llm.gemini as gemini_mod
+    sleep_mock = AsyncMock()
+    monkeypatch.setattr(gemini_mod.asyncio, "sleep", sleep_mock)
+    client, _ = _flaky_client(fail_times=2, code=429, generate_return=_response("ok"))
+    adapter = GeminiLLMAdapter({"client": client})
+    result = await adapter.generate([LLMMessage(role="user", content="hi")], LLMConfig())
+    assert result.text == "ok"
+    delays = [call.args[0] for call in sleep_mock.await_args_list]
+    assert len(delays) == 2
+    for delay, (lo, hi) in zip(delays, gemini_mod._RATE_LIMIT_BACKOFF_S):
+        assert lo <= delay <= hi  # per-attempt jitter window, not the fast 5xx backoff
+    assert delays[1] > delays[0]  # escalating, spreading across the quota window
+
+
+# --- Concurrency cap -----------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_concurrent_generates_bounded_by_semaphore(monkeypatch) -> None:
+    # NB: the autouse _no_backoff_sleep fixture mocks asyncio.sleep, so this
+    # test drives scheduling with Event.wait + executor hops instead of sleeps.
+    import asyncio as real_asyncio
+
+    import src.providers.llm.gemini as gemini_mod
+    monkeypatch.setenv("GEMINI_MAX_CONCURRENCY", "2")
+    monkeypatch.setattr(gemini_mod, "_sem_by_loop", {})  # fresh sem for this loop
+
+    in_flight = {"now": 0, "max": 0}
+    release = real_asyncio.Event()
+
+    async def _slow_generate(**kwargs):
+        in_flight["now"] += 1
+        in_flight["max"] = max(in_flight["max"], in_flight["now"])
+        await release.wait()
+        in_flight["now"] -= 1
+        return _response("ok")
+
+    models = SimpleNamespace(
+        generate_content=AsyncMock(side_effect=_slow_generate),
+        generate_content_stream=AsyncMock(),
+    )
+    client = SimpleNamespace(aio=SimpleNamespace(models=models))
+    adapter = GeminiLLMAdapter({"client": client})
+
+    tasks = [real_asyncio.create_task(
+        adapter.generate([LLMMessage(role="user", content="hi")], LLMConfig()))
+        for _ in range(6)]
+    # Yield to the loop (via executor hops — real sleep is mocked) so all six
+    # tasks advance: two should hold semaphore slots, the rest queue on it.
+    loop = real_asyncio.get_running_loop()
+    for _ in range(20):
+        await loop.run_in_executor(None, lambda: None)
+    assert in_flight["now"] == 2  # cap reached; remaining four are queued
+
+    release.set()
+    results = await real_asyncio.gather(*tasks)
+    assert all(r.text == "ok" for r in results)
+    assert in_flight["max"] <= 2
+
+
 # --- Construction ------------------------------------------------------
 
 

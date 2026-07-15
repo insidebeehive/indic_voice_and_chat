@@ -222,3 +222,34 @@ async def test_delete_removes_from_both_backends(retriever: HybridRetriever, sto
 @pytest.mark.asyncio
 async def test_search_empty_index(retriever: HybridRetriever) -> None:
     assert await retriever.search("anything", top_k=3) == []
+
+
+@pytest.mark.asyncio
+async def test_query_embedding_runs_off_the_event_loop(store: FAISSAdapter) -> None:
+    # Embedders are sync REST calls (Gemini). The QUERY path must run them in
+    # a worker thread like the ingest path already does — a blocking call on
+    # the loop freezes every concurrent session on a single-worker deployment
+    # (this was the root cause of the 200-parallel-chat stress-test collapse).
+    import threading
+
+    main_thread = threading.get_ident()
+    embed_threads: list[int] = []
+
+    class _ThreadRecordingEmbedder(HashEmbedder):
+        def embed_query(self, text: str):
+            embed_threads.append(threading.get_ident())
+            return super().embed_query(text)
+
+    r = HybridRetriever(
+        embedder=_ThreadRecordingEmbedder(dim=64),
+        vector_store=store,
+        reranker=None,
+        config=RetrievalConfig(strategy="hybrid", top_k=3, oversample_k=10,
+                               reranking=False, similarity_threshold=0.0),
+    )
+    await r.index([Document(id="a", content="plan b unlimited data")])
+    await r.search("plan b", top_k=3)
+    assert embed_threads, "embed_query was never called"
+    assert all(t != main_thread for t in embed_threads), (
+        "embed_query ran on the event-loop thread — it must be offloaded via to_thread"
+    )

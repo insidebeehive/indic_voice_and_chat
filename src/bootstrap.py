@@ -333,17 +333,30 @@ def make_chatbot_factory(registry, sessionmaker=None, platform_retriever=None):
     async def _load_crm_tools(tenant: TenantContext):
         return await crm_tools_registry.get(tenant)
 
-    async def factory(tenant: TenantContext, session_id: str) -> ChatBotAgent:
-        # Load the chat session so we have customer_id (= logged-in user/player ID)
-        # for CRM tool calls that need player-specific context.
-        user_id: str | None = None
-        if sessionmaker is not None:
-            from src.models.chat import ChatSession as _ChatSession
-            # session_id may be Redis-scoped as "{tenant_id}:{bare_id}" — strip the prefix.
-            bare_session_id = session_id.split(":", 1)[-1] if ":" in session_id else session_id
-            async with sessionmaker() as _db:
-                _row = await _db.get(_ChatSession, bare_session_id)
-                user_id = _row.customer_id if _row else None
+    # Sentinel distinguishing "caller didn't supply customer_id" from a session
+    # that genuinely has none — an anonymous session's None must not trigger a
+    # redundant DB lookup.
+    _CUSTOMER_ID_UNSET = object()
+
+    async def factory(
+        tenant: TenantContext, session_id: str, *,
+        customer_id: object = _CUSTOMER_ID_UNSET,
+    ) -> ChatBotAgent:
+        # customer_id (= logged-in user/player ID) feeds CRM tool calls that
+        # need player-specific context. The WS connect path passes it from the
+        # ChatSession row it already fetched; only legacy callers without the
+        # row fall back to loading it here.
+        if customer_id is not _CUSTOMER_ID_UNSET:
+            user_id = customer_id
+        else:
+            user_id = None
+            if sessionmaker is not None:
+                from src.models.chat import ChatSession as _ChatSession
+                # session_id may be Redis-scoped as "{tenant_id}:{bare_id}" — strip the prefix.
+                bare_session_id = session_id.split(":", 1)[-1] if ":" in session_id else session_id
+                async with sessionmaker() as _db:
+                    _row = await _db.get(_ChatSession, bare_session_id)
+                    user_id = _row.customer_id if _row else None
 
         crm_specs, crm_execs = await _load_crm_tools(tenant)
 

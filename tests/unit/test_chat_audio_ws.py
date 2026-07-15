@@ -69,7 +69,7 @@ async def ws_ctx():
     fake_tenant.slug = "demo"
     fake_tenant.settings.chat_support.chat_idle_timeout_seconds = 300
 
-    async def fake_factory(tenant, scoped_id):
+    async def fake_factory(tenant, scoped_id, *, customer_id=None):
         return fake_agent
 
     chat_api.set_chatbot_factory(fake_factory)
