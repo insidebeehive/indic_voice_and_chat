@@ -1082,10 +1082,17 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
                             break
             except WebSocketDisconnect:
                 raise
-            except Exception:  # noqa: BLE001 — one bad turn must not drop the chat
+            except Exception as turn_exc:  # noqa: BLE001 — one bad turn must not drop the chat
                 log.exception("chat turn failed", extra={"session_id": session_id})
-                await websocket.send_text(json.dumps(
-                    {"type": "error", "message": "Sorry, something went wrong — please try again."}))
+                if getattr(turn_exc, "code", None) == 429:
+                    # Provider quota exhausted (per-minute schedule failed, or
+                    # the per-day cap) — be honest instead of "something went
+                    # wrong", which reads like a bug and invites retrying now.
+                    message = ("We're experiencing very high demand right now — "
+                               "please try again in a little while.")
+                else:
+                    message = "Sorry, something went wrong — please try again."
+                await websocket.send_text(json.dumps({"type": "error", "message": message}))
     except WebSocketDisconnect:
         log.info("chat ws client disconnected", extra={"session_id": session_id})
     except Exception:  # noqa: BLE001 — never let the websocket task escape

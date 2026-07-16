@@ -256,6 +256,31 @@ def test_websocket_turn_timeout_sends_error_keeps_socket(app: FastAPI, monkeypat
         assert ended["type"] == "ended"
 
 
+def test_websocket_quota_exhaustion_sends_high_demand_message(app: FastAPI) -> None:
+    # A 429 (provider quota exhausted) must tell the customer it's demand,
+    # not a bug — the generic "something went wrong" invites retrying now.
+    client = TestClient(app)
+    sid = _create_session(client)
+
+    class _QuotaError(Exception):
+        code = 429
+
+    class _QuotaAgent:
+        async def handle_message(self, text):
+            raise _QuotaError("429 RESOURCE_EXHAUSTED")
+
+    async def _factory(tenant, session_id, *, customer_id=None):
+        return _QuotaAgent()
+
+    chat.set_chatbot_factory(_factory)
+    with client.websocket_connect(f"/chat/ws/{sid}") as ws:
+        ws.send_text(json.dumps({"type": "message", "text": "hi"}))
+        assert json.loads(ws.receive_text())["type"] == "typing"
+        err = json.loads(ws.receive_text())
+        assert err["type"] == "error"
+        assert "high demand" in err["message"]
+
+
 def test_create_session_returns_fast_when_webhook_slow(app: FastAPI, monkeypatch) -> None:
     # The session_started BO webhook is fire-and-forget: a slow/unreachable
     # tenant CRM endpoint must not stall session creation (it used to block

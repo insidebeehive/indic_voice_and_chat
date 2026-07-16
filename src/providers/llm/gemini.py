@@ -15,6 +15,7 @@ import asyncio
 import logging
 import os
 import random
+import re
 from typing import Any, AsyncIterator, Callable, Optional
 
 import json
@@ -53,6 +54,20 @@ _MAX_RETRIES = 2  # total attempts = 1 + _MAX_RETRIES (5xx only)
 _BACKOFF_BASE_S = 0.4
 _RATE_LIMIT_BACKOFF_S = ((1.0, 2.0), (4.0, 8.0), (15.0, 25.0))  # jitter window per retry
 _RATE_LIMIT_MAX_RETRIES = len(_RATE_LIMIT_BACKOFF_S)
+# Gemini's 429 body includes RetryInfo.retryDelay. For the per-MINUTE quota
+# it's ~1s and the escalating schedule above bridges it. But the per-DAY
+# request quota (e.g. 10K requests/day on Tier 1) answers with retryDelay of
+# HOURS ('36016s') — retrying is pure waste that just delays the customer's
+# error by ~35s. If Google says the quota won't clear within this bound,
+# fail fast instead of retrying.
+_RATE_LIMIT_GIVE_UP_S = 60.0
+_RETRY_DELAY_RE = re.compile(r"retryDelay['\"]?\s*[:=]\s*['\"]?(\d+(?:\.\d+)?)s")
+
+
+def _suggested_retry_delay_s(exc: Exception) -> Optional[float]:
+    """Pull Google's RetryInfo.retryDelay (seconds) out of a 429 error, if present."""
+    m = _RETRY_DELAY_RE.search(str(exc))
+    return float(m.group(1)) if m else None
 
 # Cap on concurrent in-flight Gemini requests per process. Without it, a burst
 # of sessions (e.g. a 200-parallel-chat stress test) fans out unbounded and
@@ -185,6 +200,15 @@ class GeminiLLMAdapter(ILLMProvider):
             except Exception as exc:  # noqa: BLE001 - re-raised unless retriable
                 code = getattr(exc, "code", None)
                 if code == 429 and rate_limit_attempt < _RATE_LIMIT_MAX_RETRIES:
+                    suggested = _suggested_retry_delay_s(exc)
+                    if suggested is not None and suggested > _RATE_LIMIT_GIVE_UP_S:
+                        # e.g. the per-DAY quota: "retry in 10h" — don't make
+                        # the customer wait through a doomed retry schedule.
+                        log.error(
+                            "gemini quota exhausted on %s (provider says retry in %.0fs) — not retrying",
+                            what, suggested,
+                        )
+                        raise
                     delay = random.uniform(*_RATE_LIMIT_BACKOFF_S[rate_limit_attempt])
                     rate_limit_attempt += 1
                     log.warning(

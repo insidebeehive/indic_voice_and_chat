@@ -305,6 +305,67 @@ async def test_generate_429_backoff_escalates_and_is_jittered(monkeypatch) -> No
     assert delays[1] > delays[0]  # escalating, spreading across the quota window
 
 
+class _FakeQuotaError(Exception):
+    """Mimics a google.genai 429 whose body carries RetryInfo.retryDelay."""
+
+    def __init__(self, retry_delay_s: str) -> None:
+        super().__init__(
+            "429 RESOURCE_EXHAUSTED. {'error': {'code': 429, "
+            "'details': [{'@type': 'type.googleapis.com/google.rpc.RetryInfo', "
+            f"'retryDelay': '{retry_delay_s}'}}]}}}}"
+        )
+        self.code = 429
+
+
+@pytest.mark.asyncio
+async def test_429_with_hours_long_retry_delay_fails_fast() -> None:
+    # The per-DAY quota answers "retry in 10h" (retryDelay: '36016s') — the
+    # escalating schedule can't bridge that; retrying just delays the
+    # customer's error by ~35s. Must raise on the FIRST attempt.
+    calls = {"n": 0}
+
+    async def _always_quota(**kwargs):
+        calls["n"] += 1
+        raise _FakeQuotaError("36016s")
+
+    models = SimpleNamespace(
+        generate_content=AsyncMock(side_effect=_always_quota),
+        generate_content_stream=AsyncMock(),
+    )
+    adapter = GeminiLLMAdapter({"client": SimpleNamespace(aio=SimpleNamespace(models=models))})
+    with pytest.raises(_FakeQuotaError):
+        await adapter.generate([LLMMessage(role="user", content="hi")], LLMConfig())
+    assert calls["n"] == 1  # no retries against an hours-long quota window
+
+
+@pytest.mark.asyncio
+async def test_429_with_short_retry_delay_still_retries() -> None:
+    # The per-MINUTE quota suggests ~1s — the escalating schedule handles it.
+    calls = {"n": 0}
+
+    async def _quota_once(**kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise _FakeQuotaError("1s")
+        return _response("ok")
+
+    models = SimpleNamespace(
+        generate_content=AsyncMock(side_effect=_quota_once),
+        generate_content_stream=AsyncMock(),
+    )
+    adapter = GeminiLLMAdapter({"client": SimpleNamespace(aio=SimpleNamespace(models=models))})
+    result = await adapter.generate([LLMMessage(role="user", content="hi")], LLMConfig())
+    assert result.text == "ok"
+    assert calls["n"] == 2
+
+
+def test_suggested_retry_delay_parsing() -> None:
+    from src.providers.llm.gemini import _suggested_retry_delay_s
+    assert _suggested_retry_delay_s(_FakeQuotaError("36016s")) == 36016.0
+    assert _suggested_retry_delay_s(_FakeQuotaError("1.241110042s")) == pytest.approx(1.241, abs=0.001)
+    assert _suggested_retry_delay_s(Exception("429 plain, no details")) is None
+
+
 # --- Concurrency cap -----------------------------------------------------
 
 
