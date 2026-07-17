@@ -19,6 +19,7 @@ from typing import Any, AsyncIterator
 import httpx
 
 from src.interfaces.tts import ITTSProvider, TTSConfig, TTSResult
+from src.pipeline.audio_utils import resample_pcm16
 from src.pipeline.text_normalize import normalize_for_tts
 from src.providers.tts.sarvam import _extract_pcm
 
@@ -99,14 +100,22 @@ class IndicF5TTSAdapter(ITTSProvider):
 
         # The server returns WAV; downstream bridges need raw 16-bit mono PCM
         # (a WAV header decoded as samples causes a noise burst at the start).
-        # _extract_pcm also reads the REAL sample rate from the header — the
-        # server renders at its model rate regardless of what we'd request.
-        audio_bytes, sample_rate = _extract_pcm(blob, fallback_rate=config.sample_rate)
-        duration_ms = (len(audio_bytes) / max(sample_rate * 2, 1)) * 1000.0
+        # _extract_pcm reads the REAL sample rate from the header — IndicF5
+        # renders at its model rate (24kHz) regardless of what we'd request.
+        audio_bytes, actual_rate = _extract_pcm(blob, fallback_rate=config.sample_rate)
+        # The pipeline sends TTS audio to the sink as-is and the bridges are
+        # wired for the REQUESTED rate (TTSConfig(sample_rate=16000) →
+        # 16k→8k telephony conversion happens there) — TTSResult.sample_rate
+        # is informational, not honored. 24kHz passed through unresampled
+        # would play at ~2/3 speed, so convert here, like Sarvam's API does
+        # natively when asked for a speech_sample_rate.
+        if actual_rate != config.sample_rate:
+            audio_bytes, _ = resample_pcm16(audio_bytes, actual_rate, config.sample_rate)
+        duration_ms = (len(audio_bytes) / max(config.sample_rate * 2, 1)) * 1000.0
         return TTSResult(
             audio=audio_bytes,
             duration_ms=duration_ms,
-            sample_rate=sample_rate,
+            sample_rate=config.sample_rate,
         )
 
     async def synthesize_stream(

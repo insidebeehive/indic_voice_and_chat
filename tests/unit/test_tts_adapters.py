@@ -141,14 +141,18 @@ async def test_constructor_requires_api_key(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 @respx.mock
-async def test_indicf5_synthesize_unwraps_wav_and_maps_lang(indicf5: IndicF5TTSAdapter) -> None:
+async def test_indicf5_synthesize_resamples_24k_to_requested_rate(indicf5: IndicF5TTSAdapter) -> None:
+    # IndicF5 renders at its model rate (24kHz) regardless of the request,
+    # but the pipeline/bridges are wired for the REQUESTED rate and don't
+    # honor TTSResult.sample_rate — unresampled 24k plays at ~2/3 speed.
+    # The adapter must strip the WAV header AND resample to the request.
     pcm = b"\x01\x02" * 2400  # 4800 bytes => 0.1s @ 24kHz mono 16-bit
     route = respx.post(f"{_INDICF5_URL}/tts").mock(
         return_value=Response(200, content=_wav(pcm, 24000)))
     result = await indicf5.synthesize("नमस्कार", TTSConfig(language="mr-IN", sample_rate=16000))
-    # WAV header stripped; REAL rate read from the header, not the requested one.
-    assert result.audio == pcm
-    assert result.sample_rate == 24000
+    assert result.sample_rate == 16000
+    # 0.1s of audio at 16kHz mono 16-bit = 3200 bytes (duration preserved).
+    assert len(result.audio) == pytest.approx(3200, abs=8)
     assert result.duration_ms == pytest.approx(100.0, rel=0.05)
     body = route.calls[0].request.read()
     import json as _json
@@ -158,10 +162,23 @@ async def test_indicf5_synthesize_unwraps_wav_and_maps_lang(indicf5: IndicF5TTSA
 
 @pytest.mark.asyncio
 @respx.mock
+async def test_indicf5_no_resample_when_rates_match(indicf5: IndicF5TTSAdapter) -> None:
+    pcm = b"\x01\x02" * 1600  # 3200 bytes => 0.1s @ 16kHz
+    respx.post(f"{_INDICF5_URL}/tts").mock(
+        return_value=Response(200, content=_wav(pcm, 16000)))
+    result = await indicf5.synthesize("hi", TTSConfig(language="hi-IN", sample_rate=16000))
+    assert result.audio == pcm  # byte-identical, no needless conversion
+    assert result.sample_rate == 16000
+
+
+@pytest.mark.asyncio
+@respx.mock
 async def test_indicf5_retries_5xx_then_succeeds(indicf5: IndicF5TTSAdapter) -> None:
     pcm = b"\x00\x01" * 100
     route = respx.post(f"{_INDICF5_URL}/tts")
-    route.side_effect = [Response(503), Response(200, content=_wav(pcm, 24000))]
+    # 16k here so no resample obscures the byte-identity check — this test is
+    # about retry behavior; resampling has its own tests above.
+    route.side_effect = [Response(503), Response(200, content=_wav(pcm, 16000))]
     result = await indicf5.synthesize("Namaste", TTSConfig(language="hi-IN"))
     assert result.audio == pcm
     assert route.call_count == 2
