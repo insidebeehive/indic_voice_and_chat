@@ -41,6 +41,10 @@ tts:
     "bulbul:v2": 0.015
     "bulbul:v3": 0.018
     "bulbul:v3-beta": 0.018
+  indicf5:
+    # Self-hosted on RunPod — no per-request provider fee; this figure should
+    # reflect amortized pod cost per audio-minute (adjust to actual pod rate).
+    indicf5-finetuned: 0.005
 s2s:
   gemini_live:
     gemini-3.1-flash-live-preview: 0.03

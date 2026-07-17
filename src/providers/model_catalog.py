@@ -38,6 +38,8 @@ MODELS: dict[str, dict[str, list[str]]] = {
     },
     "tts": {
         "sarvam": ["bulbul:v2", "bulbul:v3", "bulbul:v3-beta"],
+        # Self-hosted fine-tuned IndicF5 voice server (one model = one voice).
+        "indicf5": ["indicf5-finetuned"],
     },
     "s2s": {
         "gemini_live": [

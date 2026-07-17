@@ -31,6 +31,7 @@ from src.providers.tts.azure import AzureTTSAdapter
 from src.providers.tts.elevenlabs import ElevenLabsTTSAdapter
 from src.providers.tts.gemini import GeminiTTSAdapter
 from src.providers.tts.google import GoogleTTSAdapter
+from src.providers.tts.indicf5 import IndicF5TTSAdapter
 from src.providers.tts.sarvam import SarvamTTSAdapter
 from src.providers.vector_store.faiss_store import FAISSAdapter
 from src.providers.vector_store.pgvector_store import PGVectorAdapter
@@ -58,6 +59,7 @@ TTS_PROVIDERS: dict[str, type[ITTSProvider]] = {
     "google": GoogleTTSAdapter,
     "azure": AzureTTSAdapter,
     "elevenlabs": ElevenLabsTTSAdapter,
+    "indicf5": IndicF5TTSAdapter,
 }
 
 TELEPHONY_PROVIDERS: dict[str, type[ITelephonyProvider]] = {

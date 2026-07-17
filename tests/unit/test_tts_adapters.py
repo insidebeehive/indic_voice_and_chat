@@ -8,12 +8,30 @@ import respx
 from httpx import Response
 
 from src.interfaces.tts import TTSConfig
+from src.providers.tts.indicf5 import IndicF5TTSAdapter
 from src.providers.tts.sarvam import SARVAM_BASE_URL, SarvamTTSAdapter
 
 
 @pytest.fixture
 def adapter() -> SarvamTTSAdapter:
     return SarvamTTSAdapter({"api_key": "test-key"})
+
+
+_INDICF5_URL = "https://pod-8000.proxy.runpod.net"
+
+
+@pytest.fixture
+def indicf5() -> IndicF5TTSAdapter:
+    return IndicF5TTSAdapter({"base_url": _INDICF5_URL})
+
+
+def _wav(pcm: bytes, rate: int) -> bytes:
+    """Minimal RIFF/WAVE wrapper (16-bit mono) around raw PCM."""
+    import struct
+    fmt = struct.pack("<HHIIHH", 1, 1, rate, rate * 2, 2, 16)
+    return (b"RIFF" + struct.pack("<I", 36 + len(pcm)) + b"WAVE"
+            + b"fmt " + struct.pack("<I", len(fmt)) + fmt
+            + b"data" + struct.pack("<I", len(pcm)) + pcm)
 
 
 @pytest.mark.asyncio
@@ -116,3 +134,62 @@ async def test_constructor_requires_api_key(monkeypatch) -> None:
     monkeypatch.delenv("SARVAM_API_KEY", raising=False)
     with pytest.raises(ValueError):
         SarvamTTSAdapter({})
+
+
+# --- IndicF5 (self-hosted fine-tuned voice server) -----------------------
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_indicf5_synthesize_unwraps_wav_and_maps_lang(indicf5: IndicF5TTSAdapter) -> None:
+    pcm = b"\x01\x02" * 2400  # 4800 bytes => 0.1s @ 24kHz mono 16-bit
+    route = respx.post(f"{_INDICF5_URL}/tts").mock(
+        return_value=Response(200, content=_wav(pcm, 24000)))
+    result = await indicf5.synthesize("नमस्कार", TTSConfig(language="mr-IN", sample_rate=16000))
+    # WAV header stripped; REAL rate read from the header, not the requested one.
+    assert result.audio == pcm
+    assert result.sample_rate == 24000
+    assert result.duration_ms == pytest.approx(100.0, rel=0.05)
+    body = route.calls[0].request.read()
+    import json as _json
+    payload = _json.loads(body)
+    assert payload["lang"] == "mr"  # BCP-47 mr-IN mapped to the server's bare code
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_indicf5_retries_5xx_then_succeeds(indicf5: IndicF5TTSAdapter) -> None:
+    pcm = b"\x00\x01" * 100
+    route = respx.post(f"{_INDICF5_URL}/tts")
+    route.side_effect = [Response(503), Response(200, content=_wav(pcm, 24000))]
+    result = await indicf5.synthesize("Namaste", TTSConfig(language="hi-IN"))
+    assert result.audio == pcm
+    assert route.call_count == 2
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_indicf5_does_not_retry_4xx(indicf5: IndicF5TTSAdapter) -> None:
+    route = respx.post(f"{_INDICF5_URL}/tts").mock(return_value=Response(422))
+    with pytest.raises(httpx.HTTPStatusError):
+        await indicf5.synthesize("hi", TTSConfig(language="hi-IN"))
+    assert route.call_count == 1
+
+
+def test_indicf5_voices_cover_indic_languages(indicf5: IndicF5TTSAdapter) -> None:
+    for lang in ("mr-IN", "hi-IN", "ta-IN", "bn-IN"):
+        voices = indicf5.get_available_voices(lang)
+        assert voices and voices[0]["voice_id"] == "indicf5"
+    assert indicf5.get_available_voices("fr-FR") == []
+
+
+@pytest.mark.asyncio
+async def test_indicf5_constructor_requires_url(monkeypatch) -> None:
+    monkeypatch.delenv("INDICF5_TTS_URL", raising=False)
+    with pytest.raises(ValueError):
+        IndicF5TTSAdapter({})
+
+
+def test_indicf5_registered_in_provider_registry() -> None:
+    from src.providers import TTS_PROVIDERS
+    assert TTS_PROVIDERS["indicf5"] is IndicF5TTSAdapter
