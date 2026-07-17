@@ -208,6 +208,19 @@ class GeminiLLMAdapter(ILLMProvider):
             except Exception as exc:  # noqa: BLE001 - re-raised unless retriable
                 code = getattr(exc, "code", None)
                 if code == 429 and rate_limit_attempt < _RATE_LIMIT_MAX_RETRIES:
+                    if "FreeTier" in str(exc) or "free_tier" in str(exc):
+                        # Not load — a misconfigured project. A key swapped to a
+                        # Gemini project WITHOUT billing runs on the free tier
+                        # (e.g. 20 requests/DAY): retrying is pointless and the
+                        # fix is operational. Seen live 2026-07-17 after the
+                        # staging key moved to a new, unbilled project.
+                        log.error(
+                            "gemini 429 on %s is a FREE-TIER quota — the API key's "
+                            "project has no billing account attached; enable billing "
+                            "on the Gemini project to restore normal quotas",
+                            what,
+                        )
+                        raise
                     suggested = _suggested_retry_delay_s(exc)
                     if suggested is not None and suggested > _RATE_LIMIT_GIVE_UP_S:
                         # e.g. the per-DAY quota: "retry in 10h" — don't make

@@ -339,6 +339,33 @@ async def test_429_with_hours_long_retry_delay_fails_fast() -> None:
 
 
 @pytest.mark.asyncio
+async def test_429_free_tier_quota_fails_fast_without_retry() -> None:
+    # A FreeTier quota 429 means the key's project has no billing attached —
+    # a misconfiguration, not load. No retry, even though Google's suggested
+    # retryDelay can be short (seen live: 58s on a 20-requests/DAY limit).
+    calls = {"n": 0}
+
+    class _FreeTierError(Exception):
+        code = 429
+
+    async def _always_free_tier(**kwargs):
+        calls["n"] += 1
+        raise _FreeTierError(
+            "429 RESOURCE_EXHAUSTED. quotaId: "
+            "'GenerateRequestsPerDayPerProjectPerModel-FreeTier', "
+            "'retryDelay': '58s'")
+
+    models = SimpleNamespace(
+        generate_content=AsyncMock(side_effect=_always_free_tier),
+        generate_content_stream=AsyncMock(),
+    )
+    adapter = GeminiLLMAdapter({"client": SimpleNamespace(aio=SimpleNamespace(models=models))})
+    with pytest.raises(_FreeTierError):
+        await adapter.generate([LLMMessage(role="user", content="hi")], LLMConfig())
+    assert calls["n"] == 1
+
+
+@pytest.mark.asyncio
 async def test_429_with_short_retry_delay_still_retries() -> None:
     # The per-MINUTE quota suggests ~1s — the escalating schedule handles it.
     calls = {"n": 0}
