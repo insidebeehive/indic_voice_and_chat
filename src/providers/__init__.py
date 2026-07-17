@@ -18,6 +18,7 @@ from src.interfaces.vector_store import IVectorStore
 from src.providers.llm.anthropic_claude import AnthropicClaudeAdapter
 from src.providers.llm.gemini import GeminiLLMAdapter
 from src.providers.llm.groq import GroqLLMAdapter
+from src.providers.llm.openai_compat import OpenAICompatLLMAdapter
 from src.providers.stt.deepgram import DeepgramSTTAdapter
 from src.providers.stt.gemini import GeminiSTTAdapter
 from src.providers.stt.groq_whisper import GroqSTTAdapter
@@ -51,6 +52,8 @@ LLM_PROVIDERS: dict[str, type[ILLMProvider]] = {
     "gemini": GeminiLLMAdapter,
     "anthropic": AnthropicClaudeAdapter,
     "claude": AnthropicClaudeAdapter,
+    # Self-hosted vLLM (OpenAI-compatible) — e.g. on the IndicF5 RunPod pod.
+    "vllm": OpenAICompatLLMAdapter,
 }
 
 TTS_PROVIDERS: dict[str, type[ITTSProvider]] = {

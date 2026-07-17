@@ -17,6 +17,8 @@ MODELS: dict[str, dict[str, list[str]]] = {
         "deepgram": ["nova-2", "nova-3"],
     },
     "llm": {
+        # Self-hosted vLLM on the IndicF5 RunPod pod (OpenAI-compatible).
+        "vllm": ["Qwen/Qwen2.5-14B-Instruct-AWQ"],
         "gemini": [
             "gemini-3.5-flash",
             # 2.x models still work on older Gemini projects but 404 on

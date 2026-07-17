@@ -25,6 +25,7 @@ dependencies = [
     "pgvector>=0.3",
     "httpx>=0.27",
     "groq>=0.11",
+    "openai>=1.50",  # OpenAI-compatible client for self-hosted vLLM
     "google-genai>=0.3",
     "anthropic>=0.40",
     "deepgram-sdk>=3.7",

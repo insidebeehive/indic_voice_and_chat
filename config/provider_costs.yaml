@@ -29,6 +29,10 @@ llm:
     gemini-2.5-pro: 0.012
     gemini-2.0-flash: 0.0015
     gemini-2.0-flash-lite: 0.0006
+  vllm:
+    # Self-hosted on the IndicF5 RunPod pod — marginal per-request cost ~0
+    # (pod cost is already carried; adjust if a dedicated pod is added).
+    Qwen/Qwen2.5-14B-Instruct-AWQ: 0.0
   groq:
     llama-3.3-70b-versatile: 0.0012
     llama-3.1-8b-instant: 0.0003
