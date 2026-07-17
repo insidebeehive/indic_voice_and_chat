@@ -21,6 +21,9 @@ stt:
     nova-3: 0.0058
 llm:
   gemini:
+    # TODO verify against Google's published 3.5-flash pricing; seeded at the
+    # 2.5-flash rate so billing keeps producing a figure after the model swap.
+    gemini-3.5-flash: 0.002
     gemini-2.5-flash: 0.002
     gemini-2.5-flash-lite: 0.0008
     gemini-2.5-pro: 0.012

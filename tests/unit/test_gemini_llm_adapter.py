@@ -545,6 +545,42 @@ async def test_generate_with_tools_omits_json_mime() -> None:
 
 
 @pytest.mark.asyncio
+async def test_thought_signature_round_trips_through_tool_loop() -> None:
+    # Gemini 3.x attaches thought_signature to function-call parts and 400s
+    # ("missing a thought_signature") if the replayed call omits it. Caught
+    # live: every gemini-3.5-flash tool turn failed until this round-trip.
+    from src.interfaces.llm import ToolSpec
+    part = SimpleNamespace(
+        text=None,
+        function_call=SimpleNamespace(name="search_kb", args={"q": "x"}),
+        thought_signature=b"opaque-sig",
+    )
+    candidate = SimpleNamespace(
+        content=SimpleNamespace(parts=[part]),
+        finish_reason=SimpleNamespace(name="STOP"),
+    )
+    resp = SimpleNamespace(text=None, candidates=[candidate],
+                           usage_metadata=SimpleNamespace(prompt_token_count=1, candidates_token_count=1))
+    client = _make_client(generate_return=resp)
+    adapter = GeminiLLMAdapter({"client": client})
+    result = await adapter.generate(
+        [LLMMessage(role="user", content="hi")],
+        LLMConfig(response_format="text", tools=[ToolSpec("search_kb", "s", {"type": "object"})]))
+    assert result.tool_calls[0].thought_signature == b"opaque-sig"
+
+    # Replay the assistant tool-call message: the signature must ride along.
+    msgs = [
+        LLMMessage(role="user", content="hi"),
+        LLMMessage(role="assistant", content="", tool_calls=result.tool_calls),
+        LLMMessage(role="tool", name="search_kb", tool_call_id=result.tool_calls[0].id,
+                   content='{"results": []}'),
+    ]
+    _, contents = GeminiLLMAdapter._to_gemini_contents(msgs)
+    fc_parts = [p for c in contents for p in c["parts"] if "function_call" in p]
+    assert fc_parts[0]["thought_signature"] == b"opaque-sig"
+
+
+@pytest.mark.asyncio
 async def test_tool_result_message_becomes_function_response() -> None:
     from src.interfaces.llm import ToolCall
     client = _make_client(generate_return=_response("ok"))

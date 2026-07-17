@@ -21,7 +21,7 @@ import httpx
 from src.interfaces.stt import ISTTProvider, STTConfig, STTResult
 
 _BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"
-_DEFAULT_MODEL = "gemini-2.5-flash"
+_DEFAULT_MODEL = "gemini-3.5-flash"  # 2.5-flash 404s on new Gemini projects
 _TIMEOUT = 30.0
 
 # Gemini sometimes returns meta-commentary instead of an empty string when the

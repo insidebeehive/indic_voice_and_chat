@@ -32,7 +32,9 @@ from src.interfaces.llm import (
 
 log = logging.getLogger(__name__)
 
-DEFAULT_MODEL = "gemini-2.5-flash"
+# gemini-2.5-flash 404s ("no longer available to new users") on Gemini
+# projects created after mid-2026 — the staging key swap broke on it.
+DEFAULT_MODEL = "gemini-3.5-flash"
 
 # Gemini intermittently returns transient backend errors — most notably
 # ``500 INTERNAL`` ("An internal error has occurred. Please retry...") — even
@@ -146,10 +148,16 @@ class GeminiLLMAdapter(ILLMProvider):
                 continue
             role = "model" if m.role == "assistant" else "user"
             # Assistant message that emitted tool calls → function_call parts.
+            # Gemini 3.x requires the thought_signature captured from the
+            # original response to ride along, else 400 INVALID_ARGUMENT.
             if m.tool_calls:
-                contents.append({"role": role, "parts": [
-                    {"function_call": {"name": tc.name, "args": tc.arguments}}
-                    for tc in m.tool_calls]})
+                parts = []
+                for tc in m.tool_calls:
+                    part: dict[str, Any] = {"function_call": {"name": tc.name, "args": tc.arguments}}
+                    if tc.thought_signature is not None:
+                        part["thought_signature"] = tc.thought_signature
+                    parts.append(part)
+                contents.append({"role": role, "parts": parts})
                 continue
             contents.append({"role": role, "parts": _content_parts(m.content)})
         system = "\n\n".join(system_parts) if system_parts else None
@@ -346,6 +354,9 @@ class GeminiLLMAdapter(ILLMProvider):
                 id=getattr(fc, "id", None) or f"{name}-{len(calls)}",
                 name=name,
                 arguments=dict(args),
+                # Signature lives on the PART, not the function_call — must be
+                # replayed with the call on the next round (Gemini 3.x).
+                thought_signature=getattr(p, "thought_signature", None),
             ))
         return calls
 

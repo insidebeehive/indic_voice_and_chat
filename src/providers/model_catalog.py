@@ -18,6 +18,10 @@ MODELS: dict[str, dict[str, list[str]]] = {
     },
     "llm": {
         "gemini": [
+            "gemini-3.5-flash",
+            # 2.x models still work on older Gemini projects but 404 on
+            # projects created after mid-2026 ("no longer available to new
+            # users") — kept for tenants pinned to an old key.
             "gemini-2.5-flash",
             "gemini-2.5-flash-lite",
             "gemini-2.5-pro",

@@ -79,10 +79,11 @@ pipeline:
 
   llm:
     provider: gemini
-    # gemini-2.5-flash is the sweet spot: good dialogue quality with the best
-    # latency of the capable models (flash-lite was faster but low quality;
-    # 3.5-flash was higher quality but slower).
-    model: gemini-2.5-flash
+    # 2.5-flash was the latency sweet spot, but it 404s on Gemini projects
+    # created after mid-2026 ("no longer available to new users") — 3.5-flash
+    # is its successor (higher quality, somewhat slower per the latency
+    # experiments; flash-lite was faster but low quality).
+    model: gemini-3.5-flash
     temperature: 0.5
     # The JSON response envelope (response_text + slots + metadata, in Hindi)
     # needs well over 256 tokens; a tight cap truncates it into invalid JSON.

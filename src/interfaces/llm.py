@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import AsyncIterator, Optional, Union
+from typing import Any, AsyncIterator, Optional, Union
 
 
 @dataclass
@@ -32,6 +32,11 @@ class ToolCall:
     id: str
     name: str
     arguments: dict = field(default_factory=dict)
+    # Gemini 3.x attaches an opaque signature to each function-call part and
+    # REQUIRES it back when the call is replayed in the follow-up request
+    # (400 INVALID_ARGUMENT "missing a thought_signature" otherwise). Opaque
+    # provider bytes — carried, never inspected.
+    thought_signature: Any = None
 
 
 @dataclass
