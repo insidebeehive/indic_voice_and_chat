@@ -41,8 +41,11 @@ _LANGUAGES = [
     "mr-IN", "od-IN", "pa-IN", "ta-IN", "te-IN",
 ]
 
+# The fine-tune is a single MALE voice — campaigns selecting this provider
+# must set agent.gender: male so the prompt's gendered grammatical forms
+# ("kar raha hun", not "kar rahi hun") match what callers hear.
 LANGUAGE_VOICES: dict[str, list[dict]] = {
-    lang: [{"voice_id": DEFAULT_VOICE, "gender": "female"}] for lang in _LANGUAGES
+    lang: [{"voice_id": DEFAULT_VOICE, "gender": "male"}] for lang in _LANGUAGES
 }
 
 
