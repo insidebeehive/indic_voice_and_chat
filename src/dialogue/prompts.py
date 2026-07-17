@@ -665,18 +665,29 @@ def build_chatbot_system_prompt(
     )
 
     # ── Language ──────────────────────────────────────────────────────────────
+    # NB: this section must stay consistent with the per-turn directive that
+    # _compose (src/agents/chatbot.py) appends under "Additional directives" —
+    # an earlier version unconditionally ordered "Roman Hinglish for any
+    # Roman-script message", which contradicted the per-turn "MUST be in
+    # English" directive and kept English messages getting Hinglish replies.
     parts.append(
-        "LANGUAGE — match the script of the user's characters, not the meaning of their words:\n"
-        "- Roman/ASCII only (even if the words are Hindi like 'mera balance kya hai'): "
+        "LANGUAGE — reply in the language the customer is ACTUALLY using this turn:\n"
+        "- Roman/Latin script with English words ('tell me about this site'): reply in "
+        "English. Earlier Hinglish turns or an Indian platform do NOT make an English "
+        "message Hinglish — answer English in English.\n"
+        "- Roman/Latin script with romanized Hindi/Indic words ('mera balance kya hai'): "
         "reply in Roman Hinglish. Never switch to Devanagari for a Roman-script message.\n"
-        "- Devanagari characters: reply in Devanagari.\n"
-        "- Same for all other Indic scripts. If they switch mid-conversation, match immediately.\n"
-        "- suggested_followups must use the same script as your reply.\n"
-        f"Default language: {language_default}. Ignore reference source scripts — only the "
-        "user's characters decide your script.\n"
-        "Tone: casual, warm, friendly — like a helpful friend. Mix Hindi and English naturally "
-        "for Hinglish. Supported: Hindi, English, Bengali, Gujarati, Kannada, Malayalam, "
-        "Marathi, Odia, Punjabi, Tamil, Telugu."
+        "- Native Indic script (Devanagari etc.): reply in that same script.\n"
+        "- If the customer switches language mid-conversation, match immediately — the "
+        "current message wins over all earlier turns.\n"
+        "- suggested_followups use the same language and script as your reply.\n"
+        "- When an 'Additional directives' entry names this turn's language, it is "
+        "authoritative — follow it over everything else in this section.\n"
+        f"Default language: {language_default} — applies only when the current message "
+        "carries no language signal (e.g. a bare 'ok'). Ignore reference source scripts.\n"
+        "Tone: casual, warm, friendly — like a helpful friend. When speaking Hinglish, mix "
+        "Hindi and English naturally. Supported: Hindi, English, Bengali, Gujarati, Kannada, "
+        "Malayalam, Marathi, Odia, Punjabi, Tamil, Telugu."
     )
 
     # ── Response quality ──────────────────────────────────────────────────────

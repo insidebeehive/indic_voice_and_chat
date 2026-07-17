@@ -61,6 +61,25 @@ def test_voicebot_prompt_includes_all_sections() -> None:
         assert s in prompt
 
 
+def test_chatbot_language_section_is_word_language_aware() -> None:
+    # Regression guard for the persistent English→Hinglish bug: the base
+    # LANGUAGE section used to order "Roman Hinglish for ANY Roman-script
+    # message" ("not the meaning of their words"), directly contradicting the
+    # per-turn "MUST be in English" directive appended under Additional
+    # directives. The section must distinguish English words from romanized
+    # Hindi, and must declare the per-turn directive authoritative.
+    prompt = build_chatbot_system_prompt(company_name="Acme", language_default="hi")
+    assert "answer English in English" in prompt
+    assert "not the meaning of their words" not in prompt  # the old blanket rule
+    assert "authoritative" in prompt  # per-turn directive precedence declared
+    # The per-turn directive block lands AFTER the LANGUAGE section (recency).
+    prompt_with_directive = build_chatbot_system_prompt(
+        company_name="Acme", language_default="hi",
+        extra_directives=["The user's current message is in English."])
+    assert prompt_with_directive.rindex("Additional directives") > \
+        prompt_with_directive.rindex("LANGUAGE —")
+
+
 def test_voicebot_prompt_defers_link_offer_to_call_end() -> None:
     # The link/bonus must never be pitched proactively — only acknowledged
     # once genuine interest is shown, and deferred to the closing turn rather
