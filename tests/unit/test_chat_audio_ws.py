@@ -129,6 +129,126 @@ async def test_audio_ws_uploads_and_acks(ws_ctx):
 
 
 @pytest.mark.asyncio
+async def test_audio_ws_media_url_fetches_and_transcribes(ws_ctx):
+    """`type:audio` accepts media_url as an alternative to base64 data,
+    matching the image/video contract (CRM relays forward presigned URLs)."""
+    sm, media_store, fake_agent = ws_ctx
+
+    import src.auth.middleware as mw
+
+    fake_tenant = MagicMock()
+    fake_tenant.id = "t1"
+    fake_tenant.slug = "demo"
+    fake_tenant.settings.chat_support.chat_idle_timeout_seconds = 300
+
+    audio_bytes = b"fake_ogg_audio"
+
+    async def _fake_fetch(url):
+        assert url == "https://bucket.r2.example.com/voice.ogg?sig=abc"
+        return audio_bytes, "audio/ogg"
+
+    with patch.object(mw, "tenant_from_id", AsyncMock(return_value=fake_tenant)), \
+         patch.object(chat_api, "_fetch_media_url", _fake_fetch):
+        app = FastAPI()
+        app.include_router(chat_api.router, prefix="/api/v1")
+        client = TestClient(app)
+
+        with client.websocket_connect("/api/v1/chat/ws/sess1") as ws:
+            ws.send_text(json.dumps({
+                "type": "audio",
+                "media_url": "https://bucket.r2.example.com/voice.ogg?sig=abc",
+            }))
+            typing = json.loads(ws.receive_text())
+            assert typing["type"] == "typing"
+            ack = json.loads(ws.receive_text())
+            assert ack["type"] == "audio_ack"
+            assert "/api/v1/chat/media/" in ack["media_url"]
+            reply = json.loads(ws.receive_text())
+            assert reply["type"] == "message"
+            assert "I heard you" in reply["text"]
+
+    assert len(media_store.uploaded) == 1
+    key, content_type, data = media_store.uploaded[0]
+    assert data == audio_bytes
+    assert content_type == "audio/ogg"
+
+    fake_agent.llm.transcribe_audio.assert_awaited_once()
+    assert fake_agent.llm.transcribe_audio.await_args.args[0] == audio_bytes
+    fake_agent.handle_message.assert_called_once_with("hello there")
+
+
+@pytest.mark.asyncio
+async def test_audio_ws_media_url_fetch_failure_sends_error(ws_ctx):
+    sm, media_store, fake_agent = ws_ctx
+
+    import src.auth.middleware as mw
+
+    fake_tenant = MagicMock()
+    fake_tenant.id = "t1"
+    fake_tenant.slug = "demo"
+    fake_tenant.settings.chat_support.chat_idle_timeout_seconds = 300
+
+    async def _fake_fetch(url):
+        raise ValueError("media_url content exceeds size limit")
+
+    with patch.object(mw, "tenant_from_id", AsyncMock(return_value=fake_tenant)), \
+         patch.object(chat_api, "_fetch_media_url", _fake_fetch):
+        app = FastAPI()
+        app.include_router(chat_api.router, prefix="/api/v1")
+        client = TestClient(app)
+
+        with client.websocket_connect("/api/v1/chat/ws/sess1") as ws:
+            ws.send_text(json.dumps({
+                "type": "audio",
+                "media_url": "https://bucket.r2.example.com/huge.ogg",
+            }))
+            typing = json.loads(ws.receive_text())
+            assert typing["type"] == "typing"
+            err = json.loads(ws.receive_text())
+            assert err["type"] == "error"
+
+    assert len(media_store.uploaded) == 0
+    fake_agent.handle_message.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_audio_ws_media_url_non_audio_content_returns_error(ws_ctx):
+    """A media_url that serves a non-audio content type (and no explicit
+    audio/* mime in the frame) must be rejected, not transcribed."""
+    sm, media_store, fake_agent = ws_ctx
+
+    import src.auth.middleware as mw
+
+    fake_tenant = MagicMock()
+    fake_tenant.id = "t1"
+    fake_tenant.slug = "demo"
+    fake_tenant.settings.chat_support.chat_idle_timeout_seconds = 300
+
+    async def _fake_fetch(url):
+        return b"\x89PNG\r\n" + b"x" * 50, "image/png"
+
+    with patch.object(mw, "tenant_from_id", AsyncMock(return_value=fake_tenant)), \
+         patch.object(chat_api, "_fetch_media_url", _fake_fetch):
+        app = FastAPI()
+        app.include_router(chat_api.router, prefix="/api/v1")
+        client = TestClient(app)
+
+        with client.websocket_connect("/api/v1/chat/ws/sess1") as ws:
+            ws.send_text(json.dumps({
+                "type": "audio",
+                "media_url": "https://bucket.r2.example.com/photo.png",
+            }))
+            typing = json.loads(ws.receive_text())
+            assert typing["type"] == "typing"
+            err = json.loads(ws.receive_text())
+            assert err["type"] == "error"
+            assert "audio" in err["message"].lower()
+
+    assert len(media_store.uploaded) == 0
+    fake_agent.handle_message.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_audio_ws_no_media_store_returns_error(ws_ctx):
     """When _media_store is None, return an error frame instead of crashing."""
     sm, media_store, fake_agent = ws_ctx

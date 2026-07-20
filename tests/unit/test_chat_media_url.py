@@ -190,6 +190,18 @@ async def test_fetch_media_url_rejects_private_host():
 
 
 @pytest.mark.asyncio
+async def test_fetch_media_url_accepts_audio_content_type():
+    url = "https://bucket.r2.example.com/voice.ogg"
+    body = b"OggS" + b"x" * 50
+    with respx.mock, patch.object(chat_api, "_is_public_host", return_value=True):
+        respx.get(url).mock(return_value=httpx.Response(
+            200, headers={"content-type": "audio/ogg"}, content=body))
+        data, content_type = await chat_api._fetch_media_url(url)
+    assert data == body
+    assert content_type == "audio/ogg"
+
+
+@pytest.mark.asyncio
 async def test_fetch_media_url_accepts_valid_image():
     url = "https://bucket.r2.example.com/photo.png"
     body = b"\x89PNG\r\n" + b"x" * 50

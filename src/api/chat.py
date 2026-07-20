@@ -167,9 +167,9 @@ async def _fetch_media_url(url: str) -> tuple[bytes, str]:
     """Fetch a caller-supplied media URL (e.g. a presigned R2/S3 URL) server-side.
 
     Streams the body with a byte-size cap and requires the response
-    Content-Type to be image/* or video/* before accepting it. Redirects are
-    not followed (the default httpx behavior) to avoid an SSRF bypass via a
-    redirect chain."""
+    Content-Type to be image/*, video/* or audio/* before accepting it.
+    Redirects are not followed (the default httpx behavior) to avoid an SSRF
+    bypass via a redirect chain."""
     parts = urlsplit(url)
     if parts.scheme != "https" or not parts.hostname:
         raise ValueError("media_url must be an https URL")
@@ -182,7 +182,8 @@ async def _fetch_media_url(url: str) -> tuple[bytes, str]:
                 raise ValueError("media_url redirects are not followed")
             resp.raise_for_status()
             content_type = resp.headers.get("content-type", "").split(";")[0].strip().lower()
-            if not (content_type.startswith("image/") or content_type.startswith("video/")):
+            if not (content_type.startswith("image/") or content_type.startswith("video/")
+                    or content_type.startswith("audio/")):
                 raise ValueError(f"unsupported content-type: {content_type or 'unknown'}")
             chunks = bytearray()
             async for chunk in resp.aiter_bytes(chunk_size=65536):
@@ -912,8 +913,13 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
             try:
                 if mtype == "audio":
                     raw_data = msg.get("data")
+                    audio_media_url = (msg.get("media_url") or "").strip()
                     mime = (msg.get("mime") or "").strip()
-                    if not raw_data or not mime or not mime.startswith("audio/"):
+                    if not raw_data and not audio_media_url:
+                        await websocket.send_text(json.dumps(
+                            {"type": "error", "message": "audio needs 'data' (base64) or 'media_url'"}))
+                        continue
+                    if raw_data and (not mime or not mime.startswith("audio/")):
                         await websocket.send_text(json.dumps(
                             {"type": "error", "message": "audio needs 'data' (base64) + 'mime' (audio/*)"}))
                         continue
@@ -921,14 +927,32 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
                         await websocket.send_text(json.dumps(
                             {"type": "error", "message": "voice messages not available — media storage not configured"}))
                         continue
-                    try:
-                        audio_bytes = base64.b64decode(raw_data)
-                    except Exception:
-                        await websocket.send_text(json.dumps(
-                            {"type": "error", "message": "invalid base64 in audio data"}))
-                        continue
+                    audio_bytes: bytes | None = None
+                    if raw_data:
+                        try:
+                            audio_bytes = base64.b64decode(raw_data)
+                        except Exception:
+                            await websocket.send_text(json.dumps(
+                                {"type": "error", "message": "invalid base64 in audio data"}))
+                            continue
 
                     await websocket.send_text(json.dumps({"type": "typing"}))
+
+                    if audio_bytes is None:
+                        try:
+                            audio_bytes, fetched_mime = await _fetch_media_url(audio_media_url)
+                        except Exception:
+                            log.exception("media_url fetch failed", extra={"session_id": session_id})
+                            await websocket.send_text(json.dumps({
+                                "type": "error",
+                                "message": "Could not fetch media_url — check it's reachable and points at an audio file.",
+                            }))
+                            continue
+                        mime = mime or fetched_mime
+                        if not mime.startswith("audio/"):
+                            await websocket.send_text(json.dumps(
+                                {"type": "error", "message": "audio media_url must serve an audio/* content type"}))
+                            continue
 
                     object_key = _media_key(tenant.id, session_id, mime)
                     # Upload to S3 and transcribe in parallel
