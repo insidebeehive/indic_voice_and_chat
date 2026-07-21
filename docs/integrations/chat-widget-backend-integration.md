@@ -185,11 +185,26 @@ Forward every frame from CRM Frontend to our WS unchanged:
 
 | type | Forward as-is |
 |---|---|
-| `message` | ✓ |
-| `image` | ✓ (base64 data + mime) |
-| `video` | ✓ (base64 data + mime) |
-| `audio` | ✓ (base64 data + mime) |
+| `message` | ✓ (`text` must be non-empty) |
+| `image` | ✓ (base64 `data` + `mime`, OR `media_url`) |
+| `video` | ✓ (base64 `data` + `mime`, OR `media_url`) |
+| `audio` | ✓ (base64 `data` + `mime`, OR `media_url`) |
+| `document` | (upcoming — PDF/docx/xlsx/csv/txt; same shape as image) |
 | `end` | ✓ |
+
+**Attachments MUST use the typed media frames** (`image`/`video`/`audio`).
+A `media_url` on a `type:"message"` frame is silently ignored, and an empty
+`text` on `type:"message"` is rejected with `missing 'text'` — do not
+represent an attachment as a `message` frame.
+
+Media frames accept **either** inline base64 `data` (then `mime` is
+required) **or** a `media_url` we fetch server-side. `media_url` rules:
+`https://` only, publicly reachable host, no redirects (presigned S3/R2
+URLs must be single-hop and unexpired), response Content-Type must match
+the frame type's family, and **1 MB max** per file (applies to inline data
+too). With `media_url`, `mime` may be omitted — we take it from the fetch
+response. `text` captions apply to image/video (audio is transcribed;
+captions on it are ignored). Full details: `docs/crm-chat-media-contract.md`.
 
 ### Frame passthrough — Us → CRM Frontend
 
@@ -518,6 +533,8 @@ async def download_media(message_id: int, token: str) -> bytes:
 - [ ] Open your own WS endpoint that CRM Frontend connects to
 - [ ] On CRM Frontend connect: open our `ws_url`; forward the `history` frame immediately
 - [ ] Forward all frames CRM Frontend → us unchanged (text, image, video, audio, end)
+- [ ] Send attachments ONLY as typed media frames (`image`/`video`/`audio`) — never as `type:"message"` with a `media_url` (ignored) or empty `text` (rejected)
+- [ ] Enforce the 1 MB per-file limit before forwarding (better customer error than our rejection)
 - [ ] Forward all frames us → CRM Frontend; rewrite `media_url` fields to your proxy endpoint
 - [ ] Expose a media proxy route (`GET /chat/media/{id}`) that fetches from us with Bearer token
 - [ ] If our WS drops: reconnect and re-forward the `history` frame to CRM Frontend

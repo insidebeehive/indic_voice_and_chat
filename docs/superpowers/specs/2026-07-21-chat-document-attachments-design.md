@@ -6,7 +6,7 @@
 ## Purpose
 
 Customers attach small documents (bills, invoices, statements, short reports —
-1–20 pages, under 10 MB) in the ChatBot conversation and the bot answers
+1–20 pages, under 1 MB) in the ChatBot conversation and the bot answers
 questions about them **in that session**. Nothing enters the tenant knowledge
 base. The raw file is persisted like other chat media so the transcript and
 backoffice retain it.
@@ -30,7 +30,7 @@ frame naming the supported types. Text decode is UTF-8 with
 - **WS frame:** `{"type":"document", "data":<b64> | "media_url":<https URL>,
   "mime":..., "filename":..., "text":<optional caption>}`.
   - `media_url` goes through the existing `_fetch_media_url` (SSRF-guarded,
-    https-only, 10 MB cap); its content-type allowlist widens to the document
+    https-only, 1 MB cap); its content-type allowlist widens to the document
     mimes above.
   - Mime resolution order: frame `mime` → fetch response content-type →
     `filename` extension. Unresolvable → error frame.
@@ -83,7 +83,7 @@ the file just isn't persisted (logged).
 
 ## Errors & limits
 
-- 10 MB raw cap (existing `_MAX_MEDIA_FETCH_BYTES`; enforce the same cap on
+- 1 MB raw cap (existing `_MAX_MEDIA_FETCH_BYTES`; enforce the same cap on
   base64 `data` after decode).
 - Unsupported mime/extension → error frame listing supported types.
 - Extraction dependency missing (openpyxl) → error frame, logged; pypdf and

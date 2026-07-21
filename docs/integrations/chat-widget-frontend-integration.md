@@ -110,6 +110,7 @@ All outgoing frames are JSON text. Send with `ws.send(JSON.stringify(frame))`.
 ```
 
 Accepted: `image/jpeg`, `image/png`, `image/gif`, `image/webp` — **max 200 KB**
+(platform hard cap for any media file is **1 MB**)
 
 ### Video
 
@@ -117,7 +118,9 @@ Accepted: `image/jpeg`, `image/png`, `image/gif`, `image/webp` — **max 200 KB*
 { "type": "video", "data": "<base64>", "mime": "video/mp4", "text": "optional caption" }
 ```
 
-Accepted: `video/mp4`, `video/webm`, `video/quicktime` — **max 5 MB**
+Accepted: `video/mp4`, `video/webm`, `video/quicktime` — **max 1 MB**
+(platform hard cap; enforce client-side and show a friendly error for
+anything larger)
 
 ### Voice message
 
@@ -125,7 +128,16 @@ Accepted: `video/mp4`, `video/webm`, `video/quicktime` — **max 5 MB**
 { "type": "audio", "data": "<base64>", "mime": "audio/webm;codecs=opus" }
 ```
 
-Server transcribes the audio and feeds it to the AI. **Max 60 seconds** — enforce client-side. See §Voice Recording for the full flow.
+Server transcribes the audio and feeds it to the AI. **Max 60 seconds** — enforce client-side (also keeps the file under the 1 MB platform cap). See §Voice Recording for the full flow.
+
+All media frames also accept a `media_url` (https, public, ≤1 MB, no
+redirects) instead of base64 `data` — mainly useful for backend relays; see
+`docs/crm-chat-media-contract.md` for the full rules. A `document` frame type
+(PDF/docx/xlsx/csv/txt, same shape as `image`) is designed and coming soon.
+
+**Never attach media to a `type:"message"` frame** — `media_url` there is
+silently ignored and empty `text` is rejected. Attachments always go in their
+own typed frame; text-only messages go in `message`.
 
 ### End session
 

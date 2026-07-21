@@ -142,7 +142,7 @@ def _spawn_webhook_task(coro: Awaitable) -> None:
     task.add_done_callback(_webhook_tasks.discard)
 
 
-_MAX_MEDIA_FETCH_BYTES = 10 * 1024 * 1024  # cap for media pulled via media_url
+_MAX_MEDIA_FETCH_BYTES = 1 * 1024 * 1024  # cap for media pulled via media_url
 _MEDIA_FETCH_TIMEOUT = httpx.Timeout(20.0, connect=10.0)
 
 

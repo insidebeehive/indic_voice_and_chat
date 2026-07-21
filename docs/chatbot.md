@@ -35,7 +35,7 @@ Sessions & conversation:
   from the session row (no creds over the WS). Client frames:
   `{type:message,text}`, `{type:image|video|audio, data|media_url, mime, text}`,
   `{type:end}`. Media frames take base64 `data` OR an https `media_url` (fetched
-  server-side, SSRF-guarded, 10MB cap); `mime` is required with `data`, inferred
+  server-side, SSRF-guarded, 1MB cap); `mime` is required with `data`, inferred
   from the response content-type with `media_url`; `text` is an optional caption
   (image/video only). `media_url` on a `type:message` frame is NOT honored —
   attachments must use a media frame type (or the REST upload below).
