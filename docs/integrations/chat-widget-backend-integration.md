@@ -220,7 +220,7 @@ Forward every frame from our WS to CRM Frontend, **except rewrite any URL fields
 | `mode_change` | ✓ | |
 | `call_offer` | ✓ | Forward as-is (see Voice Handoff below — `call_url` is never rewritten) |
 | `ended` | ✓ | Close both connections after forwarding |
-| `error` | ✓ | |
+| `error` | ✓ | Carries a `reason` code (llm_billing/llm_quota/timeout/internal) — always forward and display; never swallow |
 
 ### Media URLs
 

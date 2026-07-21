@@ -26,7 +26,7 @@ import json
 import logging
 import socket
 import uuid
-from typing import Awaitable, Callable, Optional
+from typing import Awaitable, Callable, NoReturn, Optional
 from urllib.parse import urlsplit
 
 import httpx
@@ -129,6 +129,53 @@ _TURN_TIMEOUT_S = 90.0
 
 async def _run_turn(coro: Awaitable):
     return await asyncio.wait_for(coro, timeout=_TURN_TIMEOUT_S)
+
+
+def _classify_turn_error(exc: Exception) -> tuple[str, str]:
+    """Map a failed chat turn's exception to (reason, customer_message).
+
+    The billing-cap case is checked before the generic 429 branch: both are
+    ``google.genai.errors.ClientError`` with ``.code == 429``, but a spending
+    cap doesn't clear on its own the way a per-minute/per-day quota does, so
+    telling the customer to "try again in a little while" is actively
+    misleading and the ops signal needs to be distinct (see the extra log
+    line at the call site).
+    """
+    if getattr(exc, "code", None) == 429:
+        if "spending cap" in str(exc).lower():
+            return "llm_billing", (
+                "The AI assistant is temporarily unavailable due to a "
+                "service limit on our side. Our team has been notified — "
+                "please try again later."
+            )
+        return "llm_quota", ("We're experiencing very high demand right now — "
+                              "please try again in a little while.")
+    # asyncio.TimeoutError is TimeoutError on 3.11+, but _run_turn wraps
+    # every provider call so either spelling can surface depending on where
+    # the underlying client raises.
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
+        return "timeout", "That took longer than expected — please try again."
+    return "internal", "Sorry, something went wrong — please try again."
+
+
+def _raise_turn_http_error(exc: Exception, session_id: str) -> NoReturn:
+    """Map a failed REST chat turn to an honest HTTPException (never a bare 500).
+
+    Mirrors the WS per-turn error handling in ``chat_websocket`` — same
+    (reason, message) classification and the same ops log line for a billing
+    cap, just surfaced as an HTTP status instead of an ``error`` WS frame."""
+    reason, message = _classify_turn_error(exc)
+    log.exception("chat REST turn failed", extra={"session_id": session_id, "reason": reason})
+    if reason == "llm_billing":
+        # Distinct from ordinary quota noise: this needs a human to raise the
+        # cap, it won't clear on its own.
+        log.error(
+            "gemini monthly spending cap exceeded — raise it at "
+            "https://ai.studio/spend to restore chat",
+            extra={"session_id": session_id},
+        )
+    status = {"llm_billing": 503, "llm_quota": 503, "timeout": 504}.get(reason, 500)
+    raise HTTPException(status_code=status, detail={"message": message, "reason": reason})
 
 
 # Background webhook deliveries. Tasks must be referenced until done or the
@@ -424,7 +471,12 @@ async def chat_message(
 ) -> ChatMessageResponse:
     session_id = req.session_id or _new_session_id()
     agent = await _get_agent(tenant, _scoped_session(tenant, session_id))
-    result = await agent.handle_message(req.message)
+    try:
+        result = await agent.handle_message(req.message)
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001 — map provider failures to honest HTTP errors
+        _raise_turn_http_error(exc, session_id)
     await _persist_turn(session_id, req.message, result)
     await _emit_escalation(tenant.id, session_id, result)
     return _to_message_response(session_id, result)
@@ -455,7 +507,12 @@ async def upload_media(
         raise HTTPException(status_code=400, detail="empty upload")
     mime = file.content_type or "application/octet-stream"
     agent = await _factory(tenant, _scoped_session(tenant, session_id))
-    result = await agent.handle_image(data, mime, text)
+    try:
+        result = await agent.handle_image(data, mime, text)
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001 — map provider failures to honest HTTP errors
+        _raise_turn_http_error(exc, session_id)
     await _persist_turn(
         session_id, text or f"[{mime}]", result,
         user_type=("image" if mime.startswith("image/") else "video"), media_mime=mime)
@@ -887,7 +944,11 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
                     "type": "message", "session_id": session_id,
                     "text": farewell, "sources": [], "suggestions": [], "action": "end",
                 }))
-                summary = await agent.summarize_session()
+                try:
+                    summary = await agent.summarize_session()
+                except Exception:  # noqa: BLE001 — closing must never fail the customer
+                    log.exception("summarize on idle timeout failed", extra={"session_id": session_id})
+                    summary = ""
                 await _end_session(session_id, summary)
                 await _send_close_webhook(tenant, session_id, "ai", summary)
                 await websocket.send_text(json.dumps({
@@ -902,7 +963,11 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
 
             mtype = msg.get("type", "message")
             if mtype == "end":
-                summary = await agent.summarize_session()
+                try:
+                    summary = await agent.summarize_session()
+                except Exception:  # noqa: BLE001 — closing must never fail the customer
+                    log.exception("summarize on end failed", extra={"session_id": session_id})
+                    summary = ""
                 await _end_session(session_id, summary)
                 await _send_close_webhook(tenant, session_id, "ai", summary)
                 await websocket.send_text(json.dumps({"type": "ended", "summary": summary, "reason": "customer_ended"}))
@@ -1108,15 +1173,18 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
                 raise
             except Exception as turn_exc:  # noqa: BLE001 — one bad turn must not drop the chat
                 log.exception("chat turn failed", extra={"session_id": session_id})
-                if getattr(turn_exc, "code", None) == 429:
-                    # Provider quota exhausted (per-minute schedule failed, or
-                    # the per-day cap) — be honest instead of "something went
-                    # wrong", which reads like a bug and invites retrying now.
-                    message = ("We're experiencing very high demand right now — "
-                               "please try again in a little while.")
-                else:
-                    message = "Sorry, something went wrong — please try again."
-                await websocket.send_text(json.dumps({"type": "error", "message": message}))
+                reason, message = _classify_turn_error(turn_exc)
+                if reason == "llm_billing":
+                    # Distinct from ordinary quota noise: this needs a human to
+                    # raise the cap, it won't clear on its own.
+                    log.error(
+                        "gemini monthly spending cap exceeded — raise it at "
+                        "https://ai.studio/spend to restore chat",
+                        extra={"session_id": session_id},
+                    )
+                await websocket.send_text(json.dumps({
+                    "type": "error", "message": message, "reason": reason,
+                }))
     except WebSocketDisconnect:
         log.info("chat ws client disconnected", extra={"session_id": session_id})
     except Exception:  # noqa: BLE001 — never let the websocket task escape

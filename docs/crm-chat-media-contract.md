@@ -84,10 +84,21 @@ Accepted content types per frame type:
 | `escalation` | `{"type":"escalation","reason":...,"context_summary":...}` | conversation escalated to a human |
 | `call_offer` | `{"type":"call_offer","reason":...,"call_url":...}` | AI offered a voice call; `call_url` is the WS the browser dials |
 | `ended` | `{"type":"ended","summary":...,"reason":"customer_ended"\|"idle_timeout"}` | session closed |
-| `error` | `{"type":"error","message":...}` | that turn failed; **the socket stays open** — show the message, let the customer retry |
+| `error` | `{"type":"error","message":...,"reason":...}` | that turn failed; **the socket stays open** — show the message, let the customer retry |
 
 An `error` frame never closes the socket. Treat it as per-message failure,
-not a connection failure.
+not a connection failure. `reason` is machine-readable, for relays that want
+to act on the failure kind rather than just display `message`:
+
+| `reason` | Meaning |
+|---|---|
+| `llm_billing` | provider's monthly spending cap was hit — won't clear on its own, needs a human to raise the cap |
+| `llm_quota` | ordinary rate/quota exhaustion — transient, likely to clear shortly |
+| `timeout` | the turn exceeded the processing time budget |
+| `internal` | anything else |
+
+Relays SHOULD surface `error` frames to the customer — dropping them is
+what makes the bot look unresponsive.
 
 ## 4. REST alternative for attachments
 
@@ -103,6 +114,11 @@ Content-Type: multipart/form-data
 
 No auth header needed — the `session_id` is the capability. Same 1 MB and
 content-type rules as the WS frames.
+
+On a provider failure (billing cap, quota, timeout), this endpoint and
+`POST /chat/message` return HTTP 503 (`llm_billing`/`llm_quota`) or 504
+(`timeout`) with body `{"detail":{"message":...,"reason":...}}` — the same
+reason codes as the WS `error` frames above, never a bare 500.
 
 ## 5. Quick reference — what to send when
 
