@@ -306,8 +306,8 @@ def make_chatbot_factory(registry, sessionmaker=None, platform_retriever=None):
         if not base_url:
             return [], {}
 
-        api_token = sr.get("crm:api_token")
-        auth_type = sr.get("crm:auth_type") or "api_key"
+        api_token = sr.get("crm:api_token") or os.environ.get("PLATFORM_CRM_API_TOKEN")
+        auth_type = sr.get("crm:auth_type") or os.environ.get("PLATFORM_CRM_AUTH_TYPE") or "api_key"
         for name, spec in ALL_TOOLS.items():
             endpoint = base_url + spec["default_path"]
             specs.append(ToolSpec(
