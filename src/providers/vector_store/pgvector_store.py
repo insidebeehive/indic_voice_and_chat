@@ -21,6 +21,7 @@ from typing import Any, Optional
 
 import numpy as np
 
+from src.config import strip_libpq_only_query_params
 from src.interfaces.vector_store import Document, IVectorStore, SearchResult
 
 log = logging.getLogger(__name__)
@@ -33,7 +34,11 @@ _schema_lock: Optional[asyncio.Lock] = None
 
 
 def _to_asyncpg_dsn(url: str) -> str:
-    return url.replace("postgresql+asyncpg://", "postgresql://")
+    # database_url falls back to the raw DATABASE_URL env var (unlike
+    # src.config's SQLAlchemy-facing settings.database.url), so libpq-only
+    # params a managed provider appended (e.g. Neon's channel_binding) are
+    # still present here and must be stripped before this DSN reaches asyncpg.
+    return strip_libpq_only_query_params(url.replace("postgresql+asyncpg://", "postgresql://"))
 
 
 async def _init_conn(conn: Any) -> None:

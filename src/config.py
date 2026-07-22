@@ -22,14 +22,44 @@ from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+# libpq/psql-only query params some managed Postgres providers (Neon, …)
+# append to connection strings by default. asyncpg.connect() has no such
+# parameters and raises TypeError("unexpected keyword argument") on them —
+# SQLAlchemy's asyncpg dialect passes every URL query param through as a
+# connect() kwarg verbatim.
+_LIBPQ_ONLY_PARAMS = frozenset({"channel_binding"})
+
+
+def strip_libpq_only_query_params(url: str) -> str:
+    """Drop ``_LIBPQ_ONLY_PARAMS`` keys from a URL's query string, without the
+    scheme rewrite or ``sslmode`` translation ``normalize_db_url`` does.
+
+    For raw-DSN consumers (e.g. ``asyncpg.create_pool(dsn)`` in the pgvector
+    store) that don't go through SQLAlchemy — asyncpg's own DSN parser already
+    understands ``sslmode`` natively, but any OTHER unrecognized query key
+    (``channel_binding`` included) falls through into ``server_settings`` and
+    Postgres rejects it as an unrecognized configuration parameter.
+    """
+    from urllib.parse import urlencode, urlsplit, urlunsplit
+
+    if not any(p in url for p in _LIBPQ_ONLY_PARAMS):
+        return url
+    parts = urlsplit(url)
+    params = [(k, v) for k, v in
+              (p.split("=", 1) for p in parts.query.split("&") if p)]
+    out = [(k, v) for k, v in params if k not in _LIBPQ_ONLY_PARAMS]
+    return urlunsplit(parts._replace(query=urlencode(out)))
+
+
 def normalize_db_url(url: str) -> str:
     """Make a hosted Postgres URL usable by the async (asyncpg) engine.
 
-    Managed providers (Northflank, Heroku, …) hand out libpq-style URLs like
-    ``postgresql://…?sslmode=require``. The async engine needs the
-    ``postgresql+asyncpg`` driver, and asyncpg doesn't accept libpq's
-    ``sslmode`` query arg — it wants ``ssl``. Normalize both. SQLite and
-    already-qualified URLs pass through untouched.
+    Managed providers (Northflank, Heroku, Neon, …) hand out libpq-style URLs
+    like ``postgresql://…?sslmode=require&channel_binding=require``. The async
+    engine needs the ``postgresql+asyncpg`` driver, and asyncpg doesn't accept
+    libpq's ``sslmode`` query arg (it wants ``ssl``) or ``channel_binding`` at
+    all. Normalize/strip both. SQLite and already-qualified URLs pass through
+    untouched.
     """
     from urllib.parse import urlencode, urlsplit, urlunsplit
 
@@ -37,7 +67,8 @@ def normalize_db_url(url: str) -> str:
         url = "postgresql://" + url[len("postgres://"):]
     if url.startswith("postgresql://"):
         url = "postgresql+asyncpg://" + url[len("postgresql://"):]
-    if "+asyncpg" in url.split("://", 1)[0] and "sslmode=" in url:
+    if "+asyncpg" in url.split("://", 1)[0] and ("sslmode=" in url or any(
+            p in url for p in _LIBPQ_ONLY_PARAMS)):
         parts = urlsplit(url)
         params = [(k, v) for k, v in
                   (p.split("=", 1) for p in parts.query.split("&") if p)]
@@ -45,6 +76,8 @@ def normalize_db_url(url: str) -> str:
         for k, v in params:
             if k == "sslmode":
                 ssl_val = v
+            elif k in _LIBPQ_ONLY_PARAMS:
+                continue
             else:
                 out.append((k, v))
         if ssl_val and ssl_val != "disable":
