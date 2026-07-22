@@ -20,6 +20,7 @@ import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Optional
 
 # Load .env into the process environment for local runs, so settings read via
 # os.environ (VOX_SECRET_KEY, VOX_ADMIN_TOKENS, TENANT_*_API_TOKENS, …) work
@@ -102,6 +103,42 @@ def _parse_callback(value):
         return datetime.fromisoformat(value)
     except (ValueError, TypeError):
         return None
+
+
+async def _resolve_tenant_event_secret(
+    settings,
+    secret_env: Optional[str],
+    resolver,
+    *,
+    tenant_id: Optional[str],
+    event_type: Optional[str],
+) -> Optional[str]:
+    """Resolve the outbound tenant-event webhook signing secret.
+
+    Per-tenant DECRYPTED secret first (so it can be stored per-tenant like the
+    telephony keys), falling back to the platform-level ``EVENTS_WEBHOOK_SECRET``
+    env var. Never raises — a missing secret just means the event is sent
+    unsigned, but that's a real security gap for the tenant's CRM (it can't
+    verify the event genuinely came from us), so we log a loud warning rather
+    than sending silently unsigned.
+    """
+    secret = None
+    if secret_env:
+        ctx = None
+        if resolver is not None and settings is not None and hasattr(resolver, "resolve_by_slug"):
+            ctx = await resolver.resolve_by_slug(settings.slug)
+        secret = ctx.secret_optional(secret_env) if ctx else os.environ.get(secret_env)
+    # Fall back to platform-level signing key when no per-tenant secret is set.
+    if not secret:
+        secret = os.environ.get("EVENTS_WEBHOOK_SECRET") or None
+    if not secret:
+        log.warning(
+            "tenant event webhook sending UNSIGNED (no events_webhook_secret_env or "
+            "platform EVENTS_WEBHOOK_SECRET configured) — configure a webhook secret; "
+            "see docs/integrations/chat-widget-backend-integration.md#4-webhook-events",
+            extra={"tenant_id": tenant_id, "event_type": event_type},
+        )
+    return secret
 
 
 # How often the background sweep auto-closes calls stuck in an active status
@@ -262,20 +299,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         if not url:
             return
         secret_env = getattr(settings, "events_webhook_secret_env", None)
-        # Resolve the signing secret from the tenant's DECRYPTED secrets first
-        # (so it can be stored per-tenant like the telephony keys), falling back
-        # to process env. secret_optional() never raises — a missing secret just
-        # means the event is sent unsigned.
-        secret = None
-        if secret_env:
-            resolver = getattr(app.state, "tenant_resolver", None)
-            ctx = None
-            if resolver is not None and settings is not None and hasattr(resolver, "resolve_by_slug"):
-                ctx = await resolver.resolve_by_slug(settings.slug)
-            secret = ctx.secret_optional(secret_env) if ctx else os.environ.get(secret_env)
-        # Fall back to platform-level signing key when no per-tenant secret is set.
-        if not secret:
-            secret = os.environ.get("EVENTS_WEBHOOK_SECRET") or None
+        resolver = getattr(app.state, "tenant_resolver", None)
+        secret = await _resolve_tenant_event_secret(
+            settings, secret_env, resolver,
+            tenant_id=envelope.get("tenant_id"),
+            event_type=envelope.get("event_type"),
+        )
         # Detached so delivery (retries/backoff) never blocks the caller.
         asyncio.create_task(deliver_tenant_event(url, envelope, secret))
     set_tenant_event_notifier(_notify_tenant_event)

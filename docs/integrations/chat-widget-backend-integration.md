@@ -298,6 +298,8 @@ For `websocket` and `webrtc`, forwarding the frame as-is is the right call — C
 
 Configure your `events_webhook_url` on your tenant. We POST all lifecycle events there.
 
+Configuring a signing secret (`events_webhook_secret_env`, set via `PATCH /tenants/{id}` or at registration) is strongly recommended — an unsigned webhook lets anyone who guesses or observes your `events_webhook_url` send you fake lifecycle events. If no secret is configured, we still deliver the webhook (unsigned) and log a warning on our side; we do not withhold delivery.
+
 ### Request format
 
 ```
@@ -545,6 +547,7 @@ async def download_media(message_id: int, token: str) -> bytes:
 - [ ] `escalation_requested` → if agent available: pass `reason`, `summary`, `claim_url`, `agent_ws_url` to their console; if no agent: `POST` the decline endpoint immediately so the bot resumes
 - [ ] `session_closed` → update ticket status, store transcript
 - [ ] Verify `X-Signature` header if you configured a webhook secret
+- [ ] Configure a webhook secret at registration/update time (recommended) — see §4
 
 **Human agent console:**
 - [ ] `POST /api/v1/chat/sessions/{id}/claim` with `agent_id` and `agent_name` before connecting the WS (or `POST /api/v1/chat/sessions/{id}/decline` if no agent is available)

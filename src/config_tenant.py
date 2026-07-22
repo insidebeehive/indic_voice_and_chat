@@ -1,8 +1,8 @@
 """Per-tenant settings loader.
 
 Each tenant has a YAML file at ``config/tenants/<slug>.yaml`` that overlays
-the platform defaults. API keys are referenced **by env var name** (never
-raw values) so secrets never land in version control or the DB.
+the platform defaults. Telephony credentials are referenced **by env var
+name** (never raw values) so secrets never land in version control or the DB.
 
 Schema (all sections optional — global defaults fill the gaps):
 
@@ -16,17 +16,21 @@ Schema (all sections optional — global defaults fill the gaps):
       stt:
         provider: sarvam
         model: saaras:v3
-        api_key_env: TENANT_ACME_SARVAM_KEY
+        # api_key_env is optional/informational here: STT always resolves
+        # its key from the platform master env var (e.g. SARVAM_API_KEY),
+        # never from a per-tenant value — never consulted at runtime.
       llm:
         provider: groq
-        api_key_env: TENANT_ACME_GROQ_KEY
+        # same as above: LLM always uses the platform master key.
       tts:
         provider: sarvam
         voice_id: meera
-        api_key_env: TENANT_ACME_SARVAM_KEY
+        # same as above: TTS always uses the platform master key.
       telephony:
         provider: twilio
         from_number: "+918888888888"
+        # Telephony IS genuinely per-tenant — these are the real, required
+        # credential references (validate_credentials() enforces them).
         account_sid_env: TENANT_ACME_TWILIO_SID
         auth_token_env: TENANT_ACME_TWILIO_TOKEN
 
@@ -343,13 +347,20 @@ def load_tenant(slug: str, tenant_dir: Optional[Path] = None) -> TenantSettings:
 
 
 def validate_credentials(settings: TenantSettings, *, source: str = "") -> None:
-    """Ensure every declared provider also declares its credential env vars.
+    """Ensure telephony providers declare their credential env vars.
 
-    A tenant *may* omit a layer entirely (e.g. chat-only tenants don't need
-    telephony). But if ``provider`` is set, the env-var fields that supply
-    that provider's credentials must also be set. This closes the
-    silent-fallback footgun where an under-configured tenant would bill the
-    platform's API keys.
+    Telephony genuinely is per-tenant: if ``pipeline.telephony.provider`` is
+    set, ``account_sid_env``/``auth_token_env`` must also be set, or calls
+    would silently fall back to the platform's own telephony credentials
+    (billing/placing calls on the wrong account). We raise this at load time
+    so misconfigured tenants are caught on bootstrap rather than at
+    first-call.
+
+    STT/LLM/TTS/realtime/stt_streaming are different: those adapters
+    *always* resolve their API key from the platform-level master env var
+    (e.g. ``GEMINI_API_KEY``), never from a per-tenant ``api_key_env``. So
+    ``api_key_env`` on those layers is optional and purely informational —
+    it is not consulted at runtime and is not required here.
 
     Raises ``TenantConfigError`` listing all gaps so admins fix them in one
     round-trip rather than chasing missing fields one at a time.
@@ -357,12 +368,6 @@ def validate_credentials(settings: TenantSettings, *, source: str = "") -> None:
     gaps: list[str] = []
     p = settings.pipeline
 
-    if p.stt.provider and not p.stt.api_key_env:
-        gaps.append(f"pipeline.stt.api_key_env (provider={p.stt.provider!r})")
-    if p.llm.provider and not p.llm.api_key_env:
-        gaps.append(f"pipeline.llm.api_key_env (provider={p.llm.provider!r})")
-    if p.tts.provider and not p.tts.api_key_env:
-        gaps.append(f"pipeline.tts.api_key_env (provider={p.tts.provider!r})")
     if p.telephony.provider:
         if not p.telephony.account_sid_env:
             gaps.append(
@@ -372,8 +377,6 @@ def validate_credentials(settings: TenantSettings, *, source: str = "") -> None:
             gaps.append(
                 f"pipeline.telephony.auth_token_env (provider={p.telephony.provider!r})"
             )
-    if p.realtime and p.realtime.provider and not p.realtime.api_key_env:
-        gaps.append(f"pipeline.realtime.api_key_env (provider={p.realtime.provider!r})")
     if p.mode == "s2s" and not (p.realtime and p.realtime.provider):
         gaps.append("pipeline.realtime (provider) — required when pipeline.mode == 's2s'")
 

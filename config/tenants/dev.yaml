@@ -1,14 +1,13 @@
 # Dev / smoke-test tenant.
 #
 # Set these environment variables locally (e.g. in a gitignored .env, or
-# your shell rc) before running live tests or placing a real call. The list
-# below matches the providers this tenant actually uses (see the pipeline
-# block: Deepgram streaming STT, Gemini LLM, Sarvam TTS, Stringee telephony):
+# your shell rc) before running live tests or placing a real call.
 #
-#   export TENANT_DEV_DEEPGRAM_KEY=...           # Deepgram streaming STT (dev console live path)
-#   export TENANT_DEV_GROQ_KEY=gsk_...           # Groq Whisper STT (batch / telephony fallback)
-#   export TENANT_DEV_GEMINI_KEY=AIza...         # Google Gemini LLM (active)
-#   export TENANT_DEV_SARVAM_KEY=...             # Sarvam TTS
+# STT/LLM/TTS/realtime/stt_streaming providers (Sarvam, Gemini, Deepgram, ...)
+# always resolve their key from the platform master env var (GEMINI_API_KEY,
+# SARVAM_API_KEY, etc. — set at the platform level, not per-tenant), so no
+# TENANT_DEV_*_KEY exports are needed for those layers.
+#
 #   export STRINGEE_API_KEY_SID=SK....           # Stringee telephony (read by the adapter directly,
 #   export STRINGEE_API_KEY_SECRET=...           #   not via *_env; region-scoped — see STRINGEE_BASE_URL)
 #   export TENANT_DEV_WEBHOOK_SECRET=...         # used to verify inbound webhook signatures
@@ -43,7 +42,7 @@ pipeline:
     provider: sarvam
     model: saaras:v3
     language: hi-IN
-    api_key_env: TENANT_DEV_SARVAM_KEY
+    # no api_key_env needed — STT/LLM/TTS/realtime always use the platform master key
 
   # Speech-to-speech (Gemini Live). Spike: ~1.4s first-word + natural Hinglish.
   # The dev console S2S path uses this; voice is selectable from allowed_voices.
@@ -57,7 +56,7 @@ pipeline:
     # null (language is steered via the system instruction). Set a code only for a
     # half-cascade model that requires one.
     language_code: null
-    api_key_env: TENANT_DEV_GEMINI_KEY
+    # no api_key_env needed — STT/LLM/TTS/realtime always use the platform master key
 
   # Streaming STT for the dev console (Deepgram live). When present, the browser
   # bridge streams audio live and uses Deepgram endpointing; pipeline.stt (Sarvam)
@@ -75,7 +74,7 @@ pipeline:
                            # waits out short pauses; raise toward 500-600 if it still
                            # cuts off, lower toward 300 if turn-taking feels laggy.
     utterance_end_ms: 1000
-    api_key_env: TENANT_DEV_DEEPGRAM_KEY
+    # no api_key_env needed — STT/LLM/TTS/realtime always use the platform master key
 
   llm:
     provider: gemini
@@ -89,7 +88,7 @@ pipeline:
     # needs well over 256 tokens; a tight cap truncates it into invalid JSON.
     max_tokens: 1024
     response_format: json
-    api_key_env: TENANT_DEV_GEMINI_KEY
+    # no api_key_env needed — STT/LLM/TTS/realtime always use the platform master key
     # --- Claude alternative (swap back to compare): Haiku 4.5, fast/cheap tier.
     #     Adapter forces the JSON envelope via a '{' assistant prefill.
     # provider: anthropic
@@ -97,7 +96,6 @@ pipeline:
     # temperature: 0.5
     # max_tokens: 1024
     # response_format: json
-    # api_key_env: TENANT_DEV_ANTHROPIC_KEY
 
   tts:
     provider: sarvam
@@ -105,7 +103,7 @@ pipeline:
     language: hi-IN
     voice_id: anushka
     speed: 1.0
-    api_key_env: TENANT_DEV_SARVAM_KEY
+    # no api_key_env needed — STT/LLM/TTS/realtime always use the platform master key
 
   telephony:
     provider: stringee

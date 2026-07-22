@@ -44,17 +44,10 @@ from src.models.tenant import ProviderCost, Tenant, TenantApiKey, TenantPhoneNum
 log = logging.getLogger(__name__)
 router = APIRouter(prefix="/tenants", tags=["tenants"])
 
-# Shared master-key env var per provider. STT/LLM/TTS/realtime resolve their key
-# from these platform env vars (via TenantContext.secret's fallback to os.environ);
-# they are NEVER stored per tenant. Telephony keys are the per-tenant exception.
-_MASTER_KEY_ENV = {
-    "sarvam": "SARVAM_API_KEY",
-    "groq": "GROQ_API_KEY",
-    "gemini": "GEMINI_API_KEY",
-    "gemini_live": "GEMINI_API_KEY",
-    "anthropic": "ANTHROPIC_API_KEY",
-    "deepgram": "DEEPGRAM_API_KEY",
-}
+# STT/LLM/TTS/realtime always resolve their key from the platform master env
+# vars (e.g. GEMINI_API_KEY, via TenantContext.secret's fallback to
+# os.environ) — never stored per tenant. Telephony keys are the per-tenant
+# exception (see _map_telephony_keys below).
 
 
 # --- Schemas ------------------------------------------------------------
@@ -122,10 +115,6 @@ class RegisterTenantResponse(BaseModel):
 def _slugify(name: str) -> str:
     s = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
     return s or f"tenant-{uuid.uuid4().hex[:8]}"
-
-
-def _layer_key_env(provider: Optional[str]) -> Optional[str]:
-    return _MASTER_KEY_ENV.get(provider) if provider else None
 
 
 # Telephony credential logical-name → the TenantTelephonyConfig *_env field it sets.
@@ -199,12 +188,10 @@ async def register_tenant(
             provider=req.stt.provider if req.stt else None,
             model=req.stt.model if req.stt else None,
             language=req.stt.language if req.stt else None,
-            api_key_env=_layer_key_env(req.stt.provider) if req.stt else None,
         ),
         llm=_LLM(
             provider=req.llm.provider if req.llm else None,
             model=req.llm.model if req.llm else None,
-            api_key_env=_layer_key_env(req.llm.provider) if req.llm else None,
         ),
         tts=TenantTTSConfig(
             provider=req.tts.provider if req.tts else None,
@@ -212,14 +199,12 @@ async def register_tenant(
             language=req.tts.language if req.tts else None,
             voice_id=req.tts.voice_id if req.tts else None,
             speed=req.tts.speed if req.tts else None,
-            api_key_env=_layer_key_env(req.tts.provider) if req.tts else None,
         ),
         realtime=TenantRealtimeConfig(
             provider=req.realtime.provider,
             model=req.realtime.model,
             voice=req.realtime.voice,
             language_code=req.realtime.language_code,
-            api_key_env=_layer_key_env(req.realtime.provider),
         ) if req.realtime else None,
         telephony=TenantTelephonyConfig(
             provider=tel.provider,

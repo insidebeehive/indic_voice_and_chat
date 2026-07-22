@@ -463,7 +463,7 @@ def _build_s2s_telephony_bridge(
     if allowed and voice not in allowed:
         voice = rt.voice
     # PLATFORM-level key (not per-tenant): pass None so GeminiLiveSession.connect
-    # reads the platform GEMINI_API_KEY / GOOGLE_API_KEY. Resolving a per-tenant
+    # reads the platform GEMINI_API_KEY. Resolving a per-tenant
     # realtime key here is what crashed s2s calls — a placeholder/invalid tenant
     # key reached connect and Gemini rejected it.
     key = None

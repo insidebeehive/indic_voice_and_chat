@@ -9,18 +9,18 @@ pipeline:
     provider: sarvam
     model: saaras:v3
     language: hi-IN
-    api_key_env: TENANT_EXAMPLE_SARVAM_KEY
+    # no api_key_env needed — STT/LLM/TTS/realtime always use the platform master key
   llm:
     provider: groq
     model: llama-3.3-70b-versatile
     temperature: 0.7
-    api_key_env: TENANT_EXAMPLE_GROQ_KEY
+    # no api_key_env needed — STT/LLM/TTS/realtime always use the platform master key
   tts:
     provider: sarvam
     model: bulbul:v2
     language: hi-IN
     voice_id: anushka
-    api_key_env: TENANT_EXAMPLE_SARVAM_KEY
+    # no api_key_env needed — STT/LLM/TTS/realtime always use the platform master key
   telephony:
     provider: twilio
     from_number: "+918888888888"

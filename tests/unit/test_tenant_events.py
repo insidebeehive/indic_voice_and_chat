@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import logging
+from types import SimpleNamespace
 
 from src.integration import tenant_events as te
 
@@ -80,3 +82,74 @@ async def test_deliver_swallows_poster_exception(monkeypatch):
         raise RuntimeError("boom")
 
     assert await te.deliver("https://crm/hook", {"x": 1}, None, http_post=poster) is False
+
+
+# --- src.main._resolve_tenant_event_secret -----------------------------------
+# Both call sites (main.py's _notify_tenant_event closure and chat_webhooks'
+# send_bo_webhook) resolve a signing secret the same way — per-tenant secret
+# first, else platform EVENTS_WEBHOOK_SECRET, else None — and must WARN loudly
+# (never block delivery) when no secret resolves at all, since an unsigned
+# webhook means the tenant's CRM can't verify events are really from us.
+
+
+async def test_resolve_tenant_event_secret_logs_warning_when_unsigned(monkeypatch, caplog):
+    from src import main as main_module
+
+    monkeypatch.delenv("EVENTS_WEBHOOK_SECRET", raising=False)
+    settings = SimpleNamespace(slug="acme")
+
+    with caplog.at_level(logging.WARNING, logger="src.main"):
+        secret = await main_module._resolve_tenant_event_secret(
+            settings, None, None, tenant_id="t_acme", event_type="call.completed",
+        )
+
+    assert secret is None
+    assert any(
+        r.levelno == logging.WARNING and "UNSIGNED" in r.message
+        for r in caplog.records
+    )
+
+
+async def test_resolve_tenant_event_secret_no_warning_when_signed(monkeypatch, caplog):
+    from src import main as main_module
+
+    monkeypatch.setenv("EVENTS_WEBHOOK_SECRET", "platform-secret")
+    settings = SimpleNamespace(slug="acme")
+
+    with caplog.at_level(logging.WARNING, logger="src.main"):
+        secret = await main_module._resolve_tenant_event_secret(
+            settings, None, None, tenant_id="t_acme", event_type="call.completed",
+        )
+
+    assert secret == "platform-secret"
+    assert not any(
+        r.levelno == logging.WARNING and "UNSIGNED" in r.message
+        for r in caplog.records
+    )
+
+
+async def test_resolve_tenant_event_secret_per_tenant_secret_no_warning(monkeypatch, caplog):
+    from src import main as main_module
+
+    monkeypatch.delenv("EVENTS_WEBHOOK_SECRET", raising=False)
+    settings = SimpleNamespace(slug="acme")
+
+    class _Ctx:
+        def secret_optional(self, env_var):
+            return "tenant-secret"
+
+    class _Resolver:
+        async def resolve_by_slug(self, slug):
+            return _Ctx()
+
+    with caplog.at_level(logging.WARNING, logger="src.main"):
+        secret = await main_module._resolve_tenant_event_secret(
+            settings, "TENANT_WEBHOOK_SECRET", _Resolver(),
+            tenant_id="t_acme", event_type="call.completed",
+        )
+
+    assert secret == "tenant-secret"
+    assert not any(
+        r.levelno == logging.WARNING and "UNSIGNED" in r.message
+        for r in caplog.records
+    )

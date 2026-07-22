@@ -137,11 +137,10 @@ class GeminiEmbedder:
             return self._client
         import os
 
-        api_key = (self._api_key or os.environ.get("GEMINI_API_KEY")
-                   or os.environ.get("GOOGLE_API_KEY"))
+        api_key = self._api_key or os.environ.get("GEMINI_API_KEY")
         if not api_key:
             raise RuntimeError(
-                "GeminiEmbedder requires an API key (GEMINI_API_KEY / GOOGLE_API_KEY)")
+                "GeminiEmbedder requires an API key (GEMINI_API_KEY)")
         from google import genai  # type: ignore[import-not-found]
 
         self._client = genai.Client(api_key=api_key)

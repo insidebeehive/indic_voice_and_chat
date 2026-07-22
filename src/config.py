@@ -259,13 +259,19 @@ class Secrets(BaseSettings):
     GEMINI_API_KEY: Optional[str] = None
     DEEPGRAM_API_KEY: Optional[str] = None
     ELEVENLABS_API_KEY: Optional[str] = None
-    GOOGLE_TTS_CREDENTIALS_PATH: Optional[str] = None
+    # Declared here for auditability only — adapters resolve these via os.environ.get(...) directly; declaring does not change adapter behavior.
+    ANTHROPIC_API_KEY: Optional[str] = None
+    AZURE_SPEECH_KEY: Optional[str] = None
+    AZURE_SPEECH_REGION: Optional[str] = None
+    GOOGLE_TTS_API_KEY: Optional[str] = None
+    VLLM_BASE_URL: Optional[str] = None
+    VLLM_API_KEY: Optional[str] = None
+    INDICF5_TTS_URL: Optional[str] = None
+    EXOTEL_ACCOUNT_SID: Optional[str] = None
     TWILIO_ACCOUNT_SID: Optional[str] = None
     TWILIO_AUTH_TOKEN: Optional[str] = None
     EXOTEL_API_KEY: Optional[str] = None
     EXOTEL_API_TOKEN: Optional[str] = None
-    PINECONE_API_KEY: Optional[str] = None
-    QDRANT_URL: Optional[str] = None
 
     # Infra overrides
     DATABASE_URL: Optional[str] = None
@@ -282,7 +288,6 @@ class Secrets(BaseSettings):
     # Misc
     WEBHOOK_BASE_URL: Optional[str] = None
     EVENTS_WEBHOOK_SECRET: Optional[str] = None  # platform-level HMAC signing key for outbound webhooks
-    SECRET_KEY: str = "change-me-in-prod"
     VOX_CONFIG_PATH: str = "config/default.yaml"
 
 

@@ -31,6 +31,13 @@ async def send_bo_webhook(tenant, event_type: str, payload: dict) -> bool:
     if not secret:
         import os
         secret = os.environ.get("EVENTS_WEBHOOK_SECRET") or None
+    if not secret:
+        log.warning(
+            "bo webhook sending UNSIGNED (no events_webhook_secret_env or "
+            "platform EVENTS_WEBHOOK_SECRET configured) — configure a webhook secret; "
+            "see docs/integrations/chat-widget-backend-integration.md#4-webhook-events",
+            extra={"event_type": event_type},
+        )
     body: dict[str, Any] = {"event": event_type, **payload}
     ok = await deliver(url, body, secret)
     if not ok:

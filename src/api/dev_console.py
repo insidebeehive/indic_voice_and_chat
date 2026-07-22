@@ -964,7 +964,7 @@ def make_live_bridge_factory(
             engine=engine, store=None, kb_context=kb_ctx,
         )
 
-        # Platform-level key: connect() reads GEMINI_API_KEY / GOOGLE_API_KEY.
+        # Platform-level key: connect() reads GEMINI_API_KEY.
         key = None
         config = RealtimeConfig(
             model=rt.model, voice=voice, language_code=rt.language_code,

@@ -203,24 +203,26 @@ def test_validate_credentials_passes_when_all_keys_declared() -> None:
     validate_credentials(t)
 
 
-def test_validate_credentials_raises_when_stt_provider_lacks_key() -> None:
+def test_validate_credentials_passes_when_stt_provider_has_no_key() -> None:
+    """STT always resolves its key from the platform master env var, so a
+    tenant-level api_key_env is optional — omitting it is not an error."""
     from src.config_tenant import TenantPipelineConfig, TenantSTTConfig
     t = TenantSettings(
         id="t1", slug="t1", name="T1",
         pipeline=TenantPipelineConfig(stt=TenantSTTConfig(provider="sarvam")),
     )
-    with pytest.raises(TenantConfigError, match="pipeline.stt.api_key_env"):
-        validate_credentials(t)
+    validate_credentials(t)
 
 
-def test_validate_credentials_raises_when_llm_provider_lacks_key() -> None:
+def test_validate_credentials_passes_when_llm_provider_has_no_key() -> None:
+    """LLM always resolves its key from the platform master env var, so a
+    tenant-level api_key_env is optional — omitting it is not an error."""
     from src.config_tenant import TenantLLMConfig, TenantPipelineConfig
     t = TenantSettings(
         id="t1", slug="t1", name="T1",
         pipeline=TenantPipelineConfig(llm=TenantLLMConfig(provider="groq")),
     )
-    with pytest.raises(TenantConfigError, match="pipeline.llm.api_key_env"):
-        validate_credentials(t)
+    validate_credentials(t)
 
 
 def test_validate_credentials_raises_when_telephony_missing_sid() -> None:
@@ -248,7 +250,9 @@ def test_validate_credentials_raises_when_telephony_missing_token() -> None:
 
 
 def test_validate_credentials_collects_all_gaps_in_one_error() -> None:
-    """One error message should list every missing field — admins fix in one round-trip."""
+    """One error message should list every missing field — admins fix in one
+    round-trip. STT/LLM/TTS api_key_env is never required (platform master
+    key is always used), so only telephony gaps should appear here."""
     from src.config_tenant import (
         TenantLLMConfig, TenantPipelineConfig, TenantSTTConfig,
         TenantTTSConfig, TenantTelephonyConfig,
@@ -256,45 +260,49 @@ def test_validate_credentials_collects_all_gaps_in_one_error() -> None:
     t = TenantSettings(
         id="t1", slug="t1", name="T1",
         pipeline=TenantPipelineConfig(
-            stt=TenantSTTConfig(provider="sarvam"),       # missing api_key_env
-            llm=TenantLLMConfig(provider="groq"),         # missing api_key_env
-            tts=TenantTTSConfig(provider="sarvam"),       # missing api_key_env
+            stt=TenantSTTConfig(provider="sarvam"),       # no api_key_env needed
+            llm=TenantLLMConfig(provider="groq"),         # no api_key_env needed
+            tts=TenantTTSConfig(provider="sarvam"),       # no api_key_env needed
             telephony=TenantTelephonyConfig(provider="twilio"),  # missing sid + token
         ),
     )
     with pytest.raises(TenantConfigError) as ei:
         validate_credentials(t)
     msg = str(ei.value)
-    # All five gaps should appear in the one error.
-    assert "pipeline.stt.api_key_env" in msg
-    assert "pipeline.llm.api_key_env" in msg
-    assert "pipeline.tts.api_key_env" in msg
+    # Only the telephony gaps should appear in the one error.
     assert "account_sid_env" in msg
     assert "auth_token_env" in msg
 
 
 def test_validate_credentials_includes_source_in_error() -> None:
     """When called via load_tenant, the source path appears in the message
-    so admins can find the offending YAML."""
-    from src.config_tenant import TenantPipelineConfig, TenantSTTConfig
+    so admins can find the offending YAML. Telephony is used here since it's
+    the layer where a missing env-var reference still raises."""
+    from src.config_tenant import TenantPipelineConfig, TenantTelephonyConfig
     t = TenantSettings(
         id="t1", slug="acme", name="T1",
-        pipeline=TenantPipelineConfig(stt=TenantSTTConfig(provider="sarvam")),
+        pipeline=TenantPipelineConfig(
+            telephony=TenantTelephonyConfig(provider="twilio"),
+        ),
     )
     with pytest.raises(TenantConfigError, match="config/tenants/acme.yaml"):
         validate_credentials(t, source="config/tenants/acme.yaml")
 
 
-def test_load_tenant_rejects_provider_without_key(tenant_dir: Path) -> None:
-    """End-to-end: load_tenant fails on bootstrap, not on first request."""
+def test_load_tenant_rejects_telephony_provider_without_creds(tenant_dir: Path) -> None:
+    """End-to-end: load_tenant fails on bootstrap, not on first request.
+
+    Telephony is the layer where a missing credential env-var reference is
+    still a real gap (STT/LLM/TTS always use the platform master key, so
+    those are no longer validated here — see test_load_tenant_accepts_*)."""
     _write(tenant_dir / "broken.yaml", """
 id: t_broken
 slug: broken
 name: Broken
 pipeline:
-  stt: {provider: sarvam}
+  telephony: {provider: twilio}
 """)
-    with pytest.raises(TenantConfigError, match="api_key_env"):
+    with pytest.raises(TenantConfigError, match="account_sid_env"):
         load_tenant("broken", tenant_dir)
 
 
@@ -321,13 +329,15 @@ def test_validate_credentials_raises_when_mode_s2s_without_realtime() -> None:
         validate_credentials(t)
 
 
-def test_validate_credentials_raises_when_realtime_provider_lacks_key() -> None:
+def test_validate_credentials_passes_when_realtime_provider_has_no_key() -> None:
+    """Realtime (s2s) always resolves its key from the platform master env
+    var, so a tenant-level api_key_env is optional — omitting it is not an
+    error."""
     from src.config_tenant import TenantPipelineConfig, TenantRealtimeConfig
     t = TenantSettings(id="t1", slug="t1", name="T1",
                        pipeline=TenantPipelineConfig(
                            realtime=TenantRealtimeConfig(provider="gemini_live")))
-    with pytest.raises(TenantConfigError, match="pipeline.realtime.api_key_env"):
-        validate_credentials(t)
+    validate_credentials(t)
 
 
 def test_validate_credentials_passes_s2s_with_realtime() -> None:

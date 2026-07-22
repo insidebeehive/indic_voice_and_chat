@@ -344,8 +344,9 @@ async def test_register_telephony_secret_resolves_via_context(ctx) -> None:
     new_ctx = await resolver.resolve_by_token(hash_api_token(token))
     tel = new_ctx.settings.pipeline.telephony
     assert new_ctx.secret(tel.auth_token_env) == "tok-secret"
-    # STT api_key_env points at the shared master env var name, not stored per tenant.
-    assert new_ctx.settings.pipeline.stt.api_key_env == "GROQ_API_KEY"
+    # STT always resolves its key from the platform master env var at runtime
+    # (never per-tenant), so register_tenant leaves api_key_env unset.
+    assert new_ctx.settings.pipeline.stt.api_key_env is None
 
 
 async def test_register_persists_model_choices(ctx) -> None:
@@ -466,4 +467,6 @@ async def test_register_s2s_mode(ctx) -> None:
     assert resp.status_code == 201
     new_ctx = await resolver.resolve_by_slug(resp.json()["slug"])
     assert new_ctx.settings.pipeline.mode == "s2s"
-    assert new_ctx.settings.pipeline.realtime.api_key_env == "GEMINI_API_KEY"
+    # Realtime always resolves its key from the platform master env var at
+    # runtime (never per-tenant), so register_tenant leaves api_key_env unset.
+    assert new_ctx.settings.pipeline.realtime.api_key_env is None
