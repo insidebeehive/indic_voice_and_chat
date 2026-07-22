@@ -2,12 +2,17 @@
 
 ## Model routing + task loop
 
+**No Fable, anywhere in this loop, unless the user explicitly asks for it.**
+Default routing is Opus for planning and review, Sonnet for implementation.
+
 For any substantive task (feature, bugfix, refactor — anything beyond a trivial
 one-file tweak or a question), follow this loop:
 
-1. **Plan — Fable (main session).** Do the planning, design, and task breakdown
-   in the main loop; do not delegate planning to a cheaper model. Clarify scope
-   with the user before fanning out if the request is ambiguous.
+1. **Plan — Opus.** Do the planning, design, and task breakdown using Opus (the
+   main session, or a dispatched planning agent with `model: "opus"` if the
+   main session is running a different model). Do not delegate planning to a
+   cheaper model. Clarify scope with the user before fanning out if the
+   request is ambiguous.
 2. **Implement — Sonnet subagents.** Dispatch implementation work via the Agent
    tool with `model: "sonnet"`. Give each agent a self-contained brief: files,
    the plan step, repo conventions, and the test command it must run. Parallel
@@ -21,10 +26,10 @@ one-file tweak or a question), follow this loop:
    clean or 3 rounds have run — after 3 rounds, stop and surface the remaining
    findings to the user instead of iterating further.
 
-The main (Fable) session stays the orchestrator throughout: it synthesizes
-agent output, makes the calls between rounds, and writes the final summary.
-It should not hand-write implementation code for work already delegated —
-route fixes back through the loop.
+The main session stays the orchestrator throughout: it synthesizes agent
+output, makes the calls between rounds, and writes the final summary. It
+should not hand-write implementation code for work already delegated — route
+fixes back through the loop.
 
 Exempt from the loop: trivial mechanical edits, doc-only changes, config
 tweaks, and investigation/debugging questions where the deliverable is an
