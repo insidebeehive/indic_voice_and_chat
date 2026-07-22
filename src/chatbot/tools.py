@@ -34,7 +34,9 @@ BUILTIN_TOOLS: list[ToolSpec] = [
         name=ESCALATE,
         description=("Transfer the conversation to a human support agent. Use when "
                      "the customer is frustrated, explicitly requests a human, or the "
-                     "issue requires account-level actions you can't perform."),
+                     "issue requires account-level actions you can't perform. Do not "
+                     "call or offer this while the customer is still trying suggested "
+                     "troubleshooting steps."),
         parameters={
             "type": "object",
             "properties": {

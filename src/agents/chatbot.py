@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Optional
 
@@ -232,14 +233,19 @@ class ChatBotAgent(BaseAgent):
     # --- Single-shot RAG path (no tools) -------------------------------
 
     async def _single_shot(self, user_msg: LLMMessage, query_text: str) -> ChatTurnResult:
+        turn_start = time.perf_counter()
         # 1. Retrieval (on the text part; multimodal-only turns skip it)
+        retrieval_start = time.perf_counter()
         retrieved = await search_combined(query_text, self._retrievers) if query_text.strip() else []
+        retrieval_ms = (time.perf_counter() - retrieval_start) * 1000
         # 2. Build context
         rag = build_rag_context(retrieved, max_chars=self._max_context_chars)
         # 3. Compose messages
         messages = self._compose(rag.text, user_msg, query_text=query_text)
         # 4. LLM
+        llm_start = time.perf_counter()
         result = await self._llm.generate(messages, self._llm_config)
+        llm_ms = (time.perf_counter() - llm_start) * 1000
         response = parse_chatbot_response(result.text)
         # 5. Guard. Skip only for a multimodal turn with no retrieval — that
         # answer is grounded in the image, not the (empty) knowledge base, so the
@@ -249,12 +255,20 @@ class ChatBotAgent(BaseAgent):
             response = apply_hallucination_guard(response, rag, self._guard)
         # 6. Persist
         await self._persist(user_msg, query_text, response, len(retrieved))
+        log.info(
+            "chat turn done in %.2fs: llm=%s retrieval=%.0fms retrieved=%d",
+            time.perf_counter() - turn_start, [f"{llm_ms:.0f}ms"], retrieval_ms, len(retrieved),
+        )
         return ChatTurnResult(
             response=response, retrieved=retrieved, rag_context_chars=len(rag.text))
 
     # --- Tool-calling path (agentic) -----------------------------------
 
     async def _handle_with_tools(self, user_msg: LLMMessage, query_text: str) -> ChatTurnResult:
+        turn_start = time.perf_counter()
+        llm_ms_list: list[float] = []
+        tool_ms_list: list[tuple[str, float]] = []
+        rounds = 0
         tools = list(BUILTIN_TOOLS) + list(self._crm_tools)
         # Tools fetch their own context (search_knowledge_base), so the system
         # prompt starts without a pre-built RAG block.
@@ -273,7 +287,10 @@ class ChatBotAgent(BaseAgent):
             tools=tools,
         )
         for _ in range(self._max_tool_rounds):
+            rounds += 1
+            llm_start = time.perf_counter()
             result = await self._llm.generate(messages, cfg)
+            llm_ms_list.append((time.perf_counter() - llm_start) * 1000)
             log.debug(
                 "chatbot llm turn: finish=%s usage=%s text_len=%d tool_calls=%d",
                 result.finish_reason, result.usage, len(result.text or ""), len(result.tool_calls),
@@ -283,7 +300,9 @@ class ChatBotAgent(BaseAgent):
                 break
             messages.append(LLMMessage(role="assistant", content="", tool_calls=result.tool_calls))
             for tc in result.tool_calls:
+                tool_start = time.perf_counter()
                 out, chunks, esc, off = await self._exec_tool(tc)
+                tool_ms_list.append((tc.name, (time.perf_counter() - tool_start) * 1000))
                 retrieved_all.extend(chunks)
                 escalation = esc or escalation
                 call_offer = off or call_offer
@@ -291,9 +310,11 @@ class ChatBotAgent(BaseAgent):
                     role="tool", name=tc.name, tool_call_id=tc.id, content=json.dumps(out)))
         else:
             # Ran out of rounds still wanting tools — force a final plain answer.
+            llm_start = time.perf_counter()
             result = await self._llm.generate(
                 messages, LLMConfig(temperature=cfg.temperature, max_tokens=cfg.max_tokens,
                                     response_format="text"))
+            llm_ms_list.append((time.perf_counter() - llm_start) * 1000)
             text = result.text
 
         rag = build_rag_context(retrieved_all, max_chars=self._max_context_chars)
@@ -323,6 +344,13 @@ class ChatBotAgent(BaseAgent):
         if retrieved_all:
             response = apply_hallucination_guard(response, rag, self._guard)
         await self._persist(user_msg, query_text, response, len(retrieved_all))
+        log.info(
+            "chat turn done in %.2fs: llm=%s tools=%s rounds=%d retrieved=%d",
+            time.perf_counter() - turn_start,
+            [f"{ms:.0f}ms" for ms in llm_ms_list],
+            [f"{name}:{ms:.0f}ms" for name, ms in tool_ms_list],
+            rounds, len(retrieved_all),
+        )
         return ChatTurnResult(
             response=response, retrieved=retrieved_all, rag_context_chars=len(rag.text),
             escalation=escalation, call_offer=call_offer)

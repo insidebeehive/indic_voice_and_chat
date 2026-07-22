@@ -16,6 +16,7 @@ import logging
 import os
 import random
 import re
+from time import perf_counter
 from typing import Any, AsyncIterator, Callable, Optional
 
 import json
@@ -64,6 +65,12 @@ _RATE_LIMIT_MAX_RETRIES = len(_RATE_LIMIT_BACKOFF_S)
 # fail fast instead of retrying.
 _RATE_LIMIT_GIVE_UP_S = 60.0
 _RETRY_DELAY_RE = re.compile(r"retryDelay['\"]?\s*[:=]\s*['\"]?(\d+(?:\.\d+)?)s")
+
+# Below this cumulative (semaphore-wait + backoff-sleep) threshold, a call is
+# the common fast case — logging it would just be noise. Above it, something
+# (concurrency saturation or a retry) made the call slow, which is exactly
+# what production logs need to show.
+_SLOW_CALL_LOG_THRESHOLD_S = 1.0
 
 
 def _suggested_retry_delay_s(exc: Exception) -> Optional[float]:
@@ -201,10 +208,14 @@ class GeminiLLMAdapter(ILLMProvider):
         """
         attempt = 0
         rate_limit_attempt = 0
+        total_sem_wait = 0.0
+        total_backoff = 0.0
         while True:
+            wait_start = perf_counter()
             try:
                 async with _concurrency_sem():
-                    return await fn()
+                    total_sem_wait += perf_counter() - wait_start
+                    result = await fn()
             except Exception as exc:  # noqa: BLE001 - re-raised unless retriable
                 code = getattr(exc, "code", None)
                 if code == 429 and rate_limit_attempt < _RATE_LIMIT_MAX_RETRIES:
@@ -237,16 +248,27 @@ class GeminiLLMAdapter(ILLMProvider):
                         what, rate_limit_attempt, _RATE_LIMIT_MAX_RETRIES, delay,
                     )
                     await asyncio.sleep(delay)
+                    total_backoff += delay
                     continue
                 if code in _RETRIABLE_STATUS and attempt < _MAX_RETRIES:
                     attempt += 1
+                    delay = _BACKOFF_BASE_S * attempt
                     log.warning(
                         "gemini transient %s on %s; retry %d/%d",
                         code, what, attempt, _MAX_RETRIES,
                     )
-                    await asyncio.sleep(_BACKOFF_BASE_S * attempt)
+                    await asyncio.sleep(delay)
+                    total_backoff += delay
                     continue
                 raise
+            else:
+                waited = total_sem_wait + total_backoff
+                if waited > _SLOW_CALL_LOG_THRESHOLD_S:
+                    log.info(
+                        "gemini call waited: sem_wait=%.2fs backoff=%.2fs on %s",
+                        total_sem_wait, total_backoff, what,
+                    )
+                return result
 
     # --- Public API ----------------------------------------------------
 
