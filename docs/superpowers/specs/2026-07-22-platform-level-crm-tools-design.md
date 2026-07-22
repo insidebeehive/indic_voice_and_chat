@@ -1,0 +1,100 @@
+# Platform-level CRM tool auth — design
+
+**Date:** 2026-07-22
+**Status:** Approved
+
+## Purpose
+
+CRM tools (the built-in catalog of 18 player/operator tools the ChatBot can
+call) currently require each tenant to configure its own auth token
+(`crm:api_token` in `tenant_secrets`) before the catalog fallback activates.
+The platform currently has effectively one real operator behind it, and
+requiring per-tenant setup for a shared CRM integration is unnecessary
+friction — one tenant already has its tools registered per-tenant, which is
+why "the tools aren't getting called" for any *other* tenant: there's no
+platform-level fallback for the auth token, only for the base URL.
+
+Goal: any tenant with no tenant-specific CRM configuration gets the full
+built-in tool catalog, authenticated with **one shared platform-level
+token**, with zero per-tenant setup required. Tenant-specific overrides
+(their own registered tools, or their own `crm:*` secrets) continue to work
+exactly as today and take precedence — this is additive, not a replacement.
+
+## Current mechanism (unchanged, for context)
+
+`_load_crm_tools_uncached()` in `src/bootstrap.py` (~line 247-321):
+1. If the tenant has rows in `chat_tools`, those are used exclusively —
+   tenant-specific tools always win.
+2. Otherwise, falls back to the platform catalog (`src/chatbot/catalog.py`'s
+   `ALL_TOOLS`, 18 tools) with:
+   - `base_url` = tenant's `crm:base_url` secret, else `PLATFORM_CRM_BASE_URL`
+     env var, else nothing (returns no tools).
+   - `api_token` = tenant's `crm:api_token` secret **only** — no platform
+     fallback today. This is the gap.
+   - `auth_type` = tenant's `crm:auth_type` secret, else hardcoded `"api_key"`
+     — also no platform fallback today.
+
+## Change
+
+In the same fallback block (`src/bootstrap.py`), extend `api_token` and
+`auth_type` resolution to mirror the existing `base_url` pattern:
+
+```python
+api_token = sr.get("crm:api_token") or os.environ.get("PLATFORM_CRM_API_TOKEN")
+auth_type = sr.get("crm:auth_type") or os.environ.get("PLATFORM_CRM_AUTH_TYPE") or "api_key"
+```
+
+No change to precedence order, no change to the tenant-specific
+(`chat_tools` rows) path, no change to `ALL_TOOLS` itself.
+
+## Config declaration (consistency with the recent secrets cleanup)
+
+`PLATFORM_CRM_BASE_URL` was already an undeclared env var (read via raw
+`os.environ.get`, invisible to `Secrets` auditing) — same class of gap the
+prior secrets-realignment work just fixed for provider keys. Declare all
+three in `src/config.py`'s `Secrets` class as `Optional[str] = None`,
+declare-only (adapters/bootstrap keep reading raw env, unchanged behavior),
+matching the existing convention:
+
+```python
+PLATFORM_CRM_BASE_URL: Optional[str] = None
+PLATFORM_CRM_API_TOKEN: Optional[str] = None
+PLATFORM_CRM_AUTH_TYPE: Optional[str] = None
+```
+
+Add corresponding commented documentation lines to `.env.example`.
+
+## Testing
+
+Extend `tests/unit` coverage for `_load_crm_tools_uncached` (find existing
+tests via `grep -rln "_load_crm_tools_uncached\|crm:api_token\|crm:base_url" tests/unit/` —
+likely in a bootstrap or CRM-tools test file):
+- Tenant with no `chat_tools` rows, no `crm:*` secrets, `PLATFORM_CRM_BASE_URL`
+  + `PLATFORM_CRM_API_TOKEN` set → returns all 18 catalog tools, each `execs`
+  entry's `token` equal to the platform token.
+- Tenant with its own `crm:api_token` set (platform token also set) → tenant's
+  own token wins (existing precedence, must not regress).
+- Tenant with its own `chat_tools` rows registered (platform token set) →
+  tenant-specific tools returned unchanged, platform fallback never consulted
+  (existing precedence, must not regress).
+- No `PLATFORM_CRM_API_TOKEN` and no tenant secret → `token` is `None` (today's
+  existing behavior when nothing is configured at all — unchanged, not a new
+  failure mode).
+
+## Deployment / data step (not code, explicitly out of this implementation)
+
+The one tenant that already has its own `chat_tools` rows will keep using
+them (unchanged precedence) even after this ships — it will NOT automatically
+start using the shared platform token until its existing per-tenant
+registrations are cleared via the existing `DELETE /chat/tools/{name}`
+endpoint (tenant-authed) or `crm:*` secrets are unset. This is a manual
+follow-up step for the user/ops, not part of this code change.
+
+## Out of scope
+
+- Any new registration/admin endpoint — none needed, existing endpoints cover
+  every path (`DELETE /chat/tools/{name}` for clearing a tenant's overrides).
+- Per-tenant auth with shared tool *definitions* (the option considered and
+  not chosen) — not needed given the single-shared-token decision.
+- A DB-backed platform secrets table — env vars are consistent with how every
+  other platform-level credential in this codebase works.
