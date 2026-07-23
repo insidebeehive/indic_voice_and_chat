@@ -65,6 +65,7 @@ from src.api.call_store import (
     set_tenant_event_notifier,
 )
 from src.integration.tenant_events import deliver as deliver_tenant_event
+from src.integration.tenant_events import resolve_events_webhook_url
 from src.auth.db_resolver import DbTenantResolver
 from src.auth.middleware import set_admin_tokens, set_tenant_resolver
 from src.auth.seed import seed_campaigns_if_empty, seed_if_empty, seed_provider_costs, sync_telephony_from_yaml
@@ -295,7 +296,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     async def _notify_tenant_event(envelope: dict) -> None:
         settings = _tenant_settings_by_id(envelope.get("tenant_id"))
-        url = getattr(settings, "events_webhook_url", None)
+        url = await resolve_events_webhook_url(settings, sessionmaker)
         if not url:
             return
         secret_env = getattr(settings, "events_webhook_secret_env", None)

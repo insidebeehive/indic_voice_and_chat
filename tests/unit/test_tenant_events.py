@@ -8,7 +8,11 @@ import json
 import logging
 from types import SimpleNamespace
 
+import pytest_asyncio
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
 from src.integration import tenant_events as te
+from src.models.database import Base
 
 
 def test_sign_body_is_hmac_sha256():
@@ -153,3 +157,72 @@ async def test_resolve_tenant_event_secret_per_tenant_secret_no_warning(monkeypa
         r.levelno == logging.WARNING and "UNSIGNED" in r.message
         for r in caplog.records
     )
+
+
+# --- src.integration.tenant_events.resolve_events_webhook_url ----------------
+# The tenant's own explicit events_webhook_url wins (an escape hatch for a
+# tenant needing a different shape than its CRM's default); otherwise the
+# tenant's linked Crm's events_webhook_url_template with {operator_id}
+# substituted; otherwise None.
+
+
+@pytest_asyncio.fixture
+async def sm_with_crm_seed():
+    """Sessionmaker seeded with a single Crm row (id='betstudio') — the
+    fixture for tests exercising a tenant linked via TenantSettings(crm_id=...).
+    Mirrors tests/unit/test_crm_tools_platform_fallback.py's fixture of the
+    same name (kept local here since that module's fixture isn't shared via a
+    conftest)."""
+    from src.models.crm import Crm
+
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:", future=True)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    sm = async_sessionmaker(engine, expire_on_commit=False)
+    async with sm() as s:
+        s.add(Crm(id="betstudio", name="BetStudio",
+                   base_url="https://apistage.betstudio.io/api", auth_type="api_key"))
+        await s.commit()
+    yield sm
+    await engine.dispose()
+
+
+async def test_resolve_events_webhook_url_uses_tenant_override_when_set():
+    from src.auth.context import TenantContext
+    from src.config_tenant import TenantSettings
+    from src.integration.tenant_events import resolve_events_webhook_url
+
+    tenant = TenantContext(settings=TenantSettings(
+        id="t1", slug="t1", name="T1", events_webhook_url="https://explicit.example.com/hook"))
+    url = await resolve_events_webhook_url(tenant, sessionmaker=None)
+    assert url == "https://explicit.example.com/hook"
+
+
+async def test_resolve_events_webhook_url_uses_crm_template_with_operator_id(sm_with_crm_seed):
+    from src.auth.context import TenantContext
+    from src.config_tenant import TenantCRMConfig, TenantSettings
+    from src.integration.tenant_events import resolve_events_webhook_url
+    from src.models.crm import Crm
+
+    async with sm_with_crm_seed() as db:
+        crm = await db.get(Crm, "betstudio")
+        crm.events_webhook_url_template = "https://bostage.betstudio.io/webhooks/crm/softphone-events/{operator_id}"
+        await db.commit()
+
+    # NOTE: TenantCRMConfig is a top-level field of TenantSettings (`crm=`),
+    # not nested under `pipeline` — see src/config_tenant.py TenantSettings.crm.
+    tenant = TenantContext(settings=TenantSettings(
+        id="t1", slug="t1", name="T1", crm_id="betstudio",
+        crm=TenantCRMConfig(operator_id="ab858a8c-7ad4-47d2-a0b7-05ee93f8f134")))
+    url = await resolve_events_webhook_url(tenant, sm_with_crm_seed)
+    assert url == "https://bostage.betstudio.io/webhooks/crm/softphone-events/ab858a8c-7ad4-47d2-a0b7-05ee93f8f134"
+
+
+async def test_resolve_events_webhook_url_none_when_nothing_configured():
+    from src.auth.context import TenantContext
+    from src.config_tenant import TenantSettings
+    from src.integration.tenant_events import resolve_events_webhook_url
+
+    tenant = TenantContext(settings=TenantSettings(id="t1", slug="t1", name="T1"))
+    url = await resolve_events_webhook_url(tenant, sessionmaker=None)
+    assert url is None

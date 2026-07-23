@@ -14,7 +14,8 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from src.integration.tenant_events import deliver
+from src.integration.tenant_events import deliver, resolve_events_webhook_url
+from src.models.database import get_sessionmaker
 
 log = logging.getLogger(__name__)
 
@@ -23,7 +24,7 @@ async def send_bo_webhook(tenant, event_type: str, payload: dict) -> bool:
     """POST event_type + payload to the tenant's webhook URL.
     Returns True if the CRM acknowledged (2xx), False on failure or no URL configured."""
     settings = getattr(tenant, "settings", tenant)
-    url = getattr(settings, "events_webhook_url", None)
+    url = await resolve_events_webhook_url(tenant, get_sessionmaker())
     if not url:
         return False
     secret_env = getattr(settings, "events_webhook_secret_env", None)

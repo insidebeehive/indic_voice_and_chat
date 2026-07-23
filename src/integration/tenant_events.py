@@ -80,6 +80,46 @@ async def _httpx_post(url: str, raw: bytes, headers: dict) -> int:
             return -1
 
 
+async def resolve_events_webhook_url(tenant, sessionmaker) -> Optional[str]:
+    """The URL to POST tenant lifecycle events to.
+
+    Priority: the tenant's own explicit ``events_webhook_url`` (an escape
+    hatch for a tenant needing a different shape than its CRM's default),
+    else the tenant's linked CRM's ``events_webhook_url_template`` with
+    ``{operator_id}`` substituted from the tenant's own operator_id, else
+    None (no webhook configured at all).
+
+    ``tenant`` may be a ``TenantContext`` (real call sites) or a bare
+    ``TenantSettings``-like object exposing the same attributes directly
+    (some call sites/tests pass either) — unwrapped the same way
+    ``src.api.chat_webhooks.send_bo_webhook`` already does.
+    """
+    settings = getattr(tenant, "settings", tenant)
+
+    explicit = getattr(settings, "events_webhook_url", None)
+    if explicit:
+        return explicit
+
+    crm_id = getattr(settings, "crm_id", None)
+    if not crm_id or sessionmaker is None:
+        return None
+
+    from src.models.crm import Crm
+
+    async with sessionmaker() as db:
+        crm = await db.get(Crm, crm_id)
+    if crm is None or not crm.events_webhook_url_template:
+        return None
+
+    crm_config = getattr(settings, "crm", None)
+    operator_id = (
+        getattr(crm_config, "operator_id", None)
+        or getattr(settings, "id", None)
+        or getattr(tenant, "id", None)
+    )
+    return crm.events_webhook_url_template.replace("{operator_id}", operator_id)
+
+
 async def deliver(
     url: str,
     envelope: dict[str, Any],
