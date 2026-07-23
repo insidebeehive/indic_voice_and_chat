@@ -540,9 +540,9 @@ async function loadChat(id, slug) {
     ? "Could not load active tools."
     : resolvedSource === "tenant"
       ? "Using this tenant's own registered tools (below)."
-      : resolvedSource === "platform_fallback"
-        ? "Using the platform catalog — no tenant-specific tools registered."
-        : "No tools active — no tenant registration and no platform fallback configured (set PLATFORM_CRM_BASE_URL, or configure this tenant's own CRM credentials in the CRM tab).";
+      : resolvedSource === "crm_catalog"
+        ? "Using the linked CRM's tool catalog — no tenant-specific tools registered."
+        : "No tools active — no tenant registration and no CRM linked (link a CRM in the CRM tab, or configure this tenant's own CRM credentials there).";
 
   const resolvedRows = resolvedTools.length
     ? resolvedTools.map(t => `<tr>
