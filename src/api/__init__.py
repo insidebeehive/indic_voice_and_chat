@@ -11,6 +11,7 @@ from src.api import (
     chat_tools,
     config_routes,
     conversations,
+    crm_kb,
     crms,
     external_chat,
     knowledge,
@@ -32,6 +33,7 @@ api_router.include_router(softphone.router)
 api_router.include_router(config_routes.router)
 api_router.include_router(conversations.router)
 api_router.include_router(crms.router)
+api_router.include_router(crm_kb.router)
 api_router.include_router(knowledge.router)
 api_router.include_router(webhooks_routes.router)
 api_router.include_router(benchmarks.router)
