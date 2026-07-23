@@ -23,6 +23,7 @@ async def execute_crm_tool(
     auth_type: Optional[str],
     token: Optional[str],
     args: dict,
+    x_api_key: Optional[str] = None,
     context: Optional[dict] = None,
     extra_headers: Optional[dict] = None,
     http_client: object = None,
@@ -48,6 +49,14 @@ async def execute_crm_tool(
         headers["Authorization"] = f"Bearer {token}"
     elif token and auth_type == "api_key":
         headers["X-API-Key"] = token
+    if x_api_key:
+        # Independent of auth_type — always sent alongside whatever the
+        # token/auth_type logic above produced (the live CRM requires both
+        # Authorization and X-API-Key together). Runs unconditionally AFTER
+        # the if/elif above so it deliberately wins if a tenant has both the
+        # old-style api_key auth_type/token AND this new dedicated field
+        # configured: x_api_key is the more specific, newer mechanism.
+        headers["X-API-Key"] = x_api_key
 
     method = (method or "GET").upper()
     client = http_client

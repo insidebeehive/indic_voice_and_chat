@@ -456,6 +456,41 @@ async def test_tenant_analytics_unknown_404(ctx) -> None:
     assert (await client.get("/tenants/nope/analytics", headers=ADMIN_HEADERS)).status_code == 404
 
 
+async def test_update_and_read_back_crm_x_api_key_masked(ctx) -> None:
+    """The new, independent crm:x_api_key secret can be set via PATCH and is
+    read back masked (never the raw value) via GET .../chat-config."""
+    client, _, sm = ctx
+    tid = (await client.post(
+        "/tenants", json=_body(slug="acme"), headers=ADMIN_HEADERS)).json()["tenant_id"]
+
+    resp = await client.patch(
+        f"/tenants/{tid}",
+        json={"crm": {"auth_type": "bearer", "api_token": "bearer-tok",
+                       "x_api_key": "the-x-api-key"}},
+        headers=ADMIN_HEADERS)
+    assert resp.status_code == 200, resp.text
+
+    cfg = (await client.get(f"/tenants/{tid}/chat-config", headers=ADMIN_HEADERS)).json()
+    assert cfg["crm"]["x_api_key"] == "..."
+    assert cfg["crm"]["api_token"] == "..."
+
+    async with sm() as s:
+        rows = (await s.execute(
+            select(TenantSecret).where(TenantSecret.tenant_id == tid)
+        )).scalars().all()
+    x_row = next(r for r in rows if r.name == "crm:x_api_key")
+    assert crypto.decrypt(x_row.value_encrypted) == "the-x-api-key"
+    assert "the-x-api-key" not in x_row.value_encrypted
+
+
+async def test_crm_x_api_key_not_set_reports_empty_string(ctx) -> None:
+    client, _, _ = ctx
+    tid = (await client.post(
+        "/tenants", json=_body(slug="acme"), headers=ADMIN_HEADERS)).json()["tenant_id"]
+    cfg = (await client.get(f"/tenants/{tid}/chat-config", headers=ADMIN_HEADERS)).json()
+    assert cfg["crm"]["x_api_key"] == ""
+
+
 async def test_register_s2s_mode(ctx) -> None:
     client, resolver, _ = ctx
     body = _body(

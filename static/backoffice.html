@@ -445,6 +445,9 @@ async function loadCRM(id, slug) {
       <label>API token <small class="hint">(encrypted at rest)</small>
         <input id="ch_token" type="password" style="width:18rem" placeholder="token value" />
       </label>
+      <label>X-API-Key <small class="hint">(sent as a separate header, alongside Authorization)</small>
+        <input id="ch_xapikey" type="password" style="width:18rem" placeholder="x-api-key value" />
+      </label>
       <label>Operator ID
         <input id="ch_opid" style="width:16rem" placeholder="ab858a8c-7ad4-47d2-a0b7-…" />
       </label>
@@ -457,6 +460,7 @@ async function loadCRM(id, slug) {
   if (crmCfg.base_url)    $("ch_base").value        = crmCfg.base_url;
   if (crmCfg.auth_type)   $("ch_authtype").value    = crmCfg.auth_type;
   if (crmCfg.api_token)   $("ch_token").placeholder = "... (already set — leave blank to keep)";
+  if (crmCfg.x_api_key)   $("ch_xapikey").placeholder = "... (already set — leave blank to keep)";
   if (crmCfg.operator_id) $("ch_opid").value        = crmCfg.operator_id;
 }
 
@@ -569,10 +573,12 @@ async function saveCrmConfig(slug) {
   const base_url    = $("ch_base").value.trim();
   const auth_type   = $("ch_authtype").value;
   const api_token   = $("ch_token").value.trim();
+  const x_api_key   = $("ch_xapikey").value.trim();
   const operator_id = $("ch_opid").value.trim();
   const crm = { auth_type };
   if (base_url)    crm.base_url    = base_url;
   if (api_token)   crm.api_token   = api_token;
+  if (x_api_key)   crm.x_api_key   = x_api_key;
   if (operator_id) crm.operator_id = operator_id;
   $("ch_result").textContent = "saving…";
   const tid = SELECTED;

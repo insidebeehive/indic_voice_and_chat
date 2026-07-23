@@ -258,6 +258,12 @@ async def resolve_crm_tools(
 
     specs: list[ToolSpec] = []
     execs: dict[str, dict] = {}
+    # Moved to the top so it's available to BOTH branches below (tenant-
+    # registered tools and the platform-fallback catalog) — needed for the
+    # new, independent, tenant-level crm:x_api_key secret (sent unconditionally
+    # as X-API-Key alongside whatever the existing token/auth_type produces).
+    sr = tenant.secrets_resolved
+    x_api_key = sr.get("crm:x_api_key")
     if sessionmaker is not None:
         async with sessionmaker() as db:
             rows = (await db.execute(
@@ -294,14 +300,13 @@ async def resolve_crm_tools(
                 execs[r.name] = {
                     "endpoint": r.endpoint, "method": r.method,
                     "parameters": r.parameters or {}, "auth_type": r.auth_type,
-                    "token": token,
+                    "token": token, "x_api_key": x_api_key,
                     "extra_headers": (r.auth_config or {}).get("extra_headers")}
 
     if specs:
         return specs, execs, "tenant"  # tenant-specific tools take precedence
 
     # ── Platform catalog fallback ─────────────────────────────────────
-    sr = tenant.secrets_resolved
     base_url = (sr.get("crm:base_url") or os.environ.get("PLATFORM_CRM_BASE_URL", "")).rstrip("/")
     if not base_url:
         return [], {}, "none"
@@ -322,7 +327,7 @@ async def resolve_crm_tools(
         execs[name] = {
             "endpoint": endpoint, "method": spec.get("method", "GET"),
             "parameters": spec["parameters"], "auth_type": auth_type,
-            "token": api_token, "extra_headers": None,
+            "token": api_token, "x_api_key": x_api_key, "extra_headers": None,
         }
     return specs, execs, "platform_fallback"
 
@@ -408,6 +413,7 @@ def make_chatbot_factory(registry, sessionmaker=None, platform_retriever=None):
                 endpoint=spec["endpoint"], method=spec["method"],
                 parameters=spec["parameters"], auth_type=spec["auth_type"],
                 token=spec["token"], args=tc.arguments or {}, context=_crm_context,
+                x_api_key=spec.get("x_api_key"),
                 extra_headers=spec.get("extra_headers"))
 
         return ChatBotAgent(

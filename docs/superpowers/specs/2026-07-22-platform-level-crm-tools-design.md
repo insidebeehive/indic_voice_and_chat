@@ -125,3 +125,29 @@ fallback for auth, and there must never be one again. A tenant with no
 `crm:api_token` secret still gets the full catalog back (base_url + auth_type
 still resolve), but every tool's `token` is `None` until that tenant
 configures its own secret.
+
+## Addendum (2026-07-23): the live CRM needs both headers together
+
+Live 401s against `apistage.betstudio.io` were traced to a second gap: the
+downstream CRM requires **both** an `X-API-Key` header **and** an
+`Authorization: Bearer <token>` header on every call — confirmed by the
+product owner from the CRM's own curl example, and confirmed empirically
+live (a request with only `Authorization` still got 401; both headers must
+be present together). The existing `auth_type`/`token` mechanism only ever
+produces one header (`Authorization: Bearer` for `bearer`, or `X-API-Key` for
+the old `api_key` mode) — never both at once.
+
+Fix: added a second, independent, additive per-tenant secret
+`crm:x_api_key`. When configured, it is **always** sent as
+`X-API-Key: <value>`, unconditionally, alongside whatever the existing
+`token`/`auth_type` logic already produces (`Authorization: Bearer` in the
+live case). This is purely additive — the existing single-header
+`token`/`auth_type` mechanism is unchanged. Encrypted at rest exactly like
+`crm:api_token` (same `tenant_secrets` table, same Fernet
+`crypto.encrypt`/`crypto.decrypt`).
+
+Edge case (handled deliberately, not silently): if a tool's
+`auth_type == "api_key"` (the old single-token api_key mode, which sets
+`X-API-Key` from `token`) *and* the new `x_api_key` is also configured, the
+dedicated `x_api_key` field wins — it's the more specific, newer mechanism.
+See `src/chatbot/tool_executor.py::execute_crm_tool`.

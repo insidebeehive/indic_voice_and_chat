@@ -142,6 +142,30 @@ async def test_tenant_registered_tools_take_precedence_over_platform_fallback(mo
         await engine.dispose()
 
 
+async def test_x_api_key_secret_populated_for_every_platform_catalog_tool(monkeypatch) -> None:
+    # The new, independent crm:x_api_key secret is tenant-level (like
+    # operator_id) and must be attached to every tool's exec spec in the
+    # platform-fallback branch, not just some.
+    _clean_platform_env(monkeypatch)
+    monkeypatch.setenv("PLATFORM_CRM_BASE_URL", "https://platform-crm.example.com")
+
+    engine, sm = await _make_sessionmaker()
+    try:
+        registry = _registry()
+        factory = make_chatbot_factory(registry, sm)
+        tenant = TenantContext(
+            settings=TenantSettings(id="t1", slug="t1", name="T1"),
+            secrets_resolved={"crm:x_api_key": "the-x-api-key"},
+        )
+        agent = await factory(tenant, "s1")
+        assert len(agent._crm_tools) == len(ALL_TOOLS)
+        for name in ALL_TOOLS:
+            exec_spec = registry.crm_tools._items["t1"][1][name]
+            assert exec_spec["x_api_key"] == "the-x-api-key"
+    finally:
+        await engine.dispose()
+
+
 async def test_no_platform_token_and_no_tenant_secret_gives_none_token(monkeypatch) -> None:
     # Scenario 4: nothing configured at all (no chat_tools rows, no crm:*
     # secrets, no PLATFORM_CRM_API_TOKEN) but PLATFORM_CRM_BASE_URL is set (so

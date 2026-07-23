@@ -79,6 +79,7 @@ class ResolvedToolInfo(BaseModel):
     endpoint: str
     auth_type: Optional[str]
     token_configured: bool  # never expose the actual token value
+    x_api_key_configured: bool  # never expose the actual x_api_key value
 
 
 class ResolvedToolsResponse(BaseModel):
@@ -184,6 +185,7 @@ async def list_resolved_tools(
                 endpoint=execs[s.name]["endpoint"],
                 auth_type=execs[s.name]["auth_type"],
                 token_configured=bool(execs[s.name].get("token")),
+                x_api_key_configured=bool(execs[s.name].get("x_api_key")),
             )
             for s in specs
         ],

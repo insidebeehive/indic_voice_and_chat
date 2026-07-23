@@ -84,3 +84,38 @@ async def test_http_failure_returns_error_dict() -> None:
         auth_type=None, token=None, args={}, http_client=_Boom(),
     )
     assert "error" in out
+
+
+@pytest.mark.asyncio
+async def test_bearer_token_and_x_api_key_both_sent_together() -> None:
+    # The live CRM (apistage.betstudio.io) requires BOTH headers on every
+    # call: Authorization: Bearer <token> AND X-API-Key: <x_api_key>. The new
+    # x_api_key field is additive and independent of auth_type/token.
+    client = _FakeClient({"ok": True})
+    await execute_crm_tool(
+        endpoint="https://crm.example.com/api/wallet",
+        method="GET", parameters={},
+        auth_type="bearer", token="bearer-tok",
+        x_api_key="the-x-api-key",
+        args={}, http_client=client,
+    )
+    headers = client.calls[0][3]
+    assert headers["Authorization"] == "Bearer bearer-tok"
+    assert headers["X-API-Key"] == "the-x-api-key"
+
+
+@pytest.mark.asyncio
+async def test_x_api_key_wins_over_old_api_key_auth_type() -> None:
+    # Edge case: auth_type == "api_key" (the OLD single-token mode) already
+    # sets X-API-Key from `token`. If the NEW x_api_key is also configured,
+    # it must win (it's the more specific, newer mechanism).
+    client = _FakeClient({"ok": True})
+    await execute_crm_tool(
+        endpoint="https://crm.example.com/api/wallet",
+        method="GET", parameters={},
+        auth_type="api_key", token="old-style-token",
+        x_api_key="dedicated-x-api-key",
+        args={}, http_client=client,
+    )
+    headers = client.calls[0][3]
+    assert headers["X-API-Key"] == "dedicated-x-api-key"

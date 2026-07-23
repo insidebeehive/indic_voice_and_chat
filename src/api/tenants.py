@@ -288,6 +288,11 @@ class CrmCredentialsIn(BaseModel):
     auth_type: Optional[str] = None      # api_key | bearer  (default: api_key)
     api_token: Optional[str] = None      # write-only; never returned
     operator_id: Optional[str] = None    # stored in pipeline_config.crm.operator_id
+    # Independent, additive secret: the live CRM requires BOTH an
+    # Authorization header (from auth_type/api_token above) AND a separate
+    # X-API-Key header — this is that second header's value, sent
+    # unconditionally alongside whatever auth_type/api_token already produce.
+    x_api_key: Optional[str] = None      # write-only; never returned
 
 
 class UpdateTenantRequest(BaseModel):
@@ -440,6 +445,8 @@ async def update_tenant(
             crm_secrets["crm:auth_type"] = crm.auth_type
         if crm.api_token is not None:
             crm_secrets["crm:api_token"] = crm.api_token
+        if crm.x_api_key is not None:
+            crm_secrets["crm:x_api_key"] = crm.x_api_key
         for name, value in crm_secrets.items():
             existing = (await session.execute(
                 select(TenantSecret).where(
@@ -596,6 +603,7 @@ async def get_chat_config(
             "base_url":   sr.get("crm:base_url") or "",
             "auth_type":  sr.get("crm:auth_type") or "api_key",
             "api_token":  "..." if sr.get("crm:api_token") else "",
+            "x_api_key": "..." if sr.get("crm:x_api_key") else "",
             "operator_id": ctx.settings.crm.operator_id or "",
         },
     }

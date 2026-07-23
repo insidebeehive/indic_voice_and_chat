@@ -59,6 +59,12 @@ CRM tools:
   next chat turn, computed fresh (bypasses the CRM-tools cache): reflects the
   `PLATFORM_CRM_*` platform-fallback path too, not just this tenant's own
   registered `chat_tools` rows (which is all `GET /chat/tools` sees).
+- Auth headers: `auth_type`/token produce a single header (`Authorization:
+  Bearer <token>` or `X-API-Key: <token>`). The platform-catalog CRM
+  additionally supports an independent, additive `crm:x_api_key` tenant
+  secret — when set it is **always** sent as `X-API-Key`, alongside whatever
+  the `auth_type`/token mechanism already produces (the live CRM requires
+  both headers together). Encrypted at rest exactly like `crm:api_token`.
 
 Voice handoff:
 - `POST /chat/{session_id}/call` → summarizes the chat, stashes context under a

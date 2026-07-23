@@ -126,6 +126,26 @@ async def test_platform_fallback_without_token_reports_not_configured(ctx, monke
     assert all(t["token_configured"] is False for t in body["tools"])
 
 
+async def test_x_api_key_configured_reported_independently_of_token(ctx, monkeypatch) -> None:
+    client, sm = ctx
+    monkeypatch.setenv("PLATFORM_CRM_BASE_URL", "https://platform-crm.example.com")
+    # The in-memory test resolver doesn't re-read TenantSecret rows, so seed
+    # the tenant's secrets_resolved directly (same pattern as the other
+    # platform-fallback tests that construct TenantContext with secrets_resolved).
+    fresh_ctx = register_tenant_for_test(TenantSettings(id="t1", slug="t1", name="T1"),
+                                          plaintext_tokens=["test-token"])
+    fresh_ctx.secrets_resolved["crm:x_api_key"] = "the-x-api-key"
+
+    resp = await client.get("/chat/tools/resolved")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["source"] == "platform_fallback"
+    # token_configured stays False (no crm:api_token set) while
+    # x_api_key_configured is True — the two are independent.
+    assert all(t["token_configured"] is False for t in body["tools"])
+    assert all(t["x_api_key_configured"] is True for t in body["tools"])
+
+
 async def test_nothing_configured_gives_empty_none_source(ctx) -> None:
     client, _sm = ctx
     # No chat_tools rows, no PLATFORM_CRM_* env, no tenant crm:* secrets.
