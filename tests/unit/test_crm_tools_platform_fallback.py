@@ -17,7 +17,7 @@ from src.auth import TenantContext
 from src.auth import secrets as crypto
 from src.bootstrap import make_chatbot_factory
 from src.chatbot.catalog import ALL_TOOLS
-from src.config_tenant import TenantSettings
+from src.config_tenant import TenantCRMConfig, TenantSettings
 from src.models.chat import ChatTool
 from src.models.database import Base
 from src.models.tenant import Tenant, TenantSecret
@@ -162,6 +162,58 @@ async def test_x_api_key_secret_populated_for_every_platform_catalog_tool(monkey
         for name in ALL_TOOLS:
             exec_spec = registry.crm_tools._items["t1"][1][name]
             assert exec_spec["x_api_key"] == "the-x-api-key"
+    finally:
+        await engine.dispose()
+
+
+async def test_extra_headers_carries_operator_id_from_tenant_crm_config(monkeypatch) -> None:
+    # Regression: the platform-fallback branch hardcoded extra_headers=None,
+    # so it NEVER sent the "operatorid" header the downstream CRM needs (only
+    # the tenant-registered-tools branch did, via chat_tools.auth_config).
+    # When the tenant has its own crm.operator_id configured, every
+    # platform-fallback tool's extra_headers must carry it.
+    _clean_platform_env(monkeypatch)
+    monkeypatch.setenv("PLATFORM_CRM_BASE_URL", "https://platform-crm.example.com")
+
+    engine, sm = await _make_sessionmaker()
+    try:
+        registry = _registry()
+        factory = make_chatbot_factory(registry, sm)
+        tenant = TenantContext(
+            settings=TenantSettings(
+                id="t1", slug="t1", name="T1",
+                crm=TenantCRMConfig(operator_id="operator-uuid-123")),
+            secrets_resolved={},
+        )
+        agent = await factory(tenant, "s1")
+        assert len(agent._crm_tools) == len(ALL_TOOLS)
+        for name in ALL_TOOLS:
+            exec_spec = registry.crm_tools._items["t1"][1][name]
+            assert exec_spec["extra_headers"] == {"operatorid": "operator-uuid-123"}
+    finally:
+        await engine.dispose()
+
+
+async def test_extra_headers_falls_back_to_tenant_id_when_no_operator_id_configured(monkeypatch) -> None:
+    # Same regression as above, but for the "no crm.operator_id configured"
+    # case -> falls back to the tenant id, matching what crm_executor already
+    # does elsewhere in this file.
+    _clean_platform_env(monkeypatch)
+    monkeypatch.setenv("PLATFORM_CRM_BASE_URL", "https://platform-crm.example.com")
+
+    engine, sm = await _make_sessionmaker()
+    try:
+        registry = _registry()
+        factory = make_chatbot_factory(registry, sm)
+        tenant = TenantContext(
+            settings=TenantSettings(id="t1", slug="t1", name="T1"),
+            secrets_resolved={},
+        )
+        agent = await factory(tenant, "s1")
+        assert len(agent._crm_tools) == len(ALL_TOOLS)
+        for name in ALL_TOOLS:
+            exec_spec = registry.crm_tools._items["t1"][1][name]
+            assert exec_spec["extra_headers"] == {"operatorid": "t1"}
     finally:
         await engine.dispose()
 

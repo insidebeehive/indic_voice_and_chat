@@ -151,3 +151,22 @@ Edge case (handled deliberately, not silently): if a tool's
 `X-API-Key` from `token`) *and* the new `x_api_key` is also configured, the
 dedicated `x_api_key` field wins — it's the more specific, newer mechanism.
 See `src/chatbot/tool_executor.py::execute_crm_tool`.
+
+## Addendum (2026-07-23): the platform-fallback branch never sent `operatorid` at all
+
+Found while investigating the same 401s: `resolve_crm_tools()`'s
+platform-catalog-fallback branch hardcoded `"extra_headers": None` for every
+resolved tool, so it never sent an `operatorid` header — only the
+tenant-registered-tools branch (`chat_tools` DB rows registered via
+`/chat/tools/from-catalog`) ever carried it, via
+`auth_config["extra_headers"] = {"operatorid": req.operator_id}`. Any tenant
+served by the platform fallback (no `chat_tools` rows) has never had this
+header sent, a likely contributor to the live 401s.
+
+Fix: the platform-fallback branch now computes `operator_id` the same way the
+`crm_executor` closure in `make_chatbot_factory` already does —
+`getattr(tenant.settings.crm, "operator_id", None) or tenant.id` — and sets
+`extra_headers = {"operatorid": operator_id}` for every tool in that branch,
+replacing the hardcoded `None`. The tenant-registered-tools branch is
+untouched. See `src/bootstrap.py::resolve_crm_tools`, covered by
+`tests/unit/test_crm_tools_platform_fallback.py`.

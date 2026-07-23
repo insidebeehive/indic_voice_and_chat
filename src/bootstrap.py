@@ -319,6 +319,14 @@ async def resolve_crm_tools(
     # its own crm:api_token secret.
     api_token = sr.get("crm:api_token")
     auth_type = sr.get("crm:auth_type") or os.environ.get("PLATFORM_CRM_AUTH_TYPE") or "api_key"
+    # Same operator_id resolution as the crm_executor closure in
+    # make_chatbot_factory below: the CRM's operator identifier for this
+    # tenant, falling back to the tenant's own id. Every platform-fallback
+    # tool must carry this as the "operatorid" header — previously hardcoded
+    # to None here, so the platform-fallback path never sent it at all (only
+    # the tenant-registered chat_tools branch did, via auth_config).
+    operator_id = getattr(tenant.settings.crm, "operator_id", None) or tenant.id
+    extra_headers = {"operatorid": operator_id}
     for name, spec in ALL_TOOLS.items():
         endpoint = base_url + spec["default_path"]
         specs.append(ToolSpec(
@@ -327,7 +335,8 @@ async def resolve_crm_tools(
         execs[name] = {
             "endpoint": endpoint, "method": spec.get("method", "GET"),
             "parameters": spec["parameters"], "auth_type": auth_type,
-            "token": api_token, "x_api_key": x_api_key, "extra_headers": None,
+            "token": api_token, "x_api_key": x_api_key,
+            "extra_headers": extra_headers,
         }
     return specs, execs, "platform_fallback"
 
