@@ -306,7 +306,13 @@ async def resolve_crm_tools(
     if not base_url:
         return [], {}, "none"
 
-    api_token = sr.get("crm:api_token") or os.environ.get("PLATFORM_CRM_API_TOKEN")
+    # No PLATFORM_CRM_API_TOKEN fallback: this CRM authorizes by the token
+    # itself (not a request parameter like operator_id), so a shared
+    # platform-level token would let every tenant's chat sessions act with
+    # whichever single tenant that token belongs to — a cross-tenant CRM
+    # access issue. Every tenant using the platform catalog must configure
+    # its own crm:api_token secret.
+    api_token = sr.get("crm:api_token")
     auth_type = sr.get("crm:auth_type") or os.environ.get("PLATFORM_CRM_AUTH_TYPE") or "api_key"
     for name, spec in ALL_TOOLS.items():
         endpoint = base_url + spec["default_path"]

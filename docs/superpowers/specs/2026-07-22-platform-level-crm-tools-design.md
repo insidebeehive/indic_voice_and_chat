@@ -98,3 +98,30 @@ follow-up step for the user/ops, not part of this code change.
   not chosen) — not needed given the single-shared-token decision.
 - A DB-backed platform secrets table — env vars are consistent with how every
   other platform-level credential in this codebase works.
+
+## Correction (same day)
+
+The shared `PLATFORM_CRM_API_TOKEN` fallback described above was removed the
+same day it shipped, after the product owner (who has direct knowledge of the
+CRM's actual auth model — not something inferrable from this codebase alone)
+flagged it: this platform's downstream CRM authorizes access **by the API
+token itself**, not by a request parameter such as `operator_id`/`user_id`.
+That means a single shared platform-level token would let *every* tenant's
+chat sessions make CRM calls authorized as whichever one tenant that token
+actually belongs to — a real cross-tenant data access issue, not just an
+inconvenience.
+
+`PLATFORM_CRM_BASE_URL` and `PLATFORM_CRM_AUTH_TYPE` remain shared/platform-level
+fallbacks — those carry no tenant-isolation implication (they only answer
+"which URL" and "which auth scheme", never "authorized as whom"). Only the
+`api_token` fallback was removed.
+
+Net effect: `resolve_crm_tools()` now resolves `api_token` solely from the
+tenant's own `crm:api_token` secret (`sr.get("crm:api_token")`), with no
+environment-variable fallback. Every tenant using the platform tool catalog
+must have its own genuine `crm:api_token` secret configured (existing
+backoffice CRM tab → `PATCH /tenants/{id}`) — there is no shared-token
+fallback for auth, and there must never be one again. A tenant with no
+`crm:api_token` secret still gets the full catalog back (base_url + auth_type
+still resolve), but every tool's `token` is `None` until that tenant
+configures its own secret.

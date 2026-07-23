@@ -96,7 +96,10 @@ async def test_tenant_registered_tools_reported_as_source_tenant(ctx) -> None:
     assert t["token_configured"] is True
 
 
-async def test_platform_fallback_with_token_configured(ctx, monkeypatch) -> None:
+async def test_platform_fallback_ignores_configured_platform_token(ctx, monkeypatch) -> None:
+    # The shared PLATFORM_CRM_API_TOKEN must never be used for auth, even
+    # though it's configured in the environment — this CRM authorizes by the
+    # token itself, so a shared token would grant cross-tenant CRM access.
     client, _sm = ctx
     monkeypatch.setenv("PLATFORM_CRM_BASE_URL", "https://platform-crm.example.com")
     monkeypatch.setenv("PLATFORM_CRM_API_TOKEN", "platform-token-abc")
@@ -107,7 +110,7 @@ async def test_platform_fallback_with_token_configured(ctx, monkeypatch) -> None
     assert body["source"] == "platform_fallback"
     assert len(body["tools"]) == len(ALL_TOOLS)
     assert {t["name"] for t in body["tools"]} == set(ALL_TOOLS)
-    assert all(t["token_configured"] is True for t in body["tools"])
+    assert all(t["token_configured"] is False for t in body["tools"])
 
 
 async def test_platform_fallback_without_token_reports_not_configured(ctx, monkeypatch) -> None:

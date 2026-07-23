@@ -49,9 +49,14 @@ def _clean_platform_env(monkeypatch) -> None:
     monkeypatch.delenv("PLATFORM_CRM_AUTH_TYPE", raising=False)
 
 
-async def test_platform_fallback_used_when_no_tenant_secrets(monkeypatch) -> None:
-    # Scenario 1: no chat_tools rows, no crm:* secrets, platform base_url +
-    # token set via env -> full 18-tool catalog, every exec token == platform token.
+async def test_platform_token_ignored_even_when_configured(monkeypatch) -> None:
+    # Scenario 1 (corrected): no chat_tools rows, no crm:* secrets, platform
+    # base_url set via env -> full 18-tool catalog is still returned, but the
+    # shared PLATFORM_CRM_API_TOKEN must NEVER be used as the resolved token,
+    # even though it is present in the environment. This platform's CRM
+    # authorizes by the token itself (not a request parameter), so a shared
+    # token would let every tenant's session act with one tenant's CRM
+    # authorization — a real cross-tenant access issue.
     _clean_platform_env(monkeypatch)
     monkeypatch.setenv("PLATFORM_CRM_BASE_URL", "https://platform-crm.example.com")
     monkeypatch.setenv("PLATFORM_CRM_API_TOKEN", "platform-token-abc")
@@ -69,7 +74,7 @@ async def test_platform_fallback_used_when_no_tenant_secrets(monkeypatch) -> Non
         assert agent._crm_tools  # non-empty sanity check
         for name in ALL_TOOLS:
             exec_spec = registry.crm_tools._items["t1"][1][name]
-            assert exec_spec["token"] == "platform-token-abc"
+            assert exec_spec["token"] is None
     finally:
         await engine.dispose()
 
