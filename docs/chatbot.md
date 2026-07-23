@@ -47,8 +47,30 @@ Sessions & conversation:
 
 Knowledge base:
 - `POST /knowledge/ingest` (multipart: pdf/docx/txt/md/csv) → parse → chunk →
-  embed → per-tenant FAISS; row in `kb_documents`.
+  embed → per-tenant store; row in `kb_documents`. Unchanged by the CRM-level
+  KB work below — same table, same fields, same behavior.
 - `GET/DELETE /knowledge/documents[/{id}]`, `POST /knowledge/query` (debug), `GET /knowledge/stats`.
+- **CRM-level KB (shared docs, admin-managed):** a `Crm` can also hold its own
+  shared knowledge base — `CrmKBDocument` rows, scoped by `crm_id` (required,
+  not nullable) — managed on the CRM sub-resource:
+  `POST/GET /api/v1/crms/{crm_id}/kb/ingest|documents`,
+  `DELETE /api/v1/crms/{crm_id}/kb/documents/{id}`,
+  `GET /api/v1/crms/{crm_id}/kb/documents/{id}/download`. Admin-only
+  (`require_admin`), 404 on an unknown `crm_id` — same shape as the `Crm`
+  CRUD API. These replace the old flat, fully-global `POST
+  /knowledge/platform-ingest` / `GET|DELETE /knowledge/platform-documents[/{id}]`
+  endpoints, which are gone.
+- **Retrieval is always mixed, not tenant-wins-outright:** for every chat/voice
+  turn a tenant's own `KBDocument` chunks AND its linked CRM's `CrmKBDocument`
+  chunks are BOTH searched and the results merged by relevance score — this is
+  a deliberate difference from the CRM-tools precedence below, where the
+  tenant's own tools win outright over the CRM catalog. KB is additive
+  (tenant docs *and* shared CRM/company docs together are useful at once);
+  tools are substitutive (a tool implementation is either the tenant's own or
+  the CRM default, not both). A tenant with no linked CRM (`crm_id is None`)
+  simply gets tenant-docs-only results — never an error, same graceful
+  degradation as `resolve_crm_tools()`. `GET /knowledge/stats` reflects both
+  scopes for a CRM-linked tenant.
 
 CRM tools:
 - `POST /chat/tools` — register endpoints the bot may call (`name`, `endpoint`,
@@ -120,7 +142,10 @@ CRM-tool tokens are per-tenant (encrypted).
 
 `chat_sessions`, `chat_messages` (Alembic `0004`); `chat_tools` (`0005`);
 `kb_documents` (`0001`); `crms`/`crm_tools` + `tenants.crm_id` (`0009`, the
-shared CRM-catalog entity described above). Run `alembic upgrade head`.
+shared CRM-catalog entity described above); `crm_kb_documents` +
+`knowledge_chunks.crm_id` (`0010`, the shared CRM-level KB described above —
+renamed/backfilled from the old fully-global `platform_kb_documents`
+table added in `0006`). Run `alembic upgrade head`.
 
 ## End-to-end test (local)
 

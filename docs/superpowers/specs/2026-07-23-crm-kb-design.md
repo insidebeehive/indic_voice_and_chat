@@ -211,3 +211,31 @@ non-tenant docs to also search" changes, per the section above.
   *deleted* `KBDocument`/`PlatformKBDocument` (orphaned chunks, if any
   exist) — out of scope; this migration only touches rows reachable from
   a live document row.
+
+## Implemented (2026-07-23)
+
+Built per the plan at `docs/superpowers/plans/2026-07-23-crm-kb.md` (9 tasks,
+all complete, reviewed clean). `CrmKBDocument` (`src/models/crm.py`) replaces
+`PlatformKBDocument`; the per-CRM retriever cache replaces
+`build_platform_retriever()`; the CRM-scoped admin API
+(`POST/GET/DELETE /api/v1/crms/{crm_id}/kb/*`) replaces the old flat
+`/knowledge/platform-*` routes; the backoffice CRM page gained a KB section
+and the tenant KB tab gained a read-only "Active CRM docs" list.
+`docs/chatbot.md`'s "Knowledge base" section documents the shipped mechanism.
+
+The migration (`alembic/versions/0010_crm_kb_documents.py`) has been reviewed
+and committed but has **not** yet been applied to any real database — unlike
+the CRM-entity migration (`0009`) above, there is no live-Neon-DB
+verification for this plan yet. Task 2's report confirms it was checked
+structurally only (migration logic + a direct-against-a-test-DB fail-loud
+assertion), not run against `stage`'s actual Neon database. Applying it and
+confirming `GET /api/v1/knowledge/stats` / `GET
+/api/v1/crms/{crm_id}/kb/documents` against real data remains a pending
+manual step (see the plan's "Final verification" section).
+
+What HAS been verified: the full backend is built, and the bare
+`.venv/bin/python -m pytest tests/unit -q` run (no flags needed) is fully
+green at `24 failed, 1100 passed, 1 skipped, 22 errors` — exactly reconciled
+against the pre-plan baseline (`24 failed, 1093 passed, 22 errors` at commit
+`1dd988d`, before this plan's Task 1): only new tests were added across all
+9 tasks, zero regressions, zero new failures.
