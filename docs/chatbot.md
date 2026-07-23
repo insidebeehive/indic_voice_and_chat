@@ -70,7 +70,13 @@ Knowledge base:
   the CRM default, not both). A tenant with no linked CRM (`crm_id is None`)
   simply gets tenant-docs-only results — never an error, same graceful
   degradation as `resolve_crm_tools()`. `GET /knowledge/stats` reflects both
-  scopes for a CRM-linked tenant.
+  scopes for a CRM-linked tenant. Note: the *voicebot's* one-shot boot-time
+  KB context (built once per call via `_build_kb_context`, used by every
+  telephony/browser/S2S bridge factory) is CRM-scoped only — it never mixes
+  in the tenant's own docs, a faithful carry-over of the prior platform-only
+  behavior. The tenant+CRM merge described above applies to the chat agent's
+  per-turn retrieval (`ChatBotAgent`, `/knowledge/query`), not this one-shot
+  voice path.
 
 CRM tools:
 - `POST /chat/tools` — register endpoints the bot may call (`name`, `endpoint`,
