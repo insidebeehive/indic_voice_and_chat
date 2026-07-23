@@ -172,3 +172,47 @@ def test_query_when_retriever_unset_returns_503(tmp_faiss_index: str) -> None:
     resp = client.post("/knowledge/query", json={"query": "x"}, headers=HEADERS)
     assert resp.status_code == 503
     set_tenant_resolver(None)
+
+
+def test_query_mixes_tenant_and_linked_crm_docs(app: FastAPI) -> None:
+    from src.api import knowledge
+    from src.providers.vector_store.faiss_store import FAISSAdapter
+    from src.rag.embeddings import HashEmbedder, IdentityReranker
+    from src.rag.retriever import HybridRetriever, RetrievalConfig
+
+    crm_store = FAISSAdapter({"embedding_dim": 64, "index_path": "/tmp/crm_kb_test_index"})
+    crm_retriever = HybridRetriever(
+        embedder=HashEmbedder(dim=64), vector_store=crm_store,
+        reranker=IdentityReranker(),
+        config=RetrievalConfig(strategy="hybrid", top_k=3, oversample_k=8),
+    )
+    import asyncio
+    asyncio.get_event_loop().run_until_complete(crm_retriever.index([
+        __import__("src.interfaces.vector_store", fromlist=["Document"]).Document(
+            id="crm-chunk-1", content="CRM-level policy: refunds within 30 days.",
+            metadata={}),
+    ]))
+
+    class _FakeRegistry:
+        def get(self, crm_id: str):
+            return crm_retriever if crm_id == "betstudio" else None
+
+    knowledge.set_crm_retrievers(_FakeRegistry())
+    try:
+        from src.auth import register_tenant_for_test
+        from src.config_tenant import TenantSettings
+        register_tenant_for_test(
+            TenantSettings(id="t1", slug="t1", name="T1", crm_id="betstudio"),
+            plaintext_tokens=["test-token"],
+        )
+        client = TestClient(app)
+        resp = client.post(
+            "/knowledge/query",
+            json={"query": "refund policy", "top_k": 5},
+            headers=HEADERS,
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert any("refund" in h["content"].lower() for h in body["hits"])
+    finally:
+        knowledge.set_crm_retrievers(None)

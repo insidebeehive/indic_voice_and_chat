@@ -43,6 +43,7 @@ from sqlalchemy import text
 from src.api import (
     api_router,
     chat as chat_api,
+    crm_kb as crm_kb_api,
     external_chat as ext_chat_api,
     knowledge as knowledge_api,
     telephony_hooks,
@@ -425,7 +426,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Knowledge ingest/query resolve the SAME per-tenant retriever the chatbot
     # uses (registry.retrievers), so ingested docs are retrievable in chat.
     knowledge_api.set_retriever_factory(lambda t: runtime_registry.retrievers.get(t))
-    knowledge_api.set_platform_retriever(platform_retriever)
+    knowledge_api.set_crm_retrievers(crm_retrievers)
+    crm_kb_api.set_crm_retrievers(crm_retrievers)
     app.state.providers = providers
 
     reaper_task = asyncio.create_task(_reap_stale_calls_loop())
@@ -447,7 +449,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         chat_api.set_media_store(None)
         ext_chat_api.set_ext_redis(None)
         knowledge_api.set_retriever_factory(None)
-        knowledge_api.set_platform_retriever(None)
+        knowledge_api.set_crm_retrievers(None)
+        crm_kb_api.set_crm_retrievers(None)
         set_browser_bridge_factory(None)
         set_call_outcome_persister(None)
         set_tenant_event_notifier(None)

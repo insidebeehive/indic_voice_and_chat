@@ -19,7 +19,7 @@ import uuid
 from pathlib import Path
 from typing import Callable, Optional
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 from sqlalchemy import select
@@ -27,9 +27,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import get_db_session
 from src.auth import TenantContext, current_tenant
-from src.auth.middleware import require_admin
 from src.interfaces.vector_store import Document
-from src.models.benchmark import KBDocument, PlatformKBDocument
+from src.models.benchmark import KBDocument
 from src.rag.context_builder import search_combined
 from src.rag.ingestion import ChunkConfig, detect_language, get_chunker, parse_document
 from src.rag.retriever import HybridRetriever
@@ -42,10 +41,11 @@ router = APIRouter(prefix="/knowledge", tags=["knowledge"])
 
 
 # A factory that returns the TENANT retriever (for ingest + tenant-specific search).
-# A separate platform retriever holds the global KB shared across all tenants.
+# The tenant's linked CRM's retriever (if any) is resolved separately per-request
+# from the per-CRM registry, via tenant.settings.crm_id.
 RetrieverFactory = Callable[[TenantContext], HybridRetriever]
 _retriever_factory: Optional[RetrieverFactory] = None
-_platform_retriever: Optional[HybridRetriever] = None
+_crm_retrievers: "object | None" = None  # src.bootstrap.PerCrmRetrieverRegistry
 _chunk_config: ChunkConfig = ChunkConfig()
 
 
@@ -58,10 +58,11 @@ def set_retriever_factory(
         _chunk_config = chunk_config
 
 
-def set_platform_retriever(retriever: Optional[HybridRetriever]) -> None:
-    """Set the platform-level shared retriever (global KB, all tenants)."""
-    global _platform_retriever
-    _platform_retriever = retriever
+def set_crm_retrievers(registry) -> None:
+    """Inject the per-CRM retriever registry (typed loosely to avoid an
+    import cycle with src.bootstrap)."""
+    global _crm_retrievers
+    _crm_retrievers = registry
 
 
 def set_retriever(
@@ -81,9 +82,18 @@ def _retriever_for(tenant: TenantContext) -> HybridRetriever:
     return _retriever_factory(tenant)
 
 
+def _crm_retriever_for(tenant: TenantContext) -> Optional[HybridRetriever]:
+    if _crm_retrievers is None:
+        return None
+    crm_id = getattr(tenant.settings, "crm_id", None)
+    if not crm_id:
+        return None
+    return _crm_retrievers.get(crm_id)
+
+
 def _active_retrievers(tenant: TenantContext) -> list[HybridRetriever]:
-    """Platform retriever + tenant retriever, skipping None."""
-    return [r for r in [_platform_retriever, _retriever_for(tenant)] if r is not None]
+    """The tenant's linked CRM's retriever + the tenant's own retriever, skipping None."""
+    return [r for r in [_crm_retriever_for(tenant), _retriever_for(tenant)] if r is not None]
 
 
 # --- Schemas ------------------------------------------------------------
@@ -260,127 +270,15 @@ async def download_document(
                     headers={"Content-Disposition": f'attachment; filename="{filename}"'})
 
 
-@router.get("/platform-documents/{document_id}/download")
-async def download_platform_document(
-    document_id: str,
-    request: Request,
-    session: AsyncSession = Depends(get_db_session),
-) -> Response:
-    """Admin: download a platform KB document as reconstructed text."""
-    await require_admin(request)
-    if _platform_retriever is None:
-        raise HTTPException(status_code=503, detail="platform retriever not initialised")
-    row = await session.get(PlatformKBDocument, document_id)
-    if row is None:
-        raise HTTPException(status_code=404, detail="platform document not found")
-    text = _chunks_for_doc(_platform_retriever, document_id)
-    filename = (row.filename or document_id).rsplit(".", 1)[0] + ".txt"
-    return Response(content=text, media_type="text/plain; charset=utf-8",
-                    headers={"Content-Disposition": f'attachment; filename="{filename}"'})
-
-
-@router.get("/platform-documents", response_model=DocumentsResponse)
-async def list_platform_documents(
-    request: Request,
-    session: AsyncSession = Depends(get_db_session),
-) -> DocumentsResponse:
-    """Admin: list all documents in the platform (global) knowledge base."""
-    await require_admin(request)
-    rows = (await session.execute(
-        select(PlatformKBDocument).order_by(PlatformKBDocument.ingested_at.desc())
-    )).scalars().all()
-    items = [
-        DocumentInfo(id=r.id, filename=r.filename or r.id,
-                     language=r.language, chunk_count=r.chunk_count or 0)
-        for r in rows
-    ]
-    return DocumentsResponse(documents=items, total=len(items))
-
-
-@router.post("/platform-ingest", response_model=IngestResponse)
-async def platform_ingest_document(
-    request: Request,
-    file: UploadFile = File(...),
-    document_id: Optional[str] = Form(None),
-    session: AsyncSession = Depends(get_db_session),
-) -> IngestResponse:
-    """Admin: upload a document into the platform (global) knowledge base."""
-    await require_admin(request)
-    if _platform_retriever is None:
-        raise HTTPException(status_code=503, detail="platform retriever not initialised")
-    data = await file.read()
-    if not data:
-        raise HTTPException(status_code=400, detail="empty upload")
-    text = parse_document(file.filename or "uploaded", data)
-    if not text.strip():
-        raise HTTPException(status_code=400, detail="document parsed to empty text")
-
-    doc_id = document_id or f"platform_{_new_id()}"
-    language = detect_language(text)
-    chunker = get_chunker(_chunk_config)
-    raw_chunks = chunker(text, {
-        "filename": file.filename,
-        "document_id": doc_id,
-        "language": language,
-    })
-    if not raw_chunks:
-        raise HTTPException(status_code=400, detail="no chunks produced")
-
-    docs = [
-        Document(
-            id=f"{doc_id}::chunk-{c.index}",
-            content=c.text,
-            metadata={**c.metadata, "section": c.index, "page": c.index},
-        )
-        for c in raw_chunks
-    ]
-    indexed = await _platform_retriever.index(docs)
-    session.add(PlatformKBDocument(
-        id=doc_id,
-        filename=file.filename or doc_id,
-        source_type=(Path(file.filename).suffix.lstrip(".").lower() if file.filename else None),
-        language=language,
-        chunk_count=indexed,
-        extra_data={"chunk_ids": [d.id for d in docs]},
-    ))
-    await session.commit()
-    log.info("platform: ingested document", extra={"document_id": doc_id, "chunks": indexed})
-    return IngestResponse(document_id=doc_id, filename=file.filename or "",
-                          chunks_indexed=indexed, language=language)
-
-
-@router.delete("/platform-documents/{document_id}")
-async def delete_platform_document(
-    document_id: str,
-    request: Request,
-    session: AsyncSession = Depends(get_db_session),
-) -> dict:
-    """Admin: delete a document from the platform (global) knowledge base."""
-    await require_admin(request)
-    if _platform_retriever is None:
-        raise HTTPException(status_code=503, detail="platform retriever not initialised")
-    row = await session.get(PlatformKBDocument, document_id)
-    if row is None:
-        raise HTTPException(status_code=404, detail="platform document not found")
-    chunk_ids = (row.extra_data or {}).get("chunk_ids") or [
-        f"{document_id}::chunk-{i}" for i in range(row.chunk_count or 0)]
-    await session.delete(row)
-    await session.commit()
-    n = await _platform_retriever.delete(chunk_ids)
-    return {"document_id": document_id, "chunks_removed": n}
-
-
 @router.post("/query", response_model=QueryResponse)
 async def query(
     req: QueryRequest, tenant: TenantContext = Depends(current_tenant),
 ) -> QueryResponse:
     retrievers = _active_retrievers(tenant)
-    # Tenant-specific retriever is filtered to tenant_id; platform retriever is
-    # unfiltered (platform docs have no tenant_id). Pass tenant filter only to the
-    # tenant retriever via search_combined's per-retriever filter support is not yet
-    # implemented — instead, platform docs are naturally unscoped (no tenant_id in
-    # metadata) and FAISS has no FK, so cross-tenant leakage via the platform index
-    # is fine (it only holds shared global docs).
+    # Tenant-specific retriever is filtered to tenant_id; the linked CRM's retriever
+    # is scoped to that crm_id (see PerCrmRetrieverRegistry / CrmKBDocument.crm_id) so
+    # it only ever holds docs for tenants sharing the same CRM — no cross-tenant
+    # leakage across unrelated CRMs.
     results = await search_combined(req.query, retrievers, top_k=req.top_k)
     hits = [
         QueryHit(
@@ -402,13 +300,18 @@ async def stats(
     tenant: TenantContext = Depends(current_tenant),
     session: AsyncSession = Depends(get_db_session),
 ) -> StatsResponse:
+    from src.models.crm import CrmKBDocument
+
     tenant_rows = (await session.execute(
         select(KBDocument).where(KBDocument.tenant_id == tenant.id)
     )).scalars().all()
-    platform_rows = (await session.execute(
-        select(PlatformKBDocument)
-    )).scalars().all()
-    all_rows = tenant_rows + platform_rows
+    crm_id = getattr(tenant.settings, "crm_id", None)
+    crm_rows = []
+    if crm_id:
+        crm_rows = (await session.execute(
+            select(CrmKBDocument).where(CrmKBDocument.crm_id == crm_id)
+        )).scalars().all()
+    all_rows = tenant_rows + crm_rows
     return StatsResponse(
         document_count=len(all_rows),
         chunk_count=sum(r.chunk_count or 0 for r in all_rows),

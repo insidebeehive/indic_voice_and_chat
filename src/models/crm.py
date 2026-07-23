@@ -63,7 +63,7 @@ class CrmTool(Base):
 
 class CrmKBDocument(Base):
     """CRM-level KB documents shared across every tenant registered against
-    that CRM (replaces the old platform-wide, unscoped ``PlatformKBDocument``).
+    that CRM (replaces the old platform-wide, unscoped global KB table).
     """
 
     __tablename__ = "crm_kb_documents"
