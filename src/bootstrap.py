@@ -584,10 +584,10 @@ def _build_s2s_telephony_bridge(
         transfer_webhook_secret=_wh_secret)
 
 
-def _build_kb_context(platform_retriever, tenant_retriever) -> str:
-    """Build a static KB context string from platform + tenant retrievers for voicebot."""
+def _build_kb_context(crm_retriever, tenant_retriever) -> str:
+    """Build a static KB context string from the CRM + tenant retrievers for voicebot."""
     from src.rag.context_builder import build_voicebot_kb_context
-    retrievers = [r for r in [platform_retriever, tenant_retriever] if r is not None]
+    retrievers = [r for r in [crm_retriever, tenant_retriever] if r is not None]
     return build_voicebot_kb_context(retrievers)
 
 
