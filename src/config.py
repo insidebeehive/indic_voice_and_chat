@@ -272,14 +272,6 @@ class Secrets(BaseSettings):
     TWILIO_AUTH_TOKEN: Optional[str] = None
     EXOTEL_API_KEY: Optional[str] = None
     EXOTEL_API_TOKEN: Optional[str] = None
-    # Platform-level CRM auth fallback — src/bootstrap.py's
-    # _load_crm_tools_uncached() reads these via raw os.environ.get(...);
-    # declared here for auditability only, same convention as above.
-    # NOTE: no PLATFORM_CRM_API_TOKEN — this CRM authorizes by the token
-    # itself, so a shared token would grant cross-tenant CRM access; every
-    # tenant must configure its own crm:api_token secret instead.
-    PLATFORM_CRM_BASE_URL: Optional[str] = None
-    PLATFORM_CRM_AUTH_TYPE: Optional[str] = None
 
     # Infra overrides
     DATABASE_URL: Optional[str] = None
