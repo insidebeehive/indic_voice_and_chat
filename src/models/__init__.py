@@ -4,6 +4,7 @@ from src.models.benchmark import BenchmarkRun, KBDocument, PlatformKBDocument
 from src.models.campaign import Campaign, Lead
 from src.models.chat import ChatMessage, ChatSession, ChatTool
 from src.models.conversation import Conversation, Event, Turn
+from src.models.crm import Crm, CrmTool
 from src.models.database import Base, get_engine, get_sessionmaker
 from src.models.tenant import (
     ProviderCost,
@@ -21,6 +22,8 @@ __all__ = [
     "ChatSession",
     "ChatTool",
     "Conversation",
+    "Crm",
+    "CrmTool",
     "Event",
     "KBDocument",
     "PlatformKBDocument",

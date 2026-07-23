@@ -43,6 +43,9 @@ class Tenant(Base):
     # Full TenantPipelineConfig minus secrets (provider/model/voice/language/
     # from_number/webhook_base_url/outbound_from). Reconstructs a TenantSettings.
     pipeline_config: Mapped[dict] = mapped_column(JSON, default=dict)
+    crm_id: Mapped[Optional[str]] = mapped_column(
+        String(50), ForeignKey("crms.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=False), server_default=func.now()
     )
