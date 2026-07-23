@@ -463,9 +463,10 @@ async function loadCRM(id, slug) {
 // --- Chat tab ------------------------------------------------------------
 
 async function loadChat(id, slug) {
-  const [tr, cr] = await Promise.all([
+  const [tr, cr, rr] = await Promise.all([
     apiTenant("GET", "/api/v1/chat/tools", null, slug),
     apiSend("GET", `/api/v1/tenants/${id}/chat-config`),
+    apiTenant("GET", "/api/v1/chat/tools/resolved", null, slug),
   ]);
   const tools = tr.ok ? (tr.json.tools || []) : [];
   const cfg   = cr.ok ? cr.json : {};
@@ -481,7 +482,35 @@ async function loadChat(id, slug) {
       </tr>`).join("")
     : `<tr><td colspan="5" class="hint">No tools registered yet.</td></tr>`;
 
+  const resolved = rr.ok ? rr.json : null;
+  const resolvedTools = resolved ? (resolved.tools || []) : [];
+  const resolvedSource = resolved ? resolved.source : null;
+
+  const resolvedHint = !resolved
+    ? "Could not load active tools."
+    : resolvedSource === "tenant"
+      ? "Using this tenant's own registered tools (below)."
+      : resolvedSource === "platform_fallback"
+        ? "Using the platform catalog — no tenant-specific tools registered."
+        : "No tools active — no tenant registration and no platform fallback configured (set PLATFORM_CRM_BASE_URL, or configure this tenant's own CRM credentials in the CRM tab).";
+
+  const resolvedRows = resolvedTools.length
+    ? resolvedTools.map(t => `<tr>
+        <td>${escT(t.name)}</td>
+        <td style="max-width:22rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escAttr(t.endpoint)}">${escT(t.endpoint)}</td>
+        <td>${escT(t.auth_type || "—")}</td>
+        <td>${t.token_configured ? "✓" : "—"}</td>
+      </tr>`).join("")
+    : `<tr><td colspan="4" class="hint">No tools active.</td></tr>`;
+
   $("pane_chat").innerHTML = `
+    <h2>Active tools <small class="hint">(what this tenant actually gets right now)</small></h2>
+    <div class="hint" style="margin-bottom:.4rem;">${escT(resolvedHint)}</div>
+    <table style="margin-bottom:1.2rem;">
+      <thead><tr><th>Name</th><th>Endpoint</th><th>Auth type</th><th>Token configured</th></tr></thead>
+      <tbody id="ch_resolved_rows">${resolvedRows}</tbody>
+    </table>
+
     <h2>Registered tools <small class="hint">(per-tenant overrides)</small></h2>
     <div class="hint" style="margin-bottom:.4rem;">Platform catalog tools are used automatically. Tools here override or extend the catalog.</div>
     <table style="margin-bottom:.8rem;">
