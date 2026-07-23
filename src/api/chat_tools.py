@@ -83,7 +83,7 @@ class ResolvedToolInfo(BaseModel):
 
 
 class ResolvedToolsResponse(BaseModel):
-    source: str  # "tenant" | "platform_fallback" | "none"
+    source: str  # "tenant" | "crm_catalog" | "none"
     tools: list[ResolvedToolInfo]
 
 

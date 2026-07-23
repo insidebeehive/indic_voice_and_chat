@@ -237,21 +237,19 @@ async def resolve_crm_tools(
 
     Priority:
     1. Tenant-specific tools registered in the chat_tools DB table.
-    2. Platform catalog (catalog.ALL_TOOLS) built from the tenant's
-       ``crm:*`` secrets + ``PLATFORM_CRM_BASE_URL`` env fallback — no
-       per-tenant DB registration required.
+    2. The catalog of the ``Crm`` entity this tenant is linked to
+       (``tenant.settings.crm_id`` -> ``Crm``/``CrmTool`` DB rows), using the
+       tenant's own ``crm:*`` secrets for auth — no per-tenant DB tool
+       registration required.
 
     Returns ``(tool_specs, {name: exec_spec}, source)`` where ``source`` is
-    one of: ``"tenant"`` (tenant-registered chat_tools rows), ``"platform_fallback"``
-    (catalog served via PLATFORM_CRM_* env vars or the tenant's own crm:*
-    secrets), or ``"none"`` (nothing resolved — no tools available at all).
+    one of: ``"tenant"`` (tenant-registered chat_tools rows), ``"crm_catalog"``
+    (the linked Crm's DB-backed tool catalog), or ``"none"`` (nothing
+    resolved — no tools available at all).
     """
-    import os
-
     from sqlalchemy import select
 
     from src.auth import secrets as crypto
-    from src.chatbot.catalog import ALL_TOOLS
     from src.interfaces.llm import ToolSpec
     from src.models.chat import ChatTool
     from src.models.tenant import TenantSecret
@@ -306,39 +304,46 @@ async def resolve_crm_tools(
     if specs:
         return specs, execs, "tenant"  # tenant-specific tools take precedence
 
-    # ── Platform catalog fallback ─────────────────────────────────────
-    base_url = (sr.get("crm:base_url") or os.environ.get("PLATFORM_CRM_BASE_URL", "")).rstrip("/")
-    if not base_url:
+    # ── CRM catalog (tenant linked to a Crm entity) ─────────────────────
+    crm_id = tenant.settings.crm_id
+    if not crm_id:
         return [], {}, "none"
 
-    # No PLATFORM_CRM_API_TOKEN fallback: this CRM authorizes by the token
-    # itself (not a request parameter like operator_id), so a shared
-    # platform-level token would let every tenant's chat sessions act with
-    # whichever single tenant that token belongs to — a cross-tenant CRM
-    # access issue. Every tenant using the platform catalog must configure
-    # its own crm:api_token secret.
+    from src.models.crm import Crm, CrmTool
+
+    async with sessionmaker() as db:
+        crm = await db.get(Crm, crm_id)
+        if crm is None:
+            return [], {}, "none"
+        crm_tool_rows = (await db.execute(
+            select(CrmTool).where(CrmTool.crm_id == crm_id)
+        )).scalars().all()
+
+    if not crm_tool_rows:
+        return [], {}, "none"
+
     api_token = sr.get("crm:api_token")
-    auth_type = sr.get("crm:auth_type") or os.environ.get("PLATFORM_CRM_AUTH_TYPE") or "api_key"
     # Same operator_id resolution as the crm_executor closure in
     # make_chatbot_factory below: the CRM's operator identifier for this
-    # tenant, falling back to the tenant's own id. Every platform-fallback
-    # tool must carry this as the "operatorid" header — previously hardcoded
-    # to None here, so the platform-fallback path never sent it at all (only
-    # the tenant-registered chat_tools branch did, via auth_config).
+    # tenant, falling back to the tenant's own id. Every crm-catalog tool
+    # must carry this as the "operatorid" header — previously hardcoded
+    # to None here, so the old platform-fallback path never sent it at all
+    # (only the tenant-registered chat_tools branch did, via auth_config).
     operator_id = getattr(tenant.settings.crm, "operator_id", None) or tenant.id
     extra_headers = {"operatorid": operator_id}
-    for name, spec in ALL_TOOLS.items():
-        endpoint = base_url + spec["default_path"]
+
+    for row in crm_tool_rows:
+        endpoint = crm.base_url.rstrip("/") + row.endpoint
         specs.append(ToolSpec(
-            name=name, description=spec["description"],
-            parameters=_crm_params_to_schema(spec["parameters"])))
-        execs[name] = {
-            "endpoint": endpoint, "method": spec.get("method", "GET"),
-            "parameters": spec["parameters"], "auth_type": auth_type,
+            name=row.name, description=row.description,
+            parameters=_crm_params_to_schema(row.parameters)))
+        execs[row.name] = {
+            "endpoint": endpoint, "method": row.method,
+            "parameters": row.parameters or {}, "auth_type": crm.auth_type,
             "token": api_token, "x_api_key": x_api_key,
             "extra_headers": extra_headers,
         }
-    return specs, execs, "platform_fallback"
+    return specs, execs, "crm_catalog"
 
 
 def make_chatbot_factory(registry, sessionmaker=None, platform_retriever=None):

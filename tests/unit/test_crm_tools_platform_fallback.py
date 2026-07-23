@@ -1,16 +1,24 @@
-"""Platform-level CRM auth fallback (src/bootstrap.py _load_crm_tools_uncached).
+"""Tier-2 CRM tool resolution (src/bootstrap.py resolve_crm_tools /
+_load_crm_tools_uncached).
 
-Covers the gap described in
-docs/superpowers/specs/2026-07-22-platform-level-crm-tools-design.md: the
-platform catalog fallback already supported PLATFORM_CRM_BASE_URL, but had no
-platform fallback for api_token/auth_type — any tenant without its own
-crm:api_token secret got zero tools. These tests pin the 4 spec scenarios.
+Originally covered the gap described in
+docs/superpowers/specs/2026-07-22-platform-level-crm-tools-design.md (the
+platform catalog fallback via PLATFORM_CRM_BASE_URL + catalog.ALL_TOOLS had no
+platform fallback for api_token/auth_type). That env-var-driven mechanism has
+since been replaced (docs/superpowers/plans/2026-07-23-crm-entity.md, Task 3)
+by a tenant's link to a DB-backed ``Crm``/``CrmTool`` catalog
+(``tenant.settings.crm_id``) — these tests now pin the same precedence/token/
+x_api_key/extra_headers scenarios against that mechanism instead. The legacy
+PLATFORM_CRM_* env vars are still asserted as inert/ignored where a test
+previously depended on them, so any accidental resurrection of the old
+env-var path would be caught here.
 """
 
 from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest_asyncio
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from src.auth import TenantContext
@@ -43,6 +51,37 @@ async def _make_sessionmaker(tenant_id: str = "t1"):
     return engine, sm
 
 
+async def _make_sessionmaker_with_crm(tenant_id: str = "t1", crm_id: str = "betstudio"):
+    """Same as ``_make_sessionmaker`` but also seeds a ``Crm`` + its full
+    ``CrmTool`` catalog — the tier-2 fixture for tests exercising a tenant
+    linked to a Crm entity via ``TenantSettings(crm_id=...)``."""
+    from src.models.crm import Crm, CrmTool
+
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:", future=True)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    sm = async_sessionmaker(engine, expire_on_commit=False)
+    async with sm() as s:
+        s.add(Tenant(id=tenant_id, slug=tenant_id, name="T1"))
+        s.add(Crm(id=crm_id, name="BetStudio",
+                   base_url="https://apistage.betstudio.io/api", auth_type="api_key"))
+        for name, spec in ALL_TOOLS.items():
+            s.add(CrmTool(crm_id=crm_id, name=name, description=spec["description"],
+                           endpoint=spec["default_path"], method=spec.get("method", "GET"),
+                           parameters=spec.get("parameters", {})))
+        await s.commit()
+    return engine, sm
+
+
+@pytest_asyncio.fixture
+async def sm_with_crm_seed():
+    """Sessionmaker-only fixture (no Tenant row) for tests that call
+    ``resolve_crm_tools`` directly with a hand-built ``TenantContext``."""
+    engine, sm = await _make_sessionmaker_with_crm()
+    yield sm
+    await engine.dispose()
+
+
 def _clean_platform_env(monkeypatch) -> None:
     monkeypatch.delenv("PLATFORM_CRM_BASE_URL", raising=False)
     monkeypatch.delenv("PLATFORM_CRM_API_TOKEN", raising=False)
@@ -50,23 +89,25 @@ def _clean_platform_env(monkeypatch) -> None:
 
 
 async def test_platform_token_ignored_even_when_configured(monkeypatch) -> None:
-    # Scenario 1 (corrected): no chat_tools rows, no crm:* secrets, platform
-    # base_url set via env -> full 18-tool catalog is still returned, but the
-    # shared PLATFORM_CRM_API_TOKEN must NEVER be used as the resolved token,
-    # even though it is present in the environment. This platform's CRM
-    # authorizes by the token itself (not a request parameter), so a shared
-    # token would let every tenant's session act with one tenant's CRM
-    # authorization — a real cross-tenant access issue.
+    # Scenario 1 (corrected): no chat_tools rows, no crm:* secrets, tenant
+    # linked to a Crm entity -> full 18-tool catalog is still returned, but
+    # the legacy shared PLATFORM_CRM_API_TOKEN env var must NEVER be used as
+    # the resolved token, even though it is present in the environment (it's
+    # not even read anymore — the crm_catalog branch only ever uses the
+    # tenant's own crm:api_token secret). This platform's CRM authorizes by
+    # the token itself (not a request parameter), so a shared token would let
+    # every tenant's session act with one tenant's CRM authorization — a real
+    # cross-tenant access issue.
     _clean_platform_env(monkeypatch)
     monkeypatch.setenv("PLATFORM_CRM_BASE_URL", "https://platform-crm.example.com")
     monkeypatch.setenv("PLATFORM_CRM_API_TOKEN", "platform-token-abc")
 
-    engine, sm = await _make_sessionmaker()
+    engine, sm = await _make_sessionmaker_with_crm()
     try:
         registry = _registry()
         factory = make_chatbot_factory(registry, sm)
         tenant = TenantContext(
-            settings=TenantSettings(id="t1", slug="t1", name="T1"),
+            settings=TenantSettings(id="t1", slug="t1", name="T1", crm_id="betstudio"),
             secrets_resolved={},
         )
         agent = await factory(tenant, "s1")
@@ -81,17 +122,18 @@ async def test_platform_token_ignored_even_when_configured(monkeypatch) -> None:
 
 async def test_tenant_own_token_wins_over_platform(monkeypatch) -> None:
     # Scenario 2: tenant has its own crm:api_token secret -> tenant token wins
-    # even though the platform token is also configured (existing precedence).
+    # even though the (now-inert) legacy platform token env var is also set
+    # (existing precedence).
     _clean_platform_env(monkeypatch)
     monkeypatch.setenv("PLATFORM_CRM_BASE_URL", "https://platform-crm.example.com")
     monkeypatch.setenv("PLATFORM_CRM_API_TOKEN", "platform-token-abc")
 
-    engine, sm = await _make_sessionmaker()
+    engine, sm = await _make_sessionmaker_with_crm()
     try:
         registry = _registry()
         factory = make_chatbot_factory(registry, sm)
         tenant = TenantContext(
-            settings=TenantSettings(id="t1", slug="t1", name="T1"),
+            settings=TenantSettings(id="t1", slug="t1", name="T1", crm_id="betstudio"),
             secrets_resolved={"crm:api_token": "tenant-own-token"},
         )
         agent = await factory(tenant, "s1")
@@ -145,16 +187,15 @@ async def test_tenant_registered_tools_take_precedence_over_platform_fallback(mo
 async def test_x_api_key_secret_populated_for_every_platform_catalog_tool(monkeypatch) -> None:
     # The new, independent crm:x_api_key secret is tenant-level (like
     # operator_id) and must be attached to every tool's exec spec in the
-    # platform-fallback branch, not just some.
+    # crm_catalog branch, not just some.
     _clean_platform_env(monkeypatch)
-    monkeypatch.setenv("PLATFORM_CRM_BASE_URL", "https://platform-crm.example.com")
 
-    engine, sm = await _make_sessionmaker()
+    engine, sm = await _make_sessionmaker_with_crm()
     try:
         registry = _registry()
         factory = make_chatbot_factory(registry, sm)
         tenant = TenantContext(
-            settings=TenantSettings(id="t1", slug="t1", name="T1"),
+            settings=TenantSettings(id="t1", slug="t1", name="T1", crm_id="betstudio"),
             secrets_resolved={"crm:x_api_key": "the-x-api-key"},
         )
         agent = await factory(tenant, "s1")
@@ -167,21 +208,20 @@ async def test_x_api_key_secret_populated_for_every_platform_catalog_tool(monkey
 
 
 async def test_extra_headers_carries_operator_id_from_tenant_crm_config(monkeypatch) -> None:
-    # Regression: the platform-fallback branch hardcoded extra_headers=None,
-    # so it NEVER sent the "operatorid" header the downstream CRM needs (only
-    # the tenant-registered-tools branch did, via chat_tools.auth_config).
-    # When the tenant has its own crm.operator_id configured, every
-    # platform-fallback tool's extra_headers must carry it.
+    # Regression: the platform-fallback branch used to hardcode
+    # extra_headers=None, so it NEVER sent the "operatorid" header the
+    # downstream CRM needs (only the tenant-registered-tools branch did, via
+    # chat_tools.auth_config). When the tenant has its own crm.operator_id
+    # configured, every crm_catalog tool's extra_headers must carry it.
     _clean_platform_env(monkeypatch)
-    monkeypatch.setenv("PLATFORM_CRM_BASE_URL", "https://platform-crm.example.com")
 
-    engine, sm = await _make_sessionmaker()
+    engine, sm = await _make_sessionmaker_with_crm()
     try:
         registry = _registry()
         factory = make_chatbot_factory(registry, sm)
         tenant = TenantContext(
             settings=TenantSettings(
-                id="t1", slug="t1", name="T1",
+                id="t1", slug="t1", name="T1", crm_id="betstudio",
                 crm=TenantCRMConfig(operator_id="operator-uuid-123")),
             secrets_resolved={},
         )
@@ -199,14 +239,13 @@ async def test_extra_headers_falls_back_to_tenant_id_when_no_operator_id_configu
     # case -> falls back to the tenant id, matching what crm_executor already
     # does elsewhere in this file.
     _clean_platform_env(monkeypatch)
-    monkeypatch.setenv("PLATFORM_CRM_BASE_URL", "https://platform-crm.example.com")
 
-    engine, sm = await _make_sessionmaker()
+    engine, sm = await _make_sessionmaker_with_crm()
     try:
         registry = _registry()
         factory = make_chatbot_factory(registry, sm)
         tenant = TenantContext(
-            settings=TenantSettings(id="t1", slug="t1", name="T1"),
+            settings=TenantSettings(id="t1", slug="t1", name="T1", crm_id="betstudio"),
             secrets_resolved={},
         )
         agent = await factory(tenant, "s1")
@@ -220,19 +259,17 @@ async def test_extra_headers_falls_back_to_tenant_id_when_no_operator_id_configu
 
 async def test_no_platform_token_and_no_tenant_secret_gives_none_token(monkeypatch) -> None:
     # Scenario 4: nothing configured at all (no chat_tools rows, no crm:*
-    # secrets, no PLATFORM_CRM_API_TOKEN) but PLATFORM_CRM_BASE_URL is set (so
-    # the fallback activates and returns tools) -> token is None, matching
-    # today's existing "nothing configured" behavior, just now distinguished
-    # from "platform token configured".
+    # secrets) but the tenant is linked to a Crm entity (so the crm_catalog
+    # branch activates and returns tools) -> token is None, matching today's
+    # existing "nothing configured" behavior.
     _clean_platform_env(monkeypatch)
-    monkeypatch.setenv("PLATFORM_CRM_BASE_URL", "https://platform-crm.example.com")
 
-    engine, sm = await _make_sessionmaker()
+    engine, sm = await _make_sessionmaker_with_crm()
     try:
         registry = _registry()
         factory = make_chatbot_factory(registry, sm)
         tenant = TenantContext(
-            settings=TenantSettings(id="t1", slug="t1", name="T1"),
+            settings=TenantSettings(id="t1", slug="t1", name="T1", crm_id="betstudio"),
             secrets_resolved={},
         )
         agent = await factory(tenant, "s1")
@@ -242,3 +279,39 @@ async def test_no_platform_token_and_no_tenant_secret_gives_none_token(monkeypat
         assert exec_spec["token"] is None
     finally:
         await engine.dispose()
+
+
+async def test_crm_linked_tenant_gets_crm_catalog_tools(sm_with_crm_seed) -> None:
+    """A tenant with tenant.crm_id set gets that CRM's DB-backed tool catalog,
+    using the CRM's base_url/auth_type and the tenant's OWN api_token/x_api_key
+    (unchanged per-tenant resolution)."""
+    from src.bootstrap import resolve_crm_tools
+
+    tenant = TenantContext(
+        settings=TenantSettings(
+            id="t1", slug="t1", name="T1", crm_id="betstudio",
+            crm=TenantCRMConfig(operator_id="op-123"),
+        ),
+        secrets_resolved={"crm:api_token": "tok-abc", "crm:x_api_key": "key-xyz"},
+    )
+
+    specs, execs, source = await resolve_crm_tools(tenant, sm_with_crm_seed)
+
+    assert source == "crm_catalog"
+    assert len(specs) == 18  # matches the seeded catalog's tool count
+    sample = execs["get_player_wallet"]
+    assert sample["endpoint"] == "https://apistage.betstudio.io/api/players/{user_id}/wallet"
+    assert sample["auth_type"] == "api_key"
+    assert sample["token"] == "tok-abc"
+    assert sample["x_api_key"] == "key-xyz"
+    assert sample["extra_headers"] == {"operatorid": "op-123"}
+
+
+async def test_tenant_without_crm_link_and_no_chat_tools_gets_none(sm_with_crm_seed) -> None:
+    from src.bootstrap import resolve_crm_tools
+
+    tenant = TenantContext(settings=TenantSettings(id="t2", slug="t2", name="T2"), secrets_resolved={})
+
+    specs, execs, source = await resolve_crm_tools(tenant, sm_with_crm_seed)
+    assert source == "none"
+    assert specs == []

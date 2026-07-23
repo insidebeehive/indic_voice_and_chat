@@ -281,6 +281,10 @@ class TenantSettings(BaseModel):
     pipeline: TenantPipelineConfig = Field(default_factory=TenantPipelineConfig)
     compliance: TenantCompliance = Field(default_factory=TenantCompliance)
     crm: TenantCRMConfig = Field(default_factory=TenantCRMConfig)
+    # The Crm entity (src.models.crm.Crm) this tenant is linked to — its id, not
+    # the per-tenant crm sub-config above. Drives resolve_crm_tools()'s tier-2
+    # DB-backed tool catalog fallback (src/bootstrap.py).
+    crm_id: Optional[str] = None
     whatsapp: TenantWhatsAppConfig = Field(default_factory=TenantWhatsAppConfig)
     chat_support: ChatSupportConfig = Field(default_factory=ChatSupportConfig)
     phone_numbers: list[str] = Field(default_factory=list)

@@ -61,6 +61,7 @@ def tenant_context_from_row(tenant: Tenant) -> TenantContext:
         pipeline=pipeline,
         compliance=compliance,
         crm=crm,
+        crm_id=tenant.crm_id,
         chat_support=chat_support,
         phone_numbers=[p.phone_number for p in tenant.phone_numbers],
     )

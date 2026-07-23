@@ -2,8 +2,10 @@
 tenant's ACTUALLY-resolved CRM tools (src/bootstrap.py resolve_crm_tools()).
 
 Unlike GET /chat/tools (which only queries the chat_tools DB table), this
-endpoint reports the platform-fallback path too, since that's what a tenant
-with zero chat_tools rows actually gets served on its next chat turn.
+endpoint reports the crm_catalog path too (a tenant linked to a Crm entity via
+``tenant.settings.crm_id`` — see docs/superpowers/plans/2026-07-23-crm-entity.md,
+Task 3), since that's what a tenant with zero chat_tools rows actually gets
+served on its next chat turn.
 """
 
 from __future__ import annotations
@@ -42,6 +44,21 @@ def _clean_platform_env(monkeypatch) -> None:
     monkeypatch.delenv("PLATFORM_CRM_BASE_URL", raising=False)
     monkeypatch.delenv("PLATFORM_CRM_API_TOKEN", raising=False)
     monkeypatch.delenv("PLATFORM_CRM_AUTH_TYPE", raising=False)
+
+
+async def _seed_crm(sm, crm_id: str = "betstudio") -> None:
+    """Seed one Crm + its full CrmTool catalog into ``sm`` — the DB-backed
+    catalog a tenant's ``crm_id`` links to (tier 2 of resolve_crm_tools)."""
+    from src.models.crm import Crm, CrmTool
+
+    async with sm() as s:
+        s.add(Crm(id=crm_id, name="BetStudio",
+                   base_url="https://apistage.betstudio.io/api", auth_type="api_key"))
+        for name, spec in ALL_TOOLS.items():
+            s.add(CrmTool(crm_id=crm_id, name=name, description=spec["description"],
+                           endpoint=spec["default_path"], method=spec.get("method", "GET"),
+                           parameters=spec.get("parameters", {})))
+        await s.commit()
 
 
 @pytest_asyncio.fixture
@@ -97,31 +114,39 @@ async def test_tenant_registered_tools_reported_as_source_tenant(ctx) -> None:
 
 
 async def test_platform_fallback_ignores_configured_platform_token(ctx, monkeypatch) -> None:
-    # The shared PLATFORM_CRM_API_TOKEN must never be used for auth, even
-    # though it's configured in the environment — this CRM authorizes by the
-    # token itself, so a shared token would grant cross-tenant CRM access.
-    client, _sm = ctx
+    # The shared, legacy PLATFORM_CRM_API_TOKEN env var must never be used for
+    # auth, even though it's configured in the environment — it isn't even
+    # read anymore (the crm_catalog branch only ever uses the tenant's own
+    # crm:api_token secret). This CRM authorizes by the token itself, so a
+    # shared token would grant cross-tenant CRM access.
+    client, sm = ctx
     monkeypatch.setenv("PLATFORM_CRM_BASE_URL", "https://platform-crm.example.com")
     monkeypatch.setenv("PLATFORM_CRM_API_TOKEN", "platform-token-abc")
+    await _seed_crm(sm)
+    register_tenant_for_test(TenantSettings(id="t1", slug="t1", name="T1", crm_id="betstudio"),
+                              plaintext_tokens=["test-token"])
 
     resp = await client.get("/chat/tools/resolved")
     assert resp.status_code == 200, resp.text
     body = resp.json()
-    assert body["source"] == "platform_fallback"
+    assert body["source"] == "crm_catalog"
     assert len(body["tools"]) == len(ALL_TOOLS)
     assert {t["name"] for t in body["tools"]} == set(ALL_TOOLS)
     assert all(t["token_configured"] is False for t in body["tools"])
 
 
 async def test_platform_fallback_without_token_reports_not_configured(ctx, monkeypatch) -> None:
-    client, _sm = ctx
+    client, sm = ctx
     monkeypatch.setenv("PLATFORM_CRM_BASE_URL", "https://platform-crm.example.com")
-    # No PLATFORM_CRM_API_TOKEN set.
+    # No PLATFORM_CRM_API_TOKEN set (and no crm:api_token tenant secret).
+    await _seed_crm(sm)
+    register_tenant_for_test(TenantSettings(id="t1", slug="t1", name="T1", crm_id="betstudio"),
+                              plaintext_tokens=["test-token"])
 
     resp = await client.get("/chat/tools/resolved")
     assert resp.status_code == 200, resp.text
     body = resp.json()
-    assert body["source"] == "platform_fallback"
+    assert body["source"] == "crm_catalog"
     assert len(body["tools"]) == len(ALL_TOOLS)
     assert all(t["token_configured"] is False for t in body["tools"])
 
@@ -129,17 +154,18 @@ async def test_platform_fallback_without_token_reports_not_configured(ctx, monke
 async def test_x_api_key_configured_reported_independently_of_token(ctx, monkeypatch) -> None:
     client, sm = ctx
     monkeypatch.setenv("PLATFORM_CRM_BASE_URL", "https://platform-crm.example.com")
+    await _seed_crm(sm)
     # The in-memory test resolver doesn't re-read TenantSecret rows, so seed
     # the tenant's secrets_resolved directly (same pattern as the other
-    # platform-fallback tests that construct TenantContext with secrets_resolved).
-    fresh_ctx = register_tenant_for_test(TenantSettings(id="t1", slug="t1", name="T1"),
+    # crm_catalog tests that construct TenantContext with secrets_resolved).
+    fresh_ctx = register_tenant_for_test(TenantSettings(id="t1", slug="t1", name="T1", crm_id="betstudio"),
                                           plaintext_tokens=["test-token"])
     fresh_ctx.secrets_resolved["crm:x_api_key"] = "the-x-api-key"
 
     resp = await client.get("/chat/tools/resolved")
     assert resp.status_code == 200, resp.text
     body = resp.json()
-    assert body["source"] == "platform_fallback"
+    assert body["source"] == "crm_catalog"
     # token_configured stays False (no crm:api_token set) while
     # x_api_key_configured is True — the two are independent.
     assert all(t["token_configured"] is False for t in body["tools"])
