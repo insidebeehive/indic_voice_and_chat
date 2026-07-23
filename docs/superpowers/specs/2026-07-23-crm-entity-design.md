@@ -211,3 +211,19 @@ mechanism above) rather than forcing a mismatch.
   per tenant (nullable FK), matching every requirement gathered this
   session; a tenant needing two distinct CRMs is a future decision, not
   designed here.
+
+## Implemented (2026-07-23)
+
+Built per the plan at `docs/superpowers/plans/2026-07-23-crm-entity.md`
+(10 tasks, all merged). The migration (`alembic/versions/0009_crm_entity.py`)
+ran successfully against the real Neon database (the same one backing the
+`stage` tenant's live CRM integration): `alembic upgrade head` applied
+`0008_widen_chat_message_role -> 0009_crm_entity` with no errors, confirmed
+by `alembic current` reporting `0009_crm_entity (head)`. The verification
+query afterward showed exactly one seeded `crms` row (`id='betstudio'`),
+18 seeded `crm_tools` rows, and all 5 pre-existing tenants
+(`example`, `mgmstage`, `stage`, `dev`, `lotterystage`) linked via
+`crm_id='betstudio'` — see `.superpowers/sdd/task-2-report.md` (Step 5) for
+the full query output. `docs/chatbot.md`'s "CRM tools" section documents the
+shipped mechanism (`GET/POST/PATCH /api/v1/crms[/{id}]`,
+`source: "crm_catalog"`, precedence unchanged).

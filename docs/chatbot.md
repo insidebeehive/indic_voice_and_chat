@@ -57,14 +57,35 @@ CRM tools:
 - `GET/DELETE /chat/tools[/{name}]`.
 - `GET /chat/tools/resolved` — the tools this tenant will ACTUALLY get on its
   next chat turn, computed fresh (bypasses the CRM-tools cache): reflects the
-  `PLATFORM_CRM_*` platform-fallback path too, not just this tenant's own
-  registered `chat_tools` rows (which is all `GET /chat/tools` sees).
+  linked-`Crm`-catalog path too (`source: "crm_catalog"`), not just this
+  tenant's own registered `chat_tools` rows (which is all `GET /chat/tools`
+  sees).
+- **Where the shared catalog lives:** a tenant that isn't running its own
+  `chat_tools` gets its tools from the `Crm` entity it's linked to
+  (`tenant.settings.crm_id` → `crms`/`crm_tools` DB rows) instead of a
+  hardcoded dict + env var. A `Crm` row holds the shared `base_url`,
+  `auth_type`, and `events_webhook_url_template`; `CrmTool` rows are its tool
+  catalog (endpoint/method/parameters), joined onto `base_url` at resolve
+  time. CRM entities are admin-managed via `GET/POST/PATCH
+  /api/v1/crms[/{id}]` (no per-tenant auth — a platform-level admin
+  resource), not through the tenant API.
+- **Precedence is unchanged**: (1) the tenant's own `chat_tools` rows, if any,
+  win outright — `source: "tenant"`; (2) otherwise, the linked `Crm`'s
+  catalog is used — `source: "crm_catalog"` (renamed from the old
+  `"platform_fallback"`, same mechanism, now DB-backed instead of a
+  hardcoded catalog + `PLATFORM_CRM_*` env vars); (3) a tenant with neither
+  gets `source: "none"`. Auth is still resolved per-tenant either way — a
+  linked `Crm`'s tools always use the *tenant's own* `crm:api_token` /
+  `crm:x_api_key` secrets and `operator_id`, never anything shared across
+  tenants.
 - Auth headers: `auth_type`/token produce a single header (`Authorization:
-  Bearer <token>` or `X-API-Key: <token>`). The platform-catalog CRM
-  additionally supports an independent, additive `crm:x_api_key` tenant
-  secret — when set it is **always** sent as `X-API-Key`, alongside whatever
-  the `auth_type`/token mechanism already produces (the live CRM requires
-  both headers together). Encrypted at rest exactly like `crm:api_token`.
+  Bearer <token>` or `X-API-Key: <token>`); for `crm_catalog` tools,
+  `auth_type` comes from the linked `Crm` row while the token itself is
+  still the tenant's own `crm:api_token`. Independently of that, the tenant's
+  own `crm:x_api_key` secret — when set — is **always** sent as `X-API-Key`,
+  alongside whatever the `auth_type`/token mechanism already produces (the
+  live CRM requires both headers together). Encrypted at rest exactly like
+  `crm:api_token`.
 
 Voice handoff:
 - `POST /chat/{session_id}/call` → summarizes the chat, stashes context under a
@@ -98,7 +119,8 @@ CRM-tool tokens are per-tenant (encrypted).
 ## DB
 
 `chat_sessions`, `chat_messages` (Alembic `0004`); `chat_tools` (`0005`);
-`kb_documents` (`0001`). Run `alembic upgrade head`.
+`kb_documents` (`0001`); `crms`/`crm_tools` + `tenants.crm_id` (`0009`, the
+shared CRM-catalog entity described above). Run `alembic upgrade head`.
 
 ## End-to-end test (local)
 
