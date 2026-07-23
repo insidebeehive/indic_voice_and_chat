@@ -1,13 +1,17 @@
 """PGVector adapter for the IVectorStore interface.
 
 Stores all knowledge chunks in a single ``voicebot.knowledge_chunks`` Postgres
-table, scoped by ``tenant_id`` column (NULL = platform / global docs).  Uses the
-``pgvector`` extension's cosine-distance operator (``<=>``) with an HNSW index.
+table, scoped by EITHER ``tenant_id`` (a tenant's own KB) OR ``crm_id`` (a
+CRM's shared KB) — exactly one is set per adapter instance, never both, never
+neither.  Uses the ``pgvector`` extension's cosine-distance operator (``<=>``)
+with an HNSW index.
 
-Configuration keys (config dict passed from TenantProviders._config_for):
+Configuration keys (config dict passed from TenantProviders._config_for or
+src.bootstrap.build_crm_retriever):
   provider       : "pgvector"
   embedding_dim  : int  (default 384)
-  tenant_id      : str | None  (None → platform docs)
+  tenant_id      : str | None  (a tenant's own KB)
+  crm_id         : str | None  (a CRM's shared KB)
   database_url   : str  (optional; falls back to DATABASE_URL env var)
 """
 
@@ -93,11 +97,17 @@ async def _ensure_schema(pool: Any, dim: int) -> None:
 
 
 class PGVectorAdapter(IVectorStore):
-    """IVectorStore backed by PostgreSQL + pgvector."""
+    """IVectorStore backed by PostgreSQL + pgvector.
+
+    Each adapter instance is scoped to exactly one of ``tenant_id`` (a
+    tenant's own KB) or ``crm_id`` (a CRM's shared KB) — never both, never
+    neither, for any instance built by this codebase today.
+    """
 
     def __init__(self, config: dict) -> None:
         self._dim = int(config.get("embedding_dim", 384))
         self._tenant_id: Optional[str] = config.get("tenant_id")
+        self._crm_id: Optional[str] = config.get("crm_id")
         self._database_url: str = (
             config.get("database_url")
             or os.environ.get("DATABASE_URL", "")
@@ -114,13 +124,14 @@ class PGVectorAdapter(IVectorStore):
         await _ensure_schema(pool, self._dim)
         return pool
 
-    def _tenant_where(self) -> str:
-        """SQL snippet that scopes rows to this adapter's tenant."""
-        return "tenant_id = $%d" if self._tenant_id is not None else "tenant_id IS NULL"
-
-    def _tenant_param(self, base: int) -> list:
-        """Extra positional param(s) for tenant filtering."""
-        return [self._tenant_id] if self._tenant_id is not None else []
+    def _scope_clause(self, param_start: int) -> tuple[str, list]:
+        """SQL WHERE clause + params scoping rows to this adapter's tenant or
+        CRM. ``param_start`` is the next free ``$N`` placeholder index."""
+        if self._tenant_id is not None:
+            return f"tenant_id = ${param_start}", [self._tenant_id]
+        if self._crm_id is not None:
+            return f"crm_id = ${param_start}", [self._crm_id]
+        return "tenant_id IS NULL AND crm_id IS NULL", []
 
     # --- IVectorStore ------------------------------------------------------
 
@@ -133,21 +144,24 @@ class PGVectorAdapter(IVectorStore):
             if doc.embedding is None:
                 raise ValueError(f"Document {doc.id!r} has no embedding")
             emb = np.array(doc.embedding, dtype="float32")
-            rows.append((doc.id, doc.content, doc.metadata or {}, emb, self._tenant_id))
+            rows.append((doc.id, doc.content, doc.metadata or {}, emb,
+                         self._tenant_id, self._crm_id))
 
         import json as _json
         async with pool.acquire() as conn:
             await conn.executemany(
                 """
-                INSERT INTO voicebot.knowledge_chunks (id, content, metadata, embedding, tenant_id)
-                VALUES ($1, $2, $3::jsonb, $4, $5)
+                INSERT INTO voicebot.knowledge_chunks
+                    (id, content, metadata, embedding, tenant_id, crm_id)
+                VALUES ($1, $2, $3::jsonb, $4, $5, $6)
                 ON CONFLICT (id) DO UPDATE
                     SET content = EXCLUDED.content,
                         metadata = EXCLUDED.metadata,
                         embedding = EXCLUDED.embedding,
-                        tenant_id = EXCLUDED.tenant_id
+                        tenant_id = EXCLUDED.tenant_id,
+                        crm_id = EXCLUDED.crm_id
                 """,
-                [(r[0], r[1], _json.dumps(r[2]), r[3], r[4]) for r in rows],
+                [(r[0], r[1], _json.dumps(r[2]), r[3], r[4], r[5]) for r in rows],
             )
         return len(documents)
 
@@ -160,34 +174,26 @@ class PGVectorAdapter(IVectorStore):
         pool = await self._pool()
         q = np.array(query_embedding, dtype="float32")
 
-        # Tenant scope
-        tenant_clause = (
-            "tenant_id = $2" if self._tenant_id is not None else "tenant_id IS NULL"
-        )
-        tenant_params = [self._tenant_id] if self._tenant_id is not None else []
+        scope_clause, scope_params = self._scope_clause(2)
 
-        # Optional extra metadata filters (JSONB containment)
         filter_clause = ""
         filter_params: list = []
         if filters:
             import json as _json
-            # $1=query, $2[opt]=tenant_id, then filter is next
-            next_pos = 2 + len(tenant_params)
+            next_pos = 2 + len(scope_params)
             filter_clause = f" AND metadata @> ${next_pos}::jsonb"
             filter_params = [_json.dumps(filters)]
 
-        # params = [q] + tenant_params + filter_params + [top_k]
-        # top_k is the last element → position = 1 + len(tenant) + len(filter) + 1
-        limit_pos = 2 + len(tenant_params) + len(filter_params)
+        limit_pos = 2 + len(scope_params) + len(filter_params)
         sql = f"""
             SELECT id, content, metadata,
                    1 - (embedding <=> $1::vector) AS score
             FROM voicebot.knowledge_chunks
-            WHERE {tenant_clause}{filter_clause}
+            WHERE {scope_clause}{filter_clause}
             ORDER BY embedding <=> $1::vector
             LIMIT ${limit_pos}::integer
         """
-        params = [q] + tenant_params + filter_params + [top_k]
+        params = [q] + scope_params + filter_params + [top_k]
 
         async with pool.acquire() as conn:
             rows = await conn.fetch(sql, *params)
@@ -204,14 +210,10 @@ class PGVectorAdapter(IVectorStore):
         if not doc_ids:
             return 0
         pool = await self._pool()
-        tenant_clause = (
-            "tenant_id = $2" if self._tenant_id is not None else "tenant_id IS NULL"
-        )
-        tenant_params = [self._tenant_id] if self._tenant_id is not None else []
-        sql = f"DELETE FROM voicebot.knowledge_chunks WHERE id = ANY($1) AND {tenant_clause}"
+        scope_clause, scope_params = self._scope_clause(2)
+        sql = f"DELETE FROM voicebot.knowledge_chunks WHERE id = ANY($1) AND {scope_clause}"
         async with pool.acquire() as conn:
-            result = await conn.execute(sql, doc_ids, *tenant_params)
-        # asyncpg returns "DELETE N" as a string
+            result = await conn.execute(sql, doc_ids, *scope_params)
         try:
             return int(result.split()[-1])
         except (ValueError, IndexError):
@@ -219,11 +221,8 @@ class PGVectorAdapter(IVectorStore):
 
     async def count(self) -> int:
         pool = await self._pool()
-        tenant_clause = (
-            "tenant_id = $1" if self._tenant_id is not None else "tenant_id IS NULL"
-        )
-        tenant_params = [self._tenant_id] if self._tenant_id is not None else []
-        sql = f"SELECT count(*) FROM voicebot.knowledge_chunks WHERE {tenant_clause}"
+        scope_clause, scope_params = self._scope_clause(1)
+        sql = f"SELECT count(*) FROM voicebot.knowledge_chunks WHERE {scope_clause}"
         async with pool.acquire() as conn:
-            row = await conn.fetchrow(sql, *tenant_params)
+            row = await conn.fetchrow(sql, *scope_params)
         return int(row["count"]) if row else 0
