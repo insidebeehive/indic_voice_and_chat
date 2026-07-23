@@ -25,6 +25,7 @@ from src.auth import TenantContext, current_tenant
 from src.auth import secrets as crypto
 from src.chatbot.catalog import ALL_TOOLS
 from src.models.chat import ChatTool
+from src.models.database import get_sessionmaker
 from src.models.tenant import TenantSecret
 
 log = logging.getLogger(__name__)
@@ -70,6 +71,19 @@ class ToolInfo(BaseModel):
 
 class ToolsListResponse(BaseModel):
     tools: list[ToolInfo]
+
+
+class ResolvedToolInfo(BaseModel):
+    name: str
+    description: str
+    endpoint: str
+    auth_type: Optional[str]
+    token_configured: bool  # never expose the actual token value
+
+
+class ResolvedToolsResponse(BaseModel):
+    source: str  # "tenant" | "platform_fallback" | "none"
+    tools: list[ResolvedToolInfo]
 
 
 # --- Routes -------------------------------------------------------------
@@ -141,6 +155,39 @@ async def list_tools(
             operator_id=((r.auth_config or {}).get("extra_headers") or {}).get("operatorid"),
         ) for r in rows
     ])
+
+
+@router.get("/tools/resolved", response_model=ResolvedToolsResponse)
+async def list_resolved_tools(
+    tenant: TenantContext = Depends(current_tenant),
+) -> ResolvedToolsResponse:
+    """The tools this tenant will ACTUALLY get on its next chat turn, computed
+    fresh from the DB/env (bypasses the in-process CRM-tools cache).
+
+    Unlike ``GET /tools`` — which only reads the tenant's own registered
+    ``chat_tools`` rows — this reflects the platform-fallback path too: a
+    tenant with zero DB rows can still be served the full platform catalog
+    via ``PLATFORM_CRM_*`` env vars or its own ``crm:*`` secrets, and that
+    tenant would otherwise see an empty list from ``GET /tools`` with no way
+    to tell the fallback is active.
+    """
+    from src.bootstrap import resolve_crm_tools
+
+    sessionmaker = get_sessionmaker()
+    specs, execs, source = await resolve_crm_tools(tenant, sessionmaker)
+    return ResolvedToolsResponse(
+        source=source,
+        tools=[
+            ResolvedToolInfo(
+                name=s.name,
+                description=s.description,
+                endpoint=execs[s.name]["endpoint"],
+                auth_type=execs[s.name]["auth_type"],
+                token_configured=bool(execs[s.name].get("token")),
+            )
+            for s in specs
+        ],
+    )
 
 
 @router.delete("/tools/{tool_name}")

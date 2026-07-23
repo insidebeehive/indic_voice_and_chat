@@ -225,6 +225,102 @@ def _crm_params_to_schema(params: dict) -> dict:
     return schema
 
 
+async def resolve_crm_tools(
+    tenant: TenantContext, sessionmaker,
+) -> tuple[list, dict, str]:
+    """Resolve a tenant's CRM tools fresh from the DB/env — no caching.
+
+    This is the single source of truth for "what CRM tools does this tenant
+    actually get" — both the cached chat-runtime path (``_load_crm_tools_uncached``
+    below, via the per-tenant registry) and the ``GET /chat/tools/resolved``
+    diagnostic endpoint call into this same function.
+
+    Priority:
+    1. Tenant-specific tools registered in the chat_tools DB table.
+    2. Platform catalog (catalog.ALL_TOOLS) built from the tenant's
+       ``crm:*`` secrets + ``PLATFORM_CRM_BASE_URL`` env fallback — no
+       per-tenant DB registration required.
+
+    Returns ``(tool_specs, {name: exec_spec}, source)`` where ``source`` is
+    one of: ``"tenant"`` (tenant-registered chat_tools rows), ``"platform_fallback"``
+    (catalog served via PLATFORM_CRM_* env vars or the tenant's own crm:*
+    secrets), or ``"none"`` (nothing resolved — no tools available at all).
+    """
+    import os
+
+    from sqlalchemy import select
+
+    from src.auth import secrets as crypto
+    from src.chatbot.catalog import ALL_TOOLS
+    from src.interfaces.llm import ToolSpec
+    from src.models.chat import ChatTool
+    from src.models.tenant import TenantSecret
+
+    specs: list[ToolSpec] = []
+    execs: dict[str, dict] = {}
+    if sessionmaker is not None:
+        async with sessionmaker() as db:
+            rows = (await db.execute(
+                select(ChatTool).where(ChatTool.tenant_id == tenant.id)
+            )).scalars().all()
+            # One batched query for every tool's token secret instead of one
+            # query per tool (this loop used to be N+1 — with tenants
+            # registering a dozen-plus tools, that's a dozen-plus sequential
+            # round-trips on every single new chat session).
+            secret_names = {
+                (r.auth_config or {}).get("token_secret_name")
+                for r in rows
+                if (r.auth_config or {}).get("token_secret_name")
+            }
+            secrets_by_name: dict[str, str] = {}
+            if secret_names:
+                sec_rows = (await db.execute(
+                    select(TenantSecret).where(
+                        TenantSecret.tenant_id == tenant.id,
+                        TenantSecret.name.in_(secret_names))
+                )).scalars().all()
+                secrets_by_name = {s.name: s.value_encrypted for s in sec_rows}
+            for r in rows:
+                specs.append(ToolSpec(
+                    name=r.name, description=r.description,
+                    parameters=_crm_params_to_schema(r.parameters)))
+                token = None
+                secret_name = (r.auth_config or {}).get("token_secret_name")
+                if secret_name and secret_name in secrets_by_name:
+                    try:
+                        token = crypto.decrypt(secrets_by_name[secret_name])
+                    except Exception:  # noqa: BLE001
+                        token = None
+                execs[r.name] = {
+                    "endpoint": r.endpoint, "method": r.method,
+                    "parameters": r.parameters or {}, "auth_type": r.auth_type,
+                    "token": token,
+                    "extra_headers": (r.auth_config or {}).get("extra_headers")}
+
+    if specs:
+        return specs, execs, "tenant"  # tenant-specific tools take precedence
+
+    # ── Platform catalog fallback ─────────────────────────────────────
+    sr = tenant.secrets_resolved
+    base_url = (sr.get("crm:base_url") or os.environ.get("PLATFORM_CRM_BASE_URL", "")).rstrip("/")
+    if not base_url:
+        return [], {}, "none"
+
+    api_token = sr.get("crm:api_token") or os.environ.get("PLATFORM_CRM_API_TOKEN")
+    auth_type = sr.get("crm:auth_type") or os.environ.get("PLATFORM_CRM_AUTH_TYPE") or "api_key"
+    for name, spec in ALL_TOOLS.items():
+        endpoint = base_url + spec["default_path"]
+        specs.append(ToolSpec(
+            name=name, description=spec["description"],
+            parameters=_crm_params_to_schema(spec["parameters"])))
+        execs[name] = {
+            "endpoint": endpoint, "method": spec.get("method", "GET"),
+            "parameters": spec["parameters"], "auth_type": auth_type,
+            "token": api_token, "extra_headers": None,
+        }
+    return specs, execs, "platform_fallback"
+
+
 def make_chatbot_factory(registry, sessionmaker=None, platform_retriever=None):
     """Per-(tenant, session) ChatBotAgent factory for ``chat.set_chatbot_factory``.
 
@@ -233,91 +329,20 @@ def make_chatbot_factory(registry, sessionmaker=None, platform_retriever=None):
     Loads the tenant's registered CRM tools (chat_tools) and enables the agentic
     tool loop (builtin search/escalate/offer + CRM tools).
     """
-    from sqlalchemy import select
-
     from src.agents.base import AgentSession
     from src.agents.chatbot import ChatBotAgent
-    from src.auth import secrets as crypto
     from src.auth.registry import _AsyncPerTenantRegistry
     from src.chatbot.tool_executor import execute_crm_tool
-    from src.interfaces.llm import ToolSpec
-    from src.models.chat import ChatTool
-    from src.models.tenant import TenantSecret
 
     async def _load_crm_tools_uncached(tenant: TenantContext):
         """Return (tool_specs, {name: exec_spec}) for the tenant's CRM tools.
 
-        Priority:
-        1. Tenant-specific tools registered in the chat_tools DB table.
-        2. Platform catalog (catalog.ALL_TOOLS) built from the tenant's
-           ``crm:*`` secrets + ``PLATFORM_CRM_BASE_URL`` env fallback — no
-           per-tenant DB registration required.
+        Thin delegate to the module-level ``resolve_crm_tools`` (also used by
+        the ``GET /chat/tools/resolved`` diagnostic endpoint) — drops the
+        ``source`` value since this cached path's callers only expect a
+        2-tuple.
         """
-        import os
-        from src.chatbot.catalog import ALL_TOOLS
-
-        specs: list[ToolSpec] = []
-        execs: dict[str, dict] = {}
-        if sessionmaker is not None:
-            async with sessionmaker() as db:
-                rows = (await db.execute(
-                    select(ChatTool).where(ChatTool.tenant_id == tenant.id)
-                )).scalars().all()
-                # One batched query for every tool's token secret instead of one
-                # query per tool (this loop used to be N+1 — with tenants
-                # registering a dozen-plus tools, that's a dozen-plus sequential
-                # round-trips on every single new chat session).
-                secret_names = {
-                    (r.auth_config or {}).get("token_secret_name")
-                    for r in rows
-                    if (r.auth_config or {}).get("token_secret_name")
-                }
-                secrets_by_name: dict[str, str] = {}
-                if secret_names:
-                    sec_rows = (await db.execute(
-                        select(TenantSecret).where(
-                            TenantSecret.tenant_id == tenant.id,
-                            TenantSecret.name.in_(secret_names))
-                    )).scalars().all()
-                    secrets_by_name = {s.name: s.value_encrypted for s in sec_rows}
-                for r in rows:
-                    specs.append(ToolSpec(
-                        name=r.name, description=r.description,
-                        parameters=_crm_params_to_schema(r.parameters)))
-                    token = None
-                    secret_name = (r.auth_config or {}).get("token_secret_name")
-                    if secret_name and secret_name in secrets_by_name:
-                        try:
-                            token = crypto.decrypt(secrets_by_name[secret_name])
-                        except Exception:  # noqa: BLE001
-                            token = None
-                    execs[r.name] = {
-                        "endpoint": r.endpoint, "method": r.method,
-                        "parameters": r.parameters or {}, "auth_type": r.auth_type,
-                        "token": token,
-                        "extra_headers": (r.auth_config or {}).get("extra_headers")}
-
-        if specs:
-            return specs, execs  # tenant-specific tools take precedence
-
-        # ── Platform catalog fallback ─────────────────────────────────────
-        sr = tenant.secrets_resolved
-        base_url = (sr.get("crm:base_url") or os.environ.get("PLATFORM_CRM_BASE_URL", "")).rstrip("/")
-        if not base_url:
-            return [], {}
-
-        api_token = sr.get("crm:api_token") or os.environ.get("PLATFORM_CRM_API_TOKEN")
-        auth_type = sr.get("crm:auth_type") or os.environ.get("PLATFORM_CRM_AUTH_TYPE") or "api_key"
-        for name, spec in ALL_TOOLS.items():
-            endpoint = base_url + spec["default_path"]
-            specs.append(ToolSpec(
-                name=name, description=spec["description"],
-                parameters=_crm_params_to_schema(spec["parameters"])))
-            execs[name] = {
-                "endpoint": endpoint, "method": spec.get("method", "GET"),
-                "parameters": spec["parameters"], "auth_type": auth_type,
-                "token": api_token, "extra_headers": None,
-            }
+        specs, execs, _source = await resolve_crm_tools(tenant, sessionmaker)
         return specs, execs
 
     # A tenant's registered CRM tools rarely change, but _load_crm_tools_uncached
