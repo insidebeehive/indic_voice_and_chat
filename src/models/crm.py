@@ -16,6 +16,7 @@ new CRM's tools can be registered without a code deploy.
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Optional
 
 from sqlalchemy import (
     JSON,
@@ -57,4 +58,23 @@ class CrmTool(Base):
     method: Mapped[str] = mapped_column(String(10), default="GET")
     parameters: Mapped[dict] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=False), server_default=func.now())
+
+
+class CrmKBDocument(Base):
+    """CRM-level KB documents shared across every tenant registered against
+    that CRM (replaces the old platform-wide, unscoped ``PlatformKBDocument``).
+    """
+
+    __tablename__ = "crm_kb_documents"
+
+    id: Mapped[str] = mapped_column(String(50), primary_key=True)
+    crm_id: Mapped[str] = mapped_column(
+        String(50), ForeignKey("crms.id", ondelete="CASCADE"), nullable=False, index=True)
+    filename: Mapped[str] = mapped_column(String(255), nullable=False)
+    source_type: Mapped[Optional[str]] = mapped_column(String(50))
+    language: Mapped[Optional[str]] = mapped_column(String(10))
+    chunk_count: Mapped[int] = mapped_column(Integer, default=0)
+    extra_data: Mapped[dict] = mapped_column("metadata", JSON, default=dict)
+    ingested_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=False), server_default=func.now())
