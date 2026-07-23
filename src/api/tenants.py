@@ -301,6 +301,9 @@ class UpdateTenantRequest(BaseModel):
     telephony: Optional[TelephonyUpdateIn] = None
     chatwoot: Optional[ChatwootUpdateIn] = None
     crm: Optional[CrmCredentialsIn] = None
+    # Links this tenant to a Crm row (real Tenant.crm_id FK column, Task 1).
+    # "" clears the link (FK is nullable); omitted/None leaves it untouched.
+    crm_id: Optional[str] = None
 
 
 class UpdateTenantResponse(BaseModel):
@@ -313,6 +316,7 @@ class UpdateTenantResponse(BaseModel):
     telephony_creds_configured: list[str]
     events_webhook_url: Optional[str] = None
     events_webhook_secret_set: bool = False
+    crm_id: Optional[str] = None
 
 
 async def _refresh_resolver(request: Request, tenant_id: str) -> None:
@@ -347,6 +351,10 @@ async def update_tenant(
 
     if req.status is not None:
         t.status = req.status
+
+    if req.crm_id is not None:
+        # "" (the "— none —" dropdown option) clears the link; a real id sets it.
+        t.crm_id = req.crm_id or None
 
     pc = dict(t.pipeline_config or {})
 
@@ -480,6 +488,7 @@ async def update_tenant(
         telephony_creds_configured=_configured_creds(tel_cfg),
         events_webhook_url=pc.get("events_webhook_url"),
         events_webhook_secret_set=bool(pc.get("events_webhook_secret_env")),
+        crm_id=t.crm_id,
     )
 
 
@@ -514,6 +523,9 @@ class TenantSummary(BaseModel):
     # paste into the tenant's Stringee project so calls attribute correctly.
     stringee_softphone_answer_url: Optional[str] = None
     stringee_answer_url: Optional[str] = None
+    # CRM this tenant is linked to (Tenant.crm_id FK, Task 1) — lets the
+    # backoffice preselect the CRM dropdown.
+    crm_id: Optional[str] = None
 
 
 class TenantListResponse(BaseModel):
@@ -567,6 +579,7 @@ async def list_tenants(
                 f"{base}/stringee/softphone-answer/{t.slug}" if base else None),
             stringee_answer_url=(
                 f"{base}/stringee/answer/{t.slug}" if base else None),
+            crm_id=t.crm_id,
         ))
     return TenantListResponse(tenants=items, total=len(items))
 

@@ -418,50 +418,62 @@ async function apiTenant(method, path, body, slug) {
 }
 
 async function loadCRM(id, slug) {
-  const cr = await apiSend("GET", `/api/v1/tenants/${id}/chat-config`);
+  const [cr, crmsResp] = await Promise.all([
+    apiSend("GET", `/api/v1/tenants/${id}/chat-config`),
+    apiSend("GET", "/api/v1/crms"),
+  ]);
   const cfg    = cr.ok ? cr.json : {};
   const crmCfg = cfg.crm || {};
+  const crms   = crmsResp.ok ? crmsResp.json : [];
+  const currentCrmId = (window.TENANTS || {})[id]?.crm_id || "";
+
+  const crmOptions = crms.map(c =>
+    `<option value="${escAttr(c.id)}" ${c.id === currentCrmId ? "selected" : ""}>${escT(c.name)}</option>`
+  ).join("");
 
   $("pane_crm").innerHTML = `
     <div class="hint" style="margin-bottom:.6rem;">
-      CRM tools (wallet, bets, transactions, bonuses, profile, operator config) are built in
-      at the platform level. Set the API credentials below — no per-tenant seeding required.
+      CRM tools (wallet, bets, transactions, bonuses, profile, operator config) come
+      from the CRM this tenant is registered against. Base URL and the tool catalog
+      are managed at the CRM level (see the CRMs admin page), not per tenant.
     </div>
-    <h2>CRM API credentials</h2>
-    <div class="hint" style="margin-bottom:.5rem;">
-      Credentials used when the voicebot and chatbot call the BetStudio CRM APIs on behalf of this operator.
-      Leave <b>Base URL</b> blank to use the platform default (<code>PLATFORM_CRM_BASE_URL</code>).
-    </div>
+    <h2>CRM</h2>
     <div class="creds" style="gap:.6rem;flex-wrap:wrap;">
-      <label>Base URL <small class="hint">(blank = platform default)</small>
-        <input id="ch_base" style="width:22rem" placeholder="https://apistage.betstudio.io/api" />
-      </label>
-      <label>Auth type
-        <select id="ch_authtype">
-          <option value="api_key">api_key (X-API-Key header)</option>
-          <option value="bearer">bearer (Authorization: Bearer)</option>
+      <label>CRM
+        <select id="ch_crm_id">
+          <option value="">— none —</option>
+          ${crmOptions}
         </select>
       </label>
+    </div>
+    <div style="margin-top:.5rem;">
+      <button onclick="saveCrmConfig('${escAttr(slug)}')">Save CRM link</button>
+      <span id="ch_result" class="hint" style="margin-left:.6rem;"></span>
+    </div>
+    <h2 style="margin-top:1.2rem;">CRM auth (tenant-specific)</h2>
+    <div class="hint" style="margin-bottom:.5rem;">
+      This tenant's own credentials for the linked CRM — different tenants on the
+      same CRM each need their own here.
+    </div>
+    <div class="creds" style="gap:.6rem;flex-wrap:wrap;">
       <label>API token <small class="hint">(encrypted at rest)</small>
         <input id="ch_token" type="password" style="width:18rem" placeholder="token value" />
       </label>
-      <label>X-API-Key <small class="hint">(sent as a separate header, alongside Authorization)</small>
-        <input id="ch_xapikey" type="password" style="width:18rem" placeholder="x-api-key value" />
+      <label>X-API-Key <small class="hint">(encrypted at rest, sent alongside Authorization)</small>
+        <input id="ch_xapikey" type="password" style="width:18rem" placeholder="key value" />
       </label>
       <label>Operator ID
         <input id="ch_opid" style="width:16rem" placeholder="ab858a8c-7ad4-47d2-a0b7-…" />
       </label>
     </div>
     <div style="margin-top:.8rem;">
-      <button onclick="saveCrmConfig('${escAttr(slug)}')">Save CRM credentials</button>
-      <span id="ch_result" class="hint" style="margin-left:.6rem;"></span>
+      <button onclick="saveCrmAuth('${escAttr(slug)}')">Save CRM auth</button>
+      <span id="ch_auth_result" class="hint" style="margin-left:.6rem;"></span>
     </div>`;
 
-  if (crmCfg.base_url)    $("ch_base").value        = crmCfg.base_url;
-  if (crmCfg.auth_type)   $("ch_authtype").value    = crmCfg.auth_type;
-  if (crmCfg.api_token)   $("ch_token").placeholder = "... (already set — leave blank to keep)";
+  if (crmCfg.api_token)   $("ch_token").placeholder   = "... (already set — leave blank to keep)";
   if (crmCfg.x_api_key)   $("ch_xapikey").placeholder = "... (already set — leave blank to keep)";
-  if (crmCfg.operator_id) $("ch_opid").value        = crmCfg.operator_id;
+  if (crmCfg.operator_id) $("ch_opid").value          = crmCfg.operator_id;
 }
 
 // --- Chat tab ------------------------------------------------------------
@@ -570,20 +582,33 @@ async function saveChatwootConfig(slug) {
 }
 
 async function saveCrmConfig(slug) {
-  const base_url    = $("ch_base").value.trim();
-  const auth_type   = $("ch_authtype").value;
+  // "" (the "— none —" option) explicitly clears the link; the backend tells
+  // "clear" apart from "leave untouched" only because this key is always sent.
+  const crm_id = $("ch_crm_id").value;
+  $("ch_result").textContent = "saving…";
+  const tid = SELECTED;
+  const r = await apiSend("PATCH", `/api/v1/tenants/${tid}`, { crm_id });
+  if (r.ok) {
+    await loadTenants();   // refresh window.TENANTS so the dropdown reflects the new link
+    loadCRM(tid, slug);
+    $("ch_result").textContent = "✓ CRM link saved";
+  } else {
+    $("ch_result").textContent = `Error ${r.status}: ${r.json.detail || JSON.stringify(r.json)}`;
+  }
+}
+
+async function saveCrmAuth(slug) {
   const api_token   = $("ch_token").value.trim();
   const x_api_key   = $("ch_xapikey").value.trim();
   const operator_id = $("ch_opid").value.trim();
-  const crm = { auth_type };
-  if (base_url)    crm.base_url    = base_url;
+  const crm = {};
   if (api_token)   crm.api_token   = api_token;
   if (x_api_key)   crm.x_api_key   = x_api_key;
   if (operator_id) crm.operator_id = operator_id;
-  $("ch_result").textContent = "saving…";
+  $("ch_auth_result").textContent = "saving…";
   const tid = SELECTED;
   const r = await apiSend("PATCH", `/api/v1/tenants/${tid}`, { crm });
-  $("ch_result").textContent = r.ok ? "✓ CRM credentials saved" : `Error ${r.status}: ${r.json.detail || JSON.stringify(r.json)}`;
+  $("ch_auth_result").textContent = r.ok ? "✓ CRM auth saved" : `Error ${r.status}: ${r.json.detail || JSON.stringify(r.json)}`;
 }
 
 async function deleteTool(slug, name) {
