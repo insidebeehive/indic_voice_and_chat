@@ -130,6 +130,7 @@ async def test_platform_fallback_ignores_configured_platform_token(ctx, monkeypa
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["source"] == "crm_catalog"
+    assert body["crm_id"] == "betstudio"
     assert len(body["tools"]) == len(ALL_TOOLS)
     assert {t["name"] for t in body["tools"]} == set(ALL_TOOLS)
     assert all(t["token_configured"] is False for t in body["tools"])

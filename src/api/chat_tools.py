@@ -84,6 +84,7 @@ class ResolvedToolInfo(BaseModel):
 
 class ResolvedToolsResponse(BaseModel):
     source: str  # "tenant" | "crm_catalog" | "none"
+    crm_id: Optional[str] = None  # set only when source == "crm_catalog"
     tools: list[ResolvedToolInfo]
 
 
@@ -176,8 +177,10 @@ async def list_resolved_tools(
 
     sessionmaker = get_sessionmaker()
     specs, execs, source = await resolve_crm_tools(tenant, sessionmaker)
+    crm_id = getattr(tenant.settings, "crm_id", None) if source == "crm_catalog" else None
     return ResolvedToolsResponse(
         source=source,
+        crm_id=crm_id,
         tools=[
             ResolvedToolInfo(
                 name=s.name,
