@@ -167,11 +167,14 @@ async def list_resolved_tools(
     fresh from the DB/env (bypasses the in-process CRM-tools cache).
 
     Unlike ``GET /tools`` — which only reads the tenant's own registered
-    ``chat_tools`` rows — this reflects the platform-fallback path too: a
-    tenant with zero DB rows can still be served the full platform catalog
-    via ``PLATFORM_CRM_*`` env vars or its own ``crm:*`` secrets, and that
-    tenant would otherwise see an empty list from ``GET /tools`` with no way
-    to tell the fallback is active.
+    ``chat_tools`` rows — this reflects the full resolution priority:
+    ``"tenant"`` (the tenant's own registered ``chat_tools`` rows) takes
+    precedence, then ``"crm_catalog"`` (the tenant's linked ``Crm`` entity's
+    DB-backed tool catalog, using the tenant's own ``crm:api_token``/
+    ``crm:x_api_key`` secrets for auth), then ``"none"`` if nothing resolves.
+    A tenant with zero DB rows can still be served the linked Crm's full
+    catalog, and that tenant would otherwise see an empty list from
+    ``GET /tools`` with no way to tell the crm_catalog path is active.
     """
     from src.bootstrap import resolve_crm_tools
 

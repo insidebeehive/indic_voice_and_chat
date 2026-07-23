@@ -306,7 +306,7 @@ async def resolve_crm_tools(
 
     # ── CRM catalog (tenant linked to a Crm entity) ─────────────────────
     crm_id = tenant.settings.crm_id
-    if not crm_id:
+    if not crm_id or sessionmaker is None:
         return [], {}, "none"
 
     from src.models.crm import Crm, CrmTool

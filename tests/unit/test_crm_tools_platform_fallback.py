@@ -315,3 +315,22 @@ async def test_tenant_without_crm_link_and_no_chat_tools_gets_none(sm_with_crm_s
     specs, execs, source = await resolve_crm_tools(tenant, sm_with_crm_seed)
     assert source == "none"
     assert specs == []
+
+
+async def test_crm_linked_tenant_with_no_sessionmaker_degrades_to_none() -> None:
+    """A crm_id-linked tenant resolved with sessionmaker=None must degrade to
+    the same ([], {}, "none") result as every other "nothing configured" case
+    in this function, not raise TypeError('NoneType' object is not callable)."""
+    from src.bootstrap import resolve_crm_tools
+
+    tenant = TenantContext(
+        settings=TenantSettings(
+            id="t1", slug="t1", name="T1", crm_id="betstudio",
+            crm=TenantCRMConfig(operator_id="op-123"),
+        ),
+        secrets_resolved={"crm:api_token": "tok-abc", "crm:x_api_key": "key-xyz"},
+    )
+
+    specs, execs, source = await resolve_crm_tools(tenant, None)
+
+    assert (specs, execs, source) == ([], {}, "none")
