@@ -683,7 +683,7 @@ def make_browser_bridge_factory(
     *,
     campaign_resolver=None,
     handoff_store=None,
-    platform_retriever=None,
+    crm_retrievers=None,
 ) -> BrowserBridgeFactory:
     """Build a BrowserVoiceBridge per connection, wired to the tenant stack.
 
@@ -862,9 +862,9 @@ def make_browser_bridge_factory(
                     "this voice call. Greet them briefly and ask how you can help.",
                 ]
 
-        from src.bootstrap import _build_kb_context  # noqa: PLC0415
+        from src.bootstrap import _build_kb_context, _crm_retriever_for  # noqa: PLC0415
 
-        kb_ctx = _build_kb_context(platform_retriever, None) or None
+        kb_ctx = _build_kb_context(_crm_retriever_for(tenant, crm_retrievers), None) or None
         agent = VoiceBotAgent(
             session=AgentSession(session_id=session_id, lead_data=lead_data),
             state_machine=AgentStateMachine(),
@@ -895,7 +895,7 @@ def make_live_bridge_factory(
     slots: SlotSchema = SlotSchema(),
     *,
     campaign_resolver=None,
-    platform_retriever=None,
+    crm_retrievers=None,
 ) -> LiveBridgeFactory:
     """Build a GeminiLiveBridge (S2S) per connection from pipeline.realtime.
 
@@ -955,9 +955,9 @@ def make_live_bridge_factory(
             lead_data["lead_gender"] = lead_gender
 
         session_id = f"live_{uuid.uuid4().hex[:12]}"
-        from src.bootstrap import _build_kb_context  # noqa: PLC0415
+        from src.bootstrap import _build_kb_context, _crm_retriever_for  # noqa: PLC0415
 
-        kb_ctx = _build_kb_context(platform_retriever, None) or None
+        kb_ctx = _build_kb_context(_crm_retriever_for(tenant, crm_retrievers), None) or None
         agent = VoiceBotAgent(
             session=AgentSession(session_id=session_id, lead_data=lead_data),
             state_machine=AgentStateMachine(), slot_schema=cur_slots, script=cur_script,

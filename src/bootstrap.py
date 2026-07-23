@@ -599,7 +599,7 @@ def make_bridge_factory(
     slots: SlotSchema = SlotSchema(),
     *,
     campaign_resolver=None,
-    platform_retriever=None,
+    crm_retrievers: "PerCrmRetrieverRegistry | None" = None,
 ) -> Callable[[WebSocket, TenantContext], object]:
     """Return a callable suitable for ``set_bridge_factory(...)``.
 
@@ -650,7 +650,7 @@ def make_bridge_factory(
                 cur_script = _dc_replace(cur_script, **replacements)
         # Speech-to-speech path: when the tenant is in s2s mode, drive Gemini Live
         # over the Twilio media stream instead of the STT->LLM->TTS cascade.
-        kb_ctx = _build_kb_context(platform_retriever, None)
+        kb_ctx = _build_kb_context(_crm_retriever_for(tenant, crm_retrievers), None)
         if mode == "s2s":
             return _build_s2s_telephony_bridge(
                 providers, tenant, cur_script, cur_slots, websocket, session_store,
@@ -780,7 +780,7 @@ def make_exotel_bridge_factory(
     slots: SlotSchema = SlotSchema(),
     *,
     campaign_resolver=None,
-    platform_retriever=None,
+    crm_retrievers: "PerCrmRetrieverRegistry | None" = None,
 ) -> Callable[[WebSocket, TenantContext], ExotelMediaBridge]:
     """Build an Exotel WS bridge per call, wired to the tenant's provider stack.
 
@@ -818,7 +818,7 @@ def make_exotel_bridge_factory(
                 cur_script = _dc_replace(cur_script, **replacements)
         # S2S path: drive Gemini Live over the Exotel media stream (raw PCM16@8k,
         # snake_case stream_sid, no `clear` frame) when the tenant is in s2s mode.
-        kb_ctx = _build_kb_context(platform_retriever, None)
+        kb_ctx = _build_kb_context(_crm_retriever_for(tenant, crm_retrievers), None)
         if mode == "s2s":
             return _build_s2s_telephony_bridge(
                 providers, tenant, cur_script, cur_slots, websocket, session_store,
@@ -894,7 +894,7 @@ def make_stringee_bridge_factory(
     slots: SlotSchema = SlotSchema(),
     *,
     campaign_resolver=None,
-    platform_retriever=None,
+    crm_retrievers: "PerCrmRetrieverRegistry | None" = None,
 ):
     """Build a StringeeIvrBridge per call, wired to the tenant's providers.
 
@@ -940,7 +940,7 @@ def make_stringee_bridge_factory(
             script=cur_script,
             engine=engine,
             store=None,
-            kb_context=_build_kb_context(platform_retriever, None) or None,
+            kb_context=_build_kb_context(_crm_retriever_for(tenant, crm_retrievers), None) or None,
         )
 
         log.info(

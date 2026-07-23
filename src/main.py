@@ -70,7 +70,7 @@ from src.auth.db_resolver import DbTenantResolver
 from src.auth.middleware import set_admin_tokens, set_tenant_resolver
 from src.auth.seed import seed_campaigns_if_empty, seed_if_empty, seed_provider_costs, sync_telephony_from_yaml
 from src.bootstrap import (
-    build_platform_retriever,
+    PerCrmRetrieverRegistry,
     build_provider_registry,
     build_runtime_registry,
     make_bridge_factory,
@@ -165,22 +165,28 @@ async def _reap_stale_calls_loop() -> None:
         await asyncio.sleep(_REAP_INTERVAL_S)
 
 
-async def _seed_global_kb(platform_retriever, sessionmaker) -> None:
-    """Re-ingest bundled global KB docs into the platform FAISS index at startup.
+async def _seed_crm_kb(crm_retrievers: "PerCrmRetrieverRegistry", sessionmaker) -> None:
+    """Re-ingest bundled global KB docs into every existing CRM's KB at startup.
 
-    FAISS is in-memory and lost on each deploy; this seeds it on boot from docs
-    bundled at data/kb/global/. Uses deterministic doc_ids (filename-based) so
-    KBDocument DB rows are replaced, not duplicated, across restarts. Docs are
-    stored with tenant_id=NULL (platform-level, shared across all tenants).
+    Docs bundled at data/kb/global/ are seeded into EVERY CRM row that exists
+    at boot time (there is exactly one — 'betstudio' — as of this writing;
+    if more CRMs are added later, each gets its own copy of these bundled
+    docs, since there's no per-CRM bundled-docs directory concept today).
+    Uses deterministic doc_ids (filename-based) so CrmKBDocument DB rows are
+    replaced, not duplicated, across restarts.
     """
-    from sqlalchemy import delete as sa_delete
+    from sqlalchemy import delete as sa_delete, select
 
     from src.interfaces.vector_store import Document
-    from src.models.benchmark import PlatformKBDocument
+    from src.models.crm import Crm, CrmKBDocument
     from src.rag.ingestion import ChunkConfig, detect_language, get_chunker, parse_document
 
     kb_dir = Path("data/kb/global")
     if not kb_dir.is_dir():
+        return
+    async with sessionmaker() as session:
+        crm_ids = [r[0] for r in (await session.execute(select(Crm.id))).all()]
+    if not crm_ids:
         return
     exts = {".md", ".txt", ".pdf", ".docx", ".csv"}
     files = sorted(
@@ -193,42 +199,46 @@ async def _seed_global_kb(platform_retriever, sessionmaker) -> None:
     chunker = get_chunker(ChunkConfig())
     total = 0
     for f in files:
-        doc_id = f"global_kb_{f.stem}"
         try:
             text = parse_document(f.name, f.read_bytes())
             if not text.strip():
                 continue
             language = detect_language(text)
-            raw_chunks = chunker(text, {
-                "filename": f.name, "document_id": doc_id, "language": language,
-            })
-            if not raw_chunks:
-                continue
-            docs = [
-                Document(
-                    id=f"{doc_id}::chunk-{c.index}",
-                    content=c.text,
-                    metadata={**c.metadata, "section": c.index, "page": c.index},
-                )
-                for c in raw_chunks
-            ]
-            n = await platform_retriever.index(docs)
-            total += n
-            async with sessionmaker() as session:
-                await session.execute(
-                    sa_delete(PlatformKBDocument).where(PlatformKBDocument.id == doc_id)
-                )
-                session.add(PlatformKBDocument(
-                    id=doc_id, filename=f.name,
-                    source_type=f.suffix.lstrip(".").lower(),
-                    language=language, chunk_count=n,
-                    extra_data={"chunk_ids": [d.id for d in docs]},
-                ))
-                await session.commit()
+            for crm_id in crm_ids:
+                retriever = crm_retrievers.get(crm_id)
+                if retriever is None:
+                    continue
+                doc_id = f"crm_kb_{crm_id}_{f.stem}"
+                raw_chunks = chunker(text, {
+                    "filename": f.name, "document_id": doc_id, "language": language,
+                })
+                if not raw_chunks:
+                    continue
+                docs = [
+                    Document(
+                        id=f"{doc_id}::chunk-{c.index}",
+                        content=c.text,
+                        metadata={**c.metadata, "section": c.index, "page": c.index},
+                    )
+                    for c in raw_chunks
+                ]
+                n = await retriever.index(docs)
+                total += n
+                async with sessionmaker() as session:
+                    await session.execute(
+                        sa_delete(CrmKBDocument).where(CrmKBDocument.id == doc_id)
+                    )
+                    session.add(CrmKBDocument(
+                        id=doc_id, crm_id=crm_id, filename=f.name,
+                        source_type=f.suffix.lstrip(".").lower(),
+                        language=language, chunk_count=n,
+                        extra_data={"chunk_ids": [d.id for d in docs]},
+                    ))
+                    await session.commit()
         except Exception:  # noqa: BLE001 - one bad file must not abort the whole seed
-            log.exception("global KB seed failed", extra={"file": f.name})
+            log.exception("crm KB seed failed", extra={"file": f.name})
     if total:
-        log.info("platform KB seeded", extra={"files": len(files), "chunks": total})
+        log.info("CRM KB seeded", extra={"files": len(files), "chunks": total, "crms": len(crm_ids)})
 
 
 @asynccontextmanager
@@ -329,7 +339,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # webhooks. Real where impls exist, honest stubs for the fake-only ones.
     runtime_registry = build_runtime_registry(providers, base_session_store)
     app.state.registry = runtime_registry
-    platform_retriever = build_platform_retriever(
+    crm_retrievers = PerCrmRetrieverRegistry(
         global_defaults={"vector_store": settings.pipeline.vector_store.model_dump()},
     )
     # Drop ALL cached per-tenant instances (providers + sub-registries) whenever
@@ -352,20 +362,20 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         make_bridge_factory(
             providers=providers, session_store=base_session_store,
             campaign_resolver=campaign_resolver,
-            platform_retriever=platform_retriever,
+            crm_retrievers=crm_retrievers,
         )
     )
     telephony_hooks.set_exotel_bridge_factory(
         make_exotel_bridge_factory(
             providers=providers, session_store=base_session_store,
             campaign_resolver=campaign_resolver,
-            platform_retriever=platform_retriever,
+            crm_retrievers=crm_retrievers,
         )
     )
     telephony_hooks.set_stringee_bridge_factory(
         make_stringee_bridge_factory(
             providers=providers, campaign_resolver=campaign_resolver,
-            platform_retriever=platform_retriever,
+            crm_retrievers=crm_retrievers,
         )
     )
     # The browser voice bridge is wired ALWAYS (not just for the dev console) so
@@ -376,14 +386,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         make_browser_bridge_factory(
             providers=providers, campaign_resolver=campaign_resolver,
             handoff_store=base_session_store,
-            platform_retriever=platform_retriever,
+            crm_retrievers=crm_retrievers,
         )
     )
     if dev_console_enabled():
         set_live_bridge_factory(
             make_live_bridge_factory(
                 providers=providers, campaign_resolver=campaign_resolver,
-                platform_retriever=platform_retriever,
+                crm_retrievers=crm_retrievers,
             )
         )
         log.info("dev console enabled at /dev/voice")
@@ -394,7 +404,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # to resolve the tenant from the chat_sessions row and persist messages.
     chat_api.set_chatbot_factory(
         make_chatbot_factory(runtime_registry, sessionmaker,
-                             platform_retriever=platform_retriever))
+                             crm_retrievers=crm_retrievers))
     chat_api.set_chat_sessionmaker(sessionmaker)
     chat_api.set_chat_handoff_store(base_session_store)
     ext_chat_api.set_ext_redis(redis_client)
@@ -419,7 +429,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.providers = providers
 
     reaper_task = asyncio.create_task(_reap_stale_calls_loop())
-    kb_seed_task = asyncio.create_task(_seed_global_kb(platform_retriever, sessionmaker))
+    kb_seed_task = asyncio.create_task(_seed_crm_kb(crm_retrievers, sessionmaker))
 
     try:
         yield
