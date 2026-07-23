@@ -164,7 +164,7 @@ class ChatBotAgent(BaseAgent):
         session: AgentSession,
         llm: ILLMProvider,
         retriever: HybridRetriever,
-        platform_retriever: Optional[HybridRetriever] = None,
+        crm_retriever: Optional[HybridRetriever] = None,
         llm_config: Optional[LLMConfig] = None,
         company_name: str = "[Your Company]",
         language_default: str = "en",
@@ -185,10 +185,10 @@ class ChatBotAgent(BaseAgent):
         )
         self._llm = llm
         self._retriever = retriever
-        self._platform_retriever = platform_retriever
-        # Ordered list: platform KB first (broadest), then tenant-specific.
+        self._crm_retriever = crm_retriever
+        # Ordered list: the linked CRM's shared KB first, then tenant-specific.
         self._retrievers: list[HybridRetriever] = [
-            r for r in [platform_retriever, retriever] if r is not None
+            r for r in [crm_retriever, retriever] if r is not None
         ]
         self._llm_config = llm_config or LLMConfig(response_format="json", max_tokens=4096)
         self._company = company_name

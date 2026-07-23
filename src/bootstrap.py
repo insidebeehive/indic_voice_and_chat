@@ -24,6 +24,7 @@ import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
 
 from fastapi import WebSocket
 
@@ -83,37 +84,74 @@ DEFAULT_DEMO_SCRIPT = VoiceBotScript(
 # --- Per-tenant runtime builders ---------------------------------------
 
 
-def build_platform_retriever(
+def build_crm_retriever(
+    crm_id: str,
     global_defaults: dict | None = None,
-    base_vector_path: Path = Path("data/faiss"),
-) -> "HybridRetriever":
-    """One shared retriever for the global KB (all tenants).
+) -> Optional["HybridRetriever"]:
+    """One retriever for a single CRM's shared KB (pgvector only).
 
-    Provider is driven by global_defaults["vector_store"]["provider"]:
-    - "faiss"    → FAISS files at data/faiss/platform/
-    - "pgvector" → voicebot.knowledge_chunks table with tenant_id IS NULL
-    Defaults to faiss if global_defaults is not supplied.
+    Returns ``None`` if the configured vector_store provider isn't pgvector
+    (FAISS has no CRM-level tier — out of scope per
+    docs/superpowers/specs/2026-07-23-crm-kb-design.md) or if construction
+    fails for any reason (e.g. the pgvector table/column isn't set up yet in
+    this environment) — callers treat ``None`` exactly like "this CRM has no
+    KB", never an error.
     """
     from src.providers import get_vector_store
     from src.rag.embeddings import GeminiEmbedder
     from src.rag.retriever import HybridRetriever, RetrievalConfig
 
     vs_cfg = dict((global_defaults or {}).get("vector_store", {}))
-    vs_cfg.setdefault("provider", "faiss")
-    vs_cfg.setdefault("embedding_dim", 384)
-    vs_cfg["tenant_id"] = None  # platform chunks are unscoped
+    provider = vs_cfg.get("provider", "faiss")
+    if provider != "pgvector":
+        return None
+    vs_cfg["embedding_dim"] = vs_cfg.get("embedding_dim", 384)
+    vs_cfg["crm_id"] = crm_id
+    vs_cfg.pop("tenant_id", None)
 
-    if vs_cfg["provider"] == "faiss":
-        platform_path = base_vector_path / "platform"
-        platform_path.mkdir(parents=True, exist_ok=True)
-        vs_cfg["index_path"] = str(platform_path / "index")
-
-    vector_store = get_vector_store(vs_cfg)
+    try:
+        vector_store = get_vector_store(vs_cfg)
+    except Exception:
+        log.exception("build_crm_retriever: failed to build vector store", extra={"crm_id": crm_id})
+        return None
     return HybridRetriever(
         embedder=GeminiEmbedder(dim=384),
         vector_store=vector_store,
         config=RetrievalConfig(),
     )
+
+
+class PerCrmRetrieverRegistry:
+    """Lazy ``crm_id -> HybridRetriever | None`` cache (pgvector only).
+
+    Same shape as ``_PerTenantRegistry`` (``src/auth/registry.py``), keyed by
+    a plain ``crm_id`` string instead of a ``TenantContext`` — there is no
+    per-CRM eviction need today (pgvector reads live from the DB on every
+    query; nothing about a CRM's KB docs is cached client-side beyond the
+    thin adapter object itself).
+    """
+
+    def __init__(self, global_defaults: dict | None = None) -> None:
+        self._global_defaults = global_defaults or {}
+        self._items: dict[str, Optional["HybridRetriever"]] = {}
+
+    def get(self, crm_id: str) -> Optional["HybridRetriever"]:
+        if crm_id not in self._items:
+            self._items[crm_id] = build_crm_retriever(crm_id, self._global_defaults)
+        return self._items[crm_id]
+
+
+def _crm_retriever_for(
+    tenant: TenantContext, crm_retrievers: Optional[PerCrmRetrieverRegistry],
+) -> Optional["HybridRetriever"]:
+    """Resolve this tenant's linked CRM's retriever, or None (no link / no
+    registry / that CRM has no usable KB) — never an error."""
+    if crm_retrievers is None:
+        return None
+    crm_id = getattr(tenant.settings, "crm_id", None)
+    if not crm_id:
+        return None
+    return crm_retrievers.get(crm_id)
 
 
 def build_provider_registry(
@@ -346,7 +384,7 @@ async def resolve_crm_tools(
     return specs, execs, "crm_catalog"
 
 
-def make_chatbot_factory(registry, sessionmaker=None, platform_retriever=None):
+def make_chatbot_factory(registry, sessionmaker=None, crm_retrievers: "PerCrmRetrieverRegistry | None" = None):
     """Per-(tenant, session) ChatBotAgent factory for ``chat.set_chatbot_factory``.
 
     Uses the platform-level LLM (global defaults, no tenant override) so all chat
@@ -434,7 +472,7 @@ def make_chatbot_factory(registry, sessionmaker=None, platform_retriever=None):
             session=AgentSession(session_id=session_id),
             llm=registry.providers.get_platform_llm(),
             retriever=registry.retrievers.get(tenant),
-            platform_retriever=platform_retriever,
+            crm_retriever=_crm_retriever_for(tenant, crm_retrievers),
             company_name=tenant.name,
             language_default=getattr(tenant.settings, "default_language", None) or "en",
             store=registry.session_stores.get(tenant),
