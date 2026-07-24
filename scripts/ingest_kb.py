@@ -5,9 +5,16 @@ Posts every supported file under ``--dir`` to ``POST /api/v1/knowledge/ingest``
 with the tenant's bearer token. Use it to load the global KB (the chatbot then
 answers general queries from it via RAG).
 
-Example:
+Example (bulk):
   python scripts/ingest_kb.py \
     --dir /path/to/kb/global \
+    --base-url https://voicebot.biznexis.in \
+    --token vox_xxxxx
+
+Example (single file — e.g. onboarding a tenant's layout-specific KB doc,
+see data/kb/layouts/operator-to-layout.md):
+  python scripts/ingest_kb.py \
+    --file data/kb/layouts/layout-1.md \
     --base-url https://voicebot.biznexis.in \
     --token vox_xxxxx
 
@@ -27,24 +34,62 @@ import httpx
 _DEFAULT_EXTS = ".md,.txt,.pdf,.docx,.csv"
 
 
+def _collect_files(
+    dir_arg: str | None, file_args: list[str] | None, exts: set[str],
+) -> list[pathlib.Path]:
+    """Resolve the final file list from --dir (recursive, extension-filtered
+    sweep) and/or --file (explicit paths — ingested regardless of the
+    extension filter, since naming one directly is an intentional choice).
+    De-duplicates by resolved path (a --file path may already be covered by
+    an overlapping --dir sweep)."""
+    files: list[pathlib.Path] = []
+    if dir_arg:
+        root = pathlib.Path(dir_arg)
+        files.extend(
+            p for p in root.rglob("*")
+            if p.is_file() and p.suffix.lower() in exts and not p.name.startswith(".")
+        )
+    if file_args:
+        for f in file_args:
+            p = pathlib.Path(f)
+            if not p.is_file():
+                raise FileNotFoundError(f"--file path not found: {f}")
+            files.append(p)
+    seen: set[pathlib.Path] = set()
+    unique: list[pathlib.Path] = []
+    for p in files:
+        rp = p.resolve()
+        if rp not in seen:
+            seen.add(rp)
+            unique.append(p)
+    return sorted(unique)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--dir", required=True, help="directory of docs to ingest (recursive)")
+    ap.add_argument("--dir", help="directory of docs to ingest (recursive, extension-filtered)")
+    ap.add_argument(
+        "--file", nargs="+",
+        help="one or more explicit file paths to ingest (bypasses the --ext filter)",
+    )
     ap.add_argument("--base-url", required=True, help="e.g. https://voicebot.biznexis.in")
     ap.add_argument("--token", required=True, help="tenant bearer token (vox_...)")
-    ap.add_argument("--ext", default=_DEFAULT_EXTS, help="comma-separated extensions")
+    ap.add_argument("--ext", default=_DEFAULT_EXTS, help="comma-separated extensions (applies to --dir only)")
     args = ap.parse_args()
+
+    if not args.dir and not args.file:
+        print("error: at least one of --dir or --file is required", file=sys.stderr)
+        return 2
 
     exts = {e if e.startswith(".") else f".{e}" for e in args.ext.split(",")}
     base = args.base_url.rstrip("/")
-    root = pathlib.Path(args.dir)
-    # Skip macOS resource-fork files (._foo) and dotfiles.
-    files = sorted(
-        p for p in root.rglob("*")
-        if p.is_file() and p.suffix.lower() in exts and not p.name.startswith(".")
-    )
+    try:
+        files = _collect_files(args.dir, args.file, exts)
+    except FileNotFoundError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
     if not files:
-        print(f"no files with {sorted(exts)} under {root}", file=sys.stderr)
+        print(f"no files with {sorted(exts)} under {args.dir}", file=sys.stderr)
         return 1
 
     ok = 0
