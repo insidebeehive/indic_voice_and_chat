@@ -77,6 +77,29 @@ Knowledge base:
   behavior. The tenant+CRM merge described above applies to the chat agent's
   per-turn retrieval (`ChatBotAgent`, `/knowledge/query`), not this one-shot
   voice path.
+- **Frontend UI/navigation KB:** `data/kb/global/frontend-ui/` (11 files,
+  `ui-`-prefixed to keep every stem under `data/kb/global/` unique — see the
+  design spec) documents UI/navigation behavior common to every layout; it
+  rides the same CRM-wide auto-seed as the backend docs above, no extra
+  step needed. `data/kb/layouts/layout-N.md` (one per frontend package —
+  `layout-1` … `layout-9`, `layout-sports`) documents UI **deltas** specific
+  to one layout — these are NOT auto-seeded (they'd contradict each other
+  across tenants on different layouts) and must be ingested per-tenant.
+  **Standing process — do this whenever a new tenant/operator is
+  registered:** look up its layout in
+  `data/kb/layouts/operator-to-layout.md` (a mechanical operator → layout
+  mapping, reference-only — never ingest this file or `data/kb/layouts/README.md`
+  into any bot KB), then run:
+  ```bash
+  python scripts/ingest_kb.py \
+    --file data/kb/layouts/layout-N.md \
+    --base-url <that tenant's base URL> \
+    --token <that tenant's bearer token>
+  ```
+  This lands the doc as a normal tenant-scoped `KBDocument` — no new entity,
+  no per-layout admin UI; see
+  `docs/superpowers/specs/2026-07-24-frontend-kb-design.md` for the full
+  rationale.
 
 CRM tools:
 - `POST /chat/tools` — register endpoints the bot may call (`name`, `endpoint`,
