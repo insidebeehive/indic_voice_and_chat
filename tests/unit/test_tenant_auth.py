@@ -70,7 +70,9 @@ def test_bearer_token_resolves_tenant(resolver) -> None:
     assert resp.json()["slug"] == "acme"
 
 
-def test_x_tenant_slug_header_resolves(resolver) -> None:
+def test_x_tenant_slug_header_alone_returns_401(resolver) -> None:
+    """X-Tenant-Slug with no Authorization header must not resolve a tenant —
+    slugs are not secrets, so this must not be enough to impersonate a tenant."""
     resolver.register(_settings("acme"))
 
     async def route(t: TenantContext = Depends(current_tenant)):
@@ -78,7 +80,41 @@ def test_x_tenant_slug_header_resolves(resolver) -> None:
 
     client = TestClient(_app(route))
     resp = client.get("/who", headers={"X-Tenant-Slug": "acme"})
+    assert resp.status_code == 401
+
+
+def test_x_tenant_slug_header_with_non_admin_token_returns_401(resolver) -> None:
+    """A non-admin bearer token must not unlock the X-Tenant-Slug path either."""
+    set_admin_tokens(["super-admin-token"])
+    resolver.register(_settings("acme"), plaintext_tokens=["tenant-token"])
+
+    async def route(t: TenantContext = Depends(current_tenant)):
+        return {"slug": t.slug}
+
+    client = TestClient(_app(route))
+    resp = client.get(
+        "/who",
+        headers={"X-Tenant-Slug": "acme", "Authorization": "Bearer some-random-token"},
+    )
+    assert resp.status_code == 401
+
+
+def test_x_tenant_slug_header_with_valid_admin_token_resolves(resolver) -> None:
+    """A genuine admin bearer token alongside X-Tenant-Slug is the only way
+    to resolve a tenant via the slug header — the intended, secure behavior."""
+    set_admin_tokens(["super-admin-token"])
+    resolver.register(_settings("acme"))
+
+    async def route(t: TenantContext = Depends(current_tenant)):
+        return {"slug": t.slug}
+
+    client = TestClient(_app(route))
+    resp = client.get(
+        "/who",
+        headers={"X-Tenant-Slug": "acme", "Authorization": "Bearer super-admin-token"},
+    )
     assert resp.status_code == 200
+    assert resp.json()["slug"] == "acme"
 
 
 def test_missing_auth_returns_401(resolver) -> None:

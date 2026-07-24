@@ -5,8 +5,10 @@ Resolution sources (in priority order):
 1. ``Authorization: Bearer <token>``  — looked up by SHA-256 hash in the
    ``tenant_api_keys`` table (or the in-process registry under test).
 2. ``X-Tenant-Slug: <slug>``  — admin-style header for trusted internal
-   callers. Only honored when ``allow_header`` is True (i.e. behind an
-   admin-only route).
+   callers. Only honored when ``allow_header`` is True *and* the request
+   also carries a valid ``Authorization: Bearer <admin-token>`` (checked
+   against the same ``_admin_token_hashes`` set ``require_admin`` uses) —
+   a tenant slug alone (or a non-admin bearer token) is never sufficient.
 3. Twilio voice webhook: ``To`` form param → ``tenant_phone_numbers`` row.
 4. Twilio Media Streams WS: ``?tenant=<slug>`` query param the voice TwiML
    set on the stream URL.
@@ -117,13 +119,14 @@ async def _resolve(request: Request, *, allow_slug_header: bool = False) -> Opti
         return None
 
     auth = request.headers.get("authorization") or request.headers.get("Authorization")
+    bearer_token: Optional[str] = None
     if auth and auth.lower().startswith("bearer "):
-        token = auth.split(" ", 1)[1].strip()
-        tctx = await _resolver.resolve_by_token(hash_api_token(token))
+        bearer_token = auth.split(" ", 1)[1].strip()
+        tctx = await _resolver.resolve_by_token(hash_api_token(bearer_token))
         if tctx is not None:
             return tctx
 
-    if allow_slug_header:
+    if allow_slug_header and bearer_token and hash_api_token(bearer_token) in _admin_token_hashes:
         slug = request.headers.get("x-tenant-slug") or request.headers.get("X-Tenant-Slug")
         if slug:
             return await _resolver.resolve_by_slug(slug)
