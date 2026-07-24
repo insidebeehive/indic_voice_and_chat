@@ -16,7 +16,7 @@ from src.auth.context import hash_api_token
 from src.auth.db_resolver import DbTenantResolver
 from src.auth.middleware import set_admin_tokens, set_tenant_resolver
 from src.models.database import Base
-from src.models.tenant import TenantSecret
+from src.models.tenant import Tenant, TenantSecret
 
 ADMIN_HEADERS = {"Authorization": "Bearer admin-token"}
 
@@ -364,6 +364,26 @@ async def test_register_duplicate_slug_409(ctx) -> None:
     await client.post("/tenants", json=_body(slug="dup"), headers=ADMIN_HEADERS)
     resp = await client.post("/tenants", json=_body(slug="dup"), headers=ADMIN_HEADERS)
     assert resp.status_code == 409
+
+
+async def test_register_with_crm_id_links_tenant_to_crm(ctx) -> None:
+    """Registration can link the new tenant to a shared Crm row in one step
+    (previously only possible via a follow-up PATCH .../tenants/{id})."""
+    client, _, sm = ctx
+    from src.models.crm import Crm
+
+    async with sm() as s:
+        s.add(Crm(id="betstudio", name="BetStudio", base_url="https://crm.example.com"))
+        await s.commit()
+
+    resp = await client.post(
+        "/tenants", json=_body(slug="acme", crm_id="betstudio"), headers=ADMIN_HEADERS)
+    assert resp.status_code == 201
+    tid = resp.json()["tenant_id"]
+
+    async with sm() as s:
+        t = await s.get(Tenant, tid)
+    assert t.crm_id == "betstudio"
 
 
 async def test_list_tenants_shows_mode_and_models(ctx) -> None:

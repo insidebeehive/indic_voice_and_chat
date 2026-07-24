@@ -101,6 +101,11 @@ class RegisterTenantRequest(BaseModel):
     # Injected into every CRM tool call as "operator_id" so the CRM can scope
     # responses. Defaults to the platform's tenant ID if not provided.
     crm_operator_id: Optional[str] = None
+    # Which Crm entity row this tenant links to (the real Tenant.crm_id FK).
+    # Unrelated to crm_operator_id above — that's an opaque identifier string
+    # injected into tool calls, this is which shared CRM (tools/KB) the tenant
+    # is attached to. Don't conflate the two.
+    crm_id: Optional[str] = None
 
 
 class RegisterTenantResponse(BaseModel):
@@ -236,6 +241,7 @@ async def register_tenant(
         timezone=req.timezone, default_language=req.default_language,
         mode=req.mode, max_concurrent_calls=req.max_concurrent_calls,
         pipeline_config=pipeline_config,
+        crm_id=req.crm_id,
     ))
     for ph in tel.phone_numbers:
         session.add(TenantPhoneNumber(

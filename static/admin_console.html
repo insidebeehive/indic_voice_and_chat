@@ -108,6 +108,9 @@
 
       <!-- CRM integration -->
       <div class="grid">
+        <label>CRM <span class="hint" style="display:inline">(optional — link to a shared CRM's tools/KB now, or later in backoffice)</span>
+          <select id="t_crm_id"><option value="">— none —</option></select>
+        </label>
         <label>Events webhook URL <span class="hint" style="display:inline">(optional — can set later in backoffice)</span>
           <input id="t_webhook" placeholder="https://crm.example.com/vox-events" />
         </label>
@@ -265,6 +268,23 @@ async function updateCost(kind, provider, model) {
   if (r.ok) loadCosts();
 }
 
+async function loadCrmOptions() {
+  const r = await api("GET", "/api/v1/crms");
+  const sel = $("t_crm_id");
+  if (!sel) return;
+  sel.innerHTML = "";
+  const none = document.createElement("option");
+  none.value = ""; none.textContent = "— none —";
+  sel.appendChild(none);
+  if (r.ok) {
+    for (const c of (r.json || [])) {
+      const o = document.createElement("option");
+      o.value = c.id; o.textContent = c.name;
+      sel.appendChild(o);
+    }
+  }
+}
+
 // ── Register ────────────────────────────────────────────────────────────────
 async function registerTenant() {
   const body = {
@@ -276,6 +296,7 @@ async function registerTenant() {
     },
   };
   if ($("t_slug").value.trim())      body.slug              = $("t_slug").value.trim();
+  if ($("t_crm_id").value)           body.crm_id            = $("t_crm_id").value;
   if ($("t_webhook").value.trim())   body.events_webhook_url = $("t_webhook").value.trim();
   if ($("t_crm_op").value.trim())    body.crm_operator_id   = $("t_crm_op").value.trim();
   if ($("t_wh_secret").value.trim()) body.telephony = { provider: "none", keys: { events_webhook_secret: $("t_wh_secret").value.trim() } };
@@ -288,6 +309,7 @@ async function registerTenant() {
 loadCreds();
 loadCatalog();
 loadCosts();
+loadCrmOptions();
 </script>
 </body>
 </html>
