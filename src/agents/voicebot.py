@@ -346,6 +346,22 @@ class VoiceBotAgent(BaseAgent):
                     "metrics": metrics_dict or {},
                 },
             )
+            if metrics_dict:
+                # Redis-persisted turn metadata (above) is TTL-bound and expires;
+                # this log line is the durable record used for cross-provider
+                # latency benchmarking (Northflank's log retention outlives the
+                # session). Only fired for real pipeline turns — callers that
+                # skip STT/LLM/TTS timing (e.g. the S2S Live bridge's
+                # apply_signal call) don't pass metrics_dict at all, so this
+                # naturally stays silent there.
+                log.info("voice turn metrics", extra={
+                    "session_id": self.session.session_id,
+                    "campaign_id": self.session.campaign_id,
+                    "stt_provider": type(getattr(self._engine, "_stt", None)).__name__,
+                    "llm_provider": type(getattr(self._engine, "_llm", None)).__name__,
+                    "tts_provider": type(getattr(self._engine, "_tts", None)).__name__,
+                    "metrics": metrics_dict,
+                })
         if sentiment:
             self.session.sentiment_history.append(sentiment)
 

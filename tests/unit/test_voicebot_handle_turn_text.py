@@ -280,3 +280,86 @@ async def test_apply_signal_escalation_action_transitions_to_ended():
     await agent.apply_signal(user_text="transfer me", agent_text="jee, transfer kar rahi hoon",
                              action="transfer")
     assert agent.state.state is State.ENDED
+
+
+# --- apply_signal: structured per-turn metrics logging ----------------------
+
+
+class _StubSTT:
+    pass
+
+
+class _StubLLM:
+    pass
+
+
+class _StubTTS:
+    pass
+
+
+@pytest.mark.asyncio
+async def test_apply_signal_logs_metrics_when_metrics_dict_present(caplog):
+    """A real metrics_dict (as passed by _finish_turn from the pipeline) must
+    produce exactly one durable structured log line naming the provider
+    classes and carrying the raw metrics — this is the only durable record
+    once the Redis-persisted turn TTLs out."""
+    from src.agents.state_machine import Event
+
+    engine = _FakeEngine(None)
+    engine._stt = _StubSTT()
+    engine._llm = _StubLLM()
+    engine._tts = _StubTTS()
+    agent = VoiceBotAgent(
+        session=AgentSession(session_id="t-metrics", campaign_id="camp-1", lead_data={}),
+        state_machine=AgentStateMachine(),
+        slot_schema=SlotSchema(),
+        script=VoiceBotScript(agent_name="Anaaya", agent_role="sales", company_name="X"),
+        engine=engine,
+        store=None,
+    )
+    await agent.start()
+    await agent.state.fire(Event.UTTERANCE_COMPLETE)
+
+    metrics_dict = {
+        "stt_latency_ms": 120,
+        "llm_ttft_ms": 300,
+        "llm_total_ms": 900,
+        "tts_first_chunk_ms": 150,
+        "tts_total_ms": 700,
+        "total_latency_ms": 1400,
+    }
+    with caplog.at_level("INFO", logger="src.agents.voicebot"):
+        await agent.apply_signal(
+            user_text="haan bhej do", agent_text="ज़रूर!",
+            action="continue", metrics_dict=metrics_dict,
+        )
+
+    records = [r for r in caplog.records if r.getMessage() == "voice turn metrics"]
+    assert len(records) == 1
+    rec = records[0]
+    assert rec.session_id == "t-metrics"
+    assert rec.campaign_id == "camp-1"
+    assert rec.stt_provider == "_StubSTT"
+    assert rec.llm_provider == "_StubLLM"
+    assert rec.tts_provider == "_StubTTS"
+    assert rec.metrics == metrics_dict
+
+
+@pytest.mark.asyncio
+async def test_apply_signal_does_not_log_metrics_when_absent(caplog):
+    """Callers that don't carry real STT/LLM/TTS timing (e.g. the S2S Live
+    bridge's apply_signal call, which omits metrics_dict entirely) must not
+    trigger the metrics log line on every turn."""
+    from src.agents.state_machine import Event
+
+    agent = _agent_with_slots(SlotSchema())
+    await agent.start()
+    await agent.state.fire(Event.UTTERANCE_COMPLETE)
+
+    with caplog.at_level("INFO", logger="src.agents.voicebot"):
+        await agent.apply_signal(
+            user_text="bye", agent_text="dhanyavaad jee", action="continue",
+        )
+
+    records = [r for r in caplog.records if r.getMessage() == "voice turn metrics"]
+    assert records == []
