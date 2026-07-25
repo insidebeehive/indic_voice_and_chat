@@ -6,6 +6,7 @@ with an embedder and (optionally) a reranker — see ``src.rag.retriever``.
 
 Endpoints:
 - POST   /knowledge/ingest         multipart upload, parses + chunks + indexes
+- POST   /knowledge/ingest-layout  ingest a bundled frontend-layout KB doc (server-side file read)
 - GET    /knowledge/documents      list ingested documents (Phase 5+: paginate)
 - DELETE /knowledge/documents/{id} remove an ingested document
 - POST   /knowledge/query          retrieve top-k chunks for a query (debug)
@@ -144,7 +145,62 @@ class StatsResponse(BaseModel):
     chunk_count: int
 
 
+# Fixed allow-list matching the real files under data/kb/layouts/ — deliberately
+# excludes operator-to-layout.md and README.md (reference-only, never ingestible).
+_ALLOWED_LAYOUTS = {
+    "layout-1", "layout-2", "layout-3", "layout-4", "layout-5",
+    "layout-6", "layout-7", "layout-8", "layout-9", "layout-sports",
+}
+
+
+class IngestLayoutRequest(BaseModel):
+    layout: str
+
+
 # --- Routes -------------------------------------------------------------
+
+
+async def _ingest_text(
+    tenant: TenantContext, session: AsyncSession, *,
+    filename: str, text: str, document_id: Optional[str] = None,
+) -> IngestResponse:
+    """Chunk+embed+index `text` into the tenant's own retriever, persist a
+    KBDocument row. Shared by the multipart file-upload route and the
+    server-side layout-doc ingestion route below."""
+    if not text.strip():
+        raise HTTPException(status_code=400, detail="document parsed to empty text")
+    retriever = _retriever_for(tenant)
+    doc_id = document_id or _new_id()
+    language = detect_language(text)
+    chunker = get_chunker(_chunk_config)
+    raw_chunks = chunker(text, {
+        "filename": filename, "document_id": doc_id, "language": language,
+        "tenant_id": tenant.id,
+    })
+    if not raw_chunks:
+        raise HTTPException(status_code=400, detail="no chunks produced")
+    docs = [
+        Document(
+            id=f"{doc_id}::chunk-{c.index}", content=c.text,
+            metadata={**c.metadata, "section": c.index, "page": c.index},
+        )
+        for c in raw_chunks
+    ]
+    indexed = await retriever.index(docs)
+    # merge (not add): re-ingesting the same document_id (e.g. the deterministic
+    # layout_<layout> id used by /ingest-layout) updates the existing row instead
+    # of raising a primary-key conflict — safe to call twice for the same id.
+    await session.merge(KBDocument(
+        id=doc_id, tenant_id=tenant.id, filename=filename,
+        source_type=(Path(filename).suffix.lstrip(".").lower() if filename else None),
+        language=language, chunk_count=indexed,
+        extra_data={"chunk_ids": [d.id for d in docs]},
+    ))
+    await session.commit()
+    log.info("ingested document", extra={"document_id": doc_id, "chunks": indexed})
+    return IngestResponse(
+        document_id=doc_id, filename=filename, chunks_indexed=indexed, language=language,
+    )
 
 
 @router.post("/ingest", response_model=IngestResponse)
@@ -154,55 +210,40 @@ async def ingest_document(
     tenant: TenantContext = Depends(current_tenant),
     session: AsyncSession = Depends(get_db_session),
 ) -> IngestResponse:
-    retriever = _retriever_for(tenant)
     data = await file.read()
     if not data:
         raise HTTPException(status_code=400, detail="empty upload")
     text = parse_document(file.filename or "uploaded", data)
-    if not text.strip():
-        raise HTTPException(status_code=400, detail="document parsed to empty text")
+    return await _ingest_text(
+        tenant, session, filename=file.filename or "uploaded",
+        text=text, document_id=document_id,
+    )
 
-    doc_id = document_id or _new_id()
-    language = detect_language(text)
-    chunker = get_chunker(_chunk_config)
-    raw_chunks = chunker(text, {
-        "filename": file.filename,
-        "document_id": doc_id,
-        "language": language,
-        "tenant_id": tenant.id,
-    })
-    if not raw_chunks:
-        raise HTTPException(status_code=400, detail="no chunks produced")
 
-    docs = [
-        Document(
-            id=f"{doc_id}::chunk-{c.index}",
-            content=c.text,
-            metadata={
-                **c.metadata,
-                "section": c.index,
-                "page": c.index,
-            },
-        )
-        for c in raw_chunks
-    ]
-    indexed = await retriever.index(docs)
-    session.add(KBDocument(
-        id=doc_id,
-        tenant_id=tenant.id,
-        filename=file.filename or doc_id,
-        source_type=(Path(file.filename).suffix.lstrip(".").lower() if file.filename else None),
-        language=language,
-        chunk_count=indexed,
-        extra_data={"chunk_ids": [d.id for d in docs]},
-    ))
-    await session.commit()
-    log.info("ingested document", extra={"document_id": doc_id, "chunks": indexed})
-    return IngestResponse(
-        document_id=doc_id,
-        filename=file.filename or "",
-        chunks_indexed=indexed,
-        language=language,
+@router.post("/ingest-layout", response_model=IngestResponse)
+async def ingest_layout_document(
+    req: IngestLayoutRequest,
+    tenant: TenantContext = Depends(current_tenant),
+    session: AsyncSession = Depends(get_db_session),
+) -> IngestResponse:
+    """Ingest a bundled frontend-layout KB doc (data/kb/layouts/layout-N.md)
+    into this tenant's own KB — used by the backoffice's per-tenant layout
+    selector (admin-triggered via X-Tenant-Slug + admin token) or by a
+    tenant calling this directly with its own bearer token. `layout` is
+    validated against a fixed allow-list, since it is used to build a
+    server-side file path — never accept an arbitrary value here."""
+    if req.layout not in _ALLOWED_LAYOUTS:
+        raise HTTPException(status_code=400, detail=f"unknown layout {req.layout!r}")
+    path = Path("data/kb/layouts") / f"{req.layout}.md"
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail=f"layout doc not found: {req.layout}")
+    text = path.read_text(encoding="utf-8")
+    # Deterministic document_id: re-ingesting the same layout for the same
+    # tenant updates the existing KBDocument row (retriever.index upserts
+    # by chunk id) rather than creating duplicates — safe to click twice.
+    return await _ingest_text(
+        tenant, session, filename=f"{req.layout}.md", text=text,
+        document_id=f"layout_{req.layout}",
     )
 
 

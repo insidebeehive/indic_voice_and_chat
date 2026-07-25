@@ -174,6 +174,52 @@ def test_query_when_retriever_unset_returns_503(tmp_faiss_index: str) -> None:
     set_tenant_resolver(None)
 
 
+def test_ingest_layout_valid_name(app: FastAPI) -> None:
+    client = TestClient(app)
+    resp = client.post(
+        "/knowledge/ingest-layout", json={"layout": "layout-1"}, headers=HEADERS,
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["document_id"] == "layout_layout-1"
+    assert body["chunks_indexed"] >= 1
+
+    docs = client.get("/knowledge/documents", headers=HEADERS).json()["documents"]
+    assert any(d["id"] == "layout_layout-1" for d in docs)
+
+
+@pytest.mark.parametrize("bad_layout", ["layout-99", "../../etc/passwd"])
+def test_ingest_layout_rejects_unknown_name(app: FastAPI, bad_layout: str) -> None:
+    client = TestClient(app)
+    resp = client.post(
+        "/knowledge/ingest-layout", json={"layout": bad_layout}, headers=HEADERS,
+    )
+    assert resp.status_code == 400
+    docs = client.get("/knowledge/documents", headers=HEADERS).json()["documents"]
+    assert docs == []
+
+
+def test_ingest_layout_reingest_is_idempotent(app: FastAPI) -> None:
+    client = TestClient(app)
+    first = client.post(
+        "/knowledge/ingest-layout", json={"layout": "layout-1"}, headers=HEADERS,
+    )
+    assert first.status_code == 200
+    second = client.post(
+        "/knowledge/ingest-layout", json={"layout": "layout-1"}, headers=HEADERS,
+    )
+    assert second.status_code == 200
+    docs = client.get("/knowledge/documents", headers=HEADERS).json()["documents"]
+    matching = [d for d in docs if d["id"] == "layout_layout-1"]
+    assert len(matching) == 1
+
+
+def test_ingest_layout_missing_auth_returns_401(app: FastAPI) -> None:
+    client = TestClient(app)
+    resp = client.post("/knowledge/ingest-layout", json={"layout": "layout-1"})
+    assert resp.status_code == 401
+
+
 def test_query_mixes_tenant_and_linked_crm_docs(app: FastAPI) -> None:
     from src.api import knowledge
     from src.providers.vector_store.faiss_store import FAISSAdapter
