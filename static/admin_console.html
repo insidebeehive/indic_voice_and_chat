@@ -117,6 +117,21 @@
         <label>CRM operator ID <span class="hint" style="display:inline">(optional)</span>
           <input id="t_crm_op" placeholder="CRM's operator/brand identifier" />
         </label>
+        <label>Frontend layout <span class="hint" style="display:inline">(optional — shows a reminder command after registration; does NOT ingest automatically)</span>
+          <select id="t_layout">
+            <option value="">— not sure / skip —</option>
+            <option value="layout-1">layout-1</option>
+            <option value="layout-2">layout-2</option>
+            <option value="layout-3">layout-3</option>
+            <option value="layout-4">layout-4</option>
+            <option value="layout-5">layout-5</option>
+            <option value="layout-6">layout-6</option>
+            <option value="layout-7">layout-7</option>
+            <option value="layout-8">layout-8</option>
+            <option value="layout-9">layout-9</option>
+            <option value="layout-sports">layout-sports</option>
+          </select>
+        </label>
         <label>Webhook secret <span class="hint" style="display:inline">(optional — platform default used if blank)</span>
           <input id="t_wh_secret" placeholder="leave blank to use platform secret" />
         </label>
@@ -301,8 +316,23 @@ async function registerTenant() {
   if ($("t_crm_op").value.trim())    body.crm_operator_id   = $("t_crm_op").value.trim();
   if ($("t_wh_secret").value.trim()) body.telephony = { provider: "none", keys: { events_webhook_secret: $("t_wh_secret").value.trim() } };
 
+  const layout = $("t_layout") ? $("t_layout").value : "";
   const r = await api("POST", "/api/v1/tenants", { body });
   show("t_out", r.json);
+  if (r.ok && layout) {
+    const cmd = `python scripts/ingest_kb.py --file data/kb/layouts/${layout}.md --base-url ${base()} --token ${r.json.api_token}`;
+    const note = document.createElement("div");
+    note.className = "hint";
+    note.style.marginTop = ".6rem";
+    const label = document.createElement("strong");
+    label.textContent = "Reminder — ingest this tenant's layout KB doc:";
+    const code = document.createElement("pre");
+    code.style.cssText = "white-space:pre-wrap;background:#0b1220;color:#e2e8f0;padding:.5rem;border-radius:.3rem;margin-top:.3rem;font-size:.8rem;";
+    code.textContent = cmd;
+    note.appendChild(label);
+    note.appendChild(code);
+    $("t_out").appendChild(note);
+  }
 }
 
 // ── Init ────────────────────────────────────────────────────────────────────
