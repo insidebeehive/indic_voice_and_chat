@@ -41,6 +41,7 @@ from src.dialogue.slots import SlotSchema
 from src.interfaces.llm import LLMConfig
 from src.interfaces.stt import STTConfig
 from src.interfaces.tts import TTSConfig
+from src.models.turn_metrics import record_turn_metric
 from src.pipeline.engine import PipelineConfig, PipelineEngine
 from src.pipeline.vad import EnergyVAD
 from src.providers import (
@@ -545,7 +546,8 @@ def _build_s2s_telephony_bridge(
     agent = VoiceBotAgent(
         session=AgentSession(session_id=session_id, lead_data=lead_data),
         state_machine=AgentStateMachine(),
-        slot_schema=slots, script=script, engine=engine, store=store)
+        slot_schema=slots, script=script, engine=engine, store=store,
+        record_metric=lambda payload: record_turn_metric(tenant_id=tenant.id, **payload))
     # Voice: a dev-console override wins (validated against allowed_voices); else config.
     voice = (voice_override or "").strip() or rt.voice
     allowed = getattr(rt, "allowed_voices", None)
@@ -704,6 +706,7 @@ def make_bridge_factory(
             engine=engine,
             store=store,
             kb_context=kb_ctx or None,
+            record_metric=lambda payload: record_turn_metric(tenant_id=tenant.id, **payload),
         )
 
         log.info(
@@ -866,6 +869,7 @@ def make_exotel_bridge_factory(
             engine=engine,
             store=store,
             kb_context=kb_ctx or None,
+            record_metric=lambda payload: record_turn_metric(tenant_id=tenant.id, **payload),
         )
 
         log.info(
@@ -941,6 +945,7 @@ def make_stringee_bridge_factory(
             engine=engine,
             store=None,
             kb_context=_build_kb_context(_crm_retriever_for(tenant, crm_retrievers), None) or None,
+            record_metric=lambda payload: record_turn_metric(tenant_id=tenant.id, **payload),
         )
 
         log.info(

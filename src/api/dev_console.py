@@ -34,6 +34,7 @@ from src.api.call_store import insert_call
 from src.bootstrap import DEFAULT_DEMO_SCRIPT
 from src.config_tenant import platform_webhook_base_url
 from src.models.database import get_sessionmaker
+from src.models.turn_metrics import record_turn_metric
 from src.dialogue.prompts import VoiceBotScript, build_s2s_system_instruction
 from src.dialogue.slots import SlotSchema
 from src.interfaces.realtime import RealtimeConfig
@@ -874,6 +875,7 @@ def make_browser_bridge_factory(
             store=None,
             extra_directives=extra_directives,
             kb_context=kb_ctx,
+            record_metric=lambda payload: record_turn_metric(tenant_id=tenant.id, **payload),
         )
         log.info("dev console built call", extra={"tenant": tenant.slug, "session_id": session_id})
         return BrowserVoiceBridge(
@@ -962,6 +964,7 @@ def make_live_bridge_factory(
             session=AgentSession(session_id=session_id, lead_data=lead_data),
             state_machine=AgentStateMachine(), slot_schema=cur_slots, script=cur_script,
             engine=engine, store=None, kb_context=kb_ctx,
+            record_metric=lambda payload: record_turn_metric(tenant_id=tenant.id, **payload),
         )
 
         # Platform-level key: connect() reads GEMINI_API_KEY.
