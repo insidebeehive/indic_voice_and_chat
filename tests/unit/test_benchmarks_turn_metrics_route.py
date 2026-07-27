@@ -32,7 +32,7 @@ async def client():
                     llm_provider="GeminiLLMAdapter", tts_provider="SarvamTTSAdapter",
                     action="continue", stt_latency_ms=300, llm_ttft_ms=1200,
                     llm_total_ms=4000, tts_first_chunk_ms=2000, tts_total_ms=2500,
-                    total_latency_ms=4300,
+                    total_latency_ms=4300, tts_segments_dropped=1,
                 ),
                 TurnMetric(
                     tenant_id="dev", session_id="c1", campaign_id="bharat_matka",
@@ -40,7 +40,7 @@ async def client():
                     llm_provider="GeminiLLMAdapter", tts_provider="SarvamTTSAdapter",
                     action="continue", stt_latency_ms=280, llm_ttft_ms=1400,
                     llm_total_ms=4200, tts_first_chunk_ms=2100, tts_total_ms=2600,
-                    total_latency_ms=4500,
+                    total_latency_ms=4500, tts_segments_dropped=0,
                 ),
                 TurnMetric(
                     tenant_id="dev", session_id="c2", campaign_id="bharat_matka",
@@ -48,7 +48,7 @@ async def client():
                     llm_provider="AnthropicClaudeAdapter", tts_provider="SarvamTTSAdapter",
                     action="continue", stt_latency_ms=300, llm_ttft_ms=0,
                     llm_total_ms=5000, tts_first_chunk_ms=1900, tts_total_ms=2400,
-                    total_latency_ms=5300,
+                    total_latency_ms=5300, tts_segments_dropped=0,
                 ),
             ])
             await session.commit()
@@ -85,6 +85,7 @@ async def test_summary_groups_by_combo(client: AsyncClient) -> None:
     gemini_combo = combos[("GroqSTTAdapter", "GeminiLLMAdapter", "SarvamTTSAdapter")]
     assert gemini_combo["samples"] == 2
     assert gemini_combo["avg_total_latency_ms"] == 4400.0  # (4300 + 4500) / 2
+    assert gemini_combo["avg_tts_segments_dropped"] == 0.5  # (1 + 0) / 2
 
     claude_combo = combos[("GroqSTTAdapter", "AnthropicClaudeAdapter", "SarvamTTSAdapter")]
     assert claude_combo["samples"] == 1
@@ -127,6 +128,7 @@ async def test_record_turn_metric_then_summary_e2e(
             "tts_first_chunk_ms": 1500,
             "tts_total_ms": 1800,
             "total_latency_ms": 3300,
+            "tts_segments_dropped": 2,
         },
     }
 
@@ -146,3 +148,4 @@ async def test_record_turn_metric_then_summary_e2e(
     assert entry["avg_tts_first_chunk_ms"] == 1500.0
     assert entry["avg_tts_total_ms"] == 1800.0
     assert entry["avg_total_latency_ms"] == 3300.0
+    assert entry["avg_tts_segments_dropped"] == 2.0

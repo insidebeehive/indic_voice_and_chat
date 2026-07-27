@@ -41,6 +41,7 @@ class TurnMetric(Base):
     tts_first_chunk_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     tts_total_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     total_latency_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    tts_segments_dropped: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=False), server_default=func.now()
     )
@@ -79,6 +80,7 @@ async def record_turn_metric(
                 tts_first_chunk_ms=metrics.get("tts_first_chunk_ms", 0),
                 tts_total_ms=metrics.get("tts_total_ms", 0),
                 total_latency_ms=metrics.get("total_latency_ms", 0),
+                tts_segments_dropped=metrics.get("tts_segments_dropped", 0),
             ))
             await db.commit()
     except Exception:  # noqa: BLE001 - must never break a live call

@@ -170,6 +170,7 @@ class TurnMetrics:
     tts_first_chunk_ms: int = 0
     tts_total_ms: int = 0
     total_latency_ms: int = 0
+    tts_segments_dropped: int = 0
 
 
 @dataclass

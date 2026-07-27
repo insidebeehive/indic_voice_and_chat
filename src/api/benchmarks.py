@@ -90,6 +90,7 @@ class TurnMetricsComboEntry(BaseModel):
     avg_tts_first_chunk_ms: float
     avg_tts_total_ms: float
     avg_total_latency_ms: float
+    avg_tts_segments_dropped: float
 
 
 class TurnMetricsSummaryResponse(BaseModel):
@@ -189,6 +190,7 @@ async def turn_metrics_summary(
             func.avg(TurnMetric.tts_first_chunk_ms).label("avg_tts_first_chunk_ms"),
             func.avg(TurnMetric.tts_total_ms).label("avg_tts_total_ms"),
             func.avg(TurnMetric.total_latency_ms).label("avg_total_latency_ms"),
+            func.avg(TurnMetric.tts_segments_dropped).label("avg_tts_segments_dropped"),
         )
         .group_by(TurnMetric.stt_provider, TurnMetric.llm_provider, TurnMetric.tts_provider)
     )
@@ -205,6 +207,7 @@ async def turn_metrics_summary(
             avg_tts_first_chunk_ms=float(r.avg_tts_first_chunk_ms or 0.0),
             avg_tts_total_ms=float(r.avg_tts_total_ms or 0.0),
             avg_total_latency_ms=float(r.avg_total_latency_ms or 0.0),
+            avg_tts_segments_dropped=float(r.avg_tts_segments_dropped or 0.0),
         )
         for r in rows
     ]

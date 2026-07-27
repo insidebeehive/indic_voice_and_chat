@@ -39,6 +39,7 @@ async def test_record_turn_metric_inserts_row(sessionmaker, monkeypatch) -> None
             "tts_first_chunk_ms": 2000,
             "tts_total_ms": 2500,
             "total_latency_ms": 4300,
+            "tts_segments_dropped": 1,
         },
     )
 
@@ -60,6 +61,7 @@ async def test_record_turn_metric_inserts_row(sessionmaker, monkeypatch) -> None
     assert row.tts_first_chunk_ms == 2000
     assert row.tts_total_ms == 2500
     assert row.total_latency_ms == 4300
+    assert row.tts_segments_dropped == 1
     assert row.created_at is not None
 
 
@@ -86,5 +88,6 @@ async def test_record_turn_metric_swallows_db_errors(monkeypatch) -> None:
             "tts_first_chunk_ms": 0,
             "tts_total_ms": 0,
             "total_latency_ms": 0,
+            "tts_segments_dropped": 0,
         },
     )
