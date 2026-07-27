@@ -424,3 +424,51 @@ async def test_end_control_message_emits_outcome_and_hangs_up(monkeypatch):
     assert len(outcome_msgs) == 1  # emitted once on `end`, idempotent in finally
     assert outcome_msgs[0]["outcome"] == "not_interested"
     assert agent.hung_up is True
+
+
+@pytest.mark.asyncio
+async def test_run_with_heartbeat_sends_periodic_status(monkeypatch):
+    import src.api.browser_bridge as bb
+    monkeypatch.setattr(bb, "_HEARTBEAT_INTERVAL_S", 0.05)
+    ws = FakeWebSocket([])
+    bridge = _bridge(ws)
+
+    async def _slow_coro():
+        await asyncio.sleep(0.17)
+        return "done"
+
+    result = await bridge._run_with_heartbeat(_slow_coro())
+    assert result == "done"
+    statuses = [
+        json.loads(t).get("status") for t in ws.sent_text
+        if json.loads(t).get("type") == "status"
+    ]
+    assert statuses.count("thinking") >= 2  # at least 2 heartbeats during the 0.17s sleep at 0.05s interval
+
+
+@pytest.mark.asyncio
+async def test_run_with_heartbeat_stops_after_coro_completes(monkeypatch):
+    import src.api.browser_bridge as bb
+    monkeypatch.setattr(bb, "_HEARTBEAT_INTERVAL_S", 0.05)
+    ws = FakeWebSocket([])
+    bridge = _bridge(ws)
+
+    async def _fast_coro():
+        return "done"
+
+    await bridge._run_with_heartbeat(_fast_coro())
+    count_after = len(ws.sent_text)
+    await asyncio.sleep(0.15)  # would produce more heartbeat sends if the task weren't cancelled
+    assert len(ws.sent_text) == count_after
+
+
+@pytest.mark.asyncio
+async def test_run_with_heartbeat_propagates_coro_exception():
+    ws = FakeWebSocket([])
+    bridge = _bridge(ws)
+
+    async def _failing_coro():
+        raise ValueError("boom")
+
+    with pytest.raises(ValueError, match="boom"):
+        await bridge._run_with_heartbeat(_failing_coro())

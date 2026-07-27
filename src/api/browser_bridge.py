@@ -39,6 +39,9 @@ BROWSER_SAMPLE_RATE = 16000
 
 # Chunk size for outbound PCM frames (bytes). 8 KB ~= 256 ms @16 kHz PCM16.
 _SEND_CHUNK = 8192
+_HEARTBEAT_INTERVAL_S = 10.0  # keep the WS connection active during long-running turns — a
+                                # slow self-hosted TTS provider (e.g. IndicF5) can take longer
+                                # than a network intermediary's idle-connection timeout
 
 # Barge-in: required sustained recognized-speech (ms) while the agent is audible
 # before we treat it as an interruption (vs a one-word "haan/hmm" backchannel).
@@ -184,6 +187,25 @@ class BrowserVoiceBridge:
         pcm = random.choice(clips)
         if pcm and not (self._cancel_event is not None and self._cancel_event.is_set()):
             await self._send_pcm(pcm)
+
+    async def _heartbeat_loop(self) -> None:
+        """Send a periodic status ping while a turn is in flight, so no
+        intermediary (load balancer, proxy) treats a long-running turn as an
+        idle connection and closes it — see _run_with_heartbeat."""
+        while True:
+            await asyncio.sleep(_HEARTBEAT_INTERVAL_S)
+            if self._stopped:
+                return
+            await self._send_json({"type": "status", "status": "thinking"})
+
+    async def _run_with_heartbeat(self, coro):
+        """Run `coro` (a turn-processing call) while a background heartbeat
+        keeps the WebSocket connection visibly active — see _heartbeat_loop."""
+        heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+        try:
+            return await coro
+        finally:
+            heartbeat_task.cancel()
 
     # --- entrypoint ---------------------------------------------------
 
@@ -346,7 +368,9 @@ class BrowserVoiceBridge:
         self._capture_buffer.clear()
         self._endpoint.reset()
         await self._send_json({"type": "status", "status": "thinking"})
-        outcome = await self._agent.handle_turn(captured, self._send_pcm)
+        outcome = await self._run_with_heartbeat(
+            self._agent.handle_turn(captured, self._send_pcm)
+        )
         self._last_action = outcome.response.action
 
         m = outcome.pipeline.metrics
@@ -538,8 +562,10 @@ class BrowserVoiceBridge:
             # breath cancels the upcoming turn cleanly; before the LLM so it masks
             # the latency.
             await self._send_filler()
-            outcome = await self._agent.handle_turn_text(
-                text, self._send_pcm, cancel_event=self._cancel_event
+            outcome = await self._run_with_heartbeat(
+                self._agent.handle_turn_text(
+                    text, self._send_pcm, cancel_event=self._cancel_event
+                )
             )
         except BaseException:  # noqa: BLE001 - cancel/teardown/error must not wedge _agent_busy
             self._agent_busy = False
