@@ -231,7 +231,7 @@ async def test_handle_turn_text_passes_cancel_event_to_engine():
 
 # --- apply_signal (shared by the cascade + the S2S Live bridge) -------------
 
-def _agent_with_slots(schema):
+def _agent_with_slots(schema, record_metric=None):
     return VoiceBotAgent(
         session=AgentSession(session_id="t1", lead_data={}),
         state_machine=AgentStateMachine(),
@@ -239,6 +239,7 @@ def _agent_with_slots(schema):
         script=VoiceBotScript(agent_name="Anaaya", agent_role="sales", company_name="X"),
         engine=_FakeEngine(None),
         store=None,
+        record_metric=record_metric,
     )
 
 
@@ -363,3 +364,80 @@ async def test_apply_signal_does_not_log_metrics_when_absent(caplog):
 
     records = [r for r in caplog.records if r.getMessage() == "voice turn metrics"]
     assert records == []
+
+
+# --- apply_signal: optional record_metric callback --------------------------
+
+
+@pytest.mark.asyncio
+async def test_apply_signal_calls_record_metric_when_present():
+    from src.agents.state_machine import Event
+
+    calls = []
+
+    async def _record_metric(payload):
+        calls.append(payload)
+
+    agent = _agent_with_slots(SlotSchema(), record_metric=_record_metric)
+    await agent.start()
+    await agent.state.fire(Event.UTTERANCE_COMPLETE)
+
+    metrics_dict = {
+        "stt_latency_ms": 300, "llm_ttft_ms": 1200, "llm_total_ms": 4000,
+        "tts_first_chunk_ms": 2000, "tts_total_ms": 2500, "total_latency_ms": 4300,
+    }
+
+    await agent.apply_signal(
+        user_text="hi", agent_text="hello", action="continue",
+        metrics_dict=metrics_dict,
+    )
+
+    assert len(calls) == 1
+    payload = calls[0]
+    assert payload["session_id"] == agent.session.session_id
+    assert payload["mode"] == "layered"
+    assert payload["action"] == "continue"
+    assert payload["metrics"] == metrics_dict
+    assert payload["llm_provider"]  # non-empty class name string
+
+
+@pytest.mark.asyncio
+async def test_apply_signal_record_metric_failure_does_not_break_turn():
+    from src.agents.state_machine import Event
+
+    async def _record_metric(payload):
+        raise RuntimeError("db unavailable")
+
+    agent = _agent_with_slots(SlotSchema(), record_metric=_record_metric)
+    await agent.start()
+    await agent.state.fire(Event.UTTERANCE_COMPLETE)
+
+    metrics_dict = {
+        "stt_latency_ms": 0, "llm_ttft_ms": 0, "llm_total_ms": 0,
+        "tts_first_chunk_ms": 0, "tts_total_ms": 0, "total_latency_ms": 0,
+    }
+
+    # Must not raise.
+    await agent.apply_signal(
+        user_text="hi", agent_text="hello", action="continue",
+        metrics_dict=metrics_dict,
+    )
+
+
+@pytest.mark.asyncio
+async def test_apply_signal_no_record_metric_is_a_no_op():
+    from src.agents.state_machine import Event
+
+    agent = _agent_with_slots(SlotSchema(), record_metric=None)
+    await agent.start()
+    await agent.state.fire(Event.UTTERANCE_COMPLETE)
+
+    metrics_dict = {
+        "stt_latency_ms": 0, "llm_ttft_ms": 0, "llm_total_ms": 0,
+        "tts_first_chunk_ms": 0, "tts_total_ms": 0, "total_latency_ms": 0,
+    }
+    # Must not raise (default behavior, unchanged from before this task).
+    await agent.apply_signal(
+        user_text="hi", agent_text="hello", action="continue",
+        metrics_dict=metrics_dict,
+    )

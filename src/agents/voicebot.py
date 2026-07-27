@@ -15,7 +15,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 from src.agents.base import AgentSession, BaseAgent
 from src.agents.state_machine import AgentStateMachine, Event, State
@@ -70,6 +70,7 @@ class VoiceBotAgent(BaseAgent):
         store=None,
         extra_directives: Optional[list[str]] = None,
         kb_context: Optional[str] = None,
+        record_metric: Optional[Callable[[dict[str, Any]], Awaitable[None]]] = None,
     ) -> None:
         # Always recognise lead_gender so the LLM can infer and report it even
         # when the campaign YAML doesn't define it as a slot.
@@ -83,6 +84,7 @@ class VoiceBotAgent(BaseAgent):
         self._engine = engine
         self._extra_directives = extra_directives
         self._kb_context = kb_context
+        self._record_metric = record_metric
         # The conversation's active language. Starts at the campaign default and
         # switches when the caller speaks/asks for another language (resolved each
         # turn from the LLM-reported + STT-detected signals). Drives per-turn
@@ -362,6 +364,23 @@ class VoiceBotAgent(BaseAgent):
                     "tts_provider": type(getattr(self._engine, "_tts", None)).__name__,
                     "metrics": metrics_dict,
                 })
+                if self._record_metric is not None:
+                    try:
+                        await self._record_metric({
+                            "session_id": self.session.session_id,
+                            "campaign_id": self.session.campaign_id,
+                            "mode": "layered",
+                            "stt_provider": type(getattr(self._engine, "_stt", None)).__name__,
+                            "llm_provider": type(getattr(self._engine, "_llm", None)).__name__,
+                            "tts_provider": type(getattr(self._engine, "_tts", None)).__name__,
+                            "action": action,
+                            "metrics": metrics_dict,
+                        })
+                    except Exception:  # noqa: BLE001 - never break a live call on a metrics-write failure
+                        log.warning(
+                            "record_metric failed; continuing without persistence",
+                            exc_info=True,
+                        )
         if sentiment:
             self.session.sentiment_history.append(sentiment)
 
