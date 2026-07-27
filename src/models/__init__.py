@@ -13,6 +13,7 @@ from src.models.tenant import (
     TenantPhoneNumber,
     TenantSecret,
 )
+from src.models.turn_metrics import TurnMetric
 
 __all__ = [
     "Base",
@@ -34,6 +35,7 @@ __all__ = [
     "TenantPhoneNumber",
     "TenantSecret",
     "Turn",
+    "TurnMetric",
     "get_engine",
     "get_sessionmaker",
 ]
