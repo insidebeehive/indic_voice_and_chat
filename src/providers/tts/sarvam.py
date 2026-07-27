@@ -23,11 +23,12 @@ from src.pipeline.text_normalize import normalize_for_tts
 
 log = logging.getLogger(__name__)
 
-# A TTS request must fail well within the turn budget (TURN_TIMEOUT_S = 20s):
-# otherwise a hung Sarvam request stalls the whole turn in "thinking" until the
-# turn timeout cancels it mid-synthesis (no audio, 20s dead air). With a tight
-# per-request timeout the hang fails fast and one retry can recover a transient
-# blip — total worst case stays under the turn budget.
+# A TTS request must fail well within the per-sentence watchdog
+# (TTS_SENTENCE_TIMEOUT_S = 25s, src/pipeline/engine.py): otherwise a hung
+# Sarvam request gets treated as a dropped segment instead of completing.
+# With a tight per-request timeout the hang fails fast and one retry can
+# recover a transient blip — total worst case (2 attempts) stays under the
+# per-sentence watchdog.
 _DEFAULT_TIMEOUT_S = 8.0
 _TTS_ATTEMPTS = 2  # initial try + 1 retry
 

@@ -47,6 +47,12 @@ from src.pipeline.sentence_detector import SentenceDetector
 
 AudioSink = Callable[[bytes], Awaitable[None]]
 
+LLM_TURN_TIMEOUT_S = 20.0  # legitimate end-to-end LLM-generation budget for one turn
+TTS_SENTENCE_TIMEOUT_S = 25.0  # per-sentence rolling watchdog — covers IndicF5's 10s x 2
+                                # attempts (indicf5.py's _DEFAULT_TIMEOUT_S=10.0,
+                                # _TTS_ATTEMPTS=2) plus margin
+MAX_CONSECUTIVE_TTS_FAILURES = 2
+
 
 def _speakable_from_json(raw: str) -> str:
     """Extract the spoken text (the ``response_text`` field) from a structured
@@ -310,6 +316,7 @@ class PipelineEngine:
 
         async def tts_worker() -> None:
             nonlocal first_audio_at, bytes_sent
+            consecutive_failures = 0
             while True:
                 sentence = await sentence_queue.get()
                 if sentence is None:
@@ -317,10 +324,36 @@ class PipelineEngine:
                 if cancel_event.is_set():
                     continue
                 try:
-                    result = await self._tts.synthesize(sentence, tts_cfg)
+                    result = await asyncio.wait_for(
+                        self._tts.synthesize(sentence, tts_cfg),
+                        timeout=TTS_SENTENCE_TIMEOUT_S,
+                    )
+                except asyncio.TimeoutError:
+                    log.error(
+                        "TTS synthesize timed out after %.0fs: %r",
+                        TTS_SENTENCE_TIMEOUT_S, sentence[:60],
+                    )
+                    metrics.tts_segments_dropped += 1
+                    consecutive_failures += 1
+                    if consecutive_failures >= MAX_CONSECUTIVE_TTS_FAILURES:
+                        log.error(
+                            "aborting turn: %d consecutive TTS failures",
+                            consecutive_failures,
+                        )
+                        cancel_event.set()
+                    continue
                 except Exception as _tts_err:  # noqa: BLE001
                     log.error("TTS synthesize failed: %s", _tts_err)
+                    metrics.tts_segments_dropped += 1
+                    consecutive_failures += 1
+                    if consecutive_failures >= MAX_CONSECUTIVE_TTS_FAILURES:
+                        log.error(
+                            "aborting turn: %d consecutive TTS failures",
+                            consecutive_failures,
+                        )
+                        cancel_event.set()
                     continue
+                consecutive_failures = 0
                 if cancel_event.is_set():
                     continue
                 if first_audio_at is None:
@@ -338,6 +371,13 @@ class PipelineEngine:
         try:
             async for token in self._llm.generate_stream(messages, self._config.llm):
                 if cancel_event.is_set():
+                    break
+                if time.perf_counter() - t_llm_start > LLM_TURN_TIMEOUT_S:
+                    log.error(
+                        "LLM generation exceeded %.0fs budget; ending turn early",
+                        LLM_TURN_TIMEOUT_S,
+                    )
+                    cancel_event.set()
                     break
                 if first_token_at is None:
                     first_token_at = time.perf_counter()

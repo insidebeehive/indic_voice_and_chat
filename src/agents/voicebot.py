@@ -42,13 +42,12 @@ class TurnOutcome:
 _ESCALATION_ACTIONS = {"transfer", "schedule_callback"}
 _END_ACTIONS = {"close_positive", "close_negative", "end"}
 
-# Hard ceiling on one turn's STT+LLM+TTS. Providers have a fat tail (a Gemini
-# stream occasionally stalls; observed an 11s turn live), and an unbounded
-# ``await`` on a hung provider wedges the agent forever (``_agent_busy`` never
-# clears). On timeout we walk the state machine back to LISTENING so the call
-# survives. Set above normal turn latency (~3-7s, outliers ~11s) to avoid
-# false-firing on merely-slow turns.
-TURN_TIMEOUT_S = 20.0
+# LLM generation and each TTS sentence now enforce their own internal budgets
+# (see LLM_TURN_TIMEOUT_S / TTS_SENTENCE_TIMEOUT_S in src/pipeline/engine.py), so
+# these are a last-resort backstop against a truly wedged call, not the primary
+# timeout mechanism — see VoiceBotAgent._run_turn_with_backstop.
+HARD_TURN_TIMEOUT_S = 90.0
+_BACKSTOP_GRACE_S = 30.0
 
 # Sliding-window context. The full transcript lives in ``session.turns`` (used for
 # the UI and post-call outcome analysis), but only the system prompt + the last
@@ -213,6 +212,43 @@ class VoiceBotAgent(BaseAgent):
         data.setdefault("lead_address", _addr)
         return {k: str(v) for k, v in data.items()}
 
+    async def _run_turn_with_backstop(self, coro, cancel_event: asyncio.Event) -> TurnResult:
+        """Run a pipeline-turn coroutine with a hard backstop timeout.
+
+        LLM generation and each TTS sentence now enforce their own internal
+        budgets (PipelineEngine.run_turn_text), so this outer cap is a
+        last-resort guard against a truly wedged call, not the primary timeout
+        mechanism. On expiry we SET cancel_event (the same signal barge-in
+        uses) rather than cancelling the task directly — a bare task-cancel
+        can land inside `await tts_task` inside run_turn_text, which does NOT
+        propagate to the independently-running TTS worker Task, letting it
+        keep calling audio_sink after this turn has already returned control
+        to LISTENING (the original mid-sentence cutoff bug). Only if the
+        coroutine still hasn't wound down after a grace period do we fall
+        back to a hard cancel.
+        """
+        task = asyncio.create_task(coro)
+        done, _ = await asyncio.wait({task}, timeout=HARD_TURN_TIMEOUT_S)
+        if task in done:
+            return task.result()
+
+        log.error("turn exceeded hard cap of %.0fs; signalling cancellation", HARD_TURN_TIMEOUT_S)
+        cancel_event.set()
+        done, _ = await asyncio.wait({task}, timeout=_BACKSTOP_GRACE_S)
+        if task in done:
+            return task.result()
+
+        log.error("turn still wedged after %.0fs grace period; force-cancelling", _BACKSTOP_GRACE_S)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        return TurnResult(
+            user_text="", user_language=None, user_confidence=0.0,
+            agent_text="", audio_bytes_sent=0, metrics=TurnMetrics(), cancelled=True,
+        )
+
     async def handle_turn(self, captured_audio: bytes, audio_sink: AudioSink) -> TurnOutcome:
         """Drive one user-utterance -> agent-response cycle.
 
@@ -228,15 +264,17 @@ class VoiceBotAgent(BaseAgent):
         # Utterance complete (the telephony layer determined this via VAD).
         await self.state.fire(Event.UTTERANCE_COMPLETE)
 
+        cancel_event = asyncio.Event()
         try:
-            pipeline_result = await asyncio.wait_for(
+            pipeline_result = await self._run_turn_with_backstop(
                 self._engine.run_turn(
                     captured_audio=captured_audio,
                     history=self._history_window(),
                     audio_sink=audio_sink,
+                    cancel_event=cancel_event,
                     language=to_bcp47(self._active_language),
                 ),
-                timeout=TURN_TIMEOUT_S,
+                cancel_event,
             )
         except Exception as exc:  # noqa: BLE001 - a provider failure (incl. timeout) must not drop the call
             # STT/LLM/TTS outage (e.g. a retired model 404). Walk the state
@@ -259,6 +297,16 @@ class VoiceBotAgent(BaseAgent):
                     audio_bytes_sent=0,
                     metrics=TurnMetrics(),
                 ),
+            )
+
+        if pipeline_result.cancelled:
+            await self.state.fire(Event.LLM_RESPONSE_READY)
+            await self.state.fire(Event.RESPONSE_DELIVERED)
+            return TurnOutcome(
+                response=VoiceBotResponse(
+                    response_text="", action="continue", parse_error="barge-in"
+                ),
+                pipeline=pipeline_result,
             )
 
         return await self._finish_turn(pipeline_result)
@@ -428,8 +476,9 @@ class VoiceBotAgent(BaseAgent):
 
         await self.state.fire(Event.UTTERANCE_COMPLETE)
 
+        cancel_event = cancel_event or asyncio.Event()
         try:
-            pipeline_result = await asyncio.wait_for(
+            pipeline_result = await self._run_turn_with_backstop(
                 self._engine.run_turn_text(
                     user_text,
                     self._history_window(),
@@ -437,7 +486,7 @@ class VoiceBotAgent(BaseAgent):
                     cancel_event,
                     language=to_bcp47(self._active_language),
                 ),
-                timeout=TURN_TIMEOUT_S,
+                cancel_event,
             )
         except Exception as exc:  # noqa: BLE001 - a provider failure (incl. timeout) must not drop the call
             log.exception("pipeline turn (text) failed; recovering to LISTENING")
