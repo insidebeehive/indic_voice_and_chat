@@ -4,6 +4,8 @@ import inspect
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import pytest
+
 from src.api.dev_console import make_browser_bridge_factory
 from src.bootstrap import make_bridge_factory, make_exotel_bridge_factory
 from src.dialogue.slots import SlotSchema
@@ -111,6 +113,38 @@ async def test_browser_factory_loads_chat_handoff(fake_redis) -> None:
     assert ld["name"] == "Raju"
     assert ld["chat_summary"] == "asked about Plan B"
     assert ld["customer_id"] == "cust1"
+
+
+async def test_browser_factory_raises_when_llm_override_fails(monkeypatch) -> None:
+    monkeypatch.delenv("VLLM_BASE_URL", raising=False)
+    ws = SimpleNamespace(query_params={"llm": "vllm"})
+    factory = make_browser_bridge_factory(_providers(), slots=SlotSchema())
+    with pytest.raises(ValueError, match="VLLM_BASE_URL"):
+        await factory(websocket=ws, tenant=_tenant())
+
+
+async def test_browser_factory_raises_when_tts_override_fails(monkeypatch) -> None:
+    monkeypatch.delenv("INDICF5_TTS_URL", raising=False)
+    ws = SimpleNamespace(query_params={"tts": "indicf5"})
+    factory = make_browser_bridge_factory(_providers(), slots=SlotSchema())
+    with pytest.raises(ValueError, match="INDICF5_TTS_URL"):
+        await factory(websocket=ws, tenant=_tenant())
+
+
+async def test_browser_factory_raises_when_batch_stt_override_fails(monkeypatch) -> None:
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    ws = SimpleNamespace(query_params={"stt": "groq"})
+    factory = make_browser_bridge_factory(_providers(), slots=SlotSchema())
+    with pytest.raises(ValueError, match="GROQ_API_KEY"):
+        await factory(websocket=ws, tenant=_tenant())
+
+
+async def test_browser_factory_raises_when_streaming_stt_override_fails(monkeypatch) -> None:
+    monkeypatch.delenv("DEEPGRAM_API_KEY", raising=False)
+    ws = SimpleNamespace(query_params={"stt": "deepgram"})
+    factory = make_browser_bridge_factory(_providers(), slots=SlotSchema())
+    with pytest.raises(ValueError, match="DEEPGRAM_API_KEY"):
+        await factory(websocket=ws, tenant=_tenant())
 
 
 async def test_browser_factory_resolves_campaign_per_call() -> None:
