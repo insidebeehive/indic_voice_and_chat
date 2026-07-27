@@ -262,3 +262,17 @@ def test_no_gender_directive_when_unset() -> None:
     script = VoiceBotScript.from_campaign_yaml(SCRIPT)   # no gender
     schema = SlotSchema.from_campaign_yaml(yaml.safe_load(SLOT_YAML))
     assert "FEMALE" not in build_s2s_system_instruction(script, schema)
+
+
+def test_from_campaign_yaml_parses_pronunciations():
+    script = VoiceBotScript.from_campaign_yaml({
+        "agent_name": "Priya",
+        "company_name": "XYZ",
+        "pronunciations": {"Anaaya": "अनाया", "XYZ": "एक्स वाय ज़ेड"},
+    })
+    assert script.pronunciations == {"Anaaya": "अनाया", "XYZ": "एक्स वाय ज़ेड"}
+
+
+def test_from_campaign_yaml_pronunciations_defaults_empty():
+    script = VoiceBotScript.from_campaign_yaml({"agent_name": "Priya", "company_name": "XYZ"})
+    assert script.pronunciations == {}

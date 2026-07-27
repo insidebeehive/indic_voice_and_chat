@@ -68,7 +68,7 @@ class IndicF5TTSAdapter(ITTSProvider):
     async def synthesize(self, text: str, config: TTSConfig) -> TTSResult:
         # Same normalization as Sarvam: speak currency amounts and rewrite
         # words TTS mispronounces, scoped by language/script.
-        text = normalize_for_tts(text, config.language)
+        text = normalize_for_tts(text, config.language, extra=config.extra_pronunciations)
         body = {
             "text": text,
             "lang": _server_lang(config.language),

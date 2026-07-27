@@ -82,6 +82,12 @@ class VoiceBotAgent(BaseAgent):
         super().__init__(session=session, state_machine=state_machine, slots=slots, store=store)
         self._script = script
         self._engine = engine
+        if script.pronunciations:
+            from dataclasses import replace as _replace_cfg
+            engine._config = _replace_cfg(
+                engine._config,
+                tts=_replace_cfg(engine._config.tts, extra_pronunciations=script.pronunciations),
+            )
         self._extra_directives = extra_directives
         self._kb_context = kb_context
         self._record_metric = record_metric
@@ -163,8 +169,12 @@ class VoiceBotAgent(BaseAgent):
         base_tts = getattr(getattr(self._engine, "_config", None), "tts", None)
         opening_lang = to_bcp47(self._active_language)
         opening_tts = (
-            _replace(base_tts, language=opening_lang)
-            if base_tts is not None else _TTSConfig(language=opening_lang)
+            _replace(
+                base_tts, language=opening_lang,
+                extra_pronunciations=self._script.pronunciations or None,
+            )
+            if base_tts is not None else
+            _TTSConfig(language=opening_lang, extra_pronunciations=self._script.pronunciations or None)
         )
         try:
             tts_result = await self._engine._tts.synthesize(  # type: ignore[attr-defined]

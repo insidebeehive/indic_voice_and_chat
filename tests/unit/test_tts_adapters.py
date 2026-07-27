@@ -136,6 +136,29 @@ async def test_constructor_requires_api_key(monkeypatch) -> None:
         SarvamTTSAdapter({})
 
 
+@pytest.mark.asyncio
+@respx.mock
+async def test_sarvam_passes_extra_pronunciations_to_normalize(
+    adapter: SarvamTTSAdapter, monkeypatch,
+) -> None:
+    captured = {}
+
+    def _fake_normalize(text, language=None, extra=None):
+        captured["extra"] = extra
+        return text
+
+    monkeypatch.setattr("src.providers.tts.sarvam.normalize_for_tts", _fake_normalize)
+    pcm = b"\x01\x02\x03\x04" * 1000
+    respx.post(f"{SARVAM_BASE_URL}/text-to-speech").mock(
+        return_value=Response(200, json={"audios": [base64.b64encode(pcm).decode()]})
+    )
+
+    config = TTSConfig(language="hi-IN", extra_pronunciations={"XYZ": "एक्स वाय ज़ेड"})
+    await adapter.synthesize("hello XYZ", config)
+
+    assert captured["extra"] == {"XYZ": "एक्स वाय ज़ेड"}
+
+
 # --- IndicF5 (self-hosted fine-tuned voice server) -----------------------
 
 
@@ -210,3 +233,24 @@ async def test_indicf5_constructor_requires_url(monkeypatch) -> None:
 def test_indicf5_registered_in_provider_registry() -> None:
     from src.providers import TTS_PROVIDERS
     assert TTS_PROVIDERS["indicf5"] is IndicF5TTSAdapter
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_indicf5_passes_extra_pronunciations_to_normalize(
+    indicf5: IndicF5TTSAdapter, monkeypatch,
+) -> None:
+    captured = {}
+
+    def _fake_normalize(text, language=None, extra=None):
+        captured["extra"] = extra
+        return text
+
+    monkeypatch.setattr("src.providers.tts.indicf5.normalize_for_tts", _fake_normalize)
+    pcm = b"\x01\x02" * 100
+    respx.post(f"{_INDICF5_URL}/tts").mock(return_value=Response(200, content=_wav(pcm, 16000)))
+
+    config = TTSConfig(language="hi-IN", extra_pronunciations={"XYZ": "एक्स वाय ज़ेड"})
+    await indicf5.synthesize("hello XYZ", config)
+
+    assert captured["extra"] == {"XYZ": "एक्स वाय ज़ेड"}

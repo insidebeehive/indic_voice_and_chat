@@ -141,6 +141,7 @@ class VoiceBotScript:
     donts: list[str] = field(default_factory=list)
     conversation_style: str = ""
     max_turns: int = 0
+    pronunciations: dict[str, str] = field(default_factory=dict)
 
     @classmethod
     def from_campaign_yaml(cls, script: dict[str, Any]) -> "VoiceBotScript":
@@ -176,6 +177,7 @@ class VoiceBotScript:
             donts=list(script.get("donts") or []),
             conversation_style=script.get("conversation_style", "") or "",
             max_turns=int(script.get("max_turns") or 0),
+            pronunciations=dict(script.get("pronunciations") or {}),
         )
 
 

@@ -9,7 +9,10 @@ from src.agents.state_machine import AgentStateMachine, State
 from src.agents.voicebot import VoiceBotAgent
 from src.dialogue.prompts import VoiceBotScript
 from src.dialogue.slots import SlotSchema
-from src.pipeline.engine import TurnMetrics, TurnResult
+from src.interfaces.llm import LLMConfig
+from src.interfaces.stt import STTConfig
+from src.interfaces.tts import TTSConfig, TTSResult
+from src.pipeline.engine import PipelineConfig, PipelineEngine, TurnMetrics, TurnResult
 
 
 class _FakeEngine:
@@ -441,3 +444,74 @@ async def test_apply_signal_no_record_metric_is_a_no_op():
         user_text="hi", agent_text="hello", action="continue",
         metrics_dict=metrics_dict,
     )
+
+
+# --- campaign pronunciations threaded into TTS (fix A) ----------------------
+
+@pytest.mark.asyncio
+async def test_play_opening_passes_script_pronunciations_to_tts():
+    captured = {}
+
+    class _CapturingTTS:
+        async def synthesize(self, text, config):
+            captured["extra_pronunciations"] = config.extra_pronunciations
+            return TTSResult(audio=b"\x00\x00", duration_ms=1.0, sample_rate=16000)
+
+    engine = PipelineEngine(
+        stt=None, llm=None, tts=_CapturingTTS(),
+        config=PipelineConfig(
+            stt=STTConfig(), llm=LLMConfig(), tts=TTSConfig(language="hi-IN"),
+        ),
+    )
+    script = VoiceBotScript(
+        agent_name="Priya", agent_role="sales", company_name="XYZ",
+        opening="Hello from {company_name}",
+        pronunciations={"XYZ": "एक्स वाय ज़ेड"},
+    )
+    agent = VoiceBotAgent(
+        session=AgentSession(session_id="t1", lead_data={}),
+        state_machine=AgentStateMachine(), slot_schema=SlotSchema(),
+        script=script, engine=engine, store=None,
+    )
+
+    async def sink(audio: bytes):
+        pass
+
+    await agent.play_opening(sink)
+    assert captured["extra_pronunciations"] == {"XYZ": "एक्स वाय ज़ेड"}
+
+
+@pytest.mark.asyncio
+async def test_voicebot_agent_threads_script_pronunciations_onto_engine_config():
+    engine = PipelineEngine(
+        stt=None, llm=None, tts=None,
+        config=PipelineConfig(
+            stt=STTConfig(), llm=LLMConfig(), tts=TTSConfig(language="hi-IN"),
+        ),
+    )
+    script = VoiceBotScript(
+        agent_name="Priya", agent_role="sales", company_name="XYZ",
+        pronunciations={"XYZ": "एक्स वाय ज़ेड"},
+    )
+    VoiceBotAgent(
+        session=AgentSession(session_id="t1", lead_data={}),
+        state_machine=AgentStateMachine(), slot_schema=SlotSchema(),
+        script=script, engine=engine, store=None,
+    )
+    assert engine._config.tts.extra_pronunciations == {"XYZ": "एक्स वाय ज़ेड"}
+
+
+@pytest.mark.asyncio
+async def test_voicebot_agent_leaves_engine_config_alone_when_no_pronunciations():
+    original_tts = TTSConfig(language="hi-IN")
+    engine = PipelineEngine(
+        stt=None, llm=None, tts=None,
+        config=PipelineConfig(stt=STTConfig(), llm=LLMConfig(), tts=original_tts),
+    )
+    script = VoiceBotScript(agent_name="Priya", agent_role="sales", company_name="XYZ")
+    VoiceBotAgent(
+        session=AgentSession(session_id="t1", lead_data={}),
+        state_machine=AgentStateMachine(), slot_schema=SlotSchema(),
+        script=script, engine=engine, store=None,
+    )
+    assert engine._config.tts is original_tts

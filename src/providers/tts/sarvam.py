@@ -87,7 +87,7 @@ class SarvamTTSAdapter(ITTSProvider):
         # English/brand words Sarvam mispronounces into Devanagari — but only for
         # Devanagari-script languages, so a switch to Telugu/Malayalam doesn't get
         # the wrong script injected.
-        text = normalize_for_tts(text, config.language)
+        text = normalize_for_tts(text, config.language, extra=config.extra_pronunciations)
         body: dict[str, Any] = {
             "inputs": [text],
             "target_language_code": config.language,

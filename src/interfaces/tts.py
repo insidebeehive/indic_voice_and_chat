@@ -15,6 +15,7 @@ class TTSConfig:
     pitch: float = 0.0
     output_format: str = "pcm"  # "pcm" | "wav" | "mp3"
     sample_rate: int = 16000
+    extra_pronunciations: Optional[dict[str, str]] = None
 
 
 @dataclass
