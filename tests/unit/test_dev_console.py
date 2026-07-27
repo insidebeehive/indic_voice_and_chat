@@ -28,6 +28,31 @@ def test_dev_voice_page_served():
     assert "Voice Dev Console" in resp.text
 
 
+def test_dev_providers_excludes_hidden_options():
+    app = FastAPI()
+    app.include_router(dev_router)
+    client = TestClient(app)
+    resp = client.get("/dev/providers")
+    assert resp.status_code == 200
+    body = resp.json()
+
+    stt_ids = {o["id"] for o in body["stt"]}
+    llm_ids = {o["id"] for o in body["llm"]}
+    tts_ids = {o["id"] for o in body["tts"]}
+
+    assert "deepgram" not in stt_ids
+    assert "vllm" not in llm_ids
+    assert "azure" not in tts_ids
+    assert "google" not in tts_ids
+
+    # Other providers in the same registries must still be listed — this is
+    # an exclusion of specific options, not a broken/empty list.
+    assert "groq" in stt_ids
+    assert "gemini" in llm_ids
+    assert "sarvam" in tts_ids
+    assert "elevenlabs" in tts_ids
+
+
 # --- place-call + status endpoints --------------------------------------------
 
 import pytest

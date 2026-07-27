@@ -190,6 +190,15 @@ _TTS_META: dict[str, dict] = {
 }
 
 
+# Hidden from the dev-console's dropdowns per request — the underlying
+# registries (src.providers) are untouched, so a tenant YAML or a direct
+# ?stt=/?llm=/?tts= override still works; this only controls what shows up
+# as a selectable option here.
+_DEV_CONSOLE_EXCLUDED_STT_STREAMING = {"deepgram"}
+_DEV_CONSOLE_EXCLUDED_LLM = {"vllm"}
+_DEV_CONSOLE_EXCLUDED_TTS = {"azure", "google"}
+
+
 @dev_router.get("/dev/providers")
 async def dev_providers() -> dict:
     """STT/LLM/TTS provider lists for the layered-mode selectors."""
@@ -203,17 +212,24 @@ async def dev_providers() -> dict:
     seen_cls: set = set()
     llm_opts = []
     for k in sorted(LLM_PROVIDERS):
+        if k in _DEV_CONSOLE_EXCLUDED_LLM:
+            continue
         cls = LLM_PROVIDERS[k]
         if cls in seen_cls:
             continue
         seen_cls.add(cls)
         llm_opts.append({"id": k, "label": _labels["llm"].get(k, k)})
 
-    def _opts(registry, label_map):
-        return [{"id": k, "label": label_map.get(k, k)} for k in sorted(registry)]
+    def _opts(registry, label_map, exclude=frozenset()):
+        return [
+            {"id": k, "label": label_map.get(k, k)}
+            for k in sorted(registry) if k not in exclude
+        ]
 
     tts_opts = []
     for k in sorted(TTS_PROVIDERS):
+        if k in _DEV_CONSOLE_EXCLUDED_TTS:
+            continue
         meta = _TTS_META.get(k, {})
         tts_opts.append({
             "id": k,
@@ -222,7 +238,8 @@ async def dev_providers() -> dict:
         })
 
     return {
-        "stt": _opts(STT_PROVIDERS, _labels["stt"]) + _opts(STREAMING_STT_PROVIDERS, _labels["stt_streaming"]),
+        "stt": _opts(STT_PROVIDERS, _labels["stt"])
+        + _opts(STREAMING_STT_PROVIDERS, _labels["stt_streaming"], exclude=_DEV_CONSOLE_EXCLUDED_STT_STREAMING),
         "llm": llm_opts,
         "tts": tts_opts,
     }
