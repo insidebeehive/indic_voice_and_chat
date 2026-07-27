@@ -305,6 +305,13 @@ const activeSources = new Set();
 
 const $ = (id) => document.getElementById(id);
 const setStatus = (s) => { $("status").textContent = s; };
+const showError = (text) => {
+  const div = document.createElement("div");
+  div.className = "turn"; div.style.color = "#fca5a5";
+  div.textContent = "⚠ " + text;
+  $("transcript").appendChild(div);
+  $("transcript").scrollTop = $("transcript").scrollHeight;
+};
 let _currentCallId = null;
 let _mode = "s2s";   // tracks current mode selection
 
@@ -505,16 +512,13 @@ async function start() {
     else if (msg.type === "transcript") { if (msg.role === "user") renderPartial(""); addTranscript(msg.role, msg.text); }
     else if (msg.type === "state")      { $("state").textContent = "state: " + msg.state + "\nslots: " + JSON.stringify(msg.slots, null, 2); }
     else if (msg.type === "outcome")    { renderOutcome(msg); }
-    else if (msg.type === "error") {
-      const div = document.createElement("div");
-      div.className = "turn"; div.style.color = "#fca5a5";
-      div.textContent = "⚠ " + msg.message;
-      $("transcript").appendChild(div);
-      $("transcript").scrollTop = $("transcript").scrollHeight;
-    }
+    else if (msg.type === "error") { showError(msg.message); }
   };
 
-  ws.onclose = (e) => { stop(false); setStatus("closed"); };
+  ws.onclose = (e) => {
+    if (e.reason) { showError("connection closed: " + e.reason); }
+    stop(false); setStatus("closed");
+  };
   ws.onerror = ()  => { setStatus("connection error"); };
 }
 
