@@ -12,9 +12,13 @@ from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.api.deps import get_db_session
 from src.auth import require_admin
 from src.benchmarks.runner import SuiteRunner
+from src.models.turn_metrics import TurnMetric
 
 router = APIRouter(
     prefix="/benchmarks",
@@ -73,6 +77,23 @@ class RunSummary(BaseModel):
 class RunListResponse(BaseModel):
     runs: list[RunSummary]
     total: int
+
+
+class TurnMetricsComboEntry(BaseModel):
+    stt_provider: Optional[str]
+    llm_provider: str
+    tts_provider: Optional[str]
+    samples: int
+    avg_stt_latency_ms: float
+    avg_llm_ttft_ms: float
+    avg_llm_total_ms: float
+    avg_tts_first_chunk_ms: float
+    avg_tts_total_ms: float
+    avg_total_latency_ms: float
+
+
+class TurnMetricsSummaryResponse(BaseModel):
+    entries: list[TurnMetricsComboEntry]
 
 
 @router.get("/latency", response_model=LatencyResponse)
@@ -150,3 +171,41 @@ async def get_run(run_id: str) -> dict[str, Any]:
                 "created_at": r.created_at.isoformat(),
             }
     raise HTTPException(status_code=404, detail="run not found")
+
+
+@router.get("/turn-metrics/summary", response_model=TurnMetricsSummaryResponse)
+async def turn_metrics_summary(
+    db: AsyncSession = Depends(get_db_session),
+) -> TurnMetricsSummaryResponse:
+    stmt = (
+        select(
+            TurnMetric.stt_provider,
+            TurnMetric.llm_provider,
+            TurnMetric.tts_provider,
+            func.count().label("samples"),
+            func.avg(TurnMetric.stt_latency_ms).label("avg_stt_latency_ms"),
+            func.avg(TurnMetric.llm_ttft_ms).label("avg_llm_ttft_ms"),
+            func.avg(TurnMetric.llm_total_ms).label("avg_llm_total_ms"),
+            func.avg(TurnMetric.tts_first_chunk_ms).label("avg_tts_first_chunk_ms"),
+            func.avg(TurnMetric.tts_total_ms).label("avg_tts_total_ms"),
+            func.avg(TurnMetric.total_latency_ms).label("avg_total_latency_ms"),
+        )
+        .group_by(TurnMetric.stt_provider, TurnMetric.llm_provider, TurnMetric.tts_provider)
+    )
+    rows = (await db.execute(stmt)).all()
+    entries = [
+        TurnMetricsComboEntry(
+            stt_provider=r.stt_provider,
+            llm_provider=r.llm_provider,
+            tts_provider=r.tts_provider,
+            samples=r.samples,
+            avg_stt_latency_ms=float(r.avg_stt_latency_ms or 0.0),
+            avg_llm_ttft_ms=float(r.avg_llm_ttft_ms or 0.0),
+            avg_llm_total_ms=float(r.avg_llm_total_ms or 0.0),
+            avg_tts_first_chunk_ms=float(r.avg_tts_first_chunk_ms or 0.0),
+            avg_tts_total_ms=float(r.avg_tts_total_ms or 0.0),
+            avg_total_latency_ms=float(r.avg_total_latency_ms or 0.0),
+        )
+        for r in rows
+    ]
+    return TurnMetricsSummaryResponse(entries=entries)
