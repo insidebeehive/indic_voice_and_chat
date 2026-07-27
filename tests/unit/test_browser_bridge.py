@@ -1,6 +1,7 @@
 # tests/unit/test_browser_bridge.py
 from __future__ import annotations
 
+import asyncio
 import json
 
 import pytest
@@ -36,6 +37,22 @@ class FakeWebSocket:
         self.closed = True
 
 
+class _RaisingWebSocket(FakeWebSocket):
+    """A websocket whose sends raise, simulating a closed/dead connection —
+    the exact RuntimeError Starlette raises when the app tries to send after
+    the connection has already closed."""
+
+    async def send_text(self, data: str) -> None:
+        raise RuntimeError(
+            "Unexpected ASGI message 'websocket.send', after sending 'websocket.close'."
+        )
+
+    async def send_bytes(self, data: bytes) -> None:
+        raise RuntimeError(
+            "Unexpected ASGI message 'websocket.send', after sending 'websocket.close'."
+        )
+
+
 def _bridge(ws, agent=None):
     return BrowserVoiceBridge(
         websocket=ws,
@@ -62,6 +79,50 @@ async def test_send_pcm_writes_binary_frames():
     assert b"".join(ws.sent_bytes) == b"\x01\x02\x03\x04"
     statuses = [json.loads(t).get("status") for t in ws.sent_text]
     assert "speaking" in statuses and statuses[-1] == "listening"
+
+
+@pytest.mark.asyncio
+async def test_send_json_swallows_closed_socket_and_stops():
+    ws = _RaisingWebSocket([])
+    bridge = _bridge(ws)
+    await bridge._send_json({"type": "status", "status": "listening"})  # must not raise
+    assert bridge._stopped is True
+
+
+@pytest.mark.asyncio
+async def test_send_pcm_swallows_closed_socket_and_stops():
+    ws = _RaisingWebSocket([])
+    bridge = _bridge(ws)
+    await bridge._send_pcm(b"\x01\x02\x03\x04")  # must not raise
+    assert bridge._stopped is True
+
+
+@pytest.mark.asyncio
+async def test_send_json_noop_once_stopped():
+    ws = FakeWebSocket([])
+    bridge = _bridge(ws)
+    bridge._stopped = True
+    await bridge._send_json({"type": "status", "status": "listening"})
+    assert ws.sent_text == []
+
+
+@pytest.mark.asyncio
+async def test_send_pcm_noop_once_stopped():
+    ws = FakeWebSocket([])
+    bridge = _bridge(ws)
+    bridge._stopped = True
+    await bridge._send_pcm(b"\x01\x02\x03\x04")
+    assert ws.sent_bytes == []
+    assert ws.sent_text == []
+
+
+@pytest.mark.asyncio
+async def test_send_pcm_sets_cancel_event_on_closed_socket():
+    ws = _RaisingWebSocket([])
+    bridge = _bridge(ws)
+    bridge._cancel_event = asyncio.Event()
+    await bridge._send_pcm(b"\x01\x02")
+    assert bridge._cancel_event.is_set()
 
 
 # ---------------------------------------------------------------------------

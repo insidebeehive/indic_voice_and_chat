@@ -111,6 +111,7 @@ class BrowserVoiceBridge:
         self._frame_bytes = int(self._config.pcm_sample_rate * vad.frame_ms / 1000) * 2
         self._endpoint = EndpointDetector(vad.frame_ms, self._config.endpoint)
         self._stopped = False
+        self._send_lock = asyncio.Lock()
         # Wall-clock estimate of when the browser's queued playback will finish,
         # mirroring its gapless scheduling. Used to avoid closing the socket
         # (which tears down playback) before the final line has been heard.
@@ -133,7 +134,16 @@ class BrowserVoiceBridge:
     # --- outbound helpers ---------------------------------------------
 
     async def _send_json(self, obj: dict) -> None:
-        await self._ws.send_text(json.dumps(obj))
+        if self._stopped:
+            return
+        async with self._send_lock:
+            try:
+                await self._ws.send_text(json.dumps(obj))
+            except Exception:  # noqa: BLE001 - client disconnected mid-turn; stop sending, don't crash the session
+                log.info("browser bridge: send failed (client likely disconnected)")
+                self._stopped = True
+                if self._cancel_event is not None:
+                    self._cancel_event.set()
 
     async def _send_pcm(self, pcm16: bytes) -> None:
         """AudioSink: ship agent TTS audio to the browser as binary frames.
@@ -141,11 +151,21 @@ class BrowserVoiceBridge:
         Unlike Twilio there is no real-time pacing — the browser schedules
         gapless playback itself, so we just chunk and send.
         """
-        if not pcm16:
+        if not pcm16 or self._stopped:
             return
         await self._send_json({"type": "status", "status": "speaking"})
         for i in range(0, len(pcm16), _SEND_CHUNK):
-            await self._ws.send_bytes(pcm16[i : i + _SEND_CHUNK])
+            if self._stopped:
+                return
+            async with self._send_lock:
+                try:
+                    await self._ws.send_bytes(pcm16[i : i + _SEND_CHUNK])
+                except Exception:  # noqa: BLE001 - client disconnected mid-turn; stop sending, don't crash the session
+                    log.info("browser bridge: send_bytes failed (client likely disconnected)")
+                    self._stopped = True
+                    if self._cancel_event is not None:
+                        self._cancel_event.set()
+                    return
         # Track when this audio will finish playing (16-bit mono PCM), mirroring
         # the browser's gapless scheduling, so a terminal turn can wait for it.
         duration_s = len(pcm16) / 2 / self._config.pcm_sample_rate
