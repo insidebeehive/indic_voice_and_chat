@@ -205,6 +205,12 @@ class BrowserVoiceBridge:
         try:
             return await coro
         finally:
+            # Fire-and-forget: do NOT await the cancelled task here. Awaiting it
+            # adds one extra event-loop tick, which delays self._turn_task.done()
+            # becoming True and can drop a queued turn (see
+            # test_stream_consumer_reopens_after_unexpected_drop). Safe to skip:
+            # _heartbeat_loop's only awaits are asyncio.sleep (raises only
+            # CancelledError) and _send_json (already swallows every exception).
             heartbeat_task.cancel()
 
     # --- entrypoint ---------------------------------------------------
