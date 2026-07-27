@@ -59,6 +59,9 @@ _SENTIMENTS = {"positive", "neutral", "negative", "frustrated"}
 _CHATBOT_ACTIONS = {"none", "schedule_callback", "send_info", "create_ticket", "escalate", "resolved"}
 _CONFIDENCES = {"high", "medium", "low"}
 
+_CHATBOT_FALLBACK_TEXT = "Sorry, I couldn't formulate an answer. Could you rephrase?"
+_VOICEBOT_FALLBACK_TEXT = "Maaf kijiye, main samjha nahi. Kya aap dobara bata sakte hain?"
+
 
 def parse_voicebot_response(text: str) -> VoiceBotResponse:
     """Tolerantly extract a VoiceBotResponse from LLM output."""
@@ -73,7 +76,7 @@ def parse_voicebot_response(text: str) -> VoiceBotResponse:
     response_text = _str(obj.get("response_text"), "")
     if not response_text:
         return VoiceBotResponse(
-            response_text="Maaf kijiye, main samjha nahi. Kya aap dobara bata sakte hain?",
+            response_text=_VOICEBOT_FALLBACK_TEXT,
             action="clarify",
             parse_error="missing response_text",
             raw=obj,
@@ -103,7 +106,7 @@ def parse_chatbot_response(text: str) -> ChatBotResponse:
     response_text = _str(obj.get("response_text"), "")
     if not response_text:
         return ChatBotResponse(
-            response_text="Sorry, I couldn't formulate an answer. Could you rephrase?",
+            response_text=_CHATBOT_FALLBACK_TEXT,
             parse_error="missing response_text",
             raw=obj,
         )
@@ -143,7 +146,7 @@ def _extract_json(text: str) -> tuple[Optional[dict[str, Any]], Optional[str]]:
     last_error = "no JSON object found"
     for c in candidates:
         try:
-            obj = json.loads(c)
+            obj = json.loads(c, strict=False)
             if isinstance(obj, dict):
                 return obj, None
             last_error = "JSON was not an object"
@@ -176,12 +179,20 @@ def _largest_balanced_block(text: str) -> Optional[str]:
 def _fallback_text(text: str, speakable: bool = False) -> str:
     """When parsing fails, salvage *something* from the raw LLM output.
 
-    speakable=True (voicebot): cut to the first sentence so JSON is never
-    read aloud.  speakable=False (chatbot): return the full cleaned text.
+    If the leftover text still looks like an unparsed JSON envelope, return
+    a safe generic message instead (never expose/speak raw JSON). Otherwise:
+    speakable=True (voicebot) cuts to the first sentence so partial JSON
+    isn't read aloud; speakable=False (chatbot) returns the full cleaned
+    text verbatim.
     """
     cleaned = text.strip().replace("```json", "").replace("```", "").strip()
     if not cleaned:
         return "Maaf kijiye, ek minute de dijiye."
+    if cleaned.startswith("{") and '"response_text"' in cleaned:
+        # Still looks like an unparsed JSON envelope — never expose raw LLM
+        # JSON to the customer (or speak it via TTS). Fall back to the same
+        # safe generic message used for a missing response_text field.
+        return _VOICEBOT_FALLBACK_TEXT if speakable else _CHATBOT_FALLBACK_TEXT
     if not speakable:
         return cleaned
     # Voice path: take the first sentence-ish chunk so JSON isn't spoken.

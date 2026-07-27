@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 
 from src.dialogue.response_parser import (
+    _CHATBOT_FALLBACK_TEXT,
+    _VOICEBOT_FALLBACK_TEXT,
     parse_chatbot_response,
     parse_voicebot_response,
 )
@@ -103,3 +105,39 @@ def test_chatbot_invalid_confidence_defaults_medium() -> None:
 def test_chatbot_empty_input() -> None:
     r = parse_chatbot_response("")
     assert r.parse_error == "empty response"
+
+
+def test_chatbot_json_with_literal_newline_in_response_text() -> None:
+    # Built by hand (not json.dumps) so the raw text actually contains a
+    # literal newline character inside the response_text string value --
+    # invalid under strict-mode json.loads, valid under strict=False.
+    raw = (
+        '{"response_text": "Line one.\nLine two.", "language": "en", '
+        '"sources_used": ["plans.pdf:p2"], "confidence": "medium", '
+        '"action": "none", "suggested_followups": []}'
+    )
+    r = parse_chatbot_response(raw)
+    assert r.parse_error is None
+    assert r.raw
+    assert r.response_text == "Line one.\nLine two."
+    assert "{" not in r.response_text
+    assert "sources_used" not in r.response_text
+
+
+def test_chatbot_truncated_json_falls_back_to_safe_message() -> None:
+    # Genuinely malformed, still unparseable even with strict=False.
+    raw = '{"response_text": "Hello'
+    r = parse_chatbot_response(raw)
+    assert "response_text" not in r.response_text
+    assert r.response_text == _CHATBOT_FALLBACK_TEXT
+
+
+def test_voicebot_truncated_json_with_no_punctuation_falls_back_to_safe_message() -> None:
+    # No sentence-ending punctuation before the cutoff, so the old
+    # sentence-cut/200-char-truncate path would otherwise speak the raw
+    # JSON-ish fragment via TTS. Must hit the same safety net as chat.
+    raw = '{"response_text": "Hello'
+    r = parse_voicebot_response(raw)
+    assert "response_text" not in r.response_text
+    assert "{" not in r.response_text
+    assert r.response_text == _VOICEBOT_FALLBACK_TEXT
