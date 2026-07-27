@@ -742,4 +742,4 @@ git commit -m "feat(benchmarking): add GET /benchmarks/turn-metrics/summary admi
 - `.venv/bin/python -m pytest tests/unit -q` — full suite green apart from the 2 documented pre-existing failures.
 - `.venv/bin/alembic upgrade head` against a real (or throwaway local) Postgres DB — confirms the migration actually applies, not just the SQLite-based unit tests.
 - Manually run a dev-console turn locally (`VOX_DEV_CONSOLE=1 .venv/bin/uvicorn src.main:app --env-file .env`, open `/dev/voice`, complete one turn) and confirm a row appears in `turn_metrics` for that session.
-- `curl` the new endpoint with a valid admin token and confirm it returns the seeded/real data grouped correctly.
+- `curl` the new endpoint (mounted at `/api/v1/benchmarks/turn-metrics/summary`, not bare `/benchmarks/...` — the API is mounted under an `/api/v1` prefix in `src/main.py`) with a valid admin token and confirm it returns the seeded/real data grouped correctly.
