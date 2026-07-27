@@ -159,3 +159,38 @@ async def test_run_turn_text_cancel_stops_before_audio():
     assert sink_calls == []            # no audio synthesized/sent
     assert result.audio_bytes_sent == 0
     assert result.sentences_spoken == []
+
+
+class _SlowTTS:
+    """TTS whose synthesis takes noticeably longer than the fake LLM's
+    near-instant token stream, so a test can prove llm_total_ms excludes
+    the trailing TTS-drain time instead of silently including it."""
+
+    async def synthesize(self, text, config):
+        await asyncio.sleep(0.2)
+        return TTSResult(audio=b"\x00\x00" * 80, duration_ms=10.0, sample_rate=16000)
+
+
+@pytest.mark.asyncio
+async def test_run_turn_text_llm_total_ms_excludes_tts_drain_tail():
+    cfg = PipelineConfig(
+        stt=STTConfig(language="hi-IN"),
+        llm=LLMConfig(response_format="json", max_tokens=256),
+        tts=TTSConfig(language="hi-IN", sample_rate=16000),
+    )
+    engine = PipelineEngine(_FakeSTT(), _FakeLLM(), _SlowTTS(), cfg)
+    sink_calls = []
+
+    async def sink(audio: bytes):
+        sink_calls.append(audio)
+
+    result = await engine.run_turn_text(
+        "और कुछ benefits हैं?", history=[], audio_sink=sink,
+    )
+    # The fake LLM yields its 3 tokens near-instantly; the 0.2s TTS delay
+    # happens almost entirely AFTER the LLM's own stream finishes. If
+    # llm_total_ms still included that drain (the bug), it would read
+    # >= ~200ms. It must stay well under that.
+    assert result.metrics.llm_total_ms < 100
+    # The full turn DOES take >= 200ms once TTS is included.
+    assert result.metrics.total_latency_ms >= 200

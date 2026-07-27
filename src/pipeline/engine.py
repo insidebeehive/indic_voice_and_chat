@@ -397,10 +397,17 @@ class PipelineEngine:
                 for sentence in detector.flush():
                     await sentence_queue.put(sentence)
         finally:
+            # Captured here, BEFORE draining the TTS queue: this must reflect
+            # only the LLM's own work (token generation + flush), not however
+            # long the trailing TTS synthesis for the last sentence(s) takes
+            # afterward — that time is already correctly counted in
+            # tts_total_ms below. Capturing it after `await tts_task` (the
+            # bug this fixes) silently inflated llm_total_ms by that TTS
+            # tail, worst with a slow TTS provider.
+            metrics.llm_total_ms = int((time.perf_counter() - t_llm_start) * 1000)
             await sentence_queue.put(None)
             await tts_task
 
-        metrics.llm_total_ms = int((time.perf_counter() - t_llm_start) * 1000)
         if first_token_at is not None:
             metrics.llm_ttft_ms = int((first_token_at - t_llm_start) * 1000)
         if first_audio_at is not None:
