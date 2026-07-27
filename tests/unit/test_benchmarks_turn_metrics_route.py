@@ -11,7 +11,7 @@ from src.api import benchmarks
 from src.api.deps import get_db_session
 from src.auth.middleware import set_admin_tokens
 from src.models.database import Base
-from src.models.turn_metrics import TurnMetric
+from src.models.turn_metrics import TurnMetric, record_turn_metric
 
 ADMIN_HEADERS = {"Authorization": "Bearer admin-token"}
 
@@ -65,6 +65,11 @@ async def client():
     app.dependency_overrides[get_db_session] = _session_override
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as c:
+        # Exposed so tests can seed rows through the real record_turn_metric
+        # helper (monkeypatching its get_sessionmaker) against this SAME
+        # in-memory engine/sessionmaker, instead of only the fixture's direct
+        # TurnMetric(...) seeding above.
+        c.sm = sm  # type: ignore[attr-defined]
         yield c
     set_admin_tokens([])
     await engine.dispose()
@@ -89,3 +94,55 @@ async def test_summary_groups_by_combo(client: AsyncClient) -> None:
 async def test_summary_requires_admin(client: AsyncClient) -> None:
     resp = await client.get("/benchmarks/turn-metrics/summary")
     assert resp.status_code == 401
+
+
+async def test_record_turn_metric_then_summary_e2e(
+    client: AsyncClient, monkeypatch
+) -> None:
+    """End-to-end: record_turn_metric (the real helper VoiceBotAgent.apply_signal
+    calls in production, via src/bootstrap.py's
+    ``record_metric=lambda payload: record_turn_metric(tenant_id=tenant.id, **payload)``)
+    actually produces a row that /benchmarks/turn-metrics/summary can find and
+    aggregate. Everything else in this file substitutes a fake callback or
+    seeds rows via direct TurnMetric(...) construction; this is the one test
+    that exercises the real chain end to end."""
+    monkeypatch.setattr(
+        "src.models.turn_metrics.get_sessionmaker", lambda: client.sm  # type: ignore[attr-defined]
+    )
+
+    # Exactly the 8 keys VoiceBotAgent.apply_signal builds for _record_metric
+    # (src/agents/voicebot.py, the ``if self._record_metric is not None:`` block).
+    payload = {
+        "session_id": "e2e_call_1",
+        "campaign_id": "e2e_campaign",
+        "mode": "layered",
+        "stt_provider": "WhisperSTTAdapter",
+        "llm_provider": "OpenAILLMAdapter",
+        "tts_provider": "ElevenLabsTTSAdapter",
+        "action": "continue",
+        "metrics": {
+            "stt_latency_ms": 250,
+            "llm_ttft_ms": 900,
+            "llm_total_ms": 3000,
+            "tts_first_chunk_ms": 1500,
+            "tts_total_ms": 1800,
+            "total_latency_ms": 3300,
+        },
+    }
+
+    # Mirrors the real production call site exactly:
+    # record_turn_metric(tenant_id=tenant.id, **payload)
+    await record_turn_metric(tenant_id="dev", **payload)
+
+    resp = await client.get("/benchmarks/turn-metrics/summary", headers=ADMIN_HEADERS)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    combos = {(e["stt_provider"], e["llm_provider"], e["tts_provider"]): e for e in body["entries"]}
+    entry = combos[("WhisperSTTAdapter", "OpenAILLMAdapter", "ElevenLabsTTSAdapter")]
+    assert entry["samples"] == 1
+    assert entry["avg_stt_latency_ms"] == 250.0
+    assert entry["avg_llm_ttft_ms"] == 900.0
+    assert entry["avg_llm_total_ms"] == 3000.0
+    assert entry["avg_tts_first_chunk_ms"] == 1500.0
+    assert entry["avg_tts_total_ms"] == 1800.0
+    assert entry["avg_total_latency_ms"] == 3300.0

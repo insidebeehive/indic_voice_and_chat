@@ -39,7 +39,7 @@ def upgrade() -> None:
         sa.Column("tts_first_chunk_ms", sa.Integer(), nullable=False, server_default="0"),
         sa.Column("tts_total_ms", sa.Integer(), nullable=False, server_default="0"),
         sa.Column("total_latency_ms", sa.Integer(), nullable=False, server_default="0"),
-        sa.Column("created_at", sa.DateTime(), server_default=sa.func.now()),
+        sa.Column("created_at", sa.DateTime(), nullable=False, server_default=sa.func.now()),
     )
     op.create_index("idx_turn_metrics_tenant", "turn_metrics", ["tenant_id"])
     op.create_index(
