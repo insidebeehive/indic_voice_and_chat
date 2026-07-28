@@ -80,6 +80,20 @@ class RunListResponse(BaseModel):
 
 
 class TurnMetricsComboEntry(BaseModel):
+    """One (mode, stt_provider, llm_provider, tts_provider) combo's averaged
+    per-turn latencies.
+
+    NOT directly comparable across ``mode``: for ``mode="s2s"`` (Gemini
+    Live), there is no bridge-level VAD/utterance-end signal, so
+    ``avg_total_latency_ms`` is a turn-window duration (session-connect or
+    prior-turn-complete to now) that includes the caller's own speaking
+    time, not a cascade-style utterance-end-to-response latency — and
+    ``avg_tts_first_chunk_ms`` is reinterpreted as time-to-first-spoken-audio
+    from the realtime model, not a TTS-specific measurement. Compare
+    ``mode="layered"`` rows against each other, and ``mode="s2s"`` rows
+    against each other, but not the two against one another.
+    """
+
     mode: str
     stt_provider: Optional[str]
     llm_provider: str
