@@ -357,6 +357,8 @@ class VoiceBotAgent(BaseAgent):
         sentiment: Optional[str] = None,
         phase: Optional[str] = None,
         metrics_dict: Optional[dict[str, Any]] = None,
+        metrics_mode: str = "layered",
+        metrics_provider_override: Optional[dict[str, Optional[str]]] = None,
     ) -> dict[str, Any]:
         """Record one completed turn (transcript + slots + sentiment) and advance
         the state machine from the turn's ``action``. Shared by the cascade
@@ -414,12 +416,20 @@ class VoiceBotAgent(BaseAgent):
                 # skip STT/LLM/TTS timing (e.g. the S2S Live bridge's
                 # apply_signal call) don't pass metrics_dict at all, so this
                 # naturally stays silent there.
+                if metrics_provider_override is not None:
+                    stt_provider = metrics_provider_override.get("stt_provider")
+                    llm_provider = metrics_provider_override.get("llm_provider")
+                    tts_provider = metrics_provider_override.get("tts_provider")
+                else:
+                    stt_provider = type(getattr(self._engine, "_stt", None)).__name__
+                    llm_provider = type(getattr(self._engine, "_llm", None)).__name__
+                    tts_provider = type(getattr(self._engine, "_tts", None)).__name__
                 log.info("voice turn metrics", extra={
                     "session_id": self.session.session_id,
                     "campaign_id": self.session.campaign_id,
-                    "stt_provider": type(getattr(self._engine, "_stt", None)).__name__,
-                    "llm_provider": type(getattr(self._engine, "_llm", None)).__name__,
-                    "tts_provider": type(getattr(self._engine, "_tts", None)).__name__,
+                    "stt_provider": stt_provider,
+                    "llm_provider": llm_provider,
+                    "tts_provider": tts_provider,
                     "metrics": metrics_dict,
                 })
                 if self._record_metric is not None:
@@ -427,10 +437,10 @@ class VoiceBotAgent(BaseAgent):
                         await self._record_metric({
                             "session_id": self.session.session_id,
                             "campaign_id": self.session.campaign_id,
-                            "mode": "layered",
-                            "stt_provider": type(getattr(self._engine, "_stt", None)).__name__,
-                            "llm_provider": type(getattr(self._engine, "_llm", None)).__name__,
-                            "tts_provider": type(getattr(self._engine, "_tts", None)).__name__,
+                            "mode": metrics_mode,
+                            "stt_provider": stt_provider,
+                            "llm_provider": llm_provider,
+                            "tts_provider": tts_provider,
                             "action": action,
                             "metrics": metrics_dict,
                         })

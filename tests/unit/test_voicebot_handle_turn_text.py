@@ -448,6 +448,75 @@ async def test_apply_signal_no_record_metric_is_a_no_op():
     )
 
 
+# --- apply_signal: metrics_mode / metrics_provider_override (benchmarking) --
+
+
+@pytest.mark.asyncio
+async def test_apply_signal_uses_default_mode_and_engine_providers_when_no_override():
+    from src.agents.state_machine import Event
+
+    calls = []
+
+    async def _record_metric(payload):
+        calls.append(payload)
+
+    agent = _agent_with_slots(SlotSchema(), record_metric=_record_metric)
+    await agent.start()
+    await agent.state.fire(Event.UTTERANCE_COMPLETE)
+
+    metrics_dict = {
+        "stt_latency_ms": 300, "llm_ttft_ms": 1200, "llm_total_ms": 4000,
+        "tts_first_chunk_ms": 2000, "tts_total_ms": 2500, "total_latency_ms": 4300,
+    }
+
+    await agent.apply_signal(
+        user_text="hi", agent_text="hello", action="continue",
+        metrics_dict=metrics_dict,
+    )
+
+    assert len(calls) == 1
+    assert calls[0]["mode"] == "layered"
+    assert calls[0]["stt_provider"]  # derived from self._engine, non-empty string
+
+
+@pytest.mark.asyncio
+async def test_apply_signal_uses_explicit_mode_and_provider_override():
+    from src.agents.state_machine import Event
+
+    calls = []
+
+    async def _record_metric(payload):
+        calls.append(payload)
+
+    agent = _agent_with_slots(SlotSchema(), record_metric=_record_metric)
+    await agent.start()
+    await agent.state.fire(Event.UTTERANCE_COMPLETE)
+
+    metrics_dict = {
+        "stt_latency_ms": 0, "llm_ttft_ms": 0, "llm_total_ms": 0,
+        "tts_first_chunk_ms": 1400, "tts_total_ms": 0, "total_latency_ms": 3800,
+    }
+
+    await agent.apply_signal(
+        user_text="hi", agent_text="hello", action="continue",
+        metrics_dict=metrics_dict,
+        metrics_mode="s2s",
+        metrics_provider_override={
+            "stt_provider": None,
+            "llm_provider": "GeminiLiveSession",
+            "tts_provider": None,
+        },
+    )
+
+    assert len(calls) == 1
+    payload = calls[0]
+    assert payload["mode"] == "s2s"
+    assert payload["stt_provider"] is None
+    assert payload["llm_provider"] == "GeminiLiveSession"
+    assert payload["tts_provider"] is None
+    assert payload["metrics"]["tts_first_chunk_ms"] == 1400
+
+
 # --- campaign pronunciations threaded into TTS (fix A) ----------------------
 
 @pytest.mark.asyncio
