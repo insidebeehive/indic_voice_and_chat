@@ -83,15 +83,18 @@ class TurnMetricsComboEntry(BaseModel):
     """One (mode, stt_provider, llm_provider, tts_provider) combo's averaged
     per-turn latencies.
 
-    NOT directly comparable across ``mode``: for ``mode="s2s"`` (Gemini
-    Live), there is no bridge-level VAD/utterance-end signal, so
-    ``avg_total_latency_ms`` is a turn-window duration (session-connect or
-    prior-turn-complete to now) that includes the caller's own speaking
-    time, not a cascade-style utterance-end-to-response latency — and
-    ``avg_tts_first_chunk_ms`` is reinterpreted as time-to-first-spoken-audio
-    from the realtime model, not a TTS-specific measurement. Compare
-    ``mode="layered"`` rows against each other, and ``mode="s2s"`` rows
-    against each other, but not the two against one another.
+    For ``mode="s2s"`` (Gemini Live), there is no bridge-level VAD/utterance-end
+    event, so both fields are anchored from the last ``input_transcript`` event
+    seen this turn — a proxy for "the caller just finished speaking" — falling
+    back to turn-start only on a turn with no caller speech at all (e.g. an
+    opening greeting). ``avg_tts_first_chunk_ms`` is reinterpreted as
+    time-to-first-spoken-audio from the realtime model rather than a
+    TTS-specific measurement. This makes S2S rows broadly comparable in spirit
+    to ``mode="layered"`` rows (both are utterance-end-anchored), but not
+    byte-for-byte identical in methodology — layered mode's timestamp comes
+    from a hard STT-completion signal, S2S's from a proxy. Compare
+    ``mode="layered"`` rows against each other, and ``mode="s2s"`` rows against
+    each other, and treat cross-mode comparisons as directional, not exact.
     """
 
     mode: str

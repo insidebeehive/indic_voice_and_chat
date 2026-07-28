@@ -98,6 +98,7 @@ class _BaseLiveBridge:
         self._speaking = False
         self._turn_start_at = 0.0        # monotonic ts: start of the current turn
         self._first_audio_at: float | None = None  # monotonic ts: first "audio" event this turn
+        self._last_input_transcript_at: float | None = None  # monotonic ts: last "input_transcript" event this turn (proxy for "caller stopped talking")
         self._last_event_at = 0.0   # monotonic ts of the last model event (idle watchdog)
         # one-shot diagnostics: did the model ever HEAR the caller / RESPOND?
         self._dbg_heard_caller = False
@@ -210,6 +211,7 @@ class _BaseLiveBridge:
                         self._dbg_heard_caller = True
                         log.info("live: model heard the caller (input_transcript)",
                                  extra={"first_text": ev.text[:60]})
+                    self._last_input_transcript_at = time.monotonic()
                     self._user_buf += ev.text
                     await self._emit_transcript("user", self._user_buf, partial=True)
                 elif ev.type == "output_transcript":
@@ -262,6 +264,20 @@ class _BaseLiveBridge:
             if self._agent.state.state is State.LISTENING:
                 await self._agent.state.fire(Event.UTTERANCE_COMPLETE)
             now = time.monotonic()
+            # Anchor from the last input_transcript event this turn — the best
+            # available proxy for "the caller just finished speaking" (the
+            # underlying Live session does its own VAD internally but never
+            # surfaces a discrete end-of-speech event; see RealtimeEvent). This
+            # can lag the true end-of-speech moment slightly, since incoming
+            # audio isn't transcribed instantly, but it is far closer than
+            # turn_start_at, which would include however long the caller spoke.
+            # Falls back to turn_start_at only when no caller speech was heard
+            # this turn at all (e.g. the agent-greets-first kickoff turn).
+            anchor = (
+                self._last_input_transcript_at
+                if self._last_input_transcript_at is not None
+                else self._turn_start_at
+            )
             # S2S has no discrete STT/LLM/TTS phases (one end-to-end audio
             # model) — tts_first_chunk_ms is reinterpreted here as "time to
             # first spoken audio from the realtime model" (0 if the model
@@ -273,11 +289,11 @@ class _BaseLiveBridge:
                 "llm_ttft_ms": 0,
                 "llm_total_ms": 0,
                 "tts_first_chunk_ms": (
-                    int((self._first_audio_at - self._turn_start_at) * 1000)
+                    max(0, int((self._first_audio_at - anchor) * 1000))
                     if self._first_audio_at is not None else 0
                 ),
                 "tts_total_ms": 0,
-                "total_latency_ms": int((now - self._turn_start_at) * 1000),
+                "total_latency_ms": max(0, int((now - anchor) * 1000)),
                 "tts_segments_dropped": 0,
             }
             await self._agent.apply_signal(
@@ -308,6 +324,7 @@ class _BaseLiveBridge:
         self._speaking = False
         self._turn_start_at = time.monotonic()
         self._first_audio_at = None
+        self._last_input_transcript_at = None
         if getattr(self._agent.state, "is_terminal", False):
             if action == "transfer":
                 await self._on_transfer_hold()

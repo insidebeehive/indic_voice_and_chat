@@ -137,6 +137,85 @@ async def test_consume_events_records_s2s_turn_metrics():
 
 
 @pytest.mark.asyncio
+async def test_consume_events_anchors_metrics_from_last_input_transcript():
+    # Simulate a turn where the caller spoke for a while (long gap between
+    # turn-start and their last transcript chunk) and the model then responded
+    # quickly after that (short gap from last transcript to first audio). If
+    # metrics are still anchored from turn-start, tts_first_chunk_ms would be
+    # dominated by the caller's speaking time (the long sleep below) instead of
+    # the model's actual response time (the short sleep below).
+    calls = []
+
+    async def _record_metric(payload):
+        calls.append(payload)
+
+    class _SlowStartSession(_FakeSession):
+        async def events(self):
+            await asyncio.sleep(0.15)  # caller "speaking" before their first transcript chunk
+            yield RealtimeEvent(type="input_transcript", text="yeh")
+            await asyncio.sleep(0.15)  # more caller speech
+            yield RealtimeEvent(type="input_transcript", text=" app safe hai?")
+            await asyncio.sleep(0.02)  # short gap: model responds quickly after caller stops
+            yield RealtimeEvent(type="output_transcript", text="bilkul safe hai")
+            yield RealtimeEvent(type="audio", audio=b"\x01\x02" * 100, audio_rate=24000)
+            yield RealtimeEvent(type="tool_call", tool_name="record_turn_signal",
+                                 tool_args={"action": "send_info", "updated_slots": {}},
+                                 tool_id="x1")
+            yield RealtimeEvent(type="turn_complete")
+
+    agent = _agent(record_metric=_record_metric)
+    sess = _SlowStartSession([])
+
+    async def connect(cfg):
+        return sess
+
+    b = GeminiLiveBridge(websocket=_FakeWS(), agent=agent,
+                         config=RealtimeConfig(model="m"), connect_session=connect, llm=None)
+    b._session = sess
+    await agent.start()
+    b._turn_start_at = asyncio.get_event_loop().time()
+    import time as _time
+    b._turn_start_at = _time.monotonic()
+    await b._consume_events()
+
+    assert len(calls) == 1
+    metrics = calls[0]["metrics"]
+    # Anchored from last input_transcript (~0.02s before audio): must be well
+    # under the ~0.3s+0.02s it would be if still anchored from turn-start.
+    assert metrics["tts_first_chunk_ms"] < 150
+    assert metrics["total_latency_ms"] >= metrics["tts_first_chunk_ms"]
+
+
+@pytest.mark.asyncio
+async def test_consume_events_falls_back_to_turn_start_when_no_input_transcript():
+    # Greeting-first turn: the model speaks without ever hearing the caller
+    # this turn. There is no input_transcript to anchor from, so metrics must
+    # fall back to turn_start_at (unchanged behavior for this edge case).
+    calls = []
+
+    async def _record_metric(payload):
+        calls.append(payload)
+
+    events = [
+        RealtimeEvent(type="output_transcript", text="नमस्ते! मैं Anaaya बोल रही हूँ"),
+        RealtimeEvent(type="audio", audio=b"\x01\x02" * 100, audio_rate=24000),
+        RealtimeEvent(type="tool_call", tool_name="record_turn_signal",
+                      tool_args={"action": "continue", "updated_slots": {}}, tool_id="x1"),
+        RealtimeEvent(type="turn_complete"),
+    ]
+    b, sess, agent = _bridge(events, record_metric=_record_metric)
+    await agent.start()
+    await b._consume_events()
+
+    assert len(calls) == 1
+    metrics = calls[0]["metrics"]
+    # No input_transcript this turn -> anchor is turn_start_at -> must still be
+    # a small, non-negative, well-defined number (not a crash, not negative).
+    assert metrics["tts_first_chunk_ms"] >= 0
+    assert metrics["total_latency_ms"] >= metrics["tts_first_chunk_ms"]
+
+
+@pytest.mark.asyncio
 async def test_consume_events_no_metrics_recorded_for_silent_turn():
     calls = []
 
