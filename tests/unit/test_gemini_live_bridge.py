@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 
 import pytest
 
@@ -173,9 +174,6 @@ async def test_consume_events_anchors_metrics_from_last_input_transcript():
                          config=RealtimeConfig(model="m"), connect_session=connect, llm=None)
     b._session = sess
     await agent.start()
-    b._turn_start_at = asyncio.get_event_loop().time()
-    import time as _time
-    b._turn_start_at = _time.monotonic()
     await b._consume_events()
 
     assert len(calls) == 1
@@ -205,13 +203,15 @@ async def test_consume_events_falls_back_to_turn_start_when_no_input_transcript(
     ]
     b, sess, agent = _bridge(events, record_metric=_record_metric)
     await agent.start()
+    b._turn_start_at = time.monotonic()
     await b._consume_events()
 
     assert len(calls) == 1
     metrics = calls[0]["metrics"]
-    # No input_transcript this turn -> anchor is turn_start_at -> must still be
-    # a small, non-negative, well-defined number (not a crash, not negative).
-    assert metrics["tts_first_chunk_ms"] >= 0
+    # No input_transcript this turn -> anchor is turn_start_at (set just above,
+    # not the 0.0 __init__ default) -> must be a small, bounded, non-negative
+    # number, not the astronomically large value a garbage anchor would give.
+    assert 0 <= metrics["tts_first_chunk_ms"] < 1000
     assert metrics["total_latency_ms"] >= metrics["tts_first_chunk_ms"]
 
 
