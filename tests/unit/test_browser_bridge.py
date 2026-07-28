@@ -161,7 +161,14 @@ class FakeAgent:
     async def play_opening(self, sink):
         self.opening_played = True
         self.session.turns.append(type("Msg", (), {"role": "assistant", "content": "Namaste! Main Priya."})())
-        await sink(b"\x10\x11")  # fake opening audio
+        # Empty payload: BrowserVoiceBridge._send_pcm's `if not pcm16: return` makes
+        # this a true no-op, so it never touches _play_until (the post-opening echo
+        # gate). Verified empirically that ANY non-empty fake clip — including a
+        # larger one — sets _play_until to a real future timestamp that this test's
+        # zero-wall-clock message flood cannot outrun (all 35 follow-on frames get
+        # dropped as false-positive echo before the gate ever expires), which is
+        # what was silently swallowing the test's speech frames.
+        await sink(b"")  # fake opening audio (empty; no echo-gate window)
 
     async def handle_turn(self, captured: bytes, sink) -> TurnOutcome:
         self.turns.append(captured)

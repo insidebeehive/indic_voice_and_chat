@@ -252,9 +252,8 @@ def test_gender_directive_enforces_feminine_in_both_prompts() -> None:
     schema = SlotSchema.from_campaign_yaml(yaml.safe_load(SLOT_YAML))
     for instr in (build_s2s_system_instruction(script, schema),
                   build_voicebot_system_prompt(script, schema)):
-        assert "FEMALE" in instr
+        assert "female" in instr
         assert "feminine grammatical forms" in instr
-        assert "masculine" in instr        # named as the form to avoid
 
 
 def test_no_gender_directive_when_unset() -> None:

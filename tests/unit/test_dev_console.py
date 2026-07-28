@@ -25,7 +25,7 @@ def test_dev_voice_page_served():
     resp = client.get("/dev/voice")
     assert resp.status_code == 200
     assert "text/html" in resp.headers["content-type"]
-    assert "Voice Dev Console" in resp.text
+    assert "Voice Demo Console" in resp.text
 
 
 def test_dev_providers_excludes_hidden_options():
@@ -141,7 +141,9 @@ def test_place_call_uses_selected_provider_and_its_caller_id(monkeypatch):
         assert client.get("/dev/call-status/CA123").json()["status"] == "calling"
         assert client.get("/dev/call-status/NOPE").json()["status"] == "unknown"
         assert dev_call_control.pop_override("dev") == {
-            "mode": "s2s", "voice": "Kore", "lead_name": "Raju"}
+            "mode": "s2s", "voice": "Kore", "caller_name": "", "lead_name": "Raju",
+            "lead_gender": "", "transfer_webhook_url": "",
+        }
     finally:
         set_tenant_resolver(None)
 
@@ -183,7 +185,13 @@ def test_dev_voices_per_mode():
         data = resp.json()
         assert data["layered"]["voices"] == ["anushka", "karun"]
         assert data["layered"]["default"] == "anushka"
-        assert data["s2s"]["voices"] == ["Aoede", "Kore", "Leda"]
+        assert data["s2s"]["voices"] == [
+            "Aoede", "Kore", "Leda", "Puck", "Charon", "Fenrir", "Orus", "Zephyr",
+            "Achernar", "Achird", "Algenib", "Algieba", "Alnilam", "Autonoe",
+            "Callirrhoe", "Despina", "Enceladus", "Erinome", "Gacrux", "Iapetus",
+            "Laomedeia", "Pulcherrima", "Rasalgethi", "Sadachbia", "Sadaltager",
+            "Schedar", "Sulafat", "Umbriel", "Vindemiatrix", "Zubenelgenubi",
+        ]
         assert data["s2s"]["default"] == "Aoede"
     finally:
         set_tenant_resolver(None)

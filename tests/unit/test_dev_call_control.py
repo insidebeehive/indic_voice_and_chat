@@ -31,6 +31,9 @@ def test_monitor_ttl_evicts_stale_entries():
 
 def test_override_set_and_pop_is_one_shot():
     dcc.set_override("dev", mode="s2s", voice="Kore", lead_name="Raju")
-    assert dcc.pop_override("dev") == {"mode": "s2s", "voice": "Kore", "lead_name": "Raju"}
+    assert dcc.pop_override("dev") == {
+        "mode": "s2s", "voice": "Kore", "caller_name": "", "lead_name": "Raju",
+        "lead_gender": "", "transfer_webhook_url": "",
+    }
     assert dcc.pop_override("dev") is None
     assert dcc.pop_override("never-set") is None

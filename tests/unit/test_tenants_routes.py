@@ -394,7 +394,7 @@ async def test_list_tenants_shows_mode_and_models(ctx) -> None:
     body = resp.json()
     assert body["total"] >= 1
     acme = next(t for t in body["tenants"] if t["slug"] == "acme")
-    assert acme["mode"] == "layered"
+    assert acme["mode"] == "s2s"
     assert acme["llm"]["provider"] == "gemini"
     assert acme["llm"]["model"] == "gemini-2.5-flash-lite"
     assert acme["tts"]["model"] == "bulbul:v3"
@@ -455,8 +455,8 @@ async def test_tenant_analytics_and_billing(ctx) -> None:
     assert an["by_agent_type"]["voicebot"] == 3
     assert an["by_agent_type"]["human"] == 1
     # channel / provider / campaign breakdowns
-    assert an["by_channel"] == {"voice": 2, "webconsole": 1, "softphone": 1}
-    assert an["by_provider"]["twilio"] == 3 and an["by_provider"]["none"] == 1
+    assert an["by_channel"] == {"voice": 3, "softphone": 1}
+    assert an["by_provider"]["twilio"] == 3 and an["by_provider"]["webconsole"] == 1
     assert an["by_campaign"]["Promo"] == 1 and an["by_campaign"]["none"] == 3  # campaign_id→name
     # all breakdowns total to total_calls (the bug: they used to mismatch)
     for key in ("by_status", "by_outcome", "by_agent_type", "by_channel", "by_provider", "by_campaign"):

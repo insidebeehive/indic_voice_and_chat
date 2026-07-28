@@ -59,10 +59,10 @@ async def test_health_reports_provider_names(monkeypatch) -> None:
     body = resp.json()
     assert body["platform_defaults"] == {
         "stt": "sarvam",
-        "llm": "groq",
+        "llm": "gemini",
         "tts": "sarvam",
         "telephony": "twilio",
-        "vector_store": "faiss",
+        "vector_store": "pgvector",
     }
     assert body["redis"] == "ok"
     assert body["db"] == "ok"

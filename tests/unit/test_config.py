@@ -10,10 +10,10 @@ def test_loads_default_yaml() -> None:
     assert s.app.name == "vox-agent"
     assert s.app.version == "1.0.0"
     assert s.pipeline.stt.provider == "sarvam"
-    assert s.pipeline.llm.provider == "groq"
+    assert s.pipeline.llm.provider == "gemini"
     assert s.pipeline.tts.provider == "sarvam"
     assert s.pipeline.telephony.provider == "twilio"
-    assert s.pipeline.vector_store.provider == "faiss"
+    assert s.pipeline.vector_store.provider == "pgvector"
     assert s.pipeline.vector_store.embedding_dim == 384
 
 
