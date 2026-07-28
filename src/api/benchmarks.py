@@ -80,6 +80,7 @@ class RunListResponse(BaseModel):
 
 
 class TurnMetricsComboEntry(BaseModel):
+    mode: str
     stt_provider: Optional[str]
     llm_provider: str
     tts_provider: Optional[str]
@@ -180,6 +181,7 @@ async def turn_metrics_summary(
 ) -> TurnMetricsSummaryResponse:
     stmt = (
         select(
+            TurnMetric.mode,
             TurnMetric.stt_provider,
             TurnMetric.llm_provider,
             TurnMetric.tts_provider,
@@ -192,11 +194,12 @@ async def turn_metrics_summary(
             func.avg(TurnMetric.total_latency_ms).label("avg_total_latency_ms"),
             func.avg(TurnMetric.tts_segments_dropped).label("avg_tts_segments_dropped"),
         )
-        .group_by(TurnMetric.stt_provider, TurnMetric.llm_provider, TurnMetric.tts_provider)
+        .group_by(TurnMetric.mode, TurnMetric.stt_provider, TurnMetric.llm_provider, TurnMetric.tts_provider)
     )
     rows = (await db.execute(stmt)).all()
     entries = [
         TurnMetricsComboEntry(
+            mode=r.mode,
             stt_provider=r.stt_provider,
             llm_provider=r.llm_provider,
             tts_provider=r.tts_provider,

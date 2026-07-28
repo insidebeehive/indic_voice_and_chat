@@ -50,6 +50,14 @@ async def client():
                     llm_total_ms=5000, tts_first_chunk_ms=1900, tts_total_ms=2400,
                     total_latency_ms=5300, tts_segments_dropped=0,
                 ),
+                TurnMetric(
+                    tenant_id="dev", session_id="s2s1", campaign_id="bharat_matka",
+                    mode="s2s", stt_provider=None,
+                    llm_provider="GeminiLiveSession", tts_provider=None,
+                    action="continue", stt_latency_ms=0, llm_ttft_ms=0,
+                    llm_total_ms=0, tts_first_chunk_ms=1400, tts_total_ms=0,
+                    total_latency_ms=3800, tts_segments_dropped=0,
+                ),
             ])
             await session.commit()
 
@@ -80,7 +88,10 @@ async def test_summary_groups_by_combo(client: AsyncClient) -> None:
     assert resp.status_code == 200, resp.text
     body = resp.json()
     combos = {(e["stt_provider"], e["llm_provider"], e["tts_provider"]): e for e in body["entries"]}
-    assert len(combos) == 2
+    # 2 layered combos + 1 s2s combo (distinct stt/llm/tts triplet even
+    # without considering `mode`); mode-specific separation is covered by
+    # test_summary_includes_mode_and_separates_s2s_combo below.
+    assert len(combos) == 3
 
     gemini_combo = combos[("GroqSTTAdapter", "GeminiLLMAdapter", "SarvamTTSAdapter")]
     assert gemini_combo["samples"] == 2
@@ -90,6 +101,22 @@ async def test_summary_groups_by_combo(client: AsyncClient) -> None:
     claude_combo = combos[("GroqSTTAdapter", "AnthropicClaudeAdapter", "SarvamTTSAdapter")]
     assert claude_combo["samples"] == 1
     assert claude_combo["avg_total_latency_ms"] == 5300.0
+
+
+async def test_summary_includes_mode_and_separates_s2s_combo(client: AsyncClient) -> None:
+    resp = await client.get("/benchmarks/turn-metrics/summary", headers=ADMIN_HEADERS)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    combos = {
+        (e["mode"], e["stt_provider"], e["llm_provider"], e["tts_provider"]): e
+        for e in body["entries"]
+    }
+    assert len(combos) == 3  # the 2 pre-existing layered combos + 1 new s2s combo
+
+    s2s_combo = combos[("s2s", None, "GeminiLiveSession", None)]
+    assert s2s_combo["samples"] == 1
+    assert s2s_combo["avg_tts_first_chunk_ms"] == 1400.0
+    assert s2s_combo["avg_total_latency_ms"] == 3800.0
 
 
 async def test_summary_requires_admin(client: AsyncClient) -> None:
