@@ -40,6 +40,9 @@ class TurnMetric(Base):
     llm_total_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     tts_first_chunk_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     tts_total_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # Full turn duration (utterance-end to turn-complete) — includes the full
+    # response synthesis/speaking time, not just time-to-first-response. For
+    # perceived responsiveness, compare tts_first_chunk_ms instead.
     total_latency_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     tts_segments_dropped: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     created_at: Mapped[datetime] = mapped_column(

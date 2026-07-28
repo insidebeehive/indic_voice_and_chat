@@ -95,6 +95,14 @@ class TurnMetricsComboEntry(BaseModel):
     from a hard STT-completion signal, S2S's from a proxy. Compare
     ``mode="layered"`` rows against each other, and ``mode="s2s"`` rows against
     each other, and treat cross-mode comparisons as directional, not exact.
+
+    In both modes, ``avg_total_latency_ms`` spans the FULL turn (utterance-end
+    to turn-complete) — it includes the whole response's synthesis/speaking
+    time, not just the delay before the response starts. For perceived
+    responsiveness, ``avg_tts_first_chunk_ms`` (time to first spoken audio) is
+    the more representative figure; a call can have a large
+    ``avg_total_latency_ms`` simply because the response was long, without
+    feeling slow to respond.
     """
 
     mode: str
