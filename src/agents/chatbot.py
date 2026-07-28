@@ -429,8 +429,27 @@ class ChatBotAgent(BaseAgent):
                 f"{lang} — regardless of the conversation's default language or the "
                 "language of earlier turns."
             ]
+        elif not any(m.role == "user" for m in self.session.turns):
+            # Opening message, no language signal at all (e.g. a bare "games").
+            # There's no established conversation language yet to fall back on,
+            # and the configured default (often Devanagari Hindi) risks
+            # alienating an English-only user on their very first message.
+            # Roman Hinglish is readable by both English and Hindi/Hinglish
+            # speakers, so it's the safer opener; a later message with a real
+            # signal switches language deterministically from there, same as
+            # any other turn. Scoped to the opening message ONLY — a
+            # mid-conversation short ack ("ok") must keep following the
+            # established conversation's language (see bug #3 above), so this
+            # branch must never fire once a user turn already exists.
+            extra = [
+                "This is the very first message of the conversation and it carries no "
+                "clear language signal (e.g. a bare word like 'games'). Reply in "
+                "Roman-script Hinglish for this opening turn — readable by English and "
+                "Hindi/Hinglish speakers alike — rather than the configured default "
+                "language."
+            ]
         else:
-            extra = None  # no signal (empty/short/ambiguous) — follow the conversation
+            extra = None  # no signal mid-conversation — follow the conversation
         system_prompt = build_chatbot_system_prompt(
             company_name=self._company,
             language_default=self._language,

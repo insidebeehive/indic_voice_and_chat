@@ -173,20 +173,50 @@ async def test_english_message_gets_firm_english_directive(retriever) -> None:
 
 @pytest.mark.asyncio
 async def test_short_ack_gets_no_language_directive(retriever) -> None:
-    # A bare "ok" carries no language signal — forcing English would flip a
-    # Hinglish conversation mid-stream. No directive: history governs.
+    # A bare "ok" mid-conversation carries no language signal — forcing a
+    # language would flip an established conversation mid-stream. No
+    # directive: history governs. Seed a real prior turn first (via an
+    # actual handle_message call, the same way session.turns gets populated
+    # in production) so this genuinely exercises the MID-conversation path,
+    # not the opening-message one (which now gets a Hinglish-opener
+    # directive — see test_opening_message_with_no_signal_gets_hinglish_directive).
     llm = FakeLLM({
-        "response_text": "Theek hai!",
+        "response_text": "Your balance is 100.",
+        "language": "en",
+        "sources_used": [],
+        "confidence": "high",
+        "action": "none",
+    })
+    agent = _make_agent(llm, retriever)
+    await agent.handle_message("tell me about this site")  # establishes English
+    await agent.handle_message("ok")
+    system_prompt = llm.calls[-1][0].content
+    assert "MUST be in" not in system_prompt
+    assert "romanized Hindi (Hinglish)" not in system_prompt
+    assert "very first message" not in system_prompt
+
+
+@pytest.mark.asyncio
+async def test_opening_message_with_no_signal_gets_hinglish_directive(retriever) -> None:
+    # A bare, ambiguous single word ("games") as the FIRST message of a fresh
+    # session has no established conversation language to fall back on, and
+    # the configured default (often Devanagari Hindi) risks alienating an
+    # English-only user on their very first message. Default to Roman
+    # Hinglish instead — readable by both English and Hindi/Hinglish
+    # speakers — rather than the configured default language.
+    llm = FakeLLM({
+        "response_text": "Yaha kai games available hain!",
         "language": "hi",
         "sources_used": [],
         "confidence": "high",
         "action": "none",
     })
     agent = _make_agent(llm, retriever)
-    await agent.handle_message("ok")
+    await agent.handle_message("games")
     system_prompt = llm.calls[0][0].content
-    assert "MUST be in" not in system_prompt
-    assert "romanized Hindi (Hinglish)" not in system_prompt
+    assert "very first message" in system_prompt
+    assert "Roman-script Hinglish" in system_prompt
+    assert "MUST be in" not in system_prompt  # not the named-language branch
 
 
 @pytest.mark.asyncio
