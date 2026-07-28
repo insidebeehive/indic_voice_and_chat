@@ -96,6 +96,8 @@ class _BaseLiveBridge:
         self._pending_action: str | None = None
         self._pending_slots: dict = {}
         self._speaking = False
+        self._turn_start_at = 0.0        # monotonic ts: start of the current turn
+        self._first_audio_at: float | None = None  # monotonic ts: first "audio" event this turn
         self._last_event_at = 0.0   # monotonic ts of the last model event (idle watchdog)
         # one-shot diagnostics: did the model ever HEAR the caller / RESPOND?
         self._dbg_heard_caller = False
@@ -112,6 +114,7 @@ class _BaseLiveBridge:
             await self._on_start()
             self._session = await self._connect_session(self._config)
             self._mark_activity()
+            self._turn_start_at = time.monotonic()
             events_task = asyncio.create_task(self._consume_events())
             watchdog_task = asyncio.create_task(self._idle_watchdog())
             await self._emit_status("listening")
@@ -199,6 +202,8 @@ class _BaseLiveBridge:
                     if not self._dbg_model_audio:
                         self._dbg_model_audio = True
                         log.info("live: model is producing audio (responding)")
+                    if self._first_audio_at is None:
+                        self._first_audio_at = time.monotonic()
                     await self._send_audio_out(ev.audio, ev.audio_rate)
                 elif ev.type == "input_transcript":
                     if not self._dbg_heard_caller:
@@ -256,9 +261,36 @@ class _BaseLiveBridge:
             # Drive LISTENING->PROCESSING so apply_signal's transitions are valid.
             if self._agent.state.state is State.LISTENING:
                 await self._agent.state.fire(Event.UTTERANCE_COMPLETE)
+            now = time.monotonic()
+            # S2S has no discrete STT/LLM/TTS phases (one end-to-end audio
+            # model) — tts_first_chunk_ms is reinterpreted here as "time to
+            # first spoken audio from the realtime model" (0 if the model
+            # never produced audio this turn), and every other cascade-only
+            # field stays 0. Reuses the existing turn_metrics schema; no new
+            # column, disambiguated by mode="s2s" below.
+            metrics_dict = {
+                "stt_latency_ms": 0,
+                "llm_ttft_ms": 0,
+                "llm_total_ms": 0,
+                "tts_first_chunk_ms": (
+                    int((self._first_audio_at - self._turn_start_at) * 1000)
+                    if self._first_audio_at is not None else 0
+                ),
+                "tts_total_ms": 0,
+                "total_latency_ms": int((now - self._turn_start_at) * 1000),
+                "tts_segments_dropped": 0,
+            }
             await self._agent.apply_signal(
                 user_text=user, agent_text=agent, action=action,
-                updated_slots=self._pending_slots)
+                updated_slots=self._pending_slots,
+                metrics_dict=metrics_dict,
+                metrics_mode="s2s",
+                metrics_provider_override={
+                    "stt_provider": None,
+                    "llm_provider": type(self._session).__name__ if self._session is not None else None,
+                    "tts_provider": None,
+                },
+            )
             log.info("live turn committed", extra={
                 "user_chars": len(user), "agent_chars": len(agent), "action": action,
                 "user": user[:120], "agent": agent[:120]})
@@ -274,6 +306,8 @@ class _BaseLiveBridge:
         self._pending_action = None
         self._pending_slots = {}
         self._speaking = False
+        self._turn_start_at = time.monotonic()
+        self._first_audio_at = None
         if getattr(self._agent.state, "is_terminal", False):
             if action == "transfer":
                 await self._on_transfer_hold()

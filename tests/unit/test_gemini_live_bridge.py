@@ -50,7 +50,7 @@ class _FakeSession:
         self.closed = True
 
 
-def _agent():
+def _agent(record_metric=None):
     return VoiceBotAgent(
         session=AgentSession(session_id="t1", lead_data={}),
         state_machine=AgentStateMachine(),
@@ -59,11 +59,12 @@ def _agent():
         script=VoiceBotScript(agent_name="Anaaya", agent_role="sales", company_name="X"),
         engine=object(),
         store=None,
+        record_metric=record_metric,
     )
 
 
-def _bridge(events, llm=None):
-    agent = _agent()
+def _bridge(events, llm=None, record_metric=None):
+    agent = _agent(record_metric=record_metric)
     sess = _FakeSession(events)
 
     async def connect(cfg):
@@ -98,6 +99,58 @@ async def test_consume_events_records_turn_and_slots():
     assert len(b._ws.sent_bytes) > 0                       # agent audio resampled + sent
     assert sess.tool_responses and sess.tool_responses[0][1] == "record_turn_signal"
     assert agent.state.state is State.LISTENING            # back to listening after the turn
+
+
+@pytest.mark.asyncio
+async def test_consume_events_records_s2s_turn_metrics():
+    calls = []
+
+    async def _record_metric(payload):
+        calls.append(payload)
+
+    events = [
+        RealtimeEvent(type="input_transcript", text="yeh app safe hai?"),
+        RealtimeEvent(type="output_transcript", text="bilkul safe hai"),
+        RealtimeEvent(type="audio", audio=b"\x01\x02" * 100, audio_rate=24000),
+        RealtimeEvent(type="tool_call", tool_name="record_turn_signal",
+                      tool_args={"action": "send_info", "updated_slots": {}},
+                      tool_id="x1"),
+        RealtimeEvent(type="turn_complete"),
+    ]
+    b, sess, agent = _bridge(events, record_metric=_record_metric)
+    await agent.start()
+    await b._consume_events()
+
+    assert len(calls) == 1
+    payload = calls[0]
+    assert payload["mode"] == "s2s"
+    assert payload["stt_provider"] is None
+    assert payload["llm_provider"] == "_FakeSession"
+    assert payload["tts_provider"] is None
+    metrics = payload["metrics"]
+    # tts_first_chunk_ms here means "time to first spoken audio" for S2S rows
+    # (see the code comment in live_bridge_base.py) — the audio event fired
+    # before turn_complete, so this must be a real, non-zero measurement, and
+    # must not exceed the full turn's total_latency_ms.
+    assert metrics["tts_first_chunk_ms"] >= 0
+    assert metrics["total_latency_ms"] >= metrics["tts_first_chunk_ms"]
+
+
+@pytest.mark.asyncio
+async def test_consume_events_no_metrics_recorded_for_silent_turn():
+    calls = []
+
+    async def _record_metric(payload):
+        calls.append(payload)
+
+    events = [RealtimeEvent(type="turn_complete")]
+    b, sess, agent = _bridge(events, record_metric=_record_metric)
+    await agent.start()
+    await b._consume_events()
+
+    # No user/agent text this turn (model went silent) — no real turn
+    # happened, so no metrics row should be recorded.
+    assert calls == []
 
 
 @pytest.mark.asyncio
