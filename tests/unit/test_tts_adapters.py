@@ -8,7 +8,7 @@ import respx
 from httpx import Response
 
 from src.interfaces.tts import TTSConfig
-from src.providers.tts.indicf5 import IndicF5TTSAdapter
+from src.providers.tts.indicf5 import IndicF5TTSAdapter, _STREAM_PATH
 from src.providers.tts.sarvam import SARVAM_BASE_URL, SarvamTTSAdapter
 
 
@@ -23,15 +23,6 @@ _INDICF5_URL = "https://pod-8000.proxy.runpod.net"
 @pytest.fixture
 def indicf5() -> IndicF5TTSAdapter:
     return IndicF5TTSAdapter({"base_url": _INDICF5_URL})
-
-
-def _wav(pcm: bytes, rate: int) -> bytes:
-    """Minimal RIFF/WAVE wrapper (16-bit mono) around raw PCM."""
-    import struct
-    fmt = struct.pack("<HHIIHH", 1, 1, rate, rate * 2, 2, 16)
-    return (b"RIFF" + struct.pack("<I", 36 + len(pcm)) + b"WAVE"
-            + b"fmt " + struct.pack("<I", len(fmt)) + fmt
-            + b"data" + struct.pack("<I", len(pcm)) + pcm)
 
 
 @pytest.mark.asyncio
@@ -165,13 +156,13 @@ async def test_sarvam_passes_extra_pronunciations_to_normalize(
 @pytest.mark.asyncio
 @respx.mock
 async def test_indicf5_synthesize_resamples_24k_to_requested_rate(indicf5: IndicF5TTSAdapter) -> None:
-    # IndicF5 renders at its model rate (24kHz) regardless of the request,
-    # but the pipeline/bridges are wired for the REQUESTED rate and don't
-    # honor TTSResult.sample_rate — unresampled 24k plays at ~2/3 speed.
-    # The adapter must strip the WAV header AND resample to the request.
+    # IndicF5 always renders at its fixed native rate (24kHz) regardless of
+    # the request, but the pipeline/bridges are wired for the REQUESTED rate
+    # and don't honor TTSResult.sample_rate — unresampled 24k plays at ~2/3
+    # speed. The adapter must resample to the request. Raw PCM, no WAV header.
     pcm = b"\x01\x02" * 2400  # 4800 bytes => 0.1s @ 24kHz mono 16-bit
-    route = respx.post(f"{_INDICF5_URL}/tts").mock(
-        return_value=Response(200, content=_wav(pcm, 24000)))
+    route = respx.post(f"{_INDICF5_URL}{_STREAM_PATH}").mock(
+        return_value=Response(200, content=pcm))
     result = await indicf5.synthesize("नमस्कार", TTSConfig(language="mr-IN", sample_rate=16000))
     assert result.sample_rate == 16000
     # 0.1s of audio at 16kHz mono 16-bit = 3200 bytes (duration preserved).
@@ -186,23 +177,23 @@ async def test_indicf5_synthesize_resamples_24k_to_requested_rate(indicf5: Indic
 @pytest.mark.asyncio
 @respx.mock
 async def test_indicf5_no_resample_when_rates_match(indicf5: IndicF5TTSAdapter) -> None:
-    pcm = b"\x01\x02" * 1600  # 3200 bytes => 0.1s @ 16kHz
-    respx.post(f"{_INDICF5_URL}/tts").mock(
-        return_value=Response(200, content=_wav(pcm, 16000)))
-    result = await indicf5.synthesize("hi", TTSConfig(language="hi-IN", sample_rate=16000))
+    pcm = b"\x01\x02" * 1600  # 3200 bytes @ 24kHz (IndicF5's fixed native rate)
+    respx.post(f"{_INDICF5_URL}{_STREAM_PATH}").mock(
+        return_value=Response(200, content=pcm))
+    result = await indicf5.synthesize("hi", TTSConfig(language="hi-IN", sample_rate=24000))
     assert result.audio == pcm  # byte-identical, no needless conversion
-    assert result.sample_rate == 16000
+    assert result.sample_rate == 24000
 
 
 @pytest.mark.asyncio
 @respx.mock
 async def test_indicf5_retries_5xx_then_succeeds(indicf5: IndicF5TTSAdapter) -> None:
     pcm = b"\x00\x01" * 100
-    route = respx.post(f"{_INDICF5_URL}/tts")
-    # 16k here so no resample obscures the byte-identity check — this test is
-    # about retry behavior; resampling has its own tests above.
-    route.side_effect = [Response(503), Response(200, content=_wav(pcm, 16000))]
-    result = await indicf5.synthesize("Namaste", TTSConfig(language="hi-IN"))
+    route = respx.post(f"{_INDICF5_URL}{_STREAM_PATH}")
+    # 24k (native) here so no resample obscures the byte-identity check —
+    # this test is about retry behavior; resampling has its own test above.
+    route.side_effect = [Response(503), Response(200, content=pcm)]
+    result = await indicf5.synthesize("Namaste", TTSConfig(language="hi-IN", sample_rate=24000))
     assert result.audio == pcm
     assert route.call_count == 2
 
@@ -210,10 +201,24 @@ async def test_indicf5_retries_5xx_then_succeeds(indicf5: IndicF5TTSAdapter) -> 
 @pytest.mark.asyncio
 @respx.mock
 async def test_indicf5_does_not_retry_4xx(indicf5: IndicF5TTSAdapter) -> None:
-    route = respx.post(f"{_INDICF5_URL}/tts").mock(return_value=Response(422))
+    route = respx.post(f"{_INDICF5_URL}{_STREAM_PATH}").mock(return_value=Response(422))
     with pytest.raises(httpx.HTTPStatusError):
         await indicf5.synthesize("hi", TTSConfig(language="hi-IN"))
     assert route.call_count == 1
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_indicf5_reassembles_multiple_stream_chunks(indicf5: IndicF5TTSAdapter) -> None:
+    # Content larger than the adapter's 4096-byte chunk_size forces httpx's
+    # aiter_bytes to split delivery into multiple chunks — this proves the
+    # adapter accumulates ALL chunks (not just the first) into the final
+    # audio, rather than silently truncating a multi-chunk stream.
+    pcm = bytes(range(256)) * 50  # 12800 bytes, spans multiple 4096-byte chunks
+    respx.post(f"{_INDICF5_URL}{_STREAM_PATH}").mock(
+        return_value=Response(200, content=pcm))
+    result = await indicf5.synthesize("hi", TTSConfig(language="hi-IN", sample_rate=24000))
+    assert result.audio == pcm  # exact reassembly, no truncation/corruption
 
 
 def test_indicf5_voices_cover_indic_languages(indicf5: IndicF5TTSAdapter) -> None:
@@ -248,7 +253,7 @@ async def test_indicf5_passes_extra_pronunciations_to_normalize(
 
     monkeypatch.setattr("src.providers.tts.indicf5.normalize_for_tts", _fake_normalize)
     pcm = b"\x01\x02" * 100
-    respx.post(f"{_INDICF5_URL}/tts").mock(return_value=Response(200, content=_wav(pcm, 16000)))
+    respx.post(f"{_INDICF5_URL}{_STREAM_PATH}").mock(return_value=Response(200, content=pcm))
 
     config = TTSConfig(language="hi-IN", extra_pronunciations={"XYZ": "एक्स वाय ज़ेड"})
     await indicf5.synthesize("hello XYZ", config)

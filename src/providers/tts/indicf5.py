@@ -1,10 +1,13 @@
 """IndicF5 TTS adapter — self-hosted fine-tuned voice server (RunPod).
 
-The server exposes ``POST {base_url}/tts`` with ``{"text", "lang", "speed"}``
-and returns WAV bytes. There is no native streaming and no voice parameter
-(the fine-tune IS the voice), so ``synthesize_stream`` synthesizes per text
-segment like the Sarvam adapter, and ``get_available_voices`` reports the one
-fine-tuned voice for every IndicF5 language.
+``synthesize`` streams from ``POST {base_url}{_STREAM_PATH}`` with
+``{"text", "lang", "speed"}`` — chunked HTTP, raw PCM16 mono chunks (no
+per-chunk WAV framing), end-of-stream on connection close. The exact stream
+path is UNCONFIRMED pending live verification against the real pod — see
+``_STREAM_PATH`` below. There is no voice parameter (the fine-tune IS the
+voice), so ``synthesize_stream`` synthesizes per text segment like the
+Sarvam adapter, and ``get_available_voices`` reports the one fine-tuned
+voice for every IndicF5 language.
 
 Config: ``base_url`` in the provider config, or the platform-level
 ``INDICF5_TTS_URL`` env var (e.g. ``https://<pod-id>-8000.proxy.runpod.net``).
@@ -21,7 +24,6 @@ import httpx
 from src.interfaces.tts import ITTSProvider, TTSConfig, TTSResult
 from src.pipeline.audio_utils import resample_pcm16
 from src.pipeline.text_normalize import normalize_for_tts
-from src.providers.tts.sarvam import _extract_pcm
 
 log = logging.getLogger(__name__)
 
@@ -31,6 +33,15 @@ log = logging.getLogger(__name__)
 # paths, hence slightly more headroom than Sarvam's 8s.
 _DEFAULT_TIMEOUT_S = 10.0
 _TTS_ATTEMPTS = 2  # initial try + 1 retry
+
+# UNCONFIRMED — best guess pending live verification against the real pod.
+# If IndicF5's actual path differs, this is the only line that needs to change.
+_STREAM_PATH = "/tts/stream"
+
+# IndicF5 always renders at this fixed rate regardless of what's requested.
+# The old WAV-wrapped /tts response let us read this from the header; the new
+# raw-PCM streaming response has no header, so it's hardcoded here instead.
+_NATIVE_SAMPLE_RATE = 24000
 
 DEFAULT_VOICE = "indicf5"
 
@@ -75,37 +86,46 @@ class IndicF5TTSAdapter(ITTSProvider):
             "speed": config.speed,
         }
         timeout = httpx.Timeout(self._timeout, connect=min(self._timeout, 5.0))
-        blob: bytes | None = None
+        chunks: list[bytes] | None = None
         last_exc: Exception | None = None
         for attempt in range(_TTS_ATTEMPTS):
             try:
+                collected: list[bytes] = []
                 async with httpx.AsyncClient(timeout=timeout) as client:
-                    resp = await client.post(f"{self._base_url}/tts", json=body)
-                    resp.raise_for_status()
-                    blob = resp.content
+                    async with client.stream(
+                        "POST", f"{self._base_url}{_STREAM_PATH}", json=body,
+                    ) as resp:
+                        resp.raise_for_status()
+                        async for chunk in resp.aiter_bytes(chunk_size=4096):
+                            if chunk:
+                                collected.append(chunk)
+                chunks = collected
                 break
             except (httpx.TimeoutException, httpx.TransportError) as e:
                 last_exc = e
-                log.warning("indicf5 tts transient error (attempt %d/%d): %s",
+                log.warning("indicf5 tts stream transient error (attempt %d/%d): %s",
                             attempt + 1, _TTS_ATTEMPTS, e)
             except httpx.HTTPStatusError as e:
                 # Retry only transient 5xx; surface 4xx (bad request) at once.
+                # A mid-stream failure after some chunks were already read also
+                # lands here (or above) and discards `collected` entirely —
+                # there is no partial-audio recovery, the whole request retries.
                 if e.response.status_code >= 500 and attempt + 1 < _TTS_ATTEMPTS:
                     last_exc = e
-                    log.warning("indicf5 tts %s (attempt %d/%d); retrying",
+                    log.warning("indicf5 tts stream %s (attempt %d/%d); retrying",
                                 e.response.status_code, attempt + 1, _TTS_ATTEMPTS)
                     continue
                 raise
-        if blob is None:
+        if chunks is None:
             raise last_exc  # type: ignore[misc]  # set whenever the loop didn't break
-        if not blob:
+        audio_bytes = b"".join(chunks)
+        if not audio_bytes:
             raise RuntimeError("IndicF5 TTS returned empty audio")
 
-        # The server returns WAV; downstream bridges need raw 16-bit mono PCM
-        # (a WAV header decoded as samples causes a noise burst at the start).
-        # _extract_pcm reads the REAL sample rate from the header — IndicF5
-        # renders at its model rate (24kHz) regardless of what we'd request.
-        audio_bytes, actual_rate = _extract_pcm(blob, fallback_rate=config.sample_rate)
+        # Raw PCM16 mono, no WAV header on this endpoint — IndicF5 always
+        # renders at its fixed native rate (24kHz), same as the old /tts path,
+        # just no longer readable from a header since there isn't one anymore.
+        actual_rate = _NATIVE_SAMPLE_RATE
         # The pipeline sends TTS audio to the sink as-is and the bridges are
         # wired for the REQUESTED rate (TTSConfig(sample_rate=16000) →
         # 16k→8k telephony conversion happens there) — TTSResult.sample_rate
