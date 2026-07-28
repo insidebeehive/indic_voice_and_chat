@@ -267,8 +267,6 @@ const TEL_FIELDS = {
   stringee:   [["account_sid","API Key SID",false],["auth_token","API Key Secret",true],["user_id","User ID (e.g. dev)",false]],
   twilio:     [["account_sid","Account SID",false],["auth_token","Auth Token",true],["api_key_sid","API Key SID (softphone)",false],["api_key_secret","API Key Secret (softphone)",true],["twiml_app_sid","TwiML App SID (softphone)",false]],
   exotel:     [["account_sid","API Key / SID",false],["auth_token","API Token",true]],
-  infobip:    [["account_sid","API Key",false],["auth_token","API Secret",true]],
-  telnyx:     [["account_sid","API Key / SID",false],["auth_token","API Secret",true]],
   webconsole: [],
 };
 const escAttr = (s) => String(s == null ? "" : s).replace(/&/g,"&amp;").replace(/"/g,"&quot;").replace(/</g,"&lt;");
@@ -292,7 +290,7 @@ function loadTelephony(id) {
       <code>/api/v1/tenants/${id}</code>; the live resolver refreshes immediately.</div>
     <div class="creds" style="gap:.6rem;">
       <label>provider <select id="te_provider" onchange="onTelProviderChange()">${
-        ["stringee","twilio","exotel","infobip","telnyx","webconsole"]
+        ["stringee","twilio","exotel","webconsole"]
           .map(p => `<option value="${p}"${p === (t.telephony_provider || "") ? " selected" : ""}>${p}</option>`).join("")
       }</select></label>
       <label>from_number <input id="te_from" value="${escAttr(t.telephony_from_number)}" placeholder="+91… / 91…" /></label>
