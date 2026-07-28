@@ -11,5 +11,3 @@
 - [Live testing](live-testing.md) — placing real calls, ngrok setup
 - [Multi-tenant plan](multi-tenant-plan.md)
 - [Stringee streaming](stringee-streaming.md)
-- [Infobip trial setup](infobip-trial-setup.md)
-- [Telnyx trial setup](telnyx-trial-setup.md)

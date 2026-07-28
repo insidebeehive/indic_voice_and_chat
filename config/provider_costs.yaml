@@ -57,5 +57,3 @@ telephony:
   twilio: 0.014
   exotel: 0.007
   stringee: 0.010
-  infobip: 0.012
-  telnyx: 0.0035

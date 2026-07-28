@@ -339,9 +339,9 @@ def test_place_call_rejects_unsupported_provider():
     _register_dev_tenant()
     try:
         resp = _client().post("/dev/place-call", json={
-            "provider": "telnyx", "to_number": "+919999999999"})
+            "provider": "not_a_real_provider", "to_number": "+919999999999"})
         assert resp.status_code == 400
-        assert "telnyx" in resp.json()["detail"]
+        assert "not_a_real_provider" in resp.json()["detail"]
     finally:
         set_tenant_resolver(None)
 
