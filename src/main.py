@@ -69,7 +69,7 @@ from src.integration.tenant_events import deliver as deliver_tenant_event
 from src.integration.tenant_events import resolve_events_webhook_url
 from src.auth.db_resolver import DbTenantResolver
 from src.auth.middleware import set_admin_tokens, set_tenant_resolver
-from src.auth.seed import seed_campaigns_if_empty, seed_if_empty, seed_provider_costs, sync_telephony_from_yaml
+from src.auth.seed import seed_if_empty, seed_provider_costs, sync_telephony_from_yaml
 from src.bootstrap import (
     PerCrmRetrieverRegistry,
     build_provider_registry,
@@ -81,7 +81,6 @@ from src.bootstrap import (
 )
 from src.config import Settings, get_settings
 from src.config_tenant import TenantSettings
-from src.dialogue.campaign_loader import active_campaign_slug, load_campaign
 from src.dialogue.campaign_resolver import DbCampaignResolver
 from src.dialogue.context import SessionStore
 from src.models.database import dispose_engine, ensure_schema, get_engine, get_sessionmaker
@@ -272,9 +271,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     except Exception:
         log.warning("sync_telephony_from_yaml skipped (timeout or error)")
     await seed_provider_costs(sessionmaker)
-    seeded_campaigns = await seed_campaigns_if_empty(sessionmaker)
-    if seeded_campaigns:
-        log.info("seeded default campaigns from VOX_CAMPAIGN", extra={"count": seeded_campaigns})
     resolver = DbTenantResolver(sessionmaker)
     await resolver.reload()
     set_tenant_resolver(resolver)
@@ -347,12 +343,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # tenants reload (e.g. a key/config update via the tenant API) so the new
     # config takes effect.
     resolver.on_reload = runtime_registry.evict_all
-    campaign = load_campaign(active_campaign_slug())
-    log.info(
-        "campaign loaded",
-        extra={"slug": active_campaign_slug(), "agent": campaign.script.agent_name,
-               "slots": list(campaign.slots.specs.keys())},
-    )
     # Per-tenant campaign resolution: EVERY bridge (telephony + dev console)
     # resolves this call's script + slots from the tenant's DB campaign
     # (?campaign=<id> on the media-stream URL, else the tenant's active campaign)
