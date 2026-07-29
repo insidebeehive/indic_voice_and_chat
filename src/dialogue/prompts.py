@@ -269,14 +269,17 @@ def build_voicebot_system_prompt(
     parts.append(
         f"Language: start the call in {script.language_default}. If the caller speaks in — "
         "or asks for — another language, briefly acknowledge and switch to that language for "
-        "the rest of the call (and switch again if they change). Write `response_text` in the "
-        "NATIVE SCRIPT of whichever language you are currently speaking (Devanagari for "
+        "the rest of the call (and switch again if they change). Write `response_text` ENTIRELY "
+        "in the NATIVE SCRIPT of whichever language you are currently speaking (Devanagari for "
         "Hindi/Marathi, etc.) — never romanized/Latin, because an Indic TTS reads it aloud and "
-        "garbles Latin script. Default to respectful formal second-person (आप in Hindi, आपण "
-        "in Marathi). If the caller is very casual you may warm up your phrasing to match — "
-        "just stay courteous (तू and rude or over-familiar exclamations are out). Well-known "
-        "brand names may stay as-is. Set the `language` field to the base code of the language "
-        'you are speaking this turn (e.g. "hi", "mr", "te").'
+        "garbles Latin script. This applies to EVERYTHING in your reply, with no exceptions: "
+        "brand names, technical terms, numbers, and anything drawn from the knowledge base below "
+        "— rewrite it all in the native script rather than quoting source text verbatim, even if "
+        "the source material or a brand name is itself written in Latin script or English. "
+        "Default to respectful formal second-person (आप in Hindi, आपण in Marathi). If the caller "
+        "is very casual you may warm up your phrasing to match — just stay courteous (तू and rude "
+        "or over-familiar exclamations are out). Set the `language` field to the base code of the "
+        'language you are speaking this turn (e.g. "hi", "mr", "te").'
     )
 
     # Customer-led behavior (fixed policy, generic over every campaign).
