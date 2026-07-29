@@ -31,3 +31,21 @@ def test_extra_overrides_merge_over_defaults() -> None:
     out = apply_pronunciations("Khelo Aviator aur ZyxBrand", extra={"ZyxBrand": "ज़िक्सब्रांड"})
     assert "ज़िक्सब्रांड" in out
     assert DEFAULT_PRONUNCIATIONS["Aviator"] in out
+
+
+def test_rewrites_newly_added_sports_and_gaming_terms() -> None:
+    # These specific words were observed un-transliterated in real Stage test
+    # transcripts (still in Latin script when reaching TTS) before this
+    # expansion — this test guards against a future accidental removal.
+    out = apply_pronunciations(
+        "Cricket aur Football dono hai, aap join karke explore kar sakte hain, "
+        "koi risk nahi. Matka bhi khel sakte hain."
+    )
+    assert "Cricket" not in out and DEFAULT_PRONUNCIATIONS["Cricket"] in out
+    assert "Football" not in out and DEFAULT_PRONUNCIATIONS["Football"] in out
+    assert "join" not in out and DEFAULT_PRONUNCIATIONS["join"] in out
+    assert "explore" not in out and DEFAULT_PRONUNCIATIONS["explore"] in out
+    assert "risk" not in out and DEFAULT_PRONUNCIATIONS["risk"] in out
+    assert "Matka" not in out and DEFAULT_PRONUNCIATIONS["Matka"] in out
+    # Surrounding Hindi/Hinglish text is preserved untouched.
+    assert "aur" in out and "dono hai" in out and "koi" in out and "nahi" in out
