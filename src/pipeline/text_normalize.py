@@ -197,7 +197,7 @@ def normalize_for_tts(
         return text
     base = (language or "").strip().lower().split("-")[0]
     if base and base not in DEVANAGARI_LANGS:
-        _warn_if_untransliterated(text, base or "unknown")
+        _warn_if_untransliterated(text, base)
         return text
     result = apply_pronunciations(normalize_currency(text), extra=extra)
     _warn_if_untransliterated(result, base or "hi")
