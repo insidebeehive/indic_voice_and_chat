@@ -1,6 +1,12 @@
 from __future__ import annotations
 
-from src.pipeline.text_normalize import DEFAULT_PRONUNCIATIONS, apply_pronunciations
+import logging
+
+from src.pipeline.text_normalize import (
+    DEFAULT_PRONUNCIATIONS,
+    apply_pronunciations,
+    normalize_for_tts,
+)
 
 
 def test_rewrites_known_terms_to_devanagari() -> None:
@@ -49,3 +55,58 @@ def test_rewrites_newly_added_sports_and_gaming_terms() -> None:
     assert "Matka" not in out and DEFAULT_PRONUNCIATIONS["Matka"] in out
     # Surrounding Hindi/Hinglish text is preserved untouched.
     assert "aur" in out and "dono hai" in out and "koi" in out and "nahi" in out
+
+
+def test_normalize_for_tts_warns_on_devanagari_language_gap(caplog) -> None:
+    # Devanagari-dominant text with one genuine gap word -- "ZyxUnknownBrand"
+    # is guaranteed not to be in DEFAULT_PRONUNCIATIONS. Script-dominant text
+    # (>=60% Devanagari) with a residual Latin word is exactly the case this
+    # mechanism must catch.
+    with caplog.at_level(logging.WARNING):
+        normalize_for_tts(
+            "व्हाट्सऐप पर लिंक भेजता हूं ZyxUnknownBrand", language="hi-IN"
+        )
+    assert any(
+        r.levelno == logging.WARNING and "ZyxUnknownBrand" in str(r.__dict__.get("words"))
+        for r in caplog.records
+    )
+
+
+def test_normalize_for_tts_no_warning_when_fully_covered(caplog) -> None:
+    with caplog.at_level(logging.WARNING):
+        normalize_for_tts("व्हाट्सऐप पर लिंक भेजता हूं", language="hi-IN")
+    assert not any(r.levelno == logging.WARNING for r in caplog.records)
+
+
+def test_normalize_for_tts_no_warning_for_romanized_hinglish(caplog) -> None:
+    # Romanized Hinglish ("par", "bhejun", "aur", "khelo" are ordinary Hindi
+    # words correctly left in Latin script) must NOT be flagged -- this is
+    # expected input shape, not a pronunciation-dictionary gap. This is the
+    # exact false positive an earlier version of this mechanism produced.
+    with caplog.at_level(logging.WARNING):
+        normalize_for_tts("WhatsApp par link bhejun aur Cricket khelo", language="hi-IN")
+    assert not any(r.levelno == logging.WARNING for r in caplog.records)
+
+
+def test_normalize_for_tts_warns_for_script_dominant_unsupported_language(caplog) -> None:
+    # Telugu ("te") has zero normalization today. This is real Telugu-script
+    # text (generated via indic_transliteration from a known-correct
+    # Devanagari sentence, so the Telugu itself is linguistically valid) with
+    # one residual English word -- exactly the "no normalization exists yet
+    # for this language" gap this task must surface.
+    with caplog.at_level(logging.WARNING):
+        result = normalize_for_tts(
+            "WhatsApp మైం ఆపకో లింక భేజతా హూం", language="te-IN"
+        )
+    assert result == "WhatsApp మైం ఆపకో లింక భేజతా హూం"  # unchanged, as before this task
+    assert any(
+        r.levelno == logging.WARNING and "WhatsApp" in str(r.__dict__.get("words"))
+        for r in caplog.records
+    )
+
+
+def test_normalize_for_tts_empty_text_no_warning(caplog) -> None:
+    with caplog.at_level(logging.WARNING):
+        result = normalize_for_tts("", language="hi-IN")
+    assert result == ""
+    assert not any(r.levelno == logging.WARNING for r in caplog.records)
