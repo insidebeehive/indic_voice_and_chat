@@ -379,6 +379,20 @@ function renderPartial(text) {
   $("transcript").scrollTop = $("transcript").scrollHeight;
 }
 
+// Wipe everything from a previous call before a new one starts — transcript,
+// dialogue state/slots, outcome panel, and any pending call-id/poll state —
+// so a fresh call never shows a stale turn or leftover slot value.
+function resetSessionUI() {
+  $("transcript").innerHTML = "";
+  if (_partialEl) { _partialEl.remove(); _partialEl = null; }
+  $("state").textContent = "—";
+  $("outcome").style.display = "none";
+  _currentCallId = null;
+  $("reanalyze-wrap").style.display = "none";
+  $("reanalyzeStatus").textContent = "";
+  if (callPoll) { clearInterval(callPoll); callPoll = null; }
+}
+
 // ── Audio engine ───────────────────────────────────────────────
 function downsampleToInt16(float32, inRate) {
   if (inRate === TARGET_RATE) {
@@ -569,7 +583,7 @@ function resetStartButton() {
 async function placeCall(provider) {
   const to = ($("toNumber").value || "").trim();
   if (!to) { setStatus("enter a number to call"); return; }
-  $("outcome").style.display = "none";
+  resetSessionUI();
   $("start").classList.add("stop"); $("start").textContent = "■  Stop";
   setStatus("placing call…");
   let body;
@@ -637,6 +651,7 @@ $("start").onclick = async () => {
     if (audioCtx) { try { audioCtx.close(); } catch (_) {} audioCtx = null; }
     return;
   }
+  resetSessionUI();
   playCursor = audioCtx.currentTime;
   $("start").classList.add("stop"); $("start").textContent = "■  End Call";
   start();
