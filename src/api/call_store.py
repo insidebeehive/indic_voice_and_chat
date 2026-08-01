@@ -253,10 +253,15 @@ async def record_outcome(
     callback_at: Optional[datetime] = None,
     duration_ms: Optional[int] = None,
     ended_at: Optional[datetime] = None,
+    turns: Optional[list] = None,
 ) -> Optional[Conversation]:
     """Find the call row by provider Call SID and write its outcome + cost.
 
     Cost is computed from the providers recorded on the row + ``duration_ms``.
+    If ``turns`` is given (non-empty), the transcript is written via
+    ``save_turns`` right after the row is resolved — before any of the outcome/
+    cost fields below are touched, so a later failure in this function can't
+    cost us the transcript — and ``row.total_turns`` is set to the count saved.
     Returns the updated row, or None if no row matches the SID.
     """
     row = (await session.execute(
@@ -265,6 +270,9 @@ async def record_outcome(
     if row is None:
         log.warning("no conversation for call sid", extra={"sid": provider_call_sid})
         return None
+
+    if turns:
+        row.total_turns = await save_turns(session, conversation_id=row.id, turns=turns)
 
     row.status = status
     if outcome is not None:
@@ -352,8 +360,11 @@ async def save_turns(
 
     Skips the system-prompt turn (role='system') — it's reconstructable from
     the tenant config and would bloat the table. Returns the number of rows
-    written. Safe to call even if the conversation row doesn't exist (rows
-    simply get orphaned and the caller logs a warning).
+    written. Callers must only invoke this once the conversation row is known
+    to exist — ``Turn.conversation_id`` is a NOT NULL FK, so on Postgres this
+    raises rather than orphaning rows if it doesn't. In practice this is only
+    ever called after ``record_outcome`` has already resolved ``row`` by
+    ``provider_call_sid``, so that precondition always holds.
     """
     num = 0
     for msg in turns:

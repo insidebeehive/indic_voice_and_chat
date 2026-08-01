@@ -288,6 +288,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 summary=payload.get("summary"),
                 notes=payload.get("notes"),
                 callback_at=_parse_callback(payload.get("callback_datetime")),
+                turns=payload.get("turns"),
             )
     set_call_outcome_persister(_persist_call_outcome)
 

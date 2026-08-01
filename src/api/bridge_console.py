@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import uuid
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException
@@ -177,6 +178,25 @@ async def bridge_place_call(req: PlaceBridgeCallRequest) -> dict:
 
     from src.api import dev_call_control as _dcc
     _dcc.monitor.set_status(session.session_id, "calling")
+
+    # Register the conversation row for the tenant that PLACED the call so its
+    # outcome + transcript persist at teardown (mirrors dev_console.py's place-call
+    # flow, dev_console.py:445-457). Best-effort: a DB hiccup must not fail the
+    # already-placed call.
+    call_id = f"call_{uuid.uuid4().hex[:16]}"
+    try:
+        from src.api.call_store import insert_call
+        from src.models.database import get_sessionmaker
+
+        sm = get_sessionmaker()
+        async with sm() as db:
+            await insert_call(
+                db, call_id=call_id, tenant=tenant,
+                provider_call_sid=session.session_id, channel="voice",
+                mode=req.mode, voice=req.voice.strip() or None)
+    except Exception:  # noqa: BLE001 — the call is already placed; recording is best-effort
+        log.exception("bridge place-call: failed to record conversation",
+                      extra={"tenant": tenant.slug, "sid": session.session_id})
 
     log.info("bridge console: call placed",
              extra={"call_sid": session.session_id, "provider": provider,

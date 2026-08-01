@@ -53,7 +53,7 @@ def _agent():
         engine=object(), store=None)
 
 
-def _bridge(encoding="mulaw", events=()):
+def _bridge(encoding="mulaw", events=(), llm=None):
     agent = _agent()
     sess = _FakeSession(events)
 
@@ -64,7 +64,7 @@ def _bridge(encoding="mulaw", events=()):
         websocket=_FakeWS(), agent=agent, config=RealtimeConfig(model="m"),
         connect_session=connect, encoding=encoding,
         sid_field="streamSid" if encoding == "mulaw" else "stream_sid",
-        supports_clear=(encoding == "mulaw"))
+        supports_clear=(encoding == "mulaw"), llm=llm)
     b._session = sess
     return b, sess, agent
 
@@ -177,6 +177,228 @@ async def test_teardown_and_outcome_publish_to_monitor():
     got = dev_call_control.monitor.get("CAxyz")
     assert got["status"] == "ended"
     assert got["outcome"]["outcome"] == "interested"
+
+
+@pytest.mark.asyncio
+async def test_deliver_outcome_merges_turns_for_persister_without_mutating_payload():
+    """Pins change #4: the persister gets turns merged into a NEW dict, while
+    the payload object handed to the monitor (stored by reference, later
+    JSON-serialized by GET /dev/call-status/{call_sid}) is left untouched."""
+    from src.api import call_store, dev_call_control
+    from src.interfaces.llm import LLMMessage
+
+    b, sess, agent = _bridge("mulaw")
+    b._call_sid = "CA-MERGE"
+    agent.session.turns.extend([
+        LLMMessage(role="user", content="yeh app safe hai?"),
+        LLMMessage(role="assistant", content="bilkul safe hai"),
+    ])
+    payload = {"type": "outcome", "outcome": "interested", "summary": "s"}
+
+    delivered = {}
+
+    async def _persister(call_sid, p):
+        delivered["call_sid"] = call_sid
+        delivered["payload"] = p
+
+    call_store.set_call_outcome_persister(_persister)
+    try:
+        await b._deliver_outcome(payload)
+    finally:
+        call_store.set_call_outcome_persister(None)
+
+    # Persister got the turns (session.turns always leads with a system prompt;
+    # only the conversational turns we added matter here).
+    assert delivered["call_sid"] == "CA-MERGE"
+    turns = delivered["payload"]["turns"]
+    assert [(t.role, t.content) for t in turns if t.role != "system"] == [
+        ("user", "yeh app safe hai?"), ("assistant", "bilkul safe hai")]
+
+    # The original payload object (also handed to the monitor) is untouched.
+    assert "turns" not in payload
+    stored = dev_call_control.monitor.get("CA-MERGE")["outcome"]
+    assert "turns" not in stored
+    assert stored is payload   # same object — confirms no copy-then-mutate either
+
+
+@pytest.mark.asyncio
+async def test_deliver_outcome_failed_stamps_notes_for_persister_not_monitor():
+    """Fix #3: an outcome_failed delivery must be distinguishable, downstream in
+    the conversations row / tenant webhook, from a genuine no-outcome call —
+    the persister payload gets notes="outcome analysis failed" stamped in.
+    This must not leak into the monitor's stored copy (browser-facing), and
+    must not override notes already present on a normal "outcome" payload."""
+    from src.api import call_store, dev_call_control
+
+    b, sess, agent = _bridge("mulaw")
+    b._call_sid = "CA-NOTES-FAIL"
+
+    delivered = {}
+
+    async def _persister(call_sid, p):
+        delivered["payload"] = p
+
+    call_store.set_call_outcome_persister(_persister)
+    try:
+        await b._deliver_outcome({"type": "outcome_failed"})
+    finally:
+        call_store.set_call_outcome_persister(None)
+
+    assert delivered["payload"]["notes"] == "outcome analysis failed"
+    # The monitor copy (served to the browser) is the original, unstamped payload.
+    stored = dev_call_control.monitor.get("CA-NOTES-FAIL")["outcome"]
+    assert "notes" not in stored
+
+
+@pytest.mark.asyncio
+async def test_deliver_outcome_success_notes_untouched():
+    """Fix #3 must not change behavior for the normal "outcome" payload type —
+    an existing notes value (or its absence) passes through unstamped."""
+    from src.api import call_store
+
+    b, sess, agent = _bridge("mulaw")
+    b._call_sid = "CA-NOTES-OK"
+
+    delivered = {}
+
+    async def _persister(call_sid, p):
+        delivered["payload"] = p
+
+    call_store.set_call_outcome_persister(_persister)
+    try:
+        await b._deliver_outcome({"type": "outcome", "outcome": "interested",
+                                   "summary": "s", "notes": "genuine notes"})
+    finally:
+        call_store.set_call_outcome_persister(None)
+
+    assert delivered["payload"]["notes"] == "genuine notes"
+
+
+@pytest.mark.asyncio
+async def test_emit_outcome_success_delivers_turns_to_persister():
+    """Change #2/#3 end-to-end: a successful analysis still gets the transcript
+    to the persister via TelephonyLiveBridge._deliver_outcome, and the shared
+    _emit_outcome payload itself carries no turns key (change #5)."""
+    from src.api import call_store, dev_call_control
+    from src.interfaces.llm import LLMMessage, LLMResult
+
+    class _FakeLLM:
+        async def generate(self, messages, config):
+            return LLMResult(
+                text=('{"outcome": "interested", "summary": "Wants info", '
+                      '"notes": "n", "callback_datetime": null, "callback_phrase": null}'),
+                finish_reason="stop")
+
+    b, sess, agent = _bridge("mulaw", llm=_FakeLLM())
+    b._call_sid = "CA-SUCCESS"
+    agent.session.turns.extend([
+        LLMMessage(role="user", content="yeh app safe hai?"),
+        LLMMessage(role="assistant", content="bilkul safe hai"),
+    ])
+
+    delivered = {}
+
+    async def _persister(call_sid, payload):
+        delivered["call_sid"] = call_sid
+        delivered["payload"] = payload
+
+    call_store.set_call_outcome_persister(_persister)
+    try:
+        await b._emit_outcome()
+    finally:
+        call_store.set_call_outcome_persister(None)
+
+    assert delivered["call_sid"] == "CA-SUCCESS"
+    assert delivered["payload"]["outcome"] == "interested"
+    turns = delivered["payload"]["turns"]
+    assert [(t.role, t.content) for t in turns if t.role != "system"] == [
+        ("user", "yeh app safe hai?"), ("assistant", "bilkul safe hai")]
+
+    # Non-mutation pinned again via the full _emit_outcome path.
+    stored = dev_call_control.monitor.get("CA-SUCCESS")["outcome"]
+    assert "turns" not in stored
+    assert stored["outcome"] == "interested"
+
+
+@pytest.mark.asyncio
+async def test_emit_outcome_analysis_failure_still_delivers_turns(monkeypatch):
+    """Change #6: when analyze_call raises, the transcript must still reach the
+    persister instead of silently being lost alongside the outcome analysis."""
+    from src.api import call_store
+    from src.api import live_bridge_base
+    from src.interfaces.llm import LLMMessage
+
+    async def _boom(**kwargs):
+        raise RuntimeError("llm quota exceeded")
+
+    monkeypatch.setattr(live_bridge_base, "analyze_call", _boom)
+
+    b, sess, agent = _bridge("mulaw", llm=object())   # just needs to be non-None
+    b._call_sid = "CA-FAIL"
+    agent.session.turns.extend([
+        LLMMessage(role="user", content="hello"),
+        LLMMessage(role="assistant", content="hi there"),
+    ])
+
+    delivered = {}
+
+    async def _persister(call_sid, payload):
+        delivered["call_sid"] = call_sid
+        delivered["payload"] = payload
+
+    call_store.set_call_outcome_persister(_persister)
+    try:
+        await b._emit_outcome()
+    finally:
+        call_store.set_call_outcome_persister(None)
+
+    assert delivered["call_sid"] == "CA-FAIL"
+    assert delivered["payload"]["type"] == "outcome_failed"
+    turns = delivered["payload"]["turns"]
+    assert [(t.role, t.content) for t in turns if t.role != "system"] == [
+        ("user", "hello"), ("assistant", "hi there")]
+
+    # The monitor-stored copy (served verbatim by GET /dev/call-status) must
+    # stay turn-free even on the failure path — pins the non-mutation fix
+    # (change #4) for this path too, not just the success path.
+    from src.api import dev_call_control
+    stored = dev_call_control.monitor.get("CA-FAIL")["outcome"]
+    assert "turns" not in stored
+
+
+@pytest.mark.asyncio
+async def test_call_status_endpoint_serializes_after_analysis_failure_outcome():
+    """GET /dev/call-status/{call_sid} must still serialize successfully after
+    an outcome_failed payload (the fixed _emit_outcome except-path shape:
+    {"type": "outcome_failed"}, no "turns" key) has been delivered — catches a
+    FastAPI jsonable_encoder regression directly rather than only asserting on
+    the stored dict, and exercises the actual failure path instead of a
+    success-shaped payload that never contained turns to begin with."""
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from src.api.dev_console import dev_router
+    from src.interfaces.llm import LLMMessage
+
+    b, sess, agent = _bridge("mulaw")
+    b._call_sid = "CA-STATUS"
+    agent.session.turns.extend([
+        LLMMessage(role="user", content="hello"),
+        LLMMessage(role="assistant", content="hi"),
+    ])
+    # Matches the fixed live_bridge_base._emit_outcome except-path payload.
+    await b._deliver_outcome({"type": "outcome_failed"})
+
+    app = FastAPI()
+    app.include_router(dev_router)
+    client = TestClient(app)
+    resp = client.get("/dev/call-status/CA-STATUS")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "ended"
+    assert body["outcome"]["type"] == "outcome_failed"
+    assert "turns" not in body["outcome"]
+    assert "turns" not in body
 
 
 @pytest.mark.asyncio

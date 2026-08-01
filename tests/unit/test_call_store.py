@@ -6,6 +6,8 @@ import pytest
 import pytest_asyncio
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from sqlalchemy import select
+
 from src.api.call_store import (
     compute_call_cost,
     count_active_calls,
@@ -13,8 +15,9 @@ from src.api.call_store import (
     record_outcome,
     set_call_outcome_persister,
 )
+from src.interfaces.llm import LLMMessage
 from src.models.database import Base
-from src.models.conversation import Conversation
+from src.models.conversation import Conversation, Turn
 from src.models.tenant import ProviderCost, Tenant
 
 
@@ -185,6 +188,70 @@ async def test_record_outcome_writes_and_computes_cost(sm):
 async def test_record_outcome_unknown_sid_returns_none(sm):
     async with sm() as s:
         assert await record_outcome(s, "missing-sid", outcome="x") is None
+
+
+async def test_record_outcome_with_turns_writes_turn_rows(sm):
+    async with sm() as s:
+        s.add(_conv(id="c_turns", provider_call_sid="SID-TURNS"))
+        await s.commit()
+    turns = [
+        LLMMessage(role="system", content="You are a helpful voice agent."),
+        LLMMessage(role="user", content="yeh app safe hai?"),
+        LLMMessage(role="assistant", content="bilkul safe hai"),
+    ]
+    async with sm() as s:
+        row = await record_outcome(
+            s, "SID-TURNS", outcome="interested", summary="s", turns=turns)
+    assert row is not None
+    # role='system' is skipped -> 2 rows written, total_turns matches.
+    assert row.total_turns == 2
+
+    async with sm() as s:
+        saved = (await s.execute(
+            select(Turn).where(Turn.conversation_id == "c_turns").order_by(Turn.turn_number)
+        )).scalars().all()
+    assert [t.role for t in saved] == ["user", "assistant"]
+    assert [t.content for t in saved] == ["yeh app safe hai?", "bilkul safe hai"]
+    assert [t.conversation_id for t in saved] == ["c_turns", "c_turns"]
+
+
+async def test_record_outcome_without_turns_no_regression(sm):
+    """Omitting turns (or passing None/[]) behaves exactly as before — no Turn
+    rows, total_turns left at its default — for all 5 existing call sites."""
+    async with sm() as s:
+        s.add_all([
+            _conv(id="c_no_turns_1", provider_call_sid="SID-NT1"),
+            _conv(id="c_no_turns_2", provider_call_sid="SID-NT2"),
+            _conv(id="c_no_turns_3", provider_call_sid="SID-NT3"),
+        ])
+        await s.commit()
+
+    async with sm() as s:
+        row1 = await record_outcome(s, "SID-NT1", outcome="x")   # turns omitted
+    async with sm() as s:
+        row2 = await record_outcome(s, "SID-NT2", outcome="x", turns=None)
+    async with sm() as s:
+        row3 = await record_outcome(s, "SID-NT3", outcome="x", turns=[])
+
+    for row in (row1, row2, row3):
+        assert row is not None
+        assert row.total_turns == 0
+
+    async with sm() as s:
+        count = (await s.execute(select(Turn))).scalars().all()
+    assert count == []
+
+
+async def test_record_outcome_unknown_sid_with_turns_writes_zero_rows(sm):
+    """Guards the precondition-ordering issue directly: an unknown SID with a
+    non-empty turns list must write zero Turn rows (no row to FK against)."""
+    turns = [LLMMessage(role="user", content="hello")]
+    async with sm() as s:
+        assert await record_outcome(s, "missing-sid", outcome="x", turns=turns) is None
+
+    async with sm() as s:
+        rows = (await s.execute(select(Turn))).scalars().all()
+    assert rows == []
 
 
 async def test_deliver_to_persister_writes_outcome(sm):

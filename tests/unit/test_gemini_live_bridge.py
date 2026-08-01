@@ -233,6 +233,66 @@ async def test_consume_events_no_metrics_recorded_for_silent_turn():
 
 
 @pytest.mark.asyncio
+async def test_emit_outcome_success_message_has_no_turns_key():
+    """The shared _emit_outcome payload is untouched by the transcript-
+    persistence design — turns are only merged in downstream by
+    TelephonyLiveBridge, never in the payload handed to _deliver_outcome
+    itself. GeminiLiveBridge JSON-serializes that payload straight to the
+    browser, so this also pins that no serialization error is introduced."""
+    from src.interfaces.llm import LLMMessage, LLMResult
+
+    class _FakeLLM:
+        async def generate(self, messages, config):
+            return LLMResult(
+                text=('{"outcome": "interested", "summary": "Wants info", '
+                      '"notes": "n", "callback_datetime": null, "callback_phrase": null}'),
+                finish_reason="stop")
+
+    b, sess, agent = _bridge([], llm=_FakeLLM())
+    agent.session.turns.extend([
+        LLMMessage(role="user", content="yeh app safe hai?"),
+        LLMMessage(role="assistant", content="bilkul safe hai"),
+    ])
+
+    await b._emit_outcome()
+
+    outcome_msgs = [m for m in b._ws.sent_json if m.get("type") == "outcome"]
+    assert len(outcome_msgs) == 1
+    assert outcome_msgs[0]["outcome"] == "interested"
+    assert "turns" not in outcome_msgs[0]
+
+
+@pytest.mark.asyncio
+async def test_emit_outcome_analysis_failure_delivers_outcome_failed_frame(monkeypatch):
+    """Before the fix, the except-path payload carried a raw "turns" key (a
+    list of LLMMessage dataclasses), which GeminiLiveBridge._deliver_outcome
+    would try to json.dumps straight to the browser — that raises inside a
+    broad except Exception and silently swallows the failure notification
+    (only a misleading "socket closed" log line). After the fix, the
+    except-path payload has no "turns" key, so delivery must actually
+    succeed and reach the browser as an outcome_failed frame."""
+    from src.api import live_bridge_base
+    from src.interfaces.llm import LLMMessage
+
+    async def _boom(**kwargs):
+        raise RuntimeError("llm quota exceeded")
+
+    monkeypatch.setattr(live_bridge_base, "analyze_call", _boom)
+
+    b, sess, agent = _bridge([], llm=object())   # just needs to be non-None
+    agent.session.turns.extend([
+        LLMMessage(role="user", content="yeh app safe hai?"),
+        LLMMessage(role="assistant", content="bilkul safe hai"),
+    ])
+
+    await b._emit_outcome()
+
+    failed_msgs = [m for m in b._ws.sent_json if m.get("type") == "outcome_failed"]
+    assert len(failed_msgs) == 1
+    assert "turns" not in failed_msgs[0]
+
+
+@pytest.mark.asyncio
 async def test_interrupted_emits_interrupt_frame():
     b, sess, agent = _bridge([RealtimeEvent(type="interrupted")])
     await agent.start()

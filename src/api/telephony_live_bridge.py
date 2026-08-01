@@ -85,12 +85,26 @@ class TelephonyLiveBridge(_BaseLiveBridge):
 
     async def _deliver_outcome(self, payload: dict) -> None:
         # Publish to the dev-console call monitor so a placed call shows its outcome.
+        # `payload` is stored BY REFERENCE here and later JSON-serialized straight
+        # to the browser by GET /dev/call-status/{call_sid} — it must never be
+        # mutated in place, and must never carry raw LLMMessage turns (opaque
+        # `thought_signature` bytes can hard-fail FastAPI's jsonable_encoder).
         if self._call_sid is not None:
             dev_call_control.monitor.set_outcome(self._call_sid, payload)
         # Persist to the conversations row (keyed by provider Call SID), if a
         # persister is wired. No-op for the dev console / tests without a DB.
+        # Turns are merged into a NEW dict for the persister only — `payload`
+        # itself is left untouched (see the monitor note above).
         from src.api import call_store
-        await call_store.deliver_to_persister(self._call_sid, payload)
+        turns = list(getattr(getattr(self._agent, "session", None), "turns", []))
+        persist_payload = {**payload, "turns": turns}
+        if payload.get("type") == "outcome_failed" and not persist_payload.get("notes"):
+            # Distinguish "analysis crashed" from a genuine no-outcome call so a
+            # tenant CRM (or anyone reading the conversations row later) can tell
+            # the difference — record_outcome/_persist_call_outcome otherwise
+            # write outcome/summary/notes as all-None here.
+            persist_payload["notes"] = "outcome analysis failed"
+        await call_store.deliver_to_persister(self._call_sid, persist_payload)
 
     async def _inbound_loop(self) -> None:
         from starlette.websockets import WebSocketDisconnect

@@ -346,6 +346,15 @@ class _BaseLiveBridge:
                 tenant_timezone=self._tenant_timezone, now=datetime.now(UTC), llm=self._llm)
         except Exception:  # noqa: BLE001
             log.exception("call outcome analysis failed")
+            # Analysis failed, but the transcript is still worth persisting —
+            # without this, a failed analysis would silently drop the turns too.
+            # `turns` is deliberately left OUT of this shared/base payload:
+            # TelephonyLiveBridge._deliver_outcome re-derives turns itself from
+            # self._agent.session.turns and merges them into a fresh dict before
+            # handing off to the persister, so it doesn't need them here; and
+            # GeminiLiveBridge._deliver_outcome json.dumps's this payload straight
+            # to the browser, where raw LLMMessage objects aren't serializable.
+            await self._deliver_outcome({"type": "outcome_failed"})
             return
         cb = analysis.callback_datetime
         log.info("call outcome", extra={"outcome": analysis.outcome.value,
