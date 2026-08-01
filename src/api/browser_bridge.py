@@ -82,6 +82,15 @@ def _filler_clips() -> list[bytes]:
     return _filler_clips_cache
 
 
+def _display_error(parse_error: str) -> str:
+    """Never show a raw JSON-parse error on the dev-console transcript — it's
+    an internal LLM-output detail, not something a caller/tester needs to
+    see."""
+    if parse_error.startswith("json decode:"):
+        return "Some interpretation issue occurred"
+    return parse_error
+
+
 @dataclass
 class BrowserBridgeConfig:
     pcm_sample_rate: int = BROWSER_SAMPLE_RATE
@@ -406,7 +415,7 @@ class BrowserVoiceBridge:
         # empty-STT turns are not errors.
         err = outcome.response.parse_error or ""
         if err and err != "empty STT":
-            await self._send_json({"type": "error", "message": err})
+            await self._send_json({"type": "error", "message": _display_error(err)})
         await self._emit_state()
 
         if getattr(self._agent.state, "is_terminal", False):
@@ -617,7 +626,7 @@ class BrowserVoiceBridge:
             await self._send_json({"type": "transcript", "role": "agent", "text": agent_text})
         err = outcome.response.parse_error or ""
         if err and err != "empty STT":
-            await self._send_json({"type": "error", "message": err})
+            await self._send_json({"type": "error", "message": _display_error(err)})
         await self._emit_state()
 
         if getattr(self._agent.state, "is_terminal", False):
