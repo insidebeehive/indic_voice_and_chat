@@ -57,6 +57,14 @@ def test_rewrites_newly_added_sports_and_gaming_terms() -> None:
     assert "aur" in out and "dono hai" in out and "koi" in out and "nahi" in out
 
 
+def test_rewrites_caller_name_manoj() -> None:
+    # The dev-console defaults the caller name to "Manoj" for IndicF5/ElevenLabs
+    # (see static/dev_console.html applyTTSProviderDefaults) — it must be in the
+    # dictionary or IndicF5 mispronounces the agent's own self-introduction.
+    out = apply_pronunciations("Main Manoj baat kar raha hoon.")
+    assert "Manoj" not in out and DEFAULT_PRONUNCIATIONS["Manoj"] in out
+
+
 def test_normalize_for_tts_warns_on_devanagari_language_gap(caplog) -> None:
     # Devanagari-dominant text with one genuine gap word -- "ZyxUnknownBrand"
     # is guaranteed not to be in DEFAULT_PRONUNCIATIONS. Script-dominant text

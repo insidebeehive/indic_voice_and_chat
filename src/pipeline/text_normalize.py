@@ -66,6 +66,7 @@ DEFAULT_PRONUNCIATIONS: dict[str, str] = {
     "international": "इंटरनेशनल",
     "fan": "फैन",
     "IPL": "आईपीएल",
+    "Manoj": "मनोज",
 }
 
 
