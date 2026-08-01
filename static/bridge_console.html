@@ -569,6 +569,9 @@ function endCall() {
   if (workletNode) { try { workletNode.disconnect(); } catch (_) {} workletNode = null; }
   if (micStream) micStream.getTracks().forEach(t => t.stop()); micStream = null;
   agentSpeaking = false;
+  // Operator hangup: cut the agent off immediately. The delayed-stop grace
+  // period elsewhere is only for the closing line on a natural end-of-call.
+  stopPlayback();
   resetStartBtn(); setStatus("ending…");
   ws.send(JSON.stringify({ type: "end" }));
   setTimeout(() => { if (ws && ws.readyState === WebSocket.OPEN) stopAll(true); }, 20000);
