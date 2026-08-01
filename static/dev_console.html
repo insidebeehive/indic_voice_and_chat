@@ -224,7 +224,7 @@
       </div>
       <div class="field">
         <label>TTS — voice synthesis</label>
-        <select id="tts-select" onchange="onTTSChange()"></select>
+        <select id="tts-select" onchange="onTTSChange(true)"></select>
         <div id="tts-langs" style="font-size:.68rem;color:var(--muted);margin-top:.2rem"></div>
       </div>
       <div class="field">
@@ -686,14 +686,20 @@ function _syncCallerNameToGender(newGender) {
 // falls through to the normal gender-based sync above, same as any other
 // TTS provider.
 function applyTTSProviderDefaults(provider) {
+  const sel = $("voice-layered");
   if (provider === "elevenlabs") {
-    const sel = $("voice-layered");
     const opt = sel && Array.from(sel.options).find(
       (o) => /manoj/i.test(o.textContent) && /peaceful/i.test(o.textContent));
     if (opt) sel.value = opt.value;
     $("callerName").value = "Manoj";
   } else if (provider === "indicf5") {
     $("callerName").value = "Manoj";
+  } else if (sel) {
+    // Any other provider: same gender-based sync a manual voice change would
+    // trigger (picking a new provider swaps the selected voice underneath
+    // the operator, so it needs the same treatment).
+    const gender = (sel.options[sel.selectedIndex]?.dataset.gender || "").toLowerCase();
+    _syncCallerNameToGender(gender);
   }
 }
 
@@ -787,7 +793,7 @@ async function loadProviders() {
   } catch (e) { console.warn("[devconsole] providers fetch failed", e); }
 }
 
-async function onTTSChange() {
+async function onTTSChange(userInitiated) {
   const provider = ($("tts-select") || {}).value || "sarvam";
   // Show supported languages hint
   const meta = _ttsProviderMeta.find(m => m.id === provider);
@@ -798,7 +804,10 @@ async function onTTSChange() {
     hint.textContent = "";
   }
   await loadTTSVoices(provider);
-  applyTTSProviderDefaults(provider);
+  // Only when the operator actually picks a provider from the dropdown —
+  // not on the initial page-load call, where whatever provider happens to
+  // sort first alphabetically shouldn't silently override the caller name.
+  if (userInitiated) applyTTSProviderDefaults(provider);
 }
 
 async function loadTTSVoices(provider) {
