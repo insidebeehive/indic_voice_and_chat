@@ -667,10 +667,32 @@ $("start").onclick = async () => {
 let _voiceData = { layered: { voices: [], default: "" }, s2s: { voices: [], default: "", catalog: [] } };
 const _preferredVoice = { s2s: "Leda", layered: "arya" };
 
+// Names this console sets automatically (as opposed to one the operator typed
+// in by hand) — only these get overwritten when the voice/gender changes.
+const _AUTO_CALLER_NAMES = ["Priya", "Arjun", "Manoj"];
+
 function _syncCallerNameToGender(g) {
   const el = $("callerName"), cur = (el.value || "").trim();
-  if (g === "male"   && (cur === "Priya" || cur === "Arjun")) el.value = "Arjun";
-  if (g === "female" && (cur === "Priya" || cur === "Arjun")) el.value = "Priya";
+  if (!_AUTO_CALLER_NAMES.includes(cur)) return;
+  if (g === "male")   el.value = "Arjun";
+  if (g === "female") el.value = "Priya";
+}
+
+// ElevenLabs and IndicF5 each have a voice cloned from this dev's own voice
+// ("Manoj Peaceful" on ElevenLabs; IndicF5's one fine-tuned voice), used as
+// the default when either provider is picked. Changing the voice afterward
+// falls through to the normal gender-based sync above, same as any other
+// TTS provider.
+function applyTTSProviderDefaults(provider) {
+  if (provider === "elevenlabs") {
+    const sel = $("voice-layered");
+    const opt = sel && Array.from(sel.options).find(
+      (o) => /manoj/i.test(o.textContent) && /peaceful/i.test(o.textContent));
+    if (opt) sel.value = opt.value;
+    $("callerName").value = "Manoj";
+  } else if (provider === "indicf5") {
+    $("callerName").value = "Manoj";
+  }
 }
 
 function populateVoices(mode) {
@@ -747,6 +769,7 @@ async function onTTSChange() {
   if (hint && meta?.languages?.length) hint.textContent = "Languages: " + meta.languages.join(", ");
   else if (hint) hint.textContent = "";
   await loadTTSVoices(provider);
+  applyTTSProviderDefaults(provider);
 }
 
 async function loadTTSVoices(provider) {
@@ -769,6 +792,9 @@ async function loadTTSVoices(provider) {
 // ── Init ───────────────────────────────────────────────────────────────────
 document.addEventListener("DOMContentLoaded", () => {
   $("voice").addEventListener("change", function() {
+    _syncCallerNameToGender((this.options[this.selectedIndex]?.dataset.gender || "").toLowerCase());
+  });
+  $("voice-layered").addEventListener("change", function() {
     _syncCallerNameToGender((this.options[this.selectedIndex]?.dataset.gender || "").toLowerCase());
   });
   setMode("s2s");
