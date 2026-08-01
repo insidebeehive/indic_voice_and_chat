@@ -788,6 +788,8 @@ async function loadProviders() {
       o.value = id; o.textContent = label;
       if (ttsSel) ttsSel.appendChild(o);
     }
+    // Default to Sarvam rather than whatever sorts first alphabetically.
+    if (ttsSel && _ttsProviderMeta.some((m) => m.id === "sarvam")) ttsSel.value = "sarvam";
     // Load voices for the initially selected TTS
     await onTTSChange();
   } catch (e) { console.warn("[devconsole] providers fetch failed", e); }

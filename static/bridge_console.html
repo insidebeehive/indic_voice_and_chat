@@ -767,6 +767,8 @@ async function loadProviders() {
       const o = document.createElement("option"); o.value = id; o.textContent = label;
       if (ttsSel) ttsSel.appendChild(o);
     }
+    // Default to Sarvam rather than whatever sorts first alphabetically.
+    if (ttsSel && _ttsProviderMeta.some((m) => m.id === "sarvam")) ttsSel.value = "sarvam";
     await onTTSChange();
   } catch (e) { console.warn("[bridge] providers fetch failed", e); }
 }
