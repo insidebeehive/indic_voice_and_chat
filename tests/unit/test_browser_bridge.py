@@ -357,10 +357,11 @@ async def test_bridge_emits_error_event_on_turn_error():
 
 
 @pytest.mark.asyncio
-async def test_bridge_masks_json_decode_error_on_transcript():
-    """A raw LLM JSON-parse failure is an internal detail — the dev-console
-    transcript must show a generic message, never the json.JSONDecodeError
-    text itself."""
+async def test_bridge_does_not_surface_json_decode_error_on_transcript(caplog):
+    """A raw LLM JSON-parse failure recovers gracefully on its own (fallback
+    reply, conversation continues) and happens often enough that surfacing
+    every one is just noise — it must be logged, not shown on the transcript
+    at all (unlike a real pipeline failure, which produces no reply)."""
     vad = EnergyVAD(sample_rate=16000, frame_ms=30)
     incoming = [{"type": "websocket.receive", "text": json.dumps({"type": "hello"})}]
     for _ in range(10):
@@ -386,12 +387,12 @@ async def test_bridge_masks_json_decode_error_on_transcript():
 
     agent = JsonDecodeErrorAgent()
     bridge = BrowserVoiceBridge(websocket=ws, agent=agent, vad=vad, config=BrowserBridgeConfig())
-    await bridge.run()
+    with caplog.at_level("WARNING"):
+        await bridge.run()
 
     events = [json.loads(t) for t in ws.sent_text]
-    error_events = [e for e in events if e.get("type") == "error"]
-    assert any(e.get("message") == "Some interpretation issue occurred" for e in error_events)
-    assert not any("json decode" in e.get("message", "") for e in error_events)
+    assert not any(e.get("type") == "error" for e in events)
+    assert any("json decode" in r.message for r in caplog.records)
 
 
 @pytest.mark.asyncio

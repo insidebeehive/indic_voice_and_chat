@@ -82,13 +82,14 @@ def _filler_clips() -> list[bytes]:
     return _filler_clips_cache
 
 
-def _display_error(parse_error: str) -> str:
-    """Never show a raw JSON-parse error on the dev-console transcript — it's
-    an internal LLM-output detail, not something a caller/tester needs to
-    see."""
-    if parse_error.startswith("json decode:"):
-        return "Some interpretation issue occurred"
-    return parse_error
+def _should_surface_error(parse_error: str) -> bool:
+    """Only a real pipeline failure (provider outage/exception — the turn
+    produced no response at all, which can look like the agent hanging) is
+    worth interrupting the dev-console transcript for. Routine LLM-output
+    parse issues (malformed/truncated JSON, a missing field) already recover
+    on their own via a graceful fallback reply and happen often enough that
+    surfacing every one is just noise — those are logged instead, not shown."""
+    return parse_error.startswith("pipeline error:")
 
 
 @dataclass
@@ -410,12 +411,16 @@ class BrowserVoiceBridge:
         agent_text = outcome.response.response_text
         if agent_text:
             await self._send_json({"type": "transcript", "role": "agent", "text": agent_text})
-        # Surface a real failure (provider outage / unparseable LLM output) to the
-        # dev console instead of leaving the user staring at silence. Routine
-        # empty-STT turns are not errors.
+        # Surface a real failure (provider outage/exception — the turn produced
+        # no response at all) to the dev console instead of leaving the tester
+        # staring at silence. Routine parse issues are logged, not shown (see
+        # _should_surface_error); empty-STT turns are not errors at all.
         err = outcome.response.parse_error or ""
         if err and err != "empty STT":
-            await self._send_json({"type": "error", "message": _display_error(err)})
+            if _should_surface_error(err):
+                await self._send_json({"type": "error", "message": err})
+            else:
+                log.warning("turn response issue (not surfaced to console): %s", err)
         await self._emit_state()
 
         if getattr(self._agent.state, "is_terminal", False):
@@ -626,7 +631,10 @@ class BrowserVoiceBridge:
             await self._send_json({"type": "transcript", "role": "agent", "text": agent_text})
         err = outcome.response.parse_error or ""
         if err and err != "empty STT":
-            await self._send_json({"type": "error", "message": _display_error(err)})
+            if _should_surface_error(err):
+                await self._send_json({"type": "error", "message": err})
+            else:
+                log.warning("turn response issue (not surfaced to console): %s", err)
         await self._emit_state()
 
         if getattr(self._agent.state, "is_terminal", False):
