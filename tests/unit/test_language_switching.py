@@ -56,3 +56,21 @@ def test_llm_wins_over_stt():
 def test_same_language_is_a_no_op():
     assert resolve_active_language("hi", stt_lang="hi", llm_lang="hi") == "hi"
     assert resolve_active_language("mr", stt_lang="mr-IN", llm_lang="mr") == "mr"
+
+
+def test_normalize_lang_rejects_spelled_out_language_name():
+    # Groq/Whisper rejects a spelled-out name outright ("unsupported language:
+    # hindi") when this reaches an STT config unnormalized — the LLM
+    # occasionally self-reports "Hindi" instead of the code "hi" despite being
+    # asked for a code; that must not corrupt the active language.
+    assert normalize_lang("hindi") == ""
+    assert normalize_lang("Hindi") == ""
+    assert normalize_lang("Marathi-IN") == ""
+
+
+def test_llm_spelled_out_language_name_does_not_switch_active_language():
+    # An invalid LLM-reported value must not silently become the new active
+    # language — falls through to STT, then to the current language, exactly
+    # as if the LLM had omitted the field.
+    assert resolve_active_language("hi", llm_lang="Hindi") == "hi"
+    assert resolve_active_language("hi", stt_lang="mr", llm_lang="Hindi") == "mr"

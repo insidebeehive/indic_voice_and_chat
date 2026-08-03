@@ -12,17 +12,34 @@ Codes are kept in a canonical **base form** internally (``"mr"``, ``"hi"``);
 
 from __future__ import annotations
 
+import re
 from typing import Optional
+
+# ISO-639-1/639-2 codes are 2-3 lowercase letters. This is a shape check, not
+# a fixed allowlist — different STT/TTS providers support different language
+# subsets, so validating "looks like a code" here avoids hardcoding (and
+# having to keep in sync) yet another per-provider language list. It exists
+# specifically to reject a spelled-out language NAME ("hindi", "Hindi") that
+# occasionally slips through when the LLM self-reports its response language
+# (see build_voicebot_system_prompt's field spec) — that string would
+# otherwise pass through unchanged (no "-" to strip) and get sent straight to
+# STT/TTS providers, which reject it.
+_LANG_CODE_RE = re.compile(r"^[a-z]{2,3}$")
 
 
 def normalize_lang(code: Optional[str]) -> str:
     """Canonical base language code: lowercased, region stripped.
 
     ``"hi-IN"`` → ``"hi"``, ``"MR"`` → ``"mr"``, ``None``/``""`` → ``""``.
+    Anything that doesn't look like a real code (e.g. ``"hindi"``, spelled
+    out rather than the code ``"hi"``) also normalizes to ``""`` rather than
+    being passed through — callers already treat an empty result as "no
+    signal" and fall back accordingly.
     """
     if not code:
         return ""
-    return str(code).strip().lower().split("-")[0]
+    base = str(code).strip().lower().split("-")[0]
+    return base if _LANG_CODE_RE.match(base) else ""
 
 
 def to_bcp47(code: Optional[str]) -> str:
