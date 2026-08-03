@@ -125,6 +125,26 @@ async def test_transcribe_passes_through_existing_wav(adapter: GroqSTTAdapter) -
 
 
 @pytest.mark.asyncio
+@respx.mock
+async def test_transcribe_400_includes_response_body_in_raised_error(
+    adapter: GroqSTTAdapter,
+) -> None:
+    """httpx's default HTTPStatusError message is just the status line — the
+    actual rejection reason lives in the response body and must be surfaced,
+    or a 400 is undiagnosable from the transcript/logs alone (this is exactly
+    what happened on Stage: only 'Client error 400 Bad Request' was visible,
+    with no indication of what Groq actually objected to)."""
+    respx.post(f"{GROQ_BASE_URL}/audio/transcriptions").mock(
+        return_value=Response(
+            400, json={"error": {"message": "Audio file is too short"}}
+        )
+    )
+    with pytest.raises(Exception) as exc_info:
+        await adapter.transcribe(b"\x00\x00", STTConfig(language="hi-IN"))
+    assert "Audio file is too short" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
 async def test_constructor_requires_api_key(monkeypatch) -> None:
     monkeypatch.delenv("GROQ_API_KEY", raising=False)
     with pytest.raises(ValueError):

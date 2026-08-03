@@ -15,6 +15,7 @@ Sarvam adapter.
 from __future__ import annotations
 
 import io
+import logging
 import os
 import wave
 from typing import Any, AsyncIterator, Optional
@@ -23,6 +24,7 @@ import httpx
 
 from src.interfaces.stt import ISTTProvider, STTConfig, STTResult
 
+log = logging.getLogger(__name__)
 
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 DEFAULT_MODEL = "whisper-large-v3"
@@ -75,7 +77,18 @@ class GroqSTTAdapter(ISTTProvider):
                 data=data,
                 files=files,
             )
-            resp.raise_for_status()
+            try:
+                resp.raise_for_status()
+            except httpx.HTTPStatusError as e:
+                # httpx's default message is just "Client error '400 Bad
+                # Request' for url '...'" — the actual rejection reason lives
+                # in the response body and is otherwise lost, making a 400
+                # here undiagnosable from logs/transcript alone.
+                body = e.response.text[:500]
+                log.error("groq stt %s: %s", e.response.status_code, body)
+                raise httpx.HTTPStatusError(
+                    f"{e}: {body}", request=e.request, response=e.response
+                ) from e
             payload = resp.json()
 
         return _parse_response(payload)
