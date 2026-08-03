@@ -32,6 +32,42 @@ class FakeLLM(ILLMProvider):
             yield  # pragma: no cover
 
 
+class QueuedLLM(ILLMProvider):
+    """Returns each queued LLMResult in order, one per call; records calls."""
+
+    def __init__(self, results: list[LLMResult]) -> None:
+        self._results = list(results)
+        self.calls: list[list[LLMMessage]] = []
+
+    async def generate(self, messages, config) -> LLMResult:
+        self.calls.append(list(messages))
+        return self._results.pop(0) if self._results else LLMResult(text="ok", finish_reason="stop")
+
+    async def generate_stream(self, messages, config) -> AsyncIterator[str]:
+        if False:
+            yield  # pragma: no cover
+
+
+class FailOnSecondCallLLM(ILLMProvider):
+    """First call returns the given result; every call after that raises —
+    used to prove a failing/timing-out retry degrades gracefully rather than
+    crashing the turn."""
+
+    def __init__(self, first: LLMResult) -> None:
+        self._first = first
+        self.calls: list[list[LLMMessage]] = []
+
+    async def generate(self, messages, config) -> LLMResult:
+        self.calls.append(list(messages))
+        if len(self.calls) == 1:
+            return self._first
+        raise RuntimeError("provider unavailable")
+
+    async def generate_stream(self, messages, config) -> AsyncIterator[str]:
+        if False:
+            yield  # pragma: no cover
+
+
 # --- Fixtures ------------------------------------------------------------
 
 
@@ -102,6 +138,110 @@ async def test_handle_message_empty_input_returns_early(retriever) -> None:
     result = await agent.handle_message("   ")
     assert result.response.parse_error == "empty user input"
     assert llm.calls == []
+
+
+@pytest.mark.asyncio
+async def test_single_shot_retries_once_on_empty_llm_response(retriever) -> None:
+    """An empty first response (e.g. a safety-filter block) must not be shown
+    to the customer as the canned fallback if a retry would succeed — nothing
+    has been displayed yet at this point, unlike voice's incremental TTS, so a
+    plain retry is safe."""
+    llm = QueuedLLM([
+        LLMResult(text="", finish_reason="stop"),
+        LLMResult(text=json.dumps({
+            "response_text": "Plan B has 500GB unlimited data.",
+            "language": "en", "action": "none",
+        }), finish_reason="stop"),
+    ])
+    agent = _make_agent(llm, retriever)
+    result = await agent.handle_message("Tell me about Plan B")
+    assert result.response.response_text == "Plan B has 500GB unlimited data."
+    assert result.response.parse_error is None
+    assert len(llm.calls) == 2  # the original call + one retry
+
+
+@pytest.mark.asyncio
+async def test_single_shot_falls_back_gracefully_when_retry_also_fails(retriever) -> None:
+    llm = QueuedLLM([
+        LLMResult(text="", finish_reason="stop"),
+        LLMResult(text="", finish_reason="stop"),
+    ])
+    agent = _make_agent(llm, retriever)
+    result = await agent.handle_message("Tell me about Plan B")
+    assert result.response.parse_error == "empty response"
+    assert len(llm.calls) == 2  # the original call + exactly one retry, then give up
+
+
+@pytest.mark.asyncio
+async def test_single_shot_retries_on_truncated_malformed_json(retriever) -> None:
+    """A truncated/malformed JSON envelope (e.g. max_tokens cutting a response
+    mid-string) hits response_parser._fallback_text's THIRD branch — still
+    looks like an unparsed JSON envelope — which returns the canned chatbot
+    fallback line. This must trigger a retry same as an empty response;
+    matching on parse_error strings alone used to miss this case entirely."""
+    llm = QueuedLLM([
+        LLMResult(
+            text='{"response_text": "partial answer that got cut off mid',
+            finish_reason="length",
+        ),
+        LLMResult(text=json.dumps({
+            "response_text": "Plan B has 500GB unlimited data.",
+            "language": "en", "action": "none",
+        }), finish_reason="stop"),
+    ])
+    agent = _make_agent(llm, retriever)
+    result = await agent.handle_message("Tell me about Plan B")
+    assert result.response.response_text == "Plan B has 500GB unlimited data."
+    assert result.response.parse_error is None
+    assert len(llm.calls) == 2  # the original call + one retry
+
+
+@pytest.mark.asyncio
+async def test_single_shot_retries_on_missing_response_text_field(retriever) -> None:
+    """Valid JSON but no response_text field at all — the parse_error ==
+    'missing response_text' trigger that existed before this round, now
+    routed through is_unusable_response() instead of a direct string match."""
+    llm = QueuedLLM([
+        LLMResult(text=json.dumps({"language": "en"}), finish_reason="stop"),
+        LLMResult(text=json.dumps({
+            "response_text": "Plan B has 500GB unlimited data.",
+            "language": "en", "action": "none",
+        }), finish_reason="stop"),
+    ])
+    agent = _make_agent(llm, retriever)
+    result = await agent.handle_message("Tell me about Plan B")
+    assert result.response.response_text == "Plan B has 500GB unlimited data."
+    assert result.response.parse_error is None
+    assert len(llm.calls) == 2  # the original call + one retry
+
+
+@pytest.mark.asyncio
+async def test_single_shot_retry_exception_degrades_to_original_fallback(retriever) -> None:
+    """The retry call itself raising (e.g. a hard provider outage, or the
+    retry's own bounded timeout) must not crash the turn — it should degrade
+    to the original (pre-retry) fallback response."""
+    llm = FailOnSecondCallLLM(LLMResult(text="", finish_reason="stop"))
+    agent = _make_agent(llm, retriever)
+    result = await agent.handle_message("Tell me about Plan B")
+    assert result.response.parse_error == "empty response"
+    assert len(llm.calls) == 2  # original call + the retry attempt that raised
+
+
+@pytest.mark.asyncio
+async def test_retry_if_unusable_does_not_crash_when_max_tokens_is_none(retriever) -> None:
+    """_retry_if_unusable's docstring promises it never raises. The
+    finish_reason == "length" branch bumps max_tokens via
+    ``config.max_tokens * 1.5`` — config.max_tokens can legitimately be None
+    (provider-default), which would previously raise TypeError from outside
+    the try block, breaking that contract."""
+    llm = FakeLLM({"response_text": "ok"})
+    agent = _make_agent(llm, retriever)
+    result, elapsed_ms = await agent._retry_if_unusable(
+        "length", [LLMMessage(role="user", content="hi")],
+        LLMConfig(max_tokens=None),
+    )
+    assert result is not None
+    assert elapsed_ms >= 0
 
 
 def test_detect_script_leaves_romanized_indic_undetected() -> None:

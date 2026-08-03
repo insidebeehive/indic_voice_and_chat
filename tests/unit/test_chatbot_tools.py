@@ -212,6 +212,35 @@ async def test_no_tool_call_answers_directly(retriever) -> None:
     assert len(llm.calls) == 1
 
 
+@pytest.mark.asyncio
+async def test_tool_loop_retries_once_when_final_answer_is_empty(retriever) -> None:
+    """The tool round(s) can complete fine but the final answer-synthesis call
+    still comes back empty (e.g. a safety-filter block) — retry that final
+    call once (reusing the completed tool-call history in messages) rather
+    than showing the customer the canned fallback line immediately."""
+    async def crm_exec(tc: ToolCall) -> dict:
+        return {"status": "settled", "result": "won"}
+
+    llm = ScriptedLLM([
+        LLMResult(text="", finish_reason="tool_calls", tool_calls=[
+            ToolCall(id="t1", name="get_matka_bids", arguments={"status": "settled"})]),
+        LLMResult(text="", finish_reason="stop"),  # final synthesis: empty
+        LLMResult(text="Your last Matka bid was settled as a win.", finish_reason="stop"),
+    ])
+    crm_tools = [ToolSpec(name="get_matka_bids", description="Get Matka bids",
+                          parameters={"type": "object", "properties": {}})]
+    agent = _agent(llm, retriever, crm_tools=crm_tools, crm_executor=crm_exec)
+    result = await agent.handle_message("meri jeet credit kyu nahi hui?")
+    assert result.response.response_text == "Your last Matka bid was settled as a win."
+    assert result.response.parse_error is None
+    assert len(llm.calls) == 3  # tool round + empty final + one retry
+    # The retry reused the completed tool-call history, not a fresh tool round.
+    assert any(m.role == "tool" and m.name == "get_matka_bids" for m in llm.calls[2][0])
+    # The retry's LLMConfig has no tools — it cannot start another tool round,
+    # only synthesize a final plain-text answer from the completed history.
+    assert llm.calls[2][1].tools is None
+
+
 # --- Multimodal prep ----------------------------------------------------
 
 

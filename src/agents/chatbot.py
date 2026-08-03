@@ -17,21 +17,28 @@ are voice concerns that the VoiceBotAgent handles.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, Optional
+from dataclasses import replace as _replace_cfg
+from typing import Any
 
 from src.agents.base import AgentSession, BaseAgent
 from src.chatbot.media import prepare_multimodal_content
 from src.chatbot.tools import BUILTIN_TOOLS, ESCALATE, OFFER_CALL, SEARCH_KB
 from src.dialogue.context import SessionStore
 from src.dialogue.prompts import build_chatbot_system_prompt
-from src.dialogue.response_parser import ChatBotResponse, parse_chatbot_response
+from src.dialogue.response_parser import (
+    ChatBotResponse,
+    is_unusable_response,
+    parse_chatbot_response,
+)
 from src.dialogue.slots import SlotFiller, SlotSchema
-from src.interfaces.llm import ILLMProvider, LLMConfig, LLMMessage, ToolCall, ToolSpec
+from src.interfaces.llm import ILLMProvider, LLMConfig, LLMMessage, LLMResult, ToolCall, ToolSpec
 from src.rag.context_builder import (
     GuardConfig,
     apply_hallucination_guard,
@@ -50,6 +57,24 @@ log = logging.getLogger(__name__)
 # chat session.
 MAX_HISTORY_TURNS = 10
 
+# The one-shot retry (see _retry_if_unusable) fires only after a turn has
+# ALREADY produced an unusable (canned-fallback) response. It gets its own,
+# tighter timeout budget rather than sharing the primary turn's — src/api/chat.py
+# wraps the whole turn in asyncio.wait_for(..., timeout=_TURN_TIMEOUT_S=90.0),
+# tuned against real load-test data; an unbudgeted extra generate() call could
+# push a turn past that ceiling under a provider's own retry/backoff (e.g.
+# Gemini's escalating 429 backoff, up to ~35s), turning a degraded-but-real
+# answer into a hard timeout — worse than not retrying. Mirrors the voicebot's
+# _RETRY_HARD_TIMEOUT_S pattern (src/agents/voicebot.py), scaled for a text
+# chat turn rather than a spoken one.
+_CHAT_RETRY_TIMEOUT_S = 12.0
+
+# Cap on the bumped max_tokens used for a retry attempted after a finish_reason
+# of "length" (truncation) — see _retry_if_unusable. Keeps a runaway retry from
+# ballooning cost/latency even for a tenant configured with an already-large
+# max_tokens.
+_CHAT_RETRY_MAX_TOKENS_CAP = 8192
+
 # Executes a tenant-registered (CRM) tool call → a JSON-able result dict.
 CrmExecutor = Callable[[ToolCall], Awaitable[dict]]
 
@@ -67,7 +92,7 @@ _SCRIPT_RANGES: list[tuple[int, int, str]] = [
 ]
 
 
-def _detect_script(text: str) -> Optional[str]:
+def _detect_script(text: str) -> str | None:
     """Return an Indic language name when *text* is dominantly written in that
     language's own script (e.g. Devanagari for Hindi). Returns None for
     empty/purely numeric/punctuation text, for mixed script, AND for pure
@@ -84,7 +109,7 @@ def _detect_script(text: str) -> Optional[str]:
     """
     if not text:
         return None
-    indic_lang: Optional[str] = None
+    indic_lang: str | None = None
     indic_count = 0
     latin_count = 0
     for ch in text:
@@ -122,7 +147,7 @@ _HINGLISH_MARKERS = frozenset({
 })
 
 
-def _latin_language_hint(text: str) -> Optional[str]:
+def _latin_language_hint(text: str) -> str | None:
     """Classify a Roman-script message as "Hinglish" or "English" — or None
     when it's too short to carry a signal (bare "ok"/"thanks", which should
     follow the conversation's existing language, not force a switch).
@@ -154,8 +179,8 @@ class ChatTurnResult:
     response: ChatBotResponse
     retrieved: list[RetrievedChunk]
     rag_context_chars: int
-    escalation: Optional[dict] = None
-    call_offer: Optional[dict] = None
+    escalation: dict | None = None
+    call_offer: dict | None = None
 
 
 class ChatBotAgent(BaseAgent):
@@ -164,16 +189,16 @@ class ChatBotAgent(BaseAgent):
         session: AgentSession,
         llm: ILLMProvider,
         retriever: HybridRetriever,
-        crm_retriever: Optional[HybridRetriever] = None,
-        llm_config: Optional[LLMConfig] = None,
+        crm_retriever: HybridRetriever | None = None,
+        llm_config: LLMConfig | None = None,
         company_name: str = "[Your Company]",
         language_default: str = "en",
-        store: Optional[SessionStore] = None,
-        guard_config: Optional[GuardConfig] = None,
+        store: SessionStore | None = None,
+        guard_config: GuardConfig | None = None,
         max_context_chars: int = 2000,
         enable_tools: bool = False,
-        crm_tools: Optional[list[ToolSpec]] = None,
-        crm_executor: Optional[CrmExecutor] = None,
+        crm_tools: list[ToolSpec] | None = None,
+        crm_executor: CrmExecutor | None = None,
         max_tool_rounds: int = 2,
     ) -> None:
         # ChatBot doesn't need slots — pass an empty schema so BaseAgent is happy.
@@ -245,8 +270,32 @@ class ChatBotAgent(BaseAgent):
         # 4. LLM
         llm_start = time.perf_counter()
         result = await self._llm.generate(messages, self._llm_config)
-        llm_ms = (time.perf_counter() - llm_start) * 1000
+        llm_ms_list = [(time.perf_counter() - llm_start) * 1000]
         response = parse_chatbot_response(result.text)
+        # Only retry a genuinely unusable turn — one where the parser had to
+        # fall back to one of its canned lines (empty input, missing
+        # response_text, or truncated/malformed JSON — see
+        # response_parser.is_unusable_response). A parse_error from
+        # legitimate plain (non-JSON) text does NOT count: _fallback_text
+        # already returns that verbatim as a perfectly usable response_text,
+        # and retrying it too would waste a call on an already-good answer.
+        if is_unusable_response(response.response_text):
+            # Nothing has been shown to the customer yet (chat is request/
+            # response, unlike voice's incremental TTS) — safe to regenerate
+            # once before falling back to the canned "couldn't formulate an
+            # answer" line.
+            retried_result, retry_ms = await self._retry_if_unusable(
+                result.finish_reason, messages, self._llm_config,
+            )
+            llm_ms_list.append(retry_ms)
+            if retried_result is not None:
+                # Adopt whatever the retry produces unconditionally — including
+                # legitimate plain (non-JSON) text, which parse_chatbot_response
+                # already returns verbatim as a usable response_text despite
+                # setting parse_error. If the retry is ALSO genuinely unusable,
+                # this parses to the same canned fallback as before — no worse
+                # off than not retrying at all.
+                response = parse_chatbot_response(retried_result.text)
         # 5. Guard. Skip only for a multimodal turn with no retrieval — that
         # answer is grounded in the image, not the (empty) knowledge base, so the
         # no-retrieval fallback would wrongly clobber it. Text turns are unchanged.
@@ -257,7 +306,8 @@ class ChatBotAgent(BaseAgent):
         await self._persist(user_msg, query_text, response, len(retrieved))
         log.info(
             "chat turn done in %.2fs: llm=%s retrieval=%.0fms retrieved=%d",
-            time.perf_counter() - turn_start, [f"{llm_ms:.0f}ms"], retrieval_ms, len(retrieved),
+            time.perf_counter() - turn_start,
+            [f"{ms:.0f}ms" for ms in llm_ms_list], retrieval_ms, len(retrieved),
         )
         return ChatTurnResult(
             response=response, retrieved=retrieved, rag_context_chars=len(rag.text))
@@ -274,8 +324,8 @@ class ChatBotAgent(BaseAgent):
         # prompt starts without a pre-built RAG block.
         messages = self._compose("", user_msg, query_text=query_text)
         retrieved_all: list[RetrievedChunk] = []
-        escalation: Optional[dict] = None
-        call_offer: Optional[dict] = None
+        escalation: dict | None = None
+        call_offer: dict | None = None
         text = ""
         # JSON response-format is incompatible with tools (Gemini), so the loop
         # runs in text mode; the structured fields are derived from tool results.
@@ -326,6 +376,37 @@ class ChatBotAgent(BaseAgent):
         # text answer keep it verbatim (the JSON-fallback would mangle it). Then
         # overlay tool-derived signals (retrieved sources, escalation).
         parsed = parse_chatbot_response(text)
+        # Only retry a genuinely unusable turn — one where the parser had to
+        # fall back to one of its canned lines. NOT a parse_error from
+        # legitimate plain (non-JSON) text, which _fallback_text already
+        # returns verbatim as a perfectly usable response_text. Retrying that
+        # case too would waste a call on an already-good answer.
+        if is_unusable_response(parsed.response_text):
+            # Nothing has been shown to the customer yet — safe to regenerate
+            # once before falling back. The tool rounds already completed and
+            # are reflected in ``messages`` (tool-call + tool-result turns
+            # appended), so this only re-attempts the final answer synthesis,
+            # not the whole tool loop. tools=None explicitly — the retry can't
+            # start another tool round, only synthesize a final plain answer.
+            retry_cfg = LLMConfig(
+                model=self._llm_config.model,
+                temperature=self._llm_config.temperature,
+                max_tokens=self._llm_config.max_tokens,
+                response_format="text",
+                tools=None,
+            )
+            retried, retry_ms = await self._retry_if_unusable(
+                result.finish_reason, messages, retry_cfg,
+            )
+            llm_ms_list.append(retry_ms)
+            if retried is not None:
+                # Adopt whatever the retry produces unconditionally — including
+                # legitimate plain (non-JSON) text, which parse_chatbot_response
+                # already returns verbatim as a usable response_text despite
+                # setting parse_error. If the retry is ALSO genuinely unusable,
+                # this parses to the same canned fallback as before — no worse
+                # off than not retrying at all.
+                parsed = parse_chatbot_response(retried.text)
         if parsed.raw and not parsed.parse_error:
             response = parsed   # a real JSON envelope with a response_text
         else:
@@ -401,6 +482,54 @@ class ChatBotAgent(BaseAgent):
         }, [], None, None
 
     # --- Shared helpers -------------------------------------------------
+
+    async def _retry_if_unusable(
+        self,
+        finish_reason: str,
+        messages: list[LLMMessage],
+        config: LLMConfig,
+    ) -> tuple[LLMResult | None, float]:
+        """Retry a generate() call once, bounded by ``_CHAT_RETRY_TIMEOUT_S``.
+
+        Call this only after ``is_unusable_response()`` has confirmed the
+        first attempt's parsed response_text was one of the parser's canned
+        fallback lines — this helper always retries once when called, it
+        doesn't re-check.
+
+        If ``finish_reason`` indicates the first attempt got cut off by the
+        token limit ("length"), bump max_tokens for the retry (capped) so it
+        isn't just truncated again the same way; otherwise reuse ``config``
+        as-is.
+
+        Returns ``(retried_result_or_None, elapsed_ms)``. ``elapsed_ms`` is
+        the retry's measured duration even when it failed or timed out — so a
+        failed retry still shows up in telemetry instead of silently
+        vanishing. Never raises: a failing/timing-out retry just yields
+        ``(None, elapsed_ms)`` and the caller falls back to the original
+        (pre-retry) response, no worse off than not retrying at all.
+        """
+        log.warning(
+            "chatbot retrying turn: no usable response (finish_reason=%s)", finish_reason
+        )
+        retry_start = time.perf_counter()
+        try:
+            retry_config = config
+            if finish_reason == "length":
+                # Truncation is the likely cause — retrying with the same
+                # max_tokens would probably just get cut off again the same
+                # way. config.max_tokens can be None (provider default), so
+                # this must stay inside the try — the whole point of this
+                # helper is to never raise regardless of config shape.
+                bumped = min(int((config.max_tokens or 1024) * 1.5), _CHAT_RETRY_MAX_TOKENS_CAP)
+                retry_config = _replace_cfg(config, max_tokens=bumped)
+            result = await asyncio.wait_for(
+                self._llm.generate(messages, retry_config), timeout=_CHAT_RETRY_TIMEOUT_S,
+            )
+            return result, (time.perf_counter() - retry_start) * 1000
+        except Exception:  # noqa: BLE001 - incl. asyncio.TimeoutError; the retry
+            # itself (and its own bounded timeout) must not crash the turn.
+            log.exception("chatbot retry after empty/unparseable LLM response failed")
+            return None, (time.perf_counter() - retry_start) * 1000
 
     def _compose(
         self, rag_text: str, user_msg: LLMMessage, query_text: str = "",
@@ -528,7 +657,7 @@ class ChatBotAgent(BaseAgent):
         return await self.store.get_history(self.session.session_id)
 
     # ChatBot doesn't drive a state machine; override BaseAgent's persistence.
-    async def persist_state(self, extra: Optional[dict] = None) -> None:  # type: ignore[override]
+    async def persist_state(self, extra: dict | None = None) -> None:  # type: ignore[override]
         if self.store is None:
             return
         payload = {"agent_type": "chatbot"}
