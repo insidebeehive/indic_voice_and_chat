@@ -367,6 +367,67 @@ Return `null` (or 404) if the player has no history for the requested game.
 
 ---
 
+### 11. Player Matka Bids
+
+```
+GET /players/{user_id}/matka-bids?operator_id={operator_id}&status={status}&market={market}&limit={limit}
+```
+
+**When called:** Player asks about their OWN Matka bids or results — open/pending bids, bid history, whether a bid was accepted, cancellation/refund status, or why a win wasn't credited (e.g. "Matka mein open bets dikhao", "meri Matka history dikhao", "kya mera bet accept hua?", "Kalyan ka result kya aaya mera bet ka?", "market cancel hua toh refund milega?", "meri jeet credit kyu nahi hui?"). For a market's raw declared result with no reference to the player's own bet, use endpoint 12 under Operator Endpoints (Matka Result) instead.
+
+**Query params set by AI:**
+- `status` — `open` | `settled` | `cancelled` | `all` (default: `all`)
+- `market` — optional, filter to a specific market name (e.g. `Kalyan`, `Milan Day`, `Starline`)
+- `limit` — integer, default `20`
+
+**Expected response:**
+```json
+{
+  "bids": [
+    {
+      "id": "bid_001",
+      "market": "Kalyan",
+      "bet_type": "Jodi",
+      "number": "45",
+      "stake": 100.00,
+      "status": "open",
+      "placed_at": "2026-08-04T13:10:00Z"
+    },
+    {
+      "id": "bid_002",
+      "market": "Rajdhani Day",
+      "bet_type": "Single",
+      "number": "6",
+      "stake": 50.00,
+      "status": "won",
+      "result": "123-6",
+      "payout": 450.00,
+      "credited_at": "2026-08-03T17:40:00Z",
+      "settled_at": "2026-08-03T17:36:00Z"
+    },
+    {
+      "id": "bid_003",
+      "market": "Milan Day",
+      "bet_type": "Patti",
+      "number": "127",
+      "stake": 100.00,
+      "status": "cancelled",
+      "cancel_reason": "market_voided",
+      "refund_status": "credited",
+      "refunded_at": "2026-08-02T16:00:00Z"
+    }
+  ],
+  "pnl": {
+    "this_week": 350.00,
+    "this_month": -120.00
+  }
+}
+```
+
+`status` per bid — `open` | `won` | `lost` | `cancelled`. `payout`/`credited_at` present only when `status: "won"`. `refund_status`/`refunded_at` present only when `status: "cancelled"`. This is the endpoint to check when a player says a win wasn't credited — `credited_at` being absent/null on a `won` bid is the signal a payout is still pending.
+
+---
+
 ## Operator Endpoints
 
 These are called for any question about how the platform works — payment methods, games, promotions, platform settings. Only `operator_id` is injected (no `user_id`).
@@ -492,6 +553,72 @@ GET /operators/{operator_id}/platform-config
   "operator_profile": "Brief description of the platform."
 }
 ```
+
+---
+
+### 11. Matka Configuration
+
+```
+GET /operators/{operator_id}/matka-config?market_name={market_name}
+```
+
+**When called:** Questions about Matka platform config, game types, odds, or timing — NOT an actual declared result (see endpoint 12, Matka Result, for that). E.g. "which Matka markets are available?", "is Starline available?", "is Jackpot Matka available?", "what bet types are supported?", "what are the payout rates for Jodi?", "when does Kalyan close?", "what is the minimum Matka bet?".
+
+**Query params set by AI:**
+- `market_name` — optional, filter to a specific market (e.g. `Kalyan`, `Milan Day`, `Starline`). Omit for the full Matka config.
+
+**Expected response:**
+```json
+{
+  "markets": [
+    {
+      "name": "Kalyan",
+      "bet_types": ["Single", "Jodi", "Patti", "Half Sangam", "Full Sangam", "SP", "DP", "TP"],
+      "payout_odds": { "Single": 9.5, "Jodi": 95, "Patti": 142 },
+      "open_bid_time": "09:00", "close_bid_time": "15:00",
+      "open_result_time": "15:05", "close_result_time": "17:35",
+      "min_stake": 10, "max_stake": 50000
+    }
+  ],
+  "starline_enabled": true,
+  "jackpot_matka_enabled": false,
+  "charts_and_result_history_accessible": true,
+  "legacy_rounds_available": false
+}
+```
+
+**Not to be confused with:** endpoint 12 (Matka Result) — this endpoint describes the market's *rules and schedule*, not what number was actually declared.
+
+---
+
+### 12. Matka Result
+
+```
+GET /operators/{operator_id}/matka-results?market={market}&date={date}
+```
+
+**When called:** Customer asks for a market's declared/settled result directly — independent of whether they have a bet placed on it (e.g. "Rajdhani Day ka result kya aya hai", "Kalyan ka aaj ka number kya hai", "Milan Day open result kya tha"). Usable even for a customer with no active bet on that market.
+
+**Query params set by AI:**
+- `market` — market name (e.g. `Kalyan`, `Milan Day`, `Rajdhani Day`, `Starline`)
+- `date` — optional, `YYYY-MM-DD`. Omitted for today's/latest result.
+
+**Expected response:**
+```json
+{
+  "market": "Rajdhani Day",
+  "date": "2026-08-04",
+  "sessions": [
+    { "session": "Open", "result": "123-6", "declared_at": "2026-08-04T15:05:00Z" },
+    { "session": "Close", "result": "456-5", "declared_at": "2026-08-04T17:35:00Z" }
+  ],
+  "status": "declared"
+}
+```
+
+`status` — `declared` | `pending` (result not out yet) | `not_found` (invalid market/date). `sessions` may contain one entry (single-session markets like Starline) or two (Open/Close markets). This endpoint does **not** need to know about any player's bets — it's a lookup of the market's own declared number, same data as would appear in an app's public "Results" screen.
+
+**Not to be confused with:** endpoint 11 (Player Matka Bids, under Player Endpoints) — that returns the *player's own* bid outcome/settlement (tied to a bet they placed), not the market's raw declared result.
 
 ---
 

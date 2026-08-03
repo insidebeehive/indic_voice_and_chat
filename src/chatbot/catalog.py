@@ -201,7 +201,10 @@ PLAYER_TOOLS: dict[str, dict] = {
             "'All Bids dikhao', 'kya mera bet accept hua?', "
             "'Kalyan ka result kya aaya mera bet ka?', 'mera bet history mein nahi dikh raha', "
             "'market cancel hua toh refund milega?', 'is hafte Matka mein kitna jeeta/haara?', "
-            "'meri jeet credit kyu nahi hui?', 'bet accept kyu nahi hua?')."
+            "'meri jeet credit kyu nahi hui?', 'bet accept kyu nahi hua?'). "
+            "NOTE: for a market's result asked WITHOUT reference to the player's "
+            "own bet (e.g. a customer just asking 'Kalyan ka result kya aaya' with "
+            "no bet-status question), call get_matka_result instead."
         ),
         "parameters": {
             "user_id": {"type": "string", "source": "session",
@@ -292,8 +295,9 @@ OPERATOR_TOOLS: dict[str, dict] = {
             "timing, or limits (e.g. 'which Matka markets are available?', "
             "'is Starline available?', 'is Jackpot Matka available?', "
             "'what bet types are supported?', 'what are the payout rates for Jodi?', "
-            "'when does Kalyan close?', 'what is the minimum Matka bet?', "
-            "'can I see past results or charts?')."
+            "'when does Kalyan close?', 'what is the minimum Matka bet?'). "
+            "NOTE: this does NOT return an actual declared result number — "
+            "call get_matka_result for that."
         ),
         "parameters": {
             "operator_id": {"type": "string", "source": "session",
@@ -302,6 +306,31 @@ OPERATOR_TOOLS: dict[str, dict] = {
                             "description": "Optional: filter to a specific market (e.g. 'Kalyan', 'Milan Day', 'Starline'). Omit to get full Matka config."},
         },
         "default_path": "/operators/{operator_id}/matka-config",
+        "method": "GET",
+    },
+    "get_matka_result": {
+        "description": (
+            "Get the declared/settled result for a specific Matka market and "
+            "session (e.g. today's Rajdhani Day, Kalyan, Milan Day number) — "
+            "independent of whether the customer has a bet placed on it, and "
+            "usable even for a customer who isn't logged in with an active bet. "
+            "Call this whenever the customer asks for a market's result directly "
+            "(e.g. 'Rajdhani Day ka result kya aya hai', 'Kalyan ka aaj ka number "
+            "kya hai', 'is market ka result declare hua kya', 'Milan Day open "
+            "result kya tha'). "
+            "NOTE: this does NOT know which bets a player placed or whether they "
+            "won/lost — for the customer's OWN bid outcome, settlement status, or "
+            "payout, call get_matka_bids instead."
+        ),
+        "parameters": {
+            "operator_id": {"type": "string", "source": "session",
+                            "description": "Operator identifier"},
+            "market": {"type": "string", "source": "llm",
+                       "description": "Market name (e.g. 'Kalyan', 'Milan Day', 'Rajdhani Day', 'Starline')"},
+            "date": {"type": "string", "source": "llm",
+                     "description": "Optional: date to fetch the result for (YYYY-MM-DD). Omit for today's/latest declared result."},
+        },
+        "default_path": "/operators/{operator_id}/matka-results",
         "method": "GET",
     },
     "get_operator_promotions": {
