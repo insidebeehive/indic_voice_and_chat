@@ -115,6 +115,35 @@ async def test_browser_factory_loads_chat_handoff(fake_redis) -> None:
     assert ld["customer_id"] == "cust1"
 
 
+async def test_browser_factory_skips_campaign_resolution_for_chat_handoff(fake_redis) -> None:
+    """A chat->voice handoff call has no campaign context, and the resolved
+    script/slots get replaced with a support-mode one anyway once the handoff
+    blob loads — so campaign resolution must be skipped entirely for these
+    calls. Regression guard: a tenant with no active campaign (resolver raises
+    CampaignNotConfigured) must NOT have every chat->voice handoff rejected."""
+    import json
+
+    from src.dialogue.campaign_resolver import CampaignNotConfigured
+
+    await fake_redis.set("chat_handoff:tok1", json.dumps({
+        "customer_name": "Raju", "chat_summary": "asked about Plan B", "customer_id": "cust1"}))
+
+    class _RaisingResolver:
+        async def resolve(self, tenant_id, campaign_id=None):
+            raise CampaignNotConfigured(f"tenant {tenant_id} has no campaign")
+
+    factory = make_browser_bridge_factory(
+        _providers(),
+        campaign_resolver=_RaisingResolver(),
+        handoff_store=SimpleNamespace(redis=fake_redis),
+    )
+    ws = SimpleNamespace(query_params={"handoff": "tok1"})
+    bridge = await factory(websocket=ws, tenant=_tenant())  # must not raise
+    ld = bridge._agent.session.lead_data
+    assert ld["name"] == "Raju"
+    assert ld["chat_summary"] == "asked about Plan B"
+
+
 async def test_browser_factory_raises_when_llm_override_fails(monkeypatch) -> None:
     monkeypatch.delenv("VLLM_BASE_URL", raising=False)
     ws = SimpleNamespace(query_params={"llm": "vllm"})

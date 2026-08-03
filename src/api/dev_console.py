@@ -711,17 +711,33 @@ def make_browser_bridge_factory(
     Mirrors ``src.bootstrap.make_bridge_factory`` but returns a browser bridge.
     When a ``campaign_resolver`` is supplied, the agent's script + slots are
     resolved per call from the tenant's DB campaign (``?campaign=<id>``, else the
-    tenant's active campaign, else the YAML fallback) instead of the global
-    closure script/slots.
+    tenant's active campaign, else ``CampaignNotConfigured`` is raised — there is
+    no fallback script, see ``src.dialogue.campaign_resolver``) instead of the
+    global closure script/slots. Skipped entirely for a chat->voice handoff call
+    (``?handoff=<token>``) — that path has no campaign context and replaces the
+    script with a support-mode one regardless, so resolving one first would only
+    add a failure point for tenants with no active campaign.
     """
 
     async def factory(websocket: WebSocket, tenant: TenantContext) -> BrowserVoiceBridge:
         import uuid
 
+        query_params = getattr(websocket, "query_params", {}) or {}
+        # Chat->voice handoff calls (?handoff=<token>) carry no campaign context
+        # at all — and further down, once the handoff blob loads, the campaign
+        # script/slots get thrown away entirely and replaced with a support-mode
+        # one (see "When a valid handoff is present" below). Resolving a campaign
+        # for these calls is therefore both wasted work and, worse, a hard
+        # failure point: a tenant with no active campaign would otherwise have
+        # every chat->voice handoff rejected (CampaignNotConfigured) even though
+        # the campaign result was never going to be used. Checked on the token's
+        # mere presence, not the later Redis lookup succeeding — a handoff call
+        # is a handoff call regardless of whether that lookup pans out.
+        is_handoff_call = bool((query_params.get("handoff") or "").strip())
+
         cur_script, cur_slots = script, slots
-        if campaign_resolver is not None:
-            qp0 = getattr(websocket, "query_params", {}) or {}
-            lc = await campaign_resolver.resolve(tenant.id, qp0.get("campaign") or None)
+        if campaign_resolver is not None and not is_handoff_call:
+            lc = await campaign_resolver.resolve(tenant.id, query_params.get("campaign") or None)
             cur_script, cur_slots = lc.script, lc.slots
 
         from src.providers import (
@@ -729,7 +745,6 @@ def make_browser_bridge_factory(
             get_llm_provider, get_stt_provider, get_streaming_stt_provider, get_tts_provider,
         )
 
-        query_params = getattr(websocket, "query_params", {}) or {}
         stt_sel = (query_params.get("stt") or "").strip().lower()
         llm_sel = (query_params.get("llm") or "").strip().lower()
         tts_sel = (query_params.get("tts") or "").strip().lower()
