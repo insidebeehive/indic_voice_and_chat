@@ -47,10 +47,24 @@ from src.pipeline.sentence_detector import SentenceDetector
 
 AudioSink = Callable[[bytes], Awaitable[None]]
 
-LLM_TURN_TIMEOUT_S = 20.0  # legitimate end-to-end LLM-generation budget for one turn
-TTS_SENTENCE_TIMEOUT_S = 25.0  # per-sentence rolling watchdog — covers IndicF5's 10s x 2
-                                # attempts (indicf5.py's _DEFAULT_TIMEOUT_S=10.0,
-                                # _TTS_ATTEMPTS=2) plus margin
+LLM_TURN_TIMEOUT_S = 10.0  # legitimate end-to-end LLM-generation budget for one turn
+LLM_FIRST_TOKEN_TIMEOUT_S = 7.0  # bounds the wait for the FIRST token specifically —
+                                  # the LLM_TURN_TIMEOUT_S check above only runs once a
+                                  # token has already arrived, so a stall before that
+                                  # (e.g. the provider's connection hangs before it starts
+                                  # streaming) would otherwise be an unbounded wait.
+TTS_SENTENCE_TIMEOUT_S = 10.0  # per-sentence rolling watchdog. Tightened from 25s
+                                # (which existed to cover IndicF5's/ElevenLabs' own
+                                # 2-attempt retry at up to 10s/attempt = 20s) on the
+                                # premise that past ~10s of dead air the caller has
+                                # already given up regardless of whether the sentence
+                                # eventually synthesizes — so this now typically cuts
+                                # a slow provider off mid-retry rather than letting its
+                                # 2nd attempt finish. If that turns out to drop too
+                                # many otherwise-recoverable sentences, tighten the
+                                # providers' own per-attempt timeout (e.g. indicf5.py's
+                                # _DEFAULT_TIMEOUT_S) to fit both attempts under this
+                                # budget instead of raising this back up.
 MAX_CONSECUTIVE_TTS_FAILURES = 2
 
 
@@ -358,9 +372,9 @@ class PipelineEngine:
                     continue
                 if first_audio_at is None:
                     first_audio_at = time.perf_counter()
+                await audio_sink(result.audio)
                 bytes_sent += len(result.audio)
                 sentences_spoken.append(sentence)
-                await audio_sink(result.audio)
 
         tts_task = asyncio.create_task(tts_worker())
 
@@ -369,7 +383,29 @@ class PipelineEngine:
         spoke_anything = False
 
         try:
-            async for token in self._llm.generate_stream(messages, self._config.llm):
+            stream = self._llm.generate_stream(messages, self._config.llm).__aiter__()
+            token_index = 0
+            while True:
+                try:
+                    if token_index == 0:
+                        # See LLM_FIRST_TOKEN_TIMEOUT_S: the total-generation-budget
+                        # check below only runs once a token has already arrived, so
+                        # this bounds the one wait that check can't cover.
+                        token = await asyncio.wait_for(
+                            stream.__anext__(), timeout=LLM_FIRST_TOKEN_TIMEOUT_S
+                        )
+                    else:
+                        token = await stream.__anext__()
+                except StopAsyncIteration:
+                    break
+                except asyncio.TimeoutError:
+                    log.error(
+                        "LLM produced no first token within %.0fs; ending turn early",
+                        LLM_FIRST_TOKEN_TIMEOUT_S,
+                    )
+                    cancel_event.set()
+                    break
+                token_index += 1
                 if cancel_event.is_set():
                     break
                 if time.perf_counter() - t_llm_start > LLM_TURN_TIMEOUT_S:

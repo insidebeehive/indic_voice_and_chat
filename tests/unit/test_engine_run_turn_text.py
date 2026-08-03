@@ -104,6 +104,40 @@ async def test_run_turn_text_drops_one_slow_sentence_via_watchdog(monkeypatch):
     assert result.cancelled is False  # one dropped sentence, not enough to abort the whole turn
 
 
+class _NeverRespondingLLM:
+    """Stalls before yielding anything — simulates a provider connection that
+    hangs before streaming starts, the one wait LLM_TURN_TIMEOUT_S can't catch
+    since its check only runs once a token has already arrived."""
+
+    async def generate_stream(self, messages, config):
+        await asyncio.sleep(10)  # never returns within the (monkeypatched-small) timeout
+        yield "unreachable"  # pragma: no cover - makes this a real async generator
+
+
+@pytest.mark.asyncio
+async def test_run_turn_text_bounds_wait_for_first_token(monkeypatch):
+    import src.pipeline.engine as engine_mod
+    monkeypatch.setattr(engine_mod, "LLM_FIRST_TOKEN_TIMEOUT_S", 0.05)
+
+    cfg = PipelineConfig(
+        stt=STTConfig(language="hi-IN"),
+        llm=LLMConfig(response_format="json", max_tokens=256),
+        tts=TTSConfig(language="hi-IN", sample_rate=16000),
+    )
+    engine = PipelineEngine(_FakeSTT(), _NeverRespondingLLM(), _FakeTTS(), cfg)
+    sink_calls = []
+
+    async def sink(audio: bytes):
+        sink_calls.append(audio)
+
+    result = await engine.run_turn_text(
+        "और कुछ benefits हैं?", history=[], audio_sink=sink,
+    )
+    assert result.cancelled is True
+    assert result.agent_text == ""
+    assert sink_calls == []
+
+
 class _TwoSentenceLLM:
     async def generate_stream(self, messages, config):
         for tok in [

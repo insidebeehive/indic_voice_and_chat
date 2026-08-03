@@ -13,7 +13,10 @@ provides.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import re
+import time
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Optional
 
@@ -21,13 +24,153 @@ from src.agents.base import AgentSession, BaseAgent
 from src.agents.state_machine import AgentStateMachine, Event, State
 from src.dialogue.language import normalize_lang, resolve_active_language, to_bcp47
 from src.dialogue.prompts import VoiceBotScript, build_voicebot_system_prompt
-from src.dialogue.response_parser import VoiceBotResponse, parse_voicebot_response
+from src.dialogue.response_parser import (
+    VoiceBotResponse,
+    _SENTIMENTS,
+    _VOICEBOT_ACTIONS,
+    _VOICEBOT_PHASES,
+    parse_voicebot_response,
+)
 from src.dialogue.slots import SlotFiller, SlotSchema
 from src.interfaces.llm import LLMMessage
 from src.pipeline.engine import AudioSink, PipelineEngine, TurnMetrics, TurnResult
 
 
 log = logging.getLogger(__name__)
+
+
+def _join_spoken_sentences(sentences: list[str]) -> str:
+    """Reconstruct the text TTS actually spoke from ``TurnResult.sentences_spoken``.
+
+    The sentence detector's soft first-chunk boundary (splitting on a comma so
+    TTS starts sooner) doesn't preserve the space around that split, so a plain
+    join can glue two fragments together ("accha,dhanyavaad"). Join with a
+    space and collapse runs of whitespace instead of assuming exact byte
+    fidelity to the original streamed text.
+    """
+    return re.sub(r"\s+", " ", " ".join(sentences)).strip()
+
+
+# Targeted field recovery for a JSON envelope whose overall parse failed. The
+# observed corruption (a stray quote/brace near the END of the envelope — see
+# response_parser._extract_json's tolerant full-object parser) typically
+# leaves early fields like `action` intact even though the object as a whole
+# won't parse. This is NOT a general JSON-repair library — just enough to
+# avoid hard-overriding `action` to "continue" when the model's real decision
+# (e.g. a close_positive/transfer) is still recoverable from the raw text.
+_ACTION_RE = re.compile(r'"action"\s*:\s*"(\w+)"')
+_SENTIMENT_FIELD_RE = re.compile(r'"sentiment"\s*:\s*"(\w+)"')
+_PHASE_FIELD_RE = re.compile(r'"conversation_phase"\s*:\s*"(\w+)"')
+_SLOTS_KEY_RE = re.compile(r'"updated_slots"\s*:\s*\{')
+
+
+def _find_updated_slots_span(raw_text: str) -> Optional[tuple[int, int]]:
+    """Locate the ``updated_slots`` object's ``[start, end)`` span (the
+    opening '{' through its matching closing '}', inclusive) via
+    balanced-brace matching, tolerating corruption elsewhere in the envelope.
+    String-aware (honors ``\\"`` escapes) so a literal ``{``/``}`` inside a
+    slot's string value doesn't miscount and truncate the span early.
+    Returns ``None`` if the key isn't present or the object never balances."""
+    m = _SLOTS_KEY_RE.search(raw_text)
+    if not m:
+        return None
+    start = m.end() - 1  # index of the opening '{'
+    depth = 0
+    in_string = False
+    i = start
+    while i < len(raw_text):
+        ch = raw_text[i]
+        if in_string:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == '"':
+                in_string = False
+            i += 1
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return start, i + 1
+        i += 1
+    return None
+
+
+def _recover_updated_slots(raw_text: str) -> Optional[dict[str, Any]]:
+    """Extract ``updated_slots`` via balanced-brace matching starting right
+    after the key, tolerating corruption elsewhere in the envelope."""
+    span = _find_updated_slots_span(raw_text)
+    if span is None:
+        return None
+    start, end = span
+    try:
+        obj = json.loads(raw_text[start:end], strict=False)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+def _recover_fields_from_raw(raw_text: str) -> dict[str, Any]:
+    """Best-effort recovery of action/sentiment/conversation_phase/
+    updated_slots from raw LLM text whose full JSON parse failed. Returns
+    only the keys it could recover.
+
+    The model is instructed to emit (see build_voicebot_system_prompt's field
+    spec in prompts.py — the actual live instruction; VOICEBOT_RESPONSE_SCHEMA
+    in this same prompts.py module documents the same shape but is never sent
+    to any provider, so it isn't the ground truth for field order): response_text,
+    language, action, conversation_phase, sentiment, updated_slots,
+    action_reason, internal_notes. `action`/`sentiment`/`conversation_phase`
+    all come BEFORE `updated_slots` there — but field order isn't a hard
+    guarantee, so a slot dict that happens to contain a key literally named
+    "action"/"sentiment"/"conversation_phase" (e.g. a badly-named campaign
+    slot) whose value happens to be a valid enum member could still shadow the
+    real field. Rather than depend on order, the `updated_slots` object's own
+    span is excised from the text before searching for the other three
+    fields, so a decoy inside it can never match regardless of which side of
+    `updated_slots` the real field actually lands on.
+    """
+    out: dict[str, Any] = {}
+    if not raw_text:
+        return out
+    slots_span = _find_updated_slots_span(raw_text)
+    if slots_span is not None:
+        start, end = slots_span
+        search_text = raw_text[:start] + raw_text[end:]
+    else:
+        search_text = raw_text
+    m = _ACTION_RE.search(search_text)
+    if m and m.group(1) in _VOICEBOT_ACTIONS:
+        out["action"] = m.group(1)
+    m = _SENTIMENT_FIELD_RE.search(search_text)
+    if m and m.group(1) in _SENTIMENTS:
+        out["sentiment"] = m.group(1)
+    m = _PHASE_FIELD_RE.search(search_text)
+    if m and m.group(1) in _VOICEBOT_PHASES:
+        out["conversation_phase"] = m.group(1)
+    if slots_span is not None:
+        slots = _recover_updated_slots(raw_text)
+        if slots is not None:
+            out["updated_slots"] = slots
+    return out
+
+
+def _apply_recovered_fields(response: VoiceBotResponse, raw_text: str) -> None:
+    """Mutate ``response`` in place with whatever _recover_fields_from_raw can
+    salvage from ``raw_text``, falling back to action="continue" (the prior
+    hardcoded behaviour) only when nothing could be recovered."""
+    recovered = _recover_fields_from_raw(raw_text)
+    response.action = recovered.get("action", "continue")
+    if "updated_slots" in recovered:
+        response.updated_slots = recovered["updated_slots"]
+    if "sentiment" in recovered:
+        response.sentiment = recovered["sentiment"]
+    if "conversation_phase" in recovered:
+        response.conversation_phase = recovered["conversation_phase"]
 
 
 @dataclass
@@ -43,11 +186,27 @@ _ESCALATION_ACTIONS = {"transfer", "schedule_callback"}
 _END_ACTIONS = {"close_positive", "close_negative", "end"}
 
 # LLM generation and each TTS sentence now enforce their own internal budgets
-# (see LLM_TURN_TIMEOUT_S / TTS_SENTENCE_TIMEOUT_S in src/pipeline/engine.py), so
-# these are a last-resort backstop against a truly wedged call, not the primary
-# timeout mechanism — see VoiceBotAgent._run_turn_with_backstop.
+# (LLM_TURN_TIMEOUT_S / LLM_FIRST_TOKEN_TIMEOUT_S / TTS_SENTENCE_TIMEOUT_S in
+# src/pipeline/engine.py) — including a dedicated timeout on the wait for the
+# LLM's first token, the one open-ended wait those budgets couldn't otherwise
+# bound. With that gap closed at the source, this outer cap is a genuine rare
+# last-resort (every step it could catch is already independently bounded), so
+# it's deliberately generous rather than tuned to the ~10s-of-dead-air ceiling
+# that governs the actual per-step budgets a caller routinely experiences.
+# (Briefly tightened to 7s/3s during 2026-08 before the first-token timeout
+# existed, which would have false-positived on legitimately slow multi-sentence
+# turns — reverted once the real gap was closed instead.)
 HARD_TURN_TIMEOUT_S = 90.0
 _BACKSTOP_GRACE_S = 30.0
+
+# The one-shot retry (see _finish_turn) fires only after a turn has ALREADY
+# failed to parse — if it also stalls before a token arrives, that's a strong
+# signal the provider is genuinely down right now, not a transient blip.
+# Doubling down on the full primary backstop would be exactly backwards, so
+# the retry gets its own, even tighter budget: fail fast into the canned
+# fallback rather than making the caller wait through a second near-full wait.
+_RETRY_HARD_TIMEOUT_S = 5.0
+_RETRY_BACKSTOP_GRACE_S = 2.0
 
 # Sliding-window context. The full transcript lives in ``session.turns`` (used for
 # the UI and post-call outcome analysis), but only the system prompt + the last
@@ -212,7 +371,14 @@ class VoiceBotAgent(BaseAgent):
         data.setdefault("lead_address", _addr)
         return {k: str(v) for k, v in data.items()}
 
-    async def _run_turn_with_backstop(self, coro, cancel_event: asyncio.Event) -> TurnResult:
+    async def _run_turn_with_backstop(
+        self,
+        coro,
+        cancel_event: asyncio.Event,
+        *,
+        hard_timeout_s: Optional[float] = None,
+        grace_s: Optional[float] = None,
+    ) -> TurnResult:
         """Run a pipeline-turn coroutine with a hard backstop timeout.
 
         LLM generation and each TTS sentence now enforce their own internal
@@ -226,19 +392,30 @@ class VoiceBotAgent(BaseAgent):
         to LISTENING (the original mid-sentence cutoff bug). Only if the
         coroutine still hasn't wound down after a grace period do we fall
         back to a hard cancel.
+
+        ``hard_timeout_s``/``grace_s`` default (via ``None``, resolved here
+        rather than as literal default values) to the current module-level
+        HARD_TURN_TIMEOUT_S/_BACKSTOP_GRACE_S — a plain default value would
+        bind at class-definition time and stop tracking test monkeypatches of
+        those module attributes. The retry in _finish_turn passes its own,
+        tighter values explicitly.
         """
+        if hard_timeout_s is None:
+            hard_timeout_s = HARD_TURN_TIMEOUT_S
+        if grace_s is None:
+            grace_s = _BACKSTOP_GRACE_S
         task = asyncio.create_task(coro)
-        done, _ = await asyncio.wait({task}, timeout=HARD_TURN_TIMEOUT_S)
+        done, _ = await asyncio.wait({task}, timeout=hard_timeout_s)
         if task in done:
             return task.result()
 
-        log.error("turn exceeded hard cap of %.0fs; signalling cancellation", HARD_TURN_TIMEOUT_S)
+        log.error("turn exceeded hard cap of %.0fs; signalling cancellation", hard_timeout_s)
         cancel_event.set()
-        done, _ = await asyncio.wait({task}, timeout=_BACKSTOP_GRACE_S)
+        done, _ = await asyncio.wait({task}, timeout=grace_s)
         if task in done:
             return task.result()
 
-        log.error("turn still wedged after %.0fs grace period; force-cancelling", _BACKSTOP_GRACE_S)
+        log.error("turn still wedged after %.0fs grace period; force-cancelling", grace_s)
         task.cancel()
         try:
             await task
@@ -309,12 +486,26 @@ class VoiceBotAgent(BaseAgent):
                 pipeline=pipeline_result,
             )
 
-        return await self._finish_turn(pipeline_result)
+        return await self._finish_turn(pipeline_result, audio_sink=audio_sink, cancel_event=cancel_event)
 
-    async def _finish_turn(self, pipeline_result: TurnResult) -> TurnOutcome:
+    async def _finish_turn(
+        self,
+        pipeline_result: TurnResult,
+        *,
+        audio_sink: AudioSink,
+        cancel_event: asyncio.Event,
+    ) -> TurnOutcome:
         """Record turns, parse the structured response, apply slots, and advance
         the state machine. Shared by handle_turn (batch STT) and
         handle_turn_text (streaming STT)."""
+        # Backdated by the original attempt's own measured duration, so that
+        # when the retry call below computes its total_latency_ms as
+        # time.perf_counter() - t_overall (see PipelineEngine.run_turn_text),
+        # the result genuinely covers the full episode — the original failed
+        # attempt plus the retry — rather than only the retry's own (much
+        # shorter) duration.
+        t_recovery_start = time.perf_counter() - (pipeline_result.metrics.total_latency_ms / 1000)
+
         # Empty STT — no real user turn happened. Walk the state machine back to
         # LISTENING and let the silence handler decide what to do next.
         if not pipeline_result.user_text:
@@ -328,6 +519,90 @@ class VoiceBotAgent(BaseAgent):
             )
 
         response = parse_voicebot_response(pipeline_result.agent_text)
+        if response.parse_error:
+            spoken = _join_spoken_sentences(pipeline_result.sentences_spoken)
+            if spoken:
+                # The malformed JSON's response_text was already extracted and
+                # spoken (sentence-by-sentence, ahead of the full response) before
+                # this parse failure surfaced downstream — audio has already gone
+                # out. Reuse it instead of the canned fallback line so the
+                # transcript/history match what the caller actually heard, and
+                # let the conversation continue normally rather than forcing a
+                # redundant "please repeat that" the caller never heard asked.
+                response.response_text = spoken
+                _apply_recovered_fields(response, pipeline_result.agent_text)
+            else:
+                # Nothing was spoken this turn at all — no audio has gone out yet,
+                # so it's safe to regenerate once before falling back. Reuses the
+                # already-transcribed user_text; does not re-run STT. Goes through
+                # the same backstop wrapper as every other pipeline call in this
+                # class, but with its OWN tighter budget (_RETRY_HARD_TIMEOUT_S /
+                # _RETRY_BACKSTOP_GRACE_S) rather than the primary attempt's — a
+                # retry that also stalls before a token arrives means the provider
+                # is genuinely down right now, so doubling down on the full
+                # last-resort wait would only make an already-lost call wait
+                # longer. Reuses the turn's REAL cancel_event (not a fresh one) so
+                # a barge-in during the retry can still interrupt it and so the
+                # backstop's own expiry mechanism (cancel_event.set()) works.
+                log.warning(
+                    "retrying turn: %s produced no spoken output", response.parse_error
+                )
+                try:
+                    retried = await self._run_turn_with_backstop(
+                        self._engine.run_turn_text(
+                            pipeline_result.user_text,
+                            self._history_window(),
+                            audio_sink,
+                            cancel_event,
+                            user_language=pipeline_result.user_language,
+                            user_confidence=pipeline_result.user_confidence,
+                            stt_latency_ms=pipeline_result.metrics.stt_latency_ms,
+                            t_overall=t_recovery_start,
+                            language=to_bcp47(self._active_language),
+                        ),
+                        cancel_event,
+                        hard_timeout_s=_RETRY_HARD_TIMEOUT_S,
+                        grace_s=_RETRY_BACKSTOP_GRACE_S,
+                    )
+                except Exception:  # noqa: BLE001 - the retry itself must not crash the turn
+                    log.exception("retry after empty/unparseable LLM response failed")
+                    retried = None
+                if retried is not None:
+                    retried_spoken = _join_spoken_sentences(retried.sentences_spoken)
+                    if not retried.cancelled:
+                        pipeline_result = retried
+                        response = parse_voicebot_response(pipeline_result.agent_text)
+                        if response.parse_error and retried_spoken:
+                            response.response_text = retried_spoken
+                            _apply_recovered_fields(response, pipeline_result.agent_text)
+                    elif retried_spoken:
+                        # The retry itself got cancelled (LLM budget exceeded,
+                        # barge-in, or MAX_CONSECUTIVE_TTS_FAILURES — all set
+                        # cancel_event / return cancelled=True in engine.py), but
+                        # real content was already spoken to the caller before the
+                        # cancellation fired. Reuse the spoken text rather than
+                        # discarding it — discarding here would recreate the exact
+                        # transcript/audio divergence bug this whole recovery path
+                        # exists to fix, just relocated to the retry.
+                        #
+                        # But do NOT recover action/sentiment/conversation_phase
+                        # here (no _apply_recovered_fields call): cancellation of
+                        # a retry can be a barge-in, and this file has a
+                        # deliberate policy elsewhere (see the two
+                        # parse_error="barge-in" sites in handle_turn /
+                        # handle_turn_text) of forcing action="continue" whenever
+                        # the caller interrupted before hearing the full reply.
+                        # Acting on a terminal decision (close_positive/transfer)
+                        # the caller never actually heard announced is wrong,
+                        # so we force "continue" here too instead of recovering
+                        # a possibly-terminal action from a raw JSON fragment the
+                        # caller didn't finish hearing.
+                        pipeline_result = retried
+                        response = VoiceBotResponse(
+                            response_text=retried_spoken,
+                            action="continue",
+                            parse_error=response.parse_error or "retry cancelled",
+                        )
         # Update the conversation's active language from this turn's signals (the
         # LLM's explicitly-reported language wins; STT detection is the fallback).
         # Takes effect from the next turn's STT/TTS.
@@ -536,7 +811,7 @@ class VoiceBotAgent(BaseAgent):
                 pipeline=pipeline_result,
             )
 
-        return await self._finish_turn(pipeline_result)
+        return await self._finish_turn(pipeline_result, audio_sink=audio_sink, cancel_event=cancel_event)
 
     async def handle_silence_timeout(self, audio_sink: AudioSink) -> Optional[TurnOutcome]:
         """User went silent in LISTENING — re-prompt or end the call.
