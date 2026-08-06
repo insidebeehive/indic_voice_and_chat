@@ -150,6 +150,6 @@ Same event set and payload shape as `campaign-call-handoff.md` / `tenant-call-ev
 
 ---
 
-## Mapping to their original questions
+## Summary
 
 This document is the direct answer to "would you consider native LiveKit-room ingestion" — yes, and it's built and live-verified: no browser-widget-mechanism workaround is needed. You bring up the room and SIP participant on your side; we join it directly.
