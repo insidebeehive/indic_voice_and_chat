@@ -144,33 +144,55 @@
 
     <!-- ── CRM Management ─────────────────────────────────────────────── -->
     <div class="card">
-      <h2>CRM Management <span class="hint">(manage an existing CRM's LiveKit credentials)</span></h2>
+      <h2>CRM Management <span class="hint">(create/edit CRMs — base config, tool catalog, LiveKit credentials, knowledge base)</span></h2>
 
       <div class="grid">
         <label>CRM
           <select id="crm_sel" onchange="loadCrmDetail()"><option value="">— select —</option></select>
         </label>
+        <label>&nbsp;<button class="ghost sm" onclick="newCrmForm()" style="align-self:flex-start">+ New CRM</button></label>
       </div>
 
       <div id="crm_detail" hidden>
         <div class="grid">
-          <label>Base URL <input id="crm_base_url" disabled /></label>
-          <label>Auth type <input id="crm_auth_type" disabled /></label>
-          <label>Tools <span class="hint" style="display:inline">(read-only count — edit tools via curl)</span>
-            <input id="crm_tool_count" disabled />
+          <label>ID <span class="hint" style="display:inline">(immutable once created)</span>
+            <input id="crm_id_input" placeholder="e.g. acme-crm" />
+          </label>
+          <label>Name <input id="crm_name" placeholder="Acme CRM" /></label>
+          <label>Base URL <input id="crm_base_url" placeholder="https://api.acme.example.com" /></label>
+          <label>Events webhook URL template <input id="crm_webhook_tmpl" placeholder="https://.../events?tenant={tenant_slug}" /></label>
+          <label>Auth type
+            <select id="crm_auth_type">
+              <option value="api_key">api_key</option>
+              <option value="bearer">bearer</option>
+            </select>
           </label>
           <label>LiveKit status <span><span id="crm_lk_badge" class="badge">—</span></span></label>
         </div>
 
-        <div class="grid">
+        <label style="display:block;margin-bottom:.4rem">Tools <span class="hint" style="display:inline">(JSON array — name/description/endpoint/method/parameters. Saving REPLACES the entire tool list — leave exactly as loaded if you don't mean to change tools.)</span>
+          <textarea id="crm_tools" rows="10" style="width:100%;box-sizing:border-box;font-family:ui-monospace,monospace;font-size:.78rem;margin-top:.3rem"></textarea>
+        </label>
+
+        <div class="grid" style="margin-top:.3rem">
           <label>LiveKit URL <input id="crm_lk_url" placeholder="wss://your-project.livekit.cloud" /></label>
           <label>LiveKit API key <input id="crm_lk_key" type="password" placeholder="(unchanged if left blank)" /></label>
           <label>LiveKit API secret <input id="crm_lk_secret" type="password" placeholder="(unchanged if left blank)" /></label>
         </div>
-        <div class="hint" style="margin-bottom:.7rem">Leave API key/secret blank to keep the current value unchanged — never displayed once set, and this card never touches the CRM's tool list.</div>
+        <div class="hint" style="margin-bottom:.7rem">Leave API key/secret blank to keep the current value unchanged — never displayed once set.</div>
 
-        <button onclick="saveCrmLivekit()">Save LiveKit config</button>
+        <button onclick="saveCrmEntity()">Save CRM</button>
+        <button class="ghost" onclick="closeCrmForm()">Cancel</button>
         <div id="crm_out" class="out" hidden></div>
+
+        <div id="crm_kb_section" style="margin-top:1.1rem" hidden>
+          <h2 style="font-size:.88rem;margin:.7rem 0 .5rem">Knowledge base <span class="hint">(shared by every tenant on this CRM)</span></h2>
+          <div id="crm_kb_list"><span class="hint">Loading…</span></div>
+          <div style="margin-top:.6rem;display:flex;gap:.5rem;align-items:center">
+            <input type="file" id="crm_kb_file" accept=".pdf,.docx,.txt,.md" style="flex:1" />
+            <button class="sm" onclick="uploadCrmKBDoc()">Upload</button>
+          </div>
+        </div>
       </div>
     </div>
 
@@ -337,11 +359,39 @@ async function loadCrmOptions() {
 }
 
 // ── CRM Management ─────────────────────────────────────────────────────────
+// Full CRM entity CRUD (create/edit base config + tool catalog + LiveKit
+// creds + knowledge base) — consolidated here from the old "CRMs" section
+// on the backoffice page (that page's CRM tab is unrelated: it only links a
+// *tenant* to one of these CRMs, it never edited the CRM entity itself).
+let CRM_EDIT_ID = null; // null = the form is in "create new" mode
+
+const escA = (s) => String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;");
+const escT = (s) => String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;");
+
 function setLivekitBadge(configured) {
   const badge = $("crm_lk_badge");
   badge.textContent = configured ? "LiveKit: configured" : "LiveKit: not configured";
   badge.style.background = configured ? "#14532d" : "#7c2d12";
   badge.style.color      = configured ? "#bbf7d0" : "#fed7aa";
+}
+
+function newCrmForm() {
+  CRM_EDIT_ID = null;
+  $("crm_sel").value = "";
+  $("crm_id_input").value = "";
+  $("crm_id_input").disabled = false;
+  $("crm_name").value = "";
+  $("crm_base_url").value = "";
+  $("crm_webhook_tmpl").value = "";
+  $("crm_auth_type").value = "api_key";
+  $("crm_tools").value = "[]";
+  $("crm_lk_url").value = "";
+  $("crm_lk_key").value = "";
+  $("crm_lk_secret").value = "";
+  setLivekitBadge(false);
+  $("crm_out").hidden = true;
+  $("crm_kb_section").hidden = true;
+  $("crm_detail").hidden = false;
 }
 
 async function loadCrmDetail() {
@@ -351,10 +401,15 @@ async function loadCrmDetail() {
   const r = await api("GET", `/api/v1/crms/${id}`);
   if (!r.ok) { detail.hidden = true; return; }
   const c = r.json;
+  CRM_EDIT_ID = id;
   detail.hidden = false;
-  $("crm_base_url").value  = c.base_url || "";
-  $("crm_auth_type").value = c.auth_type || "";
-  $("crm_tool_count").value = (c.tools || []).length;
+  $("crm_id_input").value = c.id;
+  $("crm_id_input").disabled = true;
+  $("crm_name").value = c.name || "";
+  $("crm_base_url").value = c.base_url || "";
+  $("crm_webhook_tmpl").value = c.events_webhook_url_template || "";
+  $("crm_auth_type").value = c.auth_type || "api_key";
+  $("crm_tools").value = JSON.stringify(c.tools || [], null, 2);
   $("crm_lk_url").value = c.livekit_url || "";
   // Secrets are write-only — never prefilled from the API, regardless of
   // livekit_configured. Always start empty so a save never re-sends a
@@ -363,27 +418,129 @@ async function loadCrmDetail() {
   $("crm_lk_secret").value = "";
   setLivekitBadge(c.livekit_configured);
   $("crm_out").hidden = true;
+  $("crm_kb_section").hidden = false;
+  loadCrmKB(id);
 }
 
-async function saveCrmLivekit() {
-  const id = $("crm_sel").value;
-  if (!id) return;
+function closeCrmForm() {
+  $("crm_detail").hidden = true;
+  $("crm_sel").value = "";
+  CRM_EDIT_ID = null;
+}
+
+async function saveCrmEntity() {
+  let tools;
+  try {
+    tools = JSON.parse($("crm_tools").value.trim() || "[]");
+    if (!Array.isArray(tools)) throw new Error("the tools field must be a JSON array, e.g. []");
+  } catch (e) {
+    show("crm_out", `Invalid JSON in the tools field: ${e.message}`);
+    return;
+  }
+  const name = $("crm_name").value.trim();
+  const base_url = $("crm_base_url").value.trim();
+  const events_webhook_url_template = $("crm_webhook_tmpl").value.trim();
+  const auth_type = $("crm_auth_type").value;
+  if (!name)     { show("crm_out", "Name is required"); return; }
+  if (!base_url) { show("crm_out", "Base URL is required"); return; }
+
   // livekit_url is freely re-editable, so it's always sent as-is (including
   // an intentional blank to clear it). The two secrets are NEVER included
-  // unless the admin actually typed something — PATCH treats "field present"
-  // and "field omitted" differently, and an empty string would be encrypted
-  // and stored (_upsert_livekit_secrets checks `is not None`, not truthiness),
-  // silently wiping a real secret. `tools` is never included here at all, so
-  // this card can never touch the CRM's tool catalog.
-  const body = { livekit_url: $("crm_lk_url").value.trim() };
-  const key    = $("crm_lk_key").value.trim();
-  const secret = $("crm_lk_secret").value.trim();
-  if (key)    body.livekit_api_key    = key;
-  if (secret) body.livekit_api_secret = secret;
+  // unless the admin actually typed something — PATCH/POST treat "field
+  // present" and "field omitted" differently, and an empty string would be
+  // encrypted and stored (_upsert_livekit_secrets checks `is not None`, not
+  // truthiness), silently wiping a real secret.
+  const livekit_url = $("crm_lk_url").value.trim();
+  const lkKey    = $("crm_lk_key").value.trim();
+  const lkSecret = $("crm_lk_secret").value.trim();
 
-  const r = await api("PATCH", `/api/v1/crms/${id}`, { body });
-  show("crm_out", r.json);
-  if (r.ok) loadCrmDetail();
+  if (CRM_EDIT_ID === null) {
+    const id = $("crm_id_input").value.trim();
+    if (!id) { show("crm_out", "ID is required"); return; }
+    const body = { id, name, base_url, auth_type, tools, livekit_url };
+    if (events_webhook_url_template) body.events_webhook_url_template = events_webhook_url_template;
+    if (lkKey)    body.livekit_api_key    = lkKey;
+    if (lkSecret) body.livekit_api_secret = lkSecret;
+    const r = await api("POST", "/api/v1/crms", { body });
+    show("crm_out", r.json);
+    if (r.ok) { await loadCrmOptions(); $("crm_sel").value = r.json.id; loadCrmDetail(); }
+  } else {
+    const body = { name, base_url, events_webhook_url_template, auth_type, tools, livekit_url };
+    if (lkKey)    body.livekit_api_key    = lkKey;
+    if (lkSecret) body.livekit_api_secret = lkSecret;
+    const r = await api("PATCH", `/api/v1/crms/${CRM_EDIT_ID}`, { body });
+    show("crm_out", r.json);
+    if (r.ok) { await loadCrmOptions(); $("crm_sel").value = CRM_EDIT_ID; loadCrmDetail(); }
+  }
+}
+
+// ── CRM knowledge base ───────────────────────────────────────────────────────
+function _kbTable(rows) {
+  if (!rows.length) return '<span class="hint">No documents.</span>';
+  return `<table><thead><tr><th>File</th><th>Chunks</th><th>Lang</th><th></th></tr></thead>
+    <tbody>${rows}</tbody></table>`;
+}
+
+async function loadCrmKB(crmId) {
+  $("crm_kb_list").innerHTML = '<span class="hint">Loading…</span>';
+  const r = await api("GET", `/api/v1/crms/${crmId}/kb/documents`);
+  if (!r.ok) { $("crm_kb_list").innerHTML = `<span class="hint">Could not load (${r.status}).</span>`; return; }
+  const docs = r.json.documents || [];
+  const rows = docs.map(d => {
+    const dlName = escA(d.filename).replace(/\.[^.]+$/, "") + ".txt";
+    return `<tr>
+      <td>${escA(d.filename)}</td>
+      <td>${d.chunk_count}</td>
+      <td>${d.language ? escT(d.language) : "—"}</td>
+      <td style="white-space:nowrap">
+        <button class="sm" onclick="downloadCrmKBDoc('${crmId}','${escA(d.id)}','${dlName}')">↓</button>
+        <button class="sm" onclick="deleteCrmKBDoc('${escA(d.id)}')">Delete</button>
+      </td>
+    </tr>`;
+  }).join("");
+  $("crm_kb_list").innerHTML = _kbTable(rows);
+}
+
+async function downloadCrmKBDoc(crmId, docId, filename) {
+  const headers = {};
+  const tok = $("adminToken").value.trim();
+  if (tok) headers["Authorization"] = "Bearer " + tok;
+  const res = await fetch(base() + `/api/v1/crms/${crmId}/kb/documents/${docId}/download`, { headers });
+  if (!res.ok) { alert("Download failed: " + res.status); return; }
+  const blob = await res.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = filename; a.click();
+  URL.revokeObjectURL(url);
+}
+
+async function uploadCrmKBDoc() {
+  if (CRM_EDIT_ID === null) return;
+  const fileEl = $("crm_kb_file");
+  if (!fileEl.files.length) return;
+  const fd = new FormData(); fd.append("file", fileEl.files[0]);
+  const headers = {};
+  const tok = $("adminToken").value.trim();
+  if (tok) headers["Authorization"] = "Bearer " + tok;
+  const path = `/api/v1/crms/${CRM_EDIT_ID}/kb/ingest`;
+  const id = ++autoNum;
+  try {
+    const res = await fetch(base() + path, { method: "POST", headers, body: fd });
+    const text = await res.text(); let json; try { json = JSON.parse(text); } catch { json = text; }
+    logEntry(id, "POST", path, res.status, json);
+    if (res.ok) { fileEl.value = ""; loadCrmKB(CRM_EDIT_ID); }
+    else alert("Upload failed: " + (json?.detail || res.status));
+  } catch (e) {
+    logEntry(id, "POST", path, "ERR", String(e));
+  }
+}
+
+async function deleteCrmKBDoc(docId) {
+  if (CRM_EDIT_ID === null) return;
+  if (!confirm("Delete this document?")) return;
+  const r = await api("DELETE", `/api/v1/crms/${CRM_EDIT_ID}/kb/documents/${docId}`);
+  if (r.ok) loadCrmKB(CRM_EDIT_ID);
+  else alert("Delete failed: " + (r.json?.detail || r.status));
 }
 
 // ── Register ────────────────────────────────────────────────────────────────
