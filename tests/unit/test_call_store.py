@@ -426,6 +426,142 @@ async def test_mark_answered_unknown_sid_returns_none(sm):
         assert await mark_answered(s, "missing") is None
 
 
+# --- Fix 1: tenant_id scoping (LiveKit room-name cross-tenant collision) ----
+#
+# LiveKit room names are CRM-chosen and NOT guaranteed unique across tenants
+# (unlike Twilio/Exotel/Stringee Call SIDs, which are provider-generated and
+# globally unique). These tests reproduce the exact bug the ``tenant_id``
+# param on ``mark_answered``/``record_outcome`` fixes: two tenants' calls
+# sharing one room name must never let one tenant's outcome/transcript land on
+# the other tenant's conversation row.
+
+
+async def test_record_outcome_tenant_scoped_prevents_writing_into_other_tenants_row(sm):
+    """Tenant A already has a row for room 'support-line' (e.g. from an earlier,
+    already-finished call — LiveKit room names are stable/reused, unlike
+    Twilio SIDs). Tenant B's own call reuses the same room name but has no row
+    of its own yet. Without tenant scoping, the unscoped-by-SID lookup would
+    find tenant A's row (the only match) and overwrite ITS outcome/notes with
+    tenant B's data — exactly the bug this test guards against."""
+    async with sm() as s:
+        s.add(Tenant(id="t2", slug="t2", name="T2"))
+        s.add(_conv(id="c_tenantA", tenant_id="t1", provider_call_sid="support-line",
+                    status="ended", outcome="not_interested", notes="tenant A's real notes"))
+        await s.commit()
+
+    async with sm() as s:
+        row = await record_outcome(
+            s, "support-line", tenant_id="t2", outcome="interested",
+            notes="tenant B's data — must never land on tenant A's row")
+    assert row is None   # tenant-scoped lookup correctly finds nothing for t2
+
+    async with sm() as s:
+        untouched = (await s.execute(
+            select(Conversation).where(Conversation.provider_call_sid == "support-line")
+        )).scalars().all()
+    assert len(untouched) == 1
+    assert untouched[0].tenant_id == "t1"
+    assert untouched[0].outcome == "not_interested"
+    assert untouched[0].notes == "tenant A's real notes"
+
+
+async def test_record_outcome_tenant_scoped_updates_only_the_matching_tenants_row(sm):
+    """Both tenants happen to have their own row for the same room name at the
+    same time (the genuinely concurrent collision case). tenant_id scoping
+    must update ONLY the matching tenant's row and leave the other completely
+    untouched."""
+    async with sm() as s:
+        s.add(Tenant(id="t2", slug="t2", name="T2"))
+        s.add(_conv(id="c_tA", tenant_id="t1", provider_call_sid="ROOM-SHARED", status="in_progress"))
+        s.add(_conv(id="c_tB", tenant_id="t2", provider_call_sid="ROOM-SHARED", status="in_progress"))
+        await s.commit()
+
+    async with sm() as s:
+        row = await record_outcome(
+            s, "ROOM-SHARED", tenant_id="t2", outcome="interested",
+            summary="tenant B summary", notes="tenant B notes")
+    assert row is not None
+    assert row.id == "c_tB"
+
+    async with sm() as s:
+        rows = {r.id: r for r in (await s.execute(
+            select(Conversation).where(Conversation.provider_call_sid == "ROOM-SHARED")
+        )).scalars().all()}
+    assert rows["c_tB"].outcome == "interested"
+    assert rows["c_tB"].status == "ended"
+    # Tenant A's row — same room name, different tenant — is completely untouched.
+    assert rows["c_tA"].outcome is None
+    assert rows["c_tA"].status == "in_progress"
+    assert rows["c_tA"].notes is None
+
+
+async def test_record_outcome_tenant_scoped_same_tenant_single_row_unaffected(sm):
+    """Same-tenant case: passing tenant_id must not break the ordinary
+    single-row-per-tenant lookup. Distinct code path from the cross-tenant
+    collision above — there the filter discriminates between two candidate
+    rows; here there's only ever one candidate to begin with, and the filter
+    must still match it (not accidentally exclude it)."""
+    async with sm() as s:
+        s.add(_conv(id="c_solo", tenant_id="t1", provider_call_sid="ROOM-SOLO"))
+        await s.commit()
+    async with sm() as s:
+        row = await record_outcome(s, "ROOM-SOLO", tenant_id="t1", outcome="interested")
+    assert row is not None and row.id == "c_solo" and row.outcome == "interested"
+
+
+async def test_record_outcome_without_tenant_id_is_unscoped_backward_compat(sm):
+    """The default (tenant_id=None, every existing Twilio/Exotel/Stringee call
+    site) must behave EXACTLY as before this parameter existed: a plain
+    global lookup by SID alone."""
+    async with sm() as s:
+        s.add(_conv(id="c_bc", provider_call_sid="SID-BACKCOMPAT"))
+        await s.commit()
+    async with sm() as s:
+        row = await record_outcome(s, "SID-BACKCOMPAT", outcome="interested")
+    assert row is not None and row.id == "c_bc"
+
+
+async def test_mark_answered_tenant_scoped_updates_only_the_matching_tenants_row(sm):
+    from src.api.call_store import mark_answered
+
+    async with sm() as s:
+        s.add(Tenant(id="t2", slug="t2", name="T2"))
+        s.add(_conv(id="c_tA2", tenant_id="t1", provider_call_sid="ROOM-SHARED2", status="in_progress"))
+        s.add(_conv(id="c_tB2", tenant_id="t2", provider_call_sid="ROOM-SHARED2", status="in_progress"))
+        await s.commit()
+
+    async with sm() as s:
+        row = await mark_answered(s, "ROOM-SHARED2", tenant_id="t2")
+    assert row is not None and row.id == "c_tB2" and row.status == "answered"
+
+    async with sm() as s:
+        rows = {r.id: r for r in (await s.execute(
+            select(Conversation).where(Conversation.provider_call_sid == "ROOM-SHARED2")
+        )).scalars().all()}
+    assert rows["c_tB2"].status == "answered"
+    assert rows["c_tA2"].status == "in_progress"   # untouched
+
+
+async def test_mark_answered_prevents_marking_other_tenants_row_when_none_of_its_own(sm):
+    from src.api.call_store import mark_answered
+
+    async with sm() as s:
+        s.add(Tenant(id="t2", slug="t2", name="T2"))
+        s.add(_conv(id="c_onlyA", tenant_id="t1", provider_call_sid="support-line-2",
+                    status="in_progress"))
+        await s.commit()
+
+    async with sm() as s:
+        row = await mark_answered(s, "support-line-2", tenant_id="t2")
+    assert row is None
+
+    async with sm() as s:
+        untouched = (await s.execute(
+            select(Conversation).where(Conversation.provider_call_sid == "support-line-2")
+        )).scalar_one()
+    assert untouched.status == "in_progress"   # tenant A's row untouched
+
+
 async def test_reap_stale_calls_closes_only_old_active(sm):
     from datetime import datetime, timedelta
 

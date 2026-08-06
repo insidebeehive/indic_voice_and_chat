@@ -1,8 +1,14 @@
 # LiveKit SIP bridge (CRM outbound integration) — design doc
 
-> Status: **planned, not started — pending confirmation from the CRM's infra team on the
-> checklist below.** No adapter/bridge code exists yet. This doc is for alignment with that
-> team and for a future implementation plan once the open questions are answered.
+> Status: **implemented and live-verified against a real LiveKit server.** The bridge
+> (`src/api/livekit_bridge.py`), the SDK-wiring runner (`src/api/livekit_runner.py`), the
+> webhook route (`src/api/livekit_routes.py`), and the per-call factory
+> (`src/bootstrap.py`'s `make_livekit_bridge_factory`) all exist and are wired in
+> `src/main.py`. The CRM-facing artifact for this integration is
+> [`docs/integrations/livekit-room-handoff.md`](integrations/livekit-room-handoff.md) — use
+> that doc for onboarding a CRM partner; this doc remains as the original design rationale,
+> with the sections below updated to reflect what was actually built where it diverged from
+> the original recommendation.
 
 ## Context
 
@@ -63,12 +69,23 @@ shared across providers with different native sample rates.
 3. Confirmation of the LiveKit SDK/version they're standardizing on.
 
 **How we know when to join**
-4. How our agent is notified a call needs it — a webhook telling us "room X is ready, join
-   now," or LiveKit's native **Agent Dispatch** feature (LiveKit's built-in mechanism for
-   assigning a specific agent to a specific room on demand). Agent Dispatch is preferred if
-   available — it avoids us needing to stand up and secure our own webhook receiver for this.
+4. **Decided and built: a webhook, not Agent Dispatch.** This doc originally preferred
+   LiveKit's native **Agent Dispatch** feature (LiveKit's built-in mechanism for assigning a
+   specific agent to a specific room on demand) over a custom webhook, on the reasoning that
+   Agent Dispatch would avoid standing up and securing our own webhook receiver. The actual
+   implementation reverses that: the CRM configures a tenant-scoped LiveKit webhook
+   (`POST /api/v1/telephony/livekit/webhook/{tenant_slug}`, `src/api/livekit_routes.py`) that
+   fires on `participant_joined` for the SIP participant, and that route spawns
+   `livekit_runner.run_call` in the background. The deciding factor: this codebase runs as a
+   single-process uvicorn deployment, which doesn't fit Agent Dispatch's worker/subprocess
+   model cleanly, whereas a webhook reuses infrastructure this codebase already runs safely
+   for four other telephony providers (Twilio, Exotel, Stringee, and the CRM-registration
+   path). See `docs/integrations/livekit-room-handoff.md` for the CRM-facing webhook contract
+   (signature verification, event filtering, concurrency cap, dedupe).
 5. Room/participant naming or metadata convention — how we identify which tenant, which call,
-   and which caller/callee number a given room corresponds to.
+   and which caller/callee number a given room corresponds to. Built as a `vox`-namespaced
+   metadata schema (room metadata preferred, participant metadata/attributes as fallback) —
+   see `docs/integrations/livekit-room-handoff.md`'s metadata schema section.
 
 **Audio**
 6. Confirmation of codec/sample rate in the room (Opus @48kHz is the WebRTC default).

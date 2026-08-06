@@ -73,6 +73,7 @@ class TelephonyConfigIn(BaseModel):
     provider: str
     from_number: Optional[str] = None
     stringee_base_url: Optional[str] = None   # regional Stringee REST host, if any
+    livekit_url: Optional[str] = None         # LiveKit server/project URL (wss://...), if any
     # No per-tenant inbound webhook base URL — it's the platform WEBHOOK_BASE_URL
     # (always our app, common to every tenant).
     # Telephony credentials — the ONLY per-tenant secrets. Encrypted at rest.
@@ -131,6 +132,10 @@ _TEL_KEY_ENV_FIELD = {
     "api_key_sid": "api_key_sid_env", "twilio_api_key_sid": "api_key_sid_env",
     "api_key_secret": "api_key_secret_env", "twilio_api_key_secret": "api_key_secret_env",
     "twiml_app_sid": "twiml_app_sid_env",
+    # LiveKit reuses the generic account_sid_env/auth_token_env slots for its
+    # API key/secret pair — these are purely UI-facing aliases so the backoffice
+    # can label the fields with LiveKit-appropriate names; no new secret fields.
+    "livekit_api_key": "account_sid_env", "livekit_api_secret": "auth_token_env",
     # Stringee outbound app-user id — a non-null userId keeps the callout an
     # app-user->phone call so the Answer URL/SCCO runs (else silent phone->phone).
     "user_id": "user_id_env", "stringee_user_id": "user_id_env",
@@ -215,6 +220,7 @@ async def register_tenant(
             provider=tel.provider,
             from_number=tel.from_number,
             stringee_base_url=tel.stringee_base_url,
+            livekit_url=tel.livekit_url,
             **{k: v for k, v in env_fields.items() if k != "events_webhook_secret_env"},
             # also record the creds under the provider-specific slot so a tenant
             # that later adds a second provider's keys resolves each correctly.
@@ -276,6 +282,7 @@ class TelephonyUpdateIn(BaseModel):
     provider: Optional[str] = None
     from_number: Optional[str] = None
     stringee_base_url: Optional[str] = None
+    livekit_url: Optional[str] = None
     keys: dict[str, str] = Field(default_factory=dict)
     phone_numbers: Optional[list[str]] = None
 
@@ -376,6 +383,8 @@ async def update_tenant(
             tel_cfg["from_number"] = tu.from_number
         if tu.stringee_base_url is not None:
             tel_cfg["stringee_base_url"] = tu.stringee_base_url
+        if tu.livekit_url is not None:
+            tel_cfg["livekit_url"] = tu.livekit_url
 
         if tu.keys:
             if not crypto.has_key():
@@ -522,6 +531,7 @@ class TenantSummary(BaseModel):
     # (never values) of the creds configured for the active provider.
     telephony_from_number: Optional[str] = None
     telephony_stringee_base_url: Optional[str] = None
+    telephony_livekit_url: Optional[str] = None
     events_webhook_url: Optional[str] = None
     events_webhook_secret_set: bool = False
     telephony_creds_configured: list[str] = Field(default_factory=list)
@@ -576,6 +586,7 @@ async def list_tenants(
             telephony_provider=tel.get("provider"),
             telephony_from_number=tel.get("from_number"),
             telephony_stringee_base_url=tel.get("stringee_base_url"),
+            telephony_livekit_url=tel.get("livekit_url"),
             events_webhook_url=pc.get("events_webhook_url") or tel.get("events_webhook_url"),
             events_webhook_secret_set=bool(
                 pc.get("events_webhook_secret_env") or tel.get("events_webhook_secret_env")

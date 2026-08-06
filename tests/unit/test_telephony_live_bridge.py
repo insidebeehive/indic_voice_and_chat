@@ -511,3 +511,124 @@ def test_build_s2s_telephony_bridge_rejects_disallowed_voice():
         encoding="mulaw", sid_field="streamSid", supports_clear=True,
         voice_override="Charon")                   # not in allowed_voices
     assert bridge._config.voice == "Aoede"         # falls back to config default
+
+
+# --- Phase 3: LiveKit bridge factory (_build_s2s_agent_and_config split) ----
+
+
+def _livekit_tenant(mode="s2s", allowed_voices=("Aoede", "Kore")):
+    from types import SimpleNamespace
+
+    rt = SimpleNamespace(model="gemini-3.1-flash-live-preview", voice="Aoede",
+                         language_code="hi-IN", api_key_env="K",
+                         allowed_voices=list(allowed_voices))
+    return SimpleNamespace(
+        id="t1", slug="dev",
+        settings=SimpleNamespace(pipeline=SimpleNamespace(mode=mode, realtime=rt),
+                                 timezone="Asia/Kolkata"),
+        secret=lambda env: "fake-key", secret_optional=lambda env: "fake-key")
+
+
+def _livekit_providers():
+    from types import SimpleNamespace
+    _llm, _tts = object(), object()
+    return SimpleNamespace(get_stt=lambda t: None, get_llm=lambda t: _llm,
+                           get_tts=lambda t: _tts)
+
+
+def test_build_s2s_agent_and_config_matches_telephony_bridge_behavior():
+    """Regression guard for the refactor: _build_s2s_agent_and_config must produce
+    the exact same agent/config/llm/tts/timezone the (still-passing) telephony
+    bridge tests above observe on the TelephonyLiveBridge it wraps."""
+    from src.bootstrap import _build_s2s_agent_and_config, _build_s2s_telephony_bridge
+
+    tenant = _livekit_tenant(allowed_voices=("Aoede", "Kore", "Leda"))
+    providers = _livekit_providers()
+    script = VoiceBotScript(agent_name="A", agent_role="s", company_name="X")
+    slots = SlotSchema()
+
+    agent, config, connect_session, llm, tts, tenant_timezone = _build_s2s_agent_and_config(
+        providers, tenant, script, slots, None,
+        voice_override="Kore", lead_data={"lead_name": "Raju"})
+
+    bridge = _build_s2s_telephony_bridge(
+        providers, tenant, script, slots, websocket=object(), session_store=None,
+        encoding="pcm", sid_field="stream_sid", supports_clear=False,
+        call_sid_field="call_sid", voice_override="Kore", lead_data={"lead_name": "Raju"})
+
+    assert config.voice == bridge._config.voice == "Kore"
+    assert config.model == bridge._config.model
+    assert tenant_timezone == bridge._tenant_timezone == "Asia/Kolkata"
+    assert llm is bridge._llm
+    assert tts is bridge._tts
+    assert agent.session.lead_data.get("lead_name") == bridge._agent.session.lead_data.get("lead_name") == "Raju"
+
+
+@pytest.mark.asyncio
+async def test_make_livekit_bridge_factory_returns_builder():
+    from src.api.livekit_bridge import LiveKitBridge
+    from src.bootstrap import make_livekit_bridge_factory
+
+    factory = make_livekit_bridge_factory(_livekit_providers())
+    build = await factory(_livekit_tenant(), "room_123", {})
+    assert callable(build)
+
+    bridge = await build(audio_stream=object(), audio_source=object(),
+                         frame_factory=object(), on_hangup=None)
+    assert isinstance(bridge, LiveKitBridge)
+    assert bridge._room_name == "room_123"
+    assert bridge._call_sid == "room_123"
+
+
+@pytest.mark.asyncio
+async def test_make_livekit_bridge_factory_rejects_layered_mode():
+    from src.bootstrap import LiveKitModeNotSupported, make_livekit_bridge_factory
+
+    factory = make_livekit_bridge_factory(_livekit_providers())
+    with pytest.raises(LiveKitModeNotSupported):
+        await factory(_livekit_tenant(mode="layered"), "room_123", {})
+
+
+@pytest.mark.asyncio
+async def test_make_livekit_bridge_factory_resolves_campaign_from_metadata():
+    from types import SimpleNamespace
+
+    from src.bootstrap import make_livekit_bridge_factory
+
+    seen = {}
+
+    class _Resolver:
+        async def resolve(self, tenant_id, campaign_id=None):
+            seen["args"] = (tenant_id, campaign_id)
+            return SimpleNamespace(
+                script=VoiceBotScript(agent_name="A", agent_role="s", company_name="X"),
+                slots=SlotSchema())
+
+    factory = make_livekit_bridge_factory(_livekit_providers(), campaign_resolver=_Resolver())
+    await factory(_livekit_tenant(), "room_123", {"campaign_id": "camp_x"})
+    assert seen["args"] == ("t1", "camp_x")
+
+
+@pytest.mark.asyncio
+async def test_make_livekit_bridge_factory_validates_voice():
+    from src.bootstrap import make_livekit_bridge_factory
+
+    tenant = _livekit_tenant(allowed_voices=("Aoede", "Kore"))
+    factory = make_livekit_bridge_factory(_livekit_providers())
+    build = await factory(tenant, "room_123", {"voice": "not-a-real-voice"})
+    bridge = await build(audio_stream=object(), audio_source=object(), frame_factory=object())
+    assert bridge._config.voice == "Aoede"   # falls back to tenant default, same as telephony path
+
+
+@pytest.mark.asyncio
+async def test_make_livekit_bridge_factory_ignores_mode_in_metadata(caplog):
+    import logging
+
+    from src.bootstrap import make_livekit_bridge_factory
+
+    tenant = _livekit_tenant()
+    factory = make_livekit_bridge_factory(_livekit_providers())
+    with caplog.at_level(logging.WARNING, logger="src.bootstrap"):
+        build = await factory(tenant, "room_123", {"mode": "layered", "campaign_id": None})
+    assert callable(build)
+    assert any("ignoring 'mode'" in r.getMessage() for r in caplog.records)

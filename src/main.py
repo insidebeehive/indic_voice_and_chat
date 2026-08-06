@@ -46,6 +46,7 @@ from src.api import (
     crm_kb as crm_kb_api,
     external_chat as ext_chat_api,
     knowledge as knowledge_api,
+    livekit_routes,
     telephony_hooks,
 )
 from src.api.dev_console import (
@@ -77,6 +78,7 @@ from src.bootstrap import (
     make_bridge_factory,
     make_chatbot_factory,
     make_exotel_bridge_factory,
+    make_livekit_bridge_factory,
     make_stringee_bridge_factory,
 )
 from src.config import Settings, get_settings
@@ -289,6 +291,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 notes=payload.get("notes"),
                 callback_at=_parse_callback(payload.get("callback_datetime")),
                 turns=payload.get("turns"),
+                # Only set for LiveKit (room names collide across tenants; Twilio/
+                # Exotel/Stringee Call SIDs are globally unique and never set this
+                # key, so tenant_id stays None -> unscoped lookup, unchanged).
+                tenant_id=payload.get("tenant_id"),
             )
     set_call_outcome_persister(_persist_call_outcome)
 
@@ -370,6 +376,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             crm_retrievers=crm_retrievers,
         )
     )
+    # LiveKit room-join (the CRM's SIP trunk fronts LiveKit): our webhook route
+    # spawns a per-call runner that builds this factory's bridge. Same providers /
+    # session store / campaign resolver / CRM retrievers as Twilio + Exotel.
+    livekit_routes.set_livekit_bridge_factory(
+        make_livekit_bridge_factory(
+            providers=providers, session_store=base_session_store,
+            campaign_resolver=campaign_resolver,
+            crm_retrievers=crm_retrievers,
+        )
+    )
     # The browser voice bridge is wired ALWAYS (not just for the dev console) so
     # the chat→voice handoff (/api/v1/chat/voice) works in prod; the dev console's
     # own WS routes stay behind VOX_DEV_CONSOLE. handoff_store lets a ?handoff token
@@ -434,6 +450,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         telephony_hooks.set_exotel_bridge_factory(None)
         telephony_hooks.set_stringee_bridge_factory(None)
         telephony_hooks.set_softphone_providers(None)
+        livekit_routes.set_livekit_bridge_factory(None)
         chat_api.set_chatbot_factory(None)
         chat_api.set_chat_sessionmaker(None)
         chat_api.set_chat_handoff_store(None)

@@ -15,6 +15,7 @@ from src.api import (
     crms,
     external_chat,
     knowledge,
+    livekit_routes,
     sessions,
     softphone,
     telephony_crm,
@@ -42,3 +43,4 @@ api_router.include_router(chat_tools.router)
 api_router.include_router(external_chat.router)
 api_router.include_router(telephony_hooks.router)
 api_router.include_router(telephony_crm.router)
+api_router.include_router(livekit_routes.router)
