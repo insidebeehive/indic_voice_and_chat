@@ -142,6 +142,38 @@
       <div id="t_out" class="out" hidden></div>
     </div>
 
+    <!-- ── CRM Management ─────────────────────────────────────────────── -->
+    <div class="card">
+      <h2>CRM Management <span class="hint">(manage an existing CRM's LiveKit credentials)</span></h2>
+
+      <div class="grid">
+        <label>CRM
+          <select id="crm_sel" onchange="loadCrmDetail()"><option value="">— select —</option></select>
+        </label>
+      </div>
+
+      <div id="crm_detail" hidden>
+        <div class="grid">
+          <label>Base URL <input id="crm_base_url" disabled /></label>
+          <label>Auth type <input id="crm_auth_type" disabled /></label>
+          <label>Tools <span class="hint" style="display:inline">(read-only count — edit tools via curl)</span>
+            <input id="crm_tool_count" disabled />
+          </label>
+          <label>LiveKit status <span><span id="crm_lk_badge" class="badge">—</span></span></label>
+        </div>
+
+        <div class="grid">
+          <label>LiveKit URL <input id="crm_lk_url" placeholder="wss://your-project.livekit.cloud" /></label>
+          <label>LiveKit API key <input id="crm_lk_key" type="password" placeholder="(unchanged if left blank)" /></label>
+          <label>LiveKit API secret <input id="crm_lk_secret" type="password" placeholder="(unchanged if left blank)" /></label>
+        </div>
+        <div class="hint" style="margin-bottom:.7rem">Leave API key/secret blank to keep the current value unchanged — never displayed once set, and this card never touches the CRM's tool list.</div>
+
+        <button onclick="saveCrmLivekit()">Save LiveKit config</button>
+        <div id="crm_out" class="out" hidden></div>
+      </div>
+    </div>
+
     <!-- ── Provider cost catalog (collapsible) ───────────────────────── -->
     <div class="card">
       <details>
@@ -285,19 +317,73 @@ async function updateCost(kind, provider, model) {
 
 async function loadCrmOptions() {
   const r = await api("GET", "/api/v1/crms");
-  const sel = $("t_crm_id");
-  if (!sel) return;
-  sel.innerHTML = "";
-  const none = document.createElement("option");
-  none.value = ""; none.textContent = "— none —";
-  sel.appendChild(none);
-  if (r.ok) {
-    for (const c of (r.json || [])) {
-      const o = document.createElement("option");
-      o.value = c.id; o.textContent = c.name;
-      sel.appendChild(o);
+  // Populates both the tenant-creation CRM link dropdown and the CRM
+  // Management selector from a single fetch.
+  for (const [id, placeholder] of [["t_crm_id", "— none —"], ["crm_sel", "— select —"]]) {
+    const sel = $(id);
+    if (!sel) continue;
+    sel.innerHTML = "";
+    const none = document.createElement("option");
+    none.value = ""; none.textContent = placeholder;
+    sel.appendChild(none);
+    if (r.ok) {
+      for (const c of (r.json || [])) {
+        const o = document.createElement("option");
+        o.value = c.id; o.textContent = c.name;
+        sel.appendChild(o);
+      }
     }
   }
+}
+
+// ── CRM Management ─────────────────────────────────────────────────────────
+function setLivekitBadge(configured) {
+  const badge = $("crm_lk_badge");
+  badge.textContent = configured ? "LiveKit: configured" : "LiveKit: not configured";
+  badge.style.background = configured ? "#14532d" : "#7c2d12";
+  badge.style.color      = configured ? "#bbf7d0" : "#fed7aa";
+}
+
+async function loadCrmDetail() {
+  const id = $("crm_sel").value;
+  const detail = $("crm_detail");
+  if (!id) { detail.hidden = true; return; }
+  const r = await api("GET", `/api/v1/crms/${id}`);
+  if (!r.ok) { detail.hidden = true; return; }
+  const c = r.json;
+  detail.hidden = false;
+  $("crm_base_url").value  = c.base_url || "";
+  $("crm_auth_type").value = c.auth_type || "";
+  $("crm_tool_count").value = (c.tools || []).length;
+  $("crm_lk_url").value = c.livekit_url || "";
+  // Secrets are write-only — never prefilled from the API, regardless of
+  // livekit_configured. Always start empty so a save never re-sends a
+  // secret we didn't actually receive.
+  $("crm_lk_key").value = "";
+  $("crm_lk_secret").value = "";
+  setLivekitBadge(c.livekit_configured);
+  $("crm_out").hidden = true;
+}
+
+async function saveCrmLivekit() {
+  const id = $("crm_sel").value;
+  if (!id) return;
+  // livekit_url is freely re-editable, so it's always sent as-is (including
+  // an intentional blank to clear it). The two secrets are NEVER included
+  // unless the admin actually typed something — PATCH treats "field present"
+  // and "field omitted" differently, and an empty string would be encrypted
+  // and stored (_upsert_livekit_secrets checks `is not None`, not truthiness),
+  // silently wiping a real secret. `tools` is never included here at all, so
+  // this card can never touch the CRM's tool catalog.
+  const body = { livekit_url: $("crm_lk_url").value.trim() };
+  const key    = $("crm_lk_key").value.trim();
+  const secret = $("crm_lk_secret").value.trim();
+  if (key)    body.livekit_api_key    = key;
+  if (secret) body.livekit_api_secret = secret;
+
+  const r = await api("PATCH", `/api/v1/crms/${id}`, { body });
+  show("crm_out", r.json);
+  if (r.ok) loadCrmDetail();
 }
 
 // ── Register ────────────────────────────────────────────────────────────────
