@@ -41,6 +41,12 @@ class Crm(Base):
     base_url: Mapped[str] = mapped_column(String(500), nullable=False)
     events_webhook_url_template: Mapped[str | None] = mapped_column(String(500))
     auth_type: Mapped[str] = mapped_column(String(20), default="api_key")  # api_key|bearer
+    # LiveKit server/project URL (wss://...) shared by every tenant registered
+    # against this CRM — a LiveKit project belongs to the CRM partner, not to
+    # any one tenant. Plain/non-secret, mirrors ``base_url``. The paired API
+    # key/secret live encrypted in ``CrmSecret`` (name ``livekit_api_key`` /
+    # ``livekit_api_secret``), never here.
+    livekit_url: Mapped[Optional[str]] = mapped_column(String(500))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=False), server_default=func.now())
 
@@ -59,6 +65,30 @@ class CrmTool(Base):
     parameters: Mapped[dict] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=False), server_default=func.now())
+
+
+class CrmSecret(Base):
+    """A CRM-level provider secret, encrypted at rest (Fernet) — the same
+    scheme as ``TenantSecret``, just keyed by ``crm_id`` instead of
+    ``tenant_id``. Currently used only for LiveKit's API key/secret pair
+    (``name`` is ``livekit_api_key`` / ``livekit_api_secret``), shared by
+    every tenant registered against this CRM rather than duplicated per
+    tenant.
+    """
+
+    __tablename__ = "crm_secrets"
+
+    crm_id: Mapped[str] = mapped_column(
+        String(50), ForeignKey("crms.id", ondelete="CASCADE"), primary_key=True
+    )
+    name: Mapped[str] = mapped_column(String(64), primary_key=True)
+    value_encrypted: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=False), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=False), server_default=func.now(), onupdate=func.now()
+    )
 
 
 class CrmKBDocument(Base):

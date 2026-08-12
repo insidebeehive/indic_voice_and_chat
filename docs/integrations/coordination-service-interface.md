@@ -170,12 +170,12 @@ CS handles based on transport:
     CS intercepts the frame (does NOT forward to CRM Frontend)
     CS sends CRM Frontend: {"type":"mode_change","mode":"voice_pending","message":"Calling you now…"}
     CS pre-registers the call:
-      POST /api/v1/telephony/register-call  { provider, provider_call_sid, lead_id }
+      POST /api/v1/telephony/register-call  { provider, provider_call_sid, campaign_id }
       → receives call_id; call.initiated fires → CS webhook
     CS dials the customer via the telephony provider, setting our answer URL:
       https://{host}/api/v1/telephony/{provider}/voice/{tenant_slug}
     Customer answers → our AI bridge takes over automatically
-      call.answered fires → CS webhook
+      (call.answered does not fire for this flow — only call.initiated and call.completed do)
         │
    call ends:
         │
@@ -269,12 +269,12 @@ AI decides to call the customer back
         │
 AI Platform sends call_offer with transport=pstn over the relay WS
 CS intercepts; pre-registers the call:
-  POST /api/v1/telephony/register-call  { provider, provider_call_sid, lead_id }
+  POST /api/v1/telephony/register-call  { provider, provider_call_sid, campaign_id }
   → call.initiated fires → CS webhook
 CS dials the customer via the telephony provider, setting our answer URL:
   https://{host}/api/v1/telephony/{provider}/voice/{tenant_slug}
 Customer answers → our AI bridge takes over automatically
-  call.answered fires → CS webhook
+  (call.answered does not fire for this flow — only call.initiated and call.completed do)
         │
    call ends
         │
@@ -317,7 +317,8 @@ Response 202:
         │
 We dial the lead via the tenant's telephony provider.
 Lead answers → our AI bridge starts automatically.
-  call.answered fires → CS webhook
+  (call.answered does not fire for this flow either — same answer-webhook handler
+  as the register-call path above, only call.initiated and call.completed fire)
         │
    call ends
         │
@@ -396,11 +397,11 @@ When AI Platform sends a `call_offer` frame with `transport=pstn` over the chat 
 ```
 
 **CS is not in the audio path.** CS dials the customer and hands the media stream
-to us via the answer URL. Choose one of the two patterns below.
+to us via the answer URL. Use the register-call flow below.
 
 ---
 
-#### Pattern A — Answer URL (recommended)
+#### Answer URL flow
 
 CS places the call and our answer URL fires when the customer answers.
 
@@ -426,54 +427,10 @@ CS places the call and our answer URL fires when the customer answers.
    Response `201`: `{ "call_id": "call_...", "status": "in_progress" }`  
    Fires `call.initiated` (with `"source": "crm_register"`) to the CS webhook immediately.
 
-5. Customer answers → provider fires our answer URL → AI bridge starts → `call.answered` fires.
+5. Customer answers → provider fires our answer URL → AI bridge starts. `call.answered`
+   does not fire for this flow — only `call.initiated` (on registration, step 4) and
+   `call.completed` (at teardown) do.
 6. When `call.completed` arrives on the CS webhook, send CRM Frontend: `{"type":"ended"}`
-
----
-
-#### Pattern B — Mid-call patch-in
-
-Use when CS needs to hold the customer (play a disclosure, route through its own
-IVR) before engaging the AI.
-
-1. CS dials the customer; holds them on IVR/hold music.
-2. When ready, call the handoff endpoint with the **live** call SID:
-   ```
-   POST /api/v1/telephony/handoff
-   Authorization: Bearer <tenant-token>
-   Content-Type: application/json
-
-   {
-     "provider": "twilio",
-     "call_sid": "CAxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
-     "lead_id": "...",
-     "crm_account_sid": null,   // omit if using the tenant's stored credentials
-     "crm_auth_token": null
-   }
-   ```
-   Response `200`: `{ "call_id": "call_...", "status": "answered", "provider_call_sid": "..." }`
-
-   We call the provider's live-call update API to redirect the active call's media
-   stream to our AI bridge WebSocket. Both `call.initiated` and `call.answered` fire
-   immediately. `call.completed` fires at teardown.
-
-3. Send CRM Frontend: `{"type":"ended"}` when `call.completed` arrives.
-
-**Credential ownership for Pattern B:** by default we use the tenant's stored
-telephony credentials. If CS holds the call on a **separate** Twilio/Exotel
-account, pass `crm_account_sid` + `crm_auth_token` in the request, or redirect the
-call to our answer URL using CS's own Twilio client and use Pattern A instead.
-
----
-
-#### Pattern B error responses
-
-| Status | Meaning |
-|---|---|
-| 400 | Provider unsupported (e.g. `stringee`) or credentials unresolvable |
-| 409 | SID already registered — return the existing `call_id` |
-| 502 | Provider rejected redirect (call already ended, SID invalid) |
-| 503 | AI bridge not ready — retry in a few seconds |
 
 ---
 

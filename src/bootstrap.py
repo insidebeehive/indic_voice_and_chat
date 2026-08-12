@@ -511,21 +511,28 @@ def _override_lead_data(override: dict | None) -> dict:
     return data
 
 
-def _build_s2s_telephony_bridge(
+def _build_s2s_agent_and_config(
     providers: TenantProviders, tenant: TenantContext, script: VoiceBotScript,
-    slots: SlotSchema, websocket: WebSocket, session_store: SessionStore | None,
-    *, encoding: str, sid_field: str, supports_clear: bool,
-    call_sid_field: str = "callSid", voice_override: str | None = None,
-    lead_data: dict | None = None, kb_context: str | None = None,
-    transfer_webhook_url_override: str | None = None,
+    slots: SlotSchema, session_store: SessionStore | None,
+    *, voice_override: str | None = None, lead_data: dict | None = None,
+    kb_context: str | None = None,
 ):
-    """Build a TelephonyLiveBridge (Gemini Live over the media stream) for a call
-    whose tenant has pipeline.mode == 's2s'. Mirrors the cascade agent assembly
-    but returns the S2S bridge; reuses the dev-console S2S wiring shape."""
+    """Assemble everything a Gemini-Live S2S call needs EXCEPT the transport-
+    specific bridge itself: the agent, the ``RealtimeConfig``, the session
+    connector, the LLM/TTS provider clients, and the tenant's timezone.
+
+    Shared by both transport shapes:
+    - ``_build_s2s_telephony_bridge`` (Twilio/Exotel — wraps the result in a
+      ``TelephonyLiveBridge`` bound to an already-open WebSocket).
+    - ``make_livekit_bridge_factory`` (LiveKit — the caller instead gets back
+      a builder closure, because the real room transport objects don't exist
+      until a separate runner connects to the room).
+
+    Returns ``(agent, config, connect_session, llm, tts, tenant_timezone)``.
+    """
     import uuid
 
     from src.api.live_bridge_base import RECORD_TURN_SIGNAL
-    from src.api.telephony_live_bridge import TelephonyLiveBridge
     from src.dialogue.prompts import build_s2s_system_instruction
     from src.interfaces.realtime import RealtimeConfig
     from src.providers.realtime.gemini_live import GeminiLiveSession
@@ -566,20 +573,41 @@ def _build_s2s_telephony_bridge(
     async def connect(cfg: RealtimeConfig):
         return await GeminiLiveSession.connect(cfg, api_key=key)
 
+    log.info("s2s agent+config built", extra={
+        "tenant": tenant.slug, "session_id": session_id, "voice": voice, "model": rt.model})
+    tts = providers.get_tts(tenant)
+    tenant_timezone = getattr(tenant.settings, "timezone", "Asia/Kolkata")
+    return agent, config, connect, llm, tts, tenant_timezone
+
+
+def _build_s2s_telephony_bridge(
+    providers: TenantProviders, tenant: TenantContext, script: VoiceBotScript,
+    slots: SlotSchema, websocket: WebSocket, session_store: SessionStore | None,
+    *, encoding: str, sid_field: str, supports_clear: bool,
+    call_sid_field: str = "callSid", voice_override: str | None = None,
+    lead_data: dict | None = None, kb_context: str | None = None,
+    transfer_webhook_url_override: str | None = None,
+):
+    """Build a TelephonyLiveBridge (Gemini Live over the media stream) for a call
+    whose tenant has pipeline.mode == 's2s'. Mirrors the cascade agent assembly
+    but returns the S2S bridge; reuses the dev-console S2S wiring shape."""
+    from src.api.telephony_live_bridge import TelephonyLiveBridge
+
+    agent, config, connect, llm, tts, tenant_timezone = _build_s2s_agent_and_config(
+        providers, tenant, script, slots, session_store,
+        voice_override=voice_override, lead_data=lead_data, kb_context=kb_context)
+
     log.info("s2s telephony bridge built call", extra={
-        "tenant": tenant.slug, "session_id": session_id, "voice": voice,
-        "model": rt.model, "encoding": encoding})
+        "tenant": tenant.slug, "voice": config.voice, "model": config.model, "encoding": encoding})
     # Transfer-hold: TTS for failure apology; webhook so CS learns to look for a human.
     # A per-call override (e.g. bridge console) takes priority over tenant config.
-    tts = providers.get_tts(tenant)
     _wh_url = transfer_webhook_url_override or getattr(tenant.settings, "events_webhook_url", None)
     _wh_sec_env = getattr(tenant.settings, "events_webhook_secret_env", None)
     _wh_secret = (tenant.secret_optional(_wh_sec_env)
                   if _wh_sec_env and hasattr(tenant, "secret_optional") else None)
     return TelephonyLiveBridge(
         websocket=websocket, agent=agent, config=config, connect_session=connect, llm=llm,
-        tts=tts,
-        tenant_timezone=getattr(tenant.settings, "timezone", "Asia/Kolkata"),
+        tts=tts, tenant_timezone=tenant_timezone,
         encoding=encoding, sid_field=sid_field, supports_clear=supports_clear,
         call_sid_field=call_sid_field,
         transfer_webhook_url=_wh_url,
@@ -591,6 +619,86 @@ def _build_kb_context(crm_retriever, tenant_retriever) -> str:
     from src.rag.context_builder import build_voicebot_kb_context
     retrievers = [r for r in [crm_retriever, tenant_retriever] if r is not None]
     return build_voicebot_kb_context(retrievers)
+
+
+class LiveKitModeNotSupported(Exception):
+    """Raised by ``make_livekit_bridge_factory``'s factory when the tenant isn't
+    in s2s pipeline mode. LiveKit room-join is s2s-only — there is no cascade
+    (STT->LLM->TTS) LiveKit path, and no per-call mode override for it."""
+
+
+def make_livekit_bridge_factory(
+    providers: TenantProviders,
+    session_store: SessionStore | None = None,
+    script: VoiceBotScript = DEFAULT_DEMO_SCRIPT,
+    slots: SlotSchema = SlotSchema(),
+    *,
+    campaign_resolver=None,
+    crm_retrievers: "PerCrmRetrieverRegistry | None" = None,
+):
+    """Returns a factory(tenant, room_name, meta) -> builder-callable.
+
+    The builder callable takes the real LiveKit transport objects (only
+    available once a runner has actually connected to the room) and
+    constructs the ``LiveKitBridge``. This two-stage split exists because,
+    unlike Twilio/Exotel (which build the bridge inside an already-open
+    WebSocket route), LiveKit has no inbound request to hang off of — the
+    room connection happens separately, after tenant/campaign resolution
+    (Phase 4's runner owns that second stage; this module only resolves
+    config and hands back a builder).
+
+    LiveKit room-join is s2s-only: there is no per-call mode override here
+    (unlike Twilio/Exotel's dev-console override) — mode is tenant-level
+    only, and any ``mode`` key present in ``meta`` is logged and ignored.
+    """
+
+    async def factory(tenant: TenantContext, room_name: str, meta: dict):
+        meta = meta or {}
+        if meta.get("mode") is not None:
+            log.warning(
+                "livekit bridge factory: ignoring 'mode' in call metadata — "
+                "LiveKit room-join mode is tenant-level only, no per-call override",
+                extra={"tenant": tenant.slug, "room_name": room_name, "meta_mode": meta.get("mode")})
+        if tenant.settings.pipeline.mode != "s2s":
+            raise LiveKitModeNotSupported(
+                f"tenant {tenant.slug!r} is not in s2s mode — LiveKit room-join requires s2s")
+
+        campaign_id = meta.get("campaign_id")
+        voice_override = (meta.get("voice") or "").strip() or None
+        lead = meta.get("lead") or {}
+        lead_data = _override_lead_data({
+            "lead_name": lead.get("name", ""),
+            "lead_gender": lead.get("gender", ""),
+        })
+        # call_ref isn't agent config — it's for the runner/webhook layer to echo
+        # back in outbound webhooks, so it's intentionally not consumed here.
+
+        cur_script, cur_slots = script, slots
+        if campaign_resolver is not None:
+            lc = await campaign_resolver.resolve(tenant.id, campaign_id)
+            cur_script, cur_slots = lc.script, lc.slots
+
+        kb_ctx = _build_kb_context(_crm_retriever_for(tenant, crm_retrievers), None)
+
+        agent, config, connect_session, llm, tts, tenant_timezone = _build_s2s_agent_and_config(
+            providers, tenant, cur_script, cur_slots, session_store,
+            voice_override=voice_override, lead_data=lead_data, kb_context=kb_ctx)
+
+        log.info("livekit bridge factory resolved call config", extra={
+            "tenant": tenant.slug, "room_name": room_name, "voice": config.voice})
+
+        async def build(*, audio_stream, audio_source, frame_factory, on_hangup=None):
+            from src.api.livekit_bridge import LiveKitBridge
+            return LiveKitBridge(
+                agent=agent, config=config, connect_session=connect_session,
+                llm=llm, tts=tts, tenant_timezone=tenant_timezone,
+                audio_stream=audio_stream, audio_source=audio_source,
+                frame_factory=frame_factory, room_name=room_name, on_hangup=on_hangup,
+                tenant_id=tenant.id)
+
+        return build
+
+    return factory
 
 
 def make_bridge_factory(

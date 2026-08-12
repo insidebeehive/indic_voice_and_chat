@@ -15,6 +15,53 @@ platform rejects it until the feature ships. Everything else applies today.
 2. Connect to `WS /api/v1/chat/ws/{session_id}`. The `session_id` is the
    capability — no credentials go over the socket.
 
+### Language preference
+
+`POST /api/v1/chat/sessions` takes an optional `language` field:
+
+```json
+{"user_id": "...", "customer_name": "...", "language": "hi", "metadata": {}}
+```
+
+- **Format:** a short ISO-639 base code, lowercase, 2-3 letters — `hi`, `mr`,
+  `ta`, `en`, etc. **Not** a full name: `"Hindi"` fails validation silently
+  and falls back to the tenant default, it does NOT error. A region suffix
+  is also fine (`"hi-IN"` — the region is stripped before use).
+- **Omit the field** to use the tenant's configured default language.
+- This only *seeds* the session — the AI still shifts language per turn to
+  match what the customer actually types/says.
+
+Text chat itself accepts any 2-3 letter code — there's no restricted list.
+The restriction only bites if/when the session escalates to a voice call,
+because each speech provider supports a different language subset:
+
+| Language | Code | Sarvam TTS | IndicF5 TTS | S2S (Gemini Live) | ElevenLabs TTS |
+|---|---|---|---|---|---|
+| Hindi | `hi` | ✓ | ✓ | auto | auto |
+| English | `en` | ✓ | – | auto | auto |
+| Bengali | `bn` | ✓ | ✓ | auto | auto |
+| Gujarati | `gu` | ✓ | ✓ | auto | auto |
+| Kannada | `kn` | ✓ | ✓ | auto | auto |
+| Malayalam | `ml` | ✓ | ✓ | auto | auto |
+| Marathi | `mr` | ✓ | ✓ | auto | auto |
+| Odia | `od` | ✓ | ✓ | auto | auto |
+| Punjabi | `pa` | ✓ | ✓ | auto | auto |
+| Tamil | `ta` | ✓ | ✓ | auto | auto |
+| Telugu | `te` | ✓ | ✓ | auto | auto |
+| Assamese | `as` | – | ✓ | auto | auto |
+
+- **Sarvam / IndicF5** are the only providers with a real, enforced language
+  list (11 codes each, shown above). They take the code as `xx-IN` internally
+  (e.g. `hi-IN`); IndicF5 converts it to the bare 2-letter form for its own
+  wire call. **Note the non-standard code: Odia is `od`, not the ISO-639-1
+  `or`** — sending `or` passes shape validation but won't match either
+  provider's voice catalog.
+- **S2S (Gemini Live)** doesn't take an explicit language code on the current
+  native-audio model — it auto-detects and switches language from the
+  conversation itself; `language` only steers the initial system prompt.
+- **ElevenLabs** has no language parameter at all — its multilingual models
+  infer language from the text being spoken.
+
 ## 2. Client → server frames
 
 All frames are JSON text frames.

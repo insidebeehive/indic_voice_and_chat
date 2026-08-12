@@ -135,15 +135,25 @@ async def emit_tenant_event(envelope: dict) -> None:
 
 
 async def mark_answered(
-    session: AsyncSession, provider_call_sid: str
+    session: AsyncSession, provider_call_sid: str, *, tenant_id: Optional[str] = None
 ) -> Optional[Conversation]:
     """Mark a call answered: flip an in_progress row to ``answered`` and emit a
     ``call.answered`` tenant event. Returns the row, or None if no match. (There
     is no single DB choke point for "answered" across paths, so callers invoke
-    this where the call connects.)"""
-    row = (await session.execute(
-        select(Conversation).where(Conversation.provider_call_sid == provider_call_sid)
-    )).scalar_one_or_none()
+    this where the call connects.)
+
+    ``tenant_id``: optional tenant scope. Twilio/Exotel/Stringee Call SIDs are
+    provider-generated and globally unique, so their callers pass nothing here
+    and get the exact same global-by-SID lookup as before. LiveKit room names
+    are CRM-chosen and NOT guaranteed unique across tenants, so its caller
+    (``livekit_runner.py``) always passes ``tenant_id`` to prevent one tenant's
+    call from matching another tenant's row that happens to reuse the same
+    room name.
+    """
+    stmt = select(Conversation).where(Conversation.provider_call_sid == provider_call_sid)
+    if tenant_id is not None:
+        stmt = stmt.where(Conversation.tenant_id == tenant_id)
+    row = (await session.execute(stmt)).scalar_one_or_none()
     if row is None:
         return None
     if row.status == "in_progress":
@@ -254,6 +264,7 @@ async def record_outcome(
     duration_ms: Optional[int] = None,
     ended_at: Optional[datetime] = None,
     turns: Optional[list] = None,
+    tenant_id: Optional[str] = None,
 ) -> Optional[Conversation]:
     """Find the call row by provider Call SID and write its outcome + cost.
 
@@ -263,10 +274,16 @@ async def record_outcome(
     cost fields below are touched, so a later failure in this function can't
     cost us the transcript — and ``row.total_turns`` is set to the count saved.
     Returns the updated row, or None if no row matches the SID.
+
+    ``tenant_id``: optional tenant scope — see ``mark_answered``'s docstring for
+    why this matters (LiveKit room-name collisions across tenants). ``None``
+    (every existing Twilio/Exotel/Stringee caller) preserves the exact global
+    lookup behavior from before this parameter existed.
     """
-    row = (await session.execute(
-        select(Conversation).where(Conversation.provider_call_sid == provider_call_sid)
-    )).scalar_one_or_none()
+    stmt = select(Conversation).where(Conversation.provider_call_sid == provider_call_sid)
+    if tenant_id is not None:
+        stmt = stmt.where(Conversation.tenant_id == tenant_id)
+    row = (await session.execute(stmt)).scalar_one_or_none()
     if row is None:
         log.warning("no conversation for call sid", extra={"sid": provider_call_sid})
         return None

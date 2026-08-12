@@ -57,11 +57,16 @@ from __future__ import annotations
 import os
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Literal, Optional
+from typing import TYPE_CHECKING, Any, Literal, Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
 from pydantic import BaseModel, Field, ValidationError, field_validator
+
+if TYPE_CHECKING:  # pragma: no cover - type-checking only, avoids import cycles at runtime
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    from src.auth.context import TenantContext
 
 
 class MissingEnvError(RuntimeError):
@@ -157,6 +162,11 @@ class TenantTelephonyConfig(BaseModel):
     # for the recording download (and passed to the adapter for the callout).
     # Default unset → the adapter/download use api.stringee.com.
     stringee_base_url: Optional[str] = None
+    # LiveKit server/project URL for this tenant's room-join bridge (wss://...).
+    # Non-secret — the API key/secret pair lives alongside it in
+    # creds_by_provider["livekit"] via the existing account_sid_env/auth_token_env
+    # fields (TelephonyCreds is provider-agnostic; no new secret fields needed).
+    livekit_url: Optional[str] = None
     # NB: there is no per-tenant inbound webhook base URL — it's always *our* app,
     # common to every tenant, so it lives at the platform level (WEBHOOK_BASE_URL /
     # settings.pipeline.telephony.webhook_base_url, see ``platform_webhook_base_url``).
@@ -197,6 +207,85 @@ class TenantTelephonyConfig(BaseModel):
     def active_creds(self) -> "TelephonyCreds":
         """Credential refs for the tenant's *configured* telephony provider."""
         return self.creds_for(self.provider)
+
+
+def _tenant_livekit_creds(tel: TenantTelephonyConfig) -> TelephonyCreds:
+    """The tenant-level LiveKit credential slot — explicitly, NOT via
+    ``TelephonyCreds.creds_for()``'s back-compat fallback to the top-level
+    ``account_sid_env``/``auth_token_env`` fields.
+
+    Those top-level fields are always populated with the tenant's ACTIVE
+    telephony provider's creds (Twilio/Stringee/etc. — see
+    ``src/api/tenants.py``'s ``register_tenant``/``update_tenant``), for
+    single-provider back-compat. Falling back to them here would silently
+    hand a telephony provider's account secret to the LiveKit SDK for any
+    tenant that has an active non-LiveKit provider AND a bare
+    ``livekit_url`` set without ever registering real LiveKit creds —
+    exactly the "tenant partially configured" case that must instead fall
+    through cleanly to the CRM-level project, not half-resolve with the
+    wrong provider's secret.
+    """
+    slot = tel.creds_by_provider.get("livekit")
+    if slot is not None:
+        return slot
+    if (tel.provider or "").lower() == "livekit":
+        return tel.active_creds()
+    return TelephonyCreds()
+
+
+async def resolve_livekit_creds(
+    session: Optional[AsyncSession], tenant: TenantContext
+) -> Optional[tuple[str, str, str]]:
+    """Returns ``(url, api_key, api_secret)``, or ``None`` if nothing usable
+    is configured.
+
+    Precedence: a tenant-specific LiveKit project (rare — set directly on the
+    tenant's own telephony config) wins if fully configured; otherwise falls
+    back to the CRM-level project shared by every tenant registered under that
+    CRM (the common case — one LiveKit project per CRM partner, not per
+    tenant). A live async DB lookup at call time, not something pre-loaded
+    into ``TenantContext`` at auth-resolve time — deliberately kept out of
+    ``src/auth/db_resolver.py``'s hot path. ``session=None`` is accepted for
+    DB-less callers (no ``sessionmaker`` available): the tenant-level branch
+    below never touches it, so that path still resolves; the CRM-level
+    fallback is simply unavailable in that case.
+    """
+    tel = tenant.settings.pipeline.telephony
+    creds = _tenant_livekit_creds(tel)
+    url = tel.livekit_url
+    api_key = tenant.secret_optional(creds.account_sid_env)
+    api_secret = tenant.secret_optional(creds.auth_token_env)
+    if url and api_key and api_secret:
+        return url, api_key, api_secret
+
+    crm_id = tenant.settings.crm_id
+    if not crm_id or session is None:
+        return None
+
+    from sqlalchemy import select
+
+    from src.auth import secrets as crypto
+    from src.models.crm import Crm, CrmSecret
+
+    crm = await session.get(Crm, crm_id)
+    if crm is None or not crm.livekit_url:
+        return None
+
+    rows = (await session.execute(
+        select(CrmSecret).where(
+            CrmSecret.crm_id == crm_id,
+            CrmSecret.name.in_(("livekit_api_key", "livekit_api_secret")),
+        )
+    )).scalars().all()
+    by_name = {r.name: r.value_encrypted for r in rows}
+    if "livekit_api_key" not in by_name or "livekit_api_secret" not in by_name:
+        return None
+
+    return (
+        crm.livekit_url,
+        crypto.decrypt(by_name["livekit_api_key"]),
+        crypto.decrypt(by_name["livekit_api_secret"]),
+    )
 
 
 def platform_webhook_base_url() -> Optional[str]:

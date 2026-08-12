@@ -57,3 +57,9 @@ telephony:
   twilio: 0.014
   exotel: 0.007
   stringee: 0.010
+  # LiveKit room-join bridge: no PSTN per-minute leg (the CRM partner hands us
+  # an already-established room), so there's no equivalent carrier cost yet.
+  # Tentative-only either way (see call_store.py's platform-billed-total
+  # exclusion) — 0 until a real per-minute figure (e.g. LiveKit Cloud
+  # participant-minutes) is contracted.
+  livekit: 0.0

@@ -77,48 +77,6 @@
     <div id="pane_bill" hidden></div>
     <div id="pane_tel" hidden></div>
   </div>
-
-  <div class="card">
-    <h2>CRMs <span class="hint">(shared platform config — base URL &amp; tool catalog; click a row to edit)</span></h2>
-    <div style="margin-bottom:.6rem;">
-      <button class="ghost sm" onclick="newCrmForm()">+ New CRM</button>
-      <button class="ghost sm" onclick="loadCrmsList()">Reload</button>
-    </div>
-    <div id="crmlist"><span class="hint">Loading…</span></div>
-  </div>
-
-  <div class="card" id="crmDetail" hidden>
-    <h2 id="crmDetailTitle">CRM</h2>
-    <div class="creds" style="gap:.6rem;flex-wrap:wrap;">
-      <label>ID <small class="hint">(immutable once created)</small>
-        <input id="crm_id" style="width:14rem" placeholder="e.g. acme-crm" />
-      </label>
-      <label>Name <input id="crm_name" style="width:16rem" placeholder="Acme CRM" /></label>
-      <label>Base URL <input id="crm_base_url" style="width:22rem" placeholder="https://api.acme.example.com" /></label>
-      <label>Events webhook URL template <input id="crm_webhook_tmpl" style="width:22rem" placeholder="https://.../events?tenant={tenant_slug}" /></label>
-      <label>Auth type
-        <select id="crm_auth_type">
-          <option value="api_key">api_key</option>
-          <option value="bearer">bearer</option>
-        </select>
-      </label>
-    </div>
-    <h2 style="margin-top:1rem;">Tools <small class="hint">(JSON array — each item: name, description, endpoint, method, parameters)</small></h2>
-    <textarea id="crm_tools" rows="14" style="width:100%;font-family:monospace;font-size:.8rem;background:#0b1220;color:#e2e8f0;border:1px solid #334155;border-radius:.35rem;padding:.5rem;box-sizing:border-box;"></textarea>
-    <div id="crm_kb_section" style="margin-top:1.2rem;" hidden>
-      <h2>Knowledge Base <small class="hint">(shared by every tenant on this CRM)</small></h2>
-      <div id="crm_kb_list"><span class="hint">Loading…</span></div>
-      <div style="margin-top:.8rem;display:flex;gap:.5rem;align-items:center;">
-        <input type="file" id="crm_kb_file" accept=".pdf,.docx,.txt,.md" style="flex:1;font-size:.8rem;" />
-        <button class="btn-sm" onclick="uploadCrmKBDoc()">Upload</button>
-      </div>
-    </div>
-    <div style="margin-top:.8rem;">
-      <button onclick="saveCrmEntity()">Save CRM</button>
-      <button class="ghost sm" onclick="closeCrmForm()">Cancel</button>
-      <span id="crm_result" class="hint" style="margin-left:.6rem;"></span>
-    </div>
-  </div>
 </div>
 
 <script>
@@ -475,7 +433,8 @@ async function loadCRM(id, slug) {
     <div class="hint" style="margin-bottom:.6rem;">
       CRM tools (wallet, bets, transactions, bonuses, profile, operator config) come
       from the CRM this tenant is registered against. Base URL and the tool catalog
-      are managed at the CRM level (see the CRMs admin page), not per tenant.
+      are managed at the CRM level (see <a href="/admin" target="_blank">CRM Management</a>
+      in the admin console), not per tenant.
     </div>
     <h2>CRM</h2>
     <div class="creds" style="gap:.6rem;flex-wrap:wrap;">
@@ -796,155 +755,9 @@ async function loadKB(id, slug) {
     </div>`;
 }
 
-// --- CRMs admin (list + create/edit; separate from the per-tenant CRM tab
-// above — that tab only *links* a tenant to one of these) --------------
-let CRMS = {};          // id -> full detail (cached from the list load)
-let CRM_EDIT_ID = null; // null = the form is in "create new" mode
-
-async function loadCrmsList() {
-  const r = await apiSend("GET", "/api/v1/crms");
-  if (!r.ok) { $("crmlist").innerHTML = `<span class="hint">Could not load (${r.status}). Check the admin token.</span>`; return; }
-  const summaries = r.json || [];
-  if (!summaries.length) { $("crmlist").innerHTML = `<span class="hint">No CRMs yet — click "+ New CRM" to add one.</span>`; return; }
-  const details = await Promise.all(summaries.map(c => apiSend("GET", `/api/v1/crms/${encodeURIComponent(c.id)}`)));
-  CRMS = {};
-  details.forEach((d, i) => { if (d.ok) CRMS[summaries[i].id] = d.json; });
-  $("crmlist").innerHTML = `<table><thead><tr>
-      <th>id</th><th>name</th><th>base_url</th><th>tools</th></tr></thead>
-    <tbody>${summaries.map(c => {
-      const d = CRMS[c.id];
-      return `<tr data-id="${escAttr(c.id)}" onclick="selectCrm('${escAttr(c.id)}')">
-        <td>${escT(c.id)}</td><td>${escT(c.name)}</td><td>${escT(c.base_url)}</td>
-        <td>${d ? d.tools.length : "—"}</td></tr>`;
-    }).join("")}</tbody></table>`;
-}
-
-function newCrmForm() {
-  CRM_EDIT_ID = null;
-  $("crmDetailTitle").textContent = "New CRM";
-  $("crm_id").value = "";
-  $("crm_id").disabled = false;
-  $("crm_name").value = "";
-  $("crm_base_url").value = "";
-  $("crm_webhook_tmpl").value = "";
-  $("crm_auth_type").value = "api_key";
-  $("crm_tools").value = "[]";
-  $("crm_result").textContent = "";
-  $("crmDetail").hidden = false;
-  for (const tr of document.querySelectorAll("#crmlist tbody tr")) tr.classList.remove("sel");
-  $("crm_kb_section").hidden = true;
-}
-
-function selectCrm(id) {
-  const c = CRMS[id];
-  if (!c) return;
-  CRM_EDIT_ID = id;
-  for (const tr of document.querySelectorAll("#crmlist tbody tr"))
-    tr.classList.toggle("sel", tr.dataset.id === id);
-  $("crmDetailTitle").textContent = `CRM: ${c.name}`;
-  $("crm_id").value = c.id;
-  $("crm_id").disabled = true;
-  $("crm_name").value = c.name || "";
-  $("crm_base_url").value = c.base_url || "";
-  $("crm_webhook_tmpl").value = c.events_webhook_url_template || "";
-  $("crm_auth_type").value = c.auth_type || "api_key";
-  $("crm_tools").value = JSON.stringify(c.tools || [], null, 2);
-  $("crm_result").textContent = "";
-  $("crmDetail").hidden = false;
-  $("crm_kb_section").hidden = false;
-  loadCrmKB(id);
-}
-
-function closeCrmForm() {
-  $("crmDetail").hidden = true;
-  CRM_EDIT_ID = null;
-  for (const tr of document.querySelectorAll("#crmlist tbody tr")) tr.classList.remove("sel");
-}
-
-async function saveCrmEntity() {
-  let tools;
-  try {
-    tools = JSON.parse($("crm_tools").value.trim() || "[]");
-    if (!Array.isArray(tools)) throw new Error("the tools field must be a JSON array, e.g. []");
-  } catch (e) {
-    $("crm_result").textContent = `✗ Invalid JSON in the tools field: ${e.message}`;
-    return;
-  }
-  const name = $("crm_name").value.trim();
-  const base_url = $("crm_base_url").value.trim();
-  const events_webhook_url_template = $("crm_webhook_tmpl").value.trim();
-  const auth_type = $("crm_auth_type").value;
-  if (!name)     { $("crm_result").textContent = "✗ Name is required"; return; }
-  if (!base_url) { $("crm_result").textContent = "✗ Base URL is required"; return; }
-
-  $("crm_result").textContent = "saving…";
-
-  if (CRM_EDIT_ID === null) {
-    const id = $("crm_id").value.trim();
-    if (!id) { $("crm_result").textContent = "✗ ID is required"; return; }
-    const body = { id, name, base_url, auth_type, tools };
-    if (events_webhook_url_template) body.events_webhook_url_template = events_webhook_url_template;
-    const r = await apiSend("POST", "/api/v1/crms", body);
-    if (r.ok) {
-      await loadCrmsList();
-      selectCrm(r.json.id);
-      $("crm_result").textContent = "✓ CRM created";
-    } else {
-      $("crm_result").textContent = `✗ ${r.status}: ${r.json.detail || r.json.error || "error"}`;
-    }
-  } else {
-    const body = { name, base_url, events_webhook_url_template, auth_type, tools };
-    const r = await apiSend("PATCH", `/api/v1/crms/${encodeURIComponent(CRM_EDIT_ID)}`, body);
-    if (r.ok) {
-      await loadCrmsList();
-      selectCrm(CRM_EDIT_ID);
-      $("crm_result").textContent = "✓ CRM saved";
-    } else {
-      $("crm_result").textContent = `✗ ${r.status}: ${r.json.detail || r.json.error || "error"}`;
-    }
-  }
-}
-
-async function loadCrmKB(crmId) {
-  $("crm_kb_list").innerHTML = '<span class="hint">Loading…</span>';
-  const r = await apiSend("GET", `/api/v1/crms/${encodeURIComponent(crmId)}/kb/documents`);
-  if (!r.ok) { $("crm_kb_list").innerHTML = `<span class="hint">Could not load (${r.status}).</span>`; return; }
-  const docs = r.json.documents || [];
-  const rows = docs.map(d => _kbDocRow(
-    d, "deleteCrmKBDoc",
-    `/api/v1/crms/${encodeURIComponent(crmId)}/kb/documents/${d.id}/download`, null,
-  )).join("");
-  $("crm_kb_list").innerHTML = _kbTable(rows);
-}
-
-async function uploadCrmKBDoc() {
-  if (CRM_EDIT_ID === null) return;
-  const fileEl = $("crm_kb_file");
-  if (!fileEl.files.length) return;
-  const fd = new FormData(); fd.append("file", fileEl.files[0]);
-  const headers = {};
-  const tok = $("adminToken").value.trim();
-  if (tok) headers["Authorization"] = "Bearer " + tok;
-  const path = `/api/v1/crms/${encodeURIComponent(CRM_EDIT_ID)}/kb/ingest`;
-  const res = await fetch(base() + path, { method: "POST", headers, body: fd });
-  const json = await res.json().catch(() => ({}));
-  if (res.ok) { fileEl.value = ""; loadCrmKB(CRM_EDIT_ID); }
-  else alert("Upload failed: " + (json?.detail || res.status));
-}
-
-async function deleteCrmKBDoc(docId) {
-  if (CRM_EDIT_ID === null) return;
-  if (!confirm("Delete this document?")) return;
-  const r = await apiSend("DELETE", `/api/v1/crms/${encodeURIComponent(CRM_EDIT_ID)}/kb/documents/${docId}`);
-  if (r.ok) loadCrmKB(CRM_EDIT_ID);
-  else alert("Delete failed: " + (r.json?.detail || r.status));
-}
-
 loadCreds(); loadTenants();
 // Render the KB pane's empty state immediately (no tenant selected yet)
 loadKB(null, null);
-// Load the CRM admin list immediately (platform-wide, no tenant selection needed)
-loadCrmsList();
 </script>
 </body>
 </html>
