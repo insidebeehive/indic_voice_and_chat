@@ -14,6 +14,18 @@ from typing import Optional
 
 log = logging.getLogger(__name__)
 
+# Read timeout for one CRM HTTP call. Was 30s: under load api.betstudio.io
+# routinely burned the full budget (logged: "tools=['get_player_wallet:30047ms']"),
+# and since _handle_with_tools (src/agents/chatbot.py) runs tool calls
+# SEQUENTIALLY across up to _max_tool_rounds rounds, that stacked into a
+# 30-60s window with no traffic on the chat WS — long enough for the CRM's
+# downstream relay to declare the socket dead (1006) and auto-close the
+# ticket mid-conversation. A timeout here is not a turn failure: the except
+# below converts it to {"error": ...}, the model gets that as the tool result
+# and still answers (a holding message), so a shorter budget degrades the
+# answer's richness, never the turn itself. 10s is ~5x a healthy call.
+_DEFAULT_CRM_TOOL_TIMEOUT_S = 10.0
+
 
 async def execute_crm_tool(
     *,
@@ -27,7 +39,7 @@ async def execute_crm_tool(
     context: Optional[dict] = None,
     extra_headers: Optional[dict] = None,
     http_client: object = None,
-    timeout_s: float = 30.0,
+    timeout_s: float = _DEFAULT_CRM_TOOL_TIMEOUT_S,
 ) -> dict:
     context = context or {}
     values: dict = {}

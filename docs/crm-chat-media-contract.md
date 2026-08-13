@@ -130,7 +130,7 @@ Accepted content types per frame type:
 
 | Frame | Shape | Meaning |
 |---|---|---|
-| `typing` | `{"type":"typing"}` | turn accepted, reply coming |
+| `typing` | `{"type":"typing"}` | turn accepted, reply coming — repeats roughly every 8s while a long turn is in flight (treat as idempotent; any other frame clears it) |
 | `message` | `{"type":"message","session_id":...,"text":...,"sources":[...],"suggestions":[...],"action":...}` | the AI reply |
 | `audio_ack` | `{"type":"audio_ack","media_url":"/api/v1/chat/media/<id>"}` | voice note stored; URL serves the recording for transcript UIs |
 | `escalation` | `{"type":"escalation","reason":...,"context_summary":...}` | conversation escalated to a human |
