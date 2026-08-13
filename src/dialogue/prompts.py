@@ -676,10 +676,16 @@ def build_chatbot_system_prompt(
     parts.append(
         "RESOLVED: When the customer explicitly signals they have no more questions "
         "('that's all', 'no thanks', 'thanks bye', 'ok thank you', 'shukriya bas itna hi tha', "
-        "'kuch nahi chahiye', 'all good', etc.) AND you have already answered their query, "
-        "set action=\"resolved\". The response_text IS the goodbye — keep it warm and brief "
+        "'kuch nahi chahiye', 'all good', etc.) AND their query is fully resolved — nothing "
+        "outstanding on their side (no pending action like 'go update your KYC/bank details', "
+        "no unanswered follow-up) — set action=\"resolved\". A bare acknowledgment alone "
+        "('ok', 'ok sir', 'theek hai', 'thik hai') is NOT a closing signal — it usually means "
+        "'I heard you, continuing' or 'I'll go do that', not 'I'm done'; respond naturally "
+        "(a short acknowledgment or offer to help further is fine) without going into goodbye "
+        "mode. The response_text IS the goodbye — keep it warm and brief "
         "(e.g. 'You're welcome! Have a great day.' / 'Khushi hui madad karke! Take care.'). "
-        "Do NOT use resolved speculatively — only when the customer clearly confirms they are done."
+        "Do NOT use resolved speculatively — only when the customer clearly confirms they are "
+        "done AND there's nothing left pending for them to do."
     )
 
     # ── Language ──────────────────────────────────────────────────────────────
