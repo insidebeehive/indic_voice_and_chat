@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import inspect
+
+import httpx
 import pytest
 
+from src.chatbot import tool_executor
 from src.chatbot.tool_executor import execute_crm_tool
 
 
@@ -119,3 +123,65 @@ async def test_x_api_key_wins_over_old_api_key_auth_type() -> None:
     )
     headers = client.calls[0][3]
     assert headers["X-API-Key"] == "dedicated-x-api-key"
+
+
+# --- Timeout reduction (30s -> 10s): CRM relay 1006-on-silence fix -------
+
+
+def test_default_tool_timeout_is_10s() -> None:
+    sig = inspect.signature(execute_crm_tool)
+    default = sig.parameters["timeout_s"].default
+    assert default == tool_executor._DEFAULT_CRM_TOOL_TIMEOUT_S == 10.0
+
+
+@pytest.mark.asyncio
+async def test_owned_client_gets_the_default_timeout(monkeypatch) -> None:
+    """No http_client override -> execute_crm_tool builds its own httpx.AsyncClient.
+    That client must be constructed with the module's default timeout budget."""
+    captured: dict = {}
+
+    class _RecordingClient:
+        def __init__(self, timeout=None):
+            captured["timeout"] = timeout
+
+        async def get(self, url, params=None, headers=None):
+            return _FakeResp({"ok": True})
+
+        async def request(self, method, url, json=None, headers=None):
+            return _FakeResp({"ok": True})
+
+        async def aclose(self):
+            pass
+
+    monkeypatch.setattr(httpx, "AsyncClient", _RecordingClient)
+
+    out = await execute_crm_tool(
+        endpoint="https://crm.example.com/api/wallet",
+        method="GET", parameters={}, auth_type=None, token=None, args={},
+    )
+    assert out == {"status_code": 200, "data": {"ok": True}}
+    timeout = captured["timeout"]
+    assert timeout.read == 10.0
+    assert timeout.connect == 5.0
+
+
+@pytest.mark.asyncio
+async def test_read_timeout_returns_error_dict_not_raise() -> None:
+    """Regression guard for the safety property the whole timeout reduction
+    depends on: a timed-out CRM call must become {"error": ...}, never raise
+    out of execute_crm_tool (the caller — _handle_with_tools — treats a raise
+    as a hard turn failure, not a degraded-but-successful tool result)."""
+
+    class _TimingOutClient:
+        async def get(self, *a, **k):
+            raise httpx.ReadTimeout("boom")
+
+        async def request(self, *a, **k):
+            raise httpx.ReadTimeout("boom")
+
+    out = await execute_crm_tool(
+        endpoint="https://crm.example.com/api/wallet",
+        method="GET", parameters={}, auth_type=None, token=None, args={},
+        http_client=_TimingOutClient(),
+    )
+    assert out == {"error": "boom"}
