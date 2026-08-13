@@ -49,7 +49,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.agents.chatbot import ChatBotAgent, ChatTurnResult
+from src.agents.chatbot import ChatBotAgent, ChatTurnResult, MAX_HISTORY_TURNS
 from src.api.chat_cost import compute_chat_turn_cost
 from src.interfaces.media_storage import IMediaStorage
 from src.api.deps import get_db_session
@@ -272,6 +272,101 @@ async def _get_agent(tenant: TenantContext, session_id: str) -> ChatBotAgent:
 def _scoped_session(tenant: TenantContext, session_id: str) -> str:
     """Namespace the Redis session id by tenant so two tenants can use the same id."""
     return f"{tenant.id}:{session_id}"
+
+
+# Roles in chat_messages that carry conversational content worth replaying.
+_HYDRATE_ROLES = {"customer", "agent", "human_agent"}
+# How many persisted messages to replay on connect. ChatBotAgent._compose only
+# ever sends the last MAX_HISTORY_TURNS exchanges to the LLM
+# (src/agents/chatbot.py), so loading more than that window is dead weight —
+# this keeps the query O(1) regardless of how long-lived the session is.
+_HYDRATE_LIMIT = 2 * MAX_HISTORY_TURNS
+
+
+async def _hydrate_agent_history(agent: ChatBotAgent, session_id: str, tenant_id: str) -> int:
+    """Replay this session's persisted transcript into a freshly-built agent.
+
+    The factory always hands back an AgentSession with turns=[] (see
+    make_chatbot_factory in src/bootstrap.py), so an agent built for an
+    *existing* session_id starts with no memory of it. Without this, a browser
+    reconnect — network drop, backgrounded tab, page reload, all routine on
+    mobile — makes the bot answer the next message as if the conversation had
+    just begun (a full re-greeting to a bare "Ok sir"), even though the whole
+    transcript is sitting in chat_messages.
+
+    ``tenant_id`` scopes the query to messages belonging to a session owned by
+    that tenant (joined through ``ChatSession``). This is required even though
+    most call sites already derive ``session_id`` from a tenant-validated
+    ``ChatSession`` row — the REST ``/chat/message`` endpoint takes
+    ``session_id`` straight from client input, and without this filter a
+    caller could replay another tenant's persisted transcript into their own
+    LLM context by guessing/reusing a foreign session_id. A session_id that
+    doesn't belong to ``tenant_id`` degrades to the same "no history" result
+    as a nonexistent session_id, not an error.
+
+    Best-effort: a hydration failure degrades to the old memory-less behaviour
+    rather than failing the connect. Returns the number of turns replayed.
+    """
+    session = getattr(agent, "session", None)
+    if session is None:
+        # Not a real ChatBotAgent — e.g. a minimal test double standing in for
+        # one (some chat_websocket tests swap in a bare stub exposing only
+        # handle_message/summarize_session). Nothing to hydrate into.
+        return 0
+    if session.turns:  # already populated (e.g. request_call's own load)
+        return 0
+    try:
+        async with _sm()() as db:
+            rows = (await db.execute(
+                select(ChatMessage)
+                .join(ChatSession, ChatMessage.session_id == ChatSession.id)
+                .where(
+                    ChatMessage.session_id == session_id,
+                    ChatSession.tenant_id == tenant_id,
+                )
+                .order_by(ChatMessage.id.desc())
+                .limit(_HYDRATE_LIMIT)
+            )).scalars().all()
+    except Exception:  # noqa: BLE001 — memory is a nicety, the socket is not
+        log.exception("chat history hydration failed", extra={"session_id": session_id})
+        return 0
+
+    turns: list[LLMMessage] = []
+    for m in reversed(rows):  # id DESC + LIMIT gives the newest window; flip it
+        if m.role not in _HYDRATE_ROLES:
+            continue
+        content = (m.content or "").strip()
+        if not content:
+            continue
+        # human_agent -> assistant: a human took over mid-chat, but from the
+        # model's point of view those lines are still "what my side already
+        # said", so replaying them as assistant turns stops the bot repeating
+        # help a human already gave.
+        role = "user" if m.role == "customer" else "assistant"
+        if not turns and role != "user":
+            # Never open the replayed window on an assistant turn: the LIMIT
+            # can cut mid-pair, and Anthropic rejects a messages[] whose first
+            # entry is an assistant message (see providers/llm/anthropic_claude.py,
+            # which passes roles through verbatim).
+            continue
+        if turns and turns[-1].role == role:
+            # Consecutive same-role rows (an unanswered voice note, a burst of
+            # human-agent lines) — merge so the replay stays strictly
+            # alternating, which every provider accepts.
+            turns[-1] = LLMMessage(role=role, content=f"{turns[-1].content}\n{content}")
+            continue
+        turns.append(LLMMessage(role=role, content=content))
+    if turns and turns[-1].role == "user":
+        # _compose appends the incoming user message after this window; leaving
+        # a trailing unanswered customer line would put two user turns
+        # back to back. The dropped line is at most one unanswered message.
+        turns.pop()
+
+    session.turns.extend(turns)
+    if turns:
+        log.info("chat history hydrated", extra={
+            "session_id": session_id, "turns": len(turns)})
+    return len(turns)
 
 
 def new_session_id() -> str:
@@ -505,6 +600,8 @@ async def chat_message(
 ) -> ChatMessageResponse:
     session_id = req.session_id or _new_session_id()
     agent = await _get_agent(tenant, _scoped_session(tenant, session_id))
+    if req.session_id:
+        await _hydrate_agent_history(agent, session_id, tenant.id)
     try:
         result = await agent.handle_message(req.message)
     except HTTPException:
@@ -541,6 +638,7 @@ async def upload_media(
         raise HTTPException(status_code=400, detail="empty upload")
     mime = file.content_type or "application/octet-stream"
     agent = await _factory(tenant, _scoped_session(tenant, session_id))
+    await _hydrate_agent_history(agent, session_id, tenant.id)
     try:
         result = await agent.handle_image(data, mime, text)
     except HTTPException:
@@ -953,6 +1051,9 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
         log.exception("chatbot factory failed", extra={"session_id": session_id})
         await websocket.close(code=1011, reason="chatbot unavailable — please retry")
         return
+
+    await _hydrate_agent_history(agent, session_id, tenant.id)
+
     try:
         # Handle reconnect: session may already be in human/awaiting_human mode
         # (reuse the row fetched at connect — no second lookup for the same row).
@@ -1580,6 +1681,7 @@ async def process_message(
     """Single-turn chat: get agent, handle message, persist, emit events.
     Shared by the HTTP /message endpoint and the external integrations adapter."""
     agent = await _get_agent(tenant, _scoped_session(tenant, session_id))
+    await _hydrate_agent_history(agent, session_id, tenant.id)
     result = await agent.handle_message(text)
     await _persist_turn(session_id, text, result)
     await _emit_escalation(tenant.id, session_id, result)

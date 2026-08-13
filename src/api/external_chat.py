@@ -77,7 +77,7 @@ async def external_message(
 
     On the first call for a ``conversation_id`` a session is created and its
     ID is stored in Redis so subsequent calls reuse the same agent context
-    (full conversation memory, CRM tool results carry forward).
+    (full conversation memory).
     """
     from src.api.chat import new_session_id, process_message
 
