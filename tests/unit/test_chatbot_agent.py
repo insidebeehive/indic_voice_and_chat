@@ -94,7 +94,7 @@ async def retriever(tmp_faiss_index: str) -> HybridRetriever:
     return r
 
 
-def _make_agent(llm, retriever, store=None) -> ChatBotAgent:
+def _make_agent(llm, retriever, store=None, **kw) -> ChatBotAgent:
     return ChatBotAgent(
         session=AgentSession(session_id="cb-1"),
         llm=llm,
@@ -102,6 +102,7 @@ def _make_agent(llm, retriever, store=None) -> ChatBotAgent:
         company_name="Acme",
         language_default="en",
         store=store,
+        **kw,
     )
 
 
@@ -129,6 +130,58 @@ async def test_handle_message_full_happy_path(retriever) -> None:
     sent = llm.calls[0]
     assert sent[0].role == "system"
     assert "Plan B" in sent[0].content
+
+
+@pytest.mark.asyncio
+async def test_single_shot_reports_usage_and_llm_identity(retriever) -> None:
+    """ChatTurnResult carries the token usage from the (single) generate()
+    call plus the llm_provider/model the agent was constructed with — the
+    identity src/api/chat_cost.py needs to look up a rate."""
+    llm = QueuedLLM([
+        LLMResult(text=json.dumps({
+            "response_text": "Plan B has 500GB unlimited data.",
+            "language": "en", "action": "none",
+        }), finish_reason="stop", usage={"prompt_tokens": 120, "completion_tokens": 40}),
+    ])
+    agent = _make_agent(llm, retriever, llm_provider="gemini", llm_model="gemini-3.5-flash")
+    result = await agent.handle_message("Tell me about Plan B")
+    assert result.input_tokens == 120
+    assert result.output_tokens == 40
+    assert result.llm_provider == "gemini"
+    assert result.llm_model == "gemini-3.5-flash"
+
+
+@pytest.mark.asyncio
+async def test_single_shot_sums_usage_across_retry(retriever) -> None:
+    """A retried turn (empty first response) must sum usage from BOTH calls,
+    not just the first or just the last."""
+    llm = QueuedLLM([
+        LLMResult(text="", finish_reason="stop", usage={"prompt_tokens": 50, "completion_tokens": 0}),
+        LLMResult(text=json.dumps({
+            "response_text": "Plan B has 500GB unlimited data.",
+            "language": "en", "action": "none",
+        }), finish_reason="stop", usage={"prompt_tokens": 55, "completion_tokens": 30}),
+    ])
+    agent = _make_agent(llm, retriever)
+    result = await agent.handle_message("Tell me about Plan B")
+    assert len(llm.calls) == 2
+    assert result.input_tokens == 105   # 50 + 55
+    assert result.output_tokens == 30   # 0 + 30
+
+
+@pytest.mark.asyncio
+async def test_single_shot_usage_none_treated_as_zero(retriever) -> None:
+    """A defensive case: an LLMResult with usage=None (e.g. an adapter that
+    doesn't populate it) must not crash accumulation — treated as 0 tokens."""
+    llm = QueuedLLM([
+        LLMResult(text=json.dumps({
+            "response_text": "ok", "language": "en", "action": "none",
+        }), finish_reason="stop", usage=None),
+    ])
+    agent = _make_agent(llm, retriever)
+    result = await agent.handle_message("hi")
+    assert result.input_tokens == 0
+    assert result.output_tokens == 0
 
 
 @pytest.mark.asyncio

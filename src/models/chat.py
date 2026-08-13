@@ -12,7 +12,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, func
+from sqlalchemy import DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint, func
 from sqlalchemy import JSON
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -43,6 +43,11 @@ class ChatSession(Base):
     mode: Mapped[str] = mapped_column(String(20), default="ai")  # ai|awaiting_human|human|closed
     claimed_by: Mapped[Optional[str]] = mapped_column(String(100))
     claimed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=False))
+    # Running totals across the session's agent turns (chat cost tracking).
+    # NOT NULL / default 0 so SUM() across sessions never needs coalescing.
+    cost: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    input_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    output_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
 
 class ChatMessage(Base):
@@ -63,6 +68,13 @@ class ChatMessage(Base):
     latency_ms: Mapped[Optional[int]] = mapped_column(Integer)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=False), server_default=func.now())
+    # Cost tracking — set only on the agent's own turn (role="agent"); a
+    # customer/human-agent message has no LLM cost of its own.
+    input_tokens: Mapped[Optional[int]] = mapped_column(Integer)
+    output_tokens: Mapped[Optional[int]] = mapped_column(Integer)
+    cost: Mapped[Optional[float]] = mapped_column(Float)
+    llm_provider: Mapped[Optional[str]] = mapped_column(String(30))
+    llm_model: Mapped[Optional[str]] = mapped_column(String(60))
 
 
 class ChatTool(Base):

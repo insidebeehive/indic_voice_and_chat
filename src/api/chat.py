@@ -50,9 +50,11 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.agents.chatbot import ChatBotAgent, ChatTurnResult
+from src.api.chat_cost import compute_chat_turn_cost
 from src.interfaces.media_storage import IMediaStorage
 from src.api.deps import get_db_session
 from src.auth import TenantContext, current_tenant
+from src.dialogue.language import normalize_lang
 from src.interfaces.llm import LLMMessage
 from src.models.chat import ChatMessage, ChatSession
 
@@ -296,10 +298,38 @@ def _voice_call_url(conn, tenant_slug: str, token: str) -> str:
     return f"{_ws_base(conn)}/chat/voice?tenant={tenant_slug}&handoff={token}"
 
 
+# First line the customer sees on session creation. Keys are the base language
+# codes from the CRM contract (docs/crm-chat-media-contract.md) -- note "od" for
+# Odia, this platform's non-standard code, matching the Sarvam/IndicF5 catalogs.
+# "{who}" expands to " <name>" or "" -- it always sits directly after the
+# greeting word in every language here, so the no-name form reads naturally.
+_GREETINGS: dict[str, str] = {
+    "en": "Hello{who}, how can I help?",
+    "hi": "नमस्ते{who}, मैं आपकी कैसे मदद करूँ?",
+    "bn": "নমস্কার{who}, আমি আপনাকে কীভাবে সাহায্য করতে পারি?",
+    "gu": "નમસ્તે{who}, હું તમને કેવી રીતે મદદ કરી શકું?",
+    "kn": "ನಮಸ್ಕಾರ{who}, ನಾನು ನಿಮಗೆ ಹೇಗೆ ಸಹಾಯ ಮಾಡಬಹುದು?",
+    "ml": "നമസ്കാരം{who}, ഞാൻ നിങ്ങളെ എങ്ങനെ സഹായിക്കാം?",
+    "mr": "नमस्कार{who}, मी तुमची कशी मदत करू?",
+    "od": "ନମସ୍କାର{who}, ମୁଁ ଆପଣଙ୍କୁ କିପରି ସାହାଯ୍ୟ କରିପାରିବି?",
+    "pa": "ਸਤ ਸ੍ਰੀ ਅਕਾਲ{who}, ਮੈਂ ਤੁਹਾਡੀ ਕਿਵੇਂ ਮਦਦ ਕਰਾਂ?",
+    "ta": "வணக்கம்{who}, நான் உங்களுக்கு எப்படி உதவ முடியும்?",
+    "te": "నమస్కారం{who}, నేను మీకు ఎలా సహాయం చేయగలను?",
+    "as": "নমস্কাৰ{who}, মই আপোনাক কেনেকৈ সহায় কৰিব পাৰোঁ?",
+}
+
+
 def _greeting(company: str, customer_name: Optional[str], language: str) -> str:
+    """Opening line, in the session's language.
+
+    ``language`` is already tenant-default-resolved by the caller, so an
+    unmapped code falls back to English rather than to the tenant default --
+    there is no better mapped candidate at this point.
+    """
     name = (customer_name or "").strip()
-    who = name if name else "there"
-    return f"Hello {who}, how can I help?"
+    who = f" {name}" if name else ""
+    template = _GREETINGS.get(normalize_lang(language)) or _GREETINGS["en"]
+    return template.format(who=who)
 
 
 # --- Schemas ------------------------------------------------------------
@@ -384,7 +414,11 @@ async def create_session(
     session: AsyncSession = Depends(get_db_session),
 ) -> CreateSessionResponse:
     session_id = _new_session_id()
-    language = req.language or getattr(tenant.settings, "default_language", None) or "hi"
+    language = (
+        normalize_lang(req.language)
+        or getattr(tenant.settings, "default_language", None)
+        or "hi"
+    )
     session.add(ChatSession(
         id=session_id, tenant_id=tenant.id,
         customer_id=req.user_id, customer_name=req.customer_name,
@@ -1262,12 +1296,39 @@ async def _persist_turn(
                 content=user_text, media_mime=media_mime, media_url=media_url,
             )
             db.add(customer_msg)
-            db.add(ChatMessage(
+            agent_msg = ChatMessage(
                 session_id=session_id, role="agent", type="text",
                 content=result.response.response_text,
                 sources=result.response.sources_used or None,
-            ))
+            )
+            db.add(agent_msg)
             row.message_count = (row.message_count or 0) + 2
+            # Chat cost tracking (Pass 1). The ProviderCost rate lookup runs on
+            # its own independent DB session (not `db`) so that a failure there
+            # (e.g. a pre-migration deploy where the new columns don't exist
+            # yet, or a transient DB error) can never poison the `db`
+            # transaction that the customer/agent message rows above are
+            # staged on. On Postgres a failed statement aborts the *whole*
+            # enclosing transaction, so running this on `db` would silently
+            # drop the message rows too when the cost lookup fails — isolating
+            # it in its own session/connection avoids that entirely.
+            if result.llm_provider and (result.input_tokens or result.output_tokens):
+                try:
+                    async with _sm()() as cost_db:
+                        turn_cost = await compute_chat_turn_cost(
+                            cost_db, provider=result.llm_provider, model=result.llm_model,
+                            input_tokens=result.input_tokens, output_tokens=result.output_tokens,
+                        )
+                    agent_msg.input_tokens = result.input_tokens
+                    agent_msg.output_tokens = result.output_tokens
+                    agent_msg.cost = turn_cost
+                    agent_msg.llm_provider = result.llm_provider
+                    agent_msg.llm_model = result.llm_model
+                    row.cost = (row.cost or 0.0) + turn_cost
+                    row.input_tokens = (row.input_tokens or 0) + result.input_tokens
+                    row.output_tokens = (row.output_tokens or 0) + result.output_tokens
+                except Exception:  # noqa: BLE001 — never let cost bookkeeping break persistence
+                    log.exception("chat turn cost computation failed", extra={"session_id": session_id})
             await db.flush()
             msg_id = customer_msg.id
             await db.commit()

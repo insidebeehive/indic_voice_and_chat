@@ -166,14 +166,22 @@ async def patch_telephony_outbound_from(sessionmaker) -> None:
 
 
 async def seed_provider_costs(sessionmaker, path: Path = _PROVIDER_COSTS_YAML) -> int:
-    """Insert any provider_costs rows from the YAML that don't exist yet.
+    """Insert any provider_costs rows from the YAML that don't exist yet, and
+    upsert the per-token LLM rates (``llm_token_rates``) onto their matching row.
 
-    Existing rows (e.g. rates an admin updated via the API) are left untouched —
-    we only add missing (kind, provider) pairs. Returns the number inserted.
+    The per-minute rows (e.g. rates an admin updated via the API) are left
+    untouched — we only add missing (kind, provider, model) rows. The
+    per-token rates are always upserted from YAML (a separate, smaller rate
+    catalog with no admin-edit history to protect yet — see
+    ``PUT /api/v1/providers`` for the live-editable path going forward).
+    Returns the number of NEW rows inserted (per-minute + per-token combined).
     """
     if not path.exists():
         return 0
     data = yaml.safe_load(path.read_text()) or {}
+    # Not a `kind`, so it's excluded from the per-minute loop below and
+    # handled by its own pass.
+    token_rates = data.pop("llm_token_rates", None) or {}
     inserted = 0
     async with sessionmaker() as session:
         for kind, providers in data.items():
@@ -187,6 +195,22 @@ async def seed_provider_costs(sessionmaker, path: Path = _PROVIDER_COSTS_YAML) -
                             kind=kind, provider=provider, model=model,
                             cost_per_min=float(cost)))
                         inserted += 1
+
+        for provider, models in token_rates.items():
+            for model, rates in (models or {}).items():
+                in_rate = float((rates or {}).get("input_per_1k", 0.0))
+                out_rate = float((rates or {}).get("output_per_1k", 0.0))
+                row = await session.get(ProviderCost, ("llm", provider, model))
+                if row is None:
+                    session.add(ProviderCost(
+                        kind="llm", provider=provider, model=model,
+                        cost_per_1k_input_tokens=in_rate,
+                        cost_per_1k_output_tokens=out_rate))
+                    inserted += 1
+                else:
+                    row.cost_per_1k_input_tokens = in_rate
+                    row.cost_per_1k_output_tokens = out_rate
+
         await session.commit()
     if inserted:
         log.info("seeded provider costs", extra={"inserted": inserted})

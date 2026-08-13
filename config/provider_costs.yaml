@@ -63,3 +63,30 @@ telephony:
   # exclusion) — 0 until a real per-minute figure (e.g. LiveKit Cloud
   # participant-minutes) is contracted.
   livekit: 0.0
+
+# Chat (text) is billed per-token, not per-minute, so it gets its own rate
+# shape (kind → provider → model → {input_per_1k, output_per_1k}) rather than
+# reusing the per-minute keys above. Seeded onto the matching (kind="llm",
+# provider, model) provider_costs row by seed_provider_costs — see
+# src/api/chat_cost.py for the read side. Units: USD per 1,000 tokens,
+# APPROXIMATE market estimates (early 2026); replace with contracted rates.
+llm_token_rates:
+  gemini:
+    gemini-3.5-flash: {input_per_1k: 0.0003, output_per_1k: 0.0025}
+    # Provider-level fallback (model="") used by token_rates() in
+    # src/api/chat_cost.py when pipeline.llm.model is swapped to a gemini
+    # model with no dedicated row above — keeps chat cost tracking from
+    # silently going to $0.00 after a model change. Mirrors gemini-3.5-flash
+    # until per-model rates are added for the other gemini variants.
+    "": {input_per_1k: 0.0003, output_per_1k: 0.0025}
+  groq:
+    # No per-model rows yet (only per-minute rates exist for groq above).
+    # Provider-level fallback so switching the platform LLM provider to groq
+    # doesn't silently zero out chat billing. APPROXIMATE — roughly in line
+    # with published llama-3.3-70b-versatile per-token pricing.
+    "": {input_per_1k: 0.0006, output_per_1k: 0.0008}
+  anthropic:
+    # Provider-level fallback, same rationale as groq above. APPROXIMATE —
+    # roughly in line with published mid-tier (sonnet-class) per-token
+    # pricing.
+    "": {input_per_1k: 0.003, output_per_1k: 0.015}

@@ -30,6 +30,11 @@ platform rejects it until the feature ships. Everything else applies today.
 - **Omit the field** to use the tenant's configured default language.
 - This only *seeds* the session — the AI still shifts language per turn to
   match what the customer actually types/says.
+- The `greeting` returned by `POST /chat/sessions` is rendered in this
+  language, so the customer's very first line is already in their preference —
+  no English-then-switch. Languages outside the table below fall back to an
+  English greeting (the session language itself is still honored by the AI
+  from the first reply onward).
 
 Text chat itself accepts any 2-3 letter code — there's no restricted list.
 The restriction only bites if/when the session escalates to a voice call,

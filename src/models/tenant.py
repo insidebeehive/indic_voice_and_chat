@@ -151,6 +151,9 @@ class ProviderCost(Base):
     provider: Mapped[str] = mapped_column(String(40), primary_key=True)
     model: Mapped[str] = mapped_column(String(60), primary_key=True, default="")
     cost_per_min: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    # Chat (text) is billed per-token, not per-minute — used only for kind="llm".
+    cost_per_1k_input_tokens: Mapped[float] = mapped_column(Float, default=0.0)
+    cost_per_1k_output_tokens: Mapped[float] = mapped_column(Float, default=0.0)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=False), server_default=func.now(), onupdate=func.now()
     )

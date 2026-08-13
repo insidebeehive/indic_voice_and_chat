@@ -98,6 +98,79 @@ async def test_update_provider_cost_model_level(client: AsyncClient) -> None:
     assert pro and pro[0]["cost_per_min"] == 0.012
 
 
+async def test_update_provider_cost_partial_update_preserves_token_rates(client: AsyncClient) -> None:
+    """The live admin UI only ever sends {cost_per_min, model} on a plain
+    per-minute rate edit. That PUT must not reset an existing row's
+    cost_per_1k_input_tokens/cost_per_1k_output_tokens to 0 -- they're
+    Optional[float] = None on the request model precisely so "omitted" can be
+    told apart from "explicitly zero"."""
+    # Seed a row with existing (nonzero) token rates, as if set previously.
+    put_resp = await client.put(
+        "/providers/llm/gemini",
+        json={
+            "cost_per_min": 0.002, "model": "gemini-3.5-flash",
+            "cost_per_1k_input_tokens": 0.0003, "cost_per_1k_output_tokens": 0.0025,
+        },
+        headers=ADMIN_HEADERS,
+    )
+    assert put_resp.status_code == 200
+    assert put_resp.json()["cost_per_1k_input_tokens"] == pytest.approx(0.0003)
+    assert put_resp.json()["cost_per_1k_output_tokens"] == pytest.approx(0.0025)
+
+    # Now the admin UI sends only cost_per_min/model (no token-rate fields).
+    resp = await client.put(
+        "/providers/llm/gemini",
+        json={"cost_per_min": 0.0025, "model": "gemini-3.5-flash"},
+        headers=ADMIN_HEADERS,
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    # cost_per_min was updated...
+    assert body["cost_per_min"] == pytest.approx(0.0025)
+    # ...but the token rates set earlier must survive untouched, not reset to 0.
+    assert body["cost_per_1k_input_tokens"] == pytest.approx(0.0003)
+    assert body["cost_per_1k_output_tokens"] == pytest.approx(0.0025)
+
+    # The response reflects the actual stored row, not just an echo of the
+    # request body (which had no token-rate fields at all).
+    listed = (await client.get("/providers", headers=TENANT_HEADERS)).json()["providers"]
+    row = [r for r in listed if r["kind"] == "llm" and r["provider"] == "gemini"
+           and r["model"] == "gemini-3.5-flash"][0]
+    assert row["cost_per_1k_input_tokens"] == pytest.approx(0.0003)
+    assert row["cost_per_1k_output_tokens"] == pytest.approx(0.0025)
+
+
+async def test_update_provider_cost_can_explicitly_zero_token_rate(client: AsyncClient) -> None:
+    """An explicit 0.0 must be distinguished from an omitted field: sending
+    cost_per_1k_input_tokens=0.0 must actually set it to zero, not be treated
+    as 'unset' and left alone."""
+    await client.put(
+        "/providers/llm/gemini",
+        json={
+            "cost_per_min": 0.002, "model": "gemini-3.5-flash",
+            "cost_per_1k_input_tokens": 0.0003, "cost_per_1k_output_tokens": 0.0025,
+        },
+        headers=ADMIN_HEADERS,
+    )
+    resp = await client.put(
+        "/providers/llm/gemini",
+        json={
+            "cost_per_min": 0.002, "model": "gemini-3.5-flash",
+            "cost_per_1k_input_tokens": 0.0, "cost_per_1k_output_tokens": 0.0025,
+        },
+        headers=ADMIN_HEADERS,
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["cost_per_1k_input_tokens"] == 0.0
+    assert body["cost_per_1k_output_tokens"] == pytest.approx(0.0025)
+
+    listed = (await client.get("/providers", headers=TENANT_HEADERS)).json()["providers"]
+    row = [r for r in listed if r["kind"] == "llm" and r["provider"] == "gemini"
+           and r["model"] == "gemini-3.5-flash"][0]
+    assert row["cost_per_1k_input_tokens"] == 0.0
+
+
 async def test_update_provider_cost_requires_admin(client: AsyncClient) -> None:
     resp = await client.put(
         "/providers/tts/sarvam", json={"cost_per_min": 1.0}, headers=TENANT_HEADERS

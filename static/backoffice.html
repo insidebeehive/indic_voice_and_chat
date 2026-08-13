@@ -68,6 +68,8 @@
       <div class="tab" id="tab_camp" onclick="showTab('camp')">Campaign</div>
       <div class="tab" id="tab_chat" onclick="showTab('chat')">Chat</div>
       <div class="tab" id="tab_kb" onclick="showTab('kb')">Knowledge Base</div>
+      <div class="tab" id="tab_bill" onclick="showTab('bill')">Billing</div>
+      <div class="tab" id="tab_tel" onclick="showTab('tel')">Telephony</div>
     </div>
     <div id="pane_an"></div>
     <div id="pane_crm" hidden></div>
@@ -209,14 +211,22 @@ async function loadBilling(id) {
   const b = r.json;
   $("pane_bill").innerHTML = `
     <div class="stats">
-      ${statBox("Platform cost", fmt(b.platform_cost))}
+      ${statBox("Platform cost (voice + chat)", fmt(b.platform_cost))}
       ${statBox("Total calls", b.total_calls)}
       ${statBox("Billable minutes", b.billable_minutes)}
       ${statBox("Avg / call", fmt(b.avg_cost_per_call))}
       ${statBox("Telephony (tentative)", "~" + fmt(b.tentative_telephony_cost), "tnt")}
     </div>
-    <div class="hint" style="margin-top:.6rem;">Platform cost = STT/LLM/TTS or S2S (what we bill). Telephony runs on the
-      tenant's own provider key, so it's shown as a tentative figure and is <b>not</b> in the platform cost.</div>`;
+    <h2 style="margin:1.4rem 0 .6rem;">Chat cost</h2>
+    <div class="stats">
+      ${statBox("Chat sessions", b.chat_sessions)}
+      ${statBox("Chat cost", fmt(b.chat_cost))}
+      ${statBox("Chat input tokens", b.chat_input_tokens)}
+      ${statBox("Chat output tokens", b.chat_output_tokens)}
+    </div>
+    <div class="hint" style="margin-top:.6rem;">Platform cost = voice (STT/LLM/TTS or S2S) + chat (LLM tokens) combined —
+      what we bill. Telephony runs on the tenant's own provider key, so it's shown as a tentative figure and is
+      <b>not</b> in the platform cost.</div>`;
 }
 
 // Credential fields per provider — [logical_name, label, isSecret]. Only the

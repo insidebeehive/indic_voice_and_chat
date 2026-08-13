@@ -770,9 +770,14 @@ class TenantBilling(BaseModel):
     tenant_id: str
     total_calls: int
     billable_minutes: float
-    platform_cost: float                 # what we charge (STT/LLM/TTS or S2S)
+    platform_cost: float                 # combined voice + chat: what we charge
+                                          # (STT/LLM/TTS or S2S, PLUS chat LLM tokens)
     avg_cost_per_call: float
     tentative_telephony_cost: float      # tenant's own telephony — informational only
+    chat_sessions: int = 0
+    chat_input_tokens: int = 0
+    chat_output_tokens: int = 0
+    chat_cost: float = 0.0
     currency: str = "USD"
 
 
@@ -782,8 +787,10 @@ async def tenant_billing(
     session: AsyncSession = Depends(get_db_session),
     _: None = Depends(require_admin),
 ) -> TenantBilling:
-    """Billing summary: platform cost (telephony excluded) + a tentative
-    telephony figure computed from the tenant's telephony provider rate."""
+    """Billing summary: platform cost (voice + chat combined, telephony excluded)
+    + a tentative telephony figure computed from the tenant's telephony provider rate."""
+    from src.models.chat import ChatSession
+
     await _require_tenant(session, tenant_id)
     rows = (await session.execute(
         select(Conversation.cost, Conversation.duration_ms, Conversation.telephony_provider)
@@ -795,21 +802,36 @@ async def tenant_billing(
         .where(ProviderCost.kind == "telephony", ProviderCost.model == "")
     )).all())
 
-    platform = 0.0
+    voice_cost = 0.0
     tentative_tel = 0.0
     total_ms = 0
     for cost, dur, tel in rows:
-        platform += float(cost or 0.0)
+        voice_cost += float(cost or 0.0)
         total_ms += int(dur or 0)
         if tel and dur:
             tentative_tel += tel_rates.get(tel, 0.0) * (int(dur) / 60_000.0)
     n = len(rows)
+
+    chat_row = (await session.execute(
+        select(
+            func.count(ChatSession.id), func.coalesce(func.sum(ChatSession.cost), 0.0),
+            func.coalesce(func.sum(ChatSession.input_tokens), 0),
+            func.coalesce(func.sum(ChatSession.output_tokens), 0),
+        ).where(ChatSession.tenant_id == tenant_id)
+    )).one()
+    chat_sessions, chat_cost, chat_in_tok, chat_out_tok = chat_row
+
+    platform = voice_cost + float(chat_cost or 0.0)
     return TenantBilling(
         tenant_id=tenant_id, total_calls=n,
         billable_minutes=round(total_ms / 60_000.0, 4),
         platform_cost=round(platform, 6),
-        avg_cost_per_call=round(platform / n, 6) if n else 0.0,
+        avg_cost_per_call=round(voice_cost / n, 6) if n else 0.0,
         tentative_telephony_cost=round(tentative_tel, 6),
+        chat_sessions=int(chat_sessions or 0),
+        chat_input_tokens=int(chat_in_tok or 0),
+        chat_output_tokens=int(chat_out_tok or 0),
+        chat_cost=round(float(chat_cost or 0.0), 6),
     )
 
 
