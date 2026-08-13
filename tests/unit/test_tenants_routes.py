@@ -469,6 +469,45 @@ async def test_tenant_analytics_and_billing(ctx) -> None:
     assert bill["billable_minutes"] == pytest.approx(4.25)
     # tentative telephony: 0.10/min * (2 + 1 + 0.75) min = 0.375 (c3 has no telephony)
     assert bill["tentative_telephony_cost"] == pytest.approx(0.375)
+    # No chat sessions seeded yet — chat fields default to zero and don't
+    # affect the voice-only platform_cost.
+    assert bill["chat_sessions"] == 0
+    assert bill["chat_cost"] == 0.0
+    assert bill["platform_cost"] == pytest.approx(0.12)
+
+
+async def test_tenant_billing_combines_voice_and_chat_cost(ctx) -> None:
+    """platform_cost becomes the COMBINED voice + chat total (Pass 1 chat
+    cost tracking) — not voice-only with chat reported separately."""
+    client, _, sm = ctx
+    tid = (await client.post("/tenants", json=_body(slug="acme2"), headers=ADMIN_HEADERS)).json()["tenant_id"]
+
+    from src.models.chat import ChatSession
+    from src.models.conversation import Conversation
+
+    async with sm() as s:
+        s.add(Conversation(
+            id="cc1", tenant_id=tid, agent_type="voicebot", channel="voice", status="ended",
+            outcome="interested", pipeline_config={}, provider_call_sid="sc1",
+            cost=0.10, duration_ms=60_000))
+        s.add(ChatSession(
+            id="chs1", tenant_id=tid, status="ended", cost=0.05,
+            input_tokens=1000, output_tokens=400))
+        s.add(ChatSession(
+            id="chs2", tenant_id=tid, status="active", cost=0.02,
+            input_tokens=300, output_tokens=100))
+        await s.commit()
+
+    bill = (await client.get(f"/tenants/{tid}/billing", headers=ADMIN_HEADERS)).json()
+    assert bill["total_calls"] == 1
+    assert bill["chat_sessions"] == 2
+    assert bill["chat_cost"] == pytest.approx(0.07)          # 0.05 + 0.02
+    assert bill["chat_input_tokens"] == 1300                 # 1000 + 300
+    assert bill["chat_output_tokens"] == 500                 # 400 + 100
+    # Combined: voice 0.10 + chat 0.07 = 0.17
+    assert bill["platform_cost"] == pytest.approx(0.17)
+    # avg_cost_per_call stays voice-only (calls, not chat sessions).
+    assert bill["avg_cost_per_call"] == pytest.approx(0.10)
 
 
 async def test_tenant_analytics_unknown_404(ctx) -> None:

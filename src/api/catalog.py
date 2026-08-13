@@ -44,6 +44,9 @@ class ProviderCostItem(BaseModel):
     provider: str
     model: str = ""        # "" = provider-level (telephony / fallback)
     cost_per_min: float
+    # Chat (text) token rates — meaningful for kind="llm" only; 0 elsewhere.
+    cost_per_1k_input_tokens: float = 0.0
+    cost_per_1k_output_tokens: float = 0.0
 
 
 class ProvidersResponse(BaseModel):
@@ -53,6 +56,11 @@ class ProvidersResponse(BaseModel):
 class UpdateProviderCostRequest(BaseModel):
     cost_per_min: float = Field(ge=0)
     model: str = ""        # specific model variant; "" for provider-level
+    # Optional: omitted (None) means "leave this rate unchanged" — the live UI
+    # only ever sends cost_per_min/model, so these must not default-zero the
+    # stored token rates on every plain per-minute rate edit.
+    cost_per_1k_input_tokens: float | None = Field(default=None, ge=0)
+    cost_per_1k_output_tokens: float | None = Field(default=None, ge=0)
 
 
 class VoiceItem(BaseModel):
@@ -81,7 +89,9 @@ async def list_providers(
     )).scalars().all()
     return ProvidersResponse(providers=[
         ProviderCostItem(kind=r.kind, provider=r.provider, model=r.model,
-                         cost_per_min=r.cost_per_min)
+                         cost_per_min=r.cost_per_min,
+                         cost_per_1k_input_tokens=r.cost_per_1k_input_tokens,
+                         cost_per_1k_output_tokens=r.cost_per_1k_output_tokens)
         for r in rows
     ])
 
@@ -94,20 +104,32 @@ async def update_provider_cost(
     session: AsyncSession = Depends(get_db_session),
     _: None = Depends(require_admin),
 ) -> ProviderCostItem:
-    """Upsert a (provider, model) cost/min. Admin-only. New rate is read live.
+    """Upsert a (provider, model) cost/min (+ per-1k-token LLM rates). Admin-only.
+    New rate is read live.
 
     ``model`` defaults to "" (provider-level / telephony).
     """
     row = await session.get(ProviderCost, (kind, provider, req.model))
     if row is None:
         row = ProviderCost(kind=kind, provider=provider, model=req.model,
-                           cost_per_min=req.cost_per_min)
+                           cost_per_min=req.cost_per_min,
+                           cost_per_1k_input_tokens=req.cost_per_1k_input_tokens or 0.0,
+                           cost_per_1k_output_tokens=req.cost_per_1k_output_tokens or 0.0)
         session.add(row)
     else:
         row.cost_per_min = req.cost_per_min
+        # Partial update: only overwrite a token rate when the caller actually
+        # sent one. Omitting it (the only live UI caller only sends
+        # cost_per_min/model) must not silently zero out the stored rate.
+        if req.cost_per_1k_input_tokens is not None:
+            row.cost_per_1k_input_tokens = req.cost_per_1k_input_tokens
+        if req.cost_per_1k_output_tokens is not None:
+            row.cost_per_1k_output_tokens = req.cost_per_1k_output_tokens
     await session.commit()
     return ProviderCostItem(kind=kind, provider=provider, model=req.model,
-                            cost_per_min=req.cost_per_min)
+                            cost_per_min=row.cost_per_min,
+                            cost_per_1k_input_tokens=row.cost_per_1k_input_tokens,
+                            cost_per_1k_output_tokens=row.cost_per_1k_output_tokens)
 
 
 class ModelsResponse(BaseModel):

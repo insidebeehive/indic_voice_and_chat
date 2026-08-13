@@ -49,10 +49,12 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.agents.chatbot import ChatBotAgent, ChatTurnResult
+from src.agents.chatbot import ChatBotAgent, ChatTurnResult, MAX_HISTORY_TURNS
+from src.api.chat_cost import compute_chat_turn_cost
 from src.interfaces.media_storage import IMediaStorage
 from src.api.deps import get_db_session
 from src.auth import TenantContext, current_tenant
+from src.dialogue.language import normalize_lang
 from src.interfaces.llm import LLMMessage
 from src.models.chat import ChatMessage, ChatSession
 
@@ -272,6 +274,101 @@ def _scoped_session(tenant: TenantContext, session_id: str) -> str:
     return f"{tenant.id}:{session_id}"
 
 
+# Roles in chat_messages that carry conversational content worth replaying.
+_HYDRATE_ROLES = {"customer", "agent", "human_agent"}
+# How many persisted messages to replay on connect. ChatBotAgent._compose only
+# ever sends the last MAX_HISTORY_TURNS exchanges to the LLM
+# (src/agents/chatbot.py), so loading more than that window is dead weight —
+# this keeps the query O(1) regardless of how long-lived the session is.
+_HYDRATE_LIMIT = 2 * MAX_HISTORY_TURNS
+
+
+async def _hydrate_agent_history(agent: ChatBotAgent, session_id: str, tenant_id: str) -> int:
+    """Replay this session's persisted transcript into a freshly-built agent.
+
+    The factory always hands back an AgentSession with turns=[] (see
+    make_chatbot_factory in src/bootstrap.py), so an agent built for an
+    *existing* session_id starts with no memory of it. Without this, a browser
+    reconnect — network drop, backgrounded tab, page reload, all routine on
+    mobile — makes the bot answer the next message as if the conversation had
+    just begun (a full re-greeting to a bare "Ok sir"), even though the whole
+    transcript is sitting in chat_messages.
+
+    ``tenant_id`` scopes the query to messages belonging to a session owned by
+    that tenant (joined through ``ChatSession``). This is required even though
+    most call sites already derive ``session_id`` from a tenant-validated
+    ``ChatSession`` row — the REST ``/chat/message`` endpoint takes
+    ``session_id`` straight from client input, and without this filter a
+    caller could replay another tenant's persisted transcript into their own
+    LLM context by guessing/reusing a foreign session_id. A session_id that
+    doesn't belong to ``tenant_id`` degrades to the same "no history" result
+    as a nonexistent session_id, not an error.
+
+    Best-effort: a hydration failure degrades to the old memory-less behaviour
+    rather than failing the connect. Returns the number of turns replayed.
+    """
+    session = getattr(agent, "session", None)
+    if session is None:
+        # Not a real ChatBotAgent — e.g. a minimal test double standing in for
+        # one (some chat_websocket tests swap in a bare stub exposing only
+        # handle_message/summarize_session). Nothing to hydrate into.
+        return 0
+    if session.turns:  # already populated (e.g. request_call's own load)
+        return 0
+    try:
+        async with _sm()() as db:
+            rows = (await db.execute(
+                select(ChatMessage)
+                .join(ChatSession, ChatMessage.session_id == ChatSession.id)
+                .where(
+                    ChatMessage.session_id == session_id,
+                    ChatSession.tenant_id == tenant_id,
+                )
+                .order_by(ChatMessage.id.desc())
+                .limit(_HYDRATE_LIMIT)
+            )).scalars().all()
+    except Exception:  # noqa: BLE001 — memory is a nicety, the socket is not
+        log.exception("chat history hydration failed", extra={"session_id": session_id})
+        return 0
+
+    turns: list[LLMMessage] = []
+    for m in reversed(rows):  # id DESC + LIMIT gives the newest window; flip it
+        if m.role not in _HYDRATE_ROLES:
+            continue
+        content = (m.content or "").strip()
+        if not content:
+            continue
+        # human_agent -> assistant: a human took over mid-chat, but from the
+        # model's point of view those lines are still "what my side already
+        # said", so replaying them as assistant turns stops the bot repeating
+        # help a human already gave.
+        role = "user" if m.role == "customer" else "assistant"
+        if not turns and role != "user":
+            # Never open the replayed window on an assistant turn: the LIMIT
+            # can cut mid-pair, and Anthropic rejects a messages[] whose first
+            # entry is an assistant message (see providers/llm/anthropic_claude.py,
+            # which passes roles through verbatim).
+            continue
+        if turns and turns[-1].role == role:
+            # Consecutive same-role rows (an unanswered voice note, a burst of
+            # human-agent lines) — merge so the replay stays strictly
+            # alternating, which every provider accepts.
+            turns[-1] = LLMMessage(role=role, content=f"{turns[-1].content}\n{content}")
+            continue
+        turns.append(LLMMessage(role=role, content=content))
+    if turns and turns[-1].role == "user":
+        # _compose appends the incoming user message after this window; leaving
+        # a trailing unanswered customer line would put two user turns
+        # back to back. The dropped line is at most one unanswered message.
+        turns.pop()
+
+    session.turns.extend(turns)
+    if turns:
+        log.info("chat history hydrated", extra={
+            "session_id": session_id, "turns": len(turns)})
+    return len(turns)
+
+
 def new_session_id() -> str:
     return f"cs_{uuid.uuid4().hex[:16]}"
 
@@ -296,10 +393,38 @@ def _voice_call_url(conn, tenant_slug: str, token: str) -> str:
     return f"{_ws_base(conn)}/chat/voice?tenant={tenant_slug}&handoff={token}"
 
 
+# First line the customer sees on session creation. Keys are the base language
+# codes from the CRM contract (docs/crm-chat-media-contract.md) -- note "od" for
+# Odia, this platform's non-standard code, matching the Sarvam/IndicF5 catalogs.
+# "{who}" expands to " <name>" or "" -- it always sits directly after the
+# greeting word in every language here, so the no-name form reads naturally.
+_GREETINGS: dict[str, str] = {
+    "en": "Hello{who}, how can I help?",
+    "hi": "नमस्ते{who}, मैं आपकी कैसे मदद करूँ?",
+    "bn": "নমস্কার{who}, আমি আপনাকে কীভাবে সাহায্য করতে পারি?",
+    "gu": "નમસ્તે{who}, હું તમને કેવી રીતે મદદ કરી શકું?",
+    "kn": "ನಮಸ್ಕಾರ{who}, ನಾನು ನಿಮಗೆ ಹೇಗೆ ಸಹಾಯ ಮಾಡಬಹುದು?",
+    "ml": "നമസ്കാരം{who}, ഞാൻ നിങ്ങളെ എങ്ങനെ സഹായിക്കാം?",
+    "mr": "नमस्कार{who}, मी तुमची कशी मदत करू?",
+    "od": "ନମସ୍କାର{who}, ମୁଁ ଆପଣଙ୍କୁ କିପରି ସାହାଯ୍ୟ କରିପାରିବି?",
+    "pa": "ਸਤ ਸ੍ਰੀ ਅਕਾਲ{who}, ਮੈਂ ਤੁਹਾਡੀ ਕਿਵੇਂ ਮਦਦ ਕਰਾਂ?",
+    "ta": "வணக்கம்{who}, நான் உங்களுக்கு எப்படி உதவ முடியும்?",
+    "te": "నమస్కారం{who}, నేను మీకు ఎలా సహాయం చేయగలను?",
+    "as": "নমস্কাৰ{who}, মই আপোনাক কেনেকৈ সহায় কৰিব পাৰোঁ?",
+}
+
+
 def _greeting(company: str, customer_name: Optional[str], language: str) -> str:
+    """Opening line, in the session's language.
+
+    ``language`` is already tenant-default-resolved by the caller, so an
+    unmapped code falls back to English rather than to the tenant default --
+    there is no better mapped candidate at this point.
+    """
     name = (customer_name or "").strip()
-    who = name if name else "there"
-    return f"Hello {who}, how can I help?"
+    who = f" {name}" if name else ""
+    template = _GREETINGS.get(normalize_lang(language)) or _GREETINGS["en"]
+    return template.format(who=who)
 
 
 # --- Schemas ------------------------------------------------------------
@@ -384,7 +509,11 @@ async def create_session(
     session: AsyncSession = Depends(get_db_session),
 ) -> CreateSessionResponse:
     session_id = _new_session_id()
-    language = req.language or getattr(tenant.settings, "default_language", None) or "hi"
+    language = (
+        normalize_lang(req.language)
+        or getattr(tenant.settings, "default_language", None)
+        or "hi"
+    )
     session.add(ChatSession(
         id=session_id, tenant_id=tenant.id,
         customer_id=req.user_id, customer_name=req.customer_name,
@@ -471,6 +600,8 @@ async def chat_message(
 ) -> ChatMessageResponse:
     session_id = req.session_id or _new_session_id()
     agent = await _get_agent(tenant, _scoped_session(tenant, session_id))
+    if req.session_id:
+        await _hydrate_agent_history(agent, session_id, tenant.id)
     try:
         result = await agent.handle_message(req.message)
     except HTTPException:
@@ -507,6 +638,7 @@ async def upload_media(
         raise HTTPException(status_code=400, detail="empty upload")
     mime = file.content_type or "application/octet-stream"
     agent = await _factory(tenant, _scoped_session(tenant, session_id))
+    await _hydrate_agent_history(agent, session_id, tenant.id)
     try:
         result = await agent.handle_image(data, mime, text)
     except HTTPException:
@@ -919,6 +1051,9 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
         log.exception("chatbot factory failed", extra={"session_id": session_id})
         await websocket.close(code=1011, reason="chatbot unavailable — please retry")
         return
+
+    await _hydrate_agent_history(agent, session_id, tenant.id)
+
     try:
         # Handle reconnect: session may already be in human/awaiting_human mode
         # (reuse the row fetched at connect — no second lookup for the same row).
@@ -1262,12 +1397,39 @@ async def _persist_turn(
                 content=user_text, media_mime=media_mime, media_url=media_url,
             )
             db.add(customer_msg)
-            db.add(ChatMessage(
+            agent_msg = ChatMessage(
                 session_id=session_id, role="agent", type="text",
                 content=result.response.response_text,
                 sources=result.response.sources_used or None,
-            ))
+            )
+            db.add(agent_msg)
             row.message_count = (row.message_count or 0) + 2
+            # Chat cost tracking (Pass 1). The ProviderCost rate lookup runs on
+            # its own independent DB session (not `db`) so that a failure there
+            # (e.g. a pre-migration deploy where the new columns don't exist
+            # yet, or a transient DB error) can never poison the `db`
+            # transaction that the customer/agent message rows above are
+            # staged on. On Postgres a failed statement aborts the *whole*
+            # enclosing transaction, so running this on `db` would silently
+            # drop the message rows too when the cost lookup fails — isolating
+            # it in its own session/connection avoids that entirely.
+            if result.llm_provider and (result.input_tokens or result.output_tokens):
+                try:
+                    async with _sm()() as cost_db:
+                        turn_cost = await compute_chat_turn_cost(
+                            cost_db, provider=result.llm_provider, model=result.llm_model,
+                            input_tokens=result.input_tokens, output_tokens=result.output_tokens,
+                        )
+                    agent_msg.input_tokens = result.input_tokens
+                    agent_msg.output_tokens = result.output_tokens
+                    agent_msg.cost = turn_cost
+                    agent_msg.llm_provider = result.llm_provider
+                    agent_msg.llm_model = result.llm_model
+                    row.cost = (row.cost or 0.0) + turn_cost
+                    row.input_tokens = (row.input_tokens or 0) + result.input_tokens
+                    row.output_tokens = (row.output_tokens or 0) + result.output_tokens
+                except Exception:  # noqa: BLE001 — never let cost bookkeeping break persistence
+                    log.exception("chat turn cost computation failed", extra={"session_id": session_id})
             await db.flush()
             msg_id = customer_msg.id
             await db.commit()
@@ -1519,6 +1681,7 @@ async def process_message(
     """Single-turn chat: get agent, handle message, persist, emit events.
     Shared by the HTTP /message endpoint and the external integrations adapter."""
     agent = await _get_agent(tenant, _scoped_session(tenant, session_id))
+    await _hydrate_agent_history(agent, session_id, tenant.id)
     result = await agent.handle_message(text)
     await _persist_turn(session_id, text, result)
     await _emit_escalation(tenant.id, session_id, result)

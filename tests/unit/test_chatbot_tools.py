@@ -86,6 +86,25 @@ async def test_search_tool_is_called_then_answer(retriever) -> None:
 
 
 @pytest.mark.asyncio
+async def test_tool_loop_sums_usage_across_rounds(retriever) -> None:
+    """A turn with a tool round + a final answer round must sum usage from
+    BOTH generate() calls — a chat turn is not one LLM call."""
+    llm = ScriptedLLM([
+        LLMResult(text="", finish_reason="tool_calls", usage={
+            "prompt_tokens": 200, "completion_tokens": 10}, tool_calls=[
+            ToolCall(id="t1", name="search_knowledge_base", arguments={"query": "Plan B"})]),
+        LLMResult(text="Plan B has 500GB unlimited data.", finish_reason="stop",
+                  usage={"prompt_tokens": 250, "completion_tokens": 20}),
+    ])
+    agent = _agent(llm, retriever, llm_provider="gemini", llm_model="gemini-3.5-flash")
+    result = await agent.handle_message("Tell me about Plan B")
+    assert result.input_tokens == 450    # 200 + 250
+    assert result.output_tokens == 30    # 10 + 20
+    assert result.llm_provider == "gemini"
+    assert result.llm_model == "gemini-3.5-flash"
+
+
+@pytest.mark.asyncio
 async def test_tool_path_parses_json_envelope_final_reply(retriever) -> None:
     # The model emits the structured JSON envelope (per the system prompt) even in
     # the tool loop — the agent must PARSE it, not return raw JSON to the customer.

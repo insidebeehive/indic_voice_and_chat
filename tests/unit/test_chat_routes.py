@@ -32,11 +32,12 @@ HEADERS = {"Authorization": "Bearer test-token"}
 
 
 class _FakeLLM(ILLMProvider):
-    def __init__(self, payload: dict) -> None:
+    def __init__(self, payload: dict, usage: dict | None = None) -> None:
         self._json = json.dumps(payload)
+        self._usage = usage or {}
 
     async def generate(self, messages, config) -> LLMResult:
-        return LLMResult(text=self._json, finish_reason="stop")
+        return LLMResult(text=self._json, finish_reason="stop", usage=self._usage)
 
     async def generate_stream(self, messages, config) -> AsyncIterator[str]:
         if False:
@@ -103,6 +104,76 @@ async def app(tmp_faiss_index: str, fake_redis):
     await engine.dispose()
 
 
+@pytest.fixture
+async def cost_app(tmp_faiss_index: str, fake_redis):
+    """Like ``app``, but the agent reports real token usage + an
+    llm_provider/model (as bootstrap.py's factory now threads through), and
+    the DB is seeded with a matching token-rate ProviderCost row — for
+    exercising _persist_turn's chat cost bookkeeping end to end."""
+    from src.models.tenant import ProviderCost
+
+    store = FAISSAdapter({"embedding_dim": 64, "index_path": tmp_faiss_index})
+    retriever = HybridRetriever(
+        embedder=HashEmbedder(dim=64),
+        vector_store=store,
+        config=RetrievalConfig(strategy="hybrid", top_k=2, oversample_k=8, reranking=False),
+    )
+    await retriever.index([
+        Document(id="c1", content="Plan B has 500GB unlimited.", metadata={"filename": "plans.md", "page": 0})
+    ])
+
+    session_store = SessionStore(fake_redis, ttl_seconds=300, tenant_id="t1")
+
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:", future=True)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    sm = async_sessionmaker(engine, expire_on_commit=False)
+    async with sm() as s:
+        s.add(Tenant(id="t1", slug="t1", name="Acme"))
+        s.add(ProviderCost(
+            kind="llm", provider="gemini", model="gemini-3.5-flash",
+            cost_per_1k_input_tokens=0.0003, cost_per_1k_output_tokens=0.0025))
+        await s.commit()
+
+    async def _session_override():
+        async with sm() as session:
+            yield session
+
+    async def factory(tenant: TenantContext, session_id: str, *, customer_id=None) -> ChatBotAgent:
+        return ChatBotAgent(
+            session=AgentSession(session_id=session_id),
+            llm=_FakeLLM({
+                "response_text": "Plan B has 500GB.",
+                "language": "en",
+                "sources_used": ["plans.md:0"],
+                "confidence": "high",
+                "action": "none",
+            }, usage={"prompt_tokens": 100, "completion_tokens": 40}),
+            retriever=retriever,
+            company_name=tenant.settings.name,
+            store=session_store,
+            llm_provider="gemini",
+            llm_model="gemini-3.5-flash",
+        )
+
+    chat.set_chatbot_factory(factory)
+    chat.set_chat_sessionmaker(sm)
+    chat.set_chat_handoff_store(session_store)
+    register_tenant_for_test(
+        TenantSettings(id="t1", slug="t1", name="Acme"),
+        plaintext_tokens=["test-token"],
+    )
+    a = FastAPI()
+    a.include_router(chat.router)
+    a.dependency_overrides[get_db_session] = _session_override
+    yield a, sm
+    chat.set_chatbot_factory(None)
+    chat.set_chat_sessionmaker(None)
+    chat.set_chat_handoff_store(None)
+    set_tenant_resolver(None)
+    await engine.dispose()
+
+
 def _create_session(client: TestClient, **body) -> str:
     resp = client.post("/chat/sessions", json=body, headers=HEADERS)
     assert resp.status_code == 201, resp.text
@@ -121,6 +192,79 @@ def test_create_session_returns_id_greeting_ws_url(app: FastAPI) -> None:
     assert body["session_id"].startswith("cs_")
     assert "Raju" in body["greeting"]
     assert body["ws_url"].endswith(f"/api/v1/chat/ws/{body['session_id']}")
+
+
+def test_create_session_greeting_in_requested_language(app: FastAPI) -> None:
+    """CRM told us the customer's language up front -- greet in it, not English."""
+    client = TestClient(app)
+    resp = client.post("/chat/sessions",
+                       json={"customer_name": "Ravi", "language": "ta"}, headers=HEADERS)
+    assert resp.status_code == 201
+    greeting = resp.json()["greeting"]
+    assert greeting.startswith("வணக்கம் Ravi")
+    assert "Hello" not in greeting
+
+
+def test_create_session_greeting_strips_region_suffix(app: FastAPI) -> None:
+    """"mr-IN" must hit the same template as "mr"."""
+    client = TestClient(app)
+    resp = client.post("/chat/sessions",
+                       json={"customer_name": "Sneha", "language": "mr-IN"}, headers=HEADERS)
+    assert resp.json()["greeting"].startswith("नमस्कार Sneha")
+
+
+def test_create_session_greeting_defaults_to_tenant_language(app: FastAPI) -> None:
+    """No language from the CRM -> tenant default (hi), not English."""
+    client = TestClient(app)
+    resp = client.post("/chat/sessions", json={"customer_name": "Amit"}, headers=HEADERS)
+    body = resp.json()
+    assert body["greeting"].startswith("नमस्ते Amit")
+
+
+def test_create_session_greeting_unknown_language_falls_back_to_english(app: FastAPI) -> None:
+    """A language we have no template for still gets a sane opener."""
+    client = TestClient(app)
+    resp = client.post("/chat/sessions",
+                       json={"customer_name": "Lee", "language": "fr"}, headers=HEADERS)
+    assert resp.json()["greeting"] == "Hello Lee, how can I help?"
+
+
+def test_create_session_greeting_without_name(app: FastAPI) -> None:
+    client = TestClient(app)
+    resp = client.post("/chat/sessions", json={"language": "hi"}, headers=HEADERS)
+    assert resp.json()["greeting"] == "नमस्ते, मैं आपकी कैसे मदद करूँ?"
+
+
+def test_create_session_language_name_falls_back_to_tenant_default(app: FastAPI) -> None:
+    """A spelled-out name ("Hindi") is not a code: fall back per the CRM contract,
+    and don't persist the junk value on the session row."""
+    client = TestClient(app)
+    resp = client.post("/chat/sessions",
+                       json={"customer_name": "Amit", "language": "Hindi"}, headers=HEADERS)
+    sid = resp.json()["session_id"]
+    assert resp.json()["greeting"].startswith("नमस्ते Amit")
+    detail = client.get(f"/chat/sessions/{sid}", headers=HEADERS).json()
+    assert detail["language"] == "hi"
+
+
+def test_create_session_persists_normalized_language(app: FastAPI) -> None:
+    client = TestClient(app)
+    resp = client.post("/chat/sessions",
+                       json={"customer_name": "Sneha", "language": "MR-IN"}, headers=HEADERS)
+    sid = resp.json()["session_id"]
+    detail = client.get(f"/chat/sessions/{sid}", headers=HEADERS).json()
+    assert detail["language"] == "mr"
+
+
+def test_greeting_map_covers_all_contract_languages() -> None:
+    """Every code in docs/crm-chat-media-contract.md has a template.
+    Note "od" (this platform's Odia code), not the ISO "or"."""
+    from src.api import chat
+    expected = {"hi", "en", "bn", "gu", "kn", "ml", "mr", "od", "pa", "ta", "te", "as"}
+    assert expected <= set(chat._GREETINGS)
+    for code, template in chat._GREETINGS.items():
+        assert "{who}" in template, code
+        assert chat._greeting("Acme", "Raju", code).startswith(template.split("{")[0] + " Raju")
 
 
 def test_create_session_requires_auth(app: FastAPI) -> None:
@@ -390,6 +534,135 @@ def test_websocket_end_marks_session_ended(app: FastAPI) -> None:
 
 
 # --- HTTP single-turn channel ------------------------------------------
+
+
+async def test_persist_turn_writes_cost_onto_agent_message_and_session(cost_app) -> None:
+    """The customer message row gets no cost fields; the agent message row
+    gets input/output tokens + cost + llm identity; the session's running
+    totals are bumped by the same turn cost."""
+    from sqlalchemy import select
+
+    from src.models.chat import ChatMessage, ChatSession
+
+    app, sm = cost_app
+    client = TestClient(app)
+    sid = _create_session(client)
+    resp = client.post(
+        "/chat/message", json={"session_id": sid, "message": "Tell me about Plan B"}, headers=HEADERS)
+    assert resp.status_code == 200
+
+    async with sm() as s:
+        rows = (await s.execute(
+            select(ChatMessage).where(ChatMessage.session_id == sid).order_by(ChatMessage.id)
+        )).scalars().all()
+        session_row = await s.get(ChatSession, sid)
+
+    assert [r.role for r in rows] == ["customer", "agent"]
+    customer_msg, agent_msg = rows
+    # Customer message: no cost fields.
+    assert customer_msg.input_tokens is None
+    assert customer_msg.output_tokens is None
+    assert customer_msg.cost is None
+    assert customer_msg.llm_provider is None
+    # Agent message: usage=100 prompt / 40 completion tokens @ 0.0003/0.0025 per 1k.
+    # (100/1000 * 0.0003) + (40/1000 * 0.0025) = 0.00003 + 0.0001 = 0.00013
+    assert agent_msg.input_tokens == 100
+    assert agent_msg.output_tokens == 40
+    assert agent_msg.cost == pytest.approx(0.00013)
+    assert agent_msg.llm_provider == "gemini"
+    assert agent_msg.llm_model == "gemini-3.5-flash"
+    # Session running totals match the single turn.
+    assert session_row.input_tokens == 100
+    assert session_row.output_tokens == 40
+    assert session_row.cost == pytest.approx(0.00013)
+
+
+async def test_persist_turn_survives_cost_computation_failure(cost_app, monkeypatch) -> None:
+    """Regression test: a failing cost computation (e.g. the ProviderCost rate
+    lookup SELECT erroring out -- on Postgres this aborts the *whole*
+    transaction if it shares a session with the message inserts) must never
+    take the customer/agent message rows down with it. _persist_turn now runs
+    the rate lookup on its own independent DB session so a failure there can't
+    poison the transaction the message rows are persisted on."""
+    from sqlalchemy import select
+
+    from src.models.chat import ChatMessage, ChatSession
+
+    async def _boom(*args, **kwargs):
+        raise RuntimeError("simulated rate-lookup failure")
+
+    monkeypatch.setattr(chat, "compute_chat_turn_cost", _boom)
+
+    app, sm = cost_app
+    client = TestClient(app)
+    sid = _create_session(client)
+    resp = client.post(
+        "/chat/message", json={"session_id": sid, "message": "Tell me about Plan B"}, headers=HEADERS)
+    assert resp.status_code == 200
+
+    async with sm() as s:
+        rows = (await s.execute(
+            select(ChatMessage).where(ChatMessage.session_id == sid).order_by(ChatMessage.id)
+        )).scalars().all()
+        session_row = await s.get(ChatSession, sid)
+
+    # Both message rows persisted despite the cost-computation exception.
+    assert [r.role for r in rows] == ["customer", "agent"]
+    customer_msg, agent_msg = rows
+    assert customer_msg.content == "Tell me about Plan B"
+    assert agent_msg.content == "Plan B has 500GB."
+    # Cost bookkeeping was skipped (exception swallowed) -- no cost recorded,
+    # but message persistence and the session's message_count were unaffected.
+    assert agent_msg.cost is None
+    assert session_row.message_count == 2
+
+
+async def test_persist_turn_cost_computation_uses_isolated_session(cost_app, monkeypatch) -> None:
+    """Regression test for the actual session-isolation mechanism (the
+    predecessor test above only proved the outer exception handler swallows
+    errors -- it made compute_chat_turn_cost raise before touching any
+    session, so it passed even with the isolation fix reverted, i.e. cost_db
+    aliased back to db). This test proves the session object passed into
+    compute_chat_turn_cost is NOT the same object as the session the
+    customer/agent ChatMessage inserts are staged on -- the mechanism the fix
+    actually relies on. It would fail if _persist_turn were reverted to reuse
+    `db` for the cost lookup instead of opening `cost_db`."""
+    from src.api.chat_cost import compute_chat_turn_cost as real_compute_chat_turn_cost
+
+    app, sm = cost_app
+
+    created_session_ids: list[int] = []
+    real_sessionmaker = sm
+
+    def tracking_sessionmaker():
+        session = real_sessionmaker()
+        created_session_ids.append(id(session))
+        return session
+
+    monkeypatch.setattr(chat, "_sm", lambda: tracking_sessionmaker)
+
+    cost_call_session_id: dict[str, int] = {}
+
+    async def _tracking_compute(session, **kwargs):
+        cost_call_session_id["id"] = id(session)
+        return await real_compute_chat_turn_cost(session, **kwargs)
+
+    monkeypatch.setattr(chat, "compute_chat_turn_cost", _tracking_compute)
+
+    client = TestClient(app)
+    sid = _create_session(client)
+    resp = client.post(
+        "/chat/message", json={"session_id": sid, "message": "Tell me about Plan B"}, headers=HEADERS)
+    assert resp.status_code == 200
+
+    # _persist_turn opens (at least) two sessions via _sm(): the outer `db`
+    # the message rows are staged on (created first), and the isolated
+    # `cost_db` passed to compute_chat_turn_cost (created after).
+    assert len(created_session_ids) >= 2
+    db_session_id = created_session_ids[0]
+    assert "id" in cost_call_session_id, "compute_chat_turn_cost was never called"
+    assert cost_call_session_id["id"] == created_session_ids[-1]
+    assert cost_call_session_id["id"] != db_session_id
 
 
 def test_post_message_creates_session_and_returns_answer(app: FastAPI) -> None:

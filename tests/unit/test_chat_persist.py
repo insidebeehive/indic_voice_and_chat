@@ -38,6 +38,10 @@ class _FakeResult:
     response = _Resp()
     escalation = None
     call_offer = None
+    input_tokens = 0
+    output_tokens = 0
+    llm_provider = ""
+    llm_model = ""
 
 
 @pytest.mark.asyncio

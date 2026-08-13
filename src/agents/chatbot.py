@@ -174,6 +174,17 @@ def _chunk_source(chunk: RetrievedChunk) -> str:
     return f"{fn}:{page}" if page is not None else str(fn)
 
 
+def _usage_tokens(result: LLMResult | None) -> tuple[int, int]:
+    """(prompt_tokens, completion_tokens) from an LLMResult, defensively —
+    ``LLMResult.usage`` is typed as a dict but at least one adapter
+    (openai_compat, pre-fix) has been seen to pass ``None``; treat that (and a
+    None result, e.g. a failed retry) as ``{}`` rather than raising."""
+    if result is None:
+        return 0, 0
+    usage = result.usage or {}
+    return usage.get("prompt_tokens", 0) or 0, usage.get("completion_tokens", 0) or 0
+
+
 @dataclass
 class ChatTurnResult:
     response: ChatBotResponse
@@ -181,6 +192,14 @@ class ChatTurnResult:
     rag_context_chars: int
     escalation: dict | None = None
     call_offer: dict | None = None
+    # Usage accumulated across every generate() call in this turn (a turn is
+    # rarely just one LLM call — see _single_shot's retry and
+    # _handle_with_tools' multi-round loop) + the platform LLM identity used,
+    # for src/api/chat_cost.py's per-turn cost lookup.
+    input_tokens: int = 0
+    output_tokens: int = 0
+    llm_provider: str = ""
+    llm_model: str = ""
 
 
 class ChatBotAgent(BaseAgent):
@@ -200,6 +219,8 @@ class ChatBotAgent(BaseAgent):
         crm_tools: list[ToolSpec] | None = None,
         crm_executor: CrmExecutor | None = None,
         max_tool_rounds: int = 2,
+        llm_provider: str = "",
+        llm_model: str = "",
     ) -> None:
         # ChatBot doesn't need slots — pass an empty schema so BaseAgent is happy.
         super().__init__(
@@ -227,6 +248,12 @@ class ChatBotAgent(BaseAgent):
         self._crm_tools = crm_tools or []
         self._crm_executor = crm_executor
         self._max_tool_rounds = max_tool_rounds
+        # Identity of the platform LLM this agent was built with — threaded
+        # through to ChatTurnResult for per-turn token-cost lookup
+        # (src/api/chat_cost.py). Chat always runs the platform LLM (see
+        # make_chatbot_factory in src/bootstrap.py), never a per-tenant one.
+        self._llm_provider = llm_provider
+        self._llm_model = llm_model
 
     async def handle_message(self, user_text: str) -> ChatTurnResult:
         if not user_text or not user_text.strip():
@@ -271,6 +298,7 @@ class ChatBotAgent(BaseAgent):
         llm_start = time.perf_counter()
         result = await self._llm.generate(messages, self._llm_config)
         llm_ms_list = [(time.perf_counter() - llm_start) * 1000]
+        in_tok, out_tok = _usage_tokens(result)
         response = parse_chatbot_response(result.text)
         # Only retry a genuinely unusable turn — one where the parser had to
         # fall back to one of its canned lines (empty input, missing
@@ -288,6 +316,9 @@ class ChatBotAgent(BaseAgent):
                 result.finish_reason, messages, self._llm_config,
             )
             llm_ms_list.append(retry_ms)
+            retry_in, retry_out = _usage_tokens(retried_result)
+            in_tok += retry_in
+            out_tok += retry_out
             if retried_result is not None:
                 # Adopt whatever the retry produces unconditionally — including
                 # legitimate plain (non-JSON) text, which parse_chatbot_response
@@ -310,7 +341,9 @@ class ChatBotAgent(BaseAgent):
             [f"{ms:.0f}ms" for ms in llm_ms_list], retrieval_ms, len(retrieved),
         )
         return ChatTurnResult(
-            response=response, retrieved=retrieved, rag_context_chars=len(rag.text))
+            response=response, retrieved=retrieved, rag_context_chars=len(rag.text),
+            input_tokens=in_tok, output_tokens=out_tok,
+            llm_provider=self._llm_provider, llm_model=self._llm_model)
 
     # --- Tool-calling path (agentic) -----------------------------------
 
@@ -327,6 +360,8 @@ class ChatBotAgent(BaseAgent):
         escalation: dict | None = None
         call_offer: dict | None = None
         text = ""
+        in_tok = 0
+        out_tok = 0
         # JSON response-format is incompatible with tools (Gemini), so the loop
         # runs in text mode; the structured fields are derived from tool results.
         cfg = LLMConfig(
@@ -341,6 +376,9 @@ class ChatBotAgent(BaseAgent):
             llm_start = time.perf_counter()
             result = await self._llm.generate(messages, cfg)
             llm_ms_list.append((time.perf_counter() - llm_start) * 1000)
+            _round_in, _round_out = _usage_tokens(result)
+            in_tok += _round_in
+            out_tok += _round_out
             log.debug(
                 "chatbot llm turn: finish=%s usage=%s text_len=%d tool_calls=%d",
                 result.finish_reason, result.usage, len(result.text or ""), len(result.tool_calls),
@@ -365,6 +403,9 @@ class ChatBotAgent(BaseAgent):
                 messages, LLMConfig(temperature=cfg.temperature, max_tokens=cfg.max_tokens,
                                     response_format="text"))
             llm_ms_list.append((time.perf_counter() - llm_start) * 1000)
+            _forced_in, _forced_out = _usage_tokens(result)
+            in_tok += _forced_in
+            out_tok += _forced_out
             text = result.text
 
         rag = build_rag_context(retrieved_all, max_chars=self._max_context_chars)
@@ -399,6 +440,9 @@ class ChatBotAgent(BaseAgent):
                 result.finish_reason, messages, retry_cfg,
             )
             llm_ms_list.append(retry_ms)
+            _retry_in, _retry_out = _usage_tokens(retried)
+            in_tok += _retry_in
+            out_tok += _retry_out
             if retried is not None:
                 # Adopt whatever the retry produces unconditionally — including
                 # legitimate plain (non-JSON) text, which parse_chatbot_response
@@ -434,7 +478,9 @@ class ChatBotAgent(BaseAgent):
         )
         return ChatTurnResult(
             response=response, retrieved=retrieved_all, rag_context_chars=len(rag.text),
-            escalation=escalation, call_offer=call_offer)
+            escalation=escalation, call_offer=call_offer,
+            input_tokens=in_tok, output_tokens=out_tok,
+            llm_provider=self._llm_provider, llm_model=self._llm_model)
 
     async def _exec_tool(self, tc: ToolCall):
         """Dispatch a tool call. Returns (result_dict, chunks, escalation, call_offer)."""

@@ -469,6 +469,12 @@ def make_chatbot_factory(registry, sessionmaker=None, crm_retrievers: "PerCrmRet
                 x_api_key=spec.get("x_api_key"),
                 extra_headers=spec.get("extra_headers"))
 
+        # Platform-level LLM identity (provider + model) — same global default
+        # dict get_platform_llm() itself builds the client from — threaded
+        # into the agent for src/api/chat_cost.py's per-turn cost lookup.
+        # getattr-defensive: some tests stub registry.providers as a bare
+        # SimpleNamespace(get_platform_llm=...) without global_defaults.
+        _llm_defaults = getattr(registry.providers, "global_defaults", {}).get("llm", {})
         return ChatBotAgent(
             session=AgentSession(session_id=session_id),
             llm=registry.providers.get_platform_llm(),
@@ -480,6 +486,8 @@ def make_chatbot_factory(registry, sessionmaker=None, crm_retrievers: "PerCrmRet
             enable_tools=True,
             crm_tools=crm_specs,
             crm_executor=crm_executor,
+            llm_provider=_llm_defaults.get("provider") or "",
+            llm_model=_llm_defaults.get("model") or "",
         )
 
     return factory

@@ -139,7 +139,10 @@ class OpenAICompatLLMAdapter(ILLMProvider):
                 args = {}
             tool_calls.append(ToolCall(id=tc.id or f"{tc.function.name}-{len(tool_calls)}",
                                        name=tc.function.name, arguments=args))
-        usage = None
+        # LLMResult.usage is typed as a dict (never None) — the other three
+        # adapters always populate it, so mirror that here instead of leaving
+        # every consumer to defensively handle a None.
+        usage: dict[str, int] = {}
         if resp.usage is not None:
             usage = {"prompt_tokens": resp.usage.prompt_tokens,
                      "completion_tokens": resp.usage.completion_tokens}
