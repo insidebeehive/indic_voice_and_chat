@@ -32,10 +32,11 @@ coverage.xml
 .DS_Store
 
 # Project artifacts
-data/
+data/*
 !data/.gitkeep
 !data/kb/
 !data/kb/**
+data/kb/**/.DS_Store
 *.faiss
 *.index
 

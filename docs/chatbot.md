@@ -72,12 +72,14 @@ Knowledge base:
   degradation as `resolve_crm_tools()`. `GET /knowledge/stats` reflects both
   scopes for a CRM-linked tenant. Note: the *voicebot's* one-shot boot-time
   KB context (built once per call via `_build_kb_context`, used by every
-  telephony/browser/S2S bridge factory) is CRM-scoped only — it never mixes
-  in the tenant's own docs, a faithful carry-over of the prior platform-only
-  behavior. The tenant+CRM merge described above applies to the chat agent's
-  per-turn retrieval (`ChatBotAgent`, `/knowledge/query`), not this one-shot
-  voice path.
-- **Frontend UI/navigation KB:** `data/kb/global/frontend-ui/` (11 files,
+  telephony/browser/S2S bridge factory) uses the same `[crm, tenant]` merge
+  as chat — all 6 voice call sites (4 in `src/bootstrap.py`, 2 in
+  `src/api/dev_console.py`) build it from both the CRM-wide retriever and
+  the tenant-scoped retriever, so a tenant's own docs (including any
+  product-module content it has opted into, see below) are included in
+  voice calls too, not just chat's per-turn retrieval (`ChatBotAgent`,
+  `/knowledge/query`).
+- **Frontend UI/navigation KB:** `data/kb/global/frontend-ui/` (8 files,
   `ui-`-prefixed to keep every stem under `data/kb/global/` unique — see the
   design spec) documents UI/navigation behavior common to every layout; it
   rides the same CRM-wide auto-seed as the backend docs above, no extra
@@ -100,6 +102,26 @@ Knowledge base:
   no per-layout admin UI; see
   `docs/superpowers/specs/2026-07-24-frontend-kb-design.md` for the full
   rationale.
+- **Product-module KB (opt-in per tenant):** `data/kb/modules/` (6 ingestible
+  docs — one backend doc plus its `ui-`-prefixed UI-help counterpart for each
+  of casino, sports betting, and matka/lottery — plus a reference-only
+  `README.md`) is a third tier, and unlike
+  `data/kb/global/` it is **NOT** force-seeded CRM-wide. These files used to
+  live under `data/kb/global/` and `data/kb/global/frontend-ui/` and rode the
+  auto-seed, which handed every tenant content for verticals it may not run —
+  not every operator offers casino, sports, and matka. A tenant now opts in
+  explicitly, either via `POST /api/v1/knowledge/ingest-layout` with the key
+  `casino`, `sports`, or `matka`, or from the backoffice's **Ingest KB doc**
+  dropdown under the **Product modules** optgroup. One key ingests that
+  vertical's **pair** of files as two separate tenant-scoped `KBDocument` rows
+  — never concatenated into one — because each file keeps its own filename,
+  which is what `_VOICE_KB_PRIORITY` (`src/rag/context_builder.py`) matches
+  doc priority on. Ids are deterministic (`layout_<key>_<file stem>`), so
+  re-ingesting the same key updates the existing rows instead of duplicating
+  them. The allow-list of ingestible keys lives in `_INGESTIBLE_DOCS`
+  (`src/api/knowledge.py`) — that dict lookup *is* the path-traversal guard,
+  so a request value must never be turned into a filesystem path any other
+  way. `data/kb/modules/README.md` is reference-only and never ingestible.
 
 CRM tools:
 - `POST /chat/tools` — register endpoints the bot may call (`name`, `endpoint`,

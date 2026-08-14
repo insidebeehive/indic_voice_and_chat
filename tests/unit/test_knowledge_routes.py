@@ -75,6 +75,39 @@ def test_ingest_a_markdown_document(app: FastAPI) -> None:
     assert body["chunks_indexed"] >= 1
 
 
+@pytest.mark.parametrize("reserved_id", ["crm_kb_betstudio_hijack", "global_kb_hijack"])
+def test_ingest_rejects_reserved_namespace_document_id(app: FastAPI, reserved_id: str) -> None:
+    """A caller-supplied document_id in the seeder/purge-script's protected
+    namespace (crm_kb_ / global_kb_) must be rejected, not silently accepted
+    -- accepting it would let a tenant upload collide with an id the purge
+    script or the seeder's auto-reconcile treats as safe to prune."""
+    client = TestClient(app)
+    resp = client.post(
+        "/knowledge/ingest",
+        files={"file": ("plans.md", io.BytesIO(b"Plan B has 500GB"), "text/markdown")},
+        data={"document_id": reserved_id},
+        headers=HEADERS,
+    )
+    assert resp.status_code == 400
+    assert reserved_id in resp.json()["detail"]
+
+    listed = client.get("/knowledge/documents", headers=HEADERS).json()
+    assert not any(d["id"] == reserved_id for d in listed["documents"])
+
+
+def test_ingest_with_normal_document_id_still_succeeds(app: FastAPI) -> None:
+    """Non-regression: a normal caller-chosen document_id still works."""
+    client = TestClient(app)
+    resp = client.post(
+        "/knowledge/ingest",
+        files={"file": ("plans.md", io.BytesIO(b"Plan B has 500GB"), "text/markdown")},
+        data={"document_id": "my-own-doc-id"},
+        headers=HEADERS,
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["document_id"] == "my-own-doc-id"
+
+
 def test_ingest_rejects_empty_upload(app: FastAPI) -> None:
     client = TestClient(app)
     resp = client.post(
@@ -181,8 +214,11 @@ def test_ingest_layout_valid_name(app: FastAPI) -> None:
     )
     assert resp.status_code == 200, resp.text
     body = resp.json()
-    assert body["document_id"] == "layout_layout-1"
-    assert body["chunks_indexed"] >= 1
+    docs_out = body["documents"]
+    assert len(docs_out) == 1
+    assert docs_out[0]["document_id"] == "layout_layout-1"
+    assert docs_out[0]["filename"] == "layout-1.md"
+    assert docs_out[0]["chunks_indexed"] >= 1
 
     docs = client.get("/knowledge/documents", headers=HEADERS).json()["documents"]
     assert any(d["id"] == "layout_layout-1" for d in docs)
@@ -218,6 +254,85 @@ def test_ingest_layout_missing_auth_returns_401(app: FastAPI) -> None:
     client = TestClient(app)
     resp = client.post("/knowledge/ingest-layout", json={"layout": "layout-1"})
     assert resp.status_code == 401
+
+
+def test_ingest_layout_paired_module_ingests_both_files(app: FastAPI) -> None:
+    """A product-module key (casino) ingests its backend doc AND its UI-help
+    counterpart as two separate KBDocument rows — never merged into one, since
+    voicebot doc-priority matching keys off each file's own filename."""
+    client = TestClient(app)
+    resp = client.post(
+        "/knowledge/ingest-layout", json={"layout": "casino"}, headers=HEADERS,
+    )
+    assert resp.status_code == 200, resp.text
+    docs_out = resp.json()["documents"]
+    assert len(docs_out) == 2
+    assert [d["filename"] for d in docs_out] == ["06-casino-games.md", "ui-05-casino.md"]
+    assert [d["document_id"] for d in docs_out] == [
+        "layout_casino_06-casino-games", "layout_casino_ui-05-casino",
+    ]
+    assert len({d["document_id"] for d in docs_out}) == 2
+    assert all(d["chunks_indexed"] >= 1 for d in docs_out)
+
+    listed = client.get("/knowledge/documents", headers=HEADERS).json()
+    assert listed["total"] == 2
+    assert {d["id"] for d in listed["documents"]} == {
+        "layout_casino_06-casino-games", "layout_casino_ui-05-casino",
+    }
+
+
+@pytest.mark.parametrize("missing_index", [0, 1])
+def test_ingest_layout_paired_key_missing_file_ingests_nothing(
+    app: FastAPI, tmp_path, monkeypatch, missing_index: int,
+) -> None:
+    """A paired key must be all-or-nothing: if ANY of its files is missing on
+    disk, the request 404s with ZERO writes. Previously the existence check ran
+    inside the ingest loop, so a missing 2nd file left the 1st already
+    committed (KBDocument row + chunks) with no rollback and no signal."""
+    present = tmp_path / "06-casino-games.md"
+    present.write_text("# Casino\n\nSlots, live tables and jackpots.", encoding="utf-8")
+    absent = tmp_path / "ui-05-casino.md"  # deliberately never created
+    pair = [present, absent] if missing_index == 1 else [absent, present]
+    monkeypatch.setitem(knowledge._INGESTIBLE_DOCS, "casino", list(pair))
+
+    client = TestClient(app)
+    resp = client.post(
+        "/knowledge/ingest-layout", json={"layout": "casino"}, headers=HEADERS,
+    )
+    assert resp.status_code == 404, resp.text
+    assert "ui-05-casino.md" in resp.json()["detail"]
+
+    assert client.get("/knowledge/documents", headers=HEADERS).json()["documents"] == []
+    stats = client.get("/knowledge/stats", headers=HEADERS).json()
+    assert stats["document_count"] == 0
+    assert stats["chunk_count"] == 0
+
+
+def test_every_ingestible_doc_exists_on_disk() -> None:
+    """_INGESTIBLE_DOCS is the endpoint's whole path-traversal guard AND its
+    file lookup — a stale entry means a 404 at ingest time, not a test failure
+    at build time, so pin it here. Paths are cwd-relative exactly as the route
+    resolves them."""
+    missing = [
+        f"{key} -> {path}"
+        for key, paths in knowledge._INGESTIBLE_DOCS.items()
+        for path in paths
+        if not path.is_file()
+    ]
+    assert missing == [], f"missing bundled KB docs: {missing}"
+
+
+@pytest.mark.parametrize("stem", ["06-casino-games", "ui-05-casino", "README"])
+def test_ingest_layout_rejects_raw_filename_stem(app: FastAPI, stem: str) -> None:
+    """Only the registered keys are ingestible — a real file's stem under
+    data/kb/modules/ is NOT a key, so it must still 400 rather than resolve to
+    a path. (README.md is reference-only and must never be ingestible.)"""
+    client = TestClient(app)
+    resp = client.post(
+        "/knowledge/ingest-layout", json={"layout": stem}, headers=HEADERS,
+    )
+    assert resp.status_code == 400
+    assert client.get("/knowledge/documents", headers=HEADERS).json()["documents"] == []
 
 
 def test_query_mixes_tenant_and_linked_crm_docs(app: FastAPI) -> None:

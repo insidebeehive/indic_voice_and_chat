@@ -114,6 +114,21 @@ class IngestResponse(BaseModel):
     language: Optional[str]
 
 
+class IngestedFileInfo(BaseModel):
+    document_id: str
+    filename: str
+    chunks_indexed: int
+    language: Optional[str] = None
+
+
+class IngestLayoutResponse(BaseModel):
+    """Response for POST /ingest-layout — one entry per file ingested for the
+    requested key. Single-file keys (existing frontend layouts) return a
+    one-item list; paired vertical-module keys (casino/sports/matka) return
+    two."""
+    documents: list[IngestedFileInfo]
+
+
 class DocumentsResponse(BaseModel):
     documents: list[DocumentInfo]
     total: int
@@ -145,15 +160,47 @@ class StatsResponse(BaseModel):
     chunk_count: int
 
 
-# Fixed allow-list matching the real files under data/kb/layouts/ — deliberately
-# excludes operator-to-layout.md and README.md (reference-only, never ingestible).
-_ALLOWED_LAYOUTS = {
-    "layout-1", "layout-2", "layout-3", "layout-4", "layout-5",
-    "layout-6", "layout-7", "layout-8", "layout-9", "layout-sports",
+# Fixed allow-list mapping an ingest key to the bundled doc(s) it pulls in.
+# This dict lookup IS the path-traversal guard: request values only ever index
+# into this map, never build a filesystem path directly — never change that.
+#
+# - Existing frontend-layout keys (data/kb/layouts/) — one file each, unchanged
+#   from the old _ALLOWED_LAYOUTS behavior. Deliberately excludes
+#   operator-to-layout.md and README.md (reference-only, never ingestible).
+# - Product-module keys (data/kb/modules/) — each ingests a *pair* of files
+#   (backend doc + its UI-help counterpart) as two separate KBDocument rows,
+#   never merged, since voicebot doc-priority matching keys off each file's
+#   own original filename (see _VOICE_KB_PRIORITY in src/rag/context_builder.py).
+_INGESTIBLE_DOCS: dict[str, list[Path]] = {
+    "layout-1": [Path("data/kb/layouts/layout-1.md")],
+    "layout-2": [Path("data/kb/layouts/layout-2.md")],
+    "layout-3": [Path("data/kb/layouts/layout-3.md")],
+    "layout-4": [Path("data/kb/layouts/layout-4.md")],
+    "layout-5": [Path("data/kb/layouts/layout-5.md")],
+    "layout-6": [Path("data/kb/layouts/layout-6.md")],
+    "layout-7": [Path("data/kb/layouts/layout-7.md")],
+    "layout-8": [Path("data/kb/layouts/layout-8.md")],
+    "layout-9": [Path("data/kb/layouts/layout-9.md")],
+    "layout-sports": [Path("data/kb/layouts/layout-sports.md")],
+    "casino": [
+        Path("data/kb/modules/06-casino-games.md"),
+        Path("data/kb/modules/ui-05-casino.md"),
+    ],
+    "sports": [
+        Path("data/kb/modules/07-sports-betting.md"),
+        Path("data/kb/modules/ui-06-sports.md"),
+    ],
+    "matka": [
+        Path("data/kb/modules/08-matka-lottery-games.md"),
+        Path("data/kb/modules/ui-07-matka-lottery.md"),
+    ],
 }
 
 
 class IngestLayoutRequest(BaseModel):
+    # Field name kept as `layout` for backward compatibility with existing
+    # callers, though it now also accepts product-module keys (casino/sports/
+    # matka) — see _INGESTIBLE_DOCS.
     layout: str
 
 
@@ -210,6 +257,16 @@ async def ingest_document(
     tenant: TenantContext = Depends(current_tenant),
     session: AsyncSession = Depends(get_db_session),
 ) -> IngestResponse:
+    if document_id and (document_id.startswith("crm_kb_") or document_id.startswith("global_kb_")):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"document_id {document_id!r} is not allowed: the 'crm_kb_' / "
+                "'global_kb_' prefixes are reserved for the bundled-KB seeder "
+                "and purge script. Choose a different id, or omit document_id "
+                "to have one generated."
+            ),
+        )
     data = await file.read()
     if not data:
         raise HTTPException(status_code=400, detail="empty upload")
@@ -220,31 +277,59 @@ async def ingest_document(
     )
 
 
-@router.post("/ingest-layout", response_model=IngestResponse)
+@router.post("/ingest-layout", response_model=IngestLayoutResponse)
 async def ingest_layout_document(
     req: IngestLayoutRequest,
     tenant: TenantContext = Depends(current_tenant),
     session: AsyncSession = Depends(get_db_session),
-) -> IngestResponse:
-    """Ingest a bundled frontend-layout KB doc (data/kb/layouts/layout-N.md)
-    into this tenant's own KB — used by the backoffice's per-tenant layout
-    selector (admin-triggered via X-Tenant-Slug + admin token) or by a
-    tenant calling this directly with its own bearer token. `layout` is
-    validated against a fixed allow-list, since it is used to build a
-    server-side file path — never accept an arbitrary value here."""
-    if req.layout not in _ALLOWED_LAYOUTS:
+) -> IngestLayoutResponse:
+    """Ingest one or more bundled KB docs for a given key into this tenant's
+    own KB — used by the backoffice's per-tenant doc selector (admin-triggered
+    via X-Tenant-Slug + admin token) or by a tenant calling this directly with
+    its own bearer token. `layout` is validated against a fixed allow-list
+    (_INGESTIBLE_DOCS), since it is used to look up server-side file path(s)
+    — never accept an arbitrary value here.
+
+    Single-file keys (existing frontend layouts) behave exactly as before.
+    Paired keys (casino/sports/matka product modules) ingest BOTH files as
+    separate KBDocument rows — never concatenated into one — since each file
+    keeps its own filename for voicebot doc-priority matching."""
+    paths = _INGESTIBLE_DOCS.get(req.layout)
+    if paths is None:
         raise HTTPException(status_code=400, detail=f"unknown layout {req.layout!r}")
-    path = Path("data/kb/layouts") / f"{req.layout}.md"
-    if not path.is_file():
-        raise HTTPException(status_code=404, detail=f"layout doc not found: {req.layout}")
-    text = path.read_text(encoding="utf-8")
-    # Deterministic document_id: re-ingesting the same layout for the same
-    # tenant updates the existing KBDocument row (retriever.index upserts
-    # by chunk id) rather than creating duplicates — safe to click twice.
-    return await _ingest_text(
-        tenant, session, filename=f"{req.layout}.md", text=text,
-        document_id=f"layout_{req.layout}",
-    )
+    # Pre-flight ALL files for this key before ingesting ANY of them.
+    # _ingest_text commits per file, and there is no enclosing transaction, so
+    # checking existence inside the loop meant a paired key (casino/sports/
+    # matka) whose 1st file exists and 2nd is missing left a half-ingested KB:
+    # file 1's KBDocument row + chunks committed, then a 404 with no rollback
+    # and no signal that only 1 of 2 landed. All-or-nothing instead: any
+    # missing file => 404 with zero writes.
+    missing = [str(p) for p in paths if not p.is_file()]
+    if missing:
+        raise HTTPException(
+            status_code=404, detail=f"doc not found: {', '.join(missing)}")
+    results: list[IngestedFileInfo] = []
+    for path in paths:
+        text = path.read_text(encoding="utf-8")
+        # Deterministic document_id: re-ingesting the same key for the same
+        # tenant updates the existing KBDocument row(s) (retriever.index
+        # upserts by chunk id) rather than creating duplicates — safe to
+        # click twice. Single-file keys keep the exact `layout_{key}` id used
+        # before this change (no orphaned rows for existing tenants); paired
+        # keys append the file stem to keep each file's id distinct.
+        doc_id = (
+            f"layout_{req.layout}"
+            if len(paths) == 1
+            else f"layout_{req.layout}_{path.stem}"
+        )
+        ingested = await _ingest_text(
+            tenant, session, filename=path.name, text=text, document_id=doc_id,
+        )
+        results.append(IngestedFileInfo(
+            document_id=ingested.document_id, filename=ingested.filename,
+            chunks_indexed=ingested.chunks_indexed, language=ingested.language,
+        ))
+    return IngestLayoutResponse(documents=results)
 
 
 @router.get("/documents", response_model=DocumentsResponse)

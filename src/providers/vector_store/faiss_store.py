@@ -187,6 +187,10 @@ class FAISSAdapter(IVectorStore):
     async def count(self) -> int:
         return int(self._index.ntotal)
 
+    async def list_documents(self, limit: int = 2000) -> list[Document]:
+        async with self._lock:
+            return [self._docs[i] for i in self._ids[:limit] if i in self._docs]
+
 
 # --- helpers --------------------------------------------------------------
 

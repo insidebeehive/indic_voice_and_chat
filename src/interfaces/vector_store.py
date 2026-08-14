@@ -49,3 +49,9 @@ class IVectorStore(ABC):
     @abstractmethod
     async def count(self) -> int:
         """Return total document count."""
+
+    async def list_documents(self, limit: int = 2000) -> list[Document]:
+        """Enumerate stored documents for this scope (no query). Stores that
+        cannot enumerate return []. Order is NOT guaranteed — callers that care
+        must sort. Embeddings are not populated."""
+        return []

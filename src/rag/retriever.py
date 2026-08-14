@@ -22,6 +22,7 @@ This keeps the API surface small (one ``index``, one ``search``, one
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 from dataclasses import dataclass, field
 from typing import Optional
@@ -34,6 +35,8 @@ from src.interfaces.vector_store import (
     SearchResult,
 )
 from src.rag.embeddings import IEmbedder, IReranker, _tokenize
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -153,6 +156,32 @@ class HybridRetriever:
     def list_all(self, max_chunks: int = 200) -> list[Document]:
         """Return all indexed chunks (drawn from the in-memory BM25 index)."""
         return list(self._bm25._docs.values())[:max_chunks]
+
+    async def list_all_persistent(self, max_chunks: int = 2000) -> list[Document]:
+        """Enumerate chunks from the PERSISTENT store, falling back to the
+        process-local BM25 index.
+
+        ``list_all`` only sees chunks indexed by *this* process; the voicebot's
+        one-shot KB dump needs everything a tenant ever ingested, in any worker.
+        """
+        lister = getattr(self._dense, "list_documents", None)
+        if lister is not None:
+            try:
+                docs = await lister(max_chunks)
+            except Exception:
+                log.exception(
+                    "list_all_persistent: persistent enumeration failed; "
+                    "falling back to in-memory BM25 index",
+                    extra={"store": type(self._dense).__name__},
+                )
+            else:
+                if docs:
+                    return docs
+                log.info(
+                    "list_all_persistent: persistent store returned no chunks",
+                    extra={"store": type(self._dense).__name__},
+                )
+        return self.list_all(max_chunks)
 
     async def delete(self, doc_ids: list[str]) -> int:
         self._bm25.delete(doc_ids)

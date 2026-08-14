@@ -96,6 +96,16 @@ async def ingest_crm_document(
     if not text.strip():
         raise HTTPException(status_code=400, detail="document parsed to empty text")
 
+    if document_id and (document_id.startswith("crm_kb_") or document_id.startswith("global_kb_")):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"document_id {document_id!r} is not allowed: the 'crm_kb_' / "
+                "'global_kb_' prefixes are reserved for the bundled-KB seeder "
+                "and purge script. Choose a different id, or omit document_id "
+                "to have one generated."
+            ),
+        )
     doc_id = document_id or _new_id()
     language = detect_language(text)
     chunker = get_chunker(_chunk_config)

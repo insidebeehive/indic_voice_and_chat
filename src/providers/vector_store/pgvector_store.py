@@ -226,3 +226,27 @@ class PGVectorAdapter(IVectorStore):
         async with pool.acquire() as conn:
             row = await conn.fetchrow(sql, *scope_params)
         return int(row["count"]) if row else 0
+
+    async def list_documents(self, limit: int = 2000) -> list[Document]:
+        """Enumerate this scope's chunks straight from Postgres — no query,
+        no embedding needed. This is what lets the voicebot's one-shot KB
+        dump see chunks ingested by a *different* process/worker than the one
+        serving the current call (unlike ``HybridRetriever.list_all``, which
+        only sees chunks this process indexed into its in-memory BM25)."""
+        pool = await self._pool()
+        scope_clause, scope_params = self._scope_clause(1)
+        limit_pos = 1 + len(scope_params)
+        sql = f"""
+            SELECT id, content, metadata
+            FROM voicebot.knowledge_chunks
+            WHERE {scope_clause}
+            LIMIT ${limit_pos}::integer
+        """
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(sql, *scope_params, limit)
+        out: list[Document] = []
+        for r in rows:
+            raw = r["metadata"]
+            meta = json.loads(raw) if isinstance(raw, str) else (dict(raw) if raw else {})
+            out.append(Document(id=r["id"], content=r["content"], metadata=meta))
+        return out

@@ -176,6 +176,85 @@ async def test_browser_factory_raises_when_streaming_stt_override_fails(monkeypa
         await factory(websocket=ws, tenant=_tenant())
 
 
+async def test_bridge_factory_merges_crm_and_tenant_kb_tiers() -> None:
+    """Voice call sites must merge BOTH KB tiers into kb_context — the CRM-wide
+    retriever AND the tenant's own opt-in retriever — mirroring chat's
+    ``_active_retrievers()`` (src/api/knowledge.py). Regression guard: before
+    this fix, ``registry`` was hardcoded to ``None`` at every voice call site,
+    so tenant-tier-only content (e.g. casino/sports/matka once moved out of
+    the CRM-wide tier) never reached voice calls."""
+    from src.interfaces.vector_store import Document
+
+    class _FakeRetriever:
+        def __init__(self, docs) -> None:
+            self._docs = docs
+
+        def list_all(self, max_chunks: int = 200):
+            return self._docs
+
+    crm_doc = Document(
+        id="crm-doc", content="CRM-wide FAQ content.", metadata={"filename": "00-crm-faq.md"})
+    tenant_doc = Document(
+        id="tenant-doc", content="Tenant-only casino content.",
+        metadata={"filename": "06-casino-games.md"})
+
+    class _FakeCrmRetrievers:
+        def get(self, crm_id):
+            return _FakeRetriever([crm_doc])
+
+    fake_registry = SimpleNamespace(
+        retrievers=SimpleNamespace(get=lambda tenant: _FakeRetriever([tenant_doc])))
+
+    tenant = _tenant()
+    tenant.settings.crm_id = "crm_x"
+
+    factory = make_bridge_factory(
+        _providers(), crm_retrievers=_FakeCrmRetrievers(), registry=fake_registry)
+    bridge = await factory(websocket=object(), tenant=tenant)
+
+    kb_context = bridge._agent._kb_context
+    assert "crm-faq" in kb_context
+    assert "casino-games" in kb_context
+
+
+async def test_bridge_factory_kb_context_survives_cold_bm25(tmp_faiss_index) -> None:
+    """Guards the await-plumbing through ``_build_kb_context``/``make_bridge_factory``:
+    a tenant retriever built fresh in THIS process (cold in-memory BM25, no
+    ``.index()`` call ever made on it — simulating a different worker than the
+    one that served the tenant's ingest call) must still surface its
+    persistently-stored KB content in the agent's kb_context, via the real
+    ``HybridRetriever`` + ``FAISSAdapter`` (not a fake)."""
+    from src.interfaces.vector_store import Document
+    from src.providers.vector_store.faiss_store import FAISSAdapter
+    from src.rag.embeddings import HashEmbedder
+    from src.rag.retriever import HybridRetriever
+
+    warm = HybridRetriever(
+        embedder=HashEmbedder(dim=64),
+        vector_store=FAISSAdapter({"embedding_dim": 64, "index_path": tmp_faiss_index}),
+    )
+    await warm.index([
+        Document(
+            id="layout_casino::chunk-0",
+            content="Casino games include slots and live dealer.",
+            metadata={"filename": "06-casino-games.md", "section": 0},
+        )
+    ])
+
+    cold = HybridRetriever(
+        embedder=HashEmbedder(dim=64),
+        vector_store=FAISSAdapter({"embedding_dim": 64, "index_path": tmp_faiss_index}),
+    )
+    assert cold.list_all() == []  # pins the bug's precondition
+
+    fake_registry = SimpleNamespace(retrievers=SimpleNamespace(get=lambda tenant: cold))
+
+    factory = make_bridge_factory(_providers(), registry=fake_registry)
+    bridge = await factory(websocket=object(), tenant=_tenant())
+
+    assert "Casino games include slots" in bridge._agent._kb_context
+
+
 async def test_browser_factory_resolves_campaign_per_call() -> None:
     from src.dialogue.campaign_loader import LoadedCampaign
     from src.dialogue.prompts import VoiceBotScript

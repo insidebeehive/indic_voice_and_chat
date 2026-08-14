@@ -84,6 +84,52 @@ async def test_unknown_crm_id_404s(client: AsyncClient) -> None:
     assert resp.status_code == 404
 
 
+@pytest.mark.parametrize("reserved_id", ["crm_kb_betstudio_hijack", "global_kb_hijack"])
+async def test_ingest_rejects_reserved_namespace_document_id(
+    client: AsyncClient, reserved_id: str
+) -> None:
+    """A caller-supplied document_id in the seeder/purge-script's protected
+    namespace (crm_kb_ / global_kb_) must be rejected, not silently accepted
+    -- accepting it would let an admin upload collide with an id the purge
+    script or the seeder's auto-reconcile treats as safe to prune."""
+    resp = await client.post(
+        "/crms/betstudio/kb/ingest",
+        files={"file": ("plans.md", io.BytesIO(b"Plan B has 500GB unlimited"), "text/markdown")},
+        data={"document_id": reserved_id},
+        headers=ADMIN_HEADERS,
+    )
+    assert resp.status_code == 400
+    assert reserved_id in resp.json()["detail"]
+
+    # Non-regression: the id must never have been persisted.
+    listed = await client.get("/crms/betstudio/kb/documents", headers=ADMIN_HEADERS)
+    assert not any(d["id"] == reserved_id for d in listed.json()["documents"])
+
+
+async def test_ingest_without_document_id_still_succeeds(client: AsyncClient) -> None:
+    """Non-regression: omitting document_id (the common case) still works."""
+    resp = await client.post(
+        "/crms/betstudio/kb/ingest",
+        files={"file": ("plans.md", io.BytesIO(b"Plan B has 500GB unlimited"), "text/markdown")},
+        headers=ADMIN_HEADERS,
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["document_id"]
+
+
+async def test_ingest_with_normal_document_id_still_succeeds(client: AsyncClient) -> None:
+    """Non-regression: a normal caller-chosen document_id (outside the
+    reserved namespace) still works."""
+    resp = await client.post(
+        "/crms/betstudio/kb/ingest",
+        files={"file": ("plans.md", io.BytesIO(b"Plan B has 500GB unlimited"), "text/markdown")},
+        data={"document_id": "my-own-doc-id"},
+        headers=ADMIN_HEADERS,
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["document_id"] == "my-own-doc-id"
+
+
 async def test_requires_admin(client: AsyncClient) -> None:
     resp = await client.get("/crms/betstudio/kb/documents")
     assert resp.status_code == 401

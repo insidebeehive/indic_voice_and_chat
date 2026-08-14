@@ -705,6 +705,7 @@ def make_browser_bridge_factory(
     campaign_resolver=None,
     handoff_store=None,
     crm_retrievers=None,
+    registry=None,
 ) -> BrowserBridgeFactory:
     """Build a BrowserVoiceBridge per connection, wired to the tenant stack.
 
@@ -885,9 +886,16 @@ def make_browser_bridge_factory(
                     "this voice call. Greet them briefly and ask how you can help.",
                 ]
 
-        from src.bootstrap import _build_kb_context, _crm_retriever_for  # noqa: PLC0415
+        from src.bootstrap import (  # noqa: PLC0415
+            _build_kb_context,
+            _crm_retriever_for,
+            _tenant_retriever_for,
+        )
 
-        kb_ctx = _build_kb_context(_crm_retriever_for(tenant, crm_retrievers), None) or None
+        kb_ctx = await _build_kb_context(
+            _crm_retriever_for(tenant, crm_retrievers),
+            _tenant_retriever_for(tenant, registry),
+        ) or None
         agent = VoiceBotAgent(
             session=AgentSession(session_id=session_id, lead_data=lead_data),
             state_machine=AgentStateMachine(),
@@ -920,6 +928,7 @@ def make_live_bridge_factory(
     *,
     campaign_resolver=None,
     crm_retrievers=None,
+    registry=None,
 ) -> LiveBridgeFactory:
     """Build a GeminiLiveBridge (S2S) per connection from pipeline.realtime.
 
@@ -979,9 +988,16 @@ def make_live_bridge_factory(
             lead_data["lead_gender"] = lead_gender
 
         session_id = f"live_{uuid.uuid4().hex[:12]}"
-        from src.bootstrap import _build_kb_context, _crm_retriever_for  # noqa: PLC0415
+        from src.bootstrap import (  # noqa: PLC0415
+            _build_kb_context,
+            _crm_retriever_for,
+            _tenant_retriever_for,
+        )
 
-        kb_ctx = _build_kb_context(_crm_retriever_for(tenant, crm_retrievers), None) or None
+        kb_ctx = await _build_kb_context(
+            _crm_retriever_for(tenant, crm_retrievers),
+            _tenant_retriever_for(tenant, registry),
+        ) or None
         agent = VoiceBotAgent(
             session=AgentSession(session_id=session_id, lead_data=lead_data),
             state_machine=AgentStateMachine(), slot_schema=cur_slots, script=cur_script,

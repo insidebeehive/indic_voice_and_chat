@@ -131,7 +131,17 @@ _VOICE_KB_PRIORITY: list[str] = [
 _VOICE_KB_EXCLUDED: set[str] = {"12-technical-help.md"}
 
 
-def build_voicebot_kb_context(
+async def _kb_docs_for(r: "HybridRetriever") -> list[Document]:
+    """Prefer the persistent-store-backed enumeration (sees chunks ingested by
+    any process/worker); fall back to plain ``list_all()`` for retrievers that
+    don't have ``list_all_persistent`` (e.g. fakes used in tests)."""
+    lister = getattr(r, "list_all_persistent", None)
+    if lister is not None:
+        return await lister()
+    return r.list_all()
+
+
+async def build_voicebot_kb_context(
     retrievers: list["HybridRetriever"],
     max_chars: int = 15000,
 ) -> str:
@@ -145,7 +155,7 @@ def build_voicebot_kb_context(
     seen: set[str] = set()
     all_docs: list[Document] = []
     for r in retrievers:
-        for doc in r.list_all():
+        for doc in await _kb_docs_for(r):
             if doc.id not in seen:
                 seen.add(doc.id)
                 all_docs.append(doc)
@@ -155,7 +165,18 @@ def build_voicebot_kb_context(
     def _filename(doc: Document) -> str:
         return (doc.metadata or {}).get("filename") or doc.id
 
+    def _section(doc: Document) -> int:
+        try:
+            return int((doc.metadata or {}).get("section") or 0)
+        except (TypeError, ValueError):
+            return 0
+
     all_docs = [d for d in all_docs if _filename(d) not in _VOICE_KB_EXCLUDED]
+    # Stable base sort on (filename, section) so pgvector's unordered rows
+    # don't scramble intra-document chunk order. Must run BEFORE the priority
+    # sort below — the priority sort's stability depends on this ordering
+    # already being in place.
+    all_docs.sort(key=lambda d: (_filename(d), _section(d)))
     all_docs.sort(key=lambda d: (
         _VOICE_KB_PRIORITY.index(_filename(d))
         if _filename(d) in _VOICE_KB_PRIORITY else len(_VOICE_KB_PRIORITY)

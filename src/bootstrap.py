@@ -155,6 +155,23 @@ def _crm_retriever_for(
     return crm_retrievers.get(crm_id)
 
 
+def _tenant_retriever_for(
+    tenant: TenantContext, registry: "TenantRuntimeRegistry | None",
+) -> Optional["HybridRetriever"]:
+    """Resolve this tenant's own opt-in KB retriever, or None (no runtime
+    registry available at this call site) — never an error.
+
+    Mirrors ``_crm_retriever_for`` above, but for the per-tenant tier
+    (``src.api.knowledge``'s chat-side ``_active_retrievers`` equivalent for
+    voice). Callers merge this with ``_crm_retriever_for``'s result via
+    ``_build_kb_context`` so voice gets the same [CRM, tenant] KB coverage
+    chat already has.
+    """
+    if registry is None:
+        return None
+    return registry.retrievers.get(tenant)
+
+
 def build_provider_registry(
     global_defaults: dict, base_vector_path: Path = Path("data/faiss"),
 ) -> TenantProviders:
@@ -623,11 +640,11 @@ def _build_s2s_telephony_bridge(
         transfer_webhook_secret=_wh_secret)
 
 
-def _build_kb_context(crm_retriever, tenant_retriever) -> str:
+async def _build_kb_context(crm_retriever, tenant_retriever) -> str:
     """Build a static KB context string from the CRM + tenant retrievers for voicebot."""
     from src.rag.context_builder import build_voicebot_kb_context
     retrievers = [r for r in [crm_retriever, tenant_retriever] if r is not None]
-    return build_voicebot_kb_context(retrievers)
+    return await build_voicebot_kb_context(retrievers)
 
 
 class LiveKitModeNotSupported(Exception):
@@ -644,6 +661,7 @@ def make_livekit_bridge_factory(
     *,
     campaign_resolver=None,
     crm_retrievers: "PerCrmRetrieverRegistry | None" = None,
+    registry: "TenantRuntimeRegistry | None" = None,
 ):
     """Returns a factory(tenant, room_name, meta) -> builder-callable.
 
@@ -687,7 +705,8 @@ def make_livekit_bridge_factory(
             lc = await campaign_resolver.resolve(tenant.id, campaign_id)
             cur_script, cur_slots = lc.script, lc.slots
 
-        kb_ctx = _build_kb_context(_crm_retriever_for(tenant, crm_retrievers), None)
+        kb_ctx = await _build_kb_context(
+            _crm_retriever_for(tenant, crm_retrievers), _tenant_retriever_for(tenant, registry))
 
         agent, config, connect_session, llm, tts, tenant_timezone = _build_s2s_agent_and_config(
             providers, tenant, cur_script, cur_slots, session_store,
@@ -719,6 +738,7 @@ def make_bridge_factory(
     *,
     campaign_resolver=None,
     crm_retrievers: "PerCrmRetrieverRegistry | None" = None,
+    registry: "TenantRuntimeRegistry | None" = None,
 ) -> Callable[[WebSocket, TenantContext], object]:
     """Return a callable suitable for ``set_bridge_factory(...)``.
 
@@ -769,7 +789,8 @@ def make_bridge_factory(
                 cur_script = _dc_replace(cur_script, **replacements)
         # Speech-to-speech path: when the tenant is in s2s mode, drive Gemini Live
         # over the Twilio media stream instead of the STT->LLM->TTS cascade.
-        kb_ctx = _build_kb_context(_crm_retriever_for(tenant, crm_retrievers), None)
+        kb_ctx = await _build_kb_context(
+            _crm_retriever_for(tenant, crm_retrievers), _tenant_retriever_for(tenant, registry))
         if mode == "s2s":
             return _build_s2s_telephony_bridge(
                 providers, tenant, cur_script, cur_slots, websocket, session_store,
@@ -901,6 +922,7 @@ def make_exotel_bridge_factory(
     *,
     campaign_resolver=None,
     crm_retrievers: "PerCrmRetrieverRegistry | None" = None,
+    registry: "TenantRuntimeRegistry | None" = None,
 ) -> Callable[[WebSocket, TenantContext], ExotelMediaBridge]:
     """Build an Exotel WS bridge per call, wired to the tenant's provider stack.
 
@@ -938,7 +960,8 @@ def make_exotel_bridge_factory(
                 cur_script = _dc_replace(cur_script, **replacements)
         # S2S path: drive Gemini Live over the Exotel media stream (raw PCM16@8k,
         # snake_case stream_sid, no `clear` frame) when the tenant is in s2s mode.
-        kb_ctx = _build_kb_context(_crm_retriever_for(tenant, crm_retrievers), None)
+        kb_ctx = await _build_kb_context(
+            _crm_retriever_for(tenant, crm_retrievers), _tenant_retriever_for(tenant, registry))
         if mode == "s2s":
             return _build_s2s_telephony_bridge(
                 providers, tenant, cur_script, cur_slots, websocket, session_store,
@@ -1016,6 +1039,7 @@ def make_stringee_bridge_factory(
     *,
     campaign_resolver=None,
     crm_retrievers: "PerCrmRetrieverRegistry | None" = None,
+    registry: "TenantRuntimeRegistry | None" = None,
 ):
     """Build a StringeeIvrBridge per call, wired to the tenant's providers.
 
@@ -1051,6 +1075,10 @@ def make_stringee_bridge_factory(
 
         import uuid
 
+        kb_ctx = await _build_kb_context(
+            _crm_retriever_for(tenant, crm_retrievers),
+            _tenant_retriever_for(tenant, registry),
+        )
         session_id = f"call_{uuid.uuid4().hex[:12]}"
         session = AgentSession(session_id=session_id)
         sm = AgentStateMachine()
@@ -1061,7 +1089,7 @@ def make_stringee_bridge_factory(
             script=cur_script,
             engine=engine,
             store=None,
-            kb_context=_build_kb_context(_crm_retriever_for(tenant, crm_retrievers), None) or None,
+            kb_context=kb_ctx or None,
             record_metric=lambda payload: record_turn_metric(tenant_id=tenant.id, **payload),
         )
 
