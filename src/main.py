@@ -97,6 +97,16 @@ def _admin_tokens_from_env() -> list[str]:
     return [t.strip() for t in raw.split(",") if t.strip()]
 
 
+def _kb_auto_prune_enabled() -> bool:
+    """Whether ``_seed_crm_kb``'s reconcile step is allowed to actually delete
+    orphaned CrmKBDocument rows + pgvector chunks it finds, vs. just reporting
+    them. Defaults OFF: the destructive action stays opt-in until an operator
+    has reviewed ``scripts/purge_stale_kb_docs.py --dry-run`` output on their
+    own deployment and explicitly enables this. Same on/off string convention
+    as VOX_DEV_CONSOLE."""
+    return os.environ.get("VOX_KB_AUTO_PRUNE", "") == "1"
+
+
 def _parse_callback(value):
     """Parse an ISO callback datetime from an outcome payload (None-safe)."""
     if not value:
@@ -167,7 +177,12 @@ async def _reap_stale_calls_loop() -> None:
         await asyncio.sleep(_REAP_INTERVAL_S)
 
 
-async def _seed_crm_kb(crm_retrievers: "PerCrmRetrieverRegistry", sessionmaker) -> None:
+async def _seed_crm_kb(
+    crm_retrievers: "PerCrmRetrieverRegistry",
+    sessionmaker,
+    kb_dir: Path = Path("data/kb/global"),
+    auto_prune: Optional[bool] = None,
+) -> None:
     """Re-ingest bundled global KB docs into every existing CRM's KB at startup.
 
     Docs bundled at data/kb/global/ are seeded into EVERY CRM row that exists
@@ -176,6 +191,21 @@ async def _seed_crm_kb(crm_retrievers: "PerCrmRetrieverRegistry", sessionmaker) 
     docs, since there's no per-CRM bundled-docs directory concept today).
     Uses deterministic doc_ids (filename-based) so CrmKBDocument DB rows are
     replaced, not duplicated, across restarts.
+
+    Also self-heals: after seeding, any file that used to exist under
+    ``kb_dir`` but has since been renamed/deleted/moved to a different tier
+    leaves behind an orphaned ``CrmKBDocument`` row (and pgvector chunks)
+    that nothing else ever cleans up. See the reconcile step below.
+
+    ``auto_prune`` gates whether the reconcile step below is actually allowed
+    to delete what it finds, vs. only reporting it. Defaults (``None``) to
+    ``_kb_auto_prune_enabled()`` (i.e. the ``VOX_KB_AUTO_PRUNE`` env var,
+    off unless explicitly set) — overridable here so this function stays
+    unit-testable without monkeypatching the environment, same pattern as
+    ``kb_dir``.
+
+    ``kb_dir`` defaults to the real bundled-docs directory but is overridable
+    so this function is unit-testable against a tmp directory.
     """
     from sqlalchemy import delete as sa_delete, select
 
@@ -183,7 +213,9 @@ async def _seed_crm_kb(crm_retrievers: "PerCrmRetrieverRegistry", sessionmaker) 
     from src.models.crm import Crm, CrmKBDocument
     from src.rag.ingestion import ChunkConfig, detect_language, get_chunker, parse_document
 
-    kb_dir = Path("data/kb/global")
+    if auto_prune is None:
+        auto_prune = _kb_auto_prune_enabled()
+
     if not kb_dir.is_dir():
         return
     async with sessionmaker() as session:
@@ -200,6 +232,15 @@ async def _seed_crm_kb(crm_retrievers: "PerCrmRetrieverRegistry", sessionmaker) 
 
     chunker = get_chunker(ChunkConfig())
     total = 0
+    # Per-crm bookkeeping for the reconcile step below: the doc_ids we
+    # actually (re)wrote for each crm this pass. `failed_stems` tracks which
+    # *files* (by stem) raised during parsing/indexing this pass — isolated
+    # to that file only, not smeared across every crm/file. A parse failure
+    # on one file must never disable pruning for unrelated files or other
+    # crms; it only protects that one file's own derived doc ids from being
+    # mistaken for "gone" by the reconcile step below.
+    expected_ids_by_crm: dict[str, set[str]] = {crm_id: set() for crm_id in crm_ids}
+    failed_stems: set[str] = set()
     for f in files:
         try:
             text = parse_document(f.name, f.read_bytes())
@@ -211,6 +252,7 @@ async def _seed_crm_kb(crm_retrievers: "PerCrmRetrieverRegistry", sessionmaker) 
                 if retriever is None:
                     continue
                 doc_id = f"crm_kb_{crm_id}_{f.stem}"
+                expected_ids_by_crm[crm_id].add(doc_id)
                 raw_chunks = chunker(text, {
                     "filename": f.name, "document_id": doc_id, "language": language,
                 })
@@ -239,8 +281,88 @@ async def _seed_crm_kb(crm_retrievers: "PerCrmRetrieverRegistry", sessionmaker) 
                     await session.commit()
         except Exception:  # noqa: BLE001 - one bad file must not abort the whole seed
             log.exception("crm KB seed failed", extra={"file": f.name})
+            # Isolate the damage to this file only: record its stem so the
+            # reconcile step below protects *this file's* derived doc ids
+            # (across all crms) from being pruned as stale — a transient
+            # parse/index error must never be mistaken for "this file no
+            # longer exists". Every other file/crm is unaffected and still
+            # reconciles normally this pass.
+            failed_stems.add(f.stem)
     if total:
         log.info("CRM KB seeded", extra={"files": len(files), "chunks": total, "crms": len(crm_ids)})
+
+    # Reconcile: prune CrmKBDocument rows (and their pgvector chunks) that
+    # this seeder itself wrote in a previous pass but that no longer
+    # correspond to a file under kb_dir today — e.g. the file was renamed,
+    # deleted, or moved to a different tier. Without this, such rows are
+    # orphaned forever (this was the root cause of duplicate-looking docs
+    # in the KB list).
+    for crm_id in crm_ids:
+        retriever = crm_retrievers.get(crm_id)
+        if retriever is None:
+            continue  # can't safely delete pgvector chunks without a retriever
+        expected_ids = expected_ids_by_crm[crm_id]
+        # Rows tied to a file that failed to parse/index this pass are
+        # protected from pruning (in both the current and legacy id
+        # namespaces) — a transient failure on that file must not cascade
+        # into deleting its previously-seeded doc. Everything else not in
+        # expected_ids is genuinely stale and still gets pruned normally,
+        # even if some unrelated file failed elsewhere in this same pass.
+        protected_ids = {f"crm_kb_{crm_id}_{stem}" for stem in failed_stems} | {
+            f"global_kb_{stem}" for stem in failed_stems
+        }
+        async with sessionmaker() as session:
+            rows = (await session.execute(
+                select(CrmKBDocument).where(CrmKBDocument.crm_id == crm_id)
+            )).scalars().all()
+            # Only prune ids in the two namespaces this seeder has ever
+            # written under: current (`crm_kb_{crm_id}_*`) and legacy
+            # pre-migration (`global_kb_*`). Admin-uploaded docs get
+            # `crmdoc_*` ids (see POST /crms/{id}/kb/ingest in
+            # src/api/crm_kb.py) and never match either prefix, so they're
+            # never touched by this auto-reconcile.
+            seeder_prefixes = (f"crm_kb_{crm_id}_", "global_kb_")
+            stale = [
+                r for r in rows
+                if r.id.startswith(seeder_prefixes)
+                and r.id not in expected_ids
+                and r.id not in protected_ids
+            ]
+            if not stale:
+                continue
+            stale_ids = [r.id for r in stale]
+            if not auto_prune:
+                # Destructive, unattended by default: report what would be
+                # pruned but do not touch it. See scripts/purge_stale_kb_docs.py
+                # for the reviewable dry-run/--execute path, or set
+                # VOX_KB_AUTO_PRUNE=1 to let this reconcile step delete
+                # automatically on every future boot.
+                log.warning(
+                    "Found %d stale CRM KB doc(s) for crm_id=%s but "
+                    "VOX_KB_AUTO_PRUNE is not enabled -- not pruning: %s. "
+                    "Review with `python scripts/purge_stale_kb_docs.py`, then "
+                    "either run it with --execute or set VOX_KB_AUTO_PRUNE=1.",
+                    len(stale_ids), crm_id, stale_ids,
+                )
+                continue
+            pruned_ids = []
+            for row in stale:
+                # Mirror src.api.crm_kb.delete_crm_document's chunk-id
+                # resolution exactly, so manual delete and this
+                # auto-reconcile behave identically.
+                chunk_ids = (row.extra_data or {}).get("chunk_ids") or [
+                    f"{row.id}::chunk-{i}" for i in range(row.chunk_count or 0)
+                ]
+                await retriever.delete(chunk_ids)
+                await session.delete(row)
+                pruned_ids.append(row.id)
+            await session.commit()
+            # Safe under concurrent boots: expected_ids is derived purely
+            # and deterministically from kb_dir's current contents, so any
+            # number of replicas computing it independently agree on the
+            # same "stale" set — re-deleting an already-deleted row/chunk
+            # is a no-op, so no locking is needed.
+            log.warning("Pruned stale CRM KB doc(s) for crm_id=%s: %s", crm_id, pruned_ids)
 
 
 @asynccontextmanager
@@ -361,6 +483,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             providers=providers, session_store=base_session_store,
             campaign_resolver=campaign_resolver,
             crm_retrievers=crm_retrievers,
+            registry=runtime_registry,
         )
     )
     telephony_hooks.set_exotel_bridge_factory(
@@ -368,12 +491,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             providers=providers, session_store=base_session_store,
             campaign_resolver=campaign_resolver,
             crm_retrievers=crm_retrievers,
+            registry=runtime_registry,
         )
     )
     telephony_hooks.set_stringee_bridge_factory(
         make_stringee_bridge_factory(
             providers=providers, campaign_resolver=campaign_resolver,
             crm_retrievers=crm_retrievers,
+            registry=runtime_registry,
         )
     )
     # LiveKit room-join (the CRM's SIP trunk fronts LiveKit): our webhook route
@@ -384,6 +509,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             providers=providers, session_store=base_session_store,
             campaign_resolver=campaign_resolver,
             crm_retrievers=crm_retrievers,
+            registry=runtime_registry,
         )
     )
     # The browser voice bridge is wired ALWAYS (not just for the dev console) so
@@ -395,6 +521,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             providers=providers, campaign_resolver=campaign_resolver,
             handoff_store=base_session_store,
             crm_retrievers=crm_retrievers,
+            registry=runtime_registry,
         )
     )
     if dev_console_enabled():
@@ -402,6 +529,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             make_live_bridge_factory(
                 providers=providers, campaign_resolver=campaign_resolver,
                 crm_retrievers=crm_retrievers,
+                registry=runtime_registry,
             )
         )
         log.info("dev console enabled at /dev/voice")

@@ -143,44 +143,66 @@ async def _run_turn(coro: Awaitable):
 # `reason: idle_timeout` and closes the ticket while the bot is still working.
 # Transport-level pings do not help: uvicorn already sends WS pings every 20s
 # by default (ws_ping_interval) and the relay closed anyway, and Starlette
-# exposes no ping API to us regardless. So repeat the frame the CRM contract
-# already documents (docs/crm-chat-media-contract.md) — no new frame type, and
-# consumers already treat `typing` as idempotent.
-_KEEPALIVE_INTERVAL_S = 8.0
-# Grace for an in-flight keepalive send to finish once the turn is done, before
+# exposes no ping API to us regardless. So instead of repeating the silent
+# `typing` frame, send a real, visible "still working on it" chat message
+# every _INTERIM_INTERVAL_S (docs/crm-chat-media-contract.md) — no new frame
+# type, it's an ordinary `message` frame tagged `"interim": true`.
+_INTERIM_INTERVAL_S = 15.0
+# Grace for an in-flight interim send to finish once the turn is done, before
 # cancelling it outright. Bounded so a wedged socket can never delay a reply.
 _KEEPALIVE_DRAIN_S = 1.0
 
 
-async def _typing_keepalive(websocket: WebSocket, stop: asyncio.Event) -> None:
-    """Emit ``{"type":"typing"}`` every _KEEPALIVE_INTERVAL_S until ``stop``.
+async def _interim_wait_keepalive(
+    websocket: WebSocket, stop: asyncio.Event, *, session_id: str, language: str,
+) -> None:
+    """Send a real, visible "still working on it" chat message every
+    _INTERIM_INTERVAL_S until ``stop``.
+
+    Uses the same frame shape as ``_send_reply`` so existing widgets/relays
+    render it as an ordinary bubble with no client-side change (a new frame
+    type would simply be dropped -- see docs/crm-chat-media-contract.md). The
+    extra ``interim`` flag is additive and safe to ignore. These messages are
+    deliberately NOT persisted to chat_messages: they carry no LLM cost, must
+    not inflate message_count, and would otherwise be replayed into the model's
+    context by _hydrate_agent_history on reconnect.
 
     Parks in ``stop.wait()`` between frames rather than sleeping blindly, so
-    the common exit path is a clean return with no frame in flight — never a
+    the common exit path is a clean return with no frame in flight -- never a
     cancellation landing in the middle of a send. Never raises out: a send
     failure (client already gone) must not mask the real turn's result, and
     the turn path detects a dead socket on its own.
     """
+    sent = 0
     while True:
         try:
-            await asyncio.wait_for(stop.wait(), timeout=_KEEPALIVE_INTERVAL_S)
+            await asyncio.wait_for(stop.wait(), timeout=_INTERIM_INTERVAL_S)
             return  # turn finished — must not emit another frame
         except asyncio.TimeoutError:
             pass
         if stop.is_set():
             return
         try:
-            await websocket.send_text(json.dumps({"type": "typing"}))
+            await websocket.send_text(json.dumps({
+                "type": "message",
+                "session_id": session_id,
+                "text": _interim_wait_text(language, sent),
+                "sources": [],
+                "suggestions": [],
+                "action": "none",
+                "interim": True,
+            }))
         except asyncio.CancelledError:
             raise
-        except Exception:  # noqa: BLE001 — keepalive is strictly best-effort
-            log.debug("typing keepalive send failed; stopping", exc_info=True)
+        except Exception:  # noqa: BLE001 — interim messaging is strictly best-effort
+            log.debug("interim wait message send failed; stopping", exc_info=True)
             return
+        sent += 1
 
 
 async def _stop_keepalive(ka: asyncio.Task, stop: asyncio.Event) -> None:
     """Cancellation-safe teardown for a keepalive task started via
-    ``asyncio.ensure_future(_typing_keepalive(websocket, stop))``.
+    ``asyncio.ensure_future(_interim_wait_keepalive(websocket, stop, ...))``.
 
     Uses ``asyncio.wait`` (not a bare ``await ka``) for BOTH the drain and the
     final reap: ``asyncio.wait`` never propagates the awaited task's own
@@ -222,11 +244,12 @@ async def _stop_keepalive(ka: asyncio.Task, stop: asyncio.Event) -> None:
             log.debug("keepalive task ended with an exception", exc_info=exc)
 
 
-async def _run_turn_with_keepalive(websocket: WebSocket, coro):
-    """``_run_turn`` plus periodic ``typing`` frames while the turn is in flight.
+async def _run_turn_with_keepalive(websocket: WebSocket, coro, *, session_id: str, language: str):
+    """``_run_turn`` plus a periodic visible "still working on it" message while
+    the turn is in flight.
 
     The keepalive is fully torn down before this returns *or* raises, so no
-    `typing` frame can land after the reply — or after the `error` frame the
+    interim message can land after the reply — or after the `error` frame the
     per-turn handler sends on failure. Nothing in the teardown can replace the
     turn's own result or exception. A cancellation of the enclosing task that
     lands while teardown is itself in flight (see ``_stop_keepalive``) is
@@ -237,7 +260,8 @@ async def _run_turn_with_keepalive(websocket: WebSocket, coro):
     # Turn task first: if task creation somehow failed after the keepalive
     # existed we would leak an un-awaited coroutine.
     turn = asyncio.ensure_future(_run_turn(coro))
-    ka = asyncio.ensure_future(_typing_keepalive(websocket, stop))
+    ka = asyncio.ensure_future(
+        _interim_wait_keepalive(websocket, stop, session_id=session_id, language=language))
     try:
         return await turn
     finally:
@@ -536,6 +560,82 @@ def _greeting(company: str, customer_name: Optional[str], language: str) -> str:
     who = f" {name}" if name else ""
     template = _GREETINGS.get(normalize_lang(language)) or _GREETINGS["en"]
     return template.format(who=who)
+
+
+# Sent as a real chat bubble every _INTERIM_INTERVAL_S while a turn is still in
+# flight (see _interim_wait_keepalive). Same language codes as _GREETINGS above
+# -- note "od" for Odia. Two variants per language: the first fires at the first
+# interval, the second at every interval after it, so a long wait doesn't read
+# as a stuck loop repeating one line.
+#
+# All variants must be free of speaker-gender marking, matching _GREETINGS'
+# established convention above. Hindi, Marathi, Gujarati, and Punjabi
+# grammatically mark the speaker's gender on first-person verbs (continuous
+# "रहा/रही", habitual "ता/ती", etc.) and need deliberately neutral phrasing
+# (impersonal/passive constructions, or the subjunctive/optative forms
+# _GREETINGS already uses, e.g. Hindi "करूँ" / Marathi "करू" / Gujarati "કરી
+# શકું" / Punjabi "ਕਰਾਂ") -- the other 8 languages here don't inflect verbs for
+# speaker gender at all, so no equivalent care is needed for them.
+_INTERIM_WAIT_MESSAGES: dict[str, list[str]] = {
+    "en": [
+        "This is taking a little longer than usual — I'm still working on it and will get back to you shortly.",
+        "Thanks for your patience — I'm still on it and will have something for you very soon.",
+    ],
+    "hi": [
+        "इसमें सामान्य से थोड़ा ज़्यादा समय लग रहा है — इस पर काम अभी भी जारी है, जल्द ही जवाब मिल जाएगा।",
+        "आपके धैर्य के लिए धन्यवाद — जानकारी अभी भी तैयार हो रही है, बस थोड़ी देर और।",
+    ],
+    "bn": [
+        "এটি স্বাভাবিকের চেয়ে একটু বেশি সময় নিচ্ছে — আমি এখনও এটি নিয়ে কাজ করছি, খুব শীঘ্রই জানাচ্ছি।",
+        "ধৈর্য ধরার জন্য ধন্যবাদ — আমি এখনও কাজ করছি, আর একটু সময় লাগবে।",
+    ],
+    "gu": [
+        "આમાં સામાન્ય કરતાં થોડો વધુ સમય લાગી રહ્યો છે — કામ હજી ચાલુ છે, જલદી જ જવાબ મળશે.",
+        "તમારી ધીરજ બદલ આભાર — માહિતી હજી તૈયાર થઈ રહી છે, બસ થોડી જ વાર.",
+    ],
+    "kn": [
+        "ಇದಕ್ಕೆ ಎಂದಿಗಿಂತ ಸ್ವಲ್ಪ ಹೆಚ್ಚು ಸಮಯ ತೆಗೆದುಕೊಳ್ಳುತ್ತಿದೆ — ನಾನು ಇನ್ನೂ ಇದರ ಮೇಲೆ ಕೆಲಸ ಮಾಡುತ್ತಿದ್ದೇನೆ, ಶೀಘ್ರದಲ್ಲೇ ತಿಳಿಸುತ್ತೇನೆ.",
+        "ನಿಮ್ಮ ತಾಳ್ಮೆಗೆ ಧನ್ಯವಾದಗಳು — ನಾನು ಇನ್ನೂ ಕೆಲಸ ಮಾಡುತ್ತಿದ್ದೇನೆ, ಇನ್ನು ಸ್ವಲ್ಪವೇ ಸಮಯ.",
+    ],
+    "ml": [
+        "ഇതിന് പതിവിലും അൽപ്പം കൂടുതൽ സമയം എടുക്കുന്നു — ഞാൻ ഇപ്പോഴും ഇതിൽ പ്രവർത്തിക്കുന്നു, ഉടൻ അറിയിക്കാം.",
+        "ക്ഷമയ്ക്ക് നന്ദി — ഞാൻ ഇപ്പോഴും ഇതിൽ തന്നെയാണ്, ഒരു നിമിഷം കൂടി.",
+    ],
+    "mr": [
+        "याला नेहमीपेक्षा थोडा जास्त वेळ लागत आहे — मी अजूनही यावर काम करत आहे आणि लवकरच कळवेन.",
+        "तुमच्या संयमाबद्दल धन्यवाद — मी अजूनही काम करत आहे, आणखी थोडाच वेळ.",
+    ],
+    "od": [
+        "ଏଥିରେ ସାଧାରଣଠାରୁ ଟିକିଏ ଅଧିକ ସମୟ ଲାଗୁଛି — ମୁଁ ଏବେ ବି ଏଥିରେ କାମ କରୁଛି ଏବଂ ଶୀଘ୍ର ଜଣାଇବି।",
+        "ଆପଣଙ୍କ ଧୈର୍ଯ୍ୟ ପାଇଁ ଧନ୍ୟବାଦ — ମୁଁ ଏବେ ବି କାମ କରୁଛି, ଆଉ ଟିକିଏ ସମୟ।",
+    ],
+    "pa": [
+        "ਇਸ ਵਿੱਚ ਆਮ ਨਾਲੋਂ ਥੋੜ੍ਹਾ ਵੱਧ ਸਮਾਂ ਲੱਗ ਰਿਹਾ ਹੈ — ਕੰਮ ਹਾਲੇ ਵੀ ਜਾਰੀ ਹੈ, ਜਲਦੀ ਹੀ ਜਵਾਬ ਮਿਲ ਜਾਵੇਗਾ।",
+        "ਤੁਹਾਡੇ ਸਬਰ ਲਈ ਧੰਨਵਾਦ — ਜਾਣਕਾਰੀ ਹਾਲੇ ਤਿਆਰ ਹੋ ਰਹੀ ਹੈ, ਬੱਸ ਥੋੜ੍ਹਾ ਹੋਰ ਸਮਾਂ।",
+    ],
+    "ta": [
+        "இதற்கு வழக்கத்தை விட சற்று அதிக நேரம் ஆகிறது — நான் இன்னும் இதில் வேலை செய்கிறேன், விரைவில் தெரிவிக்கிறேன்.",
+        "உங்கள் பொறுமைக்கு நன்றி — நான் இன்னும் இதில்தான் இருக்கிறேன், இன்னும் சிறிது நேரம்.",
+    ],
+    "te": [
+        "దీనికి మామూలు కంటే కొంచెం ఎక్కువ సమయం పడుతోంది — నేను ఇంకా దీనిపై పని చేస్తున్నాను, త్వరలో తెలియజేస్తాను.",
+        "మీ ఓపికకు ధన్యవాదాలు — నేను ఇంకా దీనిపైనే ఉన్నాను, మరికొంత సమయం.",
+    ],
+    "as": [
+        "ইয়াত সাধাৰণতকৈ অলপ বেছি সময় লাগিছে — মই এতিয়াও ইয়াত কাম কৰি আছোঁ আৰু সোনকালে জনাম।",
+        "আপোনাৰ ধৈৰ্যৰ বাবে ধন্যবাদ — মই এতিয়াও কাম কৰি আছোঁ, আৰু অলপ সময়।",
+    ],
+}
+
+
+def _interim_wait_text(language: str, index: int) -> str:
+    """The interim "still working on it" line, in the session's language.
+
+    ``index`` is how many interim messages this turn has already sent; past the
+    last variant the final one repeats. Unmapped codes fall back to English,
+    same as ``_greeting``."""
+    variants = _INTERIM_WAIT_MESSAGES.get(normalize_lang(language)) or _INTERIM_WAIT_MESSAGES["en"]
+    return variants[min(index, len(variants) - 1)]
 
 
 # --- Schemas ------------------------------------------------------------
@@ -1254,13 +1354,15 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
                     # voice note can stall here just as long as a slow CRM
                     # tool call, so coverage can't start only at the turn.
                     _ka_stop = asyncio.Event()
-                    _ka = asyncio.ensure_future(_typing_keepalive(websocket, _ka_stop))
+                    _ka = asyncio.ensure_future(_interim_wait_keepalive(
+                        websocket, _ka_stop, session_id=session_id, language=row.language))
                     try:
                         if audio_bytes is None:
                             try:
                                 audio_bytes, fetched_mime = await _fetch_media_url(audio_media_url)
                             except Exception:
                                 log.exception("media_url fetch failed", extra={"session_id": session_id})
+                                await _stop_keepalive(_ka, _ka_stop)
                                 await websocket.send_text(json.dumps({
                                     "type": "error",
                                     "message": "Could not fetch media_url — check it's reachable and points at an audio file.",
@@ -1268,6 +1370,7 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
                                 continue
                             mime = mime or fetched_mime
                             if not mime.startswith("audio/"):
+                                await _stop_keepalive(_ka, _ka_stop)
                                 await websocket.send_text(json.dumps(
                                     {"type": "error", "message": "audio media_url must serve an audio/* content type"}))
                                 continue
@@ -1287,6 +1390,7 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
                                 await upload_coro
                         except Exception:
                             log.exception("audio upload/transcription failed", extra={"session_id": session_id})
+                            await _stop_keepalive(_ka, _ka_stop)
                             await websocket.send_text(json.dumps(
                                 {"type": "error", "message": "Could not save voice message — please try again."}))
                             continue
@@ -1294,6 +1398,19 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
                         # If transcription succeeded, get AI response; else inform customer
                         if transcript:
                             result = await _run_turn(agent.handle_message(transcript))
+                            # Stop the keepalive now, before ANY customer-visible
+                            # frame goes out (audio_ack / the real reply) and
+                            # before any human-handoff escalation:
+                            # `_run_human_mode` below is an unbounded loop for
+                            # the rest of the human conversation, and the
+                            # branch-level `finally` only fires once that loop
+                            # exits. With the old silent `typing` frame, stopping
+                            # late (after the reply) was harmless; with a real
+                            # visible interim message it is not — the customer
+                            # could see the actual answer and THEN see "still
+                            # working on it" appear after it. Safe to call again
+                            # in the `finally` below (idempotent).
+                            await _stop_keepalive(_ka, _ka_stop)
                             msg_id = await _persist_turn(
                                 session_id, transcript, result,
                                 user_type="audio", media_mime=mime, media_url=object_key,
@@ -1304,21 +1421,16 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
                                     "media_url": f"/api/v1/chat/media/{msg_id}",
                                 }))
                             await _send_reply(websocket, session_id, result, tenant.id)
-                            # Stop the keepalive now, before any human-handoff
-                            # escalation: `_run_human_mode` below is an
-                            # unbounded loop for the rest of the human
-                            # conversation, and the branch-level `finally`
-                            # only fires once that loop exits — leaving the
-                            # keepalive running would keep emitting `typing`
-                            # frames for the entire human conversation. Safe
-                            # to call again in the `finally` below (idempotent).
-                            await _stop_keepalive(_ka, _ka_stop)
                             if result.escalation:
                                 if await _handle_escalation(websocket, session_id, tenant, row, result):
                                     if await _run_human_mode(websocket, session_id, tenant):
                                         break
                         else:
-                            # Persist audio without agent reply
+                            # Persist audio without agent reply. Stop the
+                            # keepalive first — the audio_ack/error frames sent
+                            # below are the last customer-visible frames for
+                            # this branch, no interim message must arrive after.
+                            await _stop_keepalive(_ka, _ka_stop)
                             async with _sm()() as db:
                                 r = await db.get(ChatSession, session_id)
                                 if r:
@@ -1362,7 +1474,8 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
                     # large upload can stall here just as long as a slow CRM
                     # tool call, so coverage can't start only at the turn.
                     _ka_stop = asyncio.Event()
-                    _ka = asyncio.ensure_future(_typing_keepalive(websocket, _ka_stop))
+                    _ka = asyncio.ensure_future(_interim_wait_keepalive(
+                        websocket, _ka_stop, session_id=session_id, language=row.language))
                     try:
                         fetched_bytes: Optional[bytes] = None
                         if media_url:
@@ -1371,12 +1484,14 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
                                 mime = mime or fetched_mime
                             except Exception:
                                 log.exception("media_url fetch failed", extra={"session_id": session_id})
+                                await _stop_keepalive(_ka, _ka_stop)
                                 await websocket.send_text(json.dumps({
                                     "type": "error",
                                     "message": "Could not fetch media_url — check it's reachable and points at an image/video.",
                                 }))
                                 continue
                         if not mime:
+                            await _stop_keepalive(_ka, _ka_stop)
                             await websocket.send_text(json.dumps(
                                 {"type": "error", "message": "image/video needs 'mime'"}))
                             continue
@@ -1394,18 +1509,21 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
 
                         result = await _run_turn(
                             agent.handle_image(fetched_bytes if fetched_bytes is not None else data, mime, caption))
+                        # Stop the keepalive now, before ANY customer-visible
+                        # frame goes out (the real reply) and before any
+                        # human-handoff escalation: `_run_human_mode` below is
+                        # an unbounded loop for the rest of the human
+                        # conversation, and the branch-level `finally` only
+                        # fires once that loop exits. With the old silent
+                        # `typing` frame, stopping late (after the reply) was
+                        # harmless; with a real visible interim message it is
+                        # not — the customer could see the actual answer and
+                        # THEN see "still working on it" appear after it. Safe
+                        # to call again in the `finally` below (idempotent).
+                        await _stop_keepalive(_ka, _ka_stop)
                         await _persist_turn(session_id, caption or f"[{mtype}]", result,
                                             user_type=mtype, media_mime=mime, media_url=object_key)
                         await _send_reply(websocket, session_id, result, tenant.id)
-                        # Stop the keepalive now, before any human-handoff
-                        # escalation: `_run_human_mode` below is an unbounded
-                        # loop for the rest of the human conversation, and the
-                        # branch-level `finally` only fires once that loop
-                        # exits — leaving the keepalive running would keep
-                        # emitting `typing` frames for the entire human
-                        # conversation. Safe to call again in the `finally`
-                        # below (idempotent).
-                        await _stop_keepalive(_ka, _ka_stop)
                         if result.escalation:
                             if await _handle_escalation(websocket, session_id, tenant, row, result):
                                 if await _run_human_mode(websocket, session_id, tenant):
@@ -1420,7 +1538,9 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
                     continue
 
                 await websocket.send_text(json.dumps({"type": "typing"}))
-                result = await _run_turn_with_keepalive(websocket, agent.handle_message(user_text))
+                result = await _run_turn_with_keepalive(
+                    websocket, agent.handle_message(user_text),
+                    session_id=session_id, language=row.language)
                 await _persist_turn(session_id, user_text, result)
                 call_url: Optional[str] = None
                 if result.call_offer and _handoff_store is not None:

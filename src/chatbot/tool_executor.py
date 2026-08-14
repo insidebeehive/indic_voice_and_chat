@@ -14,17 +14,36 @@ from typing import Optional
 
 log = logging.getLogger(__name__)
 
-# Read timeout for one CRM HTTP call. Was 30s: under load api.betstudio.io
-# routinely burned the full budget (logged: "tools=['get_player_wallet:30047ms']"),
-# and since _handle_with_tools (src/agents/chatbot.py) runs tool calls
-# SEQUENTIALLY across up to _max_tool_rounds rounds, that stacked into a
-# 30-60s window with no traffic on the chat WS — long enough for the CRM's
-# downstream relay to declare the socket dead (1006) and auto-close the
-# ticket mid-conversation. A timeout here is not a turn failure: the except
-# below converts it to {"error": ...}, the model gets that as the tool result
-# and still answers (a holding message), so a shorter budget degrades the
-# answer's richness, never the turn itself. 10s is ~5x a healthy call.
-_DEFAULT_CRM_TOOL_TIMEOUT_S = 10.0
+# Read timeout for one CRM HTTP call. Was tightened to 10s during the 2026-08
+# relay-timeout incident fix, on the theory that a short timeout would keep
+# the chat WS from going quiet long enough for the CRM's downstream relay to
+# declare the socket dead (1006) and auto-close the ticket mid-conversation.
+# In practice, production monitoring showed real CRM calls routinely
+# saturating the OLD 30s ceiling across multiple endpoints in a single
+# window (/players/{id}/transactions: 50 occurrences, /wallet: 41, /bets: 2,
+# /profile: 1) -- these were slow-but-working calls, not hung connections, and
+# a short timeout was converting them into content-free holding answers
+# instead of real ones. The relay-silence problem this timeout interacts with
+# is now handled at the WS layer by a visible periodic interim message
+# (src/api/chat.py: _interim_wait_keepalive) rather than by cutting the tool
+# budget short, so the budget can be widened back out. A timeout here is
+# still not a turn failure: the except below converts it to {"error": ...},
+# the model gets that as the tool result and still answers (a holding
+# message), so a longer budget only improves the answer's richness -- it
+# never risks the turn itself.
+#
+# This constant is only a FALLBACK default for callers that don't pass an
+# explicit per-call budget (e.g. a direct/manual call to execute_crm_tool).
+# The real bound on tool time within a turn is enforced by the caller
+# (src/agents/chatbot.py) via a per-turn CUMULATIVE tool budget
+# (_TOOL_BUDGET_S), because a turn can involve more than 2 tool calls total —
+# up to _max_tool_rounds rounds, each of which can itself carry multiple
+# function_call parts in a single LLM response (Gemini does this). A fixed
+# "2 calls total" assumption doesn't hold, so this default is kept in step
+# with _TOOL_CALL_CEILING_S (the per-call ceiling chatbot.py enforces via
+# asyncio.wait_for) rather than derived from the turn-level cap
+# _TURN_TIMEOUT_S (src/api/chat.py) the way it previously was.
+_DEFAULT_CRM_TOOL_TIMEOUT_S = 35.0
 
 
 async def execute_crm_tool(

@@ -1,14 +1,32 @@
-"""Long-turn WS keepalive (``typing`` heartbeat) added to guard against the
-CRM's downstream relay declaring the connection dead (1006) during a turn
-that makes sequential CRM tool calls and goes tens of seconds without any
-application traffic on the socket.
+"""Long-turn WS keepalive added to guard against the CRM's downstream relay
+declaring the connection dead (1006) during a turn that makes sequential CRM
+tool calls and goes tens of seconds without any application traffic on the
+socket.
+
+The keepalive's task lifecycle (cancellation-safe drain/reap, idempotent
+stop) predates this file's current form and is NOT under test here beyond
+the direct `_run_turn_with_keepalive`/`_stop_keepalive` regression tests
+below -- only the *content* of what's repeated changed: instead of a silent
+`{"type":"typing"}` frame repeating every 8s, the platform now sends a real,
+visible "still working on it" chat message (a `message` frame tagged
+`"interim": true`) every `_INTERIM_INTERVAL_S` (15s in production, patched
+down in these tests).
 
 Covers:
-- ``_typing_keepalive`` / ``_run_turn_with_keepalive`` wired into the real WS
-  message loop (periodic frames during a slow turn, none after the reply,
-  none after an error, no change to the fast-turn frame sequence).
+- ``_interim_wait_keepalive`` / ``_run_turn_with_keepalive`` wired into the
+  real WS message loop (periodic interim frames during a slow turn, none
+  after the reply, none after an error, no change to the fast-turn frame
+  sequence).
+- Localization of the interim text, and its two-variant progression.
+- Interim messages are never persisted to chat_messages / message_count.
+- The ordering fix: the audio and image/video branches' branch-level
+  keepalive must stop before persisting/replying, not after -- otherwise a
+  slow persist/reply lets a (now visible) interim message land after the
+  real answer, which looks broken.
 - Direct unit tests of ``_run_turn_with_keepalive`` proving no leaked asyncio
   tasks and that a keepalive send failure never masks the turn's result.
+- A guard test tying `_TURN_TIMEOUT_S` to the per-turn cumulative tool budget
+  (`chatbot._TOOL_BUDGET_S`) rather than a fixed tool-call-count assumption.
 """
 
 from __future__ import annotations
@@ -16,17 +34,20 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import threading
 
 import pytest
 import pytest_asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from src.agents import chatbot
 from src.api import chat as chat_api
 from src.models.database import Base
-from src.models.chat import ChatSession
+from src.models.chat import ChatMessage, ChatSession
 
 
 class _FakeTurnResult:
@@ -78,6 +99,15 @@ async def ws_ctx():
     chat_api.set_chat_sessionmaker(None)
     chat_api.set_chatbot_factory(None)
     await engine.dispose()
+
+
+async def _add_session(sm, session_id: str, language: str) -> None:
+    """Insert an extra ChatSession row (beyond the fixture's default "sess1")
+    for tests that need a specific language code."""
+    async with sm() as db:
+        db.add(ChatSession(id=session_id, tenant_id="t1", language=language,
+                            status="active", mode="ai", extra_data={}))
+        await db.commit()
 
 
 class _FakeMediaStore:
@@ -156,9 +186,9 @@ def _connect(fake_tenant):
 
 
 @pytest.mark.asyncio
-async def test_long_turn_sends_periodic_typing(ws_ctx, monkeypatch) -> None:
+async def test_long_turn_sends_periodic_interim_messages(ws_ctx, monkeypatch) -> None:
     sm, fake_agent = ws_ctx
-    monkeypatch.setattr(chat_api, "_KEEPALIVE_INTERVAL_S", 0.05)
+    monkeypatch.setattr(chat_api, "_INTERIM_INTERVAL_S", 0.05)
 
     async def _slow_handle(text):
         await asyncio.sleep(0.4)
@@ -170,13 +200,20 @@ async def test_long_turn_sends_periodic_typing(ws_ctx, monkeypatch) -> None:
     try:
         with client.websocket_connect("/api/v1/chat/ws/sess1") as ws:
             ws.send_text(json.dumps({"type": "message", "text": "hi"}))
-            typing_count = 0
+
+            # The one-time `typing` frame at t=0 is unchanged.
             frame = json.loads(ws.receive_text())
-            while frame["type"] == "typing":
-                typing_count += 1
+            assert frame["type"] == "typing"
+
+            interim_count = 0
+            frame = json.loads(ws.receive_text())
+            while frame.get("interim"):
+                assert frame["type"] == "message"
+                interim_count += 1
                 frame = json.loads(ws.receive_text())
-            assert typing_count >= 3, f"expected >=3 typing frames, got {typing_count}"
+            assert interim_count >= 3, f"expected >=3 interim frames, got {interim_count}"
             assert frame["type"] == "message"
+            assert not frame.get("interim")
     finally:
         patcher.stop()
 
@@ -184,7 +221,7 @@ async def test_long_turn_sends_periodic_typing(ws_ctx, monkeypatch) -> None:
 @pytest.mark.asyncio
 async def test_no_typing_frames_after_the_reply(ws_ctx, monkeypatch) -> None:
     sm, fake_agent = ws_ctx
-    monkeypatch.setattr(chat_api, "_KEEPALIVE_INTERVAL_S", 0.05)
+    monkeypatch.setattr(chat_api, "_INTERIM_INTERVAL_S", 0.05)
 
     async def _slow_handle(text):
         await asyncio.sleep(0.15)
@@ -197,11 +234,12 @@ async def test_no_typing_frames_after_the_reply(ws_ctx, monkeypatch) -> None:
         with client.websocket_connect("/api/v1/chat/ws/sess1") as ws:
             ws.send_text(json.dumps({"type": "message", "text": "hi"}))
             frame = json.loads(ws.receive_text())
-            while frame["type"] == "typing":
+            while frame["type"] == "typing" or frame.get("interim"):
                 frame = json.loads(ws.receive_text())
             assert frame["type"] == "message"
+            assert not frame.get("interim")
 
-            # Several keepalive intervals' worth of real time with the turn
+            # Several interim intervals' worth of real time with the turn
             # already finished — no frame should show up on its own.
             await asyncio.sleep(0.3)
             ws.send_text(json.dumps({"type": "end"}))
@@ -214,7 +252,7 @@ async def test_no_typing_frames_after_the_reply(ws_ctx, monkeypatch) -> None:
 @pytest.mark.asyncio
 async def test_keepalive_stops_on_turn_error(ws_ctx, monkeypatch) -> None:
     sm, fake_agent = ws_ctx
-    monkeypatch.setattr(chat_api, "_KEEPALIVE_INTERVAL_S", 0.05)
+    monkeypatch.setattr(chat_api, "_INTERIM_INTERVAL_S", 0.05)
 
     async def _slow_fail(text):
         await asyncio.sleep(0.2)
@@ -226,16 +264,17 @@ async def test_keepalive_stops_on_turn_error(ws_ctx, monkeypatch) -> None:
     try:
         with client.websocket_connect("/api/v1/chat/ws/sess1") as ws:
             ws.send_text(json.dumps({"type": "message", "text": "hi"}))
-            typing_count = 0
+            interim_count = 0
             frame = json.loads(ws.receive_text())
-            while frame["type"] == "typing":
-                typing_count += 1
+            while frame["type"] == "typing" or frame.get("interim"):
+                if frame.get("interim"):
+                    interim_count += 1
                 frame = json.loads(ws.receive_text())
-            assert typing_count >= 1
+            assert interim_count >= 1
             assert frame["type"] == "error"
 
-            # No stray typing frame should arrive after the error, even after
-            # waiting through several keepalive intervals.
+            # No stray interim frame should arrive after the error, even after
+            # waiting through several interim intervals.
             await asyncio.sleep(0.3)
             ws.send_text(json.dumps({"type": "end"}))
             ended = json.loads(ws.receive_text())
@@ -244,7 +283,7 @@ async def test_keepalive_stops_on_turn_error(ws_ctx, monkeypatch) -> None:
         patcher.stop()
 
 
-# --- Regression: fast turns unchanged (default 8.0s interval never fires) -
+# --- Regression: fast turns unchanged (default 15.0s interval never fires) -
 
 
 @pytest.mark.asyncio
@@ -264,12 +303,189 @@ async def test_fast_turn_frame_sequence_unchanged(ws_ctx) -> None:
             assert typing["type"] == "typing"
             message = json.loads(ws.receive_text())
             assert message["type"] == "message"
+            assert not message.get("interim")
 
             ws.send_text(json.dumps({"type": "end"}))
             ended = json.loads(ws.receive_text())
             assert ended["type"] == "ended"
     finally:
         patcher.stop()
+
+
+# --- Localization of the interim message ----------------------------------
+
+
+@pytest.mark.asyncio
+async def test_interim_message_localized_hindi(ws_ctx, monkeypatch) -> None:
+    sm, fake_agent = ws_ctx  # "sess1" is language="hi" per the fixture
+    monkeypatch.setattr(chat_api, "_INTERIM_INTERVAL_S", 0.03)
+
+    async def _slow_handle(text):
+        await asyncio.sleep(0.15)
+        return _FakeTurnResult()
+
+    fake_agent.handle_message = _slow_handle
+
+    patcher, client = _connect(_make_tenant())
+    try:
+        with client.websocket_connect("/api/v1/chat/ws/sess1") as ws:
+            ws.send_text(json.dumps({"type": "message", "text": "hi"}))
+            frame = json.loads(ws.receive_text())
+            while not (frame["type"] == "message" and frame.get("interim")):
+                frame = json.loads(ws.receive_text())
+            assert frame["text"] == chat_api._INTERIM_WAIT_MESSAGES["hi"][0]
+    finally:
+        patcher.stop()
+
+
+@pytest.mark.asyncio
+async def test_interim_message_localized_tamil(ws_ctx, monkeypatch) -> None:
+    sm, fake_agent = ws_ctx
+    await _add_session(sm, "sess_ta", "ta")
+    monkeypatch.setattr(chat_api, "_INTERIM_INTERVAL_S", 0.03)
+
+    async def _slow_handle(text):
+        await asyncio.sleep(0.15)
+        return _FakeTurnResult()
+
+    fake_agent.handle_message = _slow_handle
+
+    patcher, client = _connect(_make_tenant())
+    try:
+        with client.websocket_connect("/api/v1/chat/ws/sess_ta") as ws:
+            ws.send_text(json.dumps({"type": "message", "text": "hi"}))
+            frame = json.loads(ws.receive_text())
+            while not (frame["type"] == "message" and frame.get("interim")):
+                frame = json.loads(ws.receive_text())
+            assert frame["text"] == chat_api._INTERIM_WAIT_MESSAGES["ta"][0]
+    finally:
+        patcher.stop()
+
+
+@pytest.mark.asyncio
+async def test_interim_message_unmapped_language_falls_back_to_english(ws_ctx, monkeypatch) -> None:
+    sm, fake_agent = ws_ctx
+    await _add_session(sm, "sess_xx", "xx")
+    monkeypatch.setattr(chat_api, "_INTERIM_INTERVAL_S", 0.03)
+
+    async def _slow_handle(text):
+        await asyncio.sleep(0.15)
+        return _FakeTurnResult()
+
+    fake_agent.handle_message = _slow_handle
+
+    patcher, client = _connect(_make_tenant())
+    try:
+        with client.websocket_connect("/api/v1/chat/ws/sess_xx") as ws:
+            ws.send_text(json.dumps({"type": "message", "text": "hi"}))
+            frame = json.loads(ws.receive_text())
+            while not (frame["type"] == "message" and frame.get("interim")):
+                frame = json.loads(ws.receive_text())
+            assert frame["text"] == chat_api._INTERIM_WAIT_MESSAGES["en"][0]
+    finally:
+        patcher.stop()
+
+
+@pytest.mark.asyncio
+async def test_interim_message_variant_progression(ws_ctx, monkeypatch) -> None:
+    """First interim message uses variant 0; every one after that uses
+    variant 1 (repeats -- never indexes past the list)."""
+    sm, fake_agent = ws_ctx
+    monkeypatch.setattr(chat_api, "_INTERIM_INTERVAL_S", 0.03)
+
+    async def _slow_handle(text):
+        await asyncio.sleep(0.13)  # several interim intervals
+        return _FakeTurnResult()
+
+    fake_agent.handle_message = _slow_handle
+
+    patcher, client = _connect(_make_tenant())
+    interim_texts: list[str] = []
+    try:
+        with client.websocket_connect("/api/v1/chat/ws/sess1") as ws:
+            ws.send_text(json.dumps({"type": "message", "text": "hi"}))
+            frame = json.loads(ws.receive_text())
+            while frame["type"] == "typing" or frame.get("interim"):
+                if frame.get("interim"):
+                    interim_texts.append(frame["text"])
+                frame = json.loads(ws.receive_text())
+    finally:
+        patcher.stop()
+
+    assert len(interim_texts) >= 3, f"expected >=3 interim messages, got {len(interim_texts)}"
+    variants = chat_api._INTERIM_WAIT_MESSAGES["hi"]
+    assert interim_texts[0] == variants[0]
+    assert interim_texts[1] == variants[1]
+    assert interim_texts[2] == variants[1]
+
+
+@pytest.mark.asyncio
+async def test_interim_frame_shape(ws_ctx, monkeypatch) -> None:
+    sm, fake_agent = ws_ctx
+    monkeypatch.setattr(chat_api, "_INTERIM_INTERVAL_S", 0.03)
+
+    async def _slow_handle(text):
+        await asyncio.sleep(0.1)
+        return _FakeTurnResult()
+
+    fake_agent.handle_message = _slow_handle
+
+    patcher, client = _connect(_make_tenant())
+    try:
+        with client.websocket_connect("/api/v1/chat/ws/sess1") as ws:
+            ws.send_text(json.dumps({"type": "message", "text": "hi"}))
+            frame = json.loads(ws.receive_text())
+            while not (frame["type"] == "message" and frame.get("interim")):
+                frame = json.loads(ws.receive_text())
+    finally:
+        patcher.stop()
+
+    assert frame["type"] == "message"
+    assert frame["session_id"] == "sess1"
+    assert frame["sources"] == []
+    assert frame["suggestions"] == []
+    assert frame["action"] == "none"
+    assert frame["interim"] is True
+
+
+@pytest.mark.asyncio
+async def test_interim_messages_not_persisted(ws_ctx, monkeypatch) -> None:
+    sm, fake_agent = ws_ctx
+    monkeypatch.setattr(chat_api, "_INTERIM_INTERVAL_S", 0.02)
+
+    async def _slow_handle(text):
+        await asyncio.sleep(0.12)
+        return _FakeTurnResult()
+
+    fake_agent.handle_message = _slow_handle
+
+    patcher, client = _connect(_make_tenant())
+    try:
+        with client.websocket_connect("/api/v1/chat/ws/sess1") as ws:
+            ws.send_text(json.dumps({"type": "message", "text": "hi"}))
+            interim_seen = 0
+            frame = json.loads(ws.receive_text())
+            while frame["type"] == "typing" or frame.get("interim"):
+                if frame.get("interim"):
+                    interim_seen += 1
+                frame = json.loads(ws.receive_text())
+            assert interim_seen >= 2, "test setup assumption broken: no interim frames fired"
+            assert frame["type"] == "message"
+    finally:
+        patcher.stop()
+
+    async with sm() as db:
+        rows = (await db.execute(
+            select(ChatMessage).where(ChatMessage.session_id == "sess1")
+        )).scalars().all()
+        session_row = await db.get(ChatSession, "sess1")
+
+    assert len(rows) == 2, (
+        f"expected exactly 2 persisted rows (customer + agent reply), "
+        f"got {len(rows)}: {[r.role for r in rows]}"
+    )
+    assert session_row.message_count == 2
+    assert session_row.cost == 0.0  # llm_provider=None on the fake result -> cost path never runs
 
 
 # --- WS-level: keepalive covers the pre-turn media window (Bug 2) --------
@@ -281,7 +497,7 @@ async def test_audio_keepalive_covers_pre_turn_media_window(ws_media_ctx, monkey
     still get keepalive frames. Regression for Bug 2: previously the audio
     branch only wrapped the turn call, leaving this window silent."""
     sm, fake_agent = ws_media_ctx
-    monkeypatch.setattr(chat_api, "_KEEPALIVE_INTERVAL_S", 0.05)
+    monkeypatch.setattr(chat_api, "_INTERIM_INTERVAL_S", 0.05)
     media_store = _FakeMediaStore(delay=0.3)
     chat_api.set_media_store(media_store)
 
@@ -294,23 +510,25 @@ async def test_audio_keepalive_covers_pre_turn_media_window(ws_media_ctx, monkey
                 "type": "audio", "data": encoded, "mime": "audio/webm",
             }))
             typing = json.loads(ws.receive_text())
-            assert typing["type"] == "typing"
+            assert typing["type"] == "typing"  # one-time frame, unchanged
 
-            # The upload delay (0.3s) hasn't reached the LLM turn yet — a
-            # keepalive frame arriving here proves coverage extends into the
+            # The upload delay (0.3s) hasn't reached the LLM turn yet — an
+            # interim frame arriving here proves coverage extends into the
             # pre-turn media window, not just the turn itself.
             second = json.loads(ws.receive_text())
-            assert second["type"] == "typing", "no keepalive frame during pre-turn media upload"
+            assert second["type"] == "message" and second.get("interim"), (
+                "no interim frame during pre-turn media upload")
 
             frame = second
-            typing_count = 1
-            while frame["type"] == "typing":
-                typing_count += 1
+            interim_count = 1
+            while frame.get("interim"):
+                interim_count += 1
                 frame = json.loads(ws.receive_text())
-            assert typing_count >= 2
+            assert interim_count >= 2
             assert frame["type"] == "audio_ack"
             reply = json.loads(ws.receive_text())
             assert reply["type"] == "message"
+            assert not reply.get("interim")
     finally:
         patcher.stop()
 
@@ -323,7 +541,7 @@ async def test_image_keepalive_covers_pre_turn_media_window(ws_media_ctx, monkey
     get keepalive frames. Regression for Bug 2: previously the image/video
     branch only wrapped the turn call, leaving this window silent."""
     sm, fake_agent = ws_media_ctx
-    monkeypatch.setattr(chat_api, "_KEEPALIVE_INTERVAL_S", 0.05)
+    monkeypatch.setattr(chat_api, "_INTERIM_INTERVAL_S", 0.05)
 
     async def _slow_fetch(url):
         await asyncio.sleep(0.3)
@@ -340,15 +558,17 @@ async def test_image_keepalive_covers_pre_turn_media_window(ws_media_ctx, monkey
                 assert typing["type"] == "typing"
 
                 second = json.loads(ws.receive_text())
-                assert second["type"] == "typing", "no keepalive frame during pre-turn media fetch"
+                assert second["type"] == "message" and second.get("interim"), (
+                    "no interim frame during pre-turn media fetch")
 
                 frame = second
-                typing_count = 1
-                while frame["type"] == "typing":
-                    typing_count += 1
+                interim_count = 1
+                while frame.get("interim"):
+                    interim_count += 1
                     frame = json.loads(ws.receive_text())
-                assert typing_count >= 2
+                assert interim_count >= 2
                 assert frame["type"] == "message"
+                assert not frame.get("interim")
     finally:
         patcher.stop()
 
@@ -361,7 +581,7 @@ async def test_image_keepalive_covers_pre_turn_media_window(ws_media_ctx, monkey
 # conversation with the customer. The audio and image/video branches used to
 # stop their branch-level keepalive only in the `finally` wrapping the whole
 # branch body — which doesn't run until `_run_human_mode` itself returns, so
-# a `typing` frame kept firing every `_KEEPALIVE_INTERVAL_S` for the entire
+# an interim frame kept firing every `_INTERIM_INTERVAL_S` for the entire
 # human conversation. `_handle_escalation`/`_run_human_mode` are faked out
 # here (their own DB/webhook/queue plumbing is exercised elsewhere) so these
 # tests isolate exactly the thing that regressed: is the real keepalive task
@@ -397,7 +617,7 @@ async def _drain_for(ws, seconds: float) -> list[dict]:
 @pytest.mark.asyncio
 async def test_no_typing_during_human_handoff_after_image_escalation(ws_media_ctx, monkeypatch) -> None:
     sm, fake_agent = ws_media_ctx
-    monkeypatch.setattr(chat_api, "_KEEPALIVE_INTERVAL_S", 0.05)
+    monkeypatch.setattr(chat_api, "_INTERIM_INTERVAL_S", 0.05)
 
     fake_result = _FakeTurnResult()
     fake_result.escalation = {"reason": "user needs help", "summary": "refund query"}
@@ -409,8 +629,8 @@ async def test_no_typing_during_human_handoff_after_image_escalation(ws_media_ct
 
     async def _fake_human_mode(websocket, session_id, tenant):
         # Stand-in for "the rest of a human agent's conversation": several
-        # keepalive intervals' worth of real time with the WS otherwise idle
-        # — exactly the window that used to leak `typing` frames.
+        # interim intervals' worth of real time with the WS otherwise idle —
+        # exactly the window that used to leak interim frames.
         await asyncio.sleep(0.3)
         return True  # session ended normally, matching the real return contract
 
@@ -432,23 +652,22 @@ async def test_no_typing_during_human_handoff_after_image_escalation(ws_media_ct
                 frames.append(frame)
 
             # `_run_human_mode` (faked above) is "in the human conversation"
-            # for 0.3s — several keepalive intervals. Drain a bit longer than
-            # that to catch any leaked `typing` frame.
+            # for 0.3s — several interim intervals. Drain a bit longer than
+            # that to catch any leaked interim frame.
             frames += await _drain_for(ws, 0.5)
     finally:
         patcher.stop()
 
-    types = [f["type"] for f in frames]
-    mode_change_idx = types.index("mode_change")
-    assert "typing" not in types[mode_change_idx + 1:], (
-        f"typing frame leaked during human handoff: {types}"
+    after = frames[[f["type"] for f in frames].index("mode_change") + 1:]
+    assert not any(f.get("interim") for f in after), (
+        f"interim frame leaked during human handoff: {frames}"
     )
 
 
 @pytest.mark.asyncio
 async def test_no_typing_during_human_handoff_after_audio_escalation(ws_media_ctx, monkeypatch) -> None:
     sm, fake_agent = ws_media_ctx
-    monkeypatch.setattr(chat_api, "_KEEPALIVE_INTERVAL_S", 0.05)
+    monkeypatch.setattr(chat_api, "_INTERIM_INTERVAL_S", 0.05)
 
     fake_result = _FakeTurnResult()
     fake_result.escalation = {"reason": "user needs help", "summary": "refund query"}
@@ -485,11 +704,252 @@ async def test_no_typing_during_human_handoff_after_audio_escalation(ws_media_ct
     finally:
         patcher.stop()
 
-    types = [f["type"] for f in frames]
-    mode_change_idx = types.index("mode_change")
-    assert "typing" not in types[mode_change_idx + 1:], (
-        f"typing frame leaked during human handoff: {types}"
+    after = frames[[f["type"] for f in frames].index("mode_change") + 1:]
+    assert not any(f.get("interim") for f in after), (
+        f"interim frame leaked during human handoff: {frames}"
     )
+
+
+# --- Ordering regression: keepalive must stop BEFORE persist/reply, -------
+# --- not after (the bug fixed alongside this rework) -----------------------
+#
+# With the OLD silent `typing` frame, stopping the branch-level keepalive
+# late (right before the escalation check, i.e. AFTER `_persist_turn` /
+# `audio_ack` / `_send_reply` had already run) was harmless — an extra
+# `typing` frame is invisible and idempotent. With a REAL visible interim
+# message this is a bug: a slow persist/reply gives the still-running
+# keepalive room to fire again, and that frame could land right after the
+# real answer — the customer would see the actual reply and THEN see
+# "still working on it" appear after it, which looks broken.
+#
+# These tests use event-controlled synchronization (not wall-clock racing)
+# so the assertion is deterministic: `_persist_turn` (or `_fetch_media_url`
+# for the error-path variants) is patched to signal once it's entered and
+# then block until released, letting the test observe directly whether the
+# keepalive is still alive AT THE MOMENT persistence/fetch begins — which is
+# exactly the moment the fix's ordering promise covers.
+#
+# NOTE: ``threading.Event`` (not ``asyncio.Event``) on purpose. Starlette's
+# ``TestClient.websocket_connect`` runs the ASGI app -- and therefore
+# ``_gated_persist``/``_gated_fetch`` below -- in a separate portal thread
+# with its OWN event loop. An ``asyncio.Event`` is only safe to ``.set()``/
+# ``.wait()`` from the single event loop that created it; sharing one across
+# the portal's loop and this test's loop silently hangs (a waiter registered
+# on one loop is never woken by a ``.set()`` call running on the other).
+# ``threading.Event`` has no such restriction, and ``asyncio.to_thread`` lets
+# each side await it without blocking its own loop.
+
+
+@pytest.mark.asyncio
+async def test_audio_interim_stops_before_persist_and_reply(ws_media_ctx, monkeypatch) -> None:
+    sm, fake_agent = ws_media_ctx
+    monkeypatch.setattr(chat_api, "_INTERIM_INTERVAL_S", 0.02)
+    chat_api.set_media_store(_FakeMediaStore())
+
+    persist_entered = threading.Event()
+    release_persist = threading.Event()
+    real_persist = chat_api._persist_turn
+
+    async def _gated_persist(*a, **k):
+        persist_entered.set()
+        await asyncio.to_thread(release_persist.wait)
+        return await real_persist(*a, **k)
+
+    monkeypatch.setattr(chat_api, "_persist_turn", _gated_persist)
+
+    patcher, client = _connect(_make_tenant())
+    frames: list[dict] = []
+    try:
+        with client.websocket_connect("/api/v1/chat/ws/sess1") as ws:
+            ws.send_text(json.dumps({
+                "type": "audio", "data": base64.b64encode(b"fake audio bytes").decode(),
+                "mime": "audio/webm",
+            }))
+
+            async def _reader():
+                while True:
+                    raw = await asyncio.to_thread(ws.receive_text)
+                    frames.append(json.loads(raw))
+
+            reader_task = asyncio.ensure_future(_reader())
+            try:
+                entered = await asyncio.to_thread(persist_entered.wait, 2.0)
+                assert entered, "test setup assumption broken: _persist_turn never entered"
+                # Several interim intervals' worth of real time while
+                # persistence is deliberately held open. If the keepalive
+                # were still alive at this point (the bug), an interim frame
+                # would arrive here.
+                await asyncio.sleep(0.1)
+                assert not any(f.get("interim") for f in frames), (
+                    f"interim frame arrived while _persist_turn was in "
+                    f"flight (keepalive not stopped before persist/reply): {frames}"
+                )
+                release_persist.set()
+                # Let the reply go out, then drain a bit more to catch any
+                # trailing interim frame.
+                await asyncio.sleep(0.1)
+            finally:
+                reader_task.cancel()
+                try:
+                    await reader_task
+                except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                    pass
+    finally:
+        patcher.stop()
+
+    reply_positions = [i for i, f in enumerate(frames)
+                        if f["type"] == "message" and not f.get("interim")]
+    assert reply_positions, f"real reply never arrived: {frames}"
+    reply_idx = reply_positions[0]
+    assert not any(f.get("interim") for f in frames[reply_idx + 1:]), (
+        f"interim frame arrived after the real reply: {frames}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_image_interim_stops_before_persist_and_reply(ws_media_ctx, monkeypatch) -> None:
+    sm, fake_agent = ws_media_ctx
+    monkeypatch.setattr(chat_api, "_INTERIM_INTERVAL_S", 0.02)
+
+    persist_entered = threading.Event()
+    release_persist = threading.Event()
+    real_persist = chat_api._persist_turn
+
+    async def _gated_persist(*a, **k):
+        persist_entered.set()
+        await asyncio.to_thread(release_persist.wait)
+        return await real_persist(*a, **k)
+
+    monkeypatch.setattr(chat_api, "_persist_turn", _gated_persist)
+
+    patcher, client = _connect(_make_tenant())
+    frames: list[dict] = []
+    try:
+        with client.websocket_connect("/api/v1/chat/ws/sess1") as ws:
+            ws.send_text(json.dumps({
+                "type": "image", "data": base64.b64encode(b"fake image bytes").decode(),
+                "mime": "image/jpeg",
+            }))
+
+            async def _reader():
+                while True:
+                    raw = await asyncio.to_thread(ws.receive_text)
+                    frames.append(json.loads(raw))
+
+            reader_task = asyncio.ensure_future(_reader())
+            try:
+                entered = await asyncio.to_thread(persist_entered.wait, 2.0)
+                assert entered, "test setup assumption broken: _persist_turn never entered"
+                await asyncio.sleep(0.1)
+                assert not any(f.get("interim") for f in frames), (
+                    f"interim frame arrived while _persist_turn was in "
+                    f"flight (keepalive not stopped before persist/reply): {frames}"
+                )
+                release_persist.set()
+                await asyncio.sleep(0.1)
+            finally:
+                reader_task.cancel()
+                try:
+                    await reader_task
+                except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                    pass
+    finally:
+        patcher.stop()
+
+    reply_positions = [i for i, f in enumerate(frames)
+                        if f["type"] == "message" and not f.get("interim")]
+    assert reply_positions, f"real reply never arrived: {frames}"
+    reply_idx = reply_positions[0]
+    assert not any(f.get("interim") for f in frames[reply_idx + 1:]), (
+        f"interim frame arrived after the real reply: {frames}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_audio_no_interim_after_media_fetch_error(ws_media_ctx, monkeypatch) -> None:
+    """Error-path variant: a media_url fetch failure must stop the keepalive
+    before the error frame is sent, so no interim frame can follow it.
+
+    Unlike the persist/reply ordering tests above, ``_stop_keepalive`` for
+    this path only runs *inside* the ``except`` handler once
+    ``_fetch_media_url`` actually raises (src/api/chat.py, the
+    ``if audio_bytes is None:`` block) -- so while the fetch is still in
+    flight the keepalive is legitimately still running and MAY send interim
+    frames (that's the pre-turn-media-window coverage proven by
+    ``test_audio_keepalive_covers_pre_turn_media_window`` above). This test's
+    own job is narrower: prove no interim frame lands AFTER the error frame,
+    not that the keepalive is silent during the fetch itself.
+
+    A plain ``asyncio.sleep``-then-raise fake stands in for the slow/failing
+    fetch -- no cross-loop ``threading.Event`` gate needed here, since
+    there's nothing to synchronize on except elapsed time relative to the
+    (patched tiny) interim interval.
+    """
+    sm, fake_agent = ws_media_ctx
+    monkeypatch.setattr(chat_api, "_INTERIM_INTERVAL_S", 0.02)
+    chat_api.set_media_store(_FakeMediaStore())
+
+    async def _slow_failing_fetch(url):
+        await asyncio.sleep(0.1)
+        raise RuntimeError("fetch failed")
+
+    monkeypatch.setattr(chat_api, "_fetch_media_url", _slow_failing_fetch)
+
+    patcher, client = _connect(_make_tenant())
+    try:
+        with client.websocket_connect("/api/v1/chat/ws/sess1") as ws:
+            ws.send_text(json.dumps({
+                "type": "audio", "media_url": "https://example.com/a.webm",
+            }))
+            typing = json.loads(ws.receive_text())
+            assert typing["type"] == "typing"
+
+            frame = json.loads(ws.receive_text())
+            while frame.get("interim"):
+                frame = json.loads(ws.receive_text())
+            assert frame["type"] == "error", f"expected error frame, got: {frame}"
+
+            trailing = await _drain_for(ws, 0.1)
+            assert not any(f.get("interim") for f in trailing), (
+                f"interim frame arrived after the error frame: {trailing}"
+            )
+    finally:
+        patcher.stop()
+
+
+@pytest.mark.asyncio
+async def test_image_no_interim_after_media_fetch_error(ws_media_ctx, monkeypatch) -> None:
+    """Same as ``test_audio_no_interim_after_media_fetch_error`` above, for
+    the image/video branch's ``_fetch_media_url`` failure path."""
+    sm, fake_agent = ws_media_ctx
+    monkeypatch.setattr(chat_api, "_INTERIM_INTERVAL_S", 0.02)
+
+    async def _slow_failing_fetch(url):
+        await asyncio.sleep(0.1)
+        raise RuntimeError("fetch failed")
+
+    monkeypatch.setattr(chat_api, "_fetch_media_url", _slow_failing_fetch)
+
+    patcher, client = _connect(_make_tenant())
+    try:
+        with client.websocket_connect("/api/v1/chat/ws/sess1") as ws:
+            ws.send_text(json.dumps({
+                "type": "image", "media_url": "https://example.com/pic.jpg",
+            }))
+            typing = json.loads(ws.receive_text())
+            assert typing["type"] == "typing"
+
+            frame = json.loads(ws.receive_text())
+            while frame.get("interim"):
+                frame = json.loads(ws.receive_text())
+            assert frame["type"] == "error", f"expected error frame, got: {frame}"
+
+            trailing = await _drain_for(ws, 0.1)
+            assert not any(f.get("interim") for f in trailing), (
+                f"interim frame arrived after the error frame: {trailing}"
+            )
+    finally:
+        patcher.stop()
 
 
 # --- Direct unit tests of _run_turn_with_keepalive ------------------------
@@ -508,7 +968,7 @@ class _FakeWS:
 
 @pytest.mark.asyncio
 async def test_keepalive_does_not_leak_tasks(monkeypatch) -> None:
-    monkeypatch.setattr(chat_api, "_KEEPALIVE_INTERVAL_S", 0.02)
+    monkeypatch.setattr(chat_api, "_INTERIM_INTERVAL_S", 0.02)
     fake_ws = _FakeWS()
 
     async def _slow_ok():
@@ -516,11 +976,12 @@ async def test_keepalive_does_not_leak_tasks(monkeypatch) -> None:
         return "turn-result"
 
     current = asyncio.current_task()
-    result = await chat_api._run_turn_with_keepalive(fake_ws, _slow_ok())
+    result = await chat_api._run_turn_with_keepalive(
+        fake_ws, _slow_ok(), session_id="sess1", language="en")
     assert result == "turn-result"
 
     sent_after_return = len(fake_ws.sent)
-    await asyncio.sleep(0.1)  # several keepalive intervals after the turn ended
+    await asyncio.sleep(0.1)  # several interim intervals after the turn ended
     assert len(fake_ws.sent) == sent_after_return, "keepalive kept sending after the turn finished"
 
     remaining = asyncio.all_tasks() - {current}
@@ -529,14 +990,15 @@ async def test_keepalive_does_not_leak_tasks(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_keepalive_send_failure_does_not_mask_result(monkeypatch) -> None:
-    monkeypatch.setattr(chat_api, "_KEEPALIVE_INTERVAL_S", 0.02)
+    monkeypatch.setattr(chat_api, "_INTERIM_INTERVAL_S", 0.02)
     fake_ws = _FakeWS(fail=True)
 
     async def _slow_ok():
         await asyncio.sleep(0.08)
         return "turn-result"
 
-    result = await chat_api._run_turn_with_keepalive(fake_ws, _slow_ok())
+    result = await chat_api._run_turn_with_keepalive(
+        fake_ws, _slow_ok(), session_id="sess1", language="en")
     assert result == "turn-result"
 
 
@@ -575,7 +1037,7 @@ async def test_outer_cancellation_during_drain_propagates(monkeypatch) -> None:
     cancellation and complete normally with ``"turn-result"``; with the fix,
     ``await task`` raises ``CancelledError`` and ``task.cancelled()`` is True.
     """
-    monkeypatch.setattr(chat_api, "_KEEPALIVE_INTERVAL_S", 0.01)
+    monkeypatch.setattr(chat_api, "_INTERIM_INTERVAL_S", 0.01)
     monkeypatch.setattr(chat_api, "_KEEPALIVE_DRAIN_S", 2.0)
 
     fake_ws = _WedgedWS()
@@ -587,7 +1049,8 @@ async def test_outer_cancellation_during_drain_propagates(monkeypatch) -> None:
         await asyncio.sleep(0.05)
         return "turn-result"
 
-    task = asyncio.ensure_future(chat_api._run_turn_with_keepalive(fake_ws, _turn()))
+    task = asyncio.ensure_future(chat_api._run_turn_with_keepalive(
+        fake_ws, _turn(), session_id="sess1", language="en"))
     try:
         await asyncio.wait_for(fake_ws.send_started.wait(), timeout=1.0)
         # Margin over the turn's own 0.05s sleep so it has definitely
@@ -680,3 +1143,68 @@ async def test_outer_cancellation_during_reap_propagates(monkeypatch) -> None:
             await ka
         except asyncio.CancelledError:
             pass
+
+
+# --- Pure-function tests ----------------------------------------------------
+
+
+def test_interim_wait_text_index_clamping_and_language_fallback() -> None:
+    # Index clamping: past the last variant, the final variant repeats --
+    # never an IndexError.
+    variants_hi = chat_api._INTERIM_WAIT_MESSAGES["hi"]
+    assert chat_api._interim_wait_text("hi", 0) == variants_hi[0]
+    assert chat_api._interim_wait_text("hi", 1) == variants_hi[1]
+    assert chat_api._interim_wait_text("hi", 2) == variants_hi[-1]
+    assert chat_api._interim_wait_text("hi", 99) == variants_hi[-1]
+
+    # Language fallback: unmapped code -> English.
+    assert chat_api._interim_wait_text("xx", 0) == chat_api._INTERIM_WAIT_MESSAGES["en"][0]
+
+
+def test_interim_messages_carry_no_masculine_self_reference() -> None:
+    # Hindi/Marathi/Gujarati/Punjabi grammatically mark the speaker's gender
+    # on first-person verbs -- a blunt substring check for known masculine
+    # markers across every variant guards against regressing to gendered
+    # self-reference (e.g. Hindi "काम कर रहा हूँ", Marathi "कळवतो").
+    masculine_markers = (
+        "रहा हूँ", "ता हूँ", "कळवतो", "करतो", "રહ્યો છું", "ਰਿਹਾ ਹਾਂ", "ਦੱਸਾਂਗਾ",
+    )
+    for lang, variants in chat_api._INTERIM_WAIT_MESSAGES.items():
+        for text in variants:
+            for marker in masculine_markers:
+                assert marker not in text, f"{lang!r} variant has masculine marker {marker!r}: {text!r}"
+    # _GREETINGS already established the neutral convention these messages
+    # mirror -- lock in that it stays that way too.
+    for lang, text in chat_api._GREETINGS.items():
+        for marker in masculine_markers:
+            assert marker not in text, f"{lang!r} greeting has masculine marker {marker!r}: {text!r}"
+
+
+def test_turn_timeout_leaves_room_for_llm_overhead_beyond_the_tool_budget() -> None:
+    # Tool time within a turn is no longer bounded by a fixed "2 calls total"
+    # assumption (a turn can carry more than 2 tool calls -- up to
+    # _max_tool_rounds rounds, each of which can itself carry several
+    # function_call parts in one LLM response). Instead it's bounded by a
+    # per-turn CUMULATIVE budget (chatbot._TOOL_BUDGET_S) regardless of how
+    # many calls make it up, with a per-call ceiling below that budget so one
+    # call can never consume the whole thing.
+    assert chatbot._TOOL_CALL_CEILING_S < chatbot._TOOL_BUDGET_S
+    # 40.0s is a documented floor for the realistic LLM-side worst case within
+    # a turn: up to 3 generate() calls (2 tool rounds + 1 final synthesis, or
+    # the forced-final path) plus one _CHAT_RETRY_TIMEOUT_S-bounded (12s)
+    # retry -- ~5-8s per call x 3 (~15-24s) + 12s retry (~27-36s realistic),
+    # comfortably under 40s of margin.
+    assert chat_api._TURN_TIMEOUT_S - chatbot._TOOL_BUDGET_S >= 40.0
+
+    # KB search (chatbot._KB_SEARCH_TIMEOUT_S) deliberately sits OUTSIDE
+    # _TOOL_BUDGET_S (see _exec_kb_tool) so a slow/exhausted CRM budget can
+    # never starve it. That means the two assertions above don't cover the
+    # full worst case: a turn carrying BOTH a fully-saturated CRM budget AND
+    # a slow KB search in every round (up to _max_tool_rounds=2) can push
+    # total tool time higher than _TOOL_BUDGET_S alone. This is a known,
+    # accepted edge case (needs both conditions at once, and even then
+    # degrades to the existing turn-timeout error path, not a silent
+    # failure) -- documented here so the number is visible, not re-derived.
+    worst_case_tool_time_s = chatbot._TOOL_BUDGET_S + 2 * chatbot._KB_SEARCH_TIMEOUT_S
+    assert worst_case_tool_time_s == 75.0
+    assert chat_api._TURN_TIMEOUT_S - worst_case_tool_time_s == 15.0

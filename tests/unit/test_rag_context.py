@@ -59,7 +59,7 @@ def _doc(filename: str, content: str) -> Document:
     return Document(id=filename, content=content, metadata={"filename": filename})
 
 
-def test_voicebot_kb_context_prioritizes_product_docs_over_filename_order() -> None:
+async def test_voicebot_kb_context_prioritizes_product_docs_over_filename_order() -> None:
     # This is the exact bug: casino-games (06) used to lose out to earlier
     # filename-sorted docs (01-05) crowding the char budget before it was
     # ever reached, even though it's core sales-call content.
@@ -68,21 +68,21 @@ def test_voicebot_kb_context_prioritizes_product_docs_over_filename_order() -> N
         _doc("06-casino-games.md", "Casino games include slots, live dealer..."),
     ]
     retriever = _FakeRetriever(docs)
-    ctx = build_voicebot_kb_context([retriever], max_chars=1000)
+    ctx = await build_voicebot_kb_context([retriever], max_chars=1000)
     assert "casino-games" in ctx
     assert "account-registration-login" in ctx
     # Casino comes first despite registration-login sorting first by filename.
     assert ctx.index("06-casino-games") < ctx.index("01-account-registration-login")
 
 
-def test_voicebot_kb_context_excludes_technical_help() -> None:
+async def test_voicebot_kb_context_excludes_technical_help() -> None:
     docs = [_doc("12-technical-help.md", "Troubleshooting steps...")]
     retriever = _FakeRetriever(docs)
-    ctx = build_voicebot_kb_context([retriever])
+    ctx = await build_voicebot_kb_context([retriever])
     assert ctx == ""
 
 
-def test_voicebot_kb_context_includes_unranked_docs_after_priority_list() -> None:
+async def test_voicebot_kb_context_includes_unranked_docs_after_priority_list() -> None:
     # A future KB doc not in the curated priority list must still be
     # included (not silently dropped), just ranked after known-priority docs.
     docs = [
@@ -90,12 +90,12 @@ def test_voicebot_kb_context_includes_unranked_docs_after_priority_list() -> Non
         _doc("06-casino-games.md", "Casino content."),
     ]
     retriever = _FakeRetriever(docs)
-    ctx = build_voicebot_kb_context([retriever])
+    ctx = await build_voicebot_kb_context([retriever])
     assert "99-new-feature" in ctx
     assert ctx.index("06-casino-games") < ctx.index("99-new-feature")
 
 
-def test_voicebot_kb_context_default_cap_fits_all_tier_one_product_docs() -> None:
+async def test_voicebot_kb_context_default_cap_fits_all_tier_one_product_docs() -> None:
     # Regression guard for the actual reported bug: with the real KB doc
     # sizes, all Tier-1 product docs (casino/sports/matka/bonuses) must fit
     # under the default cap, not just the first couple by filename order.
@@ -105,9 +105,41 @@ def test_voicebot_kb_context_default_cap_fits_all_tier_one_product_docs() -> Non
     ]
     docs = [_doc(fn, "y" * 3000) for fn in tier1]  # ~12k, close to real doc sizes
     retriever = _FakeRetriever(docs)
-    ctx = build_voicebot_kb_context([retriever])
+    ctx = await build_voicebot_kb_context([retriever])
     for fn in tier1:
         assert fn in ctx
+
+
+async def test_voicebot_kb_context_reads_persistent_store_when_bm25_cold(tmp_faiss_index) -> None:
+    """Simulates process A (ingest happened here) vs process B (cold BM25, e.g.
+    after a restart or on a different worker) sharing the same persistent
+    FAISS store. Pins the real bug: HybridRetriever.list_all() only sees
+    chunks indexed by THIS process's in-memory BM25, so a freshly-built
+    retriever in another process saw nothing — build_voicebot_kb_context must
+    fall back to the persistent store via list_all_persistent()."""
+    from src.providers.vector_store.faiss_store import FAISSAdapter
+    from src.rag.embeddings import HashEmbedder
+    from src.rag.retriever import HybridRetriever
+
+    warm = HybridRetriever(
+        embedder=HashEmbedder(dim=64),
+        vector_store=FAISSAdapter({"embedding_dim": 64, "index_path": tmp_faiss_index}),
+    )
+    await warm.index([
+        Document(
+            id="layout_casino::chunk-0",
+            content="Casino games include slots and live dealer.",
+            metadata={"filename": "06-casino-games.md", "section": 0},
+        )
+    ])
+
+    cold = HybridRetriever(
+        embedder=HashEmbedder(dim=64),
+        vector_store=FAISSAdapter({"embedding_dim": 64, "index_path": tmp_faiss_index}),
+    )
+    assert cold.list_all() == []  # pins the bug's precondition — must stay true
+    ctx = await build_voicebot_kb_context([cold])
+    assert "Casino games include slots" in ctx
 
 
 def test_build_rag_context_truncates_at_max_chars() -> None:

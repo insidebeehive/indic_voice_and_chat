@@ -130,13 +130,30 @@ Accepted content types per frame type:
 
 | Frame | Shape | Meaning |
 |---|---|---|
-| `typing` | `{"type":"typing"}` | turn accepted, reply coming — repeats roughly every 8s while a long turn is in flight (treat as idempotent; any other frame clears it) |
-| `message` | `{"type":"message","session_id":...,"text":...,"sources":[...],"suggestions":[...],"action":...}` | the AI reply |
+| `typing` | `{"type":"typing"}` | turn accepted, reply coming — sent once when a turn starts (treat as idempotent; any other frame clears it) |
+| `message` | `{"type":"message","session_id":...,"text":...,"sources":[...],"suggestions":[...],"action":...}` | the AI reply. May instead be an *interim* wait message — see below |
 | `audio_ack` | `{"type":"audio_ack","media_url":"/api/v1/chat/media/<id>"}` | voice note stored; URL serves the recording for transcript UIs |
 | `escalation` | `{"type":"escalation","reason":...,"context_summary":...}` | conversation escalated to a human |
 | `call_offer` | `{"type":"call_offer","reason":...,"call_url":...}` | AI offered a voice call; `call_url` is the WS the browser dials |
 | `ended` | `{"type":"ended","summary":...,"reason":"customer_ended"\|"idle_timeout"}` | session closed |
 | `error` | `{"type":"error","message":...,"reason":...}` | that turn failed; **the socket stays open** — show the message, let the customer retry |
+
+### Interim wait messages
+
+While a turn is taking unusually long (a slow CRM tool call, a slow media
+fetch/upload), the platform sends periodic `message` frames — roughly every
+15s — carrying an interim "still working on this" line in the session's
+language, tagged with `"interim": true`:
+
+```json
+{"type":"message","session_id":"...","text":"This is taking a little longer than usual — I'm still working on it and will get back to you shortly.","sources":[],"suggestions":[],"action":"none","interim":true}
+```
+
+These are ordinary chat bubbles — render them as such, no client-side change
+needed. They are never persisted in the transcript and are always followed
+by the real reply, an `error` frame, or `ended`. Relays that key off "bot
+sent a message" for ticket/session state tracking should check the `interim`
+flag to distinguish these from the real reply.
 
 An `error` frame never closes the socket. Treat it as per-message failure,
 not a connection failure. `reason` is machine-readable, for relays that want

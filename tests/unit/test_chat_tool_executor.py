@@ -125,13 +125,18 @@ async def test_x_api_key_wins_over_old_api_key_auth_type() -> None:
     assert headers["X-API-Key"] == "dedicated-x-api-key"
 
 
-# --- Timeout reduction (30s -> 10s): CRM relay 1006-on-silence fix -------
+# --- Timeout: 30s -> 10s (relay 1006-on-silence fix) -> 45s (widened back out
+# now that relay silence is handled by the visible interim WS message) -> 35s
+# (this constant is now only a fallback default for callers that don't pass
+# an explicit per-call budget; the real bound within a turn is the per-turn
+# cumulative budget enforced by src/agents/chatbot.py's _handle_with_tools,
+# kept in step with its _TOOL_CALL_CEILING_S) ------------------------------
 
 
-def test_default_tool_timeout_is_10s() -> None:
+def test_default_tool_timeout_is_35s() -> None:
     sig = inspect.signature(execute_crm_tool)
     default = sig.parameters["timeout_s"].default
-    assert default == tool_executor._DEFAULT_CRM_TOOL_TIMEOUT_S == 10.0
+    assert default == tool_executor._DEFAULT_CRM_TOOL_TIMEOUT_S == 35.0
 
 
 @pytest.mark.asyncio
@@ -161,7 +166,7 @@ async def test_owned_client_gets_the_default_timeout(monkeypatch) -> None:
     )
     assert out == {"status_code": 200, "data": {"ok": True}}
     timeout = captured["timeout"]
-    assert timeout.read == 10.0
+    assert timeout.read == 35.0
     assert timeout.connect == 5.0
 
 
