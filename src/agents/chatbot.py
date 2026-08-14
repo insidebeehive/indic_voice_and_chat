@@ -75,8 +75,52 @@ _CHAT_RETRY_TIMEOUT_S = 12.0
 # max_tokens.
 _CHAT_RETRY_MAX_TOKENS_CAP = 8192
 
+# Cumulative wall-clock ceiling on ALL tool execution within ONE turn, shared
+# across every round and every tool call the model emits. Not per-call: the
+# model can emit multiple function_call parts in a single response (see
+# gemini.py's _extract_tool_calls), so a per-call-only timeout doesn't bound
+# a turn with several tool calls in one round.
+_TOOL_BUDGET_S = 45.0
+# Absolute ceiling for any single tool call, even a lone first one — kept
+# below _TOOL_BUDGET_S so one call can never consume the entire budget and
+# leave zero chance for a second call the model also asked for.
+_TOOL_CALL_CEILING_S = 35.0
+# Below this much remaining budget, don't bother starting a call at all —
+# return the error result immediately rather than spending a connect
+# round-trip on a call that would immediately be cut short anyway.
+_TOOL_MIN_SLICE_S = 1.0
+
+# search_knowledge_base gets its OWN fixed timeout, entirely independent of
+# _TOOL_BUDGET_S/_TOOL_CALL_CEILING_S. It is a RAG/embedding lookup, not a
+# tenant CRM call — it never draws from, and is never shortened by, the CRM
+# tool-call budget above. Previously KB search shared that budget: a slow CRM
+# call could exhaust tool_elapsed_s, leaving a same-turn KB search skipped or
+# cut to near-zero, which meant retrieved_all stayed empty and the
+# hallucination guard (apply_hallucination_guard, gated on `if retrieved_all`
+# below) silently never fired — ungrounded, unguarded answers with no signal
+# anything went wrong. 15.0s is a generous fixed ceiling for an embedding
+# search/rerank (RAG quality matters and this call type wasn't the source of
+# the incident this budget was added for) while still bounding overall turn
+# latency rather than leaving it truly unbounded.
+_KB_SEARCH_TIMEOUT_S = 15.0
+
+# Shared "the budget ran out" tool result. Fed back to the model as the tool's
+# result content so the turn still produces a real (if degraded) answer
+# instead of hanging or erroring out. Always return a fresh dict() copy of
+# this (never the module-level object itself) — the result is JSON-serialized
+# per-call and callers/tests may hold onto it.
+_TOOL_BUDGET_EXHAUSTED = {
+    "error": "timed out",
+    "message": ("This data source did not respond in time. Answer now using what you "
+                "already have, briefly acknowledge you could not fetch that detail, and "
+                "do not ask the customer for any account details."),
+}
+
 # Executes a tenant-registered (CRM) tool call → a JSON-able result dict.
-CrmExecutor = Callable[[ToolCall], Awaitable[dict]]
+# ``timeout_s`` is this call's share of the turn's cumulative tool budget
+# (see _TOOL_BUDGET_S) — keyword-only so a positional-arg executor can't
+# silently swallow it as some other parameter.
+CrmExecutor = Callable[[ToolCall, float], Awaitable[dict]]
 
 # Unicode block boundaries for common Indic scripts.
 _SCRIPT_RANGES: list[tuple[int, int, str]] = [
@@ -352,6 +396,11 @@ class ChatBotAgent(BaseAgent):
         llm_ms_list: list[float] = []
         tool_ms_list: list[tuple[str, float]] = []
         rounds = 0
+        # Cumulative tool time spent so far THIS TURN — persists across both
+        # rounds (initialized here, outside the round loop below), which is
+        # what makes _TOOL_BUDGET_S a per-turn budget rather than a per-round
+        # one that would silently reset and double the real ceiling.
+        tool_elapsed_s = 0.0
         tools = list(BUILTIN_TOOLS) + list(self._crm_tools)
         # Tools fetch their own context (search_knowledge_base), so the system
         # prompt starts without a pre-built RAG block.
@@ -387,10 +436,37 @@ class ChatBotAgent(BaseAgent):
                 text = result.text
                 break
             messages.append(LLMMessage(role="assistant", content="", tool_calls=result.tool_calls))
-            for tc in result.tool_calls:
+            for i, tc in enumerate(result.tool_calls):
                 tool_start = time.perf_counter()
-                out, chunks, esc, off = await self._exec_tool(tc)
-                tool_ms_list.append((tc.name, (time.perf_counter() - tool_start) * 1000))
+                if tc.name == SEARCH_KB:
+                    # KB search has its own independent budget (see
+                    # _KB_SEARCH_TIMEOUT_S) — it must never draw from, or be
+                    # starved by, the CRM tool-call budget below.
+                    out, chunks, esc, off = await self._exec_kb_tool(tc)
+                elif tc.name in (ESCALATE, OFFER_CALL):
+                    # Pure local dict builders, zero I/O (see _dispatch_tool) —
+                    # they cannot time out, and must never be starved by an
+                    # exhausted CRM budget: that would silently swallow a
+                    # handoff-to-human the model explicitly requested.
+                    out, chunks, esc, off = await self._dispatch_tool(tc, 0.0)
+                else:
+                    # Fair-share the remaining cumulative CRM budget across the
+                    # CRM calls left in THIS response (KB/escalate/offer_call
+                    # excluded — budgeted/unbudgeted separately, see above),
+                    # capped per-call at _TOOL_CALL_CEILING_S so one call
+                    # (especially a lone first one) can never eat the whole
+                    # turn budget in a single shot.
+                    remaining = _TOOL_BUDGET_S - tool_elapsed_s
+                    calls_left = sum(
+                        1 for t in result.tool_calls[i:]
+                        if t.name not in (SEARCH_KB, ESCALATE, OFFER_CALL)
+                    )
+                    slice_s = min(_TOOL_CALL_CEILING_S, remaining / calls_left) if calls_left > 0 else 0.0
+                    out, chunks, esc, off = await self._exec_tool(tc, slice_s)
+                elapsed = time.perf_counter() - tool_start
+                if tc.name not in (SEARCH_KB, ESCALATE, OFFER_CALL):
+                    tool_elapsed_s += elapsed
+                tool_ms_list.append((tc.name, elapsed * 1000))
                 retrieved_all.extend(chunks)
                 escalation = esc or escalation
                 call_offer = off or call_offer
@@ -482,7 +558,45 @@ class ChatBotAgent(BaseAgent):
             input_tokens=in_tok, output_tokens=out_tok,
             llm_provider=self._llm_provider, llm_model=self._llm_model)
 
-    async def _exec_tool(self, tc: ToolCall):
+    async def _exec_tool(self, tc: ToolCall, timeout_s: float):
+        """Bound a tool call's dispatch to its budget slice.
+
+        ``timeout_s`` is this call's share of the turn's cumulative tool
+        budget (see _TOOL_BUDGET_S in _handle_with_tools). Below
+        _TOOL_MIN_SLICE_S the call isn't even attempted — the budget is
+        already exhausted, so return the degraded result immediately rather
+        than spend a connect round-trip on a call that would be cut short
+        anyway. Otherwise dispatch is wrapped in asyncio.wait_for as a
+        backstop: individual dispatch paths (e.g. the CRM HTTP call) are
+        expected to respect timeout_s themselves, but this guarantees the
+        slice is never exceeded regardless of tool type.
+        """
+        if timeout_s < _TOOL_MIN_SLICE_S:
+            log.warning("tool budget exhausted; skipping call", extra={"tool": tc.name})
+            return dict(_TOOL_BUDGET_EXHAUSTED), [], None, None
+        try:
+            return await asyncio.wait_for(self._dispatch_tool(tc, timeout_s), timeout=timeout_s)
+        except asyncio.TimeoutError:
+            log.warning("tool call exceeded its slice", extra={"tool": tc.name, "slice_s": timeout_s})
+            return dict(_TOOL_BUDGET_EXHAUSTED), [], None, None
+
+    async def _exec_kb_tool(self, tc: ToolCall):
+        """Dispatch search_knowledge_base under its own fixed timeout
+        (_KB_SEARCH_TIMEOUT_S), completely independent of the CRM tool-call
+        budget (_TOOL_BUDGET_S/tool_elapsed_s in _handle_with_tools) — a
+        slow/exhausted CRM budget must never cause a KB search to be skipped
+        or cut short. Mirrors _exec_tool's wait_for backstop shape, minus the
+        shared-budget slicing/min-slice-skip logic that doesn't apply here.
+        """
+        try:
+            return await asyncio.wait_for(
+                self._dispatch_tool(tc, _KB_SEARCH_TIMEOUT_S), timeout=_KB_SEARCH_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            log.warning("kb search exceeded its timeout",
+                        extra={"tool": tc.name, "timeout_s": _KB_SEARCH_TIMEOUT_S})
+            return dict(_TOOL_BUDGET_EXHAUSTED), [], None, None
+
+    async def _dispatch_tool(self, tc: ToolCall, timeout_s: float):
         """Dispatch a tool call. Returns (result_dict, chunks, escalation, call_offer)."""
         args = tc.arguments or {}
         if tc.name == SEARCH_KB:
@@ -506,7 +620,13 @@ class ChatBotAgent(BaseAgent):
         # Tenant CRM tool.
         if self._crm_executor is not None:
             try:
-                out = await self._crm_executor(tc)
+                # -1.0 margin: lets httpx's own read timeout normally fire
+                # before the outer wait_for in _exec_tool does, so the
+                # existing graceful {"error": ...} degradation path below
+                # wins the race in the common case. wait_for is just the
+                # backstop for cases where the read timeout doesn't equal
+                # true wall-clock time (e.g. a slow connect).
+                out = await self._crm_executor(tc, timeout_s=max(0.5, timeout_s - 1.0))
                 return (out if isinstance(out, dict) else {"result": out}), [], None, None
             except Exception:  # noqa: BLE001 — a failing tool must not kill the turn
                 log.exception("crm tool failed", extra={"tool": tc.name})

@@ -458,7 +458,7 @@ def make_chatbot_factory(registry, sessionmaker=None, crm_retrievers: "PerCrmRet
         )
         _crm_context = {"operator_id": _operator_id, "user_id": user_id}
 
-        async def crm_executor(tc) -> dict:
+        async def crm_executor(tc, *, timeout_s: float) -> dict:
             spec = crm_execs.get(tc.name)
             if spec is None:
                 return {"error": f"unknown tool {tc.name}"}
@@ -467,7 +467,8 @@ def make_chatbot_factory(registry, sessionmaker=None, crm_retrievers: "PerCrmRet
                 parameters=spec["parameters"], auth_type=spec["auth_type"],
                 token=spec["token"], args=tc.arguments or {}, context=_crm_context,
                 x_api_key=spec.get("x_api_key"),
-                extra_headers=spec.get("extra_headers"))
+                extra_headers=spec.get("extra_headers"),
+                timeout_s=timeout_s)
 
         # Platform-level LLM identity (provider + model) — same global default
         # dict get_platform_llm() itself builds the client from — threaded
