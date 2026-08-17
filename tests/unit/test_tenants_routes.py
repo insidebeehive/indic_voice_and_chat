@@ -289,6 +289,88 @@ async def test_update_tenant_status_and_404(ctx) -> None:
     assert (await client.patch(f"/tenants/{tid}", json={"status": "active"})).status_code == 401
 
 
+async def test_rotate_token_returns_new_token_and_invalidates_old(ctx) -> None:
+    client, resolver, _ = ctx
+    reg = (await client.post(
+        "/tenants", json=_body(slug="acme"), headers=ADMIN_HEADERS)).json()
+    tid = reg["tenant_id"]
+    old_token = reg["api_token"]
+
+    resp = await client.post(f"/tenants/{tid}/rotate-token", json={}, headers=ADMIN_HEADERS)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["tenant_id"] == tid
+    new_token = body["api_token"]
+    assert new_token.startswith("vox_")
+    assert new_token != old_token
+
+    # the new token authenticates; the old one is invalidated immediately
+    assert await resolver.resolve_by_token(hash_api_token(new_token)) is not None
+    assert await resolver.resolve_by_token(hash_api_token(old_token)) is None
+
+
+async def test_rotate_token_requires_admin_auth(ctx) -> None:
+    client, _, _ = ctx
+    reg = (await client.post(
+        "/tenants", json=_body(slug="acme"), headers=ADMIN_HEADERS)).json()
+    tid = reg["tenant_id"]
+    # no auth at all
+    assert (await client.post(f"/tenants/{tid}/rotate-token", json={})).status_code == 401
+    # a tenant-level token (not admin) is also rejected
+    assert (await client.post(
+        f"/tenants/{tid}/rotate-token", json={},
+        headers={"Authorization": f"Bearer {reg['api_token']}"}
+    )).status_code == 403
+
+
+async def test_rotate_token_nonexistent_tenant_404s(ctx) -> None:
+    client, _, _ = ctx
+    resp = await client.post("/tenants/nope/rotate-token", json={}, headers=ADMIN_HEADERS)
+    assert resp.status_code == 404
+
+
+async def test_rotate_token_resolver_refreshed(ctx) -> None:
+    """The new token authenticates immediately (no separate reload step),
+    proving the resolver was refreshed synchronously by the endpoint —
+    same pattern as test_update_tenant_fixes_stringee_keys_and_resolver."""
+    client, resolver, _ = ctx
+    reg = (await client.post(
+        "/tenants", json=_body(slug="acme"), headers=ADMIN_HEADERS)).json()
+    tid = reg["tenant_id"]
+
+    new_token = (await client.post(
+        f"/tenants/{tid}/rotate-token", json={}, headers=ADMIN_HEADERS)).json()["api_token"]
+
+    tctx = await resolver.resolve_by_token(hash_api_token(new_token))
+    assert tctx is not None
+    assert tctx.id == tid
+
+
+async def test_rotate_token_twice_both_rotations_succeed(ctx) -> None:
+    """Regression: the new row always uses label="rotated", so a second
+    rotation must not collide with uq_tenant_api_key_label against the row
+    the first rotation just wrote — the delete has to be flushed before the
+    insert, not just ordered first in the session."""
+    client, resolver, _ = ctx
+    reg = (await client.post(
+        "/tenants", json=_body(slug="acme"), headers=ADMIN_HEADERS)).json()
+    tid = reg["tenant_id"]
+
+    first = (await client.post(
+        f"/tenants/{tid}/rotate-token", json={}, headers=ADMIN_HEADERS))
+    assert first.status_code == 200
+    first_token = first.json()["api_token"]
+
+    second = (await client.post(
+        f"/tenants/{tid}/rotate-token", json={}, headers=ADMIN_HEADERS))
+    assert second.status_code == 200
+    second_token = second.json()["api_token"]
+    assert second_token != first_token
+
+    assert await resolver.resolve_by_token(hash_api_token(second_token)) is not None
+    assert await resolver.resolve_by_token(hash_api_token(first_token)) is None
+
+
 async def test_register_softphone_keys_mint_browser_token(ctx) -> None:
     """Registering Twilio softphone keys persists the *_env references and the
     resolver decrypts them so a browser AccessToken can be minted end-to-end."""
