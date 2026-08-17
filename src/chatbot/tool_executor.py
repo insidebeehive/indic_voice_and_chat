@@ -9,6 +9,7 @@ token the caller resolves (decrypted from tenant_secrets) — never logged.
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import Optional
 
@@ -109,6 +110,13 @@ async def execute_crm_tool(
         except Exception:  # noqa: BLE001 — non-JSON response
             body = {"text": resp.text}
         log.info("crm tool response", extra={"url": url, "status_code": resp.status_code})
+        # TEMP DEBUG (remove after the matka-availability investigation):
+        # log the actual response body so we can see what the CRM is really
+        # returning, not just the status code. Truncated — bodies here are
+        # small config/market payloads, not player PII.
+        log.info("crm tool response body [TEMP DEBUG]", extra={
+            "url": url, "body": json.dumps(body, default=str)[:4000],
+        })
         return {"status_code": resp.status_code, "data": body}
     except Exception as e:  # noqa: BLE001 — a failing CRM call must not kill the turn
         log.exception("crm tool http call failed", extra={"endpoint": endpoint})
