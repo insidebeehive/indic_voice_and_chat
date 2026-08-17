@@ -115,6 +115,11 @@ class RegisterTenantResponse(BaseModel):
     api_token: str
 
 
+class RotateTokenResponse(BaseModel):
+    tenant_id: str
+    api_token: str
+
+
 # --- Helpers ------------------------------------------------------------
 
 
@@ -505,6 +510,54 @@ async def update_tenant(
         events_webhook_secret_set=bool(pc.get("events_webhook_secret_env")),
         crm_id=t.crm_id,
     )
+
+
+@router.post("/{tenant_id}/rotate-token", response_model=RotateTokenResponse)
+async def rotate_tenant_token(
+    tenant_id: str,
+    request: Request,
+    session: AsyncSession = Depends(get_db_session),
+    _: None = Depends(require_admin),
+) -> RotateTokenResponse:
+    """Rotate a tenant's inbound API bearer token (admin).
+
+    Deletes every existing ``TenantApiKey`` row for this tenant and issues one
+    new ``vox_...`` token — the old token(s) stop authenticating immediately.
+    The plaintext is returned once, never stored. This is the tenant's
+    **inbound** token (external callers, e.g. the CRM, authenticating INTO our
+    API) — unrelated to the CRM's own outbound auth secrets in
+    ``TenantSecret``, which this does not touch.
+    """
+    t = await _require_tenant(session, tenant_id)
+
+    existing_keys = (await session.execute(
+        select(TenantApiKey).where(TenantApiKey.tenant_id == tenant_id)
+    )).scalars().all()
+    for key in existing_keys:
+        await session.delete(key)
+    # Flush the deletes before adding the new row — the new row reuses
+    # label="rotated", which collides with uq_tenant_api_key_label against a
+    # still-present old "rotated" row (a second rotation) unless the delete
+    # has actually hit the DB first; SQLAlchemy's unit of work does not
+    # guarantee DELETE-before-INSERT ordering within one flush otherwise.
+    await session.flush()
+
+    new_token = f"vox_{pysecrets.token_urlsafe(32)}"
+    session.add(TenantApiKey(
+        token_hash=hash_api_token(new_token), tenant_id=tenant_id, label="rotated"))
+
+    await session.commit()
+    try:
+        await _refresh_resolver(request, tenant_id)
+    except Exception:  # noqa: BLE001 — the DB is already rotated; the admin
+        # still needs this plaintext token even if the in-memory reload
+        # failed (it'll pick up the new token on the next natural reload
+        # regardless). Losing the token here would mean re-doing the DB
+        # surgery by hand since it's never stored anywhere.
+        log.exception("resolver refresh failed after token rotation", extra={"tenant_id": tenant_id})
+
+    log.info("rotated tenant api token", extra={"tenant_id": tenant_id})
+    return RotateTokenResponse(tenant_id=t.id, api_token=new_token)
 
 
 # --- Backoffice: list tenants + per-tenant analytics & billing -----------

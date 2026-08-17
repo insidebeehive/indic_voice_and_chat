@@ -61,7 +61,11 @@
   </div>
 
   <div class="card" id="detail" hidden>
-    <h2 id="detailTitle">Tenant</h2>
+    <div style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:.5rem;">
+      <h2 id="detailTitle" style="margin:0;">Tenant</h2>
+      <button class="btn-danger btn-sm" onclick="rotateApiToken()">Rotate API token</button>
+    </div>
+    <div id="rotateResult" style="margin:.5rem 0;"></div>
     <div class="tabs">
       <div class="tab active" id="tab_an" onclick="showTab('an')">Analytics</div>
       <div class="tab" id="tab_crm" onclick="showTab('crm')">CRM</div>
@@ -146,6 +150,7 @@ async function selectTenant(id, slug) {
     tr.classList.toggle("sel", tr.dataset.id === id);
   $("detail").hidden = false;
   $("detailTitle").textContent = `Tenant: ${slug}`;
+  $("rotateResult").innerHTML = "";
   showTab("an");
   await loadAnalytics(id);
   loadBilling(id);
@@ -160,6 +165,46 @@ function showTab(which) {
     const tabEl = $("tab_" + k);
     if (tabEl) tabEl.classList.toggle("active", which === k);
     $("pane_" + k).hidden = which !== k;
+  }
+}
+
+async function copyRotatedToken(btn, token) {
+  try {
+    await navigator.clipboard.writeText(token);
+    const old = btn.textContent;
+    btn.textContent = "Copied!";
+    setTimeout(() => { btn.textContent = old; }, 1500);
+  } catch (e) {
+    // clipboard API unavailable/blocked — the token text below is selectable instead.
+    btn.textContent = "Copy failed — select text below";
+  }
+}
+
+async function rotateApiToken() {
+  if (!SELECTED) return;
+  const slug = (window.TENANTS[SELECTED] || {}).slug || SELECTED;
+  if (!confirm(
+    `Rotate the API token for "${slug}"?\n\n` +
+    `This immediately invalidates the tenant's CURRENT API token. Anything using it ` +
+    `right now (CRM integration, chat widget, etc.) will stop authenticating until it's ` +
+    `updated with the new token. This cannot be undone.`
+  )) return;
+
+  $("rotateResult").innerHTML = `<span class="hint">rotating…</span>`;
+  const r = await apiSend("POST", `/api/v1/tenants/${SELECTED}/rotate-token`, {});
+  if (r.ok) {
+    const token = r.json.api_token;
+    $("rotateResult").innerHTML = `
+      <div class="card" style="border-color:#dc2626; background:#1a0f10;">
+        <div style="font-weight:700; color:#fca5a5; margin-bottom:.4rem;">
+          ✓ New API token generated — save it now, it will not be shown again.
+        </div>
+        <pre style="white-space:pre-wrap; word-break:break-all; background:#0b1220; border:1px solid #334155; border-radius:.35rem; padding:.5rem; margin:.4rem 0; user-select:all;">${token}</pre>
+        <button class="btn-sm" onclick="copyRotatedToken(this, '${token}')">Copy to clipboard</button>
+      </div>`;
+  } else {
+    $("rotateResult").innerHTML =
+      `<span class="hint">✗ rotate failed (${r.status}): ${r.json.detail || r.json.error || "error"}</span>`;
   }
 }
 
