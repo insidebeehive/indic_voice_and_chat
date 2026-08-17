@@ -129,15 +129,12 @@ OPERATORS: dict[str, dict] = {
             "withdrawal_processing_time": "24-48 hours (business days)",
         },
         "games_config": {
-            "casino_providers": ["Evolution Gaming", "Ezugi", "Pragmatic Play", "Spribe"],
-            "sports": ["Cricket", "Football", "Tennis", "Kabaddi", "Basketball"],
-            "leagues_covered": ["IPL", "T20 World Cup", "EPL", "Serie A", "Davis Cup"],
-            "live_casino": True,
-            "matka_available": True,
-            "virtual_sports": True,
-            "lottery_games": ["Kerala Lottery", "Bhutan Lottery"],
-            "in_play_betting": True,
-            "cashout_available": True,
+            "casino": {"enabled": True, "under_maintenance": False, "default_url": None},
+            "sports": {"enabled": True, "external": False, "internal": True,
+                       "provider": "INTERNAL", "under_maintenance": False},
+            "sports_exchange": {"enabled": False},
+            "matka": {"enabled": True, "under_maintenance": False},
+            "lottery": {"enabled": False},
         },
         "promotions": {
             "active_promotions": [
@@ -291,7 +288,7 @@ async def get_operator_games_config(
     authorization: Optional[str] = Header(None),
 ):
     _check_auth(authorization)
-    return _get_operator(operator_id)["games_config"]
+    return {"operator_id": operator_id, **_get_operator(operator_id)["games_config"]}
 
 
 @app.get("/operators/{operator_id}/promotions")

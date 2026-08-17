@@ -264,10 +264,11 @@ OPERATOR_TOOLS: dict[str, dict] = {
     },
     "get_operator_games_config": {
         "description": (
-            "Get the operator's product and games configuration: which casino game "
-            "providers/aggregators are enabled, available sports and leagues, whether "
-            "live casino is enabled, Matka/lottery/virtual-sports availability, "
-            "in-play betting support, and cashout availability on sports bets. "
+            "Get the operator's product-category availability: for each of casino, "
+            "sports, sports_exchange, matka, and lottery, whether it's enabled "
+            "(plus sports' internal/external provider and casino/sports/matka "
+            "maintenance status where applicable). No provider names, league lists, "
+            "or per-game details are returned by this endpoint. "
             "Call this when the customer asks which game CATEGORIES or product types "
             "are available on the platform (e.g. 'do you have live casino?', "
             "'is sports betting available?', 'do you have Matka?', "

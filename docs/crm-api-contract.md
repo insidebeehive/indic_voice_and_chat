@@ -464,22 +464,20 @@ GET /operators/{operator_id}/payment-config
 GET /operators/{operator_id}/games-config
 ```
 
-**When called:** Questions about available games, sports, live casino, Matka, virtual sports, in-play betting.
+**When called:** Questions about available games, sports, live casino, Matka, lottery.
 
-**Expected response:**
+**Actual response** (per-category `enabled` flags, nested — not flat lists/bools):
 ```json
 {
-  "casino_providers": ["Evolution Gaming", "Ezugi", "Pragmatic Play"],
-  "sports": ["Cricket", "Football", "Tennis", "Kabaddi"],
-  "leagues_covered": ["IPL", "T20 World Cup", "EPL"],
-  "live_casino": true,
-  "matka_available": true,
-  "virtual_sports": true,
-  "lottery_games": ["Kerala Lottery", "Bhutan Lottery"],
-  "in_play_betting": true,
-  "cashout_available": true
+  "operator_id": "…",
+  "casino": { "enabled": true, "under_maintenance": false, "default_url": null },
+  "sports": { "enabled": true, "external": false, "internal": true, "provider": "INTERNAL", "under_maintenance": false },
+  "sports_exchange": { "enabled": false },
+  "matka": { "enabled": true, "under_maintenance": false },
+  "lottery": { "enabled": false }
 }
 ```
+No provider/league lists, no `virtual_sports`/`in_play_betting`/`cashout_available` fields — those don't exist on this endpoint.
 
 ---
 
