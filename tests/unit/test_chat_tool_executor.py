@@ -190,3 +190,107 @@ async def test_read_timeout_returns_error_dict_not_raise() -> None:
         http_client=_TimingOutClient(),
     )
     assert out == {"error": "boom"}
+
+
+@pytest.mark.asyncio
+async def test_internal_ids_are_redacted_from_response_body() -> None:
+    """The real incident this guards: a CRM response echoing operator_id/
+    user_id (per the authoritative contract, e.g. games-config) must never
+    reach the LLM verbatim — a customer asked the bot to confirm a fake id
+    and it read the real one straight out of a tool response and stated it."""
+    client = _FakeClient({
+        "operator_id": "6c1a77a6-20b0-4fc9-ba4c-8add58aba9ef",
+        "user_id": "f38bc464-d319-41b3-b1f0-22c4fa1b4aaf",
+        "matka": {"enabled": True},
+        "nested": {"user_id": "should-also-be-redacted"},
+        "list_field": [{"operator_id": "should-be-redacted-too"}, {"keep": "me"}],
+    })
+    out = await execute_crm_tool(
+        endpoint="https://crm.example.com/api/operators/{operator_id}/games-config",
+        method="GET",
+        parameters={"operator_id": {"type": "string", "source": "session"}},
+        auth_type=None, token=None,
+        args={}, context={"operator_id": "6c1a77a6-20b0-4fc9-ba4c-8add58aba9ef"},
+        http_client=client,
+    )
+    data = out["data"]
+    assert data["operator_id"] == "[redacted]"
+    assert data["user_id"] == "[redacted]"
+    assert data["nested"]["user_id"] == "[redacted]"
+    assert data["list_field"][0]["operator_id"] == "[redacted]"
+    assert data["list_field"][1] == {"keep": "me"}
+    # Non-identifier data must pass through untouched.
+    assert data["matka"] == {"enabled": True}
+
+
+def test_redact_internal_ids_helper_is_recursive_and_leaves_other_keys_alone() -> None:
+    out = tool_executor._redact_internal_ids({
+        "operator_id": "x", "tenant_id": "y", "crm_id": "z", "session_id": "w",
+        "safe": "value",
+        "nested": {"user_id": "leak-me-not", "ok": 1},
+        "items": [{"operator_id": "a"}, "plain-string", 42],
+    })
+    assert out == {
+        "operator_id": "[redacted]", "tenant_id": "[redacted]",
+        "crm_id": "[redacted]", "session_id": "[redacted]",
+        "safe": "value",
+        "nested": {"user_id": "[redacted]", "ok": 1},
+        "items": [{"operator_id": "[redacted]"}, "plain-string", 42],
+    }
+    # Non-identifier strings/bools must pass through byte-for-byte -- only
+    # actual UUID substrings (and known-id keys) get touched.
+    assert tool_executor._redact_internal_ids(
+        {"matka": {"enabled": True}, "status": "Open", "type": "casino"}
+    ) == {"matka": {"enabled": True}, "status": "Open", "type": "casino"}
+
+
+def test_uuid_embedded_in_arbitrary_string_value_is_scrubbed() -> None:
+    """A UUID leaking under an unlisted key name (player_id, bare id) or
+    embedded inside free text (a CRM error message) must be scrubbed even
+    though the key itself isn't in the redacted-keys set."""
+    out = tool_executor._redact_internal_ids({
+        "message": "No player found with id 6c1a77a6-20b0-4fc9-ba4c-8add58aba9ef",
+        "player_id": "f38bc464-d319-41b3-b1f0-22c4fa1b4aaf",
+        "id": "0f7d5e4a-1111-2222-3333-444455556666",
+    })
+    assert out == {
+        "message": "No player found with id [redacted]",
+        "player_id": "[redacted]",
+        "id": "[redacted]",
+    }
+
+
+@pytest.mark.asyncio
+async def test_uuid_in_exception_message_is_scrubbed_from_error_path() -> None:
+    """A future raise_for_status() (or similar) could embed a UUID-bearing
+    URL/id in the exception text reaching the {"error": ...} path -- that
+    must be scrubbed the same as a normal response body."""
+
+    class _Boom:
+        async def get(self, *a, **k):
+            raise RuntimeError(
+                "404 for url https://crm.example.com/players/"
+                "6c1a77a6-20b0-4fc9-ba4c-8add58aba9ef"
+            )
+
+    out = await execute_crm_tool(
+        endpoint="https://x/y", method="GET", parameters={},
+        auth_type=None, token=None, args={}, http_client=_Boom(),
+    )
+    assert out == {
+        "error": "404 for url https://crm.example.com/players/[redacted]"
+    }
+
+
+def test_case_variant_keys_are_also_redacted() -> None:
+    """Casing variants of the canonical snake_case id keys must be caught by
+    normalized (lowercased, underscore-stripped) key matching -- not just the
+    exact casings previously hardcoded."""
+    out = tool_executor._redact_internal_ids({
+        "operatorID": "x", "USER_ID": "y", "TenantId": "z",
+        "bet_id": "keep-me", "event_id": "keep-me-too",
+    })
+    assert out == {
+        "operatorID": "[redacted]", "USER_ID": "[redacted]", "TenantId": "[redacted]",
+        "bet_id": "keep-me", "event_id": "keep-me-too",
+    }
