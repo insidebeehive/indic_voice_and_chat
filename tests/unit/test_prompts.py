@@ -133,6 +133,15 @@ def test_chatbot_prompt_has_scope_guardrails() -> None:
     assert "unable to answer" in prompt or "can only help" in prompt
 
 
+def test_chatbot_prompt_has_identity_confirmation_rule() -> None:
+    # Follow-up to the UUID-redaction fix: the bot must not act as a yes/no
+    # oracle confirming/denying customer-guessed profile fields (mobile,
+    # email, name, DOB) against real on-file data.
+    prompt = build_chatbot_system_prompt(company_name="Acme")
+    assert "IDENTITY CONFIRMATION" in prompt
+    assert "never confirm or deny" in prompt
+
+
 def test_chatbot_prompt_hinglish_script_matching() -> None:
     prompt = build_chatbot_system_prompt(company_name="Acme", language_default="hi")
     # Must instruct the model to match Roman script for Hinglish input.
