@@ -386,7 +386,7 @@ OPERATOR_TOOLS: dict[str, dict] = {
             "game_name": {"type": "string", "source": "llm",
                           "description": "Name of the casino game to check (e.g. 'Teen Patti', 'Andar Bahar')"},
         },
-        "default_path": "/operators/{operator_id}/players/{user_id}/games/{game_name}/bet-limit",
+        "default_path": "/casino/{operator_id}/players/{user_id}/games/{game_name}/bet-limit",
         "method": "GET",
     },
     "get_market_holiday_schedule": {
@@ -403,7 +403,7 @@ OPERATOR_TOOLS: dict[str, dict] = {
             "market_name": {"type": "string", "source": "llm",
                             "description": "Name of the matka market to check (e.g. 'Kalyan', 'Milan Day')"},
         },
-        "default_path": "/operators/{operator_id}/markets/{market_name}/holiday-schedule",
+        "default_path": "/matka/{operator_id}/markets/{market_name}/holiday-schedule",
         "method": "GET",
     },
 }
