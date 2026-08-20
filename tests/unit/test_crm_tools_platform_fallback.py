@@ -298,7 +298,7 @@ async def test_crm_linked_tenant_gets_crm_catalog_tools(sm_with_crm_seed) -> Non
     specs, execs, source = await resolve_crm_tools(tenant, sm_with_crm_seed)
 
     assert source == "crm_catalog"
-    assert len(specs) == 19  # matches the seeded catalog's tool count
+    assert len(specs) == len(ALL_TOOLS)  # matches the seeded catalog's tool count
     sample = execs["get_player_wallet"]
     assert sample["endpoint"] == "https://apistage.betstudio.io/api/players/{user_id}/wallet"
     assert sample["auth_type"] == "api_key"
