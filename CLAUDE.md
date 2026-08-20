@@ -37,11 +37,10 @@ assessment — handle those directly in the main session.
 
 ## Verification
 
-Tests live in `tests/` (pytest, run via `.venv/bin/python -m pytest`). Two
-known pre-existing failures on main (unrelated to most work):
-`test_chat_routes.py::test_claim_session_and_agent_ws` and
-`test_prompts.py::test_chatbot_prompt_has_scope_guardrails` — don't chase
-these unless the task is about them.
+Tests live in `tests/` (pytest, run via `.venv/bin/python -m pytest`). One
+known pre-existing failure on main (unrelated to most work):
+`test_chat_routes.py::test_claim_session_and_agent_ws` — don't chase
+this unless the task is about it.
 
 ## Existing standing preferences
 

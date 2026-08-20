@@ -500,6 +500,7 @@ def make_chatbot_factory(registry, sessionmaker=None, crm_retrievers: "PerCrmRet
             crm_retriever=_crm_retriever_for(tenant, crm_retrievers),
             company_name=tenant.name,
             language_default=getattr(tenant.settings, "default_language", None) or "en",
+            tenant_timezone=getattr(tenant.settings, "timezone", "Asia/Kolkata"),
             store=registry.session_stores.get(tenant),
             enable_tools=True,
             crm_tools=crm_specs,

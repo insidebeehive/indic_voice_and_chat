@@ -5,6 +5,7 @@ from src.interfaces.vector_store import Document
 from src.rag.context_builder import (
     GuardConfig,
     apply_hallucination_guard,
+    apply_no_grounding_guard,
     build_rag_context,
     build_voicebot_kb_context,
 )
@@ -240,3 +241,74 @@ def test_guard_low_confidence_with_no_sources_passes_through() -> None:
     out = apply_hallucination_guard(response, rag)
     assert out.response_text == "I'm not sure"
     assert out.confidence == "low"
+
+
+# --- No-grounding guard --------------------------------------------------
+
+
+def test_no_grounding_guard_fires_on_ungrounded_high_confidence_time_claim() -> None:
+    response = ChatBotResponse(
+        response_text="It's 11:24 PM right now.",
+        language="en",
+        confidence="high",
+    )
+    out = apply_no_grounding_guard(response, retrieved_any=False, tool_calls_made=[])
+    assert out.confidence == "low"
+    # Text is NOT rewritten — only confidence is downgraded (documented as a
+    # deliberate choice: a lexically-detected risk pattern isn't proof of
+    # fabrication, just a downgrade-and-log signal).
+    assert out.response_text == "It's 11:24 PM right now."
+
+
+def test_no_grounding_guard_fires_on_ungrounded_currency_figure() -> None:
+    response = ChatBotResponse(
+        response_text="The minimum bet is ₹10 and the maximum is ₹10,000.",
+        language="en",
+        confidence="high",
+    )
+    out = apply_no_grounding_guard(response, retrieved_any=False, tool_calls_made=[])
+    assert out.confidence == "low"
+
+
+def test_no_grounding_guard_skips_when_a_tool_was_called() -> None:
+    response = ChatBotResponse(
+        response_text="It's 11:24 PM right now.",
+        language="en",
+        confidence="high",
+    )
+    out = apply_no_grounding_guard(response, retrieved_any=False, tool_calls_made=["get_game"])
+    assert out.confidence == "high"
+    assert out is response  # unchanged, passed through as-is
+
+
+# NOTE: retrieved_any=True is not reachable via the current chatbot.py call site
+# (the guard is only invoked when retrieved_all is empty) — this test covers the
+# function's own documented contract, not a currently-reachable production path.
+def test_no_grounding_guard_skips_when_retrieval_happened() -> None:
+    response = ChatBotResponse(
+        response_text="It's 11:24 PM right now.",
+        language="en",
+        confidence="high",
+    )
+    out = apply_no_grounding_guard(response, retrieved_any=True, tool_calls_made=[])
+    assert out.confidence == "high"
+
+
+def test_no_grounding_guard_skips_low_confidence() -> None:
+    response = ChatBotResponse(
+        response_text="It's 11:24 PM right now.",
+        language="en",
+        confidence="low",
+    )
+    out = apply_no_grounding_guard(response, retrieved_any=False, tool_calls_made=[])
+    assert out.confidence == "low"
+
+
+def test_no_grounding_guard_passes_through_unrelated_text() -> None:
+    response = ChatBotResponse(
+        response_text="KYC usually takes 24-48 hours to review.",
+        language="en",
+        confidence="high",
+    )
+    out = apply_no_grounding_guard(response, retrieved_any=False, tool_calls_made=[])
+    assert out.confidence == "high"
