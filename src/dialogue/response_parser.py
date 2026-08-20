@@ -61,7 +61,14 @@ _CONFIDENCES = {"high", "medium", "low"}
 
 _CHATBOT_FALLBACK_TEXT = "Sorry, I couldn't formulate an answer. Could you rephrase?"
 _VOICEBOT_FALLBACK_TEXT = "Maaf kijiye, main samjha nahi. Kya aap dobara bata sakte hain?"
-_EMPTY_RESPONSE_TEXT = "Maaf kijiye, ek minute de dijiye."
+# Shown when the LLM's raw output was completely empty (even after the one
+# built-in retry). Must NOT imply a follow-up is coming — this is a
+# turn-based request/response system, not a live session; nothing else will
+# be sent unless the customer asks again. Split by bot type/language like
+# the other two fallbacks above (a prior single hardcoded-Hindi version was
+# shown even in English chatbot conversations).
+_CHATBOT_EMPTY_RESPONSE_TEXT = "Sorry, I wasn't able to put together an answer — could you ask that again?"
+_VOICEBOT_EMPTY_RESPONSE_TEXT = "Maaf kijiye, main jawab nahi de payi. Kya aap dobara pooch sakte hain?"
 
 
 def is_unusable_response(response_text: str) -> bool:
@@ -69,13 +76,16 @@ def is_unusable_response(response_text: str) -> bool:
     canned lines — the caller should consider retrying rather than showing
     this to the customer as-is.
 
-    Covers all three canned-fallback branches (empty input, missing
-    response_text field, and a still-JSON-looking leftover after a failed
-    parse — see ``_fallback_text``) via a single check against their known
-    literal text, so it stays correct automatically if a fourth branch is
-    ever added here as long as it also returns one of these constants.
+    Covers all four canned-fallback branches (empty input for each bot type,
+    missing response_text field, and a still-JSON-looking leftover after a
+    failed parse — see ``_fallback_text``) via a single check against their
+    known literal text, so it stays correct automatically if a fifth branch
+    is ever added here as long as it also returns one of these constants.
     """
-    return response_text in (_CHATBOT_FALLBACK_TEXT, _VOICEBOT_FALLBACK_TEXT, _EMPTY_RESPONSE_TEXT)
+    return response_text in (
+        _CHATBOT_FALLBACK_TEXT, _VOICEBOT_FALLBACK_TEXT,
+        _CHATBOT_EMPTY_RESPONSE_TEXT, _VOICEBOT_EMPTY_RESPONSE_TEXT,
+    )
 
 
 def parse_voicebot_response(text: str) -> VoiceBotResponse:
@@ -202,7 +212,7 @@ def _fallback_text(text: str, speakable: bool = False) -> str:
     """
     cleaned = text.strip().replace("```json", "").replace("```", "").strip()
     if not cleaned:
-        return _EMPTY_RESPONSE_TEXT
+        return _VOICEBOT_EMPTY_RESPONSE_TEXT if speakable else _CHATBOT_EMPTY_RESPONSE_TEXT
     if cleaned.startswith("{") and '"response_text"' in cleaned:
         # Still looks like an unparsed JSON envelope — never expose raw LLM
         # JSON to the customer (or speak it via TTS). Fall back to the same
