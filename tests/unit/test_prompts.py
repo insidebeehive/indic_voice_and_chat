@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 
 import yaml
 
@@ -126,11 +127,35 @@ def test_chatbot_prompt_has_scope_guardrails() -> None:
     assert "SCOPE" in prompt
     # player- and operator-specific are named separately.
     assert "player-specific" in prompt or "PLAYER-SPECIFIC" in prompt
-    assert "operator-specific" in prompt or "OPERATOR-SPECIFIC" in prompt
+    assert "OPERATOR/PLATFORM" in prompt
     # agent IS the support — should never defer to an external team.
     assert "YOU are the support" in prompt
-    # off-topic → declined (exact wording may vary).
-    assert "unable to answer" in prompt or "can only help" in prompt
+    # off-topic handling is still SCOPE item 4 (responds warmly, then redirects);
+    # DEPTH-MATCHING is a separate, added section reinforcing not overengaging on it.
+    assert "DEPTH-MATCHING" in prompt
+    assert "standalone deliverable outside your job" in prompt
+
+
+def test_chatbot_prompt_operator_scope_branches_on_tool_registration() -> None:
+    with_tools = build_chatbot_system_prompt(company_name="Acme", has_operator_tools=True)
+    without_tools = build_chatbot_system_prompt(company_name="Acme", has_operator_tools=False)
+    assert "call the operator tool" in with_tools
+    assert "get_operator_games_config" in with_tools
+    assert "no real-time operator lookup tools" in without_tools
+    assert "Only concept-level answers are licensed" in without_tools
+    # The no-tool branch must still forbid guessing specifics.
+    assert "Never name or describe a specific game" in without_tools
+
+
+def test_chatbot_prompt_includes_local_time() -> None:
+    prompt = build_chatbot_system_prompt(company_name="Acme", tenant_timezone="Asia/Kolkata")
+    assert "Asia/Kolkata" in prompt
+    assert re.search(r"\b\d{2}:\d{2}\b", prompt) is not None
+
+
+def test_chatbot_prompt_falls_back_to_utc_on_invalid_timezone() -> None:
+    prompt = build_chatbot_system_prompt(company_name="Acme", tenant_timezone="Not/ARealZone")
+    assert "Current local time (UTC)" in prompt
 
 
 def test_chatbot_prompt_has_identity_confirmation_rule() -> None:

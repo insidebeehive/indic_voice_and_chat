@@ -28,6 +28,7 @@ from dataclasses import replace as _replace_cfg
 from typing import Any
 
 from src.agents.base import AgentSession, BaseAgent
+from src.chatbot.catalog import OPERATOR_TOOLS, PLAYER_TOOLS
 from src.chatbot.media import prepare_multimodal_content
 from src.chatbot.tools import BUILTIN_TOOLS, ESCALATE, OFFER_CALL, SEARCH_KB
 from src.dialogue.context import SessionStore
@@ -42,6 +43,7 @@ from src.interfaces.llm import ILLMProvider, LLMConfig, LLMMessage, LLMResult, T
 from src.rag.context_builder import (
     GuardConfig,
     apply_hallucination_guard,
+    apply_no_grounding_guard,
     build_rag_context,
     search_combined,
 )
@@ -256,6 +258,7 @@ class ChatBotAgent(BaseAgent):
         llm_config: LLMConfig | None = None,
         company_name: str = "[Your Company]",
         language_default: str = "en",
+        tenant_timezone: str = "Asia/Kolkata",
         store: SessionStore | None = None,
         guard_config: GuardConfig | None = None,
         max_context_chars: int = 2000,
@@ -283,6 +286,7 @@ class ChatBotAgent(BaseAgent):
         self._llm_config = llm_config or LLMConfig(response_format="json", max_tokens=4096)
         self._company = company_name
         self._language = language_default
+        self._tenant_timezone = tenant_timezone
         self._guard = guard_config
         self._max_context_chars = max_context_chars
         # Agentic tool-calling (opt-in): builtin tools (search KB / escalate /
@@ -406,6 +410,7 @@ class ChatBotAgent(BaseAgent):
         # prompt starts without a pre-built RAG block.
         messages = self._compose("", user_msg, query_text=query_text)
         retrieved_all: list[RetrievedChunk] = []
+        tool_calls_made: list[str] = []
         escalation: dict | None = None
         call_offer: dict | None = None
         text = ""
@@ -468,6 +473,8 @@ class ChatBotAgent(BaseAgent):
                     tool_elapsed_s += elapsed
                 tool_ms_list.append((tc.name, elapsed * 1000))
                 retrieved_all.extend(chunks)
+                if tc.name not in (ESCALATE, OFFER_CALL):
+                    tool_calls_made.append(tc.name)
                 escalation = esc or escalation
                 call_offer = off or call_offer
                 messages.append(LLMMessage(
@@ -538,12 +545,18 @@ class ChatBotAgent(BaseAgent):
         response.sources_used = list(dict.fromkeys([*sources, *(response.sources_used or [])]))
         if escalation:
             response.action = "escalate"
-        # Only guard when the agent actually retrieved (search_knowledge_base was
-        # called). A no-search turn (greeting, clarifying question, CRM-tool
-        # answer) is legitimately ungrounded — the no-retrieval fallback must not
-        # clobber it.
+        # Only guard fully when the agent actually retrieved (search_knowledge_base
+        # was called). A no-search turn (greeting, clarifying question, CRM-tool
+        # answer) is legitimately ungrounded via RAG — the no-retrieval fallback
+        # must not clobber it. But a turn with NEITHER retrieval NOR any tool call
+        # at all gets the narrower no-grounding guard instead, since that's a turn
+        # where nothing at all was consulted.
         if retrieved_all:
             response = apply_hallucination_guard(response, rag, self._guard)
+        else:
+            response = apply_no_grounding_guard(
+                response, retrieved_any=bool(retrieved_all), tool_calls_made=tool_calls_made,
+            )
         await self._persist(user_msg, query_text, response, len(retrieved_all))
         log.info(
             "chat turn done in %.2fs: llm=%s tools=%s rounds=%d retrieved=%d",
@@ -750,7 +763,9 @@ class ChatBotAgent(BaseAgent):
             language_default=self._language,
             rag_context=rag_text,
             extra_directives=extra,
-            has_player_tools=bool(self._crm_tools),
+            has_player_tools=any(t.name in PLAYER_TOOLS for t in self._crm_tools),
+            has_operator_tools=any(t.name in OPERATOR_TOOLS for t in self._crm_tools),
+            tenant_timezone=self._tenant_timezone,
         )
         messages: list[LLMMessage] = [LLMMessage(role="system", content=system_prompt)]
         # Replay the last MAX_HISTORY_TURNS exchanges (system is rebuilt each

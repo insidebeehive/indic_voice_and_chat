@@ -35,7 +35,7 @@ Your full transaction history is accessible from your account's wallet or histor
 
 ## Currency
 
-Your wallet operates in the currency assigned at registration. If the platform supports multiple currencies, your currency is fixed at the time of account creation and cannot be changed after the fact. All game results, bets, and promotions are calculated in your account currency.
+Your wallet operates in the currency assigned at registration. If the platform supports multiple currencies, your currency is fixed at the time of account creation and cannot be changed after the fact. All game results, bets, and promotions are calculated in your account currency. There is no workaround for this — registering a new or second account to obtain a different currency is not a valid alternative (it violates the platform's one-account-per-person terms) and should never be suggested as a solution.
 
 ## Real-Time Balance Updates
 

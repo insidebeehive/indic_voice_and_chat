@@ -16,6 +16,8 @@ The hallucination guard is a small post-LLM check:
 from __future__ import annotations
 
 import asyncio
+import logging
+import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Optional
 
@@ -25,6 +27,8 @@ from src.rag.retriever import RetrievedChunk
 
 if TYPE_CHECKING:
     from src.rag.retriever import HybridRetriever
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -267,4 +271,53 @@ def apply_hallucination_guard(
         new.confidence = "low"
         return new
 
+    return new
+
+
+_TIME_OF_DAY_PATTERN = re.compile(
+    r"\b\d{1,2}:\d{2}\s*(am|pm|AM|PM)?\b|\b\d{1,2}\.\d{2}\s*(am|pm|AM|PM)\b"
+)
+_CURRENCY_FIGURE_PATTERN = re.compile(r"(?:₹|\bRs\.?|\bINR)\s?\d[\d,]*\b", re.IGNORECASE)
+
+
+def apply_no_grounding_guard(
+    response: ChatBotResponse,
+    retrieved_any: bool,
+    tool_calls_made: list[str],
+) -> ChatBotResponse:
+    """Backstop for turns with NO grounding source at all — neither RAG
+    retrieval nor a tool call. ``apply_hallucination_guard`` only runs when
+    RAG retrieval happened, so a pure-parametric turn (no search, no tool)
+    gets no code-level check today.
+
+    Deliberately narrow: only downgrades confidence (never rewrites text)
+    when a high-confidence, fully-ungrounded response matches a small set
+    of lexically-detectable risk patterns (a stated time-of-day, a currency
+    figure). It cannot catch fluent, well-formed prose fabrication that
+    carries no such lexical tell (e.g. inventing specific game/variant
+    names) — that class of failure is defended by prompt-level grounding
+    rules instead, not this guard.
+    """
+    if retrieved_any or tool_calls_made:
+        return response
+    if response.confidence != "high" or not response.response_text:
+        return response
+    text = response.response_text
+    if not (_TIME_OF_DAY_PATTERN.search(text) or _CURRENCY_FIGURE_PATTERN.search(text)):
+        return response
+    new = ChatBotResponse(
+        response_text=response.response_text,
+        language=response.language,
+        sources_used=list(response.sources_used),
+        confidence="low",
+        action=response.action,
+        suggested_followups=list(response.suggested_followups),
+        raw=dict(response.raw),
+        parse_error=response.parse_error,
+    )
+    log.warning(
+        "no-grounding guard: high-confidence response with no retrieval/tool call "
+        "matched a risk pattern",
+        extra={"response_text": text[:200]},
+    )
     return new

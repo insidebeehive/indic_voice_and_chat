@@ -449,6 +449,61 @@ async def test_followup_turn_includes_prior_history_in_prompt(retriever) -> None
     assert last_call[-1].content == "What's the price?"
 
 
+def test_has_operator_tools_computed_from_crm_tool_names(retriever) -> None:
+    from src.interfaces.llm import ToolSpec
+
+    agent = _make_agent(
+        FakeLLM({"response_text": "ok", "language": "en", "confidence": "high", "action": "none"}),
+        retriever,
+        crm_tools=[ToolSpec(name="get_matka_config", description="", parameters={})],
+    )
+    messages = agent._compose("", LLMMessage(role="user", content="hi"), query_text="hi")
+    system_prompt = messages[0].content
+    assert "call the operator tool" in system_prompt
+
+
+def test_has_operator_tools_false_when_no_operator_tools_registered(retriever) -> None:
+    agent = _make_agent(
+        FakeLLM({"response_text": "ok", "language": "en", "confidence": "high", "action": "none"}),
+        retriever,
+    )
+    messages = agent._compose("", LLMMessage(role="user", content="hi"), query_text="hi")
+    system_prompt = messages[0].content
+    assert "no real-time operator lookup tools" in system_prompt
+
+
+def test_tenant_timezone_threaded_into_prompt(retriever) -> None:
+    agent = _make_agent(
+        FakeLLM({"response_text": "ok", "language": "en", "confidence": "high", "action": "none"}),
+        retriever,
+        tenant_timezone="Asia/Kolkata",
+    )
+    messages = agent._compose("", LLMMessage(role="user", content="hi"), query_text="hi")
+    assert "Asia/Kolkata" in messages[0].content
+
+
+def test_has_player_tools_false_when_only_operator_tools_registered(retriever) -> None:
+    # A Matka-only tenant registers ONLY an operator tool (get_matka_config is
+    # in OPERATOR_TOOLS, not PLAYER_TOOLS). has_player_tools must be computed
+    # from per-category membership, not bare `bool(self._crm_tools)` — the
+    # latter would wrongly report True just because *some* tool is registered,
+    # picking the "call the relevant tool" player_scope branch even though no
+    # player tool exists for this tenant.
+    from src.interfaces.llm import ToolSpec
+
+    agent = _make_agent(
+        FakeLLM({"response_text": "ok", "language": "en", "confidence": "high", "action": "none"}),
+        retriever,
+        crm_tools=[ToolSpec(name="get_matka_config", description="", parameters={})],
+    )
+    messages = agent._compose("", LLMMessage(role="user", content="hi"), query_text="hi")
+    system_prompt = messages[0].content
+    # player_scope must be the NO-tools branch: no PLAYER_TOOLS are registered.
+    assert "you have no real-time lookup tools" in system_prompt
+    # operator_scope must be the has-tools branch: get_matka_config IS an operator tool.
+    assert "call the operator tool" in system_prompt
+
+
 @pytest.mark.asyncio
 async def test_persists_to_redis(retriever, fake_redis) -> None:
     llm = FakeLLM({
