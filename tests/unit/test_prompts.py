@@ -139,7 +139,7 @@ def test_chatbot_prompt_has_scope_guardrails() -> None:
 def test_chatbot_prompt_operator_scope_branches_on_tool_registration() -> None:
     with_tools = build_chatbot_system_prompt(company_name="Acme", has_operator_tools=True)
     without_tools = build_chatbot_system_prompt(company_name="Acme", has_operator_tools=False)
-    assert "call the operator tool" in with_tools
+    assert "Call the operator tool" in with_tools
     assert "get_operator_games_config" in with_tools
     assert "no real-time operator lookup tools" in without_tools
     assert "Only concept-level answers are licensed" in without_tools

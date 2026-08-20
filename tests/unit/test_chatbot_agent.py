@@ -459,7 +459,7 @@ def test_has_operator_tools_computed_from_crm_tool_names(retriever) -> None:
     )
     messages = agent._compose("", LLMMessage(role="user", content="hi"), query_text="hi")
     system_prompt = messages[0].content
-    assert "call the operator tool" in system_prompt
+    assert "Call the operator tool" in system_prompt
 
 
 def test_has_operator_tools_false_when_no_operator_tools_registered(retriever) -> None:
@@ -501,7 +501,7 @@ def test_has_player_tools_false_when_only_operator_tools_registered(retriever) -
     # player_scope must be the NO-tools branch: no PLAYER_TOOLS are registered.
     assert "you have no real-time lookup tools" in system_prompt
     # operator_scope must be the has-tools branch: get_matka_config IS an operator tool.
-    assert "call the operator tool" in system_prompt
+    assert "Call the operator tool" in system_prompt
 
 
 @pytest.mark.asyncio
