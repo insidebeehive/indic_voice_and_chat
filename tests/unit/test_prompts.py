@@ -142,9 +142,9 @@ def test_chatbot_prompt_operator_scope_branches_on_tool_registration() -> None:
     assert "Call the operator tool" in with_tools
     assert "get_operator_games_config" in with_tools
     assert "no real-time operator lookup tools" in without_tools
-    assert "Only concept-level answers are licensed" in without_tools
+    assert "only concept-level answers are licensed" in without_tools
     # The no-tool branch must still forbid guessing specifics.
-    assert "Never name or describe a specific game" in without_tools
+    assert "never name or describe a specific game" in without_tools
 
 
 def test_chatbot_prompt_includes_local_time() -> None:
