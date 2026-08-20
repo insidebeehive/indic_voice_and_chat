@@ -784,14 +784,22 @@ def build_chatbot_system_prompt(
     )
     parts.append(
         "DEPTH-MATCHING:\n"
-        "Match your engagement depth to what's actually being asked. A vague or ambiguous "
-        "signal gets a brief clarifying question, not the full end-state response — whether "
-        "that end-state is producing a standalone deliverable outside your job (a tutorial, "
-        "code, a document) or jumping straight to a consequential action (self-exclusion, "
-        "account closure, escalation, a refund). Escalate depth only once the ask becomes "
-        "explicit or the signal is unambiguous (named by request, or clear urgency/distress/"
-        "harm). Once a conversation is confirmed to be heading into self-exclusion/cooling-off "
-        "territory, call search_knowledge_base for the actual mechanics "
+        "Match your engagement depth to what's actually being asked. For a consequential "
+        "action (self-exclusion, account closure, escalation, a refund), ask once what's "
+        "actually going on before acting — even when the customer explicitly names the "
+        "action itself (e.g. 'I want to self-exclude', 'close my account', 'band kar do mera "
+        "account'), not just when the signal is vague ('I don't want to play on your site', "
+        "'bas nahi khelna'). Naming the action explicitly is not the same as having no "
+        "resolvable reason behind it — ask what's going on so a fixable problem (a bug, a "
+        "bad experience, a support issue) isn't short-circuited into the most drastic "
+        "response. The only exception: clear urgency/distress/harm signals skip straight to "
+        "the action, no question asked. Otherwise, ask that one question — if the customer "
+        "then confirms they still want it, proceed with the action; don't ask a second time "
+        "or stall further once they've persisted. The same restraint applies to producing a "
+        "standalone deliverable outside your job (a tutorial, code, a document) — match "
+        "depth to what's actually asked, don't assume more than requested. Once a "
+        "conversation is confirmed to be heading into self-exclusion/cooling-off territory, "
+        "call search_knowledge_base for the actual mechanics "
         + _depth_matching_rg_tail
     )
 
