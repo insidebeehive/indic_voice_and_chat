@@ -365,6 +365,47 @@ OPERATOR_TOOLS: dict[str, dict] = {
         "default_path": "/operators/{operator_id}/platform-config",
         "method": "GET",
     },
+    "get_bet_limit": {
+        "description": (
+            "Get the applicable bet limit (minimum and maximum stake) and "
+            "maximum profit (the upper limit on potential winnings) for a "
+            "specific player on a specific CASINO game. Does not cover Matka — "
+            "Matka stake/bet-type limits come from get_matka_config instead. "
+            "The CRM resolves any user-specific overrides, tier-based rules, or "
+            "blanket per-user limits internally and returns the single "
+            "effective limit — never guess or reconcile limits from other "
+            "tools yourself. Call this whenever a player asks about bet limits "
+            "for a named casino game (e.g. 'what's the bet limit for Teen "
+            "Patti?', 'minimum bet on Andar Bahar?')."
+        ),
+        "parameters": {
+            "operator_id": {"type": "string", "source": "session",
+                            "description": "Operator identifier"},
+            "user_id": {"type": "string", "source": "session",
+                        "description": "Player identifier"},
+            "game_name": {"type": "string", "source": "llm",
+                          "description": "Name of the casino game to check (e.g. 'Teen Patti', 'Andar Bahar')"},
+        },
+        "default_path": "/operators/{operator_id}/players/{user_id}/games/{game_name}/bet-limit",
+        "method": "GET",
+    },
+    "get_market_holiday_schedule": {
+        "description": (
+            "Get whether a specific market/game is closed on a given date (e.g. "
+            "a national holiday or a scheduled closure). Call this when a "
+            "player asks whether markets are open or closed on a specific date "
+            "or holiday (e.g. 'are markets closed on Independence Day?', "
+            "'is Kalyan open tomorrow?')."
+        ),
+        "parameters": {
+            "operator_id": {"type": "string", "source": "session",
+                            "description": "Operator identifier"},
+            "market_name": {"type": "string", "source": "llm",
+                            "description": "Name of the matka market to check (e.g. 'Kalyan', 'Milan Day')"},
+        },
+        "default_path": "/operators/{operator_id}/markets/{market_name}/holiday-schedule",
+        "method": "GET",
+    },
 }
 
 ALL_TOOLS: dict[str, dict] = {**PLAYER_TOOLS, **OPERATOR_TOOLS}
