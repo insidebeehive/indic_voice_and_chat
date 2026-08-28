@@ -13,6 +13,7 @@ from src.api import (
     conversations,
     crm_kb,
     crms,
+    deposit_verification,
     external_chat,
     knowledge,
     livekit_routes,
@@ -44,3 +45,4 @@ api_router.include_router(external_chat.router)
 api_router.include_router(telephony_hooks.router)
 api_router.include_router(telephony_crm.router)
 api_router.include_router(livekit_routes.router)
+api_router.include_router(deposit_verification.router)

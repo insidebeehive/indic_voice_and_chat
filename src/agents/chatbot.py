@@ -30,7 +30,7 @@ from typing import Any
 from src.agents.base import AgentSession, BaseAgent
 from src.chatbot.catalog import OPERATOR_TOOLS, PLAYER_TOOLS
 from src.chatbot.media import prepare_multimodal_content
-from src.chatbot.tools import BUILTIN_TOOLS, ESCALATE, OFFER_CALL, SEARCH_KB
+from src.chatbot.tools import BUILTIN_TOOLS, ESCALATE, OFFER_CALL, SEARCH_KB, SUBMIT_DEPOSIT_VERIFICATION
 from src.dialogue.context import SessionStore
 from src.dialogue.prompts import build_chatbot_system_prompt
 from src.dialogue.response_parser import (
@@ -265,6 +265,7 @@ class ChatBotAgent(BaseAgent):
         enable_tools: bool = False,
         crm_tools: list[ToolSpec] | None = None,
         crm_executor: CrmExecutor | None = None,
+        deposit_verification_executor: Callable | None = None,
         max_tool_rounds: int = 2,
         llm_provider: str = "",
         llm_model: str = "",
@@ -295,6 +296,7 @@ class ChatBotAgent(BaseAgent):
         self._enable_tools = enable_tools
         self._crm_tools = crm_tools or []
         self._crm_executor = crm_executor
+        self._deposit_verification_executor = deposit_verification_executor
         self._max_tool_rounds = max_tool_rounds
         # Identity of the platform LLM this agent was built with — threaded
         # through to ChatTurnResult for per-turn token-cost lookup
@@ -630,6 +632,22 @@ class ChatBotAgent(BaseAgent):
         if tc.name == OFFER_CALL:
             off = {"reason": args.get("reason", "")}
             return {"status": "offered", **off}, [], None, off
+        if tc.name == SUBMIT_DEPOSIT_VERIFICATION:
+            if self._deposit_verification_executor is None:
+                return {"error": "verification is not available"}, [], None, None
+            try:
+                out = await self._deposit_verification_executor(tc, timeout_s=max(0.5, timeout_s - 1.0))
+                return (out if isinstance(out, dict) else {"result": out}), [], None, None
+            except Exception:  # noqa: BLE001 — a failing submission must not kill the turn
+                log.exception("deposit verification submission failed", extra={"tool": tc.name})
+                return {
+                    "status": "error",
+                    "message": (
+                        "Could not submit the verification request right now. Let the "
+                        "customer know you're having trouble and offer to escalate to a "
+                        "human agent."
+                    ),
+                }, [], None, None
         # Tenant CRM tool.
         if self._crm_executor is not None:
             try:
@@ -765,6 +783,7 @@ class ChatBotAgent(BaseAgent):
             extra_directives=extra,
             has_player_tools=any(t.name in PLAYER_TOOLS for t in self._crm_tools),
             has_operator_tools=any(t.name in OPERATOR_TOOLS for t in self._crm_tools),
+            has_deposit_verification_tool=any(t.name == SUBMIT_DEPOSIT_VERIFICATION for t in self._crm_tools),
             tenant_timezone=self._tenant_timezone,
         )
         messages: list[LLMMessage] = [LLMMessage(role="system", content=system_prompt)]

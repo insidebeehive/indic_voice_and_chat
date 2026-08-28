@@ -12,6 +12,7 @@ from src.interfaces.llm import ToolSpec
 SEARCH_KB = "search_knowledge_base"
 ESCALATE = "escalate_to_human"
 OFFER_CALL = "offer_voice_call"
+SUBMIT_DEPOSIT_VERIFICATION = "submit_deposit_verification"
 
 BUILTIN_TOOL_NAMES = frozenset({SEARCH_KB, ESCALATE, OFFER_CALL})
 
@@ -63,3 +64,29 @@ BUILTIN_TOOLS: list[ToolSpec] = [
         },
     ),
 ]
+
+# Not in BUILTIN_TOOLS: only registered per-tenant, when the tenant has
+# deposit_verification enabled and a webhook_url configured (see
+# src/bootstrap.py's make_chatbot_factory).
+SUBMIT_DEPOSIT_VERIFICATION_TOOL_SPEC = ToolSpec(
+    name=SUBMIT_DEPOSIT_VERIFICATION,
+    description=(
+        "Submit the customer's deposit for manual verification against their proof "
+        "screenshot, when the deposit-status check shows the deposit failed but the "
+        "customer insists it succeeded. Requires a screenshot to already be uploaded "
+        "in this conversation — do not call this before the customer has sent one, "
+        "ask them to upload it first. This takes a few minutes; the result will be "
+        "delivered later in this same chat, not immediately — do not call this tool "
+        "again while a submission is already pending."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "order_id": {
+                "type": "string",
+                "description": "The order/transaction id from the deposit-status tool's response",
+            },
+        },
+        "required": ["order_id"],
+    },
+)

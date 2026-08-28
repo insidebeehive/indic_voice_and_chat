@@ -352,6 +352,14 @@ class ChatSupportConfig(BaseModel):
     chat_idle_timeout_seconds: int = 300
 
 
+class DepositVerificationConfig(BaseModel):
+    """Deposit dispute screenshot verification webhook settings."""
+    enabled: bool = False
+    webhook_url: Optional[str] = None
+    webhook_secret_env: Optional[str] = None
+    timeout_minutes: int = 5
+
+
 class TenantSettings(BaseModel):
     """Validated tenant configuration loaded from YAML."""
 
@@ -376,6 +384,7 @@ class TenantSettings(BaseModel):
     crm_id: Optional[str] = None
     whatsapp: TenantWhatsAppConfig = Field(default_factory=TenantWhatsAppConfig)
     chat_support: ChatSupportConfig = Field(default_factory=ChatSupportConfig)
+    deposit_verification: DepositVerificationConfig = Field(default_factory=DepositVerificationConfig)
     phone_numbers: list[str] = Field(default_factory=list)
 
     @field_validator("timezone")

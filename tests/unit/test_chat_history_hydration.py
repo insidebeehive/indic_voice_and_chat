@@ -236,6 +236,32 @@ async def test_human_agent_messages_replay_as_assistant(app) -> None:
     assert ticket_msgs[0].role == "assistant"
 
 
+async def test_system_pushed_messages_replay_as_assistant(app) -> None:
+    """push_async_message persists async-pushed messages (deposit verdicts,
+    verification-timeout notices) with role="system". _HYDRATE_ROLES now
+    includes "system" so these survive a reconnect, replayed as assistant
+    turns -- same rationale as human_agent above: from the model's point of
+    view, a system-pushed verdict is "what my side already said"."""
+    a, sm, llm, _tctx = app
+    client = TestClient(a)
+    sid = "cs_hydrate_system"
+    await _seed(sm, sid, [
+        ("customer", "my deposit failed"),
+        ("system", "Your deposit dispute was resolved: refund approved."),
+        ("customer", "thank you"),
+    ])
+
+    with client.websocket_connect(f"/chat/ws/{sid}") as ws:
+        ws.send_text(json.dumps({"type": "message", "text": "one more thing"}))
+        assert json.loads(ws.receive_text())["type"] == "typing"
+        assert json.loads(ws.receive_text())["type"] == "message"
+
+    last = llm.calls[-1]
+    verdict_msgs = [m for m in last if "refund approved" in str(m.content)]
+    assert verdict_msgs, "system-pushed verdict missing from replayed history"
+    assert verdict_msgs[0].role == "assistant"
+
+
 async def test_window_never_opens_on_assistant_turn(app) -> None:
     a, sm, llm, _tctx = app
     client = TestClient(a)

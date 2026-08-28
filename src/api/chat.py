@@ -26,7 +26,8 @@ import json
 import logging
 import socket
 import uuid
-from typing import Awaitable, Callable, NoReturn, Optional
+from types import SimpleNamespace
+from typing import Awaitable, Callable, NamedTuple, NoReturn, Optional
 from urllib.parse import urlsplit
 
 import httpx
@@ -80,6 +81,18 @@ _handoff_store: object | None = None  # SessionStore: carries chat→voice hando
 # _customer_queues: BO agent WS puts here → customer WS reads
 _bo_queues: dict = {}
 _customer_queues: dict = {}
+
+# Per-session queue for messages pushed into a *bot-mode* customer WS from
+# outside the normal request/response turn (e.g. a deposit-verification
+# webhook callback arriving after the vendor's async verdict, or a background
+# timeout task). Deliberately separate from ``_customer_queues`` above: that
+# dict is drained by ``_run_human_mode``'s race loop (human-agent handover
+# mode), while this one is drained by the ordinary bot-mode loop in
+# ``chat_websocket`` — the two loops are mutually exclusive per session, but
+# keeping the queues distinct avoids a delivery meant for one loop ever being
+# read out from under the other.
+_async_push_queues: dict[str, asyncio.Queue] = {}
+
 _media_store: Optional[IMediaStorage] = None
 
 # Active voice-call WebSockets keyed by chat_session_id.
@@ -410,7 +423,11 @@ def _scoped_session(tenant: TenantContext, session_id: str) -> str:
 
 
 # Roles in chat_messages that carry conversational content worth replaying.
-_HYDRATE_ROLES = {"customer", "agent", "human_agent"}
+# "system" is included so async-pushed messages (push_async_message persists
+# them with role="system" — e.g. deposit-verdict and verification-timeout
+# messages) survive a reconnect: without it the bot has no memory these were
+# ever delivered and can contradict a verdict already told to the customer.
+_HYDRATE_ROLES = {"customer", "agent", "human_agent", "system"}
 # How many persisted messages to replay on connect. ChatBotAgent._compose only
 # ever sends the last MAX_HISTORY_TURNS exchanges to the LLM
 # (src/agents/chatbot.py), so loading more than that window is dead weight —
@@ -476,7 +493,9 @@ async def _hydrate_agent_history(agent: ChatBotAgent, session_id: str, tenant_id
         # human_agent -> assistant: a human took over mid-chat, but from the
         # model's point of view those lines are still "what my side already
         # said", so replaying them as assistant turns stops the bot repeating
-        # help a human already gave.
+        # help a human already gave. system -> assistant for the same reason:
+        # async-pushed messages (deposit verdicts, timeout notices) are also
+        # "what my side already said" from the model's point of view.
         role = "user" if m.role == "customer" else "assistant"
         if not turns and role != "user":
             # Never open the replayed window on an assistant turn: the LIMIT
@@ -1250,6 +1269,39 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
         await websocket.close(code=1011, reason="tenant unavailable")
         return
 
+    # Deposit-verification reconnect sweep: a pending verification request may
+    # have quietly passed its timeout while nobody was connected to this
+    # session's socket. Catch that up now, before entering human/bot mode
+    # handling below, so a stale "pending" row doesn't linger indefinitely.
+    try:
+        from datetime import datetime, timezone
+
+        from src.models.deposit_verification import DepositVerificationRequest
+
+        async with _sm()() as db:
+            due_request_ids = (await db.execute(
+                select(DepositVerificationRequest.id).where(
+                    DepositVerificationRequest.session_id == session_id,
+                    DepositVerificationRequest.status == "pending",
+                    DepositVerificationRequest.timeout_at
+                    < datetime.now(timezone.utc).replace(tzinfo=None),
+                )
+            )).scalars().all()
+        for due_request_id in due_request_ids:
+            await _check_and_timeout_verification(due_request_id)
+        if due_request_ids:
+            # _check_and_timeout_verification escalates (and flips
+            # ChatSession.mode) via its OWN separate DB session, so the `row`
+            # fetched above is now stale — re-fetch it so the mode-branch
+            # below sees the escalation the sweep just performed instead of
+            # falling through into the bot loop.
+            async with _sm()() as db:
+                refreshed_row = await db.get(ChatSession, session_id)
+            if refreshed_row is not None:
+                row = refreshed_row
+    except Exception:  # noqa: BLE001 — the sweep must never block a reconnect
+        log.exception("deposit verification reconnect sweep failed", extra={"session_id": session_id})
+
     try:
         # Pass customer_id from the row already fetched above so the factory
         # doesn't re-query the same ChatSession row on another pool checkout.
@@ -1265,6 +1317,12 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
 
     await _hydrate_agent_history(agent, session_id, tenant.id)
 
+    # Declared here (not inside the try below) so the `finally` at the bottom
+    # of this function can safely check it even if an exception happens
+    # before the bot loop's own async_q is created (e.g. during the
+    # reconnect's _run_human_mode call just below).
+    async_q: Optional[asyncio.Queue] = None
+
     try:
         # Handle reconnect: session may already be in human/awaiting_human mode
         # (reuse the row fetched at connect — no second lookup for the same row).
@@ -1274,12 +1332,34 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
             # CRM declined — fall through to bot loop below
 
         idle_timeout = getattr(tenant.settings.chat_support, "chat_idle_timeout_seconds", 300) or None
+        # Bot-mode counterpart of `_bo_queues`/`_customer_queues`: lets a
+        # background/webhook-driven flow (deposit-verification callback, its
+        # timeout sweep) speak into this connection without a customer turn.
+        #
+        # Always create a NEW queue here (never `setdefault` onto an existing
+        # one) — if a prior connection for this session_id is still unwinding
+        # its own `finally` below, reusing its queue would make the identity
+        # check in that `finally` pass for the WRONG connection, causing the
+        # old connection's cleanup to pop (orphan) this new connection's live
+        # queue. An unconditional fresh queue keeps identity meaningful.
+        async_q = asyncio.Queue()
+        _async_push_queues[session_id] = async_q
 
         while True:
-            try:
-                raw = await asyncio.wait_for(
-                    websocket.receive_text(), timeout=idle_timeout)
-            except asyncio.TimeoutError:
+            ws_task = asyncio.ensure_future(websocket.receive_text())
+            aq_task = asyncio.ensure_future(async_q.get())
+            done, pending = await asyncio.wait(
+                {ws_task, aq_task}, return_when=asyncio.FIRST_COMPLETED,
+                timeout=idle_timeout,
+            )
+            for t in pending:
+                t.cancel()
+                try:
+                    await t
+                except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                    pass
+
+            if not done:
                 # Customer silent for idle_timeout seconds — close gracefully and
                 # fire session_closed so the CRM can auto-close the ticket.
                 farewell = (
@@ -1301,6 +1381,65 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
                     "type": "ended", "summary": summary, "reason": "idle_timeout",
                 }))
                 break
+
+            if aq_task in done:
+                # Async push won the race — deliver the already-built frame.
+                # `asyncio.wait(..., FIRST_COMPLETED)` can return BOTH tasks
+                # done in the same cycle (e.g. a customer message arrives the
+                # instant the push lands) — this must NOT `continue` past the
+                # ws_task handling below, or a real customer message is
+                # silently dropped with no log.
+                await websocket.send_text(aq_task.result())
+                # The push may be a deposit-verification timeout/webhook
+                # escalating this session (via _check_and_timeout_verification,
+                # which commits the mode flip on its OWN separate DB session
+                # and so cannot update our in-memory `row`). Re-check the
+                # session's current mode now so a live-connected socket
+                # doesn't keep answering as the bot after an out-of-band
+                # escalation just landed.
+                async with _sm()() as db:
+                    refreshed = await db.get(ChatSession, session_id)
+                if refreshed is not None:
+                    row = refreshed
+                if row.mode in ("awaiting_human", "human"):
+                    if ws_task in done:
+                        # A customer message completed in the very same cycle
+                        # as the push — forward it into the human queue
+                        # instead of letting it vanish when we hand off below
+                        # (_run_human_mode starts a fresh receive_text() and
+                        # would never see this already-consumed message).
+                        try:
+                            _raw = ws_task.result()
+                        except WebSocketDisconnect:
+                            raise  # outer except handles logging + cleanup
+                        try:
+                            _pending = json.loads(_raw)
+                        except (ValueError, TypeError):
+                            _pending = None
+                        _pending_text = (
+                            (_pending.get("text") or _pending.get("message") or "").strip()
+                            if _pending else ""
+                        )
+                        if _pending_text:
+                            await _forward_pending_text_to_bo(session_id, _pending_text)
+                    # Hand off via the same entry point normal in-turn
+                    # escalations use below (see the `_handle_escalation` /
+                    # `_run_human_mode` calls further down this loop).
+                    if await _run_human_mode(websocket, session_id, tenant):
+                        break
+                    # CRM declined/timed out — _run_human_mode already
+                    # reverted the session to bot mode; resume the bot loop.
+                    continue
+
+            if ws_task not in done:
+                # Only the async push fired this cycle (and it didn't
+                # escalate) — nothing else to process.
+                continue
+
+            try:
+                raw = ws_task.result()
+            except WebSocketDisconnect:
+                raise  # outer except handles logging + cleanup
             try:
                 msg = json.loads(raw)
             except json.JSONDecodeError:
@@ -1595,6 +1734,23 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
             await websocket.close()
         except Exception:  # noqa: BLE001
             pass
+    finally:
+        # Unlike `_bo_queues`/`_customer_queues` (which are never popped for
+        # any session, by design or oversight — see push_async_message's
+        # comment), `_async_push_queues` IS cleaned up here: it's created
+        # unconditionally on every bot-mode connection (not just escalated
+        # ones), so leaving it unpopped would leak one entry per chat session
+        # for the life of the process.
+        #
+        # Pop by identity, not just by key: if the same session_id reconnects
+        # while an OLD socket's `finally` is still unwinding (e.g. this one
+        # was slow to get here), popping unconditionally by key could remove
+        # the NEW connection's queue instead of this connection's own,
+        # orphaning it (the new connection would then push into a queue
+        # nothing drains). Only pop if the dict still holds the same queue
+        # object this connection created/owns.
+        if async_q is not None and _async_push_queues.get(session_id) is async_q:
+            _async_push_queues.pop(session_id, None)
 
 
 # --- Persistence helpers ------------------------------------------------
@@ -1706,6 +1862,53 @@ async def _persist_turn(
         return None
 
 
+async def push_async_message(
+    session_id: str, text: str, *, role: str = "system", frame_type: str = "async_message",
+) -> Optional[int]:
+    """Persist a message into ``session_id``'s transcript from OUTSIDE the normal
+    turn loop, and — if a customer WS is currently connected in bot mode — push
+    it onto that connection's live queue so it shows up immediately.
+
+    Used by background/webhook-driven flows (e.g. a deposit-verification
+    vendor callback, or the timeout sweep) that need to speak into a
+    conversation that may or may not still be connected. Never raises: this
+    may run unsupervised from a background task with no one watching for
+    exceptions, so a failure degrades to "message not delivered" rather than
+    crashing the caller.
+
+    Returns the new ``ChatMessage.id``, or ``None`` if the session doesn't
+    exist or persistence failed.
+    """
+    msg_id: Optional[int] = None
+    try:
+        async with _sm()() as db:
+            row = await db.get(ChatSession, session_id)
+            if row is None:
+                return None
+            message = ChatMessage(
+                session_id=session_id, role=role, type="text", content=text,
+            )
+            db.add(message)
+            row.message_count = (row.message_count or 0) + 1
+            await db.flush()
+            msg_id = message.id
+            await db.commit()
+    except Exception:  # noqa: BLE001 — background-safe: log, never raise
+        log.exception("push_async_message persistence failed", extra={"session_id": session_id})
+        return None
+
+    queue = _async_push_queues.get(session_id)
+    if queue is not None:
+        try:
+            await queue.put(json.dumps({
+                "type": frame_type, "session_id": session_id, "text": text,
+            }))
+        except Exception:  # noqa: BLE001 — delivery is best-effort
+            log.exception("push_async_message queue delivery failed", extra={"session_id": session_id})
+
+    return msg_id
+
+
 async def _end_session(session_id: str, summary: str = "") -> None:
     from datetime import datetime, timezone
     try:
@@ -1730,21 +1933,44 @@ async def _end_session(session_id: str, summary: str = "") -> None:
             pass
 
 
-async def _handle_escalation(
-    websocket: WebSocket,
-    session_id: str,
+class EscalationOutcome(NamedTuple):
+    """Return shape of ``_escalate_session``.
+
+    ``available``/``next_slot`` are the single ``is_bo_available`` computation
+    made during escalation — bundled here so callers (``_handle_escalation``)
+    don't need a second, later call of their own, which could disagree with
+    the first across a support-hours boundary (the webhook round trip in
+    between can take a while)."""
+    ok: bool
+    available: bool = True
+    next_slot: str = ""
+
+
+async def _escalate_session(
     tenant: TenantContext,
+    session_id: str,
     row: ChatSession,
-    result: ChatTurnResult,
-) -> bool:
-    """Flip session to awaiting_human, notify BO, inform customer of queue status.
-    Returns True if the CRM acknowledged and the session entered human-agent mode.
-    Returns False if the webhook failed — caller should keep the bot running."""
+    reason: str,
+    summary: str,
+) -> EscalationOutcome:
+    """Flip session to awaiting_human, notify BO, emit the tenant event.
+
+    The non-websocket core of escalation: mode flip, ``_bo_queues``/
+    ``_customer_queues`` setup, the BO webhook, and the emitted ``chat.escalated``
+    tenant event — everything ``_handle_escalation`` (below) needs that doesn't
+    touch a websocket. Shared with background flows that have no websocket to
+    write to at all (e.g. the deposit-verification timeout sweep in
+    ``_check_and_timeout_verification``).
+
+    Returns an ``EscalationOutcome``. ``ok`` is True if the CRM acknowledged
+    and the session entered human-agent mode; False if the webhook failed —
+    the session is reverted to bot mode and the caller decides how to inform
+    whoever's on the other end (a websocket message for a live customer,
+    nothing for a background sweep). ``available``/``next_slot`` are the
+    single ``is_bo_available`` snapshot taken at the start of this call."""
     from src.api.chat_webhooks import send_bo_webhook
     from src.chatbot.support_hours import is_bo_available
 
-    reason = result.escalation.get("reason", "")
-    summary = result.escalation.get("summary", "")
     available, next_slot = is_bo_available(tenant.settings.chat_support)
 
     async with _sm()() as db:
@@ -1776,6 +2002,40 @@ async def _handle_escalation(
             if r:
                 r.mode = "bot"
                 await db.commit()
+        return EscalationOutcome(False, available, next_slot)
+
+    # _emit_escalation expects a ChatTurnResult-shaped object (it only ever
+    # reads `.escalation`); this caller has no real ChatTurnResult (it may run
+    # from a background flow, e.g. the deposit-verification timeout sweep, with
+    # no turn in progress) — a minimal duck-typed stand-in keeps
+    # _emit_escalation's tested signature/contract unchanged for its other
+    # (turn-driven) call sites.
+    await _emit_escalation(
+        tenant.id, session_id,
+        SimpleNamespace(escalation={"reason": reason, "summary": summary}),
+    )
+    return EscalationOutcome(True, available, next_slot)
+
+
+async def _handle_escalation(
+    websocket: WebSocket,
+    session_id: str,
+    tenant: TenantContext,
+    row: ChatSession,
+    result: ChatTurnResult,
+) -> bool:
+    """Customer-WS wrapper around ``_escalate_session``: extract reason/summary
+    from the turn result, run the non-websocket escalation core, then send the
+    websocket frames reflecting the outcome — identical frames/branches to
+    before this was split out.
+    Returns True if the CRM acknowledged and the session entered human-agent mode.
+    Returns False if the webhook failed — caller should keep the bot running."""
+    reason = result.escalation.get("reason", "")
+    summary = result.escalation.get("summary", "")
+
+    outcome = await _escalate_session(tenant, session_id, row, reason, summary)
+
+    if not outcome.ok:
         await websocket.send_text(json.dumps({
             "type": "message",
             "text": ("I'm sorry, I wasn't able to connect you to a human agent right now. "
@@ -1786,19 +2046,136 @@ async def _handle_escalation(
 
     await websocket.send_text(json.dumps({"type": "mode_change", "mode": "awaiting_human"}))
 
-    if not available and next_slot:
+    # Reuse the single is_bo_available snapshot _escalate_session already
+    # took, rather than calling it again here — a second call after the
+    # webhook round trip could disagree with the first across a
+    # support-hours boundary.
+    if not outcome.available and outcome.next_slot:
         await websocket.send_text(json.dumps({
             "type": "message",
             "text": (
                 f"Our support team is currently unavailable. "
-                f"They will be available {next_slot} and will assist you then. "
+                f"They will be available {outcome.next_slot} and will assist you then. "
                 "Please stay in this chat and we will connect you as soon as they come online."
             ),
             "sources": [], "suggestions": [], "action": "wait",
         }))
 
-    await _emit_escalation(tenant.id, session_id, result)
     return True
+
+
+# --- Deposit verification timeout -----------------------------------------
+
+
+def schedule_verification_timeout(request_id: str, session_id: str, timeout_minutes: int) -> None:
+    """Fire-and-forget: after ``timeout_minutes``, check whether the
+    deposit-verification request identified by ``request_id`` is still
+    pending and — if so — auto-escalate its session to a human agent.
+
+    ``session_id`` is accepted (and unused beyond documentation/callers'
+    convenience) to make the call site self-describing; the actual lookup at
+    fire time re-reads the row by ``request_id`` so it always acts on
+    up-to-date state (e.g. a callback that resolved it in the meantime)."""
+    async def _sleep_then_check() -> None:
+        await asyncio.sleep(max(0.0, timeout_minutes * 60))
+        await _check_and_timeout_verification(request_id)
+
+    _spawn_webhook_task(_sleep_then_check())
+
+
+async def _check_and_timeout_verification(request_id: str) -> None:
+    """If the deposit-verification request ``request_id`` is still pending and
+    genuinely past its ``timeout_at``, mark it ``timed_out`` and escalate its
+    session to a human agent. A no-op if the request is missing, already
+    resolved, or not actually due yet (the last case matters because this is
+    also invoked from the reconnect sweep in ``chat_websocket`` against a real
+    timestamp check, not just from the scheduled sleep above).
+
+    Tenant and chat-session resolution happen BEFORE the row is flipped to
+    ``timed_out`` and committed — if either fails to resolve, the row is left
+    ``pending`` so a later reconnect-time sweep can retry it, rather than
+    getting permanently stuck in a state neither the vendor-callback endpoint
+    nor the reconnect sweep will ever act on again.
+
+    Runs unsupervised as a background task (no caller awaits its result), so
+    everything is wrapped in a broad try/except — a failure here must be
+    logged, never crash the process or wedge the caller."""
+    from datetime import datetime, timezone
+
+    from src.auth.middleware import tenant_from_id
+    from src.models.deposit_verification import DepositVerificationRequest
+
+    try:
+        async with _sm()() as db:
+            row = await db.get(DepositVerificationRequest, request_id)
+            if row is None or row.status != "pending":
+                return  # unknown, or already resolved/timed out — no-op
+            now = datetime.now(timezone.utc).replace(tzinfo=None)
+            if now < row.timeout_at:
+                return  # not actually due yet — defensive (see docstring)
+            deposit_session_id = row.session_id
+            order_id = row.order_id
+            tenant_id = row.tenant_id
+
+        tenant = await tenant_from_id(tenant_id)
+        if tenant is None:
+            log.warning(
+                "deposit verification timeout: tenant unavailable — request "
+                "stays pending for retry",
+                extra={"request_id": request_id, "tenant_id": tenant_id},
+            )
+            return  # row stays "pending" — a later reconnect sweep can retry
+
+        async with _sm()() as db:
+            chat_session_row = await db.get(ChatSession, deposit_session_id)
+        if chat_session_row is None:
+            log.warning(
+                "deposit verification timeout: chat session missing — request "
+                "stays pending for retry",
+                extra={"request_id": request_id, "session_id": deposit_session_id},
+            )
+            return  # row stays "pending" — a later reconnect sweep can retry
+
+        async with _sm()() as db:
+            row = await db.get(DepositVerificationRequest, request_id)
+            if row is None or row.status != "pending":
+                return  # resolved by something else in the meantime — no-op
+            row.status = "timed_out"
+            await db.commit()
+
+        outcome = await _escalate_session(
+            tenant, deposit_session_id, chat_session_row,
+            reason="deposit verification timed out",
+            summary=(
+                f"Deposit dispute for order {order_id}: verification vendor "
+                "did not respond within the configured timeout"
+            ),
+        )
+        if outcome.ok:
+            await push_async_message(
+                deposit_session_id,
+                "We're still waiting on confirmation for your deposit dispute, so "
+                "I'm connecting you with a member of our support team who can look "
+                "into it directly. Thanks for your patience!",
+                role="system",
+            )
+        else:
+            # Escalation failed (e.g. the BO webhook call itself failed) —
+            # _escalate_session already reverted the session back to bot mode,
+            # so don't tell the customer a human is now connected; that would
+            # be a broken promise with no recovery path.
+            await push_async_message(
+                deposit_session_id,
+                "Your deposit dispute verification is taking longer than expected. "
+                "We're still looking into it — please hang tight, or try again "
+                "shortly if you'd like to check in.",
+                role="system",
+            )
+    except Exception:  # noqa: BLE001 — background task: log, never raise
+        log.exception(
+            "deposit verification timeout handling failed",
+            extra={"request_id": request_id},
+        )
 
 
 _AWAIT_HUMAN_TIMEOUT_S = 300.0  # revert to bot after 5 min with no claim/decline
@@ -1817,6 +2194,31 @@ async def _revert_to_bot(websocket: WebSocket, session_id: str) -> None:
         "type": "message",
         "text": "Looks like no one is available at this time but am happy to help you again.",
         "sources": [], "suggestions": [], "action": "continue",
+    }))
+
+
+async def _forward_pending_text_to_bo(session_id: str, text: str) -> None:
+    """Persist a plain customer text message and forward it to the BO agent
+    queue — mirrors ``_run_human_mode``'s own handling of a plain-text ws
+    message (see its ``mtype`` branch below).
+
+    Used only for the rare case where a customer's ws message completes in
+    the very same ``asyncio.wait()`` cycle as an out-of-band escalation push
+    in the bot loop: the session is about to hand off into ``_run_human_mode``,
+    which starts a fresh ``receive_text()`` and would never see this
+    already-consumed message again, so it's routed into the human queue here
+    instead of being silently dropped."""
+    async with _sm()() as db:
+        r = await db.get(ChatSession, session_id)
+        if r:
+            db.add(ChatMessage(
+                session_id=session_id, role="customer", type="text", content=text,
+            ))
+            r.message_count = (r.message_count or 0) + 1
+            await db.commit()
+    bq = _bo_queues.setdefault(session_id, asyncio.Queue())
+    await bq.put(json.dumps({
+        "type": "customer_message", "text": text, "session_id": session_id,
     }))
 
 

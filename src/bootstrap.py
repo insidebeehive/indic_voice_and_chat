@@ -413,7 +413,9 @@ def make_chatbot_factory(registry, sessionmaker=None, crm_retrievers: "PerCrmRet
     from src.agents.base import AgentSession
     from src.agents.chatbot import ChatBotAgent
     from src.auth.registry import _AsyncPerTenantRegistry
+    from src.chatbot.deposit_verification import submit_deposit_verification
     from src.chatbot.tool_executor import execute_crm_tool
+    from src.chatbot.tools import SUBMIT_DEPOSIT_VERIFICATION_TOOL_SPEC
 
     async def _load_crm_tools_uncached(tenant: TenantContext):
         """Return (tool_specs, {name: exec_spec}) for the tenant's CRM tools.
@@ -452,14 +454,17 @@ def make_chatbot_factory(registry, sessionmaker=None, crm_retrievers: "PerCrmRet
         # need player-specific context. The WS connect path passes it from the
         # ChatSession row it already fetched; only legacy callers without the
         # row fall back to loading it here.
+        # session_id may be Redis-scoped as "{tenant_id}:{bare_id}" — strip the
+        # prefix; this is the bare id chat_sessions/chat_messages/
+        # deposit_verification_requests rows are keyed by.
+        bare_session_id = session_id.split(":", 1)[-1] if ":" in session_id else session_id
+
         if customer_id is not _CUSTOMER_ID_UNSET:
             user_id = customer_id
         else:
             user_id = None
             if sessionmaker is not None:
                 from src.models.chat import ChatSession as _ChatSession
-                # session_id may be Redis-scoped as "{tenant_id}:{bare_id}" — strip the prefix.
-                bare_session_id = session_id.split(":", 1)[-1] if ":" in session_id else session_id
                 async with sessionmaker() as _db:
                     _row = await _db.get(_ChatSession, bare_session_id)
                     user_id = _row.customer_id if _row else None
@@ -487,6 +492,63 @@ def make_chatbot_factory(registry, sessionmaker=None, crm_retrievers: "PerCrmRet
                 extra_headers=spec.get("extra_headers"),
                 timeout_s=timeout_s)
 
+        tool_specs = list(crm_specs)
+        dv_config = getattr(tenant.settings, "deposit_verification", None)
+        deposit_verification_executor = None
+        # A resolvable signing secret is REQUIRED, not optional: the inbound
+        # verdict callback (src/api/deposit_verification.py) rejects any
+        # callback it can't HMAC-verify with 401, and treats a missing secret
+        # as a verification failure rather than "unsigned is fine". Registering
+        # the tool without one would offer the LLM a flow whose verdict can
+        # never come back — every request would sit pending until it timed out
+        # and escalated, looking like an unresponsive vendor rather than the
+        # misconfiguration it actually is.
+        dv_secret = (
+            tenant.secret_optional(dv_config.webhook_secret_env)
+            if dv_config is not None else None
+        )
+        if (
+            dv_config is not None
+            and dv_config.enabled
+            and dv_config.webhook_url
+            and dv_secret
+            and sessionmaker is not None
+        ):
+            tool_specs.append(SUBMIT_DEPOSIT_VERIFICATION_TOOL_SPEC)
+
+            async def deposit_verification_executor(tc, *, timeout_s: float) -> dict:
+                # Lazy per-call lookup of the module-level media store injected
+                # via chat.set_media_store(...) at app startup (src/main.py).
+                # There's no public getter for it (only the setter) and
+                # src/bootstrap.py is imported by src/api/chat.py's own
+                # dependency graph at startup, so a module-level `from
+                # src.api.chat import ...` here would risk an import cycle;
+                # this lazy import (evaluated fresh on every call, matching
+                # the lazy-import pattern already used elsewhere in this
+                # closure/module) reads the current value each time, which is
+                # what set_media_store's later reassignment requires anyway.
+                from src.api import chat as _chat_api
+                return await submit_deposit_verification(
+                    tenant=tenant,
+                    session_id=bare_session_id,
+                    order_id=(tc.arguments or {}).get("order_id", ""),
+                    sessionmaker=sessionmaker,
+                    media_store=_chat_api._media_store,
+                    timeout_s=timeout_s,
+                )
+
+        elif dv_config is not None and dv_config.enabled and dv_config.webhook_url and not dv_secret:
+            log.warning(
+                "deposit verification is enabled with a webhook_url but no resolvable "
+                "webhook secret — the tool is NOT being registered, because the verdict "
+                "callback would be rejected as unsigned (401). Set webhook_secret_env "
+                "(or PATCH the tenant's deposit_verification.webhook_secret).",
+                extra={
+                    "tenant_id": tenant.id,
+                    "webhook_secret_env": dv_config.webhook_secret_env,
+                },
+            )
+
         # Platform-level LLM identity (provider + model) — same global default
         # dict get_platform_llm() itself builds the client from — threaded
         # into the agent for src/api/chat_cost.py's per-turn cost lookup.
@@ -503,8 +565,9 @@ def make_chatbot_factory(registry, sessionmaker=None, crm_retrievers: "PerCrmRet
             tenant_timezone=getattr(tenant.settings, "timezone", "Asia/Kolkata"),
             store=registry.session_stores.get(tenant),
             enable_tools=True,
-            crm_tools=crm_specs,
+            crm_tools=tool_specs,
             crm_executor=crm_executor,
+            deposit_verification_executor=deposit_verification_executor,
             llm_provider=_llm_defaults.get("provider") or "",
             llm_model=_llm_defaults.get("model") or "",
         )

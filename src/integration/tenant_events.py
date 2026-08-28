@@ -50,6 +50,22 @@ def sign_body(secret: str, raw: bytes) -> str:
     return "sha256=" + hmac.new(secret.encode("utf-8"), raw, hashlib.sha256).hexdigest()
 
 
+def verify_signature(secret: str, raw_body: bytes, header_value: Optional[str]) -> bool:
+    """Verify an INBOUND ``X-Signature``-style header against ``raw_body``,
+    using the same ``sha256=<hex>`` format ``sign_body`` produces.
+
+    Never raises: a missing/malformed header or missing secret is treated as
+    a verification failure (``False``), not an error — callers (webhook
+    handlers) turn that into a 401 rather than a 500."""
+    if not secret or not header_value:
+        return False
+    try:
+        expected = sign_body(secret, raw_body)
+        return hmac.compare_digest(expected, header_value)
+    except Exception:  # noqa: BLE001 — signature verification must never raise
+        return False
+
+
 def build_envelope(
     *,
     event_type: str,
