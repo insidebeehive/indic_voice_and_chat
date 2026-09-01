@@ -563,6 +563,7 @@ def build_chatbot_system_prompt(
     extra_directives: Optional[list[str]] = None,
     has_player_tools: bool = False,
     has_operator_tools: bool = False,
+    has_deposit_verification_tool: bool = False,
     tenant_timezone: str = "Asia/Kolkata",
 ) -> str:
     """System prompt for the RAG-powered ChatBot agent (Phase 4)."""
@@ -786,6 +787,29 @@ def build_chatbot_system_prompt(
         "- Call escalate_to_human only after the customer confirms (yes / haan / sure / kar do). "
         "Then say: 'I'm connecting you to my manager now.'"
     )
+
+    if has_deposit_verification_tool:
+        parts.append(
+            "DEPOSIT DISPUTE VERIFICATION:\n"
+            "When a deposit-status check you already ran shows a deposit as failed, but the "
+            "customer explicitly insists it went through (e.g. 'it did succeed', 'amount was "
+            "deducted', 'check again, it went through'), this is a faster, more specific "
+            "alternative to a full human escalation for exactly this dispute — prefer it over "
+            "immediately offering escalate_to_human when it's available and the precondition "
+            "below is met. Still follow ESCALATION above for any other kind of dispute, or if "
+            "this tool errors out and can't be used.\n"
+            "- Screenshot required first: only call submit_deposit_verification if the customer "
+            "has already uploaded a screenshot in this conversation as proof of the successful "
+            "transaction. If they haven't, ask them to upload one before calling the tool — do "
+            "not call it without a screenshot already sent (this also applies if the tool's "
+            "result says no screenshot was found).\n"
+            "- After calling it: tell the customer this is being manually verified and can take "
+            "a few minutes; they don't need to keep asking — the result will appear "
+            "automatically in this same chat.\n"
+            "- Already pending: if the tool's result says a verification is already pending for "
+            "this conversation, don't call it again — just remind the customer it's still being "
+            "checked."
+        )
 
     # ── Depth matching ───────────────────────────────────────────────────────
     parts.append(

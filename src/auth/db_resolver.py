@@ -23,7 +23,14 @@ from sqlalchemy.orm import selectinload
 
 from src.auth import secrets as secret_crypto
 from src.auth.context import TenantContext
-from src.config_tenant import ChatSupportConfig, TenantCompliance, TenantCRMConfig, TenantPipelineConfig, TenantSettings
+from src.config_tenant import (
+    ChatSupportConfig,
+    DepositVerificationConfig,
+    TenantCompliance,
+    TenantCRMConfig,
+    TenantPipelineConfig,
+    TenantSettings,
+)
 from src.models.tenant import Tenant
 
 log = logging.getLogger(__name__)
@@ -41,6 +48,7 @@ def tenant_context_from_row(tenant: Tenant) -> TenantContext:
     compliance = TenantCompliance(**(pc.get("compliance") or {}))
     crm = TenantCRMConfig(**(pc.get("crm") or {}))
     chat_support = ChatSupportConfig(**(pc.get("chat_support") or {}))
+    deposit_verification = DepositVerificationConfig(**(pc.get("deposit_verification") or {}))
     # events_webhook_url lives at the top level of pipeline_config (not under telephony).
     # Fall back to the old telephony location for rows written before this change.
     tel_pc = pc.get("telephony") or {}
@@ -63,6 +71,7 @@ def tenant_context_from_row(tenant: Tenant) -> TenantContext:
         crm=crm,
         crm_id=tenant.crm_id,
         chat_support=chat_support,
+        deposit_verification=deposit_verification,
         phone_numbers=[p.phone_number for p in tenant.phone_numbers],
     )
     resolved: dict[str, str] = {}

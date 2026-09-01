@@ -110,6 +110,8 @@ async def execute_crm_tool(
     args: dict,
     x_api_key: Optional[str] = None,
     context: Optional[dict] = None,
+    session_id: Optional[str] = None,
+    ticket_id: Optional[str] = None,
     extra_headers: Optional[dict] = None,
     http_client: object = None,
     timeout_s: float = _DEFAULT_CRM_TOOL_TIMEOUT_S,
@@ -150,6 +152,7 @@ async def execute_crm_tool(
         import httpx
         client = httpx.AsyncClient(timeout=httpx.Timeout(timeout_s, connect=5.0))
     log.info("crm tool call", extra={
+        "ticket_id": ticket_id, "session_id": session_id,
         "url": url, "method": method, "params": rest,
         "header_keys": list(headers.keys()),  # keys only — never log token values
     })
@@ -162,12 +165,16 @@ async def execute_crm_tool(
             body = resp.json()
         except Exception:  # noqa: BLE001 — non-JSON response
             body = {"text": resp.text}
-        log.info("crm tool response", extra={"url": url, "status_code": resp.status_code})
+        log.info("crm tool response", extra={
+            "ticket_id": ticket_id, "session_id": session_id,
+            "url": url, "status_code": resp.status_code,
+        })
         # TEMP DEBUG (remove after the matka-availability investigation):
         # log the actual response body so we can see what the CRM is really
         # returning, not just the status code. Truncated — bodies here are
         # small config/market payloads, not player PII.
         log.info("crm tool response body [TEMP DEBUG]", extra={
+            "ticket_id": ticket_id, "session_id": session_id,
             "url": url, "body": json.dumps(body, default=str)[:4000],
         })
         # Redact internal ids AFTER logging (the raw body above is for our
@@ -175,7 +182,9 @@ async def execute_crm_tool(
         # LLM's context — see _REDACTED_RESPONSE_KEYS.
         return {"status_code": resp.status_code, "data": _redact_internal_ids(body)}
     except Exception as e:  # noqa: BLE001 — a failing CRM call must not kill the turn
-        log.exception("crm tool http call failed", extra={"endpoint": endpoint})
+        log.exception("crm tool http call failed", extra={
+            "ticket_id": ticket_id, "session_id": session_id, "endpoint": endpoint,
+        })
         # A future raise_for_status() (or similar) could embed a UUID-bearing
         # URL/id in the exception text — scrub it before it reaches the LLM.
         return {"error": _UUID_RE.sub("[redacted]", str(e))}

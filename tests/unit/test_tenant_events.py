@@ -8,6 +8,7 @@ import json
 import logging
 from types import SimpleNamespace
 
+import pytest
 import pytest_asyncio
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -19,6 +20,58 @@ def test_sign_body_is_hmac_sha256():
     raw = b'{"event_type":"call.initiated"}'
     expect = "sha256=" + hmac.new(b"s3cr3t", raw, hashlib.sha256).hexdigest()
     assert te.sign_body("s3cr3t", raw) == expect
+
+
+def test_verify_signature_round_trips_sign_body():
+    raw = b'{"event_type":"call.initiated"}'
+    header = te.sign_body("s3cr3t", raw)
+    assert te.verify_signature("s3cr3t", raw, header) is True
+
+
+def test_verify_signature_rejects_tampered_body():
+    raw = b'{"event_type":"call.initiated"}'
+    header = te.sign_body("s3cr3t", raw)
+    assert te.verify_signature("s3cr3t", raw + b"x", header) is False
+
+
+def test_verify_signature_rejects_wrong_secret():
+    raw = b'{"event_type":"call.initiated"}'
+    header = te.sign_body("s3cr3t", raw)
+    assert te.verify_signature("wrong-secret", raw, header) is False
+
+
+@pytest.mark.parametrize("header_value", [None, ""])
+def test_verify_signature_rejects_missing_or_empty_header(header_value):
+    raw = b'{"event_type":"call.initiated"}'
+    assert te.verify_signature("s3cr3t", raw, header_value) is False
+
+
+def test_verify_signature_rejects_missing_secret():
+    # secret is typed plain `str` (not Optional[str]) so only "" is a valid
+    # call per the signature — the `not secret` short-circuit covers it
+    # regardless of what's passed.
+    raw = b'{"event_type":"call.initiated"}'
+    header = te.sign_body("s3cr3t", raw)
+    assert te.verify_signature("", raw, header) is False
+
+
+@pytest.mark.parametrize("header_value", [
+    "garbage",
+    "sha256=",
+    "sha256=zzzz",
+    "deadbeef",
+    "UPPERCASE_VALID",
+])
+def test_verify_signature_rejects_malformed_header_without_raising(header_value):
+    raw = b'{"event_type":"call.initiated"}'
+    if header_value == "UPPERCASE_VALID":
+        header_value = te.sign_body("s3cr3t", raw).upper()
+    assert te.verify_signature("s3cr3t", raw, header_value) is False
+
+
+def test_verify_signature_rejects_non_ascii_header_without_raising():
+    raw = b'{"event_type":"call.initiated"}'
+    assert te.verify_signature("s3cr3t", raw, "sha256=café") is False
 
 
 def test_build_envelope_shape():

@@ -6,6 +6,7 @@ from src.models.chat import ChatMessage, ChatSession, ChatTool
 from src.models.conversation import Conversation, Event, Turn
 from src.models.crm import Crm, CrmKBDocument, CrmTool
 from src.models.database import Base, get_engine, get_sessionmaker
+from src.models.deposit_verification import DepositVerificationRequest
 from src.models.tenant import (
     ProviderCost,
     Tenant,
@@ -26,6 +27,7 @@ __all__ = [
     "CrmKBDocument",
     "Crm",
     "CrmTool",
+    "DepositVerificationRequest",
     "Event",
     "KBDocument",
     "Lead",

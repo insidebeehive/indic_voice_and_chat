@@ -24,5 +24,11 @@ class LocalMediaStorage(IMediaStorage):
         clean_key = key.lstrip("/")
         return f"{self._serve_prefix}/{clean_key}"
 
+    async def download(self, key: str) -> tuple[bytes, str]:
+        entry = self._store.get(key)
+        if entry is None:
+            raise FileNotFoundError(key)
+        return entry
+
     def get(self, key: str) -> tuple[bytes, str] | None:
         return self._store.get(key)

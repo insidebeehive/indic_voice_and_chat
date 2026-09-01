@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import aiobotocore.session
+from botocore.exceptions import ClientError
 
 from src.interfaces.media_storage import IMediaStorage
 
@@ -49,3 +50,15 @@ class S3MediaStorage(IMediaStorage):
                 Params={"Bucket": self._bucket, "Key": key},
                 ExpiresIn=ttl_seconds,
             )
+
+    async def download(self, key: str) -> tuple[bytes, str]:
+        async with self._client() as client:
+            try:
+                response = await client.get_object(Bucket=self._bucket, Key=key)
+            except ClientError as exc:
+                code = exc.response.get("Error", {}).get("Code", "")
+                if code in ("NoSuchKey", "404"):
+                    raise FileNotFoundError(key) from exc
+                raise
+            body = await response["Body"].read()
+            return body, response.get("ContentType", "application/octet-stream")

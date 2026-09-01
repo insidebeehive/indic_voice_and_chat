@@ -71,7 +71,7 @@ async def app(tmp_faiss_index: str, fake_redis):
         async with sm() as session:
             yield session
 
-    async def factory(tenant: TenantContext, session_id: str, *, customer_id=None) -> ChatBotAgent:
+    async def factory(tenant: TenantContext, session_id: str, *, customer_id=None, ticket_id=None) -> ChatBotAgent:
         return ChatBotAgent(
             session=AgentSession(session_id=session_id),
             llm=_FakeLLM({
@@ -139,7 +139,7 @@ async def cost_app(tmp_faiss_index: str, fake_redis):
         async with sm() as session:
             yield session
 
-    async def factory(tenant: TenantContext, session_id: str, *, customer_id=None) -> ChatBotAgent:
+    async def factory(tenant: TenantContext, session_id: str, *, customer_id=None, ticket_id=None) -> ChatBotAgent:
         return ChatBotAgent(
             session=AgentSession(session_id=session_id),
             llm=_FakeLLM({
@@ -337,7 +337,7 @@ def test_websocket_factory_failure_closes_cleanly(app: FastAPI) -> None:
     client = TestClient(app)
     sid = _create_session(client)
 
-    async def _broken_factory(tenant, session_id, *, customer_id=None):
+    async def _broken_factory(tenant, session_id, *, customer_id=None, ticket_id=None):
         raise RuntimeError("DB connection pool exhausted")
 
     chat.set_chatbot_factory(_broken_factory)
@@ -357,7 +357,7 @@ def test_websocket_passes_customer_id_to_factory(app: FastAPI) -> None:
     seen: dict = {}
     orig_factory = chat._factory
 
-    async def _recording_factory(tenant, session_id, *, customer_id=None):
+    async def _recording_factory(tenant, session_id, *, customer_id=None, ticket_id=None):
         seen["customer_id"] = customer_id
         return await orig_factory(tenant, session_id)
 
@@ -385,7 +385,7 @@ def test_websocket_turn_timeout_sends_error_keeps_socket(app: FastAPI, monkeypat
         async def summarize_session(self):
             return "summary"
 
-    async def _factory(tenant, session_id, *, customer_id=None):
+    async def _factory(tenant, session_id, *, customer_id=None, ticket_id=None):
         return _HangingAgent()
 
     chat.set_chatbot_factory(_factory)
@@ -413,7 +413,7 @@ def test_websocket_quota_exhaustion_sends_high_demand_message(app: FastAPI) -> N
         async def handle_message(self, text):
             raise _QuotaError("429 RESOURCE_EXHAUSTED")
 
-    async def _factory(tenant, session_id, *, customer_id=None):
+    async def _factory(tenant, session_id, *, customer_id=None, ticket_id=None):
         return _QuotaAgent()
 
     chat.set_chatbot_factory(_factory)
@@ -770,7 +770,7 @@ async def escalating_app(tmp_faiss_index: str, fake_redis, tmp_path):
         async with sm() as session:
             yield session
 
-    async def factory(tenant: TenantContext, session_id: str, *, customer_id=None) -> ChatBotAgent:
+    async def factory(tenant: TenantContext, session_id: str, *, customer_id=None, ticket_id=None) -> ChatBotAgent:
         return ChatBotAgent(
             session=AgentSession(session_id=session_id),
             llm=_FakeLLMEscalating(),

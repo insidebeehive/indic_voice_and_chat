@@ -313,6 +313,14 @@ class CrmCredentialsIn(BaseModel):
     x_api_key: Optional[str] = None      # write-only; never returned
 
 
+class DepositVerificationUpdateIn(BaseModel):
+    """Deposit dispute screenshot verification webhook config — partial update."""
+    enabled: Optional[bool] = None
+    webhook_url: Optional[str] = None
+    webhook_secret: Optional[str] = None   # write-only plaintext; never returned
+    timeout_minutes: Optional[int] = None
+
+
 class UpdateTenantRequest(BaseModel):
     status: Optional[str] = Field(default=None, pattern="^(active|suspended)$")
     events_webhook_url: Optional[str] = None
@@ -322,6 +330,7 @@ class UpdateTenantRequest(BaseModel):
     # Links this tenant to a Crm row (real Tenant.crm_id FK column, Task 1).
     # "" clears the link (FK is nullable); omitted/None leaves it untouched.
     crm_id: Optional[str] = None
+    deposit_verification: Optional[DepositVerificationUpdateIn] = None
 
 
 class UpdateTenantResponse(BaseModel):
@@ -335,6 +344,8 @@ class UpdateTenantResponse(BaseModel):
     events_webhook_url: Optional[str] = None
     events_webhook_secret_set: bool = False
     crm_id: Optional[str] = None
+    deposit_verification_enabled: Optional[bool] = None
+    deposit_verification_secret_set: Optional[bool] = None
 
 
 async def _refresh_resolver(request: Request, tenant_id: str) -> None:
@@ -491,9 +502,37 @@ async def update_tenant(
             crm_cfg["operator_id"] = crm.operator_id
             pc["crm"] = crm_cfg
 
+    if req.deposit_verification is not None:
+        dv = req.deposit_verification
+        dv_cfg = dict(pc.get("deposit_verification") or {})
+        if dv.enabled is not None:
+            dv_cfg["enabled"] = dv.enabled
+        if dv.webhook_url is not None:
+            dv_cfg["webhook_url"] = dv.webhook_url
+        if dv.timeout_minutes is not None:
+            dv_cfg["timeout_minutes"] = dv.timeout_minutes
+        if dv.webhook_secret is not None:
+            if not crypto.has_key():
+                raise HTTPException(
+                    status_code=503,
+                    detail="VOX_SECRET_KEY is not set — cannot encrypt deposit verification webhook secret")
+            name = f"TENANT_{t.slug.upper().replace('-', '_')}_DEPOSIT_VERIFICATION_WEBHOOK_SECRET"
+            existing = (await session.execute(
+                select(TenantSecret).where(
+                    TenantSecret.tenant_id == tenant_id, TenantSecret.name == name)
+            )).scalar_one_or_none()
+            if existing is not None:
+                existing.value_encrypted = crypto.encrypt(dv.webhook_secret)
+            else:
+                session.add(TenantSecret(
+                    tenant_id=tenant_id, name=name,
+                    value_encrypted=crypto.encrypt(dv.webhook_secret)))
+            dv_cfg["webhook_secret_env"] = name
+        pc["deposit_verification"] = dv_cfg
+
     if req.status is not None or req.events_webhook_url is not None \
             or req.telephony is not None or req.chatwoot is not None \
-            or req.crm is not None:
+            or req.crm is not None or req.deposit_verification is not None:
         t.pipeline_config = pc  # reassign (new object) so the JSON column is marked dirty
 
     await session.commit()
@@ -502,6 +541,7 @@ async def update_tenant(
 
     pc = t.pipeline_config or {}
     tel_cfg = pc.get("telephony") or {}
+    dv_cfg = pc.get("deposit_verification") or {}
     return UpdateTenantResponse(
         tenant_id=t.id, slug=t.slug, status=t.status,
         telephony_provider=tel_cfg.get("provider"),
@@ -509,6 +549,8 @@ async def update_tenant(
         events_webhook_url=pc.get("events_webhook_url"),
         events_webhook_secret_set=bool(pc.get("events_webhook_secret_env")),
         crm_id=t.crm_id,
+        deposit_verification_enabled=dv_cfg.get("enabled"),
+        deposit_verification_secret_set=bool(dv_cfg.get("webhook_secret_env")),
     )
 
 

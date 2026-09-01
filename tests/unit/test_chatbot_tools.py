@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 from typing import AsyncIterator
 
@@ -598,3 +599,71 @@ async def test_handle_image_sends_multimodal_to_llm(retriever) -> None:
     assert isinstance(user_msg.content, list)
     assert any(p.type == "image" and p.inline_data["data"] == b"imgbytes" for p in user_msg.content)
     assert result.response.response_text == "That's an error screen."
+
+
+# --- Deposit verification tool -------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_deposit_verification_tool_without_executor_returns_error(retriever) -> None:
+    agent = _agent(ScriptedLLM([]), retriever)
+    tc = ToolCall(id="t1", name="submit_deposit_verification", arguments={"order_id": "ORD-1"})
+    result, chunks, escalation, call_offer = await agent._dispatch_tool(tc, timeout_s=10.0)
+    assert result == {"error": "verification is not available"}
+    assert chunks == []
+    assert escalation is None
+    assert call_offer is None
+
+
+@pytest.mark.asyncio
+async def test_deposit_verification_executor_exception_is_swallowed(retriever, caplog) -> None:
+    async def boom_exec(tc: ToolCall, *, timeout_s: float = 0.0):
+        raise RuntimeError("boom")
+
+    agent = _agent(ScriptedLLM([]), retriever, deposit_verification_executor=boom_exec)
+    tc = ToolCall(id="t1", name="submit_deposit_verification", arguments={"order_id": "ORD-1"})
+    with caplog.at_level(logging.ERROR, logger="src.agents.chatbot"):
+        result, chunks, escalation, call_offer = await agent._dispatch_tool(tc, timeout_s=10.0)
+    assert result["status"] == "error"
+    assert "message" in result
+    assert chunks == []
+    assert escalation is None
+    assert call_offer is None
+    assert any("deposit verification submission failed" in r.message for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_deposit_verification_executor_result_is_passed_through_and_budget_is_reduced(
+    retriever,
+) -> None:
+    seen: list[float] = []
+
+    async def deposit_exec(tc: ToolCall, *, timeout_s: float = 0.0) -> dict:
+        seen.append(timeout_s)
+        return {"status": "submitted"}
+
+    agent = _agent(ScriptedLLM([]), retriever, deposit_verification_executor=deposit_exec)
+    tc = ToolCall(id="t1", name="submit_deposit_verification", arguments={"order_id": "ORD-1"})
+
+    result, chunks, escalation, call_offer = await agent._dispatch_tool(tc, timeout_s=10.0)
+    assert result == {"status": "submitted"}
+    assert chunks == []
+    assert escalation is None
+    assert call_offer is None
+    # _dispatch_tool gives the executor its own margin: max(0.5, timeout_s - 1.0).
+    assert seen[-1] == pytest.approx(9.0)
+
+    # A very small remaining budget must floor at 0.5s, never hit zero/negative.
+    await agent._dispatch_tool(tc, timeout_s=0.6)
+    assert seen[-1] == pytest.approx(0.5)
+    await agent._dispatch_tool(tc, timeout_s=0.0)
+    assert seen[-1] == pytest.approx(0.5)
+
+    # A non-dict executor result is wrapped as {"result": <value>}.
+    async def deposit_exec_non_dict(tc: ToolCall, *, timeout_s: float = 0.0):
+        return "submitted"
+
+    agent_non_dict = _agent(
+        ScriptedLLM([]), retriever, deposit_verification_executor=deposit_exec_non_dict)
+    non_dict_result, _, _, _ = await agent_non_dict._dispatch_tool(tc, timeout_s=10.0)
+    assert non_dict_result == {"result": "submitted"}
