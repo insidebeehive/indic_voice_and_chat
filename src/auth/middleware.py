@@ -23,7 +23,7 @@ from __future__ import annotations
 import logging
 from typing import Awaitable, Callable, Optional, Protocol
 
-from fastapi import Depends, HTTPException, Request, WebSocket, status
+from fastapi import Depends, HTTPException, Request, WebSocket, WebSocketException, status
 
 from src.auth.context import TenantContext, hash_api_token
 from src.config_tenant import TenantSettings
@@ -166,6 +166,35 @@ async def require_admin(request: Request) -> None:
     token = auth.split(" ", 1)[1].strip()
     if hash_api_token(token) not in _admin_token_hashes:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="admin access denied")
+
+
+def is_admin_token(token: str | None) -> bool:
+    """True iff ``token`` is a registered platform-admin token.
+
+    Sync + None/empty-safe so WebSocket handlers (which get the token from a
+    query param, not an Authorization header) can check it without duplicating
+    the hashing rule ``require_admin`` uses.
+    """
+    if not token:
+        return False
+    return hash_api_token(token) in _admin_token_hashes
+
+
+async def require_admin_ws(websocket: WebSocket) -> None:
+    """Gate an admin WebSocket route on ``?token=<admin-token>``.
+
+    Used as a router-level dependency so the check runs BEFORE the route body
+    calls ``websocket.accept()`` — an unauthenticated client never gets a live
+    socket. Raising ``WebSocketException`` (rather than closing here) is
+    required: FastAPI's own handler performs the close, and closing twice
+    raises ``RuntimeError: Cannot call "send" once a close message has been
+    sent``. Because the close happens pre-accept, a real ASGI server rejects
+    the HTTP handshake with 403; the browser therefore sees a 1006 close, while
+    an in-process TestClient sees the 1008 below.
+    """
+    token = (websocket.query_params.get("token") or "").strip()
+    if not is_admin_token(token):
+        raise WebSocketException(code=1008, reason="admin token required")
 
 
 async def tenant_from_twilio_to_number(to_number: str) -> TenantContext:

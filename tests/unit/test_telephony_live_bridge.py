@@ -53,7 +53,7 @@ def _agent():
         engine=object(), store=None)
 
 
-def _bridge(encoding="mulaw", events=(), llm=None):
+def _bridge(encoding="mulaw", events=(), llm=None, tenant_id="t1"):
     agent = _agent()
     sess = _FakeSession(events)
 
@@ -64,7 +64,7 @@ def _bridge(encoding="mulaw", events=(), llm=None):
         websocket=_FakeWS(), agent=agent, config=RealtimeConfig(model="m"),
         connect_session=connect, encoding=encoding,
         sid_field="streamSid" if encoding == "mulaw" else "stream_sid",
-        supports_clear=(encoding == "mulaw"), llm=llm)
+        supports_clear=(encoding == "mulaw"), llm=llm, tenant_id=tenant_id)
     b._session = sess
     return b, sess, agent
 
@@ -378,6 +378,7 @@ async def test_call_status_endpoint_serializes_after_analysis_failure_outcome():
     from fastapi.testclient import TestClient
 
     from src.api.dev_console import dev_router
+    from src.auth.middleware import set_admin_tokens
     from src.interfaces.llm import LLMMessage
 
     b, sess, agent = _bridge("mulaw")
@@ -392,7 +393,14 @@ async def test_call_status_endpoint_serializes_after_analysis_failure_outcome():
     app = FastAPI()
     app.include_router(dev_router)
     client = TestClient(app)
-    resp = client.get("/dev/call-status/CA-STATUS")
+    # /dev/call-status now requires a per-request admin token (dev_router is
+    # gated by require_admin) — unrelated to this test's actual subject.
+    set_admin_tokens(["admin-token"])
+    try:
+        resp = client.get("/dev/call-status/CA-STATUS",
+                          headers={"Authorization": "Bearer admin-token"})
+    finally:
+        set_admin_tokens([])
     assert resp.status_code == 200
     body = resp.json()
     assert body["status"] == "ended"
@@ -462,6 +470,10 @@ def test_bootstrap_builds_s2s_telephony_bridge():
     assert bridge._encoding == "mulaw" and bridge._sid_field == "streamSid"
     assert bridge._config.model == "gemini-3.1-flash-live-preview"
     assert "record_turn_signal" in bridge._config.tools[0].name
+    # H2 fix: bootstrap's bridge-construction factory must thread the tenant id
+    # through so transfer_store keys are tenant-scoped (structural cross-tenant
+    # isolation, not a DB lookup — see transfer_store.py's module docstring).
+    assert bridge._tenant_id == "t1"
 
 
 def test_build_s2s_telephony_bridge_applies_voice_and_lead_override():
@@ -632,3 +644,113 @@ async def test_make_livekit_bridge_factory_ignores_mode_in_metadata(caplog):
         build = await factory(tenant, "room_123", {"mode": "layered", "campaign_id": None})
     assert callable(build)
     assert any("ignoring 'mode'" in r.getMessage() for r in caplog.records)
+
+
+# --- transfer webhook: transfer_result_url must not double /api/v1/ -----
+
+
+@pytest.mark.asyncio
+async def test_fire_transfer_webhook_url_has_single_api_v1_segment(monkeypatch):
+    """Regression: platform_webhook_base_url() carries its own /api/v1/telephony
+    path suffix (e.g. "https://host/api/v1/telephony"); naively concatenating
+    it with "/api/v1/calls/{sid}/transfer-result" used to double the /api/v1/
+    segment. transfer_result_url must now be built via public_origin(), which
+    discards that configured path."""
+    import src.integration.tenant_events as tenant_events
+    from src.utils import public_url as pu
+
+    monkeypatch.setattr(
+        pu, "platform_webhook_base_url",
+        lambda: "https://host.example.com/api/v1/telephony")
+
+    captured = {}
+
+    async def _fake_deliver(url, envelope, secret=None, **kwargs):
+        captured["url"] = url
+        captured["envelope"] = envelope
+        return True
+
+    monkeypatch.setattr(tenant_events, "deliver", _fake_deliver)
+
+    b, sess, agent = _bridge("mulaw")
+    b._transfer_webhook_url = "https://cs.example.com/webhook"
+    b._transfer_webhook_secret = "shh"
+
+    await b._fire_transfer_webhook("CA123")
+
+    assert captured["url"] == "https://cs.example.com/webhook"
+    result_url = captured["envelope"]["transfer_result_url"]
+    assert result_url == "https://host.example.com/api/v1/calls/CA123/transfer-result"
+    assert result_url.count("/api/v1/") == 1
+
+
+@pytest.mark.asyncio
+async def test_fire_transfer_webhook_noop_without_url(monkeypatch):
+    import src.integration.tenant_events as tenant_events
+
+    calls = []
+
+    async def _fake_deliver(*a, **k):
+        calls.append((a, k))
+        return True
+
+    monkeypatch.setattr(tenant_events, "deliver", _fake_deliver)
+
+    b, sess, agent = _bridge("mulaw")
+    assert b._transfer_webhook_url is None
+    await b._fire_transfer_webhook("CA999")
+    assert calls == []
+
+
+# --- H2 fix: transfer_store keyed by (tenant_id, call_sid) ----------------
+
+
+@pytest.mark.asyncio
+async def test_transfer_hold_registers_and_resolves_without_db_row():
+    """Inbound calls never get a Conversation DB row (only outbound calls do).
+    The transfer-hold flow must not depend on one — this is the exact
+    inbound-call shape a DB-lookup-based fix would have broken; it must keep
+    working end-to-end under the (tenant_id, call_sid) re-keyed store."""
+    from src.api import transfer_store
+
+    b, sess, _ = _bridge("mulaw", tenant_id="t1")
+    b._call_sid = "INBOUND-SID"          # no Conversation row exists for this sid anywhere
+    assert b._transfer_webhook_url is None   # no-op webhook; no network call needed
+
+    task = asyncio.create_task(b._on_transfer_hold())
+    try:
+        resolved = False
+        for _ in range(200):
+            await asyncio.sleep(0)
+            if transfer_store.resolve("t1", "INBOUND-SID", "success"):
+                resolved = True
+                break
+        assert resolved, "transfer future for ('t1', 'INBOUND-SID') was never registered"
+        await asyncio.wait_for(task, timeout=1.0)
+    finally:
+        if not task.done():
+            task.cancel()
+
+
+@pytest.mark.asyncio
+async def test_transfer_hold_fails_closed_without_tenant_id(monkeypatch):
+    """An unattributable transfer (no tenant_id on the bridge) must fail loudly:
+    play the apology, and never register a future nothing could ever resolve
+    (no legitimate tenant token could index it, and it would leak forever)."""
+    from src.api import transfer_store
+
+    b, _sess, _ = _bridge("mulaw", tenant_id=None)
+    b._call_sid = "NO-TENANT-SID"
+
+    apology_calls = []
+
+    async def _apology():
+        apology_calls.append(True)
+
+    monkeypatch.setattr(b, "_play_transfer_failure_apology", _apology)
+
+    await b._on_transfer_hold()
+
+    assert apology_calls == [True]
+    # No future registered under any key for this call_sid.
+    assert not any(csid == "NO-TENANT-SID" for (_tid, csid) in transfer_store._pending)

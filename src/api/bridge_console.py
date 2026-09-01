@@ -3,10 +3,10 @@
 Simulates what the CRM coordination service does:
   Place an outbound call to a customer and hand it off to the AI voiceagent.
 
-Routes (all behind dev_console_enabled gate):
-  GET  /dev/bridge                   → serve bridge_console.html
-  GET  /dev/bridge/tenants           → active tenants with from-numbers per provider
-  POST /dev/bridge/place-call        → place outbound call (AI handles it from there)
+Routes (all behind the VOX_DEV_CONSOLE mount gate):
+  GET  /dev/bridge                   → serve bridge_console.html   (open)
+  GET  /dev/bridge/tenants           → active tenants with from-numbers   (admin token)
+  POST /dev/bridge/place-call        → place outbound call   (admin token)
 """
 
 from __future__ import annotations
@@ -16,12 +16,17 @@ import logging
 import uuid
 from pathlib import Path
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
+from src.auth.middleware import require_admin
+
 log = logging.getLogger(__name__)
-router = APIRouter()
+# Open page shell + admin-gated data/action routes. See src/api/dev_console.py
+# for the same split; VOX_DEV_CONSOLE is a mount gate, not authentication.
+page_router = APIRouter(tags=["bridge-console"])
+router = APIRouter(tags=["bridge-console"], dependencies=[Depends(require_admin)])
 
 _STATIC = Path(__file__).parent.parent.parent / "static"
 
@@ -29,7 +34,7 @@ _STATIC = Path(__file__).parent.parent.parent / "static"
 # ── Routes ────────────────────────────────────────────────────────────────────
 
 
-@router.get("/dev/bridge")
+@page_router.get("/dev/bridge")
 async def bridge_console_page() -> FileResponse:
     return FileResponse(_STATIC / "bridge_console.html")
 

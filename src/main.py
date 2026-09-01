@@ -51,6 +51,7 @@ from src.api import (
 )
 from src.api.dev_console import (
     dev_console_enabled,
+    dev_page_router,
     dev_router,
     make_browser_bridge_factory,
     make_live_bridge_factory,
@@ -60,6 +61,7 @@ from src.api.dev_console import (
 from src.api.dev_console import (
     ws_router as dev_ws_router,
 )
+from src.api.bridge_console import page_router as bridge_page_router
 from src.api.bridge_console import router as bridge_router
 from src.api.call_store import (
     record_outcome,
@@ -602,14 +604,37 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-if dev_console_enabled():
-    api_router.include_router(dev_ws_router)    # WS  /api/v1/dev/voice
+# Fail closed: the dev/bridge consoles place real billed outbound calls and run
+# billed AI voice sessions, so their data/action routes now require a
+# per-request admin token. If VOX_DEV_CONSOLE is on but no admin token is
+# configured, that gate can never be satisfied — mounting those routes would
+# only publish unusable-but-reachable endpoints, so we refuse to mount them and
+# say so loudly. The open HTML shells still mount; they carry no data.
+#
+# NOTE: this reads the env var directly rather than src.auth.middleware's
+# _admin_token_hashes, because set_admin_tokens() runs in lifespan while
+# router mounting happens here at import time — the hash set is still empty
+# at this point.
+_dev_console_on = dev_console_enabled()
+_dev_console_authed = _dev_console_on and bool(_admin_tokens_from_env())
+if _dev_console_on and not _dev_console_authed:
+    log.error(
+        "VOX_DEV_CONSOLE=1 but VOX_ADMIN_TOKENS is empty — refusing to mount the "
+        "admin-gated dev/bridge console routes (place-call, voice WS, reanalyze, …). "
+        "Set VOX_ADMIN_TOKENS to enable them."
+    )
+
+if _dev_console_authed:
+    api_router.include_router(dev_ws_router)    # WS  /api/v1/dev/voice{,-live}
 
 app.include_router(api_router)
 
-if dev_console_enabled():
-    app.include_router(dev_router)              # GET /dev/voice
-    app.include_router(bridge_router)           # GET /dev/bridge
+if _dev_console_on:
+    app.include_router(dev_page_router)         # GET /dev/voice   (open page)
+    app.include_router(bridge_page_router)      # GET /dev/bridge  (open page)
+if _dev_console_authed:
+    app.include_router(dev_router)              # /dev/voices, /dev/place-call, …
+    app.include_router(bridge_router)           # /dev/bridge/tenants, /dev/bridge/place-call
 
 
 _STATIC_DIR = Path(__file__).resolve().parents[1] / "static"

@@ -329,3 +329,63 @@ async def test_call_lead_requires_auth(ctx) -> None:
     resp = await client.post(
         "/campaigns/c1/calls", json={"to_number": "+9118"}, headers={"Authorization": ""})
     assert resp.status_code == 401
+
+
+# --- POST /calls/{sid}/transfer-result — H2 cross-tenant fix -------------
+
+
+async def test_transfer_result_cross_tenant_blocked_and_future_stays_pending(ctx) -> None:
+    """Tenant B must not be able to resolve tenant A's pending transfer via the
+    HTTP route — and, critically, A's future must still be pending/undone
+    afterwards (proves the hijack is actually blocked, not just that the HTTP
+    response looks like a 404)."""
+    from src.api import transfer_store
+
+    client, _ = ctx
+    fut = transfer_store.register("t1", "SID-HIJACK")
+    try:
+        register_tenant_for_test(
+            TenantSettings(
+                id="t2", slug="t2", name="T2", max_concurrent_calls=2,
+                pipeline=TenantPipelineConfig(
+                    mode="layered",
+                    stt=TenantSTTConfig(provider="groq"),
+                    llm=TenantLLMConfig(provider="gemini"),
+                    tts=TenantTTSConfig(provider="sarvam"),
+                    telephony=TenantTelephonyConfig(provider="twilio", from_number="+1"),
+                ),
+            ),
+            plaintext_tokens=["t2-token"],
+        )
+        resp = await client.post(
+            "/calls/SID-HIJACK/transfer-result", json={"status": "success"},
+            headers={"Authorization": "Bearer t2-token"})
+        assert resp.status_code == 404
+        assert "for this tenant" in resp.json()["detail"]
+        assert not fut.done()
+    finally:
+        transfer_store.cancel_pending("t1", "SID-HIJACK")
+
+
+async def test_transfer_result_own_tenant_resolves(ctx) -> None:
+    from src.api import transfer_store
+
+    client, _ = ctx
+    fut = transfer_store.register("t1", "SID-OWN")
+    resp = await client.post(
+        "/calls/SID-OWN/transfer-result", json={"status": "success"}, headers=HEADERS)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["resolved"] is True
+    assert body["call_sid"] == "SID-OWN"
+    assert body["status"] == "success"
+    assert fut.done()
+    assert fut.result() == "success"
+
+
+async def test_transfer_result_unknown_call_sid_404(ctx) -> None:
+    client, _ = ctx
+    resp = await client.post(
+        "/calls/does-not-exist/transfer-result", json={"status": "success"}, headers=HEADERS)
+    assert resp.status_code == 404
+    assert "for this tenant" in resp.json()["detail"]

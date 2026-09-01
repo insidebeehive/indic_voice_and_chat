@@ -42,6 +42,33 @@ def test_twilio_voice_returns_twiml_with_tenant_scoped_stream_url() -> None:
         set_tenant_resolver(None)
 
 
+def test_twilio_voice_stream_url_ignores_configured_webhook_base_url(monkeypatch) -> None:
+    """Regression test: the stream URL embedded in TwiML must be derived from
+    the request that actually arrived, never from platform_webhook_base_url()
+    — even when that config value IS set to a different host. (An earlier
+    implementation attempt wired the inbound URL builders through the
+    config-first public_origin(), which would have silently retargeted every
+    inbound Twilio stream URL whenever WEBHOOK_BASE_URL pointed elsewhere.)
+    """
+    from src.utils import public_url
+
+    monkeypatch.setattr(
+        public_url, "platform_webhook_base_url",
+        lambda: "https://configured-elsewhere.example/api/v1/telephony",
+    )
+    _register_dev_tenant_with_phone()
+    try:
+        app = _make_app()
+        client = TestClient(app)
+        resp = client.post("/telephony/twilio/voice", data={"To": "+18888888888"})
+        assert resp.status_code == 200, resp.text
+        body = resp.text
+        assert "/api/v1/telephony/twilio/stream/dev" in body
+        assert "configured-elsewhere.example" not in body
+    finally:
+        set_tenant_resolver(None)
+
+
 def test_twilio_voice_unknown_number_returns_404() -> None:
     _register_dev_tenant_with_phone()
     try:

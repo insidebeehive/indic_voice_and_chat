@@ -216,9 +216,12 @@ def voicebot_xml(stream_websocket_url: str) -> str:
     ``<Connect><Stream url=.../></Connect>`` form in their Voicebot Applet
     container.
     """
+    from src.api.telephony_twilio import _xml_escape
+
+    url = _xml_escape(stream_websocket_url)
     return (
         '<?xml version="1.0" encoding="UTF-8"?>'
         "<Response>"
-        f'<Connect><Stream url="{stream_websocket_url}"/></Connect>'
+        f'<Connect><Stream url="{url}"/></Connect>'
         "</Response>"
     )

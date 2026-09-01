@@ -1,7 +1,20 @@
 # tests/unit/test_dev_console.py
 from __future__ import annotations
 
+import pytest
+
 from src.api.dev_console import dev_console_enabled
+from src.auth.middleware import set_admin_tokens
+
+
+ADMIN_HEADERS = {"Authorization": "Bearer admin-token"}
+
+
+@pytest.fixture(autouse=True)
+def _admin_token():
+    set_admin_tokens(["admin-token"])
+    yield
+    set_admin_tokens([])
 
 
 def test_dev_console_enabled_flag(monkeypatch):
@@ -15,12 +28,12 @@ def test_dev_console_enabled_flag(monkeypatch):
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from src.api.dev_console import dev_router
+from src.api.dev_console import dev_page_router, dev_router
 
 
 def test_dev_voice_page_served():
     app = FastAPI()
-    app.include_router(dev_router)
+    app.include_router(dev_page_router)
     client = TestClient(app)
     resp = client.get("/dev/voice")
     assert resp.status_code == 200
@@ -32,7 +45,7 @@ def test_dev_providers_excludes_hidden_options():
     app = FastAPI()
     app.include_router(dev_router)
     client = TestClient(app)
-    resp = client.get("/dev/providers")
+    resp = client.get("/dev/providers", headers=ADMIN_HEADERS)
     assert resp.status_code == 200
     body = resp.json()
 
@@ -54,8 +67,6 @@ def test_dev_providers_excludes_hidden_options():
 
 
 # --- place-call + status endpoints --------------------------------------------
-
-import pytest
 
 import src.api.dev_console as devmod
 from src.auth import register_tenant_for_test
@@ -123,7 +134,7 @@ def test_place_call_uses_selected_provider_and_its_caller_id(monkeypatch):
     _register_dev_tenant(provider="stringee", outbound_from={"twilio": "+15705255679"})
     try:
         client = _client()
-        resp = client.post("/dev/place-call", json={
+        resp = client.post("/dev/place-call", headers=ADMIN_HEADERS, json={
             "provider": "twilio", "to_number": "+919999999999",
             "mode": "s2s", "voice": "Kore", "lead_name": "Raju"})
         assert resp.status_code == 200, resp.text
@@ -138,8 +149,8 @@ def test_place_call_uses_selected_provider_and_its_caller_id(monkeypatch):
 
         from src.api import dev_call_control
         assert dev_call_control.monitor.get("CA123")["status"] == "calling"
-        assert client.get("/dev/call-status/CA123").json()["status"] == "calling"
-        assert client.get("/dev/call-status/NOPE").json()["status"] == "unknown"
+        assert client.get("/dev/call-status/CA123", headers=ADMIN_HEADERS).json()["status"] == "calling"
+        assert client.get("/dev/call-status/NOPE", headers=ADMIN_HEADERS).json()["status"] == "unknown"
         assert dev_call_control.pop_override("dev") == {
             "mode": "s2s", "voice": "Kore", "caller_name": "", "lead_name": "Raju",
             "lead_gender": "", "transfer_webhook_url": "",
@@ -180,7 +191,7 @@ def test_dev_voices_per_mode():
         app = FastAPI()
         app.include_router(dev_router)
         app.state.providers = _FakeProviders()
-        resp = TestClient(app).get("/dev/voices?tenant=dev")
+        resp = TestClient(app).get("/dev/voices?tenant=dev", headers=ADMIN_HEADERS)
         assert resp.status_code == 200, resp.text
         data = resp.json()
         assert data["layered"]["voices"] == ["anushka", "karun"]
@@ -217,7 +228,7 @@ def test_place_call_passes_tenant_creds_to_adapter(monkeypatch):
         pipeline=TenantPipelineConfig(telephony=TenantTelephonyConfig(
             provider="stringee", from_number="+918204268005",
             account_sid_env="DEV_STR_SID", auth_token_env="DEV_STR_SECRET"))))
-    resp = _client().post("/dev/place-call", json={
+    resp = _client().post("/dev/place-call", headers=ADMIN_HEADERS, json={
         "provider": "stringee", "to_number": "+918618795697", "mode": "s2s", "voice": "Kore"})
     assert resp.status_code == 200, resp.text
     assert captured["account_sid"] == "SK.dev-sid"
@@ -248,7 +259,7 @@ def test_place_call_passes_stringee_user_id_to_adapter(monkeypatch):
             provider="stringee", from_number="+918204268005",
             account_sid_env="DEV_STR_SID", auth_token_env="DEV_STR_SECRET",
             user_id_env="DEV_STR_USER"))))
-    resp = _client().post("/dev/place-call", json={
+    resp = _client().post("/dev/place-call", headers=ADMIN_HEADERS, json={
         "provider": "stringee", "to_number": "+918618795697", "mode": "s2s", "voice": "Kore"})
     assert resp.status_code == 200, resp.text
     assert captured["user_id"] == "dev"
@@ -281,7 +292,7 @@ def test_place_call_records_conversation_for_requesting_tenant(monkeypatch):
         pipeline=TenantPipelineConfig(telephony=TenantTelephonyConfig(
             provider="stringee", from_number="+918204268005"))))
     try:
-        resp = _client().post("/dev/place-call", json={
+        resp = _client().post("/dev/place-call", headers=ADMIN_HEADERS, json={
             "provider": "stringee", "to_number": "+918618795697",
             "mode": "s2s", "voice": "Kore", "tenant": "stage"})
         assert resp.status_code == 200, resp.text
@@ -320,7 +331,7 @@ def test_place_call_falls_back_to_platform_webhook_base_url(monkeypatch):
         pipeline=TenantPipelineConfig(telephony=TenantTelephonyConfig(
             provider="stringee", from_number="+918204268005"))))  # no webhook_base_url
     try:
-        resp = _client().post("/dev/place-call", json={
+        resp = _client().post("/dev/place-call", headers=ADMIN_HEADERS, json={
             "provider": "stringee", "to_number": "+918618795697", "mode": "s2s", "voice": "Kore"})
         assert resp.status_code == 200, resp.text
         assert captured["webhook_url"] == "https://platform.example/api/v1/telephony/stringee/answer/dev"
@@ -335,7 +346,7 @@ def test_place_call_no_caller_id_for_provider(monkeypatch):
     monkeypatch.setattr(devmod, "get_telephony_provider", _no_build)
     _register_dev_tenant(provider="stringee", outbound_from={"twilio": "+15705255679"})
     try:
-        resp = _client().post("/dev/place-call", json={
+        resp = _client().post("/dev/place-call", headers=ADMIN_HEADERS, json={
             "provider": "exotel", "to_number": "+919999999999"})  # no exotel caller-ID
         assert resp.status_code == 400
         assert "exotel" in resp.json()["detail"]
@@ -346,7 +357,7 @@ def test_place_call_no_caller_id_for_provider(monkeypatch):
 def test_place_call_rejects_unsupported_provider():
     _register_dev_tenant()
     try:
-        resp = _client().post("/dev/place-call", json={
+        resp = _client().post("/dev/place-call", headers=ADMIN_HEADERS, json={
             "provider": "not_a_real_provider", "to_number": "+919999999999"})
         assert resp.status_code == 400
         assert "not_a_real_provider" in resp.json()["detail"]
@@ -369,7 +380,7 @@ def test_place_call_stringee_uses_answer_webhook_no_override(monkeypatch):
     _pin_platform_webhook(monkeypatch)
     _register_dev_tenant(provider="stringee")          # from_number +918204268005
     try:
-        resp = _client().post("/dev/place-call", json={
+        resp = _client().post("/dev/place-call", headers=ADMIN_HEADERS, json={
             "provider": "stringee", "to_number": "+918618795697", "mode": "s2s", "voice": "Kore"})
         assert resp.status_code == 200, resp.text
         assert resp.json()["provider_call_sid"] == "STR1"
@@ -391,10 +402,86 @@ def test_place_call_failure_clears_override(monkeypatch):
     monkeypatch.setattr(devmod, "get_telephony_provider", lambda cfg: _BoomAdapter())
     _register_dev_tenant(provider="twilio", outbound_from={"twilio": "+15705255679"})
     try:
-        resp = _client().post("/dev/place-call", json={
+        resp = _client().post("/dev/place-call", headers=ADMIN_HEADERS, json={
             "provider": "twilio", "to_number": "+919999999999", "mode": "s2s"})
         assert resp.status_code == 502
         from src.api import dev_call_control
         assert dev_call_control.pop_override("dev") is None   # not left stale
     finally:
         set_tenant_resolver(None)
+
+
+# --- admin-token gating ---------------------------------------------------
+
+_PLACE_CALL_BODY = {"provider": "twilio", "to_number": "+919999999999"}
+
+# Every admin-gated route on dev_router: (method, path).
+_ADMIN_GATED_ROUTES = [
+    ("GET", "/dev/voices?tenant=dev"),
+    ("GET", "/dev/providers"),
+    ("GET", "/dev/tts-voices?provider=sarvam&language=hi-IN"),
+    ("GET", "/dev/campaigns?tenant=dev"),
+    ("POST", "/dev/place-call"),
+    ("POST", "/dev/reanalyze?call_id=call_x&tenant=dev"),
+    ("GET", "/dev/call-status/CA123"),
+]
+
+
+def _issue(client, method, path, headers=None):
+    if method == "POST" and path.startswith("/dev/place-call"):
+        return client.post(path, json=_PLACE_CALL_BODY, headers=headers)
+    if method == "POST":
+        return client.post(path, headers=headers)
+    return client.get(path, headers=headers)
+
+
+@pytest.mark.parametrize("method,path", _ADMIN_GATED_ROUTES)
+def test_admin_gated_routes_401_without_token(method, path):
+    resp = _issue(_client(), method, path)
+    assert resp.status_code == 401
+
+
+@pytest.mark.parametrize("method,path", _ADMIN_GATED_ROUTES)
+def test_admin_gated_routes_403_with_wrong_token(method, path):
+    resp = _issue(_client(), method, path, headers={"Authorization": "Bearer nope"})
+    assert resp.status_code == 403
+
+
+def test_dev_voice_page_open_with_no_token():
+    """The HTML shell itself carries no data — it's mounted unauthenticated
+    on dev_page_router, separate from every data/action route above."""
+    app = FastAPI()
+    app.include_router(dev_page_router)
+    resp = TestClient(app).get("/dev/voice")
+    assert resp.status_code == 200
+
+
+# --- voice WS admin gating -------------------------------------------------
+
+import starlette.websockets
+
+from src.api.dev_console import ws_router
+
+
+def _ws_client():
+    app = FastAPI()
+    app.include_router(ws_router)
+    return TestClient(app)
+
+
+@pytest.mark.parametrize("path", ["/dev/voice", "/dev/voice-live"])
+def test_voice_ws_rejects_missing_token(path):
+    client = _ws_client()
+    with pytest.raises(starlette.websockets.WebSocketDisconnect) as exc_info:
+        with client.websocket_connect(path):
+            pass
+    assert exc_info.value.code == 1008
+
+
+@pytest.mark.parametrize("path", ["/dev/voice", "/dev/voice-live"])
+def test_voice_ws_rejects_wrong_token(path):
+    client = _ws_client()
+    with pytest.raises(starlette.websockets.WebSocketDisconnect) as exc_info:
+        with client.websocket_connect(f"{path}?token=nope&tenant=dev"):
+            pass
+    assert exc_info.value.code == 1008

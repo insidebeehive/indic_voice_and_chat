@@ -242,10 +242,11 @@ def voice_twiml(stream_websocket_url: str) -> str:
     Tells Twilio to open a media stream to ``stream_websocket_url`` and
     keep the call up while we drive the conversation.
     """
+    url = _xml_escape(stream_websocket_url)
     return (
         '<?xml version="1.0" encoding="UTF-8"?>'
         "<Response>"
-        f'<Connect><Stream url="{stream_websocket_url}"/></Connect>'
+        f'<Connect><Stream url="{url}"/></Connect>'
         "</Response>"
     )
 

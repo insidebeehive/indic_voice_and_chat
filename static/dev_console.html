@@ -161,6 +161,12 @@
 <div class="header">
   <h1>🎙 Voice Demo Console</h1>
   <span class="hint">— use headphones to avoid echo</span>
+  <label class="hint" style="display:inline-flex;align-items:center;gap:.3rem">
+    admin token
+    <input type="password" id="adminToken" style="width:14rem" placeholder="VOX_ADMIN_TOKENS value" />
+  </label>
+  <button id="saveToken" onclick="saveAdminToken()" style="padding:.25rem .6rem;font-size:.75rem">Save</button>
+  <span id="tokenHint" class="hint"></span>
   <span id="status">idle</span>
 </div>
 
@@ -312,6 +318,44 @@ const showError = (text) => {
   $("transcript").appendChild(div);
   $("transcript").scrollTop = $("transcript").scrollHeight;
 };
+
+// ── Admin auth ─────────────────────────────────────────────────
+// Same localStorage key as /admin (static/admin_console.html) so one pasted
+// token serves every admin surface. Sent as a Bearer header on data/action
+// routes and as ?token= on the voice WebSockets (browsers can't set headers
+// on a WS handshake).
+function adminToken() {
+  const el = document.getElementById("adminToken");
+  return ((el && el.value) || localStorage.getItem("vox_admin") || "").trim();
+}
+function saveAdminToken() {
+  localStorage.setItem("vox_admin", (document.getElementById("adminToken").value || "").trim());
+  const hint = document.getElementById("tokenHint");
+  if (hint) { hint.textContent = "saved"; setTimeout(() => { hint.textContent = ""; }, 1500); }
+}
+(function loadAdminToken() {
+  const el = document.getElementById("adminToken");
+  if (el) el.value = localStorage.getItem("vox_admin") || "";
+})();
+function authHeaders(extra) {
+  const h = Object.assign({}, extra || {});
+  const t = adminToken();
+  if (t) h["Authorization"] = "Bearer " + t;
+  return h;
+}
+async function authFetch(url, opts) {
+  const o = Object.assign({}, opts || {});
+  o.headers = authHeaders(o.headers);
+  const res = await fetch(url, o);
+  if (res.status === 401 || res.status === 403) {
+    showError(res.status === 401
+      ? "admin token required — paste it in the header box and click Save"
+      : "admin token rejected (403) — check it matches VOX_ADMIN_TOKENS");
+    if (typeof setStatus === "function") setStatus("unauthorized");
+  }
+  return res;
+}
+
 let _currentCallId = null;
 let _mode = "s2s";   // tracks current mode selection
 
@@ -345,7 +389,7 @@ async function reanalyzeCall() {
   $("reanalyze").disabled = true;
   $("reanalyzeStatus").textContent = "analyzing…";
   try {
-    const r = await fetch("/dev/reanalyze?call_id=" + encodeURIComponent(_currentCallId) + "&tenant=dev", { method: "POST" });
+    const r = await authFetch("/dev/reanalyze?call_id=" + encodeURIComponent(_currentCallId) + "&tenant=dev", { method: "POST" });
     const data = await r.json();
     if (!r.ok) { $("reanalyzeStatus").textContent = "failed: " + (data.detail || r.status); return; }
     renderOutcome(data);
@@ -482,10 +526,14 @@ async function start() {
     if (llm) qs += "&llm=" + encodeURIComponent(llm);
     if (tts) qs += "&tts=" + encodeURIComponent(tts);
   }
+  const _tok = adminToken();
+  if (_tok) qs += "&token=" + encodeURIComponent(_tok);
   ws = new WebSocket(`${wsProto}://${location.host}${path}?${qs}`);
   ws.binaryType = "arraybuffer";
+  let _wsOpened = false;
 
   ws.onopen = async () => {
+    _wsOpened = true;
     ws.send(JSON.stringify({ type: "hello", tenant: "dev" }));
     sendBargeConfig();
     try {
@@ -530,7 +578,13 @@ async function start() {
   };
 
   ws.onclose = (e) => {
-    if (e.reason) { showError("connection closed: " + e.reason); }
+    if (!_wsOpened) {
+      showError("voice session refused — check the admin token, then Save and retry");
+      stop(false); setStatus("unauthorized");
+      return;
+    }
+    if (e.code === 1008 && e.reason) { showError(e.reason); }
+    else if (e.reason) { showError("connection closed: " + e.reason); }
     stop(false); setStatus("closed");
   };
   ws.onerror = ()  => { setStatus("connection error"); };
@@ -591,7 +645,7 @@ async function placeCall(provider) {
   setStatus("placing call…");
   let body;
   try {
-    const resp = await fetch("/dev/place-call", {
+    const resp = await authFetch("/dev/place-call", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         provider, to_number: to, mode: _mode,
@@ -618,7 +672,17 @@ function pollCall(callSid) {
   callPoll = setInterval(async () => {
     let data;
     try {
-      const r = await fetch("/dev/call-status/" + encodeURIComponent(callSid));
+      // Plain fetch (not authFetch) here: on 401/403 we stop the interval
+      // ourselves below instead of showing a banner on every poll tick.
+      const r = await fetch("/dev/call-status/" + encodeURIComponent(callSid), { headers: authHeaders() });
+      if (r.status === 401 || r.status === 403) {
+        showError(r.status === 401
+          ? "admin token required — paste it in the header box and click Save"
+          : "admin token rejected (403) — check it matches VOX_ADMIN_TOKENS");
+        setStatus("unauthorized");
+        stopWatching();
+        return;
+      }
       if (!r.ok) return;
       data = await r.json();
     } catch (_) { return; }
@@ -737,7 +801,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
 async function loadVoices() {
   try {
-    const r = await fetch("/dev/voices?tenant=dev");
+    const r = await authFetch("/dev/voices?tenant=dev");
     if (r.ok) _voiceData = await r.json();
   } catch (e) { console.warn("[devconsole] voices fetch failed", e); }
   populateVoices(_mode);
@@ -748,7 +812,7 @@ loadVoices();
 async function loadCampaigns() {
   const sel = $("campaign");
   try {
-    const r = await fetch("/dev/campaigns?tenant=dev");
+    const r = await authFetch("/dev/campaigns?tenant=dev");
     if (!r.ok) return;
     const data = await r.json();
     sel.innerHTML = "";
@@ -767,7 +831,7 @@ let _ttsProviderMeta = [];   // [{id, label, languages}]
 
 async function loadProviders() {
   try {
-    const r = await fetch("/dev/providers");
+    const r = await authFetch("/dev/providers");
     if (!r.ok) return;
     const data = await r.json();
     const fill = (selId, opts) => {
@@ -817,7 +881,7 @@ async function loadTTSVoices(provider) {
   const sel = $("voice-layered");
   if (!sel) return;
   try {
-    const r = await fetch("/dev/tts-voices?provider=" + encodeURIComponent(provider) + "&language=" + language);
+    const r = await authFetch("/dev/tts-voices?provider=" + encodeURIComponent(provider) + "&language=" + language);
     if (!r.ok) return;
     const data = await r.json();
     sel.innerHTML = "";
