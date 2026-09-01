@@ -16,10 +16,13 @@ Inbound flow:
 from __future__ import annotations
 
 import asyncio
+import functools
 import inspect
 import json
 import logging
+import re
 from collections.abc import Callable
+from urllib.parse import urlsplit
 
 import httpx
 from fastapi import (
@@ -42,9 +45,28 @@ from src.api.telephony_stringee_bridge import StringeeIvrBridge, registry
 from src.api.telephony_twilio import softphone_dial_twiml, voice_twiml
 from src.auth import TenantContext
 from src.auth.middleware import tenant_from_slug, tenant_from_twilio_to_number
+from src.utils import public_url
+from src.utils.http_fetch import assert_safe_url, fetch_capped
 
 log = logging.getLogger(__name__)
 router = APIRouter(prefix="/telephony", tags=["telephony"])
+
+# Twilio recording URLs always live on api.twilio.com or a subdomain scoped
+# api.<region>.twilio.com — anchored so a suffix trick like
+# "api.twilio.com.attacker.com" can never match.
+_TWILIO_RECORDING_HOST_PATTERN = r"^api\.twilio\.com$|^api\.[a-z0-9-]+\.twilio\.com$"
+# Stringee recording URLs live on api.stringee.com or a regional subdomain
+# (e.g. asia-2.api.stringee.com).
+_STRINGEE_HOST_PATTERN = r"^([a-z0-9-]+\.)*stringee\.com$"
+
+# Twilio softphone recordings are dual-channel (record-from-answer-dual, see
+# telephony_twilio.py) 8kHz/16-bit WAV at ~32 KB/s — the original (pre-C3-fix)
+# code had no cap at all. 50 MiB covers ~26 min of audio, well above any real
+# call, while still bounding a malicious/huge response.
+_TWILIO_RECORDING_MAX_BYTES = 50 * 1024 * 1024  # ~26 min of dual-channel 8kHz/16-bit WAV
+# A single Stringee IVR turn recording, fetched inline while a live call is on
+# the line — bounded much tighter than the Twilio manual-call recording above.
+_STRINGEE_TURN_MAX_BYTES = 10 * 1024 * 1024  # a single IVR turn's recording
 
 
 # --- Browser softphone (human agent ↔ lead) deps ---------------------------
@@ -116,7 +138,8 @@ async def prewarm_stringee_call(call_id: str, tenant) -> None:
     stringee_base = raw_base.rstrip("/") + "/stringee"
     try:
         bridge = _stringee_bridge_factory(
-            call_id=call_id, tenant=tenant, base_url=stringee_base, fetch=_download)
+            call_id=call_id, tenant=tenant, base_url=stringee_base,
+            fetch=functools.partial(_download, tenant=tenant))
         if inspect.isawaitable(bridge):
             bridge = await bridge
         from src.api.telephony_stringee_bridge import registry
@@ -128,11 +151,17 @@ async def prewarm_stringee_call(call_id: str, tenant) -> None:
 
 def _ws_stream_url(request: Request, path: str) -> str:
     """Build the media-stream WSS URL for ``/api/v1/telephony/{path}``, honoring
-    the reverse-proxy forwarded host/proto (Northflank terminates TLS upstream)."""
-    base = request.headers.get("x-forwarded-host") or request.url.netloc
-    forwarded_proto = request.headers.get("x-forwarded-proto")
-    scheme = "wss" if (forwarded_proto == "https" or request.url.scheme == "https") else "ws"
-    return f"{scheme}://{base}/api/v1/telephony/{path}"
+    the reverse-proxy forwarded host/proto (Northflank terminates TLS
+    upstream). Purely header-derived — never reads ``platform_webhook_base_url()``
+    (see ``src/utils/public_url.py``'s ``origin_from_headers`` and
+    ``platform_webhook_base_url()``'s docstring in ``src/config_tenant.py``:
+    inbound telephony URLs must always resolve to the host that actually
+    received the request).
+    """
+    origin = public_url.origin_from_headers(request)
+    parsed = urlsplit(origin)
+    ws_scheme = "wss" if parsed.scheme == "https" else "ws"
+    return f"{ws_scheme}://{parsed.netloc}/api/v1/telephony/{path}"
 
 
 @router.post("/twilio/voice", response_class=Response)
@@ -286,11 +315,10 @@ async def twilio_stream_with_sid(
 
 
 def _forwarded_base(request: Request) -> str:
-    """Public base URL for our telephony routes, honoring reverse-proxy headers."""
-    base = request.headers.get("x-forwarded-host") or request.url.netloc
-    proto = request.headers.get("x-forwarded-proto")
-    scheme = "https" if (proto == "https" or request.url.scheme == "https") else "http"
-    return f"{scheme}://{base}/api/v1/telephony"
+    """Public base URL for our telephony routes, honoring reverse-proxy
+    headers. Purely header-derived — never reads ``platform_webhook_base_url()``
+    (see ``src/utils/public_url.py``'s ``origin_from_headers``)."""
+    return f"{public_url.origin_from_headers(request)}/api/v1/telephony"
 
 
 async def _provider_caller_id(
@@ -366,13 +394,38 @@ async def twilio_softphone_twiml(
 
 
 async def _download_twilio_recording(url: str, account_sid: str | None, auth_token: str | None) -> bytes:
-    """Fetch a Twilio recording as a WAV. Twilio recordings require account auth."""
+    """Fetch a Twilio recording as a WAV. Twilio recordings require account auth.
+
+    ``url`` is caller-supplied (the webhook's ``RecordingUrl`` form field) —
+    an unauthenticated attacker could point it anywhere, and since Basic Auth
+    carries the tenant's real Twilio Account SID + Auth Token, blindly
+    fetching it would leak those credentials to an arbitrary host (SSRF +
+    credential leak). Reject before making any network call unless the host
+    is Twilio's own and (when we have a SID to protect) the URL path is
+    scoped to that same account.
+    """
     wav_url = url if url.endswith(".wav") else f"{url}.wav"
+    try:
+        parsed = assert_safe_url(
+            wav_url, allowed_host_pattern=_TWILIO_RECORDING_HOST_PATTERN, require_https=True)
+        if ".." in parsed.path.split("/"):
+            # httpx normalizes dot-segments before sending, so a path like
+            # /Accounts/AC_REAL/../AC_OTHER/... would pass the account-binding
+            # regex below on the raw path but actually reach AC_OTHER on the
+            # wire — reject before that check runs.
+            raise ValueError("recording URL path contains a dot-segment")
+        if account_sid and not re.search(rf"/Accounts/{re.escape(account_sid)}/", parsed.path):
+            raise ValueError("recording URL is not scoped to the tenant's Twilio account")
+    except ValueError as e:
+        log.warning("twilio recording download rejected: %s", e)
+        raise
+
     auth = (account_sid, auth_token) if (account_sid and auth_token) else None
-    async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=10.0)) as c:
-        resp = await c.get(wav_url, auth=auth)
-        resp.raise_for_status()
-        return resp.content
+    content, _ct = await fetch_capped(
+        wav_url, auth=auth, allowed_host_pattern=_TWILIO_RECORDING_HOST_PATTERN,
+        max_bytes=_TWILIO_RECORDING_MAX_BYTES,
+        timeout=httpx.Timeout(30.0, connect=10.0))
+    return content
 
 
 @router.post("/twilio/softphone-recording/{tenant_slug}", response_class=Response)
@@ -677,27 +730,44 @@ async def _download_stringee_recording(
     creds = tel.active_creds()
     sid = tenant.secret(creds.account_sid_env) if creds.account_sid_env else None
     secret = tenant.secret(creds.auth_token_env) if creds.auth_token_env else None
-    # Go straight to https (Stringee 301-redirects http→https), and rewrite the
-    # host to the tenant's regional Stringee REST base when set — the URL arrives
-    # pointing at api.stringee.com, but a regional project's keySid is only valid
-    # on its regional host (e.g. asia-2.api.stringee.com), else r:5 "keySid
-    # invalid" (see scripts/stringee_recording_probe.py). Auth is the same
-    # X-STRINGEE-AUTH server token the callout uses.
+    # Force https unconditionally (Stringee 301-redirects http→https, but we no
+    # longer rely on following that redirect — see follow_redirects=False below),
+    # and rewrite the host to the tenant's regional Stringee REST base when set —
+    # the URL arrives pointing at api.stringee.com, but a regional project's
+    # keySid is only valid on its regional host (e.g. asia-2.api.stringee.com),
+    # else r:5 "keySid invalid" (see scripts/stringee_recording_probe.py). Auth
+    # is the same X-STRINGEE-AUTH server token the callout uses.
+    extra_host: str | None = None
     if tel.stringee_base_url:
-        from urllib.parse import urlsplit
         base = tel.stringee_base_url.rstrip("/")
-        if "://" not in base:
-            base = "https://" + base
-        parts = urlsplit(url if "://" in url else "https://" + url)
-        url = f"{base}{parts.path}" + (f"?{parts.query}" if parts.query else "")
+        base_parts = urlsplit(base if "://" in base else "https://" + base)
+        host = base_parts.netloc
+        # extra_allowed_hosts is compared against assert_safe_url's
+        # parts.hostname (port-stripped), so it must be built from .hostname
+        # here too, not .netloc — a base like "myvendor.example:8443" would
+        # otherwise never match its own allowlist entry. `host` (netloc) is
+        # still used below to build the actual request URL, where the port
+        # must be kept.
+        extra_host = (base_parts.hostname or "").lower() or None
     else:
-        url = url.replace("http://", "https://", 1)
+        url_parts = urlsplit(url if "://" in url else "https://" + url)
+        host = url_parts.netloc
+    parts = urlsplit(url if "://" in url else "https://" + url)
+    url = f"https://{host}{parts.path}" + (f"?{parts.query}" if parts.query else "")
+
+    assert_safe_url(
+        url,
+        allowed_host_pattern=_STRINGEE_HOST_PATTERN,
+        extra_allowed_hosts={extra_host} if extra_host else None,
+        require_https=True,
+    )
+
     headers = {}
     if sid and secret:
         headers["X-STRINGEE-AUTH"] = mint_server_token(sid, secret)
     delay = 3.0
     async with httpx.AsyncClient(
-        timeout=httpx.Timeout(30.0, connect=10.0), follow_redirects=True) as client:
+        timeout=httpx.Timeout(30.0, connect=10.0), follow_redirects=False) as client:
         for attempt in range(attempts):
             resp = await client.get(url, headers=headers)
             if resp.status_code == 404 and attempt < attempts - 1:
@@ -808,17 +878,47 @@ async def exotel_stream(websocket: WebSocket, tenant_slug: str) -> None:
 
 
 def _stringee_base(request: Request) -> str:
-    base = request.headers.get("x-forwarded-host") or request.url.netloc
-    proto = request.headers.get("x-forwarded-proto")
-    scheme = "https" if (proto == "https" or request.url.scheme == "https") else "http"
-    return f"{scheme}://{base}/api/v1/telephony/stringee"
+    """Public base URL for Stringee IVR webhook callbacks, honoring
+    reverse-proxy headers. Purely header-derived — never reads
+    ``platform_webhook_base_url()`` (see ``src/utils/public_url.py``'s
+    ``origin_from_headers``)."""
+    return f"{public_url.origin_from_headers(request)}/api/v1/telephony/stringee"
 
 
-async def _download(url: str) -> bytes:
-    async with httpx.AsyncClient(timeout=httpx.Timeout(8.0, connect=5.0)) as c:
-        resp = await c.get(url)
-        resp.raise_for_status()
-        return resp.content
+async def _download(url: str, tenant: TenantContext) -> bytes:
+    """Fetch a Stringee-hosted recording URL for the IVR turn bridge.
+
+    ``url`` arrives via the ``event_url``/``recording_url`` webhook fields —
+    caller-controlled input from Stringee's side, so it's restricted to
+    Stringee's own hosts (plus the tenant's configured regional/whitelabel
+    Stringee host) before any request goes out. This blocks a live call turn,
+    so it keeps the original tight 8s/5s timeout and a cap sized for a single
+    IVR turn's recording rather than fetch_capped's shared defaults.
+    """
+    tel = tenant.settings.pipeline.telephony
+    extra_host = None
+    if tel.stringee_base_url:
+        base = tel.stringee_base_url.rstrip("/")
+        base_parts = urlsplit(base if "://" in base else "https://" + base)
+        # See the matching comment in _download_stringee_recording: must be
+        # .hostname (port-stripped), not .netloc, to match what
+        # assert_safe_url compares extra_allowed_hosts against.
+        extra_host = (base_parts.hostname or "").lower() or None
+    # Force https unconditionally, same as _download_stringee_recording and for
+    # the same reason: Stringee sends/redirects http→https, or a configured
+    # base URL might carry any scheme, and fetch_capped requires https up
+    # front (require_https=True) — an unmodified http:// URL here would be
+    # rejected outright instead of upgraded, and since this runs inline on a
+    # live call turn, that failure is swallowed by the bridge's broad
+    # exception handling and silently reprompts the caller forever.
+    parts = urlsplit(url if "://" in url else "https://" + url)
+    url = f"https://{parts.netloc}{parts.path}" + (f"?{parts.query}" if parts.query else "")
+    content, _ct = await fetch_capped(
+        url, allowed_host_pattern=_STRINGEE_HOST_PATTERN,
+        extra_allowed_hosts={extra_host} if extra_host else None,
+        max_bytes=_STRINGEE_TURN_MAX_BYTES,
+        timeout=httpx.Timeout(8.0, connect=5.0))
+    return content
 
 
 def _stringee_number(value: object) -> str | None:
@@ -916,7 +1016,7 @@ async def _stringee_answer(request: Request, tenant: "TenantContext | None"):
     else:
         bridge = _stringee_bridge_factory(
             call_id=call_id, tenant=tenant,
-            base_url=stringee_base, fetch=_download,
+            base_url=stringee_base, fetch=functools.partial(_download, tenant=tenant),
         )
         if inspect.isawaitable(bridge):
             bridge = await bridge

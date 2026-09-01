@@ -18,7 +18,7 @@ from typing import Callable, Optional
 
 import asyncio
 
-from fastapi import APIRouter, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
@@ -29,6 +29,7 @@ from src.api.answer_paths import ANSWER_PATHS
 from src.api.browser_bridge import BrowserBridgeConfig, BrowserVoiceBridge
 from src.api.gemini_live_bridge import RECORD_TURN_SIGNAL, GeminiLiveBridge
 from src.auth.context import TenantContext
+from src.auth.middleware import require_admin, require_admin_ws
 from src.auth.registry import TenantProviders
 from src.api.call_store import insert_call
 from src.bootstrap import DEFAULT_DEMO_SCRIPT
@@ -51,8 +52,24 @@ log = logging.getLogger(__name__)
 _STATIC = Path(__file__).resolve().parents[2] / "static"
 
 # WS path lives under the /api/v1 router; the page route is top-level.
-ws_router = APIRouter(prefix="/dev", tags=["dev-console"])   # mounted under /api/v1
-dev_router = APIRouter(tags=["dev-console"])                  # mounted at app root
+#
+# Three routers, split by auth posture:
+#   dev_page_router — the HTML shell only, unauthenticated (it ships no data and
+#                     its own fetches carry the operator's admin token).
+#   dev_router      — every data/action route, admin-token gated per request.
+#   ws_router       — the two billed voice sessions, admin-token gated via
+#                     ?token= BEFORE the socket is accepted.
+# The VOX_DEV_CONSOLE env gate in src/main.py still decides whether any of them
+# mount at all; it is not, on its own, authentication.
+ws_router = APIRouter(                                        # mounted under /api/v1
+    prefix="/dev", tags=["dev-console"],
+    dependencies=[Depends(require_admin_ws)],
+)
+dev_page_router = APIRouter(tags=["dev-console"])             # mounted at app root, OPEN
+dev_router = APIRouter(                                       # mounted at app root
+    tags=["dev-console"],
+    dependencies=[Depends(require_admin)],
+)
 
 # Factory: (websocket, tenant) -> BrowserVoiceBridge. Set during lifespan.
 BrowserBridgeFactory = Callable[[WebSocket, TenantContext], BrowserVoiceBridge]
@@ -113,7 +130,7 @@ def set_live_bridge_factory(factory: Optional[LiveBridgeFactory]) -> None:
     _live_bridge_factory = factory
 
 
-@dev_router.get("/dev/voice")
+@dev_page_router.get("/dev/voice")
 async def dev_voice_page() -> FileResponse:
     return FileResponse(_STATIC / "dev_console.html", media_type="text/html")
 
@@ -464,9 +481,11 @@ async def dev_place_call(req: PlaceCallRequest) -> dict:
 async def dev_reanalyze(call_id: str, request: Request, tenant: str = "dev") -> dict:
     """Re-run outcome analysis for a finished webconsole call.
 
-    Used by the dev console Reanalyze button — no Bearer auth required (gated
-    by VOX_DEV_CONSOLE). Reads stored turns from the DB, re-runs analyze_call,
-    updates the conversation row, and returns the new outcome + summary.
+    Used by the dev console Reanalyze button — requires a Bearer admin token
+    (gated by ``require_admin`` on ``dev_router``, itself only mounted when
+    VOX_DEV_CONSOLE is on). Reads stored turns from the DB, re-runs
+    analyze_call, updates the conversation row, and returns the new outcome +
+    summary.
     """
     from src.auth.middleware import tenant_from_slug
     from src.analysis.call_outcome import analyze_call

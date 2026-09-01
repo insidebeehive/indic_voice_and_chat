@@ -21,16 +21,12 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import ipaddress
 import json
 import logging
-import socket
 import uuid
 from types import SimpleNamespace
 from typing import Awaitable, Callable, NamedTuple, NoReturn, Optional
-from urllib.parse import urlsplit
 
-import httpx
 from fastapi import (
     APIRouter,
     Depends,
@@ -58,6 +54,9 @@ from src.auth import TenantContext, current_tenant
 from src.dialogue.language import normalize_lang
 from src.interfaces.llm import LLMMessage
 from src.models.chat import ChatMessage, ChatSession
+import src.utils.http_fetch as http_fetch
+from src.utils.http_fetch import MAX_FETCH_BYTES as _MAX_MEDIA_FETCH_BYTES
+from src.utils.http_fetch import fetch_capped as _fetch_capped
 
 log = logging.getLogger(__name__)
 router = APIRouter(prefix="/chat", tags=["chat"])
@@ -342,55 +341,37 @@ def _spawn_webhook_task(coro: Awaitable) -> None:
     task.add_done_callback(_webhook_tasks.discard)
 
 
-_MAX_MEDIA_FETCH_BYTES = 1 * 1024 * 1024  # cap for media pulled via media_url
-_MEDIA_FETCH_TIMEOUT = httpx.Timeout(20.0, connect=10.0)
-
-
 def _is_public_host(hostname: str) -> bool:
-    """Reject hostnames resolving to private/loopback/link-local addresses —
-    media_url is untrusted client input (unlike vendor recording URLs
-    elsewhere in this codebase), so this guards against using it to probe
-    internal network services."""
-    try:
-        infos = socket.getaddrinfo(hostname, None)
-    except socket.gaierror:
-        return False
-    for info in infos:
-        addr = info[4][0]
-        ip = ipaddress.ip_address(addr)
-        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
-            return False
-    return True
+    """Thin wrapper preserved for spec compliance / future-proofing — delegates
+    to ``src.utils.http_fetch.is_public_host``, which now backs this check."""
+    return http_fetch.is_public_host(hostname)
 
 
 async def _fetch_media_url(url: str) -> tuple[bytes, str]:
     """Fetch a caller-supplied media URL (e.g. a presigned R2/S3 URL) server-side.
 
-    Streams the body with a byte-size cap and requires the response
-    Content-Type to be image/*, video/* or audio/* before accepting it.
-    Redirects are not followed (the default httpx behavior) to avoid an SSRF
-    bypass via a redirect chain."""
-    parts = urlsplit(url)
-    if parts.scheme != "https" or not parts.hostname:
-        raise ValueError("media_url must be an https URL")
-    if not _is_public_host(parts.hostname):
-        raise ValueError("media_url resolves to a non-public address")
-
-    async with httpx.AsyncClient(timeout=_MEDIA_FETCH_TIMEOUT) as client:
-        async with client.stream("GET", url) as resp:
-            if resp.is_redirect:
-                raise ValueError("media_url redirects are not followed")
-            resp.raise_for_status()
-            content_type = resp.headers.get("content-type", "").split(";")[0].strip().lower()
-            if not (content_type.startswith("image/") or content_type.startswith("video/")
-                    or content_type.startswith("audio/")):
-                raise ValueError(f"unsupported content-type: {content_type or 'unknown'}")
-            chunks = bytearray()
-            async for chunk in resp.aiter_bytes(chunk_size=65536):
-                chunks.extend(chunk)
-                if len(chunks) > _MAX_MEDIA_FETCH_BYTES:
-                    raise ValueError("media_url content exceeds size limit")
-            return bytes(chunks), content_type
+    Delegates to ``src.utils.http_fetch.fetch_capped`` — streams the body with
+    a byte-size cap and requires the response Content-Type to be image/*,
+    video/* or audio/* before accepting it. Redirects are not followed to
+    avoid an SSRF bypass via a redirect chain. media_url is untrusted client
+    input (unlike vendor recording URLs elsewhere in this codebase), so no
+    host allowlist is applied here — only the https + public-host + size/
+    content-type checks."""
+    try:
+        return await _fetch_capped(
+            url, max_bytes=_MAX_MEDIA_FETCH_BYTES,
+            accept_content_types=("image/", "video/", "audio/"))
+    except ValueError as e:
+        msg = str(e)
+        if msg == "url must be an https URL":
+            raise ValueError("media_url must be an https URL") from e
+        if msg == "url resolves to a non-public address":
+            raise ValueError("media_url resolves to a non-public address") from e
+        if msg == "url redirects are not followed":
+            raise ValueError("media_url redirects are not followed") from e
+        if msg == "url content exceeds size limit":
+            raise ValueError("media_url content exceeds size limit") from e
+        raise
 
 
 def set_chatbot_factory(factory: Optional[ChatBotFactory]) -> None:

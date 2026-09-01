@@ -93,11 +93,11 @@ async def transfer_result(
     if req.status not in ("success", "failure"):
         raise HTTPException(status_code=400, detail="status must be 'success' or 'failure'")
     from src.api.transfer_store import resolve
-    resolved = resolve(provider_call_sid, req.status)
+    resolved = resolve(tenant.id, provider_call_sid, req.status)
     if not resolved:
         raise HTTPException(
             status_code=404,
-            detail="no in-flight transfer waiting for this call SID")
+            detail="no in-flight transfer waiting for this call SID for this tenant")
     return {"resolved": True, "call_sid": provider_call_sid, "status": req.status}
 
 

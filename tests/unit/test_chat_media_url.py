@@ -17,6 +17,7 @@ from fastapi.testclient import TestClient
 from src.api import chat as chat_api
 from src.models.database import Base
 from src.models.chat import ChatSession
+from src.utils import http_fetch
 
 
 class _FakeMediaStore:
@@ -160,7 +161,7 @@ async def test_image_ws_media_url_fetch_failure_sends_error():
 async def test_fetch_media_url_rejects_oversized_body():
     url = "https://bucket.r2.example.com/huge.png"
     body = b"x" * (chat_api._MAX_MEDIA_FETCH_BYTES + 1)
-    with respx.mock, patch.object(chat_api, "_is_public_host", return_value=True):
+    with respx.mock, patch.object(http_fetch, "is_public_host", return_value=True):
         respx.get(url).mock(return_value=httpx.Response(
             200, headers={"content-type": "image/png"}, content=body))
         with pytest.raises(ValueError, match="exceeds size limit"):
@@ -170,7 +171,7 @@ async def test_fetch_media_url_rejects_oversized_body():
 @pytest.mark.asyncio
 async def test_fetch_media_url_rejects_bad_content_type():
     url = "https://bucket.r2.example.com/not-media.txt"
-    with respx.mock, patch.object(chat_api, "_is_public_host", return_value=True):
+    with respx.mock, patch.object(http_fetch, "is_public_host", return_value=True):
         respx.get(url).mock(return_value=httpx.Response(
             200, headers={"content-type": "text/plain"}, content=b"hello"))
         with pytest.raises(ValueError, match="unsupported content-type"):
@@ -193,7 +194,7 @@ async def test_fetch_media_url_rejects_private_host():
 async def test_fetch_media_url_accepts_audio_content_type():
     url = "https://bucket.r2.example.com/voice.ogg"
     body = b"OggS" + b"x" * 50
-    with respx.mock, patch.object(chat_api, "_is_public_host", return_value=True):
+    with respx.mock, patch.object(http_fetch, "is_public_host", return_value=True):
         respx.get(url).mock(return_value=httpx.Response(
             200, headers={"content-type": "audio/ogg"}, content=body))
         data, content_type = await chat_api._fetch_media_url(url)
@@ -205,7 +206,7 @@ async def test_fetch_media_url_accepts_audio_content_type():
 async def test_fetch_media_url_accepts_valid_image():
     url = "https://bucket.r2.example.com/photo.png"
     body = b"\x89PNG\r\n" + b"x" * 50
-    with respx.mock, patch.object(chat_api, "_is_public_host", return_value=True):
+    with respx.mock, patch.object(http_fetch, "is_public_host", return_value=True):
         respx.get(url).mock(return_value=httpx.Response(
             200, headers={"content-type": "image/png"}, content=body))
         data, content_type = await chat_api._fetch_media_url(url)

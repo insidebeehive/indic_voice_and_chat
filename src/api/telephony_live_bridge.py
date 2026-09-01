@@ -40,6 +40,7 @@ class TelephonyLiveBridge(_BaseLiveBridge):
 
     def __init__(self, *, websocket, agent, config: RealtimeConfig, connect_session,
                  llm=None, tts=None, tenant_timezone: str = "Asia/Kolkata",
+                 tenant_id: str | None = None,
                  encoding: str = "mulaw", sid_field: str = "streamSid",
                  supports_clear: bool = True, call_sid_field: str = "callSid",
                  transfer_webhook_url: str | None = None,
@@ -49,6 +50,7 @@ class TelephonyLiveBridge(_BaseLiveBridge):
                          llm=llm, tenant_timezone=tenant_timezone)
         self._ws = websocket
         self._tts = tts
+        self._tenant_id = tenant_id
         self._encoding = encoding
         self._sid_field = sid_field
         self._supports_clear = supports_clear
@@ -203,6 +205,12 @@ class TelephonyLiveBridge(_BaseLiveBridge):
         if not call_sid:
             return
 
+        if not self._tenant_id:
+            log.error("transfer hold without tenant id; failing transfer",
+                      extra={"call_sid": call_sid})
+            await self._play_transfer_failure_apology()
+            return
+
         # Close the Gemini Live session — AI stops. Inbound audio will be
         # discarded (_on_media checks self._session is None).
         if self._session is not None:
@@ -216,7 +224,7 @@ class TelephonyLiveBridge(_BaseLiveBridge):
         await self._fire_transfer_webhook(call_sid)
 
         # Wait for CS result. Timeout → treat as failure (no human found).
-        fut = transfer_store.register(call_sid)
+        fut = transfer_store.register(self._tenant_id, call_sid)
         try:
             result = await asyncio.wait_for(fut, timeout=_TRANSFER_TIMEOUT_S)
         except asyncio.TimeoutError:
@@ -224,7 +232,7 @@ class TelephonyLiveBridge(_BaseLiveBridge):
                      extra={"call_sid": call_sid})
             result = "failure"
         except asyncio.CancelledError:
-            transfer_store.cancel_pending(call_sid)
+            transfer_store.cancel_pending(self._tenant_id, call_sid)
             return
 
         log.info("transfer hold resolved", extra={"call_sid": call_sid, "result": result})
@@ -234,9 +242,12 @@ class TelephonyLiveBridge(_BaseLiveBridge):
     async def _fire_transfer_webhook(self, call_sid: str) -> None:
         if not self._transfer_webhook_url:
             return
-        from src.config_tenant import platform_webhook_base_url
         from src.integration.tenant_events import deliver
-        base = (platform_webhook_base_url() or "").rstrip("/")
+        from src.utils.public_url import public_origin
+        # public_origin() is the bare scheme://netloc — platform_webhook_base_url()
+        # itself carries a path suffix (e.g. /api/v1/telephony), so naively
+        # concatenating it here would double the /api/v1/ segment.
+        base = public_origin()
         body = {
             "event": "call.transfer_requested",
             "call_sid": call_sid,

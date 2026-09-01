@@ -702,7 +702,7 @@ def _build_s2s_telephony_bridge(
                   if _wh_sec_env and hasattr(tenant, "secret_optional") else None)
     return TelephonyLiveBridge(
         websocket=websocket, agent=agent, config=config, connect_session=connect, llm=llm,
-        tts=tts, tenant_timezone=tenant_timezone,
+        tts=tts, tenant_timezone=tenant_timezone, tenant_id=tenant.id,
         encoding=encoding, sid_field=sid_field, supports_clear=supports_clear,
         call_sid_field=call_sid_field,
         transfer_webhook_url=_wh_url,
