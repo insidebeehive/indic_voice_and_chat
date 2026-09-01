@@ -449,6 +449,7 @@ def make_chatbot_factory(registry, sessionmaker=None, crm_retrievers: "PerCrmRet
     async def factory(
         tenant: TenantContext, session_id: str, *,
         customer_id: object = _CUSTOMER_ID_UNSET,
+        ticket_id: str | None = None,
     ) -> ChatBotAgent:
         # customer_id (= logged-in user/player ID) feeds CRM tool calls that
         # need player-specific context. The WS connect path passes it from the
@@ -490,6 +491,7 @@ def make_chatbot_factory(registry, sessionmaker=None, crm_retrievers: "PerCrmRet
                 token=spec["token"], args=tc.arguments or {}, context=_crm_context,
                 x_api_key=spec.get("x_api_key"),
                 extra_headers=spec.get("extra_headers"),
+                session_id=bare_session_id, ticket_id=ticket_id,
                 timeout_s=timeout_s)
 
         tool_specs = list(crm_specs)
@@ -535,6 +537,7 @@ def make_chatbot_factory(registry, sessionmaker=None, crm_retrievers: "PerCrmRet
                     sessionmaker=sessionmaker,
                     media_store=_chat_api._media_store,
                     timeout_s=timeout_s,
+                    ticket_id=ticket_id,
                 )
 
         elif dv_config is not None and dv_config.enabled and dv_config.webhook_url and not dv_secret:
@@ -570,6 +573,8 @@ def make_chatbot_factory(registry, sessionmaker=None, crm_retrievers: "PerCrmRet
             deposit_verification_executor=deposit_verification_executor,
             llm_provider=_llm_defaults.get("provider") or "",
             llm_model=_llm_defaults.get("model") or "",
+            session_id=bare_session_id,
+            ticket_id=ticket_id,
         )
 
     return factory

@@ -539,9 +539,11 @@ async def test_tool_not_registered_when_misconfigured(sm, caplog, case) -> None:
 async def test_registered_executor_passes_bare_session_id_and_current_media_store(sm, monkeypatch) -> None:
     captured: dict = {}
 
-    async def _fake_submit(*, tenant, session_id, order_id, sessionmaker, media_store, timeout_s):
+    async def _fake_submit(*, tenant, session_id, order_id, sessionmaker, media_store, timeout_s,
+                            ticket_id=None):
         captured.update(tenant=tenant, session_id=session_id, order_id=order_id,
-                         sessionmaker=sessionmaker, media_store=media_store, timeout_s=timeout_s)
+                         sessionmaker=sessionmaker, media_store=media_store, timeout_s=timeout_s,
+                         ticket_id=ticket_id)
         return {"status": "submitted", "message": "ok"}
 
     import src.chatbot.deposit_verification as dv_module
@@ -571,7 +573,8 @@ async def test_registered_executor_passes_bare_session_id_and_current_media_stor
 async def test_registered_executor_defaults_missing_order_id_argument_to_empty_string(sm, monkeypatch) -> None:
     captured: dict = {}
 
-    async def _fake_submit(*, tenant, session_id, order_id, sessionmaker, media_store, timeout_s):
+    async def _fake_submit(*, tenant, session_id, order_id, sessionmaker, media_store, timeout_s,
+                            ticket_id=None):
         captured["order_id"] = order_id
         return {"status": "missing_order_id"}
 

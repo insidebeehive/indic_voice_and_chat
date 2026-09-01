@@ -87,7 +87,7 @@ async def app(tmp_faiss_index: str, fake_redis):
 
     llm = _RecordingLLM()
 
-    async def factory(tenant: TenantContext, session_id: str, *, customer_id=None) -> ChatBotAgent:
+    async def factory(tenant: TenantContext, session_id: str, *, customer_id=None, ticket_id=None) -> ChatBotAgent:
         return ChatBotAgent(
             session=AgentSession(session_id=session_id),
             llm=llm,

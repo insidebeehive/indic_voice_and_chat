@@ -308,21 +308,24 @@ def _classify_turn_error(exc: Exception) -> tuple[str, str]:
     return "internal", "Sorry, something went wrong — please try again."
 
 
-def _raise_turn_http_error(exc: Exception, session_id: str) -> NoReturn:
+def _raise_turn_http_error(
+    exc: Exception, session_id: str, *, ticket_id: Optional[str] = None,
+) -> NoReturn:
     """Map a failed REST chat turn to an honest HTTPException (never a bare 500).
 
     Mirrors the WS per-turn error handling in ``chat_websocket`` — same
     (reason, message) classification and the same ops log line for a billing
     cap, just surfaced as an HTTP status instead of an ``error`` WS frame."""
     reason, message = _classify_turn_error(exc)
-    log.exception("chat REST turn failed", extra={"session_id": session_id, "reason": reason})
+    log.exception("chat REST turn failed", extra={
+        "ticket_id": ticket_id, "session_id": session_id, "reason": reason})
     if reason == "llm_billing":
         # Distinct from ordinary quota noise: this needs a human to raise the
         # cap, it won't clear on its own.
         log.error(
             "gemini monthly spending cap exceeded — raise it at "
             "https://ai.studio/spend to restore chat",
-            extra={"session_id": session_id},
+            extra={"ticket_id": ticket_id, "session_id": session_id},
         )
     status = {"llm_billing": 503, "llm_quota": 503, "timeout": 504}.get(reason, 500)
     raise HTTPException(status_code=status, detail={"message": message, "reason": reason})
@@ -422,6 +425,14 @@ def _scoped_session(tenant: TenantContext, session_id: str) -> str:
     return f"{tenant.id}:{session_id}"
 
 
+def _ticket_id_from_row(row: ChatSession | None) -> Optional[str]:
+    """External CRM ticket number for a session, when the CRM supplied one at
+    session-creation time (``metadata: {"crm_ticket_id": ...}`` on
+    ``POST /chat/sessions``). Often absent (e.g. widget-created sessions) —
+    always treat the result as optional. Used purely for log correlation."""
+    return (row.extra_data or {}).get("crm_ticket_id") if row else None
+
+
 # Roles in chat_messages that carry conversational content worth replaying.
 # "system" is included so async-pushed messages (push_async_message persists
 # them with role="system" — e.g. deposit-verdict and verification-timeout
@@ -467,6 +478,11 @@ async def _hydrate_agent_history(agent: ChatBotAgent, session_id: str, tenant_id
         return 0
     if session.turns:  # already populated (e.g. request_call's own load)
         return 0
+    # Pulled straight off the agent — the factory (src/bootstrap.py) already
+    # threaded ticket_id into ChatBotAgent's constructor when it had one, so
+    # this is a zero-cost read, not a new lookup. getattr-defensive for the
+    # same test-double reason as `session` above.
+    ticket_id = getattr(agent, "_ticket_id", None)
     try:
         async with _sm()() as db:
             rows = (await db.execute(
@@ -480,7 +496,8 @@ async def _hydrate_agent_history(agent: ChatBotAgent, session_id: str, tenant_id
                 .limit(_HYDRATE_LIMIT)
             )).scalars().all()
     except Exception:  # noqa: BLE001 — memory is a nicety, the socket is not
-        log.exception("chat history hydration failed", extra={"session_id": session_id})
+        log.exception("chat history hydration failed", extra={
+            "ticket_id": ticket_id, "session_id": session_id})
         return 0
 
     turns: list[LLMMessage] = []
@@ -519,7 +536,7 @@ async def _hydrate_agent_history(agent: ChatBotAgent, session_id: str, tenant_id
     session.turns.extend(turns)
     if turns:
         log.info("chat history hydrated", extra={
-            "session_id": session_id, "turns": len(turns)})
+            "ticket_id": ticket_id, "session_id": session_id, "turns": len(turns)})
     return len(turns)
 
 
@@ -867,17 +884,19 @@ async def upload_media(
     if not data:
         raise HTTPException(status_code=400, detail="empty upload")
     mime = file.content_type or "application/octet-stream"
-    agent = await _factory(tenant, _scoped_session(tenant, session_id))
+    ticket_id = _ticket_id_from_row(row)
+    agent = await _factory(tenant, _scoped_session(tenant, session_id), ticket_id=ticket_id)
     await _hydrate_agent_history(agent, session_id, tenant.id)
     try:
         result = await agent.handle_image(data, mime, text)
     except HTTPException:
         raise
     except Exception as exc:  # noqa: BLE001 — map provider failures to honest HTTP errors
-        _raise_turn_http_error(exc, session_id)
+        _raise_turn_http_error(exc, session_id, ticket_id=ticket_id)
     await _persist_turn(
         session_id, text or f"[{mime}]", result,
-        user_type=("image" if mime.startswith("image/") else "video"), media_mime=mime)
+        user_type=("image" if mime.startswith("image/") else "video"), media_mime=mime,
+        ticket_id=ticket_id)
     await _emit_escalation(tenant.id, session_id, result)
     return _to_message_response(session_id, result)
 
@@ -908,7 +927,8 @@ async def request_call(
         raise HTTPException(status_code=503, detail="chat voice handoff not initialized")
 
     # Summarize the conversation so far (from persisted messages) for the voicebot.
-    agent = await _factory(tenant, _scoped_session(tenant, session_id))
+    agent = await _factory(
+        tenant, _scoped_session(tenant, session_id), ticket_id=_ticket_id_from_row(row))
     msgs = (await session.execute(
         select(ChatMessage).where(ChatMessage.session_id == session_id).order_by(ChatMessage.id)
     )).scalars().all()
@@ -1093,7 +1113,8 @@ async def claim_session(
             "type": "mode_change", "mode": "human",
             "agent_name": req.agent_name,
         }))
-    log.info("session claimed", extra={"session_id": session_id, "agent": req.agent_id})
+    log.info("session claimed", extra={
+        "ticket_id": _ticket_id_from_row(row), "session_id": session_id, "agent": req.agent_id})
     return ClaimResponse(status="claimed", agent_id=req.agent_id)
 
 
@@ -1122,7 +1143,8 @@ async def decline_session(
     cq = _customer_queues.get(session_id)
     if cq:
         await cq.put(json.dumps({"type": "declined"}))
-    log.info("session declined by CRM", extra={"session_id": session_id})
+    log.info("session declined by CRM", extra={
+        "ticket_id": _ticket_id_from_row(row), "session_id": session_id})
     return DeclineResponse(status="declined")
 
 
@@ -1155,6 +1177,7 @@ async def agent_websocket(websocket: WebSocket, session_id: str) -> None:
     if row.mode not in ("awaiting_human", "human"):
         await websocket.close(code=4004, reason="session not in handover mode")
         return
+    ticket_id = _ticket_id_from_row(row)
 
     # Send full history on connect
     async with _sm()() as db:
@@ -1229,16 +1252,17 @@ async def agent_websocket(websocket: WebSocket, session_id: str) -> None:
                     await cq.put(json.dumps({"type": "message", "text": text, "from": "human_agent"}))
                 elif mtype == "end":
                     await cq.put(json.dumps({"type": "ended"}))
-                    await _end_session(session_id, "Ended by support agent")
+                    await _end_session(session_id, "Ended by support agent", ticket_id=ticket_id)
                     break
     except WebSocketDisconnect:
-        log.info("agent ws disconnected", extra={"session_id": session_id})
+        log.info("agent ws disconnected", extra={"ticket_id": ticket_id, "session_id": session_id})
     except Exception as _exc:  # noqa: BLE001
         log.error(
             "agent ws crashed: %s: %s", type(_exc).__name__, _exc,
-            extra={"session_id": session_id},
+            extra={"ticket_id": ticket_id, "session_id": session_id},
         )
-        log.exception("agent ws crashed (full tb)", extra={"session_id": session_id})
+        log.exception("agent ws crashed (full tb)", extra={
+            "ticket_id": ticket_id, "session_id": session_id})
     finally:
         try:
             await websocket.close()
@@ -1264,6 +1288,10 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
     if row is None:
         await websocket.close(code=4004, reason="chat session not found")
         return
+    # Computed ONCE per connection (never inside the per-message receive loop
+    # below) — a session's crm_ticket_id doesn't change mid-conversation, and
+    # this is used purely for log correlation with the external CRM ticket.
+    ticket_id = _ticket_id_from_row(row)
     tenant = await tenant_from_id(row.tenant_id)
     if tenant is None:
         await websocket.close(code=1011, reason="tenant unavailable")
@@ -1300,18 +1328,20 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
             if refreshed_row is not None:
                 row = refreshed_row
     except Exception:  # noqa: BLE001 — the sweep must never block a reconnect
-        log.exception("deposit verification reconnect sweep failed", extra={"session_id": session_id})
+        log.exception("deposit verification reconnect sweep failed", extra={
+            "ticket_id": ticket_id, "session_id": session_id})
 
     try:
         # Pass customer_id from the row already fetched above so the factory
         # doesn't re-query the same ChatSession row on another pool checkout.
         agent = await _factory(tenant, _scoped_session(tenant, session_id),
-                               customer_id=row.customer_id)
+                               customer_id=row.customer_id, ticket_id=ticket_id)
     except Exception:
         # A failure here (e.g. a DB connection pool exhausted under a burst of
         # concurrent new sessions) must not leave the client waiting forever
         # with no response — close with a clear code instead of hanging.
-        log.exception("chatbot factory failed", extra={"session_id": session_id})
+        log.exception("chatbot factory failed", extra={
+            "ticket_id": ticket_id, "session_id": session_id})
         await websocket.close(code=1011, reason="chatbot unavailable — please retry")
         return
 
@@ -1327,7 +1357,7 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
         # Handle reconnect: session may already be in human/awaiting_human mode
         # (reuse the row fetched at connect — no second lookup for the same row).
         if row.mode in ("awaiting_human", "human"):
-            if await _run_human_mode(websocket, session_id, tenant):
+            if await _run_human_mode(websocket, session_id, tenant, ticket_id=ticket_id):
                 return  # session fully ended
             # CRM declined — fall through to bot loop below
 
@@ -1373,10 +1403,11 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
                 try:
                     summary = await agent.summarize_session()
                 except Exception:  # noqa: BLE001 — closing must never fail the customer
-                    log.exception("summarize on idle timeout failed", extra={"session_id": session_id})
+                    log.exception("summarize on idle timeout failed", extra={
+                        "ticket_id": ticket_id, "session_id": session_id})
                     summary = ""
-                await _end_session(session_id, summary)
-                await _send_close_webhook(tenant, session_id, "ai", summary)
+                await _end_session(session_id, summary, ticket_id=ticket_id)
+                await _send_close_webhook(tenant, session_id, "ai", summary, ticket_id=ticket_id)
                 await websocket.send_text(json.dumps({
                     "type": "ended", "summary": summary, "reason": "idle_timeout",
                 }))
@@ -1425,7 +1456,7 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
                     # Hand off via the same entry point normal in-turn
                     # escalations use below (see the `_handle_escalation` /
                     # `_run_human_mode` calls further down this loop).
-                    if await _run_human_mode(websocket, session_id, tenant):
+                    if await _run_human_mode(websocket, session_id, tenant, ticket_id=ticket_id):
                         break
                     # CRM declined/timed out — _run_human_mode already
                     # reverted the session to bot mode; resume the bot loop.
@@ -1451,10 +1482,11 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
                 try:
                     summary = await agent.summarize_session()
                 except Exception:  # noqa: BLE001 — closing must never fail the customer
-                    log.exception("summarize on end failed", extra={"session_id": session_id})
+                    log.exception("summarize on end failed", extra={
+                        "ticket_id": ticket_id, "session_id": session_id})
                     summary = ""
-                await _end_session(session_id, summary)
-                await _send_close_webhook(tenant, session_id, "ai", summary)
+                await _end_session(session_id, summary, ticket_id=ticket_id)
+                await _send_close_webhook(tenant, session_id, "ai", summary, ticket_id=ticket_id)
                 await websocket.send_text(json.dumps({"type": "ended", "summary": summary, "reason": "customer_ended"}))
                 break
 
@@ -1500,7 +1532,8 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
                             try:
                                 audio_bytes, fetched_mime = await _fetch_media_url(audio_media_url)
                             except Exception:
-                                log.exception("media_url fetch failed", extra={"session_id": session_id})
+                                log.exception("media_url fetch failed", extra={
+                                    "ticket_id": ticket_id, "session_id": session_id})
                                 await _stop_keepalive(_ka, _ka_stop)
                                 await websocket.send_text(json.dumps({
                                     "type": "error",
@@ -1528,7 +1561,8 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
                             else:
                                 await upload_coro
                         except Exception:
-                            log.exception("audio upload/transcription failed", extra={"session_id": session_id})
+                            log.exception("audio upload/transcription failed", extra={
+                                "ticket_id": ticket_id, "session_id": session_id})
                             await _stop_keepalive(_ka, _ka_stop)
                             await websocket.send_text(json.dumps(
                                 {"type": "error", "message": "Could not save voice message — please try again."}))
@@ -1553,6 +1587,7 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
                             msg_id = await _persist_turn(
                                 session_id, transcript, result,
                                 user_type="audio", media_mime=mime, media_url=object_key,
+                                ticket_id=ticket_id,
                             )
                             if msg_id is not None:
                                 await websocket.send_text(json.dumps({
@@ -1562,7 +1597,7 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
                             await _send_reply(websocket, session_id, result, tenant.id)
                             if result.escalation:
                                 if await _handle_escalation(websocket, session_id, tenant, row, result):
-                                    if await _run_human_mode(websocket, session_id, tenant):
+                                    if await _run_human_mode(websocket, session_id, tenant, ticket_id=ticket_id):
                                         break
                         else:
                             # Persist audio without agent reply. Stop the
@@ -1622,7 +1657,8 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
                                 fetched_bytes, fetched_mime = await _fetch_media_url(media_url)
                                 mime = mime or fetched_mime
                             except Exception:
-                                log.exception("media_url fetch failed", extra={"session_id": session_id})
+                                log.exception("media_url fetch failed", extra={
+                                    "ticket_id": ticket_id, "session_id": session_id})
                                 await _stop_keepalive(_ka, _ka_stop)
                                 await websocket.send_text(json.dumps({
                                     "type": "error",
@@ -1643,7 +1679,8 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
                                 object_key = _media_key(tenant.id, session_id, mime)
                                 await _media_store.upload(raw_bytes, object_key, mime.split(";")[0])
                             except Exception:
-                                log.exception("media upload failed", extra={"session_id": session_id})
+                                log.exception("media upload failed", extra={
+                                    "ticket_id": ticket_id, "session_id": session_id})
                                 object_key = None
 
                         result = await _run_turn(
@@ -1661,11 +1698,12 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
                         # to call again in the `finally` below (idempotent).
                         await _stop_keepalive(_ka, _ka_stop)
                         await _persist_turn(session_id, caption or f"[{mtype}]", result,
-                                            user_type=mtype, media_mime=mime, media_url=object_key)
+                                            user_type=mtype, media_mime=mime, media_url=object_key,
+                                            ticket_id=ticket_id)
                         await _send_reply(websocket, session_id, result, tenant.id)
                         if result.escalation:
                             if await _handle_escalation(websocket, session_id, tenant, row, result):
-                                if await _run_human_mode(websocket, session_id, tenant):
+                                if await _run_human_mode(websocket, session_id, tenant, ticket_id=ticket_id):
                                     break
                     finally:
                         await _stop_keepalive(_ka, _ka_stop)
@@ -1680,7 +1718,7 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
                 result = await _run_turn_with_keepalive(
                     websocket, agent.handle_message(user_text),
                     session_id=session_id, language=row.language)
-                await _persist_turn(session_id, user_text, result)
+                await _persist_turn(session_id, user_text, result, ticket_id=ticket_id)
                 call_url: Optional[str] = None
                 if result.call_offer and _handoff_store is not None:
                     summary = await agent.summarize_session()
@@ -1700,20 +1738,21 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
                     # Agent confirmed the user has no more questions — close immediately
                     # without waiting for the idle timeout.
                     summary = await agent.summarize_session()
-                    await _end_session(session_id, summary)
-                    await _send_close_webhook(tenant, session_id, "ai", summary)
+                    await _end_session(session_id, summary, ticket_id=ticket_id)
+                    await _send_close_webhook(tenant, session_id, "ai", summary, ticket_id=ticket_id)
                     await websocket.send_text(json.dumps({
                         "type": "ended", "summary": summary, "reason": "resolved",
                     }))
                     break
                 if result.escalation:
                     if await _handle_escalation(websocket, session_id, tenant, row, result):
-                        if await _run_human_mode(websocket, session_id, tenant):
+                        if await _run_human_mode(websocket, session_id, tenant, ticket_id=ticket_id):
                             break
             except WebSocketDisconnect:
                 raise
             except Exception as turn_exc:  # noqa: BLE001 — one bad turn must not drop the chat
-                log.exception("chat turn failed", extra={"session_id": session_id})
+                log.exception("chat turn failed", extra={
+                    "ticket_id": ticket_id, "session_id": session_id})
                 reason, message = _classify_turn_error(turn_exc)
                 if reason == "llm_billing":
                     # Distinct from ordinary quota noise: this needs a human to
@@ -1721,15 +1760,17 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
                     log.error(
                         "gemini monthly spending cap exceeded — raise it at "
                         "https://ai.studio/spend to restore chat",
-                        extra={"session_id": session_id},
+                        extra={"ticket_id": ticket_id, "session_id": session_id},
                     )
                 await websocket.send_text(json.dumps({
                     "type": "error", "message": message, "reason": reason,
                 }))
     except WebSocketDisconnect:
-        log.info("chat ws client disconnected", extra={"session_id": session_id})
+        log.info("chat ws client disconnected", extra={
+            "ticket_id": ticket_id, "session_id": session_id})
     except Exception:  # noqa: BLE001 — never let the websocket task escape
-        log.exception("chat websocket crashed")
+        log.exception("chat websocket crashed", extra={
+            "ticket_id": ticket_id, "session_id": session_id})
         try:
             await websocket.close()
         except Exception:  # noqa: BLE001
@@ -1806,7 +1847,7 @@ async def _emit_escalation(tenant_id: str, session_id: str, result: ChatTurnResu
 async def _persist_turn(
     session_id: str, user_text: str, result: ChatTurnResult,
     *, user_type: str = "text", media_mime: Optional[str] = None,
-    media_url: Optional[str] = None,
+    media_url: Optional[str] = None, ticket_id: Optional[str] = None,
 ) -> Optional[int]:
     """Append the customer + agent messages to chat_messages and bump the count.
     Returns the customer ChatMessage.id on success, None on error or missing session."""
@@ -1852,18 +1893,21 @@ async def _persist_turn(
                     row.input_tokens = (row.input_tokens or 0) + result.input_tokens
                     row.output_tokens = (row.output_tokens or 0) + result.output_tokens
                 except Exception:  # noqa: BLE001 — never let cost bookkeeping break persistence
-                    log.exception("chat turn cost computation failed", extra={"session_id": session_id})
+                    log.exception("chat turn cost computation failed", extra={
+                        "ticket_id": ticket_id, "session_id": session_id})
             await db.flush()
             msg_id = customer_msg.id
             await db.commit()
             return msg_id
     except Exception:
-        log.exception("chat message persistence failed", extra={"session_id": session_id})
+        log.exception("chat message persistence failed", extra={
+            "ticket_id": ticket_id, "session_id": session_id})
         return None
 
 
 async def push_async_message(
     session_id: str, text: str, *, role: str = "system", frame_type: str = "async_message",
+    ticket_id: Optional[str] = None,
 ) -> Optional[int]:
     """Persist a message into ``session_id``'s transcript from OUTSIDE the normal
     turn loop, and — if a customer WS is currently connected in bot mode — push
@@ -1894,7 +1938,8 @@ async def push_async_message(
             msg_id = message.id
             await db.commit()
     except Exception:  # noqa: BLE001 — background-safe: log, never raise
-        log.exception("push_async_message persistence failed", extra={"session_id": session_id})
+        log.exception("push_async_message persistence failed", extra={
+            "ticket_id": ticket_id, "session_id": session_id})
         return None
 
     queue = _async_push_queues.get(session_id)
@@ -1904,12 +1949,15 @@ async def push_async_message(
                 "type": frame_type, "session_id": session_id, "text": text,
             }))
         except Exception:  # noqa: BLE001 — delivery is best-effort
-            log.exception("push_async_message queue delivery failed", extra={"session_id": session_id})
+            log.exception("push_async_message queue delivery failed", extra={
+                "ticket_id": ticket_id, "session_id": session_id})
 
     return msg_id
 
 
-async def _end_session(session_id: str, summary: str = "") -> None:
+async def _end_session(
+    session_id: str, summary: str = "", *, ticket_id: Optional[str] = None,
+) -> None:
     from datetime import datetime, timezone
     try:
         async with _sm()() as db:
@@ -1923,7 +1971,8 @@ async def _end_session(session_id: str, summary: str = "") -> None:
                 row.summary = summary
             await db.commit()
     except Exception:  # noqa: BLE001
-        log.exception("chat session end failed", extra={"session_id": session_id})
+        log.exception("chat session end failed", extra={
+            "ticket_id": ticket_id, "session_id": session_id})
     # Close any live voice call that was started from this chat session.
     voice_ws = _active_voice_ws.pop(session_id, None)
     if voice_ws:
@@ -1971,6 +2020,8 @@ async def _escalate_session(
     from src.api.chat_webhooks import send_bo_webhook
     from src.chatbot.support_hours import is_bo_available
 
+    # `row` is already loaded by every caller — zero-cost, no new query.
+    ticket_id = _ticket_id_from_row(row)
     available, next_slot = is_bo_available(tenant.settings.chat_support)
 
     async with _sm()() as db:
@@ -1996,7 +2047,7 @@ async def _escalate_session(
         # CRM couldn't accept the transfer — revert to bot mode and let the
         # bot continue so the customer isn't left with no one to talk to.
         log.warning("escalation webhook failed; reverting session to bot mode",
-                    extra={"session_id": session_id})
+                    extra={"ticket_id": ticket_id, "session_id": session_id})
         async with _sm()() as db:
             r = await db.get(ChatSession, session_id)
             if r:
@@ -2105,6 +2156,10 @@ async def _check_and_timeout_verification(request_id: str) -> None:
     from src.auth.middleware import tenant_from_id
     from src.models.deposit_verification import DepositVerificationRequest
 
+    # Pre-declared so the outer except below can always safely reference them
+    # even if the very first lookup fails.
+    deposit_session_id: Optional[str] = None
+    ticket_id: Optional[str] = None
     try:
         async with _sm()() as db:
             row = await db.get(DepositVerificationRequest, request_id)
@@ -2117,22 +2172,30 @@ async def _check_and_timeout_verification(request_id: str) -> None:
             order_id = row.order_id
             tenant_id = row.tenant_id
 
+        # Fetch the ChatSession row once, up front — used below both for the
+        # "session missing" guard and (via _ticket_id_from_row) for log
+        # correlation with the external CRM ticket on every branch below,
+        # including the tenant-unavailable guard that used to fire first.
+        async with _sm()() as db:
+            chat_session_row = await db.get(ChatSession, deposit_session_id)
+        ticket_id = _ticket_id_from_row(chat_session_row)
+
         tenant = await tenant_from_id(tenant_id)
         if tenant is None:
             log.warning(
                 "deposit verification timeout: tenant unavailable — request "
                 "stays pending for retry",
-                extra={"request_id": request_id, "tenant_id": tenant_id},
+                extra={"ticket_id": ticket_id, "session_id": deposit_session_id,
+                       "request_id": request_id, "tenant_id": tenant_id},
             )
             return  # row stays "pending" — a later reconnect sweep can retry
 
-        async with _sm()() as db:
-            chat_session_row = await db.get(ChatSession, deposit_session_id)
         if chat_session_row is None:
             log.warning(
                 "deposit verification timeout: chat session missing — request "
                 "stays pending for retry",
-                extra={"request_id": request_id, "session_id": deposit_session_id},
+                extra={"ticket_id": ticket_id, "session_id": deposit_session_id,
+                       "request_id": request_id},
             )
             return  # row stays "pending" — a later reconnect sweep can retry
 
@@ -2157,7 +2220,7 @@ async def _check_and_timeout_verification(request_id: str) -> None:
                 "We're still waiting on confirmation for your deposit dispute, so "
                 "I'm connecting you with a member of our support team who can look "
                 "into it directly. Thanks for your patience!",
-                role="system",
+                role="system", ticket_id=ticket_id,
             )
         else:
             # Escalation failed (e.g. the BO webhook call itself failed) —
@@ -2169,12 +2232,13 @@ async def _check_and_timeout_verification(request_id: str) -> None:
                 "Your deposit dispute verification is taking longer than expected. "
                 "We're still looking into it — please hang tight, or try again "
                 "shortly if you'd like to check in.",
-                role="system",
+                role="system", ticket_id=ticket_id,
             )
     except Exception:  # noqa: BLE001 — background task: log, never raise
         log.exception(
             "deposit verification timeout handling failed",
-            extra={"request_id": request_id},
+            extra={"ticket_id": ticket_id, "session_id": deposit_session_id,
+                   "request_id": request_id},
         )
 
 
@@ -2226,6 +2290,7 @@ async def _run_human_mode(
     websocket: WebSocket,
     session_id: str,
     tenant: TenantContext,
+    *, ticket_id: Optional[str] = None,
 ) -> bool:
     """Handle the customer WS while mode is awaiting_human or human.
     Returns True when the session ended normally (agent closed it / customer left).
@@ -2257,7 +2322,7 @@ async def _run_human_mode(
             if not done:
                 # Timeout — CRM never called claim or decline
                 log.warning("await_human timed out; reverting to bot",
-                            extra={"session_id": session_id})
+                            extra={"ticket_id": ticket_id, "session_id": session_id})
                 await _revert_to_bot(websocket, session_id)
                 return False
 
@@ -2286,7 +2351,7 @@ async def _run_human_mode(
                 if mtype == "end":
                     from src.api.chat_webhooks import send_bo_webhook
                     summary = "Ended by customer"
-                    await _end_session(session_id, summary)
+                    await _end_session(session_id, summary, ticket_id=ticket_id)
                     await send_bo_webhook(tenant, "session_closed", {
                         "session_id": session_id,
                         "mode_at_close": "human",
@@ -2319,6 +2384,7 @@ async def _run_human_mode(
 
 async def _send_close_webhook(
     tenant: TenantContext, session_id: str, mode_at_close: str, summary: str,
+    *, ticket_id: Optional[str] = None,
 ) -> None:
     """Send session_closed webhook with full transcript. Best-effort."""
     from src.api.chat_webhooks import send_bo_webhook
@@ -2341,7 +2407,8 @@ async def _send_close_webhook(
             "transcript": transcript,
         })
     except Exception:  # noqa: BLE001
-        log.exception("session_closed webhook failed", extra={"session_id": session_id})
+        log.exception("session_closed webhook failed", extra={
+            "ticket_id": ticket_id, "session_id": session_id})
 
 
 async def process_message(

@@ -203,7 +203,7 @@ async def ws_ctx():
     fake_agent.llm = MagicMock()
     fake_agent.session = MagicMock()
 
-    async def fake_factory(tenant, scoped_id, *, customer_id=None):
+    async def fake_factory(tenant, scoped_id, *, customer_id=None, ticket_id=None):
         return fake_agent
 
     chat_api.set_chatbot_factory(fake_factory)

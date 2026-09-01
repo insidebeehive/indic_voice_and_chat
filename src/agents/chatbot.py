@@ -269,6 +269,8 @@ class ChatBotAgent(BaseAgent):
         max_tool_rounds: int = 2,
         llm_provider: str = "",
         llm_model: str = "",
+        session_id: str | None = None,
+        ticket_id: str | None = None,
     ) -> None:
         # ChatBot doesn't need slots — pass an empty schema so BaseAgent is happy.
         super().__init__(
@@ -304,6 +306,12 @@ class ChatBotAgent(BaseAgent):
         # make_chatbot_factory in src/bootstrap.py), never a per-tenant one.
         self._llm_provider = llm_provider
         self._llm_model = llm_model
+        # External-ticket / session identifiers threaded through purely for
+        # log correlation (see tool-call-failure logs below) — never used for
+        # behavior. Both optional; None when the caller (e.g. bootstrap.py's
+        # make_chatbot_factory) has no crm_ticket_id for this session.
+        self._session_id = session_id
+        self._ticket_id = ticket_id
 
     async def handle_message(self, user_text: str) -> ChatTurnResult:
         if not user_text or not user_text.strip():
@@ -389,6 +397,7 @@ class ChatBotAgent(BaseAgent):
             "chat turn done in %.2fs: llm=%s retrieval=%.0fms retrieved=%d",
             time.perf_counter() - turn_start,
             [f"{ms:.0f}ms" for ms in llm_ms_list], retrieval_ms, len(retrieved),
+            extra={"ticket_id": self._ticket_id, "session_id": self._session_id},
         )
         return ChatTurnResult(
             response=response, retrieved=retrieved, rag_context_chars=len(rag.text),
@@ -438,6 +447,7 @@ class ChatBotAgent(BaseAgent):
             log.debug(
                 "chatbot llm turn: finish=%s usage=%s text_len=%d tool_calls=%d",
                 result.finish_reason, result.usage, len(result.text or ""), len(result.tool_calls),
+                extra={"ticket_id": self._ticket_id, "session_id": self._session_id},
             )
             if not result.tool_calls:
                 text = result.text
@@ -566,6 +576,7 @@ class ChatBotAgent(BaseAgent):
             [f"{ms:.0f}ms" for ms in llm_ms_list],
             [f"{name}:{ms:.0f}ms" for name, ms in tool_ms_list],
             rounds, len(retrieved_all),
+            extra={"ticket_id": self._ticket_id, "session_id": self._session_id},
         )
         return ChatTurnResult(
             response=response, retrieved=retrieved_all, rag_context_chars=len(rag.text),
@@ -587,12 +598,17 @@ class ChatBotAgent(BaseAgent):
         slice is never exceeded regardless of tool type.
         """
         if timeout_s < _TOOL_MIN_SLICE_S:
-            log.warning("tool budget exhausted; skipping call", extra={"tool": tc.name})
+            log.warning("tool budget exhausted; skipping call", extra={
+                "ticket_id": self._ticket_id, "session_id": self._session_id, "tool": tc.name,
+            })
             return dict(_TOOL_BUDGET_EXHAUSTED), [], None, None
         try:
             return await asyncio.wait_for(self._dispatch_tool(tc, timeout_s), timeout=timeout_s)
         except asyncio.TimeoutError:
-            log.warning("tool call exceeded its slice", extra={"tool": tc.name, "slice_s": timeout_s})
+            log.warning("tool call exceeded its slice", extra={
+                "ticket_id": self._ticket_id, "session_id": self._session_id,
+                "tool": tc.name, "slice_s": timeout_s,
+            })
             return dict(_TOOL_BUDGET_EXHAUSTED), [], None, None
 
     async def _exec_kb_tool(self, tc: ToolCall):
@@ -608,7 +624,8 @@ class ChatBotAgent(BaseAgent):
                 self._dispatch_tool(tc, _KB_SEARCH_TIMEOUT_S), timeout=_KB_SEARCH_TIMEOUT_S)
         except asyncio.TimeoutError:
             log.warning("kb search exceeded its timeout",
-                        extra={"tool": tc.name, "timeout_s": _KB_SEARCH_TIMEOUT_S})
+                        extra={"ticket_id": self._ticket_id, "session_id": self._session_id,
+                               "tool": tc.name, "timeout_s": _KB_SEARCH_TIMEOUT_S})
             return dict(_TOOL_BUDGET_EXHAUSTED), [], None, None
 
     async def _dispatch_tool(self, tc: ToolCall, timeout_s: float):
@@ -619,7 +636,10 @@ class ChatBotAgent(BaseAgent):
                 chunks = await search_combined(args.get("query", ""), self._retrievers)
             except Exception:  # noqa: BLE001 — a search failure (e.g. embedder
                 # unavailable) must not kill the turn; the model answers without RAG.
-                log.exception("knowledge search failed", extra={"query": args.get("query", "")})
+                log.exception("knowledge search failed", extra={
+                    "ticket_id": self._ticket_id, "session_id": self._session_id,
+                    "query": args.get("query", ""),
+                })
                 return {"error": "knowledge search is temporarily unavailable", "results": []}, [], None, None
             return (
                 {"results": [{"content": c.document.content, "source": _chunk_source(c),
@@ -639,7 +659,9 @@ class ChatBotAgent(BaseAgent):
                 out = await self._deposit_verification_executor(tc, timeout_s=max(0.5, timeout_s - 1.0))
                 return (out if isinstance(out, dict) else {"result": out}), [], None, None
             except Exception:  # noqa: BLE001 — a failing submission must not kill the turn
-                log.exception("deposit verification submission failed", extra={"tool": tc.name})
+                log.exception("deposit verification submission failed", extra={
+                    "ticket_id": self._ticket_id, "session_id": self._session_id, "tool": tc.name,
+                })
                 return {
                     "status": "error",
                     "message": (
@@ -660,7 +682,9 @@ class ChatBotAgent(BaseAgent):
                 out = await self._crm_executor(tc, timeout_s=max(0.5, timeout_s - 1.0))
                 return (out if isinstance(out, dict) else {"result": out}), [], None, None
             except Exception:  # noqa: BLE001 — a failing tool must not kill the turn
-                log.exception("crm tool failed", extra={"tool": tc.name})
+                log.exception("crm tool failed", extra={
+                    "ticket_id": self._ticket_id, "session_id": self._session_id, "tool": tc.name,
+                })
                 return {
                     "status": "pending",
                     "message": (
@@ -706,7 +730,8 @@ class ChatBotAgent(BaseAgent):
         (pre-retry) response, no worse off than not retrying at all.
         """
         log.warning(
-            "chatbot retrying turn: no usable response (finish_reason=%s)", finish_reason
+            "chatbot retrying turn: no usable response (finish_reason=%s)", finish_reason,
+            extra={"ticket_id": self._ticket_id, "session_id": self._session_id},
         )
         retry_start = time.perf_counter()
         try:
@@ -725,7 +750,8 @@ class ChatBotAgent(BaseAgent):
             return result, (time.perf_counter() - retry_start) * 1000
         except Exception:  # noqa: BLE001 - incl. asyncio.TimeoutError; the retry
             # itself (and its own bounded timeout) must not crash the turn.
-            log.exception("chatbot retry after empty/unparseable LLM response failed")
+            log.exception("chatbot retry after empty/unparseable LLM response failed",
+                          extra={"ticket_id": self._ticket_id, "session_id": self._session_id})
             return None, (time.perf_counter() - retry_start) * 1000
 
     def _compose(
@@ -844,7 +870,8 @@ class ChatBotAgent(BaseAgent):
                 messages, LLMConfig(response_format="text", temperature=0.3, max_tokens=120))
             return (result.text or "").strip()
         except Exception:  # noqa: BLE001 — summary is best-effort
-            log.exception("chat session summarize failed")
+            log.exception("chat session summarize failed",
+                          extra={"ticket_id": self._ticket_id, "session_id": self._session_id})
             return ""
 
     async def get_history(self) -> list[dict[str, Any]]:

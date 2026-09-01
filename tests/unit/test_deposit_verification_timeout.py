@@ -396,7 +396,7 @@ def _fake_agent() -> MagicMock:
     return agent
 
 
-async def _fake_factory(tenant, scoped_id, *, customer_id=None):
+async def _fake_factory(tenant, scoped_id, *, customer_id=None, ticket_id=None):
     return _fake_agent()
 
 

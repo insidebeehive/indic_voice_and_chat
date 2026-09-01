@@ -46,6 +46,7 @@ async def submit_deposit_verification(
     sessionmaker,
     media_store: IMediaStorage,
     timeout_s: float,
+    ticket_id: str | None = None,
 ) -> dict:
     dv_config = tenant.settings.deposit_verification
     secret = tenant.secret_optional(dv_config.webhook_secret_env)
@@ -115,7 +116,10 @@ async def submit_deposit_verification(
         except FileNotFoundError:
             log.warning(
                 "deposit verification: screenshot missing from media store",
-                extra={"session_id": session_id, "media_url": screenshot_row.media_url},
+                extra={
+                    "ticket_id": ticket_id, "session_id": session_id,
+                    "media_url": screenshot_row.media_url,
+                },
             )
             return {
                 "status": "no_screenshot",
@@ -156,7 +160,7 @@ async def submit_deposit_verification(
         log.warning(
             "deposit verification: WEBHOOK_BASE_URL is not configured — callback_url "
             "sent to the vendor is a relative path and unusable by an external caller",
-            extra={"request_id": request_id},
+            extra={"ticket_id": ticket_id, "session_id": session_id, "request_id": request_id},
         )
         callback_url = f"/api/v1/deposit-verification/callback/{request_id}"
 
@@ -186,7 +190,9 @@ async def submit_deposit_verification(
             )
         ok = 200 <= resp.status_code < 300
     except Exception:  # noqa: BLE001 — a failing vendor call must not kill the turn
-        log.exception("deposit verification vendor POST failed", extra={"request_id": request_id})
+        log.exception("deposit verification vendor POST failed", extra={
+            "ticket_id": ticket_id, "session_id": session_id, "request_id": request_id,
+        })
         ok = False
 
     if not ok:
