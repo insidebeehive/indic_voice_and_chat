@@ -21,6 +21,7 @@ Auth: ``Authorization: Bearer <tenant-token>`` on both endpoints.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from typing import Any, Optional
 
@@ -32,6 +33,7 @@ from src.api.deps import get_db_session
 from src.auth import TenantContext, current_tenant
 from src.auth import middleware as auth_middleware
 from src.auth.audit import token_fingerprint
+from src.auth.webhook_auth import WebhookAuthError, signature_mode, verify_chatwoot
 from src.models.chat import ChatSession
 from src.models.database import get_sessionmaker
 
@@ -217,20 +219,226 @@ async def openai_chat_completions(
 #     "sender": { "name": "Ravi", "identifier": "<external_id>", "type": "contact" }
 #   }
 #
-# Auth: same tenant Bearer token as the generic endpoint.
+# Auth (H3 remediation): tenant identity comes from an opaque, unguessable
+# ``webhook_id`` capability token in the URL path — never from anything in
+# the request body. Optionally layered with per-tenant HMAC-SHA256 signature
+# verification (``chatwoot:webhook_hmac_secret``) and an inbox_id
+# consistency cross-check (``chatwoot:inbox_id``). See
+# ``POST /integrations/chatwoot/webhook/{webhook_id}`` below. A legacy,
+# tokenless route (``POST /integrations/chatwoot/webhook``, no path param)
+# is kept only for backward compatibility during migration — see its own
+# docstring for exactly how it behaves under each signature mode.
 # ---------------------------------------------------------------------------
 
 
-@router.post("/chatwoot/webhook")
+def _reject_unauthorized(message: str, **extra: Any) -> HTTPException:
+    """Log a webhook auth failure and return the uniform 401 to raise.
+
+    Every distinct auth-failure reason (unknown webhook_id, HMAC failure in
+    enforce mode, inbox_id mismatch, legacy route in enforce mode) gets the
+    IDENTICAL status+detail on the wire — differentiated only in our own
+    logs via ``extra`` — matching the uniform-rejection convention used by
+    the LiveKit webhook (see src/api/livekit_routes.py). Callers use
+    ``raise _reject_unauthorized(...)``. Never pass the full body or secrets
+    in ``extra``.
+    """
+    log.warning(message, extra=extra)
+    return HTTPException(status_code=401, detail="invalid webhook signature")
+
+
+@router.post("/chatwoot/webhook/{webhook_id}")
 async def chatwoot_webhook(
-    payload: dict,
+    webhook_id: str,
     request: Request,
 ) -> dict:
-    """Chatwoot Agent Bot webhook — no bearer token required.
+    """Chatwoot Agent Bot webhook — tenant identity comes from the
+    unguessable ``webhook_id`` capability token in the URL path, never from
+    the request body (see H3 remediation).
 
-    Tenant is resolved from the Chatwoot inbox_id embedded in the payload
-    (``conversation.inbox_id`` or ``inbox.id``). Configure ``chatwoot:inbox_id``
-    for each tenant via the backoffice Chat tab or PATCH /tenants/{id}.
+    Configure ``chatwoot:webhook_id`` for each tenant via the backoffice
+    Chat tab or PATCH /tenants/{id}. Optionally also configure
+    ``chatwoot:webhook_hmac_secret`` (HMAC-SHA256 signature verification)
+    and/or ``chatwoot:inbox_id`` (defense-in-depth cross-check against the
+    payload's own inbox id).
+    """
+    # Resolve tenant from the path segment BEFORE reading the request body at
+    # all — an unknown webhook_id is rejected without ever looking at the
+    # payload.
+    resolver = getattr(request.app.state, "tenant_resolver", None) or auth_middleware._resolver
+    tenant: TenantContext | None = None
+    if resolver is not None and hasattr(resolver, "resolve_by_chatwoot_webhook_id"):
+        tenant = await resolver.resolve_by_chatwoot_webhook_id(webhook_id)
+
+    if tenant is None:
+        raise _reject_unauthorized(
+            "chatwoot webhook: unknown webhook_id",
+            reason="unknown_webhook_id", webhook_id=webhook_id,
+        )
+
+    # Read raw bytes ourselves (not FastAPI's auto-parsed `payload: dict`) so
+    # we have both the exact bytes for HMAC verification AND the parsed dict,
+    # without risking a re-serialization mismatch between the two.
+    raw_body = await request.body()
+    try:
+        payload = json.loads(raw_body)
+    except json.JSONDecodeError:
+        raise _reject_unauthorized(
+            "chatwoot webhook: invalid JSON body",
+            reason="invalid_json", tenant=tenant.slug,
+        ) from None
+
+    # json.loads accepts any JSON value, not just objects — a list, string,
+    # number, null, or bool would all pass the try/except above and then blow
+    # up on the first `.get()` call below with an unhandled AttributeError
+    # (bare 500 on an unauthenticated endpoint, and a second oracle: 500 =
+    # valid webhook_id + non-dict body vs 401 = unknown webhook_id). Reject
+    # through the same uniform path as every other auth failure here.
+    if not isinstance(payload, dict):
+        raise _reject_unauthorized(
+            "chatwoot webhook: non-dict JSON body",
+            reason="non_dict_json_body", tenant=tenant.slug,
+        )
+
+    # HMAC layer — opt-in per tenant. Absence of a configured secret is the
+    # normal/expected case (the webhook_id capability token is the primary
+    # control), so it's silently skipped with no log line.
+    hmac_secret = tenant.secret_optional("chatwoot:webhook_hmac_secret")
+    if hmac_secret:
+        try:
+            verify_chatwoot(
+                raw_body=raw_body,
+                secret=hmac_secret,
+                signature_header=request.headers.get("X-Chatwoot-Signature"),
+                timestamp_header=request.headers.get("X-Chatwoot-Timestamp"),
+            )
+        except WebhookAuthError as e:
+            if signature_mode() == "enforce":
+                raise _reject_unauthorized(
+                    "chatwoot webhook: HMAC verification failed",
+                    reason=e.reason, tenant=tenant.slug,
+                ) from None
+            log.warning(
+                "chatwoot webhook: HMAC check would have rejected (log_only mode)",
+                extra={"reason": e.reason, "tenant": tenant.slug, "mode": "log_only"},
+            )
+
+    # inbox_id consistency cross-check (defense-in-depth, not the primary
+    # auth boundary): the webhook_id path segment above is already
+    # sufficient proof of authorization (capability token). But a legitimate
+    # Chatwoot integration should never send a payload claiming a DIFFERENT
+    # inbox than the one configured for this tenant, so a mismatch here is a
+    # real signal of misuse — a valid capability token used with a payload
+    # claiming a different inbox — and is treated as a hard reject rather
+    # than a soft warn-and-proceed. Skipped entirely when no inbox_id is
+    # configured for the tenant (nothing to compare against).
+    configured_inbox_id = tenant.secret_optional("chatwoot:inbox_id")
+    if configured_inbox_id:
+        conversation = payload.get("conversation") or {}
+        raw_inbox_id = (
+            str((payload.get("inbox") or {}).get("id", ""))
+            or str(conversation.get("inbox_id", ""))
+        )
+        if raw_inbox_id and str(configured_inbox_id) != raw_inbox_id:
+            raise _reject_unauthorized(
+                "chatwoot webhook: inbox_id mismatch",
+                reason="inbox_id_mismatch", tenant=tenant.slug,
+            )
+
+    return await _handle_chatwoot_event(tenant, payload)
+
+
+@router.post("/chatwoot/webhook")
+async def chatwoot_webhook_legacy(
+    request: Request,
+) -> dict:
+    """DEPRECATED legacy tokenless Chatwoot webhook route — superseded by
+    ``POST /integrations/chatwoot/webhook/{webhook_id}`` (see H3 remediation).
+
+    This route has no ``webhook_id`` path segment to resolve a tenant from at
+    all — that absence is exactly the vulnerability being fixed (tenant
+    identity was resolvable from a small, enumerable ``inbox_id`` embedded in
+    the attacker-controlled request body). So in enforce mode (the default)
+    it is hard-rejected without reading or parsing the body at all: this
+    handler takes ``request: Request`` (not a ``payload: dict`` parameter),
+    so FastAPI does not parse the body before routing here, and the enforce
+    check below returns before ``await request.body()`` is ever called.
+
+    In log_only mode it can't "process anyway" the way a signature-only
+    check could — there's no tenant-independent secret to check against
+    before a tenant is even resolved — so the only thing that changes in
+    log_only mode is that every hit is now logged as a deprecated-path
+    warning. The actual processing behavior below (resolve tenant by
+    ``chatwoot:inbox_id`` extracted from the body, or fail with the existing
+    "not mapped" response) is UNCHANGED from pre-remediation behavior,
+    preserved deliberately so log_only mode doesn't produce a hard behavior
+    change on top of a logging change. A malformed or non-dict JSON body in
+    log_only mode is treated the same as "no inbox_id extracted" — it falls
+    into the existing "not mapped" 200 response rather than crashing or
+    inventing a new response shape.
+    """
+    if signature_mode() == "enforce":
+        raise _reject_unauthorized(
+            "chatwoot webhook: legacy tokenless route disabled",
+            reason="legacy_route_disabled",
+        )
+
+    log.warning(
+        "chatwoot webhook: legacy tokenless route hit (deprecated — will be "
+        "hard-rejected once enforce mode is on; migrate to "
+        "/integrations/chatwoot/webhook/{webhook_id})",
+        extra={"reason": "legacy_route_deprecated", "mode": "log_only"},
+    )
+
+    # --- Unchanged pre-remediation behavior below: resolve tenant from
+    # inbox_id embedded in the body (no bearer token, no webhook_id). Only
+    # reached in log_only mode, so we parse the body ourselves here (rather
+    # than via a `payload: dict` parameter) and treat malformed/non-dict JSON
+    # as "no inbox_id extracted" — same as any other unmapped payload. ---
+    raw_body = await request.body()
+    try:
+        payload = json.loads(raw_body)
+    except json.JSONDecodeError:
+        payload = None
+    if not isinstance(payload, dict):
+        log.warning(
+            "chatwoot webhook: legacy route received malformed/non-dict JSON body",
+            extra={"reason": "invalid_json_body", "mode": "log_only"},
+        )
+        return {"ignored": True, "reason": "inbox_id not mapped to any tenant"}
+
+    conversation = payload.get("conversation") or {}
+    raw_inbox_id = (
+        str((payload.get("inbox") or {}).get("id", ""))
+        or str(conversation.get("inbox_id", ""))
+    )
+    log.info("chatwoot inbox_id extracted", extra={"inbox_id": raw_inbox_id})
+
+    tenant: TenantContext | None = None
+    if raw_inbox_id:
+        resolver = getattr(request.app.state, "tenant_resolver", None) or auth_middleware._resolver
+        if resolver is not None and hasattr(resolver, "resolve_by_chatwoot_inbox"):
+            tenant = await resolver.resolve_by_chatwoot_inbox(raw_inbox_id)
+
+    if tenant is None:
+        log.warning(
+            "chatwoot webhook: no tenant mapped to inbox_id — "
+            "set chatwoot:inbox_id via backoffice Chat tab",
+            extra={"inbox_id": raw_inbox_id},
+        )
+        # Return 200 so Chatwoot doesn't retry; we just can't process it yet.
+        return {"ignored": True, "reason": "inbox_id not mapped to any tenant"}
+
+    return await _handle_chatwoot_event(tenant, payload)
+
+
+async def _handle_chatwoot_event(tenant: TenantContext, payload: dict) -> dict:
+    """Given an already-authenticated tenant + parsed payload, filter to real
+    incoming customer messages and kick off the background agent turn.
+
+    Shared by both the ``webhook_id``-based route and the legacy route once
+    each has resolved a tenant — auth (or lack thereof) is entirely the
+    caller's concern; this helper only decides whether an event is one we
+    act on.
     """
     event = payload.get("event", "")
     sender = payload.get("sender") or {}
@@ -267,29 +475,6 @@ async def chatwoot_webhook(
     if not conversation_id:
         log.warning("chatwoot webhook missing conversation.id")
         return {"ignored": True, "reason": "missing conversation.id"}
-
-    # Resolve tenant from inbox_id (no bearer token required).
-    # inbox_id may be in payload.inbox.id or payload.conversation.inbox_id
-    raw_inbox_id = (
-        str((payload.get("inbox") or {}).get("id", ""))
-        or str(conversation.get("inbox_id", ""))
-    )
-    log.info("chatwoot inbox_id extracted", extra={"inbox_id": raw_inbox_id})
-
-    tenant: TenantContext | None = None
-    if raw_inbox_id:
-        resolver = getattr(request.app.state, "tenant_resolver", None) or auth_middleware._resolver
-        if resolver is not None and hasattr(resolver, "resolve_by_chatwoot_inbox"):
-            tenant = await resolver.resolve_by_chatwoot_inbox(raw_inbox_id)
-
-    if tenant is None:
-        log.warning(
-            "chatwoot webhook: no tenant mapped to inbox_id — "
-            "set chatwoot:inbox_id via backoffice Chat tab",
-            extra={"inbox_id": raw_inbox_id},
-        )
-        # Return 200 so Chatwoot doesn't retry; we just can't process it yet.
-        return {"ignored": True, "reason": "inbox_id not mapped to any tenant"}
 
     # Log secrets_resolved keys (not values) to help diagnose missing credentials.
     log.info(

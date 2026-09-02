@@ -88,6 +88,7 @@ from src.config_tenant import TenantSettings
 from src.dialogue.campaign_resolver import DbCampaignResolver
 from src.dialogue.context import SessionStore
 from src.models.database import dispose_engine, ensure_schema, get_engine, get_sessionmaker
+from src.utils.client_ip import ClientIPMiddleware
 from src.utils.logging import configure_logging, get_logger
 
 log = get_logger(__name__)
@@ -603,6 +604,12 @@ app = FastAPI(
     description="Vendor-agnostic agentic framework for multilingual VoiceBot + ChatBot",
     lifespan=lifespan,
 )
+
+# Resolve the client IP once per HTTP request / WS connection and publish it on
+# a ContextVar, so every log line emitted while serving that connection carries
+# it (see src/utils/client_ip.py and the log filter in src/utils/logging.py).
+# Pure-ASGI so it covers websocket scopes, which BaseHTTPMiddleware does not.
+app.add_middleware(ClientIPMiddleware)
 
 # Fail closed: the dev/bridge consoles place real billed outbound calls and run
 # billed AI voice sessions, so their data/action routes now require a

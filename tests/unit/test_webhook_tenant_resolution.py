@@ -216,7 +216,7 @@ async def fallback_app(monkeypatch) -> AsyncIterator[FastAPI]:
     resolver = InMemoryTenantResolver()
     resolver.register(
         TenantSettings(id="t-cw", slug="t-cw", name="Acme"),
-        secrets={"chatwoot:inbox_id": "42"},
+        secrets={"chatwoot:webhook_id": "wh-fallback-1"},
     )
     set_tenant_resolver(resolver)
 
@@ -234,17 +234,21 @@ async def fallback_app(monkeypatch) -> AsyncIterator[FastAPI]:
 
 
 def test_chatwoot_webhook_falls_back_to_module_level_resolver(fallback_app: FastAPI) -> None:
+    """Verifies the app.state.tenant_resolver -> middleware._resolver
+    fallback on the primary webhook_id-based route (the route this fallback
+    actually matters for long-term). The legacy tokenless route's
+    resolve_by_chatwoot_inbox / log_only behavior has its own explicit
+    coverage in tests/unit/test_external_chat.py."""
     payload = {
         "event": "message_created",
         "message_type": 0,
         "content": "hello",
         "conversation": {"id": 456},
-        "inbox": {"id": 42},
         "sender": {"name": "Ravi", "identifier": "ext-id-1", "type": "contact"},
     }
 
     client = TestClient(fallback_app)
-    resp = client.post("/integrations/chatwoot/webhook", json=payload)
+    resp = client.post("/integrations/chatwoot/webhook/wh-fallback-1", json=payload)
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body == {"accepted": True}

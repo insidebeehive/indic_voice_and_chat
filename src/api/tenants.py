@@ -743,10 +743,7 @@ async def rotate_webhook_credentials(
         integrations_base = _chatwoot_integrations_base_url(base)
         instructions["chatwoot"] = (
             f"Point the Chatwoot Agent Bot webhook at "
-            f"{integrations_base}/chatwoot/webhook/{webhook_id} — note the "
-            f"current route only accepts {integrations_base}/chatwoot/webhook "
-            f"(no per-tenant {{webhook_id}} segment yet); this exact URL will "
-            f"only work once that route is updated to accept it (follow-up work)."
+            f"{integrations_base}/chatwoot/webhook/{webhook_id}"
         )
 
     await session.commit()
