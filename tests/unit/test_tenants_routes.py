@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from src.api import tenants
 from src.api.deps import get_db_session
 from src.auth import secrets as crypto
+from src.auth.audit import reset_suppression_state
 from src.auth.context import hash_api_token
 from src.auth.db_resolver import DbTenantResolver
 from src.auth.middleware import set_admin_tokens, set_tenant_resolver
@@ -26,6 +27,13 @@ from src.models.tenant import Tenant, TenantSecret
 from src.utils.logging import configure_logging
 
 ADMIN_HEADERS = {"Authorization": "Bearer admin-token"}
+
+
+@pytest.fixture(autouse=True)
+def _reset_audit_suppression_state():
+    reset_suppression_state()
+    yield
+    reset_suppression_state()
 
 
 @pytest_asyncio.fixture
@@ -265,6 +273,69 @@ async def test_update_campaign_cross_tenant_404(ctx) -> None:
     r = await client.put(f"/tenants/{tid}/campaigns/c1",
                          json={"company": "X"}, headers=ADMIN_HEADERS)
     assert r.status_code == 404
+
+
+async def test_update_campaign_cross_tenant_404_logs_denied(ctx, caplog) -> None:
+    """Same 404 as test_update_campaign_cross_tenant_404, plus an
+    admin_scope_denied INFO record — this is an already-authenticated admin
+    hitting the wrong tenant's campaign_id, most likely a typo, so it logs at
+    INFO not WARNING."""
+    client, _, sm = ctx
+    tid = (await client.post(
+        "/tenants", json=_body(slug="acme"), headers=ADMIN_HEADERS)).json()["tenant_id"]
+    await _seed_campaign(sm, "t_other")   # campaign belongs to a different tenant
+
+    with caplog.at_level(logging.INFO):
+        r = await client.put(f"/tenants/{tid}/campaigns/c1",
+                             json={"company": "X"}, headers=ADMIN_HEADERS)
+    assert r.status_code == 404
+    assert r.json()["detail"] == "campaign not found"
+
+    denied = [rec for rec in caplog.records if getattr(rec, "event", None) == "admin_scope_denied"]
+    assert len(denied) == 1, caplog.records
+    assert denied[0].levelno == logging.INFO
+    assert denied[0].reason == "campaign_not_in_tenant"
+    assert denied[0].found is True
+
+    # the other tenant's campaign is untouched
+    from src.models.campaign import Campaign
+    async with sm() as s:
+        row = (await s.execute(select(Campaign).where(Campaign.id == "c1"))).scalar_one()
+    assert row.tenant_id == "t_other"
+    assert "OldCo" in row.config_yaml
+
+
+async def test_update_campaign_unknown_id_404_logs_denied(ctx, caplog) -> None:
+    client, _, _ = ctx
+    tid = (await client.post(
+        "/tenants", json=_body(slug="acme"), headers=ADMIN_HEADERS)).json()["tenant_id"]
+
+    with caplog.at_level(logging.INFO):
+        r = await client.put(f"/tenants/{tid}/campaigns/does-not-exist",
+                             json={"company": "X"}, headers=ADMIN_HEADERS)
+    assert r.status_code == 404
+    assert r.json()["detail"] == "campaign not found"
+
+    denied = [rec for rec in caplog.records if getattr(rec, "event", None) == "admin_scope_denied"]
+    assert len(denied) == 1, caplog.records
+    assert denied[0].levelno == logging.INFO
+    assert denied[0].reason == "admin_campaign_not_found"
+    assert denied[0].found is False
+
+
+async def test_update_campaign_same_tenant_logs_no_denial(ctx, caplog) -> None:
+    client, _, sm = ctx
+    tid = (await client.post(
+        "/tenants", json=_body(slug="acme"), headers=ADMIN_HEADERS)).json()["tenant_id"]
+    await _seed_campaign(sm, tid)
+
+    with caplog.at_level(logging.INFO):
+        r = await client.put(f"/tenants/{tid}/campaigns/c1",
+                             json={"company": "X"}, headers=ADMIN_HEADERS)
+    assert r.status_code == 200
+
+    denied = [rec for rec in caplog.records if getattr(rec, "event", None) == "admin_scope_denied"]
+    assert denied == []
 
 
 async def test_update_and_list_tenant_stringee_base_url(ctx) -> None:

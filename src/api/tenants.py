@@ -26,6 +26,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.api.answer_paths import answer_url_for
 from src.api.deps import get_db_session
 from src.auth import secrets as crypto
+from src.auth.audit import log_denied
 from src.auth.context import hash_api_token
 from src.auth.middleware import require_admin
 from src.config_tenant import (
@@ -1242,6 +1243,16 @@ async def update_campaign_script(
     """Edit a campaign's script (structured fields merged into its config_yaml)."""
     row = await session.get(Campaign, campaign_id)
     if row is None or row.tenant_id != tenant_id:
+        log_denied(
+            logging.INFO, "admin cross-tenant campaign access denied",
+            event="admin_scope_denied",
+            reason=("campaign_not_in_tenant" if row is not None else "admin_campaign_not_found"),
+            route="/tenants/{tenant_id}/campaigns/{campaign_id}",
+            tenant_id=tenant_id,
+            resource="campaign", resource_id=campaign_id,
+            found=row is not None,
+            owner_tenant_id=(row.tenant_id if row is not None else None),
+        )
         raise HTTPException(status_code=404, detail="campaign not found")
     try:
         row.config_yaml = _apply_campaign_script(row.config_yaml, req)

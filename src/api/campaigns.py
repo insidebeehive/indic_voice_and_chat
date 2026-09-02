@@ -22,6 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import get_db_session
 from src.auth import TenantContext, current_tenant
+from src.auth.audit import log_denied
 from src.campaign.models import LeadImportError, parse_leads_csv
 from src.models.campaign import Campaign as DbCampaign
 from src.models.campaign import Lead as DbLead
@@ -89,6 +90,15 @@ async def _scoped(session: AsyncSession, campaign_id: str, tenant: TenantContext
     """Fetch a campaign and 404 if it doesn't belong to ``tenant``."""
     campaign = await session.get(DbCampaign, campaign_id)
     if campaign is None or campaign.tenant_id != tenant.id:
+        log_denied(
+            logging.WARNING, "cross-tenant campaign access denied",
+            event="cross_tenant_access_denied",
+            reason=("campaign_not_owned" if campaign is not None else "campaign_not_found"),
+            tenant=tenant.slug, tenant_id=tenant.id,
+            resource="campaign", resource_id=campaign_id,
+            found=campaign is not None,
+            owner_tenant_id=(campaign.tenant_id if campaign is not None else None),
+        )
         raise HTTPException(status_code=404, detail="campaign not found")
     return campaign
 

@@ -28,6 +28,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import get_db_session
 from src.auth import TenantContext, current_tenant
+from src.auth.audit import log_denied
 from src.interfaces.vector_store import Document
 from src.models.benchmark import KBDocument
 from src.rag.context_builder import search_combined
@@ -95,6 +96,25 @@ def _crm_retriever_for(tenant: TenantContext) -> Optional[HybridRetriever]:
 def _active_retrievers(tenant: TenantContext) -> list[HybridRetriever]:
     """The tenant's linked CRM's retriever + the tenant's own retriever, skipping None."""
     return [r for r in [_crm_retriever_for(tenant), _retriever_for(tenant)] if r is not None]
+
+
+async def _scoped_kb_doc(
+    session: AsyncSession, document_id: str, tenant: TenantContext
+) -> KBDocument:
+    """Fetch a KB document row and 404 if it doesn't belong to ``tenant``."""
+    row = await session.get(KBDocument, document_id)
+    if row is None or row.tenant_id != tenant.id:
+        log_denied(
+            logging.WARNING, "cross-tenant KB document access denied",
+            event="cross_tenant_access_denied",
+            reason=("kb_document_not_owned" if row is not None else "kb_document_not_found"),
+            tenant=tenant.slug, tenant_id=tenant.id,
+            resource="kb_document", resource_id=document_id,
+            found=row is not None,
+            owner_tenant_id=(row.tenant_id if row is not None else None),
+        )
+        raise HTTPException(status_code=404, detail="document not found")
+    return row
 
 
 # --- Schemas ------------------------------------------------------------
@@ -358,9 +378,7 @@ async def delete_document(
     session: AsyncSession = Depends(get_db_session),
 ) -> dict:
     retriever = _retriever_for(tenant)
-    row = await session.get(KBDocument, document_id)
-    if row is None or row.tenant_id != tenant.id:
-        raise HTTPException(status_code=404, detail="document not found")
+    row = await _scoped_kb_doc(session, document_id, tenant)
     chunk_ids = (row.extra_data or {}).get("chunk_ids") or [
         f"{document_id}::chunk-{i}" for i in range(row.chunk_count or 0)]
     await session.delete(row)
@@ -386,9 +404,7 @@ async def download_document(
     session: AsyncSession = Depends(get_db_session),
 ) -> Response:
     """Download a tenant KB document as reconstructed text."""
-    row = await session.get(KBDocument, document_id)
-    if row is None or row.tenant_id != tenant.id:
-        raise HTTPException(status_code=404, detail="document not found")
+    row = await _scoped_kb_doc(session, document_id, tenant)
     retriever = _retriever_for(tenant)
     text = _chunks_for_doc(retriever, document_id)
     filename = (row.filename or document_id).rsplit(".", 1)[0] + ".txt"

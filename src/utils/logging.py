@@ -56,13 +56,19 @@ class _AdminLabelLogFilter(logging.Filter):
         return True
 
 
+_VALID_LOG_LEVELS = {"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG", "NOTSET"}
+
+
 def configure_logging(level: str = "INFO") -> None:
     """Configure root logger with JSON output to stdout.
 
     Idempotent — safe to call multiple times (e.g. in tests).
     """
     root = logging.getLogger()
-    root.setLevel(level.upper())
+    normalized = (level or "INFO").strip().upper()
+    if normalized not in _VALID_LOG_LEVELS:
+        normalized = "INFO"
+    root.setLevel(normalized)
 
     # Remove any existing handlers so we don't duplicate output.
     for h in list(root.handlers):
