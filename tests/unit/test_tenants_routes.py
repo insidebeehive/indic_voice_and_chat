@@ -15,6 +15,7 @@ from src.auth import secrets as crypto
 from src.auth.context import hash_api_token
 from src.auth.db_resolver import DbTenantResolver
 from src.auth.middleware import set_admin_tokens, set_tenant_resolver
+from src.config_tenant import platform_webhook_base_url
 from src.models.database import Base
 from src.models.tenant import Tenant, TenantSecret
 
@@ -630,6 +631,244 @@ async def test_crm_x_api_key_not_set_reports_empty_string(ctx) -> None:
         "/tenants", json=_body(slug="acme"), headers=ADMIN_HEADERS)).json()["tenant_id"]
     cfg = (await client.get(f"/tenants/{tid}/chat-config", headers=ADMIN_HEADERS)).json()
     assert cfg["crm"]["x_api_key"] == ""
+
+
+async def test_rotate_webhook_credentials_stringee_only(ctx) -> None:
+    client, _, sm = ctx
+    tid = (await client.post(
+        "/tenants", json=_body(slug="acme"), headers=ADMIN_HEADERS)).json()["tenant_id"]
+
+    resp = await client.post(
+        f"/tenants/{tid}/webhook-credentials/rotate",
+        json={"providers": ["stringee"]}, headers=ADMIN_HEADERS)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["rotated"] == ["stringee"]
+    assert set(body["credentials"].keys()) == {"webhook:stringee_path_token"}
+
+    async with sm() as s:
+        rows = (await s.execute(
+            select(TenantSecret).where(TenantSecret.tenant_id == tid)
+        )).scalars().all()
+    names = {r.name for r in rows}
+    assert "webhook:stringee_path_token" in names
+    # the signing secret is never auto-minted — it must stay absent
+    assert "webhook:stringee_signing_secret" not in names
+
+
+async def test_rotate_webhook_credentials_exotel_both_secrets(ctx) -> None:
+    client, _, sm = ctx
+    tid = (await client.post(
+        "/tenants", json=_body(slug="acme"), headers=ADMIN_HEADERS)).json()["tenant_id"]
+
+    resp = await client.post(
+        f"/tenants/{tid}/webhook-credentials/rotate",
+        json={"providers": ["exotel"]}, headers=ADMIN_HEADERS)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["rotated"] == ["exotel"]
+    user = body["credentials"]["webhook:exotel_basic_user"]
+    password = body["credentials"]["webhook:exotel_basic_password"]
+    assert ":" not in user and "@" not in user
+    assert ":" not in password and "@" not in password
+
+    async with sm() as s:
+        rows = (await s.execute(
+            select(TenantSecret).where(TenantSecret.tenant_id == tid)
+        )).scalars().all()
+    by_name = {r.name: r for r in rows}
+    assert "webhook:exotel_basic_user" in by_name
+    assert "webhook:exotel_basic_password" in by_name
+    assert crypto.decrypt(by_name["webhook:exotel_basic_user"].value_encrypted) == user
+    assert crypto.decrypt(by_name["webhook:exotel_basic_password"].value_encrypted) == password
+
+
+async def test_rotate_webhook_credentials_chatwoot(ctx) -> None:
+    client, _, sm = ctx
+    tid = (await client.post(
+        "/tenants", json=_body(slug="acme"), headers=ADMIN_HEADERS)).json()["tenant_id"]
+
+    resp = await client.post(
+        f"/tenants/{tid}/webhook-credentials/rotate",
+        json={"providers": ["chatwoot"]}, headers=ADMIN_HEADERS)
+    assert resp.status_code == 200, resp.text
+    webhook_id = resp.json()["credentials"]["chatwoot:webhook_id"]
+    assert webhook_id
+
+    async with sm() as s:
+        rows = (await s.execute(
+            select(TenantSecret).where(
+                TenantSecret.tenant_id == tid, TenantSecret.name == "chatwoot:webhook_id")
+        )).scalars().all()
+    assert len(rows) == 1
+    assert crypto.decrypt(rows[0].value_encrypted) == webhook_id
+
+
+async def test_rotate_webhook_credentials_twice_upserts_not_duplicates(ctx) -> None:
+    client, _, sm = ctx
+    tid = (await client.post(
+        "/tenants", json=_body(slug="acme"), headers=ADMIN_HEADERS)).json()["tenant_id"]
+
+    first = (await client.post(
+        f"/tenants/{tid}/webhook-credentials/rotate",
+        json={"providers": ["stringee"]}, headers=ADMIN_HEADERS)).json()
+    second = (await client.post(
+        f"/tenants/{tid}/webhook-credentials/rotate",
+        json={"providers": ["stringee"]}, headers=ADMIN_HEADERS)).json()
+
+    first_token = first["credentials"]["webhook:stringee_path_token"]
+    second_token = second["credentials"]["webhook:stringee_path_token"]
+    assert first_token != second_token
+
+    async with sm() as s:
+        rows = (await s.execute(
+            select(TenantSecret).where(
+                TenantSecret.tenant_id == tid,
+                TenantSecret.name == "webhook:stringee_path_token")
+        )).scalars().all()
+    assert len(rows) == 1
+    assert crypto.decrypt(rows[0].value_encrypted) == second_token
+
+
+async def test_rotate_webhook_credentials_requires_admin(ctx) -> None:
+    client, _, _ = ctx
+    tid = (await client.post(
+        "/tenants", json=_body(slug="acme"), headers=ADMIN_HEADERS)).json()["tenant_id"]
+    resp = await client.post(
+        f"/tenants/{tid}/webhook-credentials/rotate", json={"providers": ["stringee"]})
+    assert resp.status_code == 401
+
+
+async def test_rotate_webhook_credentials_unknown_tenant_404(ctx) -> None:
+    client, _, _ = ctx
+    resp = await client.post(
+        "/tenants/nope/webhook-credentials/rotate",
+        json={"providers": ["stringee"]}, headers=ADMIN_HEADERS)
+    assert resp.status_code == 404
+
+
+async def test_rotate_webhook_credentials_empty_providers_422(ctx) -> None:
+    client, _, _ = ctx
+    tid = (await client.post(
+        "/tenants", json=_body(slug="acme"), headers=ADMIN_HEADERS)).json()["tenant_id"]
+    resp = await client.post(
+        f"/tenants/{tid}/webhook-credentials/rotate",
+        json={"providers": []}, headers=ADMIN_HEADERS)
+    assert resp.status_code == 422
+
+
+async def test_rotate_webhook_credentials_unknown_provider_422(ctx) -> None:
+    client, _, _ = ctx
+    tid = (await client.post(
+        "/tenants", json=_body(slug="acme"), headers=ADMIN_HEADERS)).json()["tenant_id"]
+    resp = await client.post(
+        f"/tenants/{tid}/webhook-credentials/rotate",
+        json={"providers": ["twilio"]}, headers=ADMIN_HEADERS)
+    assert resp.status_code == 422
+
+
+async def test_rotate_webhook_credentials_stringee_instructions_url(ctx) -> None:
+    """The instructions string must build the URL the same way production
+    answer-URL construction does — `base` already includes /api/v1/telephony,
+    so it must not be re-added (regression: doubled-up URL)."""
+    client, _, _ = ctx
+    tid = (await client.post(
+        "/tenants", json=_body(slug="acme"), headers=ADMIN_HEADERS)).json()["tenant_id"]
+
+    resp = await client.post(
+        f"/tenants/{tid}/webhook-credentials/rotate",
+        json={"providers": ["stringee"]}, headers=ADMIN_HEADERS)
+    body = resp.json()
+    token = body["credentials"]["webhook:stringee_path_token"]
+    instr = body["instructions"]["stringee"]
+
+    base = (platform_webhook_base_url() or "").rstrip("/") or "<your-webhook-base-url>"
+    assert f"{base}/stringee/answer/acme?vt={token}" in instr
+    assert instr.count(token) == 1
+    assert "/api/v1/telephony/api/v1/telephony" not in instr
+
+
+async def test_rotate_webhook_credentials_exotel_instructions_embed_real_creds(ctx) -> None:
+    """The Exotel instruction must embed the real minted user/password in the
+    URL netloc — not a literal `<host>` placeholder — and must not double up
+    the /api/v1/telephony path segment."""
+    client, _, _ = ctx
+    tid = (await client.post(
+        "/tenants", json=_body(slug="acme"), headers=ADMIN_HEADERS)).json()["tenant_id"]
+
+    resp = await client.post(
+        f"/tenants/{tid}/webhook-credentials/rotate",
+        json={"providers": ["exotel"]}, headers=ADMIN_HEADERS)
+    body = resp.json()
+    user = body["credentials"]["webhook:exotel_basic_user"]
+    password = body["credentials"]["webhook:exotel_basic_password"]
+    instr = body["instructions"]["exotel"]
+
+    assert f"{user}:{password}@" in instr
+    assert "<host>" not in instr
+    assert "/api/v1/telephony/api/v1/telephony" not in instr
+    assert instr.count("/exotel/voice/acme") == 1
+
+
+async def test_rotate_webhook_credentials_chatwoot_instructions_url(ctx) -> None:
+    """The Chatwoot instruction must use the /api/v1/integrations prefix
+    (external_chat.router's actual mount point), not the telephony base, and
+    must not produce a mismatched/doubled path."""
+    client, _, _ = ctx
+    tid = (await client.post(
+        "/tenants", json=_body(slug="acme"), headers=ADMIN_HEADERS)).json()["tenant_id"]
+
+    resp = await client.post(
+        f"/tenants/{tid}/webhook-credentials/rotate",
+        json={"providers": ["chatwoot"]}, headers=ADMIN_HEADERS)
+    body = resp.json()
+    webhook_id = body["credentials"]["chatwoot:webhook_id"]
+    instr = body["instructions"]["chatwoot"]
+
+    tel_base = (platform_webhook_base_url() or "").rstrip("/") or "<your-webhook-base-url>"
+    integrations_base = tenants._chatwoot_integrations_base_url(tel_base)
+    assert f"{integrations_base}/chatwoot/webhook/{webhook_id}" in instr
+    # The chatwoot webhook route lives under a different router prefix than
+    # the telephony base — it must not be built by reusing the telephony base
+    # verbatim (that would put "/telephony" and "/integrations" on the same URL).
+    assert "/telephony/integrations" not in instr
+    assert "/api/v1/telephony/chatwoot" not in instr
+
+
+async def test_rotate_webhook_credentials_503_without_secret_key(ctx, monkeypatch) -> None:
+    client, _, _ = ctx
+    tid = (await client.post(
+        "/tenants", json=_body(slug="acme"), headers=ADMIN_HEADERS)).json()["tenant_id"]
+
+    monkeypatch.setattr(crypto, "has_key", lambda: False)
+    resp = await client.post(
+        f"/tenants/{tid}/webhook-credentials/rotate",
+        json={"providers": ["stringee"]}, headers=ADMIN_HEADERS)
+    assert resp.status_code == 503
+
+
+async def test_list_tenants_webhook_auth_booleans_flip_after_rotation(ctx) -> None:
+    client, _, _ = ctx
+    tid = (await client.post(
+        "/tenants", json=_body(slug="acme"), headers=ADMIN_HEADERS)).json()["tenant_id"]
+
+    before = next(t for t in (await client.get("/tenants", headers=ADMIN_HEADERS))
+                  .json()["tenants"] if t["tenant_id"] == tid)
+    assert before["stringee_webhook_auth_configured"] is False
+    assert before["exotel_basic_auth_configured"] is False
+    assert before["chatwoot_webhook_id_configured"] is False
+
+    rotate_resp = await client.post(
+        f"/tenants/{tid}/webhook-credentials/rotate",
+        json={"providers": ["stringee", "exotel", "chatwoot"]}, headers=ADMIN_HEADERS)
+    minted_token = rotate_resp.json()["credentials"]["webhook:stringee_path_token"]
+
+    list_resp = await client.get("/tenants", headers=ADMIN_HEADERS)
+    assert minted_token not in list_resp.text
+    after = next(t for t in list_resp.json()["tenants"] if t["tenant_id"] == tid)
+    assert after["stringee_webhook_auth_configured"] is True
+    assert after["exotel_basic_auth_configured"] is True
+    assert after["chatwoot_webhook_id_configured"] is True
 
 
 async def test_register_s2s_mode(ctx) -> None:

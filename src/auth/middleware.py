@@ -40,6 +40,12 @@ class TenantResolver(Protocol):
 
     async def resolve_by_id(self, tenant_id: str) -> Optional[TenantContext]: ...
 
+    async def resolve_by_chatwoot_inbox(self, inbox_id: str) -> Optional[TenantContext]: ...
+
+    async def resolve_by_stringee_webhook_token(self, token: str) -> Optional[TenantContext]: ...
+
+    async def resolve_by_chatwoot_webhook_id(self, webhook_id: str) -> Optional[TenantContext]: ...
+
 
 class InMemoryTenantResolver:
     """Test/bootstrap resolver: registers tenants by token, slug, and phone."""
@@ -49,20 +55,34 @@ class InMemoryTenantResolver:
         self._by_slug: dict[str, TenantContext] = {}
         self._by_phone: dict[str, TenantContext] = {}
         self._by_id: dict[str, TenantContext] = {}
+        self._by_chatwoot_inbox: dict[str, TenantContext] = {}
+        self._by_stringee_webhook_token: dict[str, TenantContext] = {}
+        self._by_chatwoot_webhook_id: dict[str, TenantContext] = {}
 
     def register(
         self,
         settings: TenantSettings,
         *,
         plaintext_tokens: Optional[list[str]] = None,
+        secrets: Optional[dict[str, str]] = None,
     ) -> TenantContext:
-        ctx = TenantContext(settings=settings)
+        ctx = TenantContext(settings=settings, secrets_resolved=dict(secrets or {}))
         self._by_slug[settings.slug] = ctx
         self._by_id[settings.id] = ctx
         for token in plaintext_tokens or []:
             self._by_token[hash_api_token(token)] = ctx
         for phone in settings.phone_numbers:
             self._by_phone[phone] = ctx
+        secrets = secrets or {}
+        inbox_id = secrets.get("chatwoot:inbox_id")
+        if inbox_id:
+            self._by_chatwoot_inbox[str(inbox_id)] = ctx
+        stringee_webhook_token = secrets.get("webhook:stringee_path_token")
+        if stringee_webhook_token:
+            self._by_stringee_webhook_token[str(stringee_webhook_token)] = ctx
+        chatwoot_webhook_id = secrets.get("chatwoot:webhook_id")
+        if chatwoot_webhook_id:
+            self._by_chatwoot_webhook_id[str(chatwoot_webhook_id)] = ctx
         return ctx
 
     def clear(self) -> None:
@@ -70,6 +90,9 @@ class InMemoryTenantResolver:
         self._by_slug.clear()
         self._by_phone.clear()
         self._by_id.clear()
+        self._by_chatwoot_inbox.clear()
+        self._by_stringee_webhook_token.clear()
+        self._by_chatwoot_webhook_id.clear()
 
     async def resolve_by_token(self, token_hash: str) -> Optional[TenantContext]:
         return self._by_token.get(token_hash)
@@ -82,6 +105,15 @@ class InMemoryTenantResolver:
 
     async def resolve_by_id(self, tenant_id: str) -> Optional[TenantContext]:
         return self._by_id.get(tenant_id)
+
+    async def resolve_by_chatwoot_inbox(self, inbox_id: str) -> Optional[TenantContext]:
+        return self._by_chatwoot_inbox.get(str(inbox_id))
+
+    async def resolve_by_stringee_webhook_token(self, token: str) -> Optional[TenantContext]:
+        return self._by_stringee_webhook_token.get(str(token))
+
+    async def resolve_by_chatwoot_webhook_id(self, webhook_id: str) -> Optional[TenantContext]:
+        return self._by_chatwoot_webhook_id.get(str(webhook_id))
 
 
 _resolver: Optional[TenantResolver] = None
@@ -103,12 +135,13 @@ def register_tenant_for_test(
     settings: TenantSettings,
     *,
     plaintext_tokens: Optional[list[str]] = None,
+    secrets: Optional[dict[str, str]] = None,
 ) -> TenantContext:
     """Convenience used by tests to seed a tenant on the in-memory resolver."""
     global _resolver
     if not isinstance(_resolver, InMemoryTenantResolver):
         _resolver = InMemoryTenantResolver()
-    return _resolver.register(settings, plaintext_tokens=plaintext_tokens)
+    return _resolver.register(settings, plaintext_tokens=plaintext_tokens, secrets=secrets)
 
 
 # --- FastAPI dependencies ----------------------------------------------

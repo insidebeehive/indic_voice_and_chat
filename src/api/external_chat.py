@@ -30,6 +30,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import get_db_session
 from src.auth import TenantContext, current_tenant
+from src.auth import middleware as auth_middleware
+from src.auth.audit import token_fingerprint
 from src.models.chat import ChatSession
 from src.models.database import get_sessionmaker
 
@@ -107,7 +109,8 @@ async def external_message(
             await _redis.set(redis_key, session_id, ex=_EXT_SESSION_TTL)
         log.info("external chat session created", extra={
             "tenant": tenant.slug, "conversation_id": req.conversation_id,
-            "session_id": session_id, "user_id": req.user_id,
+            "session_id": session_id,
+            "user_fp": token_fingerprint(req.user_id) if req.user_id else None,
         })
 
     # --- Run agent turn ---
@@ -229,9 +232,6 @@ async def chatwoot_webhook(
     (``conversation.inbox_id`` or ``inbox.id``). Configure ``chatwoot:inbox_id``
     for each tenant via the backoffice Chat tab or PATCH /tenants/{id}.
     """
-    # --- Always log the full payload at DEBUG so we can diagnose missing fields ---
-    log.debug("chatwoot webhook raw payload", extra={"payload": payload})
-
     event = payload.get("event", "")
     sender = payload.get("sender") or {}
     log.info("chatwoot webhook received", extra={
@@ -278,7 +278,7 @@ async def chatwoot_webhook(
 
     tenant: TenantContext | None = None
     if raw_inbox_id:
-        resolver = getattr(request.app.state, "tenant_resolver", None)
+        resolver = getattr(request.app.state, "tenant_resolver", None) or auth_middleware._resolver
         if resolver is not None and hasattr(resolver, "resolve_by_chatwoot_inbox"):
             tenant = await resolver.resolve_by_chatwoot_inbox(raw_inbox_id)
 
@@ -306,7 +306,8 @@ async def chatwoot_webhook(
 
     log.info("chatwoot message received", extra={
         "tenant": tenant.slug, "conversation_id": conversation_id,
-        "user_id": user_id, "has_user_id": user_id is not None, "text_len": len(text),
+        "user_fp": token_fingerprint(user_id) if user_id else None,
+        "has_user_id": user_id is not None, "text_len": len(text),
     })
 
     # Return 200 to Chatwoot immediately — Chatwoot has a ~10 s webhook timeout,

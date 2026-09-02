@@ -15,13 +15,15 @@ import logging
 import re
 import secrets as pysecrets
 import uuid
-from typing import Optional
+from types import SimpleNamespace
+from typing import Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.api.answer_paths import answer_url_for
 from src.api.deps import get_db_session
 from src.auth import secrets as crypto
 from src.auth.context import hash_api_token
@@ -602,6 +604,170 @@ async def rotate_tenant_token(
     return RotateTokenResponse(tenant_id=t.id, api_token=new_token)
 
 
+# --- Webhook credentials rotation (admin) --------------------------------
+
+
+class WebhookCredentialsRotateRequest(BaseModel):
+    """Mint fresh per-tenant webhook-verification credentials for one or more
+    providers. Twilio needs nothing here — it already reuses the tenant's
+    existing Twilio auth token secret for signature verification."""
+    providers: list[Literal["stringee", "exotel", "chatwoot"]] = Field(min_length=1)
+
+
+class WebhookCredentialsRotateResponse(BaseModel):
+    tenant_id: str
+    slug: str
+    rotated: list[str]
+    # Plaintext minted values, returned ONCE only — never persisted anywhere
+    # except encrypted (via crypto.encrypt) in tenant_secrets.value_encrypted.
+    credentials: dict[str, str]
+    # Human-readable, ready-to-paste guidance per rotated provider.
+    instructions: dict[str, str]
+
+
+def _chatwoot_integrations_base_url(telephony_base: str) -> str:
+    """Derive the ``/api/v1/integrations`` base URL from the telephony webhook
+    base (``platform_webhook_base_url()``, which already includes
+    ``/api/v1/telephony`` — see ``config/default.yaml``). The Chatwoot webhook
+    route is registered under a sibling router prefix, ``/api/v1/integrations``
+    (``external_chat.router``, mounted in ``src/api/__init__.py``), not under
+    ``/api/v1/telephony`` — so it is NOT safe to reuse ``telephony_base`` as-is.
+    """
+    if telephony_base.endswith("/telephony"):
+        return telephony_base[: -len("/telephony")] + "/integrations"
+    return f"{telephony_base}/integrations"
+
+
+async def _upsert_tenant_secret(
+    session: AsyncSession, tenant_id: str, name: str, value: str
+) -> None:
+    """Encrypt + upsert one ``TenantSecret`` row — the same select-then-update-
+    or-insert shape used above for telephony/Chatwoot/CRM secrets."""
+    existing = (await session.execute(
+        select(TenantSecret).where(
+            TenantSecret.tenant_id == tenant_id, TenantSecret.name == name)
+    )).scalar_one_or_none()
+    if existing is not None:
+        existing.value_encrypted = crypto.encrypt(value)
+    else:
+        session.add(TenantSecret(
+            tenant_id=tenant_id, name=name, value_encrypted=crypto.encrypt(value)))
+
+
+@router.post(
+    "/{tenant_id}/webhook-credentials/rotate",
+    response_model=WebhookCredentialsRotateResponse,
+)
+async def rotate_webhook_credentials(
+    tenant_id: str,
+    req: WebhookCredentialsRotateRequest,
+    request: Request,
+    session: AsyncSession = Depends(get_db_session),
+    _: None = Depends(require_admin),
+) -> WebhookCredentialsRotateResponse:
+    """Mint + rotate per-tenant inbound-webhook verification credentials (admin).
+
+    NOT wired into any request-verification path yet — this route only mints
+    and stores the values; the webhook handlers that will check them are
+    separate follow-up work.
+
+    - ``stringee``: a fresh ``webhook:stringee_path_token`` (appended as
+      ``?vt=<token>`` to the Stringee Answer/Event URL). The Stringee
+      *signing* secret (``webhook:stringee_signing_secret``) is never minted
+      here — it comes from the tenant's own Stringee console and can only be
+      set via the generic ``PATCH /tenants/{id}`` secret-update path.
+    - ``exotel``: a fresh HTTP Basic Auth user/password pair
+      (``webhook:exotel_basic_user`` / ``webhook:exotel_basic_password``) to
+      embed in the Exotel callback URL's netloc.
+    - ``chatwoot``: a fresh ``chatwoot:webhook_id`` to scope the Chatwoot
+      Agent Bot webhook URL to this tenant.
+    """
+    t = await _require_tenant(session, tenant_id)
+
+    if not crypto.has_key():
+        raise HTTPException(
+            status_code=503,
+            detail="VOX_SECRET_KEY is not set — cannot encrypt webhook credentials")
+
+    base = (platform_webhook_base_url() or "").rstrip("/") or "<your-webhook-base-url>"
+    rotated: list[str] = []
+    credentials: dict[str, str] = {}
+    instructions: dict[str, str] = {}
+
+    if "stringee" in req.providers:
+        token = pysecrets.token_urlsafe(32)
+        await _upsert_tenant_secret(session, tenant_id, "webhook:stringee_path_token", token)
+        rotated.append("stringee")
+        credentials["webhook:stringee_path_token"] = token
+        # Build the instruction URL through the same tested helper production
+        # code will use — `base` already includes /api/v1/telephony, so it
+        # must be passed bare (answer_url_for appends the ANSWER_PATHS
+        # segment + slug itself; re-adding the prefix here would double it up).
+        stub = SimpleNamespace(
+            slug=t.slug, secrets_resolved={"webhook:stringee_path_token": token})
+        url = answer_url_for(stub, "stringee", base)
+        instructions["stringee"] = f"Set the Stringee Answer/Event URL to {url}"
+
+    if "exotel" in req.providers:
+        # Username: token_hex(8) -> 16 hex chars ([0-9a-f]), guaranteed to
+        # contain no ':'/'@'/'/' so it's always safe to embed verbatim in a
+        # URL netloc. Password: token_urlsafe(24) for more entropy on the
+        # half an attacker would actually need to brute-force; urlsafe's
+        # alphabet (A-Za-z0-9-_) is also netloc-safe.
+        user = pysecrets.token_hex(8)
+        password = pysecrets.token_urlsafe(24)
+        await _upsert_tenant_secret(session, tenant_id, "webhook:exotel_basic_user", user)
+        await _upsert_tenant_secret(session, tenant_id, "webhook:exotel_basic_password", password)
+        rotated.append("exotel")
+        credentials["webhook:exotel_basic_user"] = user
+        credentials["webhook:exotel_basic_password"] = password
+        stub = SimpleNamespace(
+            slug=t.slug,
+            secrets_resolved={
+                "webhook:exotel_basic_user": user,
+                "webhook:exotel_basic_password": password,
+            },
+        )
+        url = answer_url_for(stub, "exotel", base)
+        instructions["exotel"] = f"Use {url} as the Exotel callback URL"
+
+    if "chatwoot" in req.providers:
+        webhook_id = pysecrets.token_urlsafe(32)
+        await _upsert_tenant_secret(session, tenant_id, "chatwoot:webhook_id", webhook_id)
+        rotated.append("chatwoot")
+        credentials["chatwoot:webhook_id"] = webhook_id
+        # The Chatwoot webhook route lives under a DIFFERENT router prefix
+        # (/api/v1/integrations, registered via external_chat.router — see
+        # src/api/__init__.py) than the telephony one `base` is built for
+        # (/api/v1/telephony), so it can't reuse `base` directly.
+        integrations_base = _chatwoot_integrations_base_url(base)
+        instructions["chatwoot"] = (
+            f"Point the Chatwoot Agent Bot webhook at "
+            f"{integrations_base}/chatwoot/webhook/{webhook_id} — note the "
+            f"current route only accepts {integrations_base}/chatwoot/webhook "
+            f"(no per-tenant {{webhook_id}} segment yet); this exact URL will "
+            f"only work once that route is updated to accept it (follow-up work)."
+        )
+
+    await session.commit()
+    try:
+        await _refresh_resolver(request, tenant_id)
+    except Exception:  # noqa: BLE001 — the DB write already succeeded and is
+        # the source of truth; losing the plaintext response over a resolver
+        # refresh hiccup would mean re-minting credentials for no reason.
+        log.exception(
+            "resolver refresh failed after webhook credential rotation",
+            extra={"tenant_id": tenant_id})
+
+    log.info(
+        "rotated webhook credentials",
+        extra={"tenant_id": tenant_id, "providers": rotated})
+    return WebhookCredentialsRotateResponse(
+        tenant_id=t.id, slug=t.slug, rotated=rotated,
+        credentials=credentials, instructions=instructions,
+    )
+
+
 # --- Backoffice: list tenants + per-tenant analytics & billing -----------
 
 
@@ -637,6 +803,12 @@ class TenantSummary(BaseModel):
     # CRM this tenant is linked to (Tenant.crm_id FK, Task 1) — lets the
     # backoffice preselect the CRM dropdown.
     crm_id: Optional[str] = None
+    # Whether the new per-tenant webhook-verification secrets (Task 1, minted
+    # via POST .../webhook-credentials/rotate) are configured — NAMES/booleans
+    # only, never values. Additive fields; default False for older tenants.
+    stringee_webhook_auth_configured: bool = False
+    exotel_basic_auth_configured: bool = False
+    chatwoot_webhook_id_configured: bool = False
 
 
 class TenantListResponse(BaseModel):
@@ -669,10 +841,28 @@ async def list_tenants(
     """List every tenant with its mode + selected providers/models (admin)."""
     rows = (await session.execute(select(Tenant).order_by(Tenant.created_at))).scalars().all()
     base = (platform_webhook_base_url() or "").rstrip("/")
+
+    # Webhook-credential secret names, per tenant — a dedicated query instead
+    # of lazy-loading Tenant.secrets (the query above doesn't eager-load that
+    # relationship, so touching it here would raise MissingGreenlet).
+    webhook_secret_rows = (await session.execute(
+        select(TenantSecret.tenant_id, TenantSecret.name).where(
+            TenantSecret.name.in_([
+                "webhook:stringee_path_token", "webhook:stringee_signing_secret",
+                "webhook:exotel_basic_user", "webhook:exotel_basic_password",
+                "chatwoot:webhook_id",
+            ])
+        )
+    )).all()
+    webhook_secret_names: dict[str, set[str]] = {}
+    for secret_tenant_id, name in webhook_secret_rows:
+        webhook_secret_names.setdefault(secret_tenant_id, set()).add(name)
+
     items = []
     for t in rows:
         pc = t.pipeline_config or {}
         tel = pc.get("telephony") or {}
+        names = webhook_secret_names.get(t.id, set())
         items.append(TenantSummary(
             tenant_id=t.id, slug=t.slug, name=t.name, status=t.status,
             mode=t.mode, max_concurrent_calls=t.max_concurrent_calls,
@@ -692,6 +882,13 @@ async def list_tenants(
             stringee_answer_url=(
                 f"{base}/stringee/answer/{t.slug}" if base else None),
             crm_id=t.crm_id,
+            stringee_webhook_auth_configured=bool(
+                {"webhook:stringee_path_token", "webhook:stringee_signing_secret"} & names
+            ),
+            exotel_basic_auth_configured=(
+                {"webhook:exotel_basic_user", "webhook:exotel_basic_password"} <= names
+            ),
+            chatwoot_webhook_id_configured="chatwoot:webhook_id" in names,
         ))
     return TenantListResponse(tenants=items, total=len(items))
 

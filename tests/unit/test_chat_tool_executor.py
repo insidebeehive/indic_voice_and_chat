@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import inspect
+import logging
 
 import httpx
 import pytest
+import respx
 
 from src.chatbot import tool_executor
 from src.chatbot.tool_executor import execute_crm_tool
@@ -280,6 +282,82 @@ async def test_uuid_in_exception_message_is_scrubbed_from_error_path() -> None:
     assert out == {
         "error": "404 for url https://crm.example.com/players/[redacted]"
     }
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_response_body_never_logged_pii_regression(caplog) -> None:
+    """The real incident: a [TEMP DEBUG] log line used to dump the RAW CRM
+    response body at INFO level. get_player_profile-shaped responses carry
+    mobile/email/kyc_documents/bank_saved — none of that (nor the resolved
+    UUID in the URL) may ever reach the logs, at any level."""
+    user_id = "6c1a77a6-20b0-4fc9-ba4c-8add58aba9ef"
+    payload = {
+        "mobile": "+919876543210",
+        "email": "real.customer@example.com",
+        "kyc_documents": ["Aadhaar-XXXX", "PAN-XXXX"],
+        "bank_saved": {"bank": "HDFC", "account_last4": "1234", "upi": "customer@upi"},
+        "user_id": user_id,
+    }
+    route = respx.get(f"https://crm.example.com/players/{user_id}/profile").mock(
+        return_value=httpx.Response(200, json=payload)
+    )
+
+    with caplog.at_level(logging.DEBUG, logger="src.chatbot.tool_executor"):
+        out = await execute_crm_tool(
+            endpoint="https://crm.example.com/players/{user_id}/profile",
+            method="GET",
+            parameters={"user_id": {"type": "string", "source": "llm"}},
+            auth_type=None, token=None,
+            args={"user_id": user_id},
+        )
+
+    assert route.call_count == 1
+    assert out["status_code"] == 200
+
+    blob = "\n".join(
+        r.getMessage() + " " + repr(r.__dict__) for r in caplog.records
+    )
+    for leaked in (
+        "+919876543210",
+        "real.customer@example.com",
+        "customer@upi",
+        '"account_last4": "1234"',
+        user_id,
+    ):
+        assert leaked not in blob, f"PII/id leaked into logs: {leaked!r}"
+
+
+@pytest.mark.asyncio
+async def test_crm_tool_call_log_has_param_keys_not_values(caplog) -> None:
+    client = _FakeClient({"ok": True})
+    mobile = "+919876543210"
+
+    with caplog.at_level(logging.INFO, logger="src.chatbot.tool_executor"):
+        await execute_crm_tool(
+            endpoint="https://crm.example.com/api/search",
+            method="GET",
+            parameters={"mobile": {"type": "string", "source": "llm"}},
+            auth_type=None, token=None,
+            args={"mobile": mobile}, http_client=client,
+        )
+
+    call_records = [r for r in caplog.records if r.getMessage() == "crm tool call"]
+    assert len(call_records) == 1
+    record = call_records[0]
+
+    assert record.__dict__.get("param_keys") == ["mobile"]
+    assert "params" not in record.__dict__
+    assert mobile not in repr(record.__dict__)
+
+
+def test_redact_url_scrubs_uuid() -> None:
+    assert tool_executor._redact_url(
+        "https://crm.example.com/players/6c1a77a6-20b0-4fc9-ba4c-8add58aba9ef/profile"
+    ) == "https://crm.example.com/players/[redacted]/profile"
+
+    no_uuid = "https://crm.example.com/api/search"
+    assert tool_executor._redact_url(no_uuid) == no_uuid
 
 
 def test_case_variant_keys_are_also_redacted() -> None:
