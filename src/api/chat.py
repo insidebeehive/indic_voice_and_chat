@@ -51,6 +51,7 @@ from src.api.chat_cost import compute_chat_turn_cost
 from src.interfaces.media_storage import IMediaStorage
 from src.api.deps import get_db_session
 from src.auth import TenantContext, current_tenant
+from src.auth.audit import log_denied, token_fingerprint
 from src.dialogue.language import normalize_lang
 from src.interfaces.llm import LLMMessage
 from src.models.chat import ChatMessage, ChatSession
@@ -945,6 +946,11 @@ async def chat_voice_ws(websocket: WebSocket) -> None:
     try:
         tenant = await tenant_from_slug(websocket.query_params.get("tenant", ""))
     except Exception:  # noqa: BLE001
+        log_denied(logging.WARNING, "voice ws tenant resolution failed",
+                   event="auth_rejected", reason="voice_ws_unknown_tenant",
+                   route=websocket.url.path,
+                   tenant=websocket.query_params.get("tenant") or None,
+                   exc_info=True)
         await websocket.close(code=1008, reason="unknown tenant")
         return
 
@@ -1017,6 +1023,13 @@ async def get_media(
         authed = True
 
     if not authed:
+        log_denied(logging.WARNING, "media access denied",
+                   event="auth_rejected", reason="media_unauthorized",
+                   route="/chat/media/{message_id}",
+                   message_id=message_id,
+                   session_id_presented=bool(session_id),
+                   session_fp=(token_fingerprint(session_id, domain="vox-logfp-sid-v1")
+                               if session_id else None))
         raise HTTPException(status_code=401, detail="unauthorized")
 
     ttl = 3600
@@ -1138,15 +1151,26 @@ async def agent_websocket(websocket: WebSocket, session_id: str) -> None:
 
     token = (websocket.query_params.get("token") or "").strip()
     if not token:
+        log_denied(logging.INFO, "agent ws auth rejected",
+                   event="auth_rejected", reason="agent_ws_missing_token",
+                   route=websocket.url.path, session_id=session_id)
         await websocket.close(code=1008, reason="missing token")
         return
     from src.auth.middleware import tenant_from_bearer_token
     try:
         tenant = await tenant_from_bearer_token(token)
     except Exception:  # noqa: BLE001
+        log_denied(logging.WARNING, "agent ws auth rejected",
+                   event="auth_rejected", reason="agent_ws_token_resolve_error",
+                   route=websocket.url.path, session_id=session_id,
+                   token_fp=token_fingerprint(token), exc_info=True)
         await websocket.close(code=1008, reason="invalid token")
         return
     if tenant is None:
+        log_denied(logging.WARNING, "agent ws auth rejected",
+                   event="auth_rejected", reason="agent_ws_token_unknown",
+                   route=websocket.url.path, session_id=session_id,
+                   token_fp=token_fingerprint(token))
         await websocket.close(code=1008, reason="invalid token")
         return
 
@@ -1267,6 +1291,10 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
     async with _sm()() as db:
         row = await db.get(ChatSession, session_id)
     if row is None:
+        log_denied(logging.WARNING, "chat ws session not found",
+                   event="auth_rejected", reason="chat_ws_session_not_found",
+                   route=websocket.url.path,
+                   session_fp=token_fingerprint(session_id, domain="vox-logfp-sid-v1"))
         await websocket.close(code=4004, reason="chat session not found")
         return
     # Computed ONCE per connection (never inside the per-message receive loop

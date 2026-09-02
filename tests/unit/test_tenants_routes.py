@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
+import io
+import json
+import logging
+
 import pytest
 import pytest_asyncio
 from fastapi import FastAPI
@@ -18,6 +23,7 @@ from src.auth.middleware import set_admin_tokens, set_tenant_resolver
 from src.config_tenant import platform_webhook_base_url
 from src.models.database import Base
 from src.models.tenant import Tenant, TenantSecret
+from src.utils.logging import configure_logging
 
 ADMIN_HEADERS = {"Authorization": "Bearer admin-token"}
 
@@ -869,6 +875,83 @@ async def test_list_tenants_webhook_auth_booleans_flip_after_rotation(ctx) -> No
     assert after["stringee_webhook_auth_configured"] is True
     assert after["exotel_basic_auth_configured"] is True
     assert after["chatwoot_webhook_id_configured"] is True
+
+
+@pytest.fixture
+def json_log_stream():
+    """Install the REAL production logging config, redirected to a buffer —
+    same pattern as tests/unit/test_client_ip.py's fixture of the same name.
+
+    caplog alone is not sufficient here: ``_AdminLabelLogFilter`` is attached
+    to the handler ``configure_logging`` installs, not to any logger, so it
+    never runs against caplog's own handler.
+    """
+    root = logging.getLogger()
+    saved_handlers = root.handlers[:]
+    saved_level = root.level
+
+    configure_logging("INFO")
+    handler = root.handlers[-1]
+    buffer = io.StringIO()
+    handler.setStream(buffer)
+    try:
+        yield buffer
+    finally:
+        root.handlers[:] = saved_handlers
+        root.setLevel(saved_level)
+
+
+def _records(buffer: io.StringIO) -> list[dict]:
+    return [json.loads(line) for line in buffer.getvalue().splitlines() if line.strip()]
+
+
+async def test_admin_label_propagates_to_tenants_log_lines(ctx, json_log_stream) -> None:
+    """src/api/tenants.py's existing ``log.info("registered tenant", ...)``
+    call gains ``admin_label`` for free via the ambient ContextVar + logging
+    filter set up in Package A/B — this test makes NO edits to
+    src/api/tenants.py to pass."""
+    client, _, _ = ctx
+    set_admin_tokens(["lbl=ops-alice:admin-token"])
+
+    resp = await client.post("/tenants", json=_body(slug="labeled"), headers=ADMIN_HEADERS)
+    assert resp.status_code == 201
+
+    records = _records(json_log_stream)
+    reg = next(r for r in records if r.get("message") == "registered tenant")
+    assert reg["admin_label"] == "ops-alice"
+
+
+async def test_admin_label_does_not_leak_across_requests(ctx, json_log_stream) -> None:
+    """One admin-authed request followed by one anonymous request: the
+    anonymous request's log line must carry no admin_label at all — each
+    ASGI request runs in its own asyncio Task, so a label set during the
+    first request cannot leak into the second.
+
+    Each call is wrapped in its own ``asyncio.create_task`` to reproduce that
+    task-per-request boundary: httpx's ``ASGITransport`` invokes the app
+    in-process, so two ``await client.get(...)`` calls made directly in this
+    same test coroutine would otherwise share ONE task/context (an artifact
+    of the test transport, not of a real ASGI server or of
+    ``fastapi.testclient.TestClient``, both of which give each request its
+    own task) and would make this assertion fail for reasons unrelated to
+    the code under test.
+    """
+    client, _, _ = ctx
+    set_admin_tokens(["lbl=ops-alice:admin-token"])
+
+    admin_resp = await asyncio.create_task(client.post(
+        "/tenants", json=_body(slug="labeled2"), headers=ADMIN_HEADERS))
+    assert admin_resp.status_code == 201
+
+    anon_resp = await asyncio.create_task(client.get("/tenants"))
+    assert anon_resp.status_code == 401
+
+    records = _records(json_log_stream)
+    admin_rec = next(r for r in records if r.get("message") == "registered tenant")
+    assert admin_rec["admin_label"] == "ops-alice"
+
+    anon_rec = next(r for r in records if r.get("message") == "admin auth rejected")
+    assert "admin_label" not in anon_rec
 
 
 async def test_register_s2s_mode(ctx) -> None:

@@ -10,6 +10,7 @@ import sys
 
 from pythonjsonlogger import jsonlogger
 
+from src.auth.audit import current_admin_label
 from src.utils.client_ip import current_client_ip
 
 
@@ -33,6 +34,28 @@ class _ClientIPLogFilter(logging.Filter):
         return True
 
 
+class _AdminLabelLogFilter(logging.Filter):
+    """Stamp records emitted during an admin-authenticated request with the
+    operator label of the admin token that authenticated it.
+
+    Unlike _ClientIPLogFilter this stamps ONLY when a label is actually set —
+    the overwhelming majority of traffic is not admin traffic, and adding
+    `admin_label: null` to every record would change the shape of every log
+    line in the system for no signal. An explicit `admin_label` passed via
+    extra={} still wins.
+
+    Dependency direction is one-way: this module imports src.auth.audit;
+    src/auth/audit.py must never import this module.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if not hasattr(record, "admin_label"):
+            label = current_admin_label()
+            if label is not None:
+                record.admin_label = label
+        return True
+
+
 def configure_logging(level: str = "INFO") -> None:
     """Configure root logger with JSON output to stdout.
 
@@ -52,6 +75,7 @@ def configure_logging(level: str = "INFO") -> None:
     )
     handler.setFormatter(formatter)
     handler.addFilter(_ClientIPLogFilter())
+    handler.addFilter(_AdminLabelLogFilter())
     root.addHandler(handler)
 
     # Quiet down noisy libraries.
