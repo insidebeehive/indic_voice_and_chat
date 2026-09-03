@@ -1,13 +1,16 @@
 """Tests for the per-tenant webhook-credential resolver indexes.
 
 Covers the ``resolve_by_stringee_webhook_token`` / ``resolve_by_chatwoot_webhook_id``
-(and ``resolve_by_chatwoot_inbox``) lookups on both ``DbTenantResolver`` and
-``InMemoryTenantResolver``, plus the ``external_chat.py`` Chatwoot webhook
-handler's fallback from ``app.state.tenant_resolver`` to the module-level
-``middleware._resolver`` global.
+/ ``resolve_by_deposit_verification_reply_token`` (and ``resolve_by_chatwoot_inbox``)
+lookups on both ``DbTenantResolver`` and ``InMemoryTenantResolver``, plus the
+``external_chat.py`` Chatwoot webhook handler's fallback from
+``app.state.tenant_resolver`` to the module-level ``middleware._resolver`` global.
 
-These indexes are infrastructure only in this PR — not yet wired into any
-live route's credential-verification logic.
+``resolve_by_deposit_verification_reply_token`` is now live, wired into
+``POST /deposit-verification/reply/{token}`` (``src/api/deposit_verification.py``);
+see ``tests/unit/test_deposit_ticket_reply_route.py`` for route-level coverage.
+The other indexes here remain infrastructure only in this PR — not yet wired
+into any live route's credential-verification logic.
 """
 
 from __future__ import annotations
@@ -59,6 +62,10 @@ async def db_ctx(monkeypatch):
             tenant_id="t1", name="chatwoot:webhook_id",
             value_encrypted=crypto.encrypt("wh-xyz-123"),
         ))
+        s.add(TenantSecret(
+            tenant_id="t1", name="deposit_verification:reply_token",
+            value_encrypted=crypto.encrypt("dv-reply-tok-789"),
+        ))
         await s.commit()
 
     resolver = DbTenantResolver(sm)
@@ -82,9 +89,18 @@ async def test_db_resolver_resolves_by_chatwoot_webhook_id(db_ctx: DbTenantResol
     assert ctx.slug == "t1"
 
 
+async def test_db_resolver_resolves_by_deposit_verification_reply_token(
+    db_ctx: DbTenantResolver,
+) -> None:
+    ctx = await db_ctx.resolve_by_deposit_verification_reply_token("dv-reply-tok-789")
+    assert ctx is not None
+    assert ctx.slug == "t1"
+
+
 async def test_db_resolver_returns_none_for_unknown_keys(db_ctx: DbTenantResolver) -> None:
     assert await db_ctx.resolve_by_stringee_webhook_token("no-such-token") is None
     assert await db_ctx.resolve_by_chatwoot_webhook_id("no-such-webhook-id") is None
+    assert await db_ctx.resolve_by_deposit_verification_reply_token("no-such-dv-token") is None
 
 
 # ---------------------------------------------------------------------------
@@ -100,11 +116,16 @@ def test_in_memory_resolver_register_with_secrets() -> None:
     resolver = InMemoryTenantResolver()
     ctx = resolver.register(
         _settings(),
-        secrets={"webhook:stringee_path_token": "tok123", "chatwoot:webhook_id": "wh456"},
+        secrets={
+            "webhook:stringee_path_token": "tok123",
+            "chatwoot:webhook_id": "wh456",
+            "deposit_verification:reply_token": "dv789",
+        },
     )
     assert ctx.secrets_resolved == {
         "webhook:stringee_path_token": "tok123",
         "chatwoot:webhook_id": "wh456",
+        "deposit_verification:reply_token": "dv789",
     }
 
     import asyncio
@@ -112,23 +133,47 @@ def test_in_memory_resolver_register_with_secrets() -> None:
     async def _run():
         stringee_ctx = await resolver.resolve_by_stringee_webhook_token("tok123")
         webhook_ctx = await resolver.resolve_by_chatwoot_webhook_id("wh456")
-        return stringee_ctx, webhook_ctx
+        dv_ctx = await resolver.resolve_by_deposit_verification_reply_token("dv789")
+        return stringee_ctx, webhook_ctx, dv_ctx
 
-    stringee_ctx, webhook_ctx = asyncio.run(_run())
+    stringee_ctx, webhook_ctx, dv_ctx = asyncio.run(_run())
     assert stringee_ctx is ctx
     assert webhook_ctx is ctx
+    assert dv_ctx is ctx
+
+
+def test_in_memory_resolver_unknown_deposit_verification_token_returns_none() -> None:
+    resolver = InMemoryTenantResolver()
+    resolver.register(
+        _settings(),
+        secrets={"deposit_verification:reply_token": "dv789"},
+    )
+
+    import asyncio
+
+    assert asyncio.run(
+        resolver.resolve_by_deposit_verification_reply_token("no-such-dv-token")
+    ) is None
 
 
 def test_in_memory_resolver_clear_does_not_leak_state() -> None:
     resolver = InMemoryTenantResolver()
     resolver.register(
         _settings("t1"),
-        secrets={"webhook:stringee_path_token": "tok-old", "chatwoot:webhook_id": "wh-old"},
+        secrets={
+            "webhook:stringee_path_token": "tok-old",
+            "chatwoot:webhook_id": "wh-old",
+            "deposit_verification:reply_token": "dv-old",
+        },
     )
     resolver.clear()
     resolver.register(
         _settings("t2"),
-        secrets={"webhook:stringee_path_token": "tok-new", "chatwoot:webhook_id": "wh-new"},
+        secrets={
+            "webhook:stringee_path_token": "tok-new",
+            "chatwoot:webhook_id": "wh-new",
+            "deposit_verification:reply_token": "dv-new",
+        },
     )
 
     import asyncio
@@ -137,15 +182,19 @@ def test_in_memory_resolver_clear_does_not_leak_state() -> None:
         return (
             await resolver.resolve_by_stringee_webhook_token("tok-old"),
             await resolver.resolve_by_chatwoot_webhook_id("wh-old"),
+            await resolver.resolve_by_deposit_verification_reply_token("dv-old"),
             await resolver.resolve_by_stringee_webhook_token("tok-new"),
             await resolver.resolve_by_chatwoot_webhook_id("wh-new"),
+            await resolver.resolve_by_deposit_verification_reply_token("dv-new"),
         )
 
-    old_tok, old_wh, new_tok, new_wh = asyncio.run(_run())
+    old_tok, old_wh, old_dv, new_tok, new_wh, new_dv = asyncio.run(_run())
     assert old_tok is None
     assert old_wh is None
+    assert old_dv is None
     assert new_tok is not None
     assert new_wh is not None
+    assert new_dv is not None
 
 
 def test_in_memory_resolver_register_without_secrets_kwarg_still_works() -> None:

@@ -563,6 +563,24 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         from src.providers.media.local import LocalMediaStorage
         log.info("media storage: using local filesystem fallback (/tmp/chat_media)")
         chat_api.set_media_store(LocalMediaStorage())
+        # json_ticket_relay vendors need a real, publicly-fetchable signed URL
+        # (see src/chatbot/deposit_verification.py); LocalMediaStorage only
+        # ever produces a relative, unsigned path, so any tenant on that
+        # contract can never successfully submit a verification while the
+        # local fallback is in effect. Warn (not a hard failure) so this is
+        # caught at boot instead of silently erroring on first submission.
+        broken_slugs = [
+            slug for slug, t in (getattr(app.state, "tenants", {}) or {}).items()
+            if getattr(t.deposit_verification, "contract", None) == "json_ticket_relay"
+        ]
+        if broken_slugs:
+            log.warning(
+                "deposit verification: tenant(s) use contract='json_ticket_relay' while "
+                "media storage is the local filesystem fallback — this vendor requires a "
+                "real public signed URL, which LocalMediaStorage cannot provide; "
+                "verification submissions for these tenants will fail",
+                extra={"tenant_slugs": broken_slugs},
+            )
     # Knowledge ingest/query resolve the SAME per-tenant retriever the chatbot
     # uses (registry.retrievers), so ingested docs are retrievable in chat.
     knowledge_api.set_retriever_factory(lambda t: runtime_registry.retrievers.get(t))

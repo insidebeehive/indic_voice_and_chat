@@ -357,7 +357,20 @@ class DepositVerificationConfig(BaseModel):
     enabled: bool = False
     webhook_url: Optional[str] = None
     webhook_secret_env: Optional[str] = None
-    timeout_minutes: int = 5
+    # gt=0: 0 or negative would either fire the timeout immediately (0) or
+    # never mark a stalled request due (negative), and PATCH /tenants/{id}
+    # has no other guard against either.
+    timeout_minutes: int = Field(default=5, gt=0)
+    # Vendor API contract this tenant's webhook speaks. "multipart_verdict" is
+    # the original/default contract (src/chatbot/deposit_verification.py +
+    # src/api/deposit_verification.py); "json_ticket_relay" is a newer
+    # vendor's JSON-ticket contract, added additively — default preserves all
+    # existing behavior unchanged.
+    contract: Literal["multipart_verdict", "json_ticket_relay"] = "multipart_verdict"
+    # gt=0: a signed screenshot URL with a zero/negative TTL would be
+    # rejected or already-expired the moment the vendor tries to fetch it.
+    screenshot_url_ttl_seconds: int = Field(default=3600, gt=0)
+    mobile_metadata_keys: list[str] = Field(default_factory=lambda: ["mobile", "phone"])
 
 
 class TenantSettings(BaseModel):

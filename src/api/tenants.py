@@ -322,6 +322,14 @@ class DepositVerificationUpdateIn(BaseModel):
     webhook_url: Optional[str] = None
     webhook_secret: Optional[str] = None   # write-only plaintext; never returned
     timeout_minutes: Optional[int] = None
+    # Vendor API contract this tenant's webhook speaks — see
+    # DepositVerificationConfig.contract in src/config_tenant.py.
+    contract: Optional[Literal["multipart_verdict", "json_ticket_relay"]] = None
+    screenshot_url_ttl_seconds: Optional[int] = None
+    # ``json_ticket_relay``-only: ordered ``ChatSession.extra_data`` keys to
+    # try when resolving the optional outbound ``mobile`` field — see
+    # DepositVerificationConfig.mobile_metadata_keys in src/config_tenant.py.
+    mobile_metadata_keys: Optional[list[str]] = None
 
 
 class UpdateTenantRequest(BaseModel):
@@ -514,6 +522,12 @@ async def update_tenant(
             dv_cfg["webhook_url"] = dv.webhook_url
         if dv.timeout_minutes is not None:
             dv_cfg["timeout_minutes"] = dv.timeout_minutes
+        if dv.contract is not None:
+            dv_cfg["contract"] = dv.contract
+        if dv.screenshot_url_ttl_seconds is not None:
+            dv_cfg["screenshot_url_ttl_seconds"] = dv.screenshot_url_ttl_seconds
+        if dv.mobile_metadata_keys is not None:
+            dv_cfg["mobile_metadata_keys"] = dv.mobile_metadata_keys
         if dv.webhook_secret is not None:
             if not crypto.has_key():
                 raise HTTPException(
@@ -612,7 +626,8 @@ class WebhookCredentialsRotateRequest(BaseModel):
     """Mint fresh per-tenant webhook-verification credentials for one or more
     providers. Twilio needs nothing here — it already reuses the tenant's
     existing Twilio auth token secret for signature verification."""
-    providers: list[Literal["stringee", "exotel", "chatwoot"]] = Field(min_length=1)
+    providers: list[Literal["stringee", "exotel", "chatwoot", "deposit_verification"]] = Field(
+        min_length=1)
 
 
 class WebhookCredentialsRotateResponse(BaseModel):
@@ -637,6 +652,17 @@ def _chatwoot_integrations_base_url(telephony_base: str) -> str:
     if telephony_base.endswith("/telephony"):
         return telephony_base[: -len("/telephony")] + "/integrations"
     return f"{telephony_base}/integrations"
+
+
+def _deposit_verification_base_url(telephony_base: str) -> str:
+    """Derive the ``/api/v1/deposit-verification`` base URL from the telephony
+    webhook base, same rationale as ``_chatwoot_integrations_base_url``: the
+    deposit-verification routes (``src/api/deposit_verification.py``) are
+    registered under their own sibling router prefix, not under
+    ``/api/v1/telephony``."""
+    if telephony_base.endswith("/telephony"):
+        return telephony_base[: -len("/telephony")] + "/deposit-verification"
+    return f"{telephony_base}/deposit-verification"
 
 
 async def _upsert_tenant_secret(
@@ -668,9 +694,11 @@ async def rotate_webhook_credentials(
 ) -> WebhookCredentialsRotateResponse:
     """Mint + rotate per-tenant inbound-webhook verification credentials (admin).
 
-    NOT wired into any request-verification path yet — this route only mints
-    and stores the values; the webhook handlers that will check them are
-    separate follow-up work.
+    This route only mints and stores the values; whether a given credential
+    is actually checked yet depends on the webhook handler. The
+    ``deposit_verification`` reply-token below IS checked, live, by
+    ``POST /deposit-verification/reply/{token}``
+    (``src/api/deposit_verification.py``).
 
     - ``stringee``: a fresh ``webhook:stringee_path_token`` (appended as
       ``?vt=<token>`` to the Stringee Answer/Event URL). The Stringee
@@ -682,6 +710,13 @@ async def rotate_webhook_credentials(
       embed in the Exotel callback URL's netloc.
     - ``chatwoot``: a fresh ``chatwoot:webhook_id`` to scope the Chatwoot
       Agent Bot webhook URL to this tenant.
+    - ``deposit_verification``: a fresh ``deposit_verification:reply_token``
+      capability token scoping the deposit-verification-reply inbound
+      callback to this tenant (mirrors the ``chatwoot`` token above — see
+      ``resolve_by_deposit_verification_reply_token`` on the tenant
+      resolver). The route itself (``POST
+      /deposit-verification/reply/{token}``) is live, in
+      ``src/api/deposit_verification.py``.
     """
     t = await _require_tenant(session, tenant_id)
 
@@ -745,6 +780,22 @@ async def rotate_webhook_credentials(
         instructions["chatwoot"] = (
             f"Point the Chatwoot Agent Bot webhook at "
             f"{integrations_base}/chatwoot/webhook/{webhook_id}"
+        )
+
+    if "deposit_verification" in req.providers:
+        reply_token = pysecrets.token_urlsafe(32)
+        await _upsert_tenant_secret(
+            session, tenant_id, "deposit_verification:reply_token", reply_token)
+        rotated.append("deposit_verification")
+        credentials["deposit_verification:reply_token"] = reply_token
+        # The deposit-verification routes live under their own router prefix
+        # (/api/v1/deposit-verification, registered via deposit_verification.router
+        # — see src/api/__init__.py), a sibling of the telephony one `base` is
+        # built for, same as the Chatwoot case above.
+        dv_base = _deposit_verification_base_url(base)
+        instructions["deposit_verification"] = (
+            f"Configure the deposit-dispute-ticket vendor's reply webhook at "
+            f"{dv_base}/reply/{reply_token}"
         )
 
     await session.commit()
