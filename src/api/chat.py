@@ -51,6 +51,7 @@ from src.api.chat_cost import compute_chat_turn_cost
 from src.interfaces.media_storage import IMediaStorage
 from src.api.deps import get_db_session
 from src.auth import TenantContext, current_tenant
+from src.auth.audit import log_denied, token_fingerprint
 from src.dialogue.language import normalize_lang
 from src.interfaces.llm import LLMMessage
 from src.models.chat import ChatMessage, ChatSession
@@ -785,15 +786,33 @@ async def list_sessions(
     return SessionListResponse(sessions=[_summary(r) for r in rows])
 
 
+async def _scoped_chat_session(
+    db: AsyncSession, session_id: str, tenant: TenantContext
+) -> ChatSession:
+    """Fetch a chat session and 404 if it doesn't belong to ``tenant``."""
+    row = await db.get(ChatSession, session_id)
+    if row is None or row.tenant_id != tenant.id:
+        log_denied(
+            logging.WARNING, "cross-tenant chat session access denied",
+            event="cross_tenant_access_denied",
+            reason=("chat_session_not_owned" if row is not None else "chat_session_not_found"),
+            tenant=tenant.slug, tenant_id=tenant.id,
+            resource="chat_session", resource_id=session_id,
+            session_id=session_id,
+            found=row is not None,
+            owner_tenant_id=(row.tenant_id if row is not None else None),
+        )
+        raise HTTPException(status_code=404, detail="chat session not found")
+    return row
+
+
 @router.get("/sessions/{session_id}", response_model=SessionDetailResponse)
 async def get_session(
     session_id: str = Path(min_length=1),
     tenant: TenantContext = Depends(current_tenant),
     session: AsyncSession = Depends(get_db_session),
 ) -> SessionDetailResponse:
-    row = await session.get(ChatSession, session_id)
-    if row is None or row.tenant_id != tenant.id:
-        raise HTTPException(status_code=404, detail="chat session not found")
+    row = await _scoped_chat_session(session, session_id, tenant)
     msgs = (await session.execute(
         select(ChatMessage).where(ChatMessage.session_id == session_id)
         .order_by(ChatMessage.id)
@@ -945,6 +964,11 @@ async def chat_voice_ws(websocket: WebSocket) -> None:
     try:
         tenant = await tenant_from_slug(websocket.query_params.get("tenant", ""))
     except Exception:  # noqa: BLE001
+        log_denied(logging.WARNING, "voice ws tenant resolution failed",
+                   event="auth_rejected", reason="voice_ws_unknown_tenant",
+                   route=websocket.url.path,
+                   tenant=websocket.query_params.get("tenant") or None,
+                   exc_info=True)
         await websocket.close(code=1008, reason="unknown tenant")
         return
 
@@ -1017,6 +1041,13 @@ async def get_media(
         authed = True
 
     if not authed:
+        log_denied(logging.WARNING, "media access denied",
+                   event="auth_rejected", reason="media_unauthorized",
+                   route="/chat/media/{message_id}",
+                   message_id=message_id,
+                   session_id_presented=bool(session_id),
+                   session_fp=(token_fingerprint(session_id, domain="vox-logfp-sid-v1")
+                               if session_id else None))
         raise HTTPException(status_code=401, detail="unauthorized")
 
     ttl = 3600
@@ -1070,9 +1101,7 @@ async def claim_session(
     session: AsyncSession = Depends(get_db_session),
 ) -> ClaimResponse:
     """BO agent claims an awaiting_human session; 409 if already claimed; 400 if wrong mode."""
-    row = await session.get(ChatSession, session_id)
-    if row is None or row.tenant_id != tenant.id:
-        raise HTTPException(status_code=404, detail="chat session not found")
+    row = await _scoped_chat_session(session, session_id, tenant)
     if row.mode == "human":
         raise HTTPException(
             status_code=409,
@@ -1111,9 +1140,7 @@ async def decline_session(
 ) -> DeclineResponse:
     """CRM calls this when it cannot assign a human agent to an awaiting_human session.
     Reverts the session to bot mode and signals the customer WS to resume bot conversation."""
-    row = await session.get(ChatSession, session_id)
-    if row is None or row.tenant_id != tenant.id:
-        raise HTTPException(status_code=404, detail="chat session not found")
+    row = await _scoped_chat_session(session, session_id, tenant)
     if row.mode != "awaiting_human":
         raise HTTPException(
             status_code=400,
@@ -1138,21 +1165,44 @@ async def agent_websocket(websocket: WebSocket, session_id: str) -> None:
 
     token = (websocket.query_params.get("token") or "").strip()
     if not token:
+        log_denied(logging.INFO, "agent ws auth rejected",
+                   event="auth_rejected", reason="agent_ws_missing_token",
+                   route=websocket.url.path, session_id=session_id)
         await websocket.close(code=1008, reason="missing token")
         return
     from src.auth.middleware import tenant_from_bearer_token
     try:
         tenant = await tenant_from_bearer_token(token)
     except Exception:  # noqa: BLE001
+        log_denied(logging.WARNING, "agent ws auth rejected",
+                   event="auth_rejected", reason="agent_ws_token_resolve_error",
+                   route=websocket.url.path, session_id=session_id,
+                   token_fp=token_fingerprint(token), exc_info=True)
         await websocket.close(code=1008, reason="invalid token")
         return
     if tenant is None:
+        log_denied(logging.WARNING, "agent ws auth rejected",
+                   event="auth_rejected", reason="agent_ws_token_unknown",
+                   route=websocket.url.path, session_id=session_id,
+                   token_fp=token_fingerprint(token))
         await websocket.close(code=1008, reason="invalid token")
         return
 
     async with _sm()() as db:
         row = await db.get(ChatSession, session_id)
     if row is None or row.tenant_id != tenant.id:
+        log_denied(
+            logging.WARNING, "cross-tenant agent ws session access denied",
+            event="cross_tenant_access_denied",
+            reason=("agent_ws_session_not_owned" if row is not None
+                    else "agent_ws_session_not_found"),
+            route=websocket.url.path,
+            tenant=tenant.slug, tenant_id=tenant.id,
+            resource="chat_session", resource_id=session_id,
+            session_id=session_id,
+            found=row is not None,
+            owner_tenant_id=(row.tenant_id if row is not None else None),
+        )
         await websocket.close(code=4004, reason="session not found")
         return
     if row.mode not in ("awaiting_human", "human"):
@@ -1267,6 +1317,10 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
     async with _sm()() as db:
         row = await db.get(ChatSession, session_id)
     if row is None:
+        log_denied(logging.WARNING, "chat ws session not found",
+                   event="auth_rejected", reason="chat_ws_session_not_found",
+                   route=websocket.url.path,
+                   session_fp=token_fingerprint(session_id, domain="vox-logfp-sid-v1"))
         await websocket.close(code=4004, reason="chat session not found")
         return
     # Computed ONCE per connection (never inside the per-message receive loop

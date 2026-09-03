@@ -24,6 +24,7 @@ from src.api.call_store import count_active_calls, insert_call
 from src.api.deps import get_db_session
 from src.config_tenant import platform_webhook_base_url
 from src.auth import TenantContext, current_tenant
+from src.auth.audit import log_denied
 from src.interfaces.telephony import CallConfig
 from src.models.campaign import Campaign as DbCampaign
 from src.models.conversation import Conversation
@@ -75,6 +76,47 @@ class TransferResultRequest(BaseModel):
     status: str  # "success" | "failure"
 
 
+# --- Helpers ------------------------------------------------------------
+
+
+async def _scoped_campaign(
+    session: AsyncSession, campaign_id: str, tenant: TenantContext
+) -> DbCampaign:
+    """Fetch a campaign and 404 if it doesn't belong to ``tenant``."""
+    campaign = await session.get(DbCampaign, campaign_id)
+    if campaign is None or campaign.tenant_id != tenant.id:
+        log_denied(
+            logging.WARNING, "cross-tenant campaign access denied",
+            event="cross_tenant_access_denied",
+            reason=("campaign_not_owned" if campaign is not None else "campaign_not_found"),
+            tenant=tenant.slug, tenant_id=tenant.id,
+            resource="campaign", resource_id=campaign_id,
+            found=campaign is not None,
+            owner_tenant_id=(campaign.tenant_id if campaign is not None else None),
+        )
+        raise HTTPException(status_code=404, detail="campaign not found")
+    return campaign
+
+
+async def _scoped_conversation(
+    session: AsyncSession, call_id: str, tenant: TenantContext
+) -> Conversation:
+    """Fetch a conversation (call) row and 404 if it doesn't belong to ``tenant``."""
+    row = await session.get(Conversation, call_id)
+    if row is None or row.tenant_id != tenant.id:
+        log_denied(
+            logging.WARNING, "cross-tenant call access denied",
+            event="cross_tenant_access_denied",
+            reason=("call_not_owned" if row is not None else "call_not_found"),
+            tenant=tenant.slug, tenant_id=tenant.id,
+            resource="conversation", resource_id=call_id,
+            found=row is not None,
+            owner_tenant_id=(row.tenant_id if row is not None else None),
+        )
+        raise HTTPException(status_code=404, detail="call not found")
+    return row
+
+
 # --- Routes -------------------------------------------------------------
 
 
@@ -95,6 +137,19 @@ async def transfer_result(
     from src.api.transfer_store import resolve
     resolved = resolve(tenant.id, provider_call_sid, req.status)
     if not resolved:
+        # The store is keyed by (tenant_id, call_sid), so a miss here covers
+        # BOTH "no such SID anywhere" and "that SID belongs to another tenant"
+        # — deliberately indistinguishable without a cross-tenant read of
+        # _pending, which we will not do.
+        log_denied(
+            logging.WARNING, "transfer-result denied: no pending transfer for this tenant",
+            event="cross_tenant_access_denied",
+            reason="transfer_not_pending_for_tenant",
+            route="/calls/{provider_call_sid}/transfer-result",
+            tenant=tenant.slug, tenant_id=tenant.id,
+            resource="transfer", resource_id=provider_call_sid,
+            found=False,
+        )
         raise HTTPException(
             status_code=404,
             detail="no in-flight transfer waiting for this call SID for this tenant")
@@ -109,9 +164,7 @@ async def call_lead(
     session: AsyncSession = Depends(get_db_session),
     tenant: TenantContext = Depends(current_tenant),
 ) -> CallLeadResponse:
-    campaign = await session.get(DbCampaign, campaign_id)
-    if campaign is None or campaign.tenant_id != tenant.id:
-        raise HTTPException(status_code=404, detail="campaign not found")
+    campaign = await _scoped_campaign(session, campaign_id, tenant)
     if campaign.status != "active":
         raise HTTPException(
             status_code=409, detail=f"campaign is {campaign.status!r}, not active")
@@ -238,9 +291,7 @@ async def get_call(
     session: AsyncSession = Depends(get_db_session),
     tenant: TenantContext = Depends(current_tenant),
 ) -> CallStatusResponse:
-    row = await session.get(Conversation, call_id)
-    if row is None or row.tenant_id != tenant.id:
-        raise HTTPException(status_code=404, detail="call not found")
+    row = await _scoped_conversation(session, call_id, tenant)
     return CallStatusResponse(
         call_id=row.id, status=row.status, outcome=row.outcome,
         summary=row.summary, notes=row.notes,
@@ -271,9 +322,7 @@ async def summarize_outcome(
     from src.interfaces.llm import LLMMessage
     from src.providers import get_llm_provider
 
-    row = await session.get(Conversation, call_id)
-    if row is None or row.tenant_id != tenant.id:
-        raise HTTPException(status_code=404, detail="call not found")
+    row = await _scoped_conversation(session, call_id, tenant)
 
     audio_bytes = await audio.read()
     if not audio_bytes:

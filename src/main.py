@@ -71,7 +71,7 @@ from src.api.call_store import (
 from src.integration.tenant_events import deliver as deliver_tenant_event
 from src.integration.tenant_events import resolve_events_webhook_url
 from src.auth.db_resolver import DbTenantResolver
-from src.auth.middleware import set_admin_tokens, set_tenant_resolver
+from src.auth.middleware import admin_token_labels, set_admin_tokens, set_tenant_resolver
 from src.auth.seed import seed_if_empty, seed_provider_costs, sync_telephony_from_yaml
 from src.bootstrap import (
     PerCrmRetrieverRegistry,
@@ -88,6 +88,7 @@ from src.config_tenant import TenantSettings
 from src.dialogue.campaign_resolver import DbCampaignResolver
 from src.dialogue.context import SessionStore
 from src.models.database import dispose_engine, ensure_schema, get_engine, get_sessionmaker
+from src.utils.client_ip import ClientIPMiddleware
 from src.utils.logging import configure_logging, get_logger
 
 log = get_logger(__name__)
@@ -401,6 +402,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     await resolver.reload()
     set_tenant_resolver(resolver)
     set_admin_tokens(_admin_tokens_from_env())
+    labels = admin_token_labels()
+    log.info("admin tokens configured", extra={"count": len(labels), "labels": labels})
     app.state.tenant_resolver = resolver
     app.state.tenants = resolver.loaded_settings()
 
@@ -604,6 +607,12 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# Resolve the client IP once per HTTP request / WS connection and publish it on
+# a ContextVar, so every log line emitted while serving that connection carries
+# it (see src/utils/client_ip.py and the log filter in src/utils/logging.py).
+# Pure-ASGI so it covers websocket scopes, which BaseHTTPMiddleware does not.
+app.add_middleware(ClientIPMiddleware)
+
 # Fail closed: the dev/bridge consoles place real billed outbound calls and run
 # billed AI voice sessions, so their data/action routes now require a
 # per-request admin token. If VOX_DEV_CONSOLE is on but no admin token is
@@ -612,8 +621,8 @@ app = FastAPI(
 # say so loudly. The open HTML shells still mount; they carry no data.
 #
 # NOTE: this reads the env var directly rather than src.auth.middleware's
-# _admin_token_hashes, because set_admin_tokens() runs in lifespan while
-# router mounting happens here at import time — the hash set is still empty
+# _admin_token_labels, because set_admin_tokens() runs in lifespan while
+# router mounting happens here at import time — that map is still empty
 # at this point.
 _dev_console_on = dev_console_enabled()
 _dev_console_authed = _dev_console_on and bool(_admin_tokens_from_env())

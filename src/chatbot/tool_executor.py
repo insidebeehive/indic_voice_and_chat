@@ -9,7 +9,6 @@ token the caller resolves (decrypted from tenant_secrets) — never logged.
 
 from __future__ import annotations
 
-import json
 import logging
 import re
 from typing import Optional
@@ -67,6 +66,18 @@ def _redact_internal_ids(value: object) -> object:
     if isinstance(value, str):
         return _UUID_RE.sub("[redacted]", value)
     return value
+
+
+def _redact_url(url: str) -> str:
+    """Scrub UUID-shaped substrings from a resolved CRM URL before logging.
+
+    ``{param}`` placeholders are substituted with real values before the call
+    (e.g. /players/{user_id}/profile -> /players/6c1a77a6-.../profile), so the
+    resolved URL carries a real player identifier that must not land in logs.
+    Deliberately reuses _UUID_RE so URL scrubbing and response-body scrubbing
+    can never drift apart.
+    """
+    return _UUID_RE.sub("[redacted]", url or "")
 
 # Read timeout for one CRM HTTP call. Was tightened to 10s during the 2026-08
 # relay-timeout incident fix, on the theory that a short timeout would keep
@@ -153,7 +164,10 @@ async def execute_crm_tool(
         client = httpx.AsyncClient(timeout=httpx.Timeout(timeout_s, connect=5.0))
     log.info("crm tool call", extra={
         "ticket_id": ticket_id, "session_id": session_id,
-        "url": url, "method": method, "params": rest,
+        "url": _redact_url(url), "method": method,
+        # keys only — resolved param VALUES can be customer PII (mobile,
+        # email) or a player id; same rule as header_keys below.
+        "param_keys": sorted(rest.keys()),
         "header_keys": list(headers.keys()),  # keys only — never log token values
     })
     try:
@@ -167,19 +181,13 @@ async def execute_crm_tool(
             body = {"text": resp.text}
         log.info("crm tool response", extra={
             "ticket_id": ticket_id, "session_id": session_id,
-            "url": url, "status_code": resp.status_code,
+            "url": _redact_url(url), "status_code": resp.status_code,
         })
-        # TEMP DEBUG (remove after the matka-availability investigation):
-        # log the actual response body so we can see what the CRM is really
-        # returning, not just the status code. Truncated — bodies here are
-        # small config/market payloads, not player PII.
-        log.info("crm tool response body [TEMP DEBUG]", extra={
-            "ticket_id": ticket_id, "session_id": session_id,
-            "url": url, "body": json.dumps(body, default=str)[:4000],
-        })
-        # Redact internal ids AFTER logging (the raw body above is for our
-        # own investigation, not customer-facing) but BEFORE this reaches the
-        # LLM's context — see _REDACTED_RESPONSE_KEYS.
+        # The response body is never logged, at any level: CRM bodies carry
+        # real customer PII (get_player_profile returns mobile, email,
+        # kyc_documents, bank_saved). Only url (UUID-scrubbed) + status_code
+        # go to the log, above. Redact internal ids before the body reaches
+        # the LLM's context — see _REDACTED_RESPONSE_KEYS.
         return {"status_code": resp.status_code, "data": _redact_internal_ids(body)}
     except Exception as e:  # noqa: BLE001 — a failing CRM call must not kill the turn
         log.exception("crm tool http call failed", extra={

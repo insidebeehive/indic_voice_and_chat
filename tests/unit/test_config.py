@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from src.config import load_settings, reset_settings_cache
+from src.config import Secrets, load_settings, reset_settings_cache
 
 
 def test_loads_default_yaml() -> None:
@@ -45,6 +45,46 @@ def test_media_storage_config_from_env(monkeypatch):
     assert s.media_storage.access_key == "ak"
     assert s.media_storage.bucket == "mybucket"
     reset_settings_cache()
+
+
+def test_env_override_log_level_uppercase(monkeypatch) -> None:
+    reset_settings_cache()
+    monkeypatch.setenv("VOX_LOG_LEVEL", "DEBUG")
+    s = load_settings()
+    assert s.app.log_level == "DEBUG"
+    reset_settings_cache()
+
+
+def test_env_override_log_level_lowercase_normalized(monkeypatch) -> None:
+    reset_settings_cache()
+    monkeypatch.setenv("VOX_LOG_LEVEL", "debug")
+    s = load_settings()
+    assert s.app.log_level == "DEBUG"
+    reset_settings_cache()
+
+
+def test_env_override_log_level_invalid_falls_back_to_default(monkeypatch) -> None:
+    reset_settings_cache()
+    monkeypatch.delenv("VOX_LOG_LEVEL", raising=False)
+    default_level = load_settings().app.log_level
+    reset_settings_cache()
+
+    monkeypatch.setenv("VOX_LOG_LEVEL", "NOT_A_REAL_LEVEL")
+    s = load_settings()
+    assert s.app.log_level == default_level
+    reset_settings_cache()
+
+
+def test_log_level_unset_uses_yaml_value(monkeypatch) -> None:
+    reset_settings_cache()
+    monkeypatch.delenv("VOX_LOG_LEVEL", raising=False)
+    s = load_settings()
+    assert s.app.log_level == "INFO"
+    reset_settings_cache()
+
+
+def test_secrets_declares_vox_log_level_field() -> None:
+    assert "VOX_LOG_LEVEL" in Secrets.model_fields
 
 
 def test_explicit_path_override(tmp_path: Path) -> None:

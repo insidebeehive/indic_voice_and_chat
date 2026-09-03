@@ -13,6 +13,7 @@ via ``set_crm_retrievers`` at app startup (same DI pattern as
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Optional
 
@@ -23,6 +24,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import get_db_session
+from src.auth.audit import log_denied
 from src.auth.middleware import require_admin
 from src.interfaces.vector_store import Document
 from src.models.crm import Crm, CrmKBDocument
@@ -53,6 +55,26 @@ def _retriever_for_crm(crm_id: str):
 async def _require_crm(session: AsyncSession, crm_id: str) -> None:
     if await session.get(Crm, crm_id) is None:
         raise HTTPException(status_code=404, detail=f"CRM {crm_id!r} not found")
+
+
+async def _scoped_crm_doc(
+    session: AsyncSession, document_id: str, crm_id: str
+) -> CrmKBDocument:
+    """Fetch a CRM KB document row and 404 if it doesn't belong to ``crm_id``."""
+    row = await session.get(CrmKBDocument, document_id)
+    if row is None or row.crm_id != crm_id:
+        log_denied(
+            logging.INFO, "cross-CRM KB document access denied",
+            event="admin_scope_denied",
+            reason=("crm_kb_document_not_in_crm" if row is not None
+                    else "crm_kb_document_not_found"),
+            resource="crm_kb_document", resource_id=document_id,
+            crm_id=crm_id,
+            found=row is not None,
+            owner_crm_id=(row.crm_id if row is not None else None),
+        )
+        raise HTTPException(status_code=404, detail="document not found")
+    return row
 
 
 class DocumentInfo(BaseModel):
@@ -160,9 +182,7 @@ async def delete_crm_document(
 ) -> dict:
     await _require_crm(session, crm_id)
     retriever = _retriever_for_crm(crm_id)
-    row = await session.get(CrmKBDocument, document_id)
-    if row is None or row.crm_id != crm_id:
-        raise HTTPException(status_code=404, detail="document not found")
+    row = await _scoped_crm_doc(session, document_id, crm_id)
     chunk_ids = (row.extra_data or {}).get("chunk_ids") or [
         f"{document_id}::chunk-{i}" for i in range(row.chunk_count or 0)]
     await session.delete(row)
@@ -188,9 +208,7 @@ async def download_crm_document(
     _: None = Depends(require_admin),
 ) -> Response:
     await _require_crm(session, crm_id)
-    row = await session.get(CrmKBDocument, document_id)
-    if row is None or row.crm_id != crm_id:
-        raise HTTPException(status_code=404, detail="document not found")
+    row = await _scoped_crm_doc(session, document_id, crm_id)
     retriever = _retriever_for_crm(crm_id)
     text = _chunks_for_doc(retriever, document_id)
     filename = (row.filename or document_id).rsplit(".", 1)[0] + ".txt"

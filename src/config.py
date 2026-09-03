@@ -289,6 +289,7 @@ class Secrets(BaseSettings):
     WEBHOOK_BASE_URL: Optional[str] = None
     EVENTS_WEBHOOK_SECRET: Optional[str] = None  # platform-level HMAC signing key for outbound webhooks
     VOX_CONFIG_PATH: str = "config/default.yaml"
+    VOX_LOG_LEVEL: Optional[str] = None
 
 
 class Settings(BaseModel):
@@ -317,6 +318,9 @@ def _load_yaml(path: Path) -> dict[str, Any]:
     return data
 
 
+_VALID_LOG_LEVELS = {"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG", "NOTSET"}
+
+
 def _apply_env_overrides(yaml_data: dict[str, Any], secrets: Secrets) -> dict[str, Any]:
     """Apply env-derived overrides to the YAML config dict in place."""
     if secrets.DATABASE_URL:
@@ -339,6 +343,23 @@ def _apply_env_overrides(yaml_data: dict[str, Any], secrets: Secrets) -> dict[st
         yaml_data.setdefault("media_storage", {})["endpoint_url"] = secrets.MEDIA_STORAGE_ENDPOINT_URL
     if secrets.MEDIA_STORAGE_REGION:
         yaml_data.setdefault("media_storage", {})["region"] = secrets.MEDIA_STORAGE_REGION
+    if secrets.VOX_LOG_LEVEL:
+        normalized = secrets.VOX_LOG_LEVEL.strip().upper()
+        if normalized in _VALID_LOG_LEVELS:
+            yaml_data.setdefault("app", {})["log_level"] = normalized
+        else:
+            # print, not log.warning: this runs during config loading, which
+            # happens at import time before configure_logging() is ever called
+            # (see src/main.py's lifespan) -- a logger call here would hit an
+            # unconfigured root logger. Must not raise: configure_logging() is
+            # invoked from FastAPI's lifespan, so an uncaught exception during
+            # config loading would crash-loop the whole service on every
+            # restart if a bad value were ever set.
+            print(
+                f"WARNING: invalid VOX_LOG_LEVEL={secrets.VOX_LOG_LEVEL!r}, "
+                f"expected one of {sorted(_VALID_LOG_LEVELS)} -- ignoring, "
+                f"using configured default"
+            )
     return yaml_data
 
 

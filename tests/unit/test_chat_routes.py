@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import AsyncIterator
 
 import pytest
@@ -16,6 +17,7 @@ from src.agents.chatbot import ChatBotAgent
 from src.api import chat
 from src.api.deps import get_db_session
 from src.auth import TenantContext, register_tenant_for_test
+from src.auth.audit import reset_suppression_state, token_fingerprint
 from src.auth.middleware import set_tenant_resolver
 from src.config_tenant import TenantSettings
 from src.dialogue.context import SessionStore
@@ -29,6 +31,16 @@ from src.rag.retriever import HybridRetriever, RetrievalConfig
 
 
 HEADERS = {"Authorization": "Bearer test-token"}
+
+
+@pytest.fixture(autouse=True)
+def _reset_audit_suppression_state():
+    """log_denied's per-(reason, client_ip) suppression window is module-level
+    state — without resetting it, one test's auth-rejection log gets silently
+    suppressed by a prior test's rejections for the same reason."""
+    reset_suppression_state()
+    yield
+    reset_suppression_state()
 
 
 class _FakeLLM(ILLMProvider):
@@ -320,12 +332,68 @@ def test_websocket_round_trip(app: FastAPI) -> None:
     assert "plans.md:0" in reply["sources"]
 
 
+def test_websocket_normal_turn_still_logs_session_id_in_clear(
+    app: FastAPI, caplog
+) -> None:
+    """Control test for the fingerprinting carve-out: a NORMAL successful WS
+    turn (not a rejection) must still show session_id in the clear in the
+    existing disconnect log line -- proving the carve-out added for the
+    session-not-found close (site 6) is narrow, not a blanket change across
+    the file."""
+    client = TestClient(app)
+    sid = _create_session(client)
+    with caplog.at_level(logging.INFO):
+        with client.websocket_connect(f"/chat/ws/{sid}") as ws:
+            ws.send_text(json.dumps({"type": "message", "text": "Plan B?"}))
+            assert json.loads(ws.receive_text())["type"] == "typing"
+            assert json.loads(ws.receive_text())["type"] == "message"
+
+    disconnect_records = [
+        r for r in caplog.records if r.getMessage() == "chat ws client disconnected"
+    ]
+    assert len(disconnect_records) == 1, caplog.records
+    assert disconnect_records[0].session_id == sid
+
+    # No auth_rejected record for a normal, successful connection.
+    assert not [r for r in caplog.records if getattr(r, "event", None) == "auth_rejected"]
+
+
 def test_websocket_unknown_session_closes(app: FastAPI) -> None:
     client = TestClient(app)
     from starlette.websockets import WebSocketDisconnect
     with pytest.raises(WebSocketDisconnect):
         with client.websocket_connect("/chat/ws/cs_doesnotexist") as ws:
             ws.receive_text()
+
+
+def test_websocket_unknown_session_logs_auth_rejected_fingerprinted(
+    app: FastAPI, caplog
+) -> None:
+    """WS /ws/{session_id} — session_id IS the entire credential on this route,
+    so an unknown/guessed session_id must be logged (this is the highest-value
+    site in the whole remediation plan), but only as a fingerprint. The raw
+    guessed session_id must never appear in any log record from the attempt."""
+    from starlette.websockets import WebSocketDisconnect
+
+    guessed = "cs_guessedvalue123"
+    client = TestClient(app)
+    with caplog.at_level(logging.INFO):
+        with pytest.raises(WebSocketDisconnect):
+            with client.websocket_connect(f"/chat/ws/{guessed}") as ws:
+                ws.receive_text()
+
+    rejected = [r for r in caplog.records if getattr(r, "event", None) == "auth_rejected"]
+    assert len(rejected) == 1, rejected
+    record = rejected[0]
+    assert record.reason == "chat_ws_session_not_found"
+    assert record.levelno == logging.WARNING
+    assert record.session_fp == token_fingerprint(guessed, domain="vox-logfp-sid-v1")
+
+    # The raw guessed session_id must never leak into any captured record.
+    for r in caplog.records:
+        assert guessed not in r.getMessage()
+        for value in vars(r).values():
+            assert value != guessed
 
 
 def test_websocket_factory_failure_closes_cleanly(app: FastAPI) -> None:
@@ -500,6 +568,34 @@ async def test_request_call_returns_voice_url_and_stores_context(app: FastAPI, f
     assert ctx["chat_session_id"] == sid
     assert ctx["customer_name"] == "Raju"
     assert "chat_summary" in ctx
+
+
+def test_voice_ws_unknown_tenant_logs_auth_rejected(app: FastAPI, caplog) -> None:
+    """chat_voice_ws's bare `except Exception:` around tenant resolution used
+    to swallow the failure silently. It must now log with exc_info populated.
+
+    A downstream tenant-resolution helper in src/auth/middleware.py (Package B,
+    landing in parallel) may ALSO legitimately log its own auth_rejected record
+    for the same underlying rejection (reason="unknown_tenant_slug") -- that's
+    expected, so this only filters by OUR reason rather than asserting a total
+    record count for the whole connection attempt."""
+    from starlette.websockets import WebSocketDisconnect
+
+    client = TestClient(app)
+    with caplog.at_level(logging.INFO):
+        with pytest.raises(WebSocketDisconnect):
+            with client.websocket_connect("/chat/voice?tenant=doesnotexist") as ws:
+                ws.receive_text()
+
+    ours = [
+        r for r in caplog.records
+        if getattr(r, "reason", None) == "voice_ws_unknown_tenant"
+    ]
+    assert len(ours) == 1, caplog.records
+    record = ours[0]
+    assert record.event == "auth_rejected"
+    assert record.levelno == logging.WARNING
+    assert record.exc_info is not None
 
 
 def test_upload_endpoint_processes_and_persists(app: FastAPI) -> None:
@@ -894,3 +990,406 @@ def test_agent_ws_wrong_mode_closes(app: FastAPI) -> None:
             f"/chat/sessions/{sid}/agent-ws?token=test-token"
         ) as ws:
             ws.receive_text()
+
+
+def test_agent_ws_wrong_mode_close_is_not_logged(app: FastAPI, caplog) -> None:
+    """The 'session not in handover mode' close (and the cross-tenant
+    `row is None or row.tenant_id != tenant.id` close it sits behind) are
+    explicitly OUT OF SCOPE for this change -- confirm neither one produces
+    an auth_rejected record."""
+    from starlette.websockets import WebSocketDisconnect
+
+    client = TestClient(app)
+    sid = _create_session(client)
+
+    with caplog.at_level(logging.INFO):
+        with pytest.raises(WebSocketDisconnect):
+            with client.websocket_connect(
+                f"/chat/sessions/{sid}/agent-ws?token=test-token"
+            ) as ws:
+                ws.receive_text()
+
+    assert not [r for r in caplog.records if getattr(r, "event", None) == "auth_rejected"]
+
+
+def test_agent_ws_missing_token_logs_auth_rejected(app: FastAPI, caplog) -> None:
+    """Site 2: no ?token= at all -- benign (client just didn't send one), so
+    this logs at INFO, not WARNING. session_id is an ordinary correlation
+    field on this route (the credential here is the token, not session_id),
+    so it's logged in the clear."""
+    from starlette.websockets import WebSocketDisconnect
+
+    client = TestClient(app)
+    sid = _create_session(client)
+
+    with caplog.at_level(logging.INFO):
+        with pytest.raises(WebSocketDisconnect):
+            with client.websocket_connect(f"/chat/sessions/{sid}/agent-ws") as ws:
+                ws.receive_text()
+
+    rejected = [r for r in caplog.records if getattr(r, "event", None) == "auth_rejected"]
+    assert len(rejected) == 1, rejected
+    record = rejected[0]
+    assert record.reason == "agent_ws_missing_token"
+    assert record.levelno == logging.INFO
+    assert record.session_id == sid
+
+
+def test_agent_ws_invalid_token_logs_auth_rejected(app: FastAPI, caplog) -> None:
+    """Site 4: token resolved but no tenant found for it (existing
+    test_agent_ws_invalid_token_closes covers the close behavior; this
+    confirms the log line added alongside it)."""
+    from starlette.websockets import WebSocketDisconnect
+
+    client = TestClient(app)
+    sid = _create_session(client)
+
+    with caplog.at_level(logging.INFO):
+        with pytest.raises(WebSocketDisconnect):
+            with client.websocket_connect(
+                f"/chat/sessions/{sid}/agent-ws?token=wrong-token"
+            ) as ws:
+                ws.receive_text()
+
+    rejected = [r for r in caplog.records if getattr(r, "event", None) == "auth_rejected"]
+    assert len(rejected) == 1, rejected
+    record = rejected[0]
+    assert record.reason == "agent_ws_token_unknown"
+    assert record.levelno == logging.WARNING
+    assert record.session_id == sid
+    assert record.token_fp == token_fingerprint("wrong-token")
+
+
+def test_agent_ws_token_resolve_error_logs_with_exc_info(
+    app: FastAPI, caplog, monkeypatch
+) -> None:
+    """Site 3: the token resolver itself throwing (not just an unknown token)
+    is an ops signal, not merely an attacker signal -- exc_info must be
+    populated."""
+    from starlette.websockets import WebSocketDisconnect
+
+    async def _boom(token: str):
+        raise RuntimeError("resolver backend unavailable")
+
+    monkeypatch.setattr("src.auth.middleware.tenant_from_bearer_token", _boom)
+
+    client = TestClient(app)
+    sid = _create_session(client)
+
+    with caplog.at_level(logging.INFO):
+        with pytest.raises(WebSocketDisconnect):
+            with client.websocket_connect(
+                f"/chat/sessions/{sid}/agent-ws?token=some-token"
+            ) as ws:
+                ws.receive_text()
+
+    rejected = [r for r in caplog.records if getattr(r, "event", None) == "auth_rejected"]
+    assert len(rejected) == 1, rejected
+    record = rejected[0]
+    assert record.reason == "agent_ws_token_resolve_error"
+    assert record.levelno == logging.WARNING
+    assert record.session_id == sid
+    assert record.token_fp == token_fingerprint("some-token")
+    assert record.exc_info is not None
+
+
+# --- Cross-tenant chat session access (audit logging) --------------------
+#
+# An authenticated tenant probing another tenant's chat session ids must be
+# logged (event="cross_tenant_access_denied", distinct from "auth_rejected"
+# so it can never collide with the auth-failure counts asserted above),
+# without changing any existing HTTP/WS response.
+
+
+async def _seed_foreign_chat_session(session_id: str, *, tenant_id: str = "t2", mode: str = "ai") -> None:
+    """Insert a ChatSession row owned by a tenant OTHER than the default test
+    tenant ("t1"/HEADERS) -- simulates tenant A guessing or reusing tenant
+    B's real session id. Uses the sessionmaker already injected into `chat`
+    by the `app` fixture (chat.set_chat_sessionmaker)."""
+    from src.models.chat import ChatSession
+    from src.models.tenant import Tenant
+
+    sm = chat._sm()
+    async with sm() as s:
+        if await s.get(Tenant, tenant_id) is None:
+            s.add(Tenant(id=tenant_id, slug=tenant_id, name="Other Co"))
+        s.add(ChatSession(
+            id=session_id, tenant_id=tenant_id, language="en", status="active",
+            extra_data={}, mode=mode,
+        ))
+        await s.commit()
+
+
+async def _seed_own_chat_session(session_id: str, *, mode: str = "ai") -> None:
+    """Insert a ChatSession row owned by the default test tenant ("t1")."""
+    from src.models.chat import ChatSession
+
+    sm = chat._sm()
+    async with sm() as s:
+        s.add(ChatSession(
+            id=session_id, tenant_id="t1", language="en", status="active",
+            extra_data={}, mode=mode,
+        ))
+        await s.commit()
+
+
+def _cross_tenant_records(caplog):
+    return [r for r in caplog.records if getattr(r, "event", None) == "cross_tenant_access_denied"]
+
+
+# get_session ---------------------------------------------------------------
+
+
+async def test_get_session_cross_tenant_logs_and_404(app: FastAPI, caplog) -> None:
+    client = TestClient(app)
+    other_sid = "cs_foreign_get_1"
+    await _seed_foreign_chat_session(other_sid)
+
+    with caplog.at_level(logging.INFO):
+        resp = client.get(f"/chat/sessions/{other_sid}", headers=HEADERS)
+
+    assert resp.status_code == 404
+    assert resp.json()["detail"] == "chat session not found"
+
+    records = _cross_tenant_records(caplog)
+    assert len(records) == 1, records
+    rec = records[0]
+    assert rec.reason == "chat_session_not_owned"
+    assert rec.levelno == logging.WARNING
+    assert rec.found is True
+    assert rec.owner_tenant_id == "t2"
+    assert rec.session_id == other_sid
+    assert rec.resource == "chat_session"
+    assert rec.resource_id == other_sid
+
+
+async def test_get_session_nonexistent_logs_and_404(app: FastAPI, caplog) -> None:
+    client = TestClient(app)
+    missing_sid = "cs_does_not_exist_1"
+
+    with caplog.at_level(logging.INFO):
+        resp = client.get(f"/chat/sessions/{missing_sid}", headers=HEADERS)
+
+    assert resp.status_code == 404
+    assert resp.json()["detail"] == "chat session not found"
+
+    records = _cross_tenant_records(caplog)
+    assert len(records) == 1, records
+    rec = records[0]
+    assert rec.reason == "chat_session_not_found"
+    assert rec.levelno == logging.WARNING
+    assert rec.found is False
+    assert rec.owner_tenant_id is None
+    assert rec.session_id == missing_sid
+
+
+def test_get_session_same_tenant_no_cross_tenant_log(app: FastAPI, caplog) -> None:
+    client = TestClient(app)
+    sid = _create_session(client)
+
+    with caplog.at_level(logging.INFO):
+        resp = client.get(f"/chat/sessions/{sid}", headers=HEADERS)
+
+    assert resp.status_code == 200
+    assert not _cross_tenant_records(caplog)
+
+
+# claim_session ---------------------------------------------------------------
+
+
+async def test_claim_session_cross_tenant_logs_and_404(app: FastAPI, caplog) -> None:
+    client = TestClient(app)
+    other_sid = "cs_foreign_claim_1"
+    await _seed_foreign_chat_session(other_sid, mode="awaiting_human")
+
+    with caplog.at_level(logging.INFO):
+        resp = client.post(
+            f"/chat/sessions/{other_sid}/claim",
+            json={"agent_id": "a01", "agent_name": "Priya"},
+            headers=HEADERS,
+        )
+
+    assert resp.status_code == 404
+    assert resp.json()["detail"] == "chat session not found"
+
+    records = _cross_tenant_records(caplog)
+    assert len(records) == 1, records
+    rec = records[0]
+    assert rec.reason == "chat_session_not_owned"
+    assert rec.levelno == logging.WARNING
+    assert rec.found is True
+    assert rec.owner_tenant_id == "t2"
+    assert rec.session_id == other_sid
+
+
+async def test_claim_session_nonexistent_logs_and_404(app: FastAPI, caplog) -> None:
+    client = TestClient(app)
+    missing_sid = "cs_does_not_exist_2"
+
+    with caplog.at_level(logging.INFO):
+        resp = client.post(
+            f"/chat/sessions/{missing_sid}/claim",
+            json={"agent_id": "a01", "agent_name": "Priya"},
+            headers=HEADERS,
+        )
+
+    assert resp.status_code == 404
+    assert resp.json()["detail"] == "chat session not found"
+
+    records = _cross_tenant_records(caplog)
+    assert len(records) == 1, records
+    rec = records[0]
+    assert rec.reason == "chat_session_not_found"
+    assert rec.levelno == logging.WARNING
+    assert rec.found is False
+    assert rec.owner_tenant_id is None
+
+
+async def test_claim_session_same_tenant_no_cross_tenant_log(app: FastAPI, caplog) -> None:
+    client = TestClient(app)
+    sid = "cs_own_claim_1"
+    await _seed_own_chat_session(sid, mode="awaiting_human")
+
+    with caplog.at_level(logging.INFO):
+        resp = client.post(
+            f"/chat/sessions/{sid}/claim",
+            json={"agent_id": "a01", "agent_name": "Priya"},
+            headers=HEADERS,
+        )
+
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "claimed", "agent_id": "a01"}
+    assert not _cross_tenant_records(caplog)
+
+
+# decline_session ---------------------------------------------------------------
+
+
+async def test_decline_session_cross_tenant_logs_and_404(app: FastAPI, caplog) -> None:
+    client = TestClient(app)
+    other_sid = "cs_foreign_decline_1"
+    await _seed_foreign_chat_session(other_sid, mode="awaiting_human")
+
+    with caplog.at_level(logging.INFO):
+        resp = client.post(f"/chat/sessions/{other_sid}/decline", headers=HEADERS)
+
+    assert resp.status_code == 404
+    assert resp.json()["detail"] == "chat session not found"
+
+    records = _cross_tenant_records(caplog)
+    assert len(records) == 1, records
+    rec = records[0]
+    assert rec.reason == "chat_session_not_owned"
+    assert rec.levelno == logging.WARNING
+    assert rec.found is True
+    assert rec.owner_tenant_id == "t2"
+    assert rec.session_id == other_sid
+
+
+async def test_decline_session_nonexistent_logs_and_404(app: FastAPI, caplog) -> None:
+    client = TestClient(app)
+    missing_sid = "cs_does_not_exist_3"
+
+    with caplog.at_level(logging.INFO):
+        resp = client.post(f"/chat/sessions/{missing_sid}/decline", headers=HEADERS)
+
+    assert resp.status_code == 404
+    assert resp.json()["detail"] == "chat session not found"
+
+    records = _cross_tenant_records(caplog)
+    assert len(records) == 1, records
+    rec = records[0]
+    assert rec.reason == "chat_session_not_found"
+    assert rec.levelno == logging.WARNING
+    assert rec.found is False
+    assert rec.owner_tenant_id is None
+
+
+async def test_decline_session_same_tenant_no_cross_tenant_log(app: FastAPI, caplog) -> None:
+    client = TestClient(app)
+    sid = "cs_own_decline_1"
+    await _seed_own_chat_session(sid, mode="awaiting_human")
+
+    with caplog.at_level(logging.INFO):
+        resp = client.post(f"/chat/sessions/{sid}/decline", headers=HEADERS)
+
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "declined"}
+    assert not _cross_tenant_records(caplog)
+
+
+# agent_websocket (BO handover WS close) -------------------------------------
+
+
+async def test_agent_ws_cross_tenant_logs_and_closes(app: FastAPI, caplog) -> None:
+    from starlette.websockets import WebSocketDisconnect
+
+    client = TestClient(app)
+    other_sid = "cs_foreign_agentws_1"
+    await _seed_foreign_chat_session(other_sid)
+
+    with caplog.at_level(logging.INFO):
+        with pytest.raises(WebSocketDisconnect) as exc_info:
+            with client.websocket_connect(
+                f"/chat/sessions/{other_sid}/agent-ws?token=test-token"
+            ) as ws:
+                ws.receive_text()
+
+    assert exc_info.value.code == 4004
+    assert exc_info.value.reason == "session not found"
+
+    records = _cross_tenant_records(caplog)
+    assert len(records) == 1, records
+    rec = records[0]
+    assert rec.reason == "agent_ws_session_not_owned"
+    assert rec.levelno == logging.WARNING
+    assert rec.found is True
+    assert rec.owner_tenant_id == "t2"
+    assert rec.session_id == other_sid
+    assert rec.resource == "chat_session"
+    assert rec.resource_id == other_sid
+
+
+async def test_agent_ws_nonexistent_session_logs_and_closes(app: FastAPI, caplog) -> None:
+    from starlette.websockets import WebSocketDisconnect
+
+    client = TestClient(app)
+    missing_sid = "cs_does_not_exist_4"
+
+    with caplog.at_level(logging.INFO):
+        with pytest.raises(WebSocketDisconnect) as exc_info:
+            with client.websocket_connect(
+                f"/chat/sessions/{missing_sid}/agent-ws?token=test-token"
+            ) as ws:
+                ws.receive_text()
+
+    assert exc_info.value.code == 4004
+    assert exc_info.value.reason == "session not found"
+
+    records = _cross_tenant_records(caplog)
+    assert len(records) == 1, records
+    rec = records[0]
+    assert rec.reason == "agent_ws_session_not_found"
+    assert rec.levelno == logging.WARNING
+    assert rec.found is False
+    assert rec.owner_tenant_id is None
+    assert rec.session_id == missing_sid
+
+
+def test_agent_ws_same_tenant_no_cross_tenant_log(app: FastAPI, caplog) -> None:
+    """A same-tenant connection that passes the ownership check (but still
+    fails the wrong-mode check further below, out of scope for this change)
+    must not produce a cross_tenant_access_denied record."""
+    from starlette.websockets import WebSocketDisconnect
+
+    client = TestClient(app)
+    sid = _create_session(client)
+
+    with caplog.at_level(logging.INFO):
+        with pytest.raises(WebSocketDisconnect):
+            with client.websocket_connect(
+                f"/chat/sessions/{sid}/agent-ws?token=test-token"
+            ) as ws:
+                ws.receive_text()
+
+    assert not _cross_tenant_records(caplog)

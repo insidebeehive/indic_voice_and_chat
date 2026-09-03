@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import logging
 
 import pytest
 import pytest_asyncio
@@ -13,12 +14,23 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from src.api import campaigns
 from src.api.deps import get_db_session
 from src.auth import register_tenant_for_test
+from src.auth.audit import reset_suppression_state
 from src.auth.middleware import set_tenant_resolver
 from src.config_tenant import TenantSettings
 from src.models.database import Base
 from src.models.tenant import Tenant
 
 HEADERS = {"Authorization": "Bearer test-token"}
+
+
+@pytest.fixture(autouse=True)
+def _reset_audit_suppression_state():
+    """log_denied's per-(reason, client_ip) suppression window is module-level
+    state — without resetting it, one test's rejection log gets silently
+    suppressed by a prior test's rejections for the same reason."""
+    reset_suppression_state()
+    yield
+    reset_suppression_state()
 
 
 @pytest_asyncio.fixture
@@ -167,3 +179,65 @@ async def test_missing_auth_returns_401(client: AsyncClient) -> None:
     # Empty Authorization overrides the client default → unauthenticated.
     resp = await client.get("/campaigns", headers={"Authorization": ""})
     assert resp.status_code == 401
+
+
+# --- _scoped cross-tenant audit logging -----------------------------------
+
+
+async def test_scoped_campaign_cross_tenant_logs_denial(
+    client: AsyncClient, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Campaign owned by t1; t2 probing it must 404 (response unchanged) AND
+    # emit exactly one cross_tenant_access_denied record with found=True.
+    await client.post("/campaigns", json={"id": "c1", "name": "X"})
+    register_tenant_for_test(
+        TenantSettings(id="t2", slug="t2", name="T2"), plaintext_tokens=["other-token"]
+    )
+    with caplog.at_level(logging.INFO):
+        resp = await client.get(
+            "/campaigns/c1", headers={"Authorization": "Bearer other-token"})
+    assert resp.status_code == 404
+    assert resp.json()["detail"] == "campaign not found"
+    denied = [r for r in caplog.records
+              if getattr(r, "event", None) == "cross_tenant_access_denied"]
+    assert len(denied) == 1, denied
+    rec = denied[0]
+    assert rec.reason == "campaign_not_owned"
+    assert rec.levelno == logging.WARNING
+    assert rec.resource == "campaign"
+    assert rec.resource_id == "c1"
+    assert rec.found is True
+    assert rec.owner_tenant_id == "t1"
+    assert rec.tenant == "t2"
+    assert rec.tenant_id == "t2"
+
+
+async def test_scoped_campaign_not_found_logs_denial(
+    client: AsyncClient, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Nonexistent campaign id: response unchanged, one record with found=False.
+    with caplog.at_level(logging.INFO):
+        resp = await client.get("/campaigns/missing")
+    assert resp.status_code == 404
+    assert resp.json()["detail"] == "campaign not found"
+    denied = [r for r in caplog.records
+              if getattr(r, "event", None) == "cross_tenant_access_denied"]
+    assert len(denied) == 1, denied
+    rec = denied[0]
+    assert rec.reason == "campaign_not_found"
+    assert rec.levelno == logging.WARNING
+    assert rec.found is False
+    assert rec.owner_tenant_id is None
+
+
+async def test_scoped_campaign_same_tenant_success_emits_no_denial(
+    client: AsyncClient, caplog: pytest.LogCaptureFixture
+) -> None:
+    # A normal same-tenant success must not emit any cross_tenant_access_denied.
+    await client.post("/campaigns", json={"id": "c1", "name": "X"})
+    with caplog.at_level(logging.INFO):
+        resp = await client.get("/campaigns/c1")
+    assert resp.status_code == 200
+    denied = [r for r in caplog.records
+              if getattr(r, "event", None) == "cross_tenant_access_denied"]
+    assert denied == []

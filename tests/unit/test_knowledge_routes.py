@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import logging
 
 import pytest
 from fastapi import FastAPI
@@ -12,6 +13,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from src.api import knowledge
 from src.api.deps import get_db_session
 from src.auth import register_tenant_for_test
+from src.auth.audit import reset_suppression_state
 from src.auth.middleware import set_tenant_resolver
 from src.config_tenant import TenantSettings
 from src.models.database import Base
@@ -23,6 +25,13 @@ from src.rag.retriever import HybridRetriever, RetrievalConfig
 
 
 HEADERS = {"Authorization": "Bearer test-token"}
+
+
+@pytest.fixture(autouse=True)
+def _reset_audit_suppression_state():
+    reset_suppression_state()
+    yield
+    reset_suppression_state()
 
 
 @pytest.fixture
@@ -171,6 +180,125 @@ def test_delete_unknown_document_404(app: FastAPI) -> None:
     client = TestClient(app)
     resp = client.delete("/knowledge/documents/missing", headers=HEADERS)
     assert resp.status_code == 404
+
+
+def test_delete_document_cross_tenant_404_logs_denied(app: FastAPI, caplog) -> None:
+    """A tenant deleting another tenant's document gets the same 404 as
+    before, but a cross_tenant_access_denied WARNING record is emitted and
+    the document itself is left untouched (not actually deleted)."""
+    client = TestClient(app)
+    ingested = client.post(
+        "/knowledge/ingest",
+        files={"file": ("plans.md", io.BytesIO(b"Plan B has 500GB"), "text/markdown")},
+        headers=HEADERS,
+    ).json()
+    doc_id = ingested["document_id"]
+
+    register_tenant_for_test(
+        TenantSettings(id="t2", slug="t2", name="T2"), plaintext_tokens=["t2-token"],
+    )
+    with caplog.at_level(logging.INFO):
+        resp = client.delete(
+            f"/knowledge/documents/{doc_id}", headers={"Authorization": "Bearer t2-token"})
+    assert resp.status_code == 404
+    assert resp.json()["detail"] == "document not found"
+
+    denied = [r for r in caplog.records if getattr(r, "event", None) == "cross_tenant_access_denied"]
+    assert len(denied) == 1, caplog.records
+    assert denied[0].levelno == logging.WARNING
+    assert denied[0].reason == "kb_document_not_owned"
+    assert denied[0].found is True
+
+    still_there = client.get("/knowledge/documents", headers=HEADERS).json()
+    assert any(d["id"] == doc_id for d in still_there["documents"])
+
+
+def test_delete_unknown_document_404_logs_denied(app: FastAPI, caplog) -> None:
+    client = TestClient(app)
+    with caplog.at_level(logging.INFO):
+        resp = client.delete("/knowledge/documents/missing", headers=HEADERS)
+    assert resp.status_code == 404
+    assert resp.json()["detail"] == "document not found"
+
+    denied = [r for r in caplog.records if getattr(r, "event", None) == "cross_tenant_access_denied"]
+    assert len(denied) == 1, caplog.records
+    assert denied[0].levelno == logging.WARNING
+    assert denied[0].reason == "kb_document_not_found"
+    assert denied[0].found is False
+
+
+def test_delete_document_same_tenant_logs_no_denial(app: FastAPI, caplog) -> None:
+    client = TestClient(app)
+    ingested = client.post(
+        "/knowledge/ingest",
+        files={"file": ("plans.md", io.BytesIO(b"Plan B has 500GB"), "text/markdown")},
+        headers=HEADERS,
+    ).json()
+    doc_id = ingested["document_id"]
+
+    with caplog.at_level(logging.INFO):
+        resp = client.delete(f"/knowledge/documents/{doc_id}", headers=HEADERS)
+    assert resp.status_code == 200
+
+    denied = [r for r in caplog.records if getattr(r, "event", None) == "cross_tenant_access_denied"]
+    assert denied == []
+
+
+def test_download_document_cross_tenant_404_logs_denied(app: FastAPI, caplog) -> None:
+    client = TestClient(app)
+    ingested = client.post(
+        "/knowledge/ingest",
+        files={"file": ("plans.md", io.BytesIO(b"Plan B has 500GB"), "text/markdown")},
+        headers=HEADERS,
+    ).json()
+    doc_id = ingested["document_id"]
+
+    register_tenant_for_test(
+        TenantSettings(id="t2", slug="t2", name="T2"), plaintext_tokens=["t2-token"],
+    )
+    with caplog.at_level(logging.INFO):
+        resp = client.get(
+            f"/knowledge/documents/{doc_id}/download",
+            headers={"Authorization": "Bearer t2-token"})
+    assert resp.status_code == 404
+    assert resp.json()["detail"] == "document not found"
+
+    denied = [r for r in caplog.records if getattr(r, "event", None) == "cross_tenant_access_denied"]
+    assert len(denied) == 1, caplog.records
+    assert denied[0].levelno == logging.WARNING
+    assert denied[0].reason == "kb_document_not_owned"
+    assert denied[0].found is True
+
+
+def test_download_document_unknown_id_404_logs_denied(app: FastAPI, caplog) -> None:
+    client = TestClient(app)
+    with caplog.at_level(logging.INFO):
+        resp = client.get("/knowledge/documents/missing/download", headers=HEADERS)
+    assert resp.status_code == 404
+    assert resp.json()["detail"] == "document not found"
+
+    denied = [r for r in caplog.records if getattr(r, "event", None) == "cross_tenant_access_denied"]
+    assert len(denied) == 1, caplog.records
+    assert denied[0].levelno == logging.WARNING
+    assert denied[0].reason == "kb_document_not_found"
+    assert denied[0].found is False
+
+
+def test_download_document_same_tenant_logs_no_denial(app: FastAPI, caplog) -> None:
+    client = TestClient(app)
+    ingested = client.post(
+        "/knowledge/ingest",
+        files={"file": ("plans.md", io.BytesIO(b"Plan B has 500GB"), "text/markdown")},
+        headers=HEADERS,
+    ).json()
+    doc_id = ingested["document_id"]
+
+    with caplog.at_level(logging.INFO):
+        resp = client.get(f"/knowledge/documents/{doc_id}/download", headers=HEADERS)
+    assert resp.status_code == 200
+
+    denied = [r for r in caplog.records if getattr(r, "event", None) == "cross_tenant_access_denied"]
+    assert denied == []
 
 
 def test_stats_reflects_ingest(app: FastAPI) -> None:

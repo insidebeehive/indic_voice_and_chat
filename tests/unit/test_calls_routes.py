@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -13,6 +14,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from src.api import calls
 from src.api.deps import get_db_session
 from src.auth import register_tenant_for_test
+from src.auth.audit import reset_suppression_state
 from src.auth.middleware import set_tenant_resolver
 from src.config_tenant import (
     TenantLLMConfig,
@@ -28,6 +30,16 @@ from src.models.database import Base
 from src.models.tenant import Tenant
 
 HEADERS = {"Authorization": "Bearer test-token"}
+
+
+@pytest.fixture(autouse=True)
+def _reset_audit_suppression_state():
+    """log_denied's per-(reason, client_ip) suppression window is module-level
+    state — without resetting it, one test's rejection log gets silently
+    suppressed by a prior test's rejections for the same reason."""
+    reset_suppression_state()
+    yield
+    reset_suppression_state()
 
 
 class _FakeSession:
@@ -389,3 +401,188 @@ async def test_transfer_result_unknown_call_sid_404(ctx) -> None:
         "/calls/does-not-exist/transfer-result", json={"status": "success"}, headers=HEADERS)
     assert resp.status_code == 404
     assert "for this tenant" in resp.json()["detail"]
+
+
+# --- cross-tenant access-attempt audit logging ----------------------------
+
+
+async def test_transfer_result_cross_tenant_logs_denial(
+    ctx, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The store is keyed by (tenant_id, call_sid), so a miss is structurally
+    # indistinguishable between "no such SID" and "SID belongs to another
+    # tenant" — found is always False here, single reason.
+    from src.api import transfer_store
+
+    client, _ = ctx
+    fut = transfer_store.register("t1", "SID-HIJACK-2")
+    try:
+        register_tenant_for_test(
+            TenantSettings(id="t2", slug="t2", name="T2"), plaintext_tokens=["t2-token-2"]
+        )
+        with caplog.at_level(logging.INFO):
+            resp = await client.post(
+                "/calls/SID-HIJACK-2/transfer-result", json={"status": "success"},
+                headers={"Authorization": "Bearer t2-token-2"})
+        assert resp.status_code == 404
+        assert "for this tenant" in resp.json()["detail"]
+        assert not fut.done()
+        denied = [r for r in caplog.records
+                  if getattr(r, "event", None) == "cross_tenant_access_denied"]
+        assert len(denied) == 1, denied
+        rec = denied[0]
+        assert rec.reason == "transfer_not_pending_for_tenant"
+        assert rec.levelno == logging.WARNING
+        assert rec.found is False
+        assert rec.resource == "transfer"
+        assert rec.resource_id == "SID-HIJACK-2"
+        assert rec.tenant == "t2"
+    finally:
+        transfer_store.cancel_pending("t1", "SID-HIJACK-2")
+
+
+async def test_transfer_result_unknown_sid_logs_denial(
+    ctx, caplog: pytest.LogCaptureFixture
+) -> None:
+    # No such SID at all — same reason/found=False (no found=True case is
+    # possible for this route: the store's composite key makes "found but
+    # wrong tenant" and "not found" indistinguishable, see comment above).
+    client, _ = ctx
+    with caplog.at_level(logging.INFO):
+        resp = await client.post(
+            "/calls/does-not-exist-2/transfer-result", json={"status": "success"},
+            headers=HEADERS)
+    assert resp.status_code == 404
+    assert "for this tenant" in resp.json()["detail"]
+    denied = [r for r in caplog.records
+              if getattr(r, "event", None) == "cross_tenant_access_denied"]
+    assert len(denied) == 1, denied
+    assert denied[0].reason == "transfer_not_pending_for_tenant"
+    assert denied[0].found is False
+
+
+async def test_transfer_result_own_tenant_emits_no_denial(
+    ctx, caplog: pytest.LogCaptureFixture
+) -> None:
+    from src.api import transfer_store
+
+    client, _ = ctx
+    transfer_store.register("t1", "SID-OWN-2")
+    with caplog.at_level(logging.INFO):
+        resp = await client.post(
+            "/calls/SID-OWN-2/transfer-result", json={"status": "success"}, headers=HEADERS)
+    assert resp.status_code == 200
+    denied = [r for r in caplog.records
+              if getattr(r, "event", None) == "cross_tenant_access_denied"]
+    assert denied == []
+
+
+async def test_call_lead_cross_tenant_campaign_logs_denial(
+    ctx, caplog: pytest.LogCaptureFixture
+) -> None:
+    # t1 owns c1; t2 probing it must 404 (unchanged) and log found=True.
+    client, _ = ctx
+    register_tenant_for_test(
+        TenantSettings(id="t2", slug="t2", name="T2"), plaintext_tokens=["t2-token-3"]
+    )
+    with caplog.at_level(logging.INFO):
+        resp = await client.post(
+            "/campaigns/c1/calls", json={"to_number": "+9118"},
+            headers={"Authorization": "Bearer t2-token-3"})
+    assert resp.status_code == 404
+    assert resp.json()["detail"] == "campaign not found"
+    denied = [r for r in caplog.records
+              if getattr(r, "event", None) == "cross_tenant_access_denied"]
+    assert len(denied) == 1, denied
+    rec = denied[0]
+    assert rec.reason == "campaign_not_owned"
+    assert rec.levelno == logging.WARNING
+    assert rec.found is True
+    assert rec.owner_tenant_id == "t1"
+    assert rec.resource == "campaign"
+    assert rec.resource_id == "c1"
+
+
+async def test_call_lead_unknown_campaign_logs_denial(
+    ctx, caplog: pytest.LogCaptureFixture
+) -> None:
+    client, _ = ctx
+    with caplog.at_level(logging.INFO):
+        resp = await client.post("/campaigns/nope/calls", json={"to_number": "+9118"})
+    assert resp.status_code == 404
+    assert resp.json()["detail"] == "campaign not found"
+    denied = [r for r in caplog.records
+              if getattr(r, "event", None) == "cross_tenant_access_denied"]
+    assert len(denied) == 1, denied
+    assert denied[0].reason == "campaign_not_found"
+    assert denied[0].found is False
+    assert denied[0].owner_tenant_id is None
+
+
+async def test_call_lead_same_tenant_success_emits_no_denial(
+    ctx, caplog: pytest.LogCaptureFixture
+) -> None:
+    client, _ = ctx
+    with caplog.at_level(logging.INFO):
+        resp = await client.post(
+            "/campaigns/c1/calls", json={"to_number": "+918618795697"})
+    assert resp.status_code == 202
+    denied = [r for r in caplog.records
+              if getattr(r, "event", None) == "cross_tenant_access_denied"]
+    assert denied == []
+
+
+async def test_get_call_cross_tenant_logs_denial(
+    ctx, caplog: pytest.LogCaptureFixture
+) -> None:
+    client, sm = ctx
+    async with sm() as s:
+        s.add(Tenant(id="t2b", slug="t2b", name="T2B"))
+        s.add(Conversation(
+            id="other-call-2", tenant_id="t2b", agent_type="voicebot", channel="voice",
+            status="in_progress", pipeline_config={}, provider_call_sid="x2"))
+        await s.commit()
+    with caplog.at_level(logging.INFO):
+        resp = await client.get("/calls/other-call-2")
+    assert resp.status_code == 404
+    assert resp.json()["detail"] == "call not found"
+    denied = [r for r in caplog.records
+              if getattr(r, "event", None) == "cross_tenant_access_denied"]
+    assert len(denied) == 1, denied
+    rec = denied[0]
+    assert rec.reason == "call_not_owned"
+    assert rec.levelno == logging.WARNING
+    assert rec.found is True
+    assert rec.owner_tenant_id == "t2b"
+    assert rec.resource == "conversation"
+    assert rec.resource_id == "other-call-2"
+
+
+async def test_get_call_unknown_logs_denial(
+    ctx, caplog: pytest.LogCaptureFixture
+) -> None:
+    client, _ = ctx
+    with caplog.at_level(logging.INFO):
+        resp = await client.get("/calls/missing-2")
+    assert resp.status_code == 404
+    assert resp.json()["detail"] == "call not found"
+    denied = [r for r in caplog.records
+              if getattr(r, "event", None) == "cross_tenant_access_denied"]
+    assert len(denied) == 1, denied
+    assert denied[0].reason == "call_not_found"
+    assert denied[0].found is False
+    assert denied[0].owner_tenant_id is None
+
+
+async def test_get_call_same_tenant_success_emits_no_denial(
+    ctx, caplog: pytest.LogCaptureFixture
+) -> None:
+    client, _ = ctx
+    call_id = (await client.post(
+        "/campaigns/c1/calls", json={"to_number": "+918618795697"})).json()["call_id"]
+    with caplog.at_level(logging.INFO):
+        resp = await client.get(f"/calls/{call_id}")
+    assert resp.status_code == 200
+    denied = [r for r in caplog.records
+              if getattr(r, "event", None) == "cross_tenant_access_denied"]
+    assert denied == []
