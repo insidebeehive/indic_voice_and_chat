@@ -48,6 +48,10 @@ class TenantResolver(Protocol):
 
     async def resolve_by_chatwoot_webhook_id(self, webhook_id: str) -> Optional[TenantContext]: ...
 
+    async def resolve_by_deposit_verification_reply_token(
+        self, token: str
+    ) -> Optional[TenantContext]: ...
+
 
 class InMemoryTenantResolver:
     """Test/bootstrap resolver: registers tenants by token, slug, and phone."""
@@ -60,6 +64,7 @@ class InMemoryTenantResolver:
         self._by_chatwoot_inbox: dict[str, TenantContext] = {}
         self._by_stringee_webhook_token: dict[str, TenantContext] = {}
         self._by_chatwoot_webhook_id: dict[str, TenantContext] = {}
+        self._by_deposit_verification_reply_token: dict[str, TenantContext] = {}
 
     def register(
         self,
@@ -85,6 +90,9 @@ class InMemoryTenantResolver:
         chatwoot_webhook_id = secrets.get("chatwoot:webhook_id")
         if chatwoot_webhook_id:
             self._by_chatwoot_webhook_id[str(chatwoot_webhook_id)] = ctx
+        deposit_verification_reply_token = secrets.get("deposit_verification:reply_token")
+        if deposit_verification_reply_token:
+            self._by_deposit_verification_reply_token[str(deposit_verification_reply_token)] = ctx
         return ctx
 
     def clear(self) -> None:
@@ -95,6 +103,7 @@ class InMemoryTenantResolver:
         self._by_chatwoot_inbox.clear()
         self._by_stringee_webhook_token.clear()
         self._by_chatwoot_webhook_id.clear()
+        self._by_deposit_verification_reply_token.clear()
 
     async def resolve_by_token(self, token_hash: str) -> Optional[TenantContext]:
         return self._by_token.get(token_hash)
@@ -116,6 +125,11 @@ class InMemoryTenantResolver:
 
     async def resolve_by_chatwoot_webhook_id(self, webhook_id: str) -> Optional[TenantContext]:
         return self._by_chatwoot_webhook_id.get(str(webhook_id))
+
+    async def resolve_by_deposit_verification_reply_token(
+        self, token: str
+    ) -> Optional[TenantContext]:
+        return self._by_deposit_verification_reply_token.get(str(token))
 
 
 _resolver: Optional[TenantResolver] = None

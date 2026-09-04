@@ -66,6 +66,38 @@ def verify_signature(secret: str, raw_body: bytes, header_value: Optional[str]) 
         return False
 
 
+def sign_body_hex(secret: str, raw: bytes) -> str:
+    """Bare-hex HMAC-SHA256, no ``sha256=`` prefix — for vendors whose contract
+    specifies ``hex(HMAC-SHA256(raw_body, salt))`` verbatim (unlike
+    ``sign_body``'s ``sha256=<hex>`` form used by our own outbound webhooks)."""
+    return hmac.new(secret.encode("utf-8"), raw, hashlib.sha256).hexdigest()
+
+
+def verify_signature_hex(secret: str, raw_body: bytes, header_value: Optional[str]) -> bool:
+    """Verify an INBOUND bare-hex signature header against ``raw_body``, using
+    the same unprefixed ``hex(HMAC-SHA256(...))`` format ``sign_body_hex``
+    produces.
+
+    Strict: a ``sha256=``-prefixed value (``verify_signature``'s format) is
+    rejected, not silently accepted — the two signature schemes are kept
+    distinct on purpose.
+
+    Never raises: a missing/malformed header or missing secret is treated as
+    a verification failure (``False``), not an error — callers (webhook
+    handlers) turn that into a 401 rather than a 500."""
+    if not secret or not header_value:
+        return False
+    try:
+        expected = sign_body_hex(secret, raw_body)
+        # .lower() on the INCOMING header only — sign_body_hex's own output
+        # (both `expected` here and whatever we send on outbound requests)
+        # is already lowercase via hexdigest(), so this doesn't change what
+        # we send; it just tolerates a vendor that sends uppercase hex.
+        return hmac.compare_digest(expected, header_value.lower())
+    except Exception:  # noqa: BLE001 — signature verification must never raise
+        return False
+
+
 def build_envelope(
     *,
     event_type: str,

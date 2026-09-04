@@ -96,6 +96,7 @@ class DbTenantResolver:
         self._by_chatwoot_inbox: dict[str, TenantContext] = {}
         self._by_stringee_webhook_token: dict[str, TenantContext] = {}
         self._by_chatwoot_webhook_id: dict[str, TenantContext] = {}
+        self._by_deposit_verification_reply_token: dict[str, TenantContext] = {}
         # Optional callback fired after a (re)load so cached per-tenant provider
         # clients can be evicted (e.g. providers.evict) — otherwise a key/config
         # update leaves stale clients behind.
@@ -113,6 +114,7 @@ class DbTenantResolver:
             )).scalars().all()
             by_token, by_slug, by_phone, by_id, by_cw_inbox = {}, {}, {}, {}, {}
             by_stringee_webhook_token, by_cw_webhook_id = {}, {}
+            by_dv_reply_token = {}
             for t in rows:
                 ctx = tenant_context_from_row(t)
                 by_slug[t.slug] = ctx
@@ -130,11 +132,15 @@ class DbTenantResolver:
                 chatwoot_webhook_id = ctx.secrets_resolved.get("chatwoot:webhook_id")
                 if chatwoot_webhook_id:
                     by_cw_webhook_id[str(chatwoot_webhook_id)] = ctx
+                dv_reply_token = ctx.secrets_resolved.get("deposit_verification:reply_token")
+                if dv_reply_token:
+                    by_dv_reply_token[str(dv_reply_token)] = ctx
             self._by_token, self._by_slug, self._by_phone = by_token, by_slug, by_phone
             self._by_id = by_id
             self._by_chatwoot_inbox = by_cw_inbox
             self._by_stringee_webhook_token = by_stringee_webhook_token
             self._by_chatwoot_webhook_id = by_cw_webhook_id
+            self._by_deposit_verification_reply_token = by_dv_reply_token
         log.info("tenant resolver loaded from DB", extra={"count": len(self._by_slug)})
         if self.on_reload is not None:
             self.on_reload()   # drop stale per-tenant provider clients
@@ -168,3 +174,8 @@ class DbTenantResolver:
 
     async def resolve_by_chatwoot_webhook_id(self, webhook_id: str) -> Optional[TenantContext]:
         return self._by_chatwoot_webhook_id.get(str(webhook_id))
+
+    async def resolve_by_deposit_verification_reply_token(
+        self, token: str
+    ) -> Optional[TenantContext]:
+        return self._by_deposit_verification_reply_token.get(str(token))

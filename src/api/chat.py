@@ -43,7 +43,7 @@ from fastapi import (
 )
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.agents.chatbot import ChatBotAgent, ChatTurnResult, MAX_HISTORY_TURNS
@@ -2235,11 +2235,38 @@ async def _check_and_timeout_verification(request_id: str) -> None:
             return  # row stays "pending" — a later reconnect sweep can retry
 
         async with _sm()() as db:
-            row = await db.get(DepositVerificationRequest, request_id)
-            if row is None or row.status != "pending":
-                return  # resolved by something else in the meantime — no-op
-            row.status = "timed_out"
+            # Atomic claim, not read-then-write: with the sliding timeout
+            # window (json_ticket_relay's per-relay re-arm), MULTIPLE timers
+            # can legitimately become due for the same request_id at once —
+            # a plain `db.get` + status check + `db.commit()` here would let
+            # two concurrent callers both observe status=="pending" before
+            # either commits, and both then escalate (double BO webhook call,
+            # double customer-facing push). The `WHERE status = 'pending'`
+            # guard makes the transition itself the compare-and-swap: only
+            # one concurrent UPDATE can match+affect the row, so only one
+            # caller ever sees `rowcount == 1` and proceeds to escalate.
+            #
+            # The `timeout_at <= now` clause closes a second race: `now` was
+            # computed above, BEFORE the `db.get(ChatSession)` and
+            # `tenant_from_id` awaits — if a relay on /reply/{token} slides
+            # `timeout_at` forward into the future during that window, this
+            # timer must not still win the claim just because the row was
+            # `pending` and due AT THE TIME this check started. Re-checking
+            # the deadline as part of the same atomic UPDATE ensures the
+            # claim only succeeds if the row is BOTH still pending AND still
+            # actually overdue (relative to `now`) at the moment it commits.
+            result = await db.execute(
+                update(DepositVerificationRequest)
+                .where(
+                    DepositVerificationRequest.id == request_id,
+                    DepositVerificationRequest.status == "pending",
+                    DepositVerificationRequest.timeout_at <= now,
+                )
+                .values(status="timed_out")
+            )
             await db.commit()
+            if result.rowcount == 0:
+                return  # resolved (or claimed by a concurrent timer) in the meantime — no-op
 
         outcome = await _escalate_session(
             tenant, deposit_session_id, chat_session_row,

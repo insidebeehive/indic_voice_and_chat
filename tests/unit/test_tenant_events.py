@@ -74,6 +74,83 @@ def test_verify_signature_rejects_non_ascii_header_without_raising():
     assert te.verify_signature("s3cr3t", raw, "sha256=café") is False
 
 
+# --- sign_body_hex / verify_signature_hex -------------------------------
+# Bare-hex HMAC-SHA256, no "sha256=" prefix — a separate, distinct signature
+# scheme from sign_body/verify_signature's "sha256=<hex>" format, for vendors
+# whose contract specifies hex(HMAC-SHA256(raw_body, salt)) verbatim.
+
+
+def test_sign_body_hex_is_64_lowercase_hex_chars_no_prefix():
+    raw = b'{"ticket_id":"abc123"}'
+    sig = te.sign_body_hex("s3cr3t", raw)
+    assert len(sig) == 64
+    assert sig == sig.lower()
+    assert all(c in "0123456789abcdef" for c in sig)
+    assert not sig.startswith("sha256=")
+
+
+def test_sign_body_hex_matches_raw_hmac():
+    raw = b'{"ticket_id":"abc123"}'
+    expect = hmac.new(b"s3cr3t", raw, hashlib.sha256).hexdigest()
+    assert te.sign_body_hex("s3cr3t", raw) == expect
+
+
+def test_verify_signature_hex_round_trips_sign_body_hex():
+    raw = b'{"ticket_id":"abc123"}'
+    header = te.sign_body_hex("s3cr3t", raw)
+    assert te.verify_signature_hex("s3cr3t", raw, header) is True
+
+
+def test_verify_signature_hex_rejects_tampered_body():
+    raw = b'{"ticket_id":"abc123"}'
+    header = te.sign_body_hex("s3cr3t", raw)
+    assert te.verify_signature_hex("s3cr3t", raw + b"x", header) is False
+
+
+def test_verify_signature_hex_rejects_wrong_secret():
+    raw = b'{"ticket_id":"abc123"}'
+    header = te.sign_body_hex("s3cr3t", raw)
+    assert te.verify_signature_hex("wrong-secret", raw, header) is False
+
+
+def test_verify_signature_hex_rejects_sha256_prefixed_value():
+    """Strict: the OTHER scheme's "sha256=<hex>" form must not be accepted,
+    even though it embeds the correct hex digest."""
+    raw = b'{"ticket_id":"abc123"}'
+    prefixed = te.sign_body("s3cr3t", raw)
+    assert prefixed.startswith("sha256=")
+    assert te.verify_signature_hex("s3cr3t", raw, prefixed) is False
+
+
+@pytest.mark.parametrize("secret,header_value", [
+    ("", "deadbeef"),
+    (None, "deadbeef"),
+])
+def test_verify_signature_hex_rejects_missing_or_empty_secret_without_raising(secret, header_value):
+    raw = b'{"ticket_id":"abc123"}'
+    assert te.verify_signature_hex(secret, raw, header_value) is False
+
+
+@pytest.mark.parametrize("header_value", [None, ""])
+def test_verify_signature_hex_rejects_missing_or_empty_header(header_value):
+    raw = b'{"ticket_id":"abc123"}'
+    assert te.verify_signature_hex("s3cr3t", raw, header_value) is False
+
+
+def test_verify_signature_hex_rejects_non_ascii_header_without_raising():
+    raw = b'{"ticket_id":"abc123"}'
+    assert te.verify_signature_hex("s3cr3t", raw, "café") is False
+
+
+def test_verify_signature_hex_accepts_uppercased_header_value():
+    """N12: sign_body_hex's own output is always lowercase (hexdigest()), but
+    a vendor sending the same valid signature uppercased must still verify —
+    tolerance applies only to the INCOMING header, not to what we send."""
+    raw = b'{"ticket_id":"abc123"}'
+    header = te.sign_body_hex("s3cr3t", raw)
+    assert te.verify_signature_hex("s3cr3t", raw, header.upper()) is True
+
+
 def test_build_envelope_shape():
     e = te.build_envelope(event_type="call.completed", call_id="c1",
                           tenant_id="t1", channel="voicebot", data={"outcome": "x"})
