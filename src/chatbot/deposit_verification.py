@@ -43,6 +43,7 @@ from sqlalchemy import select
 
 from src.auth.context import TenantContext
 from src.campaign.dnd_filter import normalize_phone
+from src.chatbot.tool_executor import REDACTED_PLACEHOLDER
 from src.config_tenant import DepositVerificationConfig, platform_webhook_base_url
 from src.integration.tenant_events import sign_body, sign_body_hex
 from src.interfaces.media_storage import IMediaStorage
@@ -83,17 +84,22 @@ async def submit_deposit_verification(
         return {"status": "error", "message": "Verification is not available for this account."}
 
     order_id = (order_id or "").strip()
-    if not order_id:
+    if not order_id or order_id == REDACTED_PLACEHOLDER:
         # The callback handler cross-checks the vendor's order_id against the
         # value stored on this row with strict equality, so an empty/missing
         # order_id here would guarantee a 400 on the verdict callback and
         # leave the request to time out. Fail fast and tell the LLM instead.
+        # REDACTED_PLACEHOLDER is what tool_executor._redact_internal_ids
+        # substitutes for a scrubbed internal-id-shaped value; treat it the
+        # same as a missing order_id rather than forwarding that literal
+        # string to the vendor as a real order id.
         return {
             "status": "missing_order_id",
             "message": (
-                "No order id was provided. Look up the customer's failed deposit with the "
-                "deposit-status tool first and call this again with the order id from "
-                "that response."
+                "No order id was provided. Call get_player_latest_deposit_order first "
+                "and pass its PgsOrderId value back here as order_id. If no deposit "
+                "order can be found for this customer, do not invent or substitute an "
+                "order id — escalate to a human agent instead."
             ),
         }
 

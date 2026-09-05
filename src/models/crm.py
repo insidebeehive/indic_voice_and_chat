@@ -47,6 +47,26 @@ class Crm(Base):
     # key/secret live encrypted in ``CrmSecret`` (name ``livekit_api_key`` /
     # ``livekit_api_secret``), never here.
     livekit_url: Mapped[Optional[str]] = mapped_column(String(500))
+    # Selects the ChatBot system-prompt pack (src/dialogue/packs/*.py) this
+    # CRM's tenants use — e.g. "betting" or "generic". NULL/unrecognized
+    # values fall back to "generic" at prompt-build time; nothing here ever
+    # raises on a missing/unknown pack name.
+    prompt_pack: Mapped[Optional[str]] = mapped_column(String(50))
+    # Selects the bundled KB pack (data/kb/packs/<name>/) auto-seeded into
+    # this CRM's shared KB at boot by ``_seed_crm_kb`` (src/main.py) — e.g.
+    # "betting-default". NULL means this CRM gets NO bundled docs seeded
+    # (opt-in, not automatic-for-every-CRM); an unrecognized value simply
+    # never matches any ``kb_dir``'s pack name, so it also seeds nothing —
+    # nothing here ever raises on a missing/unknown pack name.
+    bundled_kb_pack: Mapped[Optional[str]] = mapped_column(String(50))
+    # Per-CRM TTS pronunciation overrides (English/brand term -> Devanagari
+    # phonetic spelling), merged over the generic
+    # ``src.pipeline.text_normalize.DEFAULT_PRONUNCIATIONS`` at TTS-synthesis
+    # time (denormalized onto ``TenantSettings.pronunciation_overrides`` at
+    # tenant-resolution time, src/auth/db_resolver.py — same pattern as
+    # ``prompt_pack``). NULL/empty means this CRM gets no extra terms beyond
+    # the generic default — nothing here ever raises on a missing value.
+    pronunciation_overrides: Mapped[Optional[dict]] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=False), server_default=func.now())
 

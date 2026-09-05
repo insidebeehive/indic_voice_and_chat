@@ -40,6 +40,12 @@ PLAYERS: dict[str, dict] = {
             {"id": "txn_003", "type": "sports",     "amount": 600.00,  "status": "settled",    "timestamp": "2026-06-20T14:00:00Z", "description": "IPL bet win"},
             {"id": "txn_004", "type": "withdrawal", "amount": 1000.00, "status": "processing", "timestamp": "2026-06-20T16:00:00Z", "method": "Bank Transfer"},
         ],
+        "latest_deposit_order": {
+            "PgsOrderId": "PGS20260621143000123",
+            "datetime": "2026-06-21T14:30:00Z",
+            "amount": 1500.00,
+            "status": "failed",
+        },
         "bets": [
             {"id": "bet_001", "sport": "Cricket", "match": "MI vs CSK", "selection": "MI Win",
              "stake": 500.00, "odds": 1.85, "status": "open", "cashout_value": 480.00,
@@ -216,6 +222,15 @@ async def get_player_transactions(
     if type and type != "all":
         txns = [t for t in txns if t["type"] == type]
     return {"transactions": txns[:limit], "total": len(txns)}
+
+
+@app.get("/players/{user_id}/latest-deposit-order")
+async def get_player_latest_deposit_order(
+    user_id: str = Path(...),
+    authorization: Optional[str] = Header(None),
+):
+    _check_auth(authorization)
+    return _get_player(user_id).get("latest_deposit_order")
 
 
 @app.get("/players/{user_id}/bets")

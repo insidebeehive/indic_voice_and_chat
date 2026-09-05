@@ -183,17 +183,20 @@ async def _reap_stale_calls_loop() -> None:
 async def _seed_crm_kb(
     crm_retrievers: "PerCrmRetrieverRegistry",
     sessionmaker,
-    kb_dir: Path = Path("data/kb/global"),
+    kb_dir: Path = Path("data/kb/packs/betting-default"),
     auto_prune: Optional[bool] = None,
+    bundled_kb_pack: str = "betting-default",
 ) -> None:
-    """Re-ingest bundled global KB docs into every existing CRM's KB at startup.
+    """Re-ingest a bundled KB pack into every CRM that's opted into it.
 
-    Docs bundled at data/kb/global/ are seeded into EVERY CRM row that exists
-    at boot time (there is exactly one — 'betstudio' — as of this writing;
-    if more CRMs are added later, each gets its own copy of these bundled
-    docs, since there's no per-CRM bundled-docs directory concept today).
-    Uses deterministic doc_ids (filename-based) so CrmKBDocument DB rows are
-    replaced, not duplicated, across restarts.
+    Docs bundled at ``kb_dir`` (default data/kb/packs/betting-default/) are
+    seeded ONLY into CRM rows whose ``bundled_kb_pack`` column equals
+    ``bundled_kb_pack`` (default "betting-default", matching ``kb_dir``'s
+    default) — a CRM with ``bundled_kb_pack`` unset (NULL) or set to a
+    different pack name gets none of this pack's docs. This is an explicit
+    per-CRM opt-in, not automatic-for-every-CRM. Uses deterministic doc_ids
+    (filename-based) so CrmKBDocument DB rows are replaced, not duplicated,
+    across restarts.
 
     Also self-heals: after seeding, any file that used to exist under
     ``kb_dir`` but has since been renamed/deleted/moved to a different tier
@@ -208,7 +211,10 @@ async def _seed_crm_kb(
     ``kb_dir``.
 
     ``kb_dir`` defaults to the real bundled-docs directory but is overridable
-    so this function is unit-testable against a tmp directory.
+    so this function is unit-testable against a tmp directory. ``bundled_kb_pack``
+    likewise defaults to the pack name matching that default directory but is
+    overridable for testability (e.g. pairing a tmp ``kb_dir`` with a
+    made-up pack name so the real DB/pack names are never touched by tests).
     """
     from sqlalchemy import delete as sa_delete, select
 
@@ -222,7 +228,13 @@ async def _seed_crm_kb(
     if not kb_dir.is_dir():
         return
     async with sessionmaker() as session:
-        crm_ids = [r[0] for r in (await session.execute(select(Crm.id))).all()]
+        crm_ids = [
+            r[0] for r in (
+                await session.execute(
+                    select(Crm.id).where(Crm.bundled_kb_pack == bundled_kb_pack)
+                )
+            ).all()
+        ]
     if not crm_ids:
         return
     exts = {".md", ".txt", ".pdf", ".docx", ".csv"}

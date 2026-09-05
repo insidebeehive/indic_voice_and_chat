@@ -242,9 +242,19 @@ class VoiceBotAgent(BaseAgent):
         self._engine = engine
         if script.pronunciations:
             from dataclasses import replace as _replace_cfg
+            # Merge over whatever's already on the engine's TTS config (e.g. a
+            # CRM's pronunciation_overrides, threaded in at engine-construction
+            # time — src/bootstrap.py) rather than replacing it outright, so a
+            # campaign-level pronunciation fix doesn't silently wipe the CRM's
+            # own overrides. Campaign wins on key collision — the more specific
+            # scope, matching apply_pronunciations' "extra wins" precedence.
+            merged_pronunciations = {
+                **(engine._config.tts.extra_pronunciations or {}),
+                **script.pronunciations,
+            }
             engine._config = _replace_cfg(
                 engine._config,
-                tts=_replace_cfg(engine._config.tts, extra_pronunciations=script.pronunciations),
+                tts=_replace_cfg(engine._config.tts, extra_pronunciations=merged_pronunciations),
             )
         self._extra_directives = extra_directives
         self._kb_context = kb_context
@@ -326,13 +336,24 @@ class VoiceBotAgent(BaseAgent):
         from src.interfaces.tts import TTSConfig as _TTSConfig
         base_tts = getattr(getattr(self._engine, "_config", None), "tts", None)
         opening_lang = to_bcp47(self._active_language)
+        # Merge the script's own pronunciations over whatever's already on
+        # base_tts (e.g. a CRM's pronunciation_overrides) rather than replacing
+        # it outright -- otherwise a campaign with no script.pronunciations
+        # (script.pronunciations or None -> None) would silently wipe the CRM's
+        # overrides for the opening line specifically. Script wins on key
+        # collision (mirrors __init__'s merge above and apply_pronunciations'
+        # "extra wins" precedence).
+        merged_pronunciations = {
+            **(getattr(base_tts, "extra_pronunciations", None) or {}),
+            **(self._script.pronunciations or {}),
+        } or None
         opening_tts = (
             _replace(
                 base_tts, language=opening_lang,
-                extra_pronunciations=self._script.pronunciations or None,
+                extra_pronunciations=merged_pronunciations,
             )
             if base_tts is not None else
-            _TTSConfig(language=opening_lang, extra_pronunciations=self._script.pronunciations or None)
+            _TTSConfig(language=opening_lang, extra_pronunciations=merged_pronunciations)
         )
         try:
             tts_result = await self._engine._tts.synthesize(  # type: ignore[attr-defined]

@@ -482,6 +482,26 @@ def test_tenant_timezone_threaded_into_prompt(retriever) -> None:
     assert "Asia/Kolkata" in messages[0].content
 
 
+def test_prompt_pack_threaded_into_prompt(retriever) -> None:
+    # Default (no prompt_pack passed) must be the neutral generic pack.
+    default_agent = _make_agent(
+        FakeLLM({"response_text": "ok", "language": "en", "confidence": "high", "action": "none"}),
+        retriever,
+    )
+    default_prompt = default_agent._compose(
+        "", LLMMessage(role="user", content="hi"), query_text="hi")[0].content
+    assert "kyc" not in default_prompt.lower()
+
+    betting_agent = _make_agent(
+        FakeLLM({"response_text": "ok", "language": "en", "confidence": "high", "action": "none"}),
+        retriever,
+        prompt_pack="betting",
+    )
+    betting_prompt = betting_agent._compose(
+        "", LLMMessage(role="user", content="hi"), query_text="hi")[0].content
+    assert "KYC" in betting_prompt
+
+
 def test_has_player_tools_false_when_only_operator_tools_registered(retriever) -> None:
     # A Matka-only tenant registers ONLY an operator tool (get_matka_config is
     # in OPERATOR_TOOLS, not PLAYER_TOOLS). has_player_tools must be computed

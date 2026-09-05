@@ -811,6 +811,7 @@ def make_browser_bridge_factory(
                 language=tts_language,
                 voice_id=tts_voice,
                 sample_rate=16000,
+                extra_pronunciations=getattr(tenant.settings, "pronunciation_overrides", None),
             ),
         )
         engine = PipelineEngine(stt, llm, tts, pipeline_cfg)

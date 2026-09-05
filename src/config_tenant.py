@@ -395,6 +395,17 @@ class TenantSettings(BaseModel):
     # the per-tenant crm sub-config above. Drives resolve_crm_tools()'s tier-2
     # DB-backed tool catalog fallback (src/bootstrap.py).
     crm_id: Optional[str] = None
+    # ChatBot system-prompt pack (src/dialogue/packs) denormalized from the
+    # linked Crm row's prompt_pack at tenant-resolution time (src/auth/db_resolver.py) —
+    # "generic" when unset/NULL or when the tenant has no linked CRM at all.
+    prompt_pack: str = "generic"
+    # TTS pronunciation overrides denormalized from the linked Crm row's
+    # pronunciation_overrides at tenant-resolution time (src/auth/db_resolver.py) —
+    # merged over src.pipeline.text_normalize.DEFAULT_PRONUNCIATIONS at
+    # synthesis time (src/bootstrap.py). None when unset/NULL or when the
+    # tenant has no linked CRM at all -- that CRM simply gets the generic
+    # default with no extra terms.
+    pronunciation_overrides: Optional[dict[str, str]] = None
     whatsapp: TenantWhatsAppConfig = Field(default_factory=TenantWhatsAppConfig)
     chat_support: ChatSupportConfig = Field(default_factory=ChatSupportConfig)
     deposit_verification: DepositVerificationConfig = Field(default_factory=DepositVerificationConfig)

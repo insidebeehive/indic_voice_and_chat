@@ -36,10 +36,21 @@ from src.models.tenant import Tenant
 log = logging.getLogger(__name__)
 
 
-def tenant_context_from_row(tenant: Tenant) -> TenantContext:
+def tenant_context_from_row(
+    tenant: Tenant,
+    crm_prompt_pack: Optional[str] = None,
+    crm_pronunciation_overrides: Optional[dict] = None,
+) -> TenantContext:
     """Build a TenantContext from a fully-loaded Tenant ORM row.
 
     The row's relationships (`phone_numbers`, `secrets`) must be eager-loaded.
+    ``crm_prompt_pack`` is the linked Crm row's ``prompt_pack`` value (looked up
+    by the caller, since ``Tenant`` has no ORM relationship to `Crm`) — falls
+    back to "generic" when unset/NULL or when the tenant has no linked CRM.
+    ``crm_pronunciation_overrides`` is the linked Crm row's
+    ``pronunciation_overrides`` value, same lookup — None when unset/NULL or
+    when the tenant has no linked CRM (that CRM's TTS then uses only the
+    generic DEFAULT_PRONUNCIATIONS default, no extra terms).
     """
     pc = tenant.pipeline_config or {}
     pipeline = TenantPipelineConfig(**pc)
@@ -70,6 +81,8 @@ def tenant_context_from_row(tenant: Tenant) -> TenantContext:
         compliance=compliance,
         crm=crm,
         crm_id=tenant.crm_id,
+        prompt_pack=crm_prompt_pack or "generic",
+        pronunciation_overrides=crm_pronunciation_overrides or None,
         chat_support=chat_support,
         deposit_verification=deposit_verification,
         phone_numbers=[p.phone_number for p in tenant.phone_numbers],
@@ -104,6 +117,8 @@ class DbTenantResolver:
 
     async def reload(self) -> int:
         """(Re)load every tenant from the DB. Returns the count loaded."""
+        from src.models.crm import Crm
+
         async with self._sm() as session:
             rows = (await session.execute(
                 select(Tenant).options(
@@ -112,11 +127,25 @@ class DbTenantResolver:
                     selectinload(Tenant.secrets),
                 )
             )).scalars().all()
+            # crm_id -> prompt_pack, denormalized onto each linked tenant's
+            # settings below (mirrors the crm_id denormalization itself) —
+            # one query for all CRMs rather than one per tenant.
+            crm_prompt_pack_by_id = dict(
+                (await session.execute(select(Crm.id, Crm.prompt_pack))).all()
+            )
+            # Same denormalization for pronunciation_overrides (TTS).
+            crm_pronunciation_overrides_by_id = dict(
+                (await session.execute(select(Crm.id, Crm.pronunciation_overrides))).all()
+            )
             by_token, by_slug, by_phone, by_id, by_cw_inbox = {}, {}, {}, {}, {}
             by_stringee_webhook_token, by_cw_webhook_id = {}, {}
             by_dv_reply_token = {}
             for t in rows:
-                ctx = tenant_context_from_row(t)
+                ctx = tenant_context_from_row(
+                    t,
+                    crm_prompt_pack=crm_prompt_pack_by_id.get(t.crm_id),
+                    crm_pronunciation_overrides=crm_pronunciation_overrides_by_id.get(t.crm_id),
+                )
                 by_slug[t.slug] = ctx
                 by_id[t.id] = ctx
                 for k in t.api_keys:

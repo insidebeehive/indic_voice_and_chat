@@ -41,7 +41,10 @@ async def sessionmaker_fixture(tmp_faiss_index: str):
     sm = async_sessionmaker(engine, expire_on_commit=False)
 
     async with sm() as s:
-        s.add(Crm(id=CRM_ID, name="BetStudio", base_url="https://x"))
+        s.add(Crm(
+            id=CRM_ID, name="BetStudio", base_url="https://x",
+            bundled_kb_pack="betting-default",
+        ))
         # Pre-migration orphan: a doc the seeder wrote under the legacy
         # `global_kb_*` id namespace whose source file no longer exists.
         s.add(CrmKBDocument(

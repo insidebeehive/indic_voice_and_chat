@@ -372,3 +372,64 @@ def test_case_variant_keys_are_also_redacted() -> None:
         "operatorID": "[redacted]", "USER_ID": "[redacted]", "TenantId": "[redacted]",
         "bet_id": "keep-me", "event_id": "keep-me-too",
     }
+
+
+def test_pgs_order_id_is_exempt_from_redaction() -> None:
+    """PgsOrderId is the payment gateway's own order reference, forwarded
+    verbatim to the deposit-verification vendor -- it must reach the LLM
+    unmodified, unlike the internal platform ids this scrub targets."""
+    out = tool_executor._redact_internal_ids({
+        "PgsOrderId": "PGS20260621143000123",
+        "datetime": "2026-06-21T14:30:00Z",
+        "status": "failed",
+    })
+    assert out == {
+        "PgsOrderId": "PGS20260621143000123",
+        "datetime": "2026-06-21T14:30:00Z",
+        "status": "failed",
+    }
+
+
+def test_pgs_order_id_exemption_survives_uuid_shaped_value_but_is_narrow() -> None:
+    """A UUID-shaped value under the exact PgsOrderId key must NOT be
+    redacted (proving the exemption works even for the case the general
+    UUID scrub would otherwise catch), while a UUID-shaped value under any
+    other, non-exempt key in the SAME payload must still be redacted -- this
+    pins the exemption's narrowness so it can't silently regress into a
+    general allowlist."""
+    out = tool_executor._redact_internal_ids({
+        "PgsOrderId": "550e8400-e29b-41d4-a716-446655440000",
+        "note": "ref 550e8400-e29b-41d4-a716-446655440000",
+    })
+    assert out == {
+        "PgsOrderId": "550e8400-e29b-41d4-a716-446655440000",
+        "note": f"ref {tool_executor.REDACTED_PLACEHOLDER}",
+    }
+
+
+def test_pgs_order_id_exemption_is_exact_match_not_substring() -> None:
+    """A key that CONTAINS the normalized substring "pgsorderid" but does not
+    normalize to exactly "pgsorderid" must NOT be exempt -- this is the actual
+    proof the exemption is exact-match. A hypothetical buggy substring-based
+    exemption (e.g. `if "pgsorderid" in normalized_k`) would wrongly pass this
+    key through unredacted; the "note" key used in the test above never
+    contains that substring, so it can't catch that bug on its own."""
+    out = tool_executor._redact_internal_ids({
+        "realPgsOrderId_internalPlayerRef": "550e8400-e29b-41d4-a716-446655440000",
+    })
+    assert out == {
+        "realPgsOrderId_internalPlayerRef": tool_executor.REDACTED_PLACEHOLDER,
+    }
+
+
+def test_pgs_order_id_non_string_value_is_not_blindly_passed_through() -> None:
+    """The exact PgsOrderId exemption only short-circuits for a string value
+    (`isinstance(v, str)`) -- a non-string value under that exact key (a
+    nested dict/list, as some CRM responses might send) must still recurse
+    through the normal redaction path rather than being exempted wholesale."""
+    out = tool_executor._redact_internal_ids({
+        "PgsOrderId": {"user_id": "should-still-be-redacted", "keep": "me"},
+    })
+    assert out == {
+        "PgsOrderId": {"user_id": tool_executor.REDACTED_PLACEHOLDER, "keep": "me"},
+    }
