@@ -2,12 +2,12 @@
 """Bulk-ingest a directory of knowledge-base docs into a tenant's KB via the API.
 
 Posts every supported file under ``--dir`` to ``POST /api/v1/knowledge/ingest``
-with the tenant's bearer token. Use it to load the global KB (the chatbot then
-answers general queries from it via RAG).
+with the tenant's bearer token. Use it to bulk-load a KB pack (the chatbot
+then answers general queries from it via RAG).
 
 Example (bulk):
   python scripts/ingest_kb.py \
-    --dir /path/to/kb/global \
+    --dir /path/to/kb/packs/betting-default \
     --base-url https://voicebot.biznexis.in \
     --token vox_xxxxx
 

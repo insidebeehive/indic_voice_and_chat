@@ -52,6 +52,13 @@ class Crm(Base):
     # values fall back to "generic" at prompt-build time; nothing here ever
     # raises on a missing/unknown pack name.
     prompt_pack: Mapped[Optional[str]] = mapped_column(String(50))
+    # Selects the bundled KB pack (data/kb/packs/<name>/) auto-seeded into
+    # this CRM's shared KB at boot by ``_seed_crm_kb`` (src/main.py) — e.g.
+    # "betting-default". NULL means this CRM gets NO bundled docs seeded
+    # (opt-in, not automatic-for-every-CRM); an unrecognized value simply
+    # never matches any ``kb_dir``'s pack name, so it also seeds nothing —
+    # nothing here ever raises on a missing/unknown pack name.
+    bundled_kb_pack: Mapped[Optional[str]] = mapped_column(String(50))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=False), server_default=func.now())
 

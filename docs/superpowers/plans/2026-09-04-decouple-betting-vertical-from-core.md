@@ -85,12 +85,26 @@
 - `_seed_crm_kb`'s existing `kb_dir` parameter (default `Path("data/kb/global")`, soon `Path("data/kb/packs/betting-default")`) stays for testability, but the function's CRM-selection logic changes from "every `Crm` row" (`select(Crm.id)`) to "every `Crm` row where `bundled_kb_pack == '<pack matching this kb_dir>'`" — i.e., only CRMs that opted into that specific pack get seeded from it.
 - The existing legacy-id reconciliation/pruning logic (`crm_kb_{crm_id}_*` vs stale `global_kb_*`) can stay as-is; this task does not need to also do the id-scheme cleanup mentioned in `scripts/purge_stale_kb_docs.py` unless it's trivial to include — if it adds real risk/scope, leave it as a separate followup and say so in the completion report.
 
-- [ ] **Step 1:** Re-read `src/main.py::_seed_crm_kb` in full (function signature, doc comment, and its caller near the bottom of the file) to confirm current behavior matches this plan's description before changing anything.
-- [ ] **Step 2:** Add `bundled_kb_pack` to `Crm`, generate + hand-edit the Alembic migration with the explicit backfill (check actual row count/CRM ids in the target DB before writing the backfill SQL — don't guess).
-- [ ] **Step 3:** Change `_seed_crm_kb`'s CRM-selection query to filter by `bundled_kb_pack` matching the pack being seeded, instead of selecting all CRMs.
-- [ ] **Step 4:** `git mv data/kb/global data/kb/packs/betting-default` and fix every reference found in Step-0 grep (`src/main.py`, `src/rag/context_builder.py`, `scripts/ingest_kb.py`, any others found).
-- [ ] **Step 5:** Add/update a unit test for `_seed_crm_kb` (it already has a `kb_dir`/`auto_prune` override for testability per its docstring — use the same pattern) asserting: a CRM with `bundled_kb_pack` set gets seeded, a CRM with it unset does not.
-- [ ] **Step 6:** Run `.venv/bin/python -m pytest tests/ -q`, confirm no new failures.
+- [x] **Step 1:** Re-read `src/main.py::_seed_crm_kb` in full (function signature, doc comment, and its caller near the bottom of the file) to confirm current behavior matches this plan's description before changing anything.
+- [x] **Step 2:** Add `bundled_kb_pack` to `Crm`, generate + hand-edit the Alembic migration with the explicit backfill (check actual row count/CRM ids in the target DB before writing the backfill SQL — don't guess).
+- [x] **Step 3:** Change `_seed_crm_kb`'s CRM-selection query to filter by `bundled_kb_pack` matching the pack being seeded, instead of selecting all CRMs.
+- [x] **Step 4:** `git mv data/kb/global data/kb/packs/betting-default` and fix every reference found in Step-0 grep (`src/main.py`, `src/rag/context_builder.py`, `scripts/ingest_kb.py`, any others found).
+- [x] **Step 5:** Add/update a unit test for `_seed_crm_kb` (it already has a `kb_dir`/`auto_prune` override for testability per its docstring — use the same pattern) asserting: a CRM with `bundled_kb_pack` set gets seeded, a CRM with it unset does not.
+- [x] **Step 6:** Run `.venv/bin/python -m pytest tests/ -q`, confirm no new failures.
+
+**Status: DONE (2026-09-05).** Implemented by a Sonnet subagent, verified by one Opus review round with no fix round needed — every claim (rename completeness, NULL-exclusion SQL semantics, migration chaining, test realism) was independently reproduced, not taken on report. Full suite: 1934 passed, 3 failed (documented pre-existing baseline), 5 deselected. Uncommitted in the working tree pending the project owner's decision to commit.
+
+**Discrepancy vs. plan, confirmed correct:** `src/rag/context_builder.py`'s priority list is actually named `_VOICE_KB_PRIORITY` (not `PRIORITY_ORDER`), holds bare filenames with no `data/kb/global` string in it, and only reranks already-retrieved KB documents — it doesn't drive ingestion and already degrades gracefully for an unlisted filename. No edit was needed there.
+
+**Deferred, not a defect:** the `crm_kb_{crm_id}_*` vs. legacy `global_kb_*` id-scheme cleanup (`scripts/purge_stale_kb_docs.py`) was left untouched, per the plan's own allowance — logged here as a followup, not attempted.
+
+**⚠️ Deploy blocker, same class as Task 1's, not yet resolved:** `alembic/versions/0017_crm_bundled_kb_pack.py` exists (adds `Crm.bundled_kb_pack`, backfills `'betting-default'`) but has **not been applied** (DB is at `0016_crm_prompt_pack`). Unlike Task 1's blocker, this one does **not** crash boot — `_seed_crm_kb` runs as a never-awaited `asyncio.create_task`, so on an unmigrated DB it fails silently as an unretrieved task exception: KB seeding just silently stops happening, with no obvious signal. `src/api/crms.py`'s `list_crms` (full-entity `select(Crm)`) would also fail once this deploys. **Apply `0017` together with `0016` (if not already) before/with deploying this change.**
+
+**Known Low-priority residuals, left for the owner's call (none block Task 2):**
+- The reconcile/prune loop now iterates only the opt-in-filtered `crm_ids` — if a CRM's `bundled_kb_pack` is later cleared, its previously-seeded rows are orphaned rather than pruned. Arguably the safer default, but undocumented in the function's docstring.
+- `bundled_kb_pack=None` passed explicitly to `_seed_crm_kb` would invert the gate (seeds exactly the CRMs that never opted in, since SQLAlchemy compiles `== None` to `IS NULL`) — guarded only by the `str` type annotation, no runtime check. Only matters if something ever calls this function with an explicit `None`; the boot-time call always passes a real pack name.
+- No test asserts the real production default `kb_dir` (`Path("data/kb/packs/betting-default")`) actually resolves to an existing directory — every test uses a `tmp_path` override, so a typo in the renamed default path would be a silent no-op (`if not kb_dir.is_dir(): return`) that a green suite wouldn't catch.
+- Task 4's Step 3 grep (`data/kb/global`, literal) will miss 11 relative-path references (`../global/`, `global/`) found in `data/kb/modules/README.md` and `data/kb/layouts/README.md` — both already on Task 4's file list, but Task 4 Step 3 itself should widen its grep pattern to catch them.
 
 ---
 
@@ -134,5 +148,5 @@
 
 - [ ] **Step 1:** Read every file in the list above in full.
 - [ ] **Step 2:** Rewrite each one to describe the system **as it now stands** — prompt packs (generic default, betting as one named pack), CRM-level opt-in KB bundling (with tenant-level casino/sports/matka module docs unchanged), CRM-level pronunciation overrides. Write these as plain, current-state facts. **Do not** add "this used to be global," "previously this was hardcoded," "note: stale," or any diff/history framing anywhere in the rewritten docs — a reader six months from now should not be able to tell this was ever any other way from the doc text itself. (Git history is where the "how it changed" story belongs, not the docs.)
-- [ ] **Step 3:** Grep the whole repo for `data/kb/global` and confirm zero remaining references outside git history/this plan file itself.
+- [ ] **Step 3:** Grep the whole repo for `data/kb/global` **and also** the looser relative forms `global/` and `../global/` (the literal-only grep misses real hits — confirmed during Task 2's review to exist in `data/kb/modules/README.md` and `data/kb/layouts/README.md`) and confirm zero remaining references outside git history/this plan file itself.
 - [ ] **Step 4:** Confirm no doc still asserts the RAG/ChatBot subsystem is "untouched scaffold" or similar outdated framing unrelated to this plan but caught in the same sweep — fix opportunistically if trivial, otherwise leave a separate note for the owner rather than scope-creeping this task.
