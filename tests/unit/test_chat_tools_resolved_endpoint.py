@@ -10,6 +10,8 @@ served on its next chat turn.
 
 from __future__ import annotations
 
+import re
+
 import pytest_asyncio
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
@@ -21,7 +23,7 @@ from src.auth import TenantContext, register_tenant_for_test
 from src.auth import secrets as crypto
 from src.auth.middleware import set_tenant_resolver
 from src.bootstrap import resolve_crm_tools
-from src.chatbot.catalog import ALL_TOOLS
+from src.chatbot.catalog import ALL_TOOLS, PLAYER_TOOLS
 from src.config_tenant import TenantSettings
 from src.models.chat import ChatTool
 from src.models.database import Base
@@ -222,3 +224,40 @@ async def test_resolve_crm_tools_matches_cached_path_shape(monkeypatch) -> None:
         assert execs["check_order_status"]["endpoint"] == "https://crm/api/orders/{order_id}"
     finally:
         await engine.dispose()
+
+
+# --- Catalog shape sanity ----------------------------------------------------
+
+
+def test_all_tools_catalog_entries_are_well_formed() -> None:
+    """Every ALL_TOOLS entry must have the shape resolve_crm_tools()/the
+    catalog-onboarding endpoint expect: description/parameters/default_path/
+    method, well-formed param dicts, and default_path placeholders that all
+    correspond to declared params."""
+    for name, entry in ALL_TOOLS.items():
+        for key in ("description", "parameters", "default_path", "method"):
+            assert key in entry, f"{name} is missing '{key}'"
+        assert isinstance(entry["description"], str) and entry["description"]
+        assert isinstance(entry["default_path"], str) and entry["default_path"]
+        assert entry["method"] in {"GET", "POST", "PUT", "PATCH", "DELETE"}, name
+
+        params = entry["parameters"]
+        assert isinstance(params, dict)
+        for param_name, param in params.items():
+            for key in ("type", "source", "description"):
+                assert key in param, f"{name}.{param_name} is missing '{key}'"
+            assert param["source"] in {"session", "llm"}, f"{name}.{param_name}"
+
+        placeholders = set(re.findall(r"\{(\w+)\}", entry["default_path"]))
+        assert placeholders <= set(params), (
+            f"{name}: default_path placeholders {placeholders} not all declared "
+            f"as params {set(params)}"
+        )
+
+
+def test_get_player_latest_deposit_order_is_registered_in_catalog() -> None:
+    entry = PLAYER_TOOLS["get_player_latest_deposit_order"]
+    assert entry["default_path"] == "/players/{user_id}/latest-deposit-order"
+    assert entry["method"] == "GET"
+    assert set(entry["parameters"]) == {"user_id"}
+    assert entry["parameters"]["user_id"]["source"] == "session"

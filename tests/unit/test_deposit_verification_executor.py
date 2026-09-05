@@ -31,6 +31,7 @@ from src.chatbot.tools import (
     BUILTIN_TOOLS,
     SUBMIT_DEPOSIT_VERIFICATION,
 )
+from src.chatbot.tool_executor import REDACTED_PLACEHOLDER
 from src.config_tenant import DepositVerificationConfig, TenantSettings
 from src.integration.tenant_events import sign_body
 from src.interfaces.llm import ToolCall
@@ -356,6 +357,25 @@ async def test_empty_order_id_rejected_even_when_no_screenshot_exists(sm) -> Non
         sessionmaker=sm, media_store=_FakeMediaStore(), timeout_s=10.0)
     assert out["status"] == "missing_order_id"
     assert await _rows(sm) == []
+
+
+@respx.mock
+async def test_redacted_placeholder_order_id_is_rejected_like_empty(sm) -> None:
+    # REDACTED_PLACEHOLDER is what tool_executor._redact_internal_ids
+    # substitutes for a scrubbed internal-id-shaped value. If an order_id
+    # argument ever comes back as that literal string (e.g. the LLM echoed a
+    # redacted field from an earlier tool response), it must be treated
+    # exactly like a missing/empty order_id -- never forwarded to the vendor
+    # as real.
+    session_id = "s-redacted-oid"
+    await _add_image_message(sm, session_id)
+    store = _FakeMediaStore()
+    out = await submit_deposit_verification(
+        tenant=_tenant(), session_id=session_id, order_id=REDACTED_PLACEHOLDER,
+        sessionmaker=sm, media_store=store, timeout_s=10.0)
+    assert out["status"] == "missing_order_id"
+    assert await _rows(sm) == []
+    assert store.downloads == []
 
 
 @respx.mock

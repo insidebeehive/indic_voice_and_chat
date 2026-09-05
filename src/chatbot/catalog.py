@@ -31,7 +31,9 @@ PLAYER_TOOLS: dict[str, dict] = {
             "Get the player's transaction history: deposits, withdrawals, casino "
             "credits/debits, sports credits/debits. Supports filtering by type and "
             "date range via query params. Use to answer questions like 'did my "
-            "deposit go through?' or 'show my recent withdrawals'."
+            "deposit go through?' or 'show my recent withdrawals'. "
+            "NOTE: this does NOT return the PgsOrderId needed to raise a deposit "
+            "verification — call get_player_latest_deposit_order for that."
         ),
         "parameters": {
             "user_id": {"type": "string", "source": "session",
@@ -42,6 +44,27 @@ PLAYER_TOOLS: dict[str, dict] = {
                         "description": "Max records to return (default: 20)"},
         },
         "default_path": "/players/{user_id}/transactions",
+        "method": "GET",
+    },
+    "get_player_latest_deposit_order": {
+        "description": (
+            "Get the payment-gateway order details for the player's most recent "
+            "deposit attempt in the last 7 days: PgsOrderId (the payment gateway's "
+            "own order id), datetime, amount, and status (success | failed | pending). "
+            "Call this whenever the customer disputes a deposit — money deducted but "
+            "balance not credited, or a deposit shown as failed that they insist went "
+            "through (e.g. 'paise kat gaye par balance nahi aaya', 'deposit failed "
+            "dikha raha hai par payment ho gaya', 'my deposit did go through, check "
+            "again'). "
+            "This is the ONLY source of the PgsOrderId that submit_deposit_verification "
+            "needs as its order_id — get_player_transactions does NOT return it. "
+            "Returns nothing if the player has made no deposit attempt in the last 7 days."
+        ),
+        "parameters": {
+            "user_id": {"type": "string", "source": "session",
+                        "description": "Player identifier"},
+        },
+        "default_path": "/players/{user_id}/latest-deposit-order",
         "method": "GET",
     },
     "get_player_bets": {

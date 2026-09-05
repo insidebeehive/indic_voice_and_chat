@@ -428,6 +428,32 @@ GET /players/{user_id}/matka-bids?operator_id={operator_id}&status={status}&mark
 
 ---
 
+### 12. Player Latest Deposit Order
+
+```
+GET /players/{user_id}/latest-deposit-order
+```
+
+**When called:** Player disputes a deposit — says the money was deducted but not credited, or that a deposit shown as failed actually went through. Returns the payment-gateway order reference for the player's most recent deposit attempt, which the chatbot needs to raise a manual deposit-verification ticket with the operator's verification vendor.
+
+No query params — only the `user_id` is sent. The lookup window (the player's latest deposit attempt within the past 7 days) is your own business logic, not something we pass in.
+
+**Expected response:**
+```json
+{
+  "PgsOrderId": "PGS20260621143000123",
+  "datetime": "2026-06-21T14:30:00Z",
+  "amount": 1500.00,
+  "status": "failed"
+}
+```
+
+`PgsOrderId` is the payment gateway's own order id — field name kept verbatim in the gateway's casing (`PgsOrderId`, not `pgs_order_id`), since it is forwarded to the verification vendor as-is.
+`status` — `success` | `failed` | `pending` (`pending` = still in flight at the gateway).
+Return the single most recent attempt only, not a list. Return `null` (or 404) if the player has made no deposit attempt in the last 7 days.
+
+---
+
 ## Operator Endpoints
 
 These are called for any question about how the platform works — payment methods, games, promotions, platform settings. Only `operator_id` is injected (no `user_id`).
@@ -710,6 +736,7 @@ Content-Type: application/json
   "tools": [
     "get_player_wallet",
     "get_player_transactions",
+    "get_player_latest_deposit_order",
     "get_player_bets",
     "get_player_bonuses",
     "get_player_profile",
@@ -722,4 +749,4 @@ Content-Type: application/json
 }
 ```
 
-Omit the `tools` array to register all 10 tools at once. This call is idempotent — safe to re-run when your base URL or token changes.
+Omit the `tools` array to register every tool in this contract at once. This call is idempotent — safe to re-run when your base URL or token changes.

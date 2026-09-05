@@ -750,7 +750,11 @@ def build_chatbot_system_prompt(
             "automatically in this same chat.\n"
             "- Already pending: if the tool's result says a verification is already pending for "
             "this conversation, don't call it again — just remind the customer it's still being "
-            "checked."
+            "checked.\n"
+            "- Order id source: the order id must come from get_player_latest_deposit_order's "
+            "PgsOrderId field — never from get_player_transactions (which doesn't return it), "
+            "and never invented; if no deposit order can be found, escalate to a human instead "
+            "of guessing."
         )
 
     # ── Depth matching ───────────────────────────────────────────────────────

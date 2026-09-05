@@ -15,6 +15,15 @@ from typing import Optional
 
 log = logging.getLogger(__name__)
 
+# Placeholder substituted for any internal-id-shaped value this module
+# redacts (by key, in _redact_internal_ids, or by UUID pattern, in both
+# _redact_internal_ids and _redact_url). Shared as a constant — rather than
+# an inline literal repeated at each call site — so that
+# src/chatbot/deposit_verification.py's "[redacted]" == missing-order-id
+# guard (and its test) can import the same value and can never silently
+# drift out of sync with what this module actually emits.
+REDACTED_PLACEHOLDER = "[redacted]"
+
 # Internal identifier keys stripped from every CRM tool response before it
 # reaches the LLM. These are pure system-routing plumbing (never something a
 # customer needs or should see) — echoed back by some CRM endpoints per their
@@ -33,6 +42,16 @@ _REDACTED_RESPONSE_KEYS = {
     "operator_id", "user_id", "tenant_id", "crm_id", "session_id",
 }
 _REDACTED_KEYS_NORMALIZED = {k.replace("_", "") for k in _REDACTED_RESPONSE_KEYS}
+
+# Narrow, EXACT-match exemption from the UUID value-scrub below — not a
+# general allowlist. "PgsOrderId" is the payment gateway's own order
+# reference (see get_player_latest_deposit_order), which the platform must
+# forward on to the deposit-verification vendor unmodified. It is not one of
+# the internal platform ids this scrub was hardened against, so even a
+# UUID-shaped value under this exact (normalized) key must reach the LLM
+# as-is instead of being redacted. Normalized the same way as
+# _REDACTED_KEYS_NORMALIZED above (lowercased, underscores stripped).
+_PGS_ORDER_ID_KEY_NORMALIZED = "pgsorderid"
 
 # Belt-and-suspenders value-level scrub: a UUID can leak through a key name
 # that isn't in _REDACTED_RESPONSE_KEYS (e.g. "player_id", "customer_id", a
@@ -53,18 +72,23 @@ def _redact_internal_ids(value: object) -> object:
     than relying on each tool's response shape being individually audited.
     """
     if isinstance(value, dict):
-        return {
-            k: (
-                "[redacted]"
-                if k.lower().replace("_", "") in _REDACTED_KEYS_NORMALIZED
-                else _redact_internal_ids(v)
-            )
-            for k, v in value.items()
-        }
+        result = {}
+        for k, v in value.items():
+            normalized_k = k.lower().replace("_", "")
+            if normalized_k in _REDACTED_KEYS_NORMALIZED:
+                result[k] = REDACTED_PLACEHOLDER
+            elif normalized_k == _PGS_ORDER_ID_KEY_NORMALIZED and isinstance(v, str):
+                # EXACT-match exemption — see _PGS_ORDER_ID_KEY_NORMALIZED
+                # above. Preserve the payment-gateway order id unmodified,
+                # even if it happens to be UUID-shaped.
+                result[k] = v
+            else:
+                result[k] = _redact_internal_ids(v)
+        return result
     if isinstance(value, list):
         return [_redact_internal_ids(v) for v in value]
     if isinstance(value, str):
-        return _UUID_RE.sub("[redacted]", value)
+        return _UUID_RE.sub(REDACTED_PLACEHOLDER, value)
     return value
 
 
@@ -77,7 +101,7 @@ def _redact_url(url: str) -> str:
     Deliberately reuses _UUID_RE so URL scrubbing and response-body scrubbing
     can never drift apart.
     """
-    return _UUID_RE.sub("[redacted]", url or "")
+    return _UUID_RE.sub(REDACTED_PLACEHOLDER, url or "")
 
 # Read timeout for one CRM HTTP call. Was tightened to 10s during the 2026-08
 # relay-timeout incident fix, on the theory that a short timeout would keep
@@ -195,7 +219,7 @@ async def execute_crm_tool(
         })
         # A future raise_for_status() (or similar) could embed a UUID-bearing
         # URL/id in the exception text — scrub it before it reaches the LLM.
-        return {"error": _UUID_RE.sub("[redacted]", str(e))}
+        return {"error": _UUID_RE.sub(REDACTED_PLACEHOLDER, str(e))}
     finally:
         if own:
             try:
