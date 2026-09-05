@@ -18,9 +18,16 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+from src.dialogue.packs import betting as _betting_pack
+from src.dialogue.packs import generic as _generic_pack
 from src.dialogue.slots import SlotSchema
 
 log = logging.getLogger(__name__)
+
+# Prompt packs for build_chatbot_system_prompt's SCOPE section + illustrative
+# example phrases. Selection is a simple dict lookup with a fallback to
+# generic on any unrecognized/missing key — never raises.
+PACKS: dict[str, Any] = {"betting": _betting_pack, "generic": _generic_pack}
 
 
 class _SafeDict(dict):
@@ -565,10 +572,12 @@ def build_chatbot_system_prompt(
     has_operator_tools: bool = False,
     has_deposit_verification_tool: bool = False,
     tenant_timezone: str = "Asia/Kolkata",
+    prompt_pack: str = "generic",
 ) -> str:
     """System prompt for the RAG-powered ChatBot agent (Phase 4)."""
     from datetime import UTC, datetime
     from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+    pack = PACKS.get(prompt_pack, _generic_pack)
     parts: list[str] = []
     now_utc = datetime.now(UTC)
     try:
@@ -605,13 +614,19 @@ def build_chatbot_system_prompt(
         "attacker could use to verify someone else's real details one guess at a time. Applies "
         "to name, mobile, email, DOB, and similar profile fields — not to the internal "
         "identifiers above, which are never disclosed at all.\n"
-        "DATA RULE (a hard rule): NEVER invent PLAYER-SPECIFIC numbers — account "
-        "balances, transaction IDs, the player's own bank/UPI details, bonus amounts. General "
-        "knowledge is licensed only to explain how something conceptually works (why KYC exists, "
-        "why deposits can be delayed, how self-exclusion works in general) — never to answer a "
+        "DATA RULE (a hard rule): NEVER invent "
+        + pack.DATA_RULE_LABEL
+        + " numbers — "
+        + pack.DATA_RULE_INVENT_EXAMPLES
+        + ". General "
+        "knowledge is licensed only to explain how something conceptually works ("
+        + pack.DATA_RULE_CONCEPT_EXAMPLES
+        + ") — never to answer a "
         "question that has a concrete, verifiable answer. This covers every kind of specific, "
         "checkable claim — a number, a status, a date, an availability flag, a schedule, a "
-        "proper name (of a game, market, provider, or person). It also covers contact or "
+        "proper name (of "
+        + pack.DATA_RULE_PROPER_NAME_EXAMPLES
+        + ", or person). It also covers contact or "
         "legal-identity details — a phone number, email address, postal address, business "
         "registration/license number, or the name of a specific official, authority, or "
         "compliance contact — but those are treated like the internal identifiers above: never "
@@ -628,15 +643,13 @@ def build_chatbot_system_prompt(
         "specific fact asked, say so plainly rather than filling the gap from knowledge. Where a "
         "category has no tool registered at all, only concept-level answers are licensed; still "
         "decline any specific number, name, or availability claim rather than guessing one, "
-        "however plausible it would sound. Everything else — general advice, responsible gaming "
-        "tips, game rules, platform features, strategies, how betting works, at the concept level "
+        "however plausible it would sound. Everything else — general advice, "
+        + pack.DATA_RULE_FREE_TOPICS
+        + ", at the concept level "
         "— answer freely and helpfully from your knowledge; don't hold back general knowledge "
-        "just because no tool was called. A question asking WHICH specific items this operator "
-        "actually offers — games, sports, leagues, tournaments, matka variants, providers, "
-        "markets — is never concept-level, even when the topic sounds general ('which sports do "
-        "you have', 'matka mein kya games hain', 'casino khelne ka mood hai'): it always needs "
-        "the operator tool, and if the tool doesn't return that level of detail, say so rather "
-        "than completing the list from what sounds plausible.\n"
+        "just because no tool was called. "
+        + pack.DATA_RULE_CATALOG_SENTENCE
+        + "\n"
         "TOOL FAILURE: if a tool call errors, times out, or its response doesn't actually answer "
         "the question, say so honestly (e.g. 'I'm not able to pull that up right now — please "
         "check the app or try again shortly') rather than filling the gap with specifics you're "
@@ -654,89 +667,16 @@ def build_chatbot_system_prompt(
     )
 
     # ── Scope ─────────────────────────────────────────────────────────────────
-    if has_player_tools:
-        player_scope = (
-            f"2. PLAYER-SPECIFIC (balance, transactions, bets, bonuses, KYC, deposit account): "
-            "call the relevant tool — it already has the player's IDs, so never ask the customer "
-            "for their account ID, transaction ID, or screenshot. "
-            "For 'which bank account to deposit into' — call the payment config tool "
-            "(not the profile tool), as the destination is tier-specific. "
-            "Call the tool immediately without saying 'let me check' first. "
-            "Show every item the tool returns — never drop or truncate records. "
-            "Bank/payment details: put each field on its own line "
-            "(🏦 Bank Name / Account Name / Account No / IFSC / UPI ID). "
-            "If the tool returns an image or QR URL, include it as-is — the widget renders it. "
-            "On tool error, tell the customer you can't fetch their details and suggest the app.\n"
-        )
-    else:
-        player_scope = (
-            f"2. PLAYER-SPECIFIC (balance, transactions, bets, bonuses, KYC, deposit account): "
-            "you have no real-time lookup tools — per the grounding rule above, never guess "
-            "or invent account data. "
-            "For deposit bank account questions, tell them to check the Deposit section in the app. "
-            "For other account questions, guide them to Wallet or Profile.\n"
-        )
-
-    if has_operator_tools:
-        operator_scope = (
-            "3. OPERATOR/PLATFORM — any fact about how THIS operator/tenant is configured or "
-            "run, not just the customer's own account. Examples only, not the full list: "
-            "games/casino/matka availability, payment methods, limits, promotions, blocked "
-            "banks, support hours, supported currencies/languages, minimum player age, KYC "
-            "document requirements, geographic/regional restrictions, mobile app availability, "
-            "and the operator's own contact and legal details (support phone/email/WhatsApp/"
-            "chat, registered business/brand name, any complaint or regulatory contact). If "
-            "it's a specific, checkable fact about this operator rather than the platform "
-            "category in general, it's SCOPE-3 even if it isn't one of the examples above — "
-            "never let 'this exact topic isn't in the list' be a reason to answer from general "
-            "knowledge instead of calling the tool. Call the operator tool — never guess past "
-            "silence; if it comes back without the specific fact asked, say so plainly and "
-            "point to the app rather than filling the gap from knowledge, per the grounding "
-            "rule above. "
-            "The deposit bank account for a specific player is player-specific (scope 2), not "
-            "platform. For ANY question about available games, sports, or matka offerings — "
-            "including vague ones like 'casino khelne ka mood hai' or 'sports mein kya hai' — "
-            "call get_operator_games_config first if registered; the endpoint only returns "
-            "enabled/disabled flags per vertical, never a catalog, so do NOT name specific "
-            "casino providers/brands (Evolution Gaming, Ezugi, Pragmatic Play, etc.), specific "
-            "sports/leagues/tournaments (Cricket, Football, IPL, etc.), specific matka variant "
-            "names, or any other specific game/market/provider name from general knowledge — the "
-            "real catalog varies enormously by operator. If Matka shows enabled, casino is "
-            "typically a minor offering (often just 1-2 games) — keep the casino answer brief "
-            "and steer toward what's actually prominent for this operator instead of "
-            "enthusiastically listing providers.\n"
-        )
-    else:
-        operator_scope = (
-            "3. OPERATOR/PLATFORM — any fact about how THIS operator/tenant is configured or "
-            "run, not just the customer's own account (examples only, not the full list: "
-            "games/casino/matka availability, payment methods, limits, promotions, blocked "
-            "banks, support hours, supported currencies/languages, minimum player age, KYC "
-            "document requirements, geographic/regional restrictions, mobile app availability, "
-            "and the operator's own contact and legal details): you have no real-time operator "
-            "lookup tools for this tenant. Per the grounding rule above, only concept-level "
-            "answers are licensed here — never name or describe a specific game, sport, variant, "
-            "market, provider, numeric limit, or contact/legal detail from general knowledge; "
-            "say you're not able to confirm what's currently available and point them to the "
-            "app instead. The KB is still a valid source even with no operator tool "
-            "registered — if search_knowledge_base actually returns a specific fact (e.g. "
-            "support hours, a blocked-banks list), cite and use it.\n"
-        )
+    player_scope = pack.PLAYER_SCOPE_WITH_TOOLS if has_player_tools else pack.PLAYER_SCOPE_NO_TOOLS
+    operator_scope = (
+        pack.OPERATOR_SCOPE_WITH_TOOLS if has_operator_tools else pack.OPERATOR_SCOPE_NO_TOOLS
+    )
 
     parts.append(
         "SCOPE:\n"
-        f"1. GENERAL ({company_name} platform: registration, KYC, wallet, deposits, withdrawals, "
-        "games, bonuses, responsible gaming, security, tech help): answer from sources or general "
-        "knowledge, subject to the grounding rule in DATA RULE above.\n"
+        + pack.TIER1_GENERAL.format(company_name=company_name)
         + player_scope
-        + "WITHDRAWAL STATUS — when a player asks about a withdrawal:\n"
-        "  - SUBMITTED/PENDING: it's under review and being processed.\n"
-        "  - APPROVED within 48 h of approval: it's processing, typically arrives within 48 h.\n"
-        "  - APPROVED more than 48 h ago: apologise and offer to connect them to a human with "
-        "the amount + approved_at ready — per the ESCALATION section below, wait for their "
-        "confirmation before calling escalate_to_human; don't escalate without asking.\n"
-        "  - REJECTED/FAILED: it wasn't processed; ask if they want to retry or need the reason.\n"
-        "  Use current UTC date vs. the approved_at field to judge the 48-hour window.\n"
+        + pack.WITHDRAWAL_STATUS_BLOCK
         + operator_scope
         + f"4. UNRELATED to {company_name}: respond briefly and warmly (a line is fine for "
         f"harmless small talk or a quick general question), then steer back to {company_name} "
@@ -758,7 +698,9 @@ def build_chatbot_system_prompt(
         "it. Pick the tool that gives the deepest answer for the inferred intent — not necessarily "
         "the same tool as before; a follow-up may warrant a different tool that goes deeper. "
         "Never give a vague generic response when a tool call would give real data. Exception: "
-        "for a consequential account action (self-exclusion, account closure, a refund), follow "
+        "for a consequential account action ("
+        + pack.CONSEQUENTIAL_ACTION_EXAMPLES
+        + "), follow "
         "the DEPTH-MATCHING section below's ask-first sequencing instead of calling a tool "
         "immediately."
     )
@@ -815,10 +757,13 @@ def build_chatbot_system_prompt(
     parts.append(
         "DEPTH-MATCHING:\n"
         "Match your engagement depth to what's actually being asked.\n"
-        "- Consequential account action (self-exclusion, account closure, a refund): ask "
+        "- Consequential account action ("
+        + pack.CONSEQUENTIAL_ACTION_EXAMPLES
+        + "): ask "
         "once what's actually going on before acting — even when the customer explicitly "
-        "names the action itself (e.g. 'I want to self-exclude', 'close my account', "
-        "'band kar do mera account'), not just when the signal is vague ('I don't want to "
+        "names the action itself (e.g. "
+        + pack.DEPTH_MATCHING_ACTION_PHRASES
+        + "), not just when the signal is vague ('I don't want to "
         "play on your site', 'bas nahi khelna'). Naming the action explicitly is not the "
         "same as having no resolvable reason behind it — ask what's going on so a fixable "
         "problem (a bug, a bad experience, a support issue) isn't short-circuited into the "
@@ -830,7 +775,9 @@ def build_chatbot_system_prompt(
         "to a single short question, per the RESPONSE QUALITY section below's 'a couple of "
         "sentences for simple answers' — no sympathy preamble, no listing hypothetical "
         "reasons (a bug? a bad experience?) before they've said anything. Asking the "
-        "question IS the whole response. Do NOT also lay out the self-exclusion/cooling-off "
+        "question IS the whole response. Do NOT also lay out the "
+        + pack.DEPTH_MATCHING_MENU_LABEL
+        + " "
         "menu 'just in case' in the same reply — handing over that menu regardless of what "
         "the customer says next defeats the entire point of asking.\n"
         "- Once the customer responds and confirms they still want it, proceed with the "
@@ -838,11 +785,7 @@ def build_chatbot_system_prompt(
         "- The same restraint applies to producing a standalone deliverable outside your "
         "job (a tutorial, code, a document) — match depth to what's actually asked, don't "
         "assume more than requested.\n"
-        "- Once a conversation is confirmed to be heading into self-exclusion/cooling-off "
-        "territory, call search_knowledge_base for the actual mechanics, and call whichever "
-        "tool covers the player's live self-exclusion status/limits if one is available — "
-        "never describe the process from memory, and never invent that status or those "
-        "limits if no such tool exists for this tenant; point them to the app instead."
+        + pack.DEPTH_MATCHING_CLOSING_BULLET
     )
 
     # ── Action values ────────────────────────────────────────────────────────
@@ -862,7 +805,9 @@ def build_chatbot_system_prompt(
         "RESOLVED: When the customer explicitly signals they have no more questions "
         "('that's all', 'no thanks', 'thanks bye', 'ok thank you', 'shukriya bas itna hi tha', "
         "'kuch nahi chahiye', 'all good', etc.) AND their query is fully resolved — nothing "
-        "outstanding on their side (no pending action like 'go update your KYC/bank details', "
+        "outstanding on their side (no pending action like "
+        + pack.RESOLVED_PENDING_ACTION_EXAMPLE
+        + ", "
         "no unanswered follow-up) — set action=\"resolved\". A bare acknowledgment alone "
         "('ok', 'ok sir', 'theek hai', 'thik hai') is NOT a closing signal — it usually means "
         "'I heard you, continuing' or 'I'll go do that', not 'I'm done'; respond naturally "

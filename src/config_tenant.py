@@ -395,6 +395,10 @@ class TenantSettings(BaseModel):
     # the per-tenant crm sub-config above. Drives resolve_crm_tools()'s tier-2
     # DB-backed tool catalog fallback (src/bootstrap.py).
     crm_id: Optional[str] = None
+    # ChatBot system-prompt pack (src/dialogue/packs) denormalized from the
+    # linked Crm row's prompt_pack at tenant-resolution time (src/auth/db_resolver.py) —
+    # "generic" when unset/NULL or when the tenant has no linked CRM at all.
+    prompt_pack: str = "generic"
     whatsapp: TenantWhatsAppConfig = Field(default_factory=TenantWhatsAppConfig)
     chat_support: ChatSupportConfig = Field(default_factory=ChatSupportConfig)
     deposit_verification: DepositVerificationConfig = Field(default_factory=DepositVerificationConfig)

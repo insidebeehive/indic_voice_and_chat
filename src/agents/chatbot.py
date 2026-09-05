@@ -259,6 +259,7 @@ class ChatBotAgent(BaseAgent):
         company_name: str = "[Your Company]",
         language_default: str = "en",
         tenant_timezone: str = "Asia/Kolkata",
+        prompt_pack: str = "generic",
         store: SessionStore | None = None,
         guard_config: GuardConfig | None = None,
         max_context_chars: int = 2000,
@@ -290,6 +291,7 @@ class ChatBotAgent(BaseAgent):
         self._company = company_name
         self._language = language_default
         self._tenant_timezone = tenant_timezone
+        self._prompt_pack = prompt_pack
         self._guard = guard_config
         self._max_context_chars = max_context_chars
         # Agentic tool-calling (opt-in): builtin tools (search KB / escalate /
@@ -811,6 +813,7 @@ class ChatBotAgent(BaseAgent):
             has_operator_tools=any(t.name in OPERATOR_TOOLS for t in self._crm_tools),
             has_deposit_verification_tool=any(t.name == SUBMIT_DEPOSIT_VERIFICATION for t in self._crm_tools),
             tenant_timezone=self._tenant_timezone,
+            prompt_pack=self._prompt_pack,
         )
         messages: list[LLMMessage] = [LLMMessage(role="system", content=system_prompt)]
         # Replay the last MAX_HISTORY_TURNS exchanges (system is rebuilt each

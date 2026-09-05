@@ -47,6 +47,11 @@ class Crm(Base):
     # key/secret live encrypted in ``CrmSecret`` (name ``livekit_api_key`` /
     # ``livekit_api_secret``), never here.
     livekit_url: Mapped[Optional[str]] = mapped_column(String(500))
+    # Selects the ChatBot system-prompt pack (src/dialogue/packs/*.py) this
+    # CRM's tenants use — e.g. "betting" or "generic". NULL/unrecognized
+    # values fall back to "generic" at prompt-build time; nothing here ever
+    # raises on a missing/unknown pack name.
+    prompt_pack: Mapped[Optional[str]] = mapped_column(String(50))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=False), server_default=func.now())
 

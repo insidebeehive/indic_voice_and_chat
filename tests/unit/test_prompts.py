@@ -123,7 +123,10 @@ def test_chatbot_prompt_with_rag_context() -> None:
 
 
 def test_chatbot_prompt_has_scope_guardrails() -> None:
-    prompt = build_chatbot_system_prompt(company_name="Acme")
+    # Pinned to the betting pack: "OPERATOR/PLATFORM" is that pack's label for
+    # SCOPE-3 (the generic pack uses "BUSINESS/PLATFORM" — see
+    # test_chatbot_prompt_generic_pack_has_no_gambling_vocabulary below).
+    prompt = build_chatbot_system_prompt(company_name="Acme", prompt_pack="betting")
     assert "SCOPE" in prompt
     # player- and operator-specific are named separately.
     assert "player-specific" in prompt or "PLAYER-SPECIFIC" in prompt
@@ -137,14 +140,93 @@ def test_chatbot_prompt_has_scope_guardrails() -> None:
 
 
 def test_chatbot_prompt_operator_scope_branches_on_tool_registration() -> None:
-    with_tools = build_chatbot_system_prompt(company_name="Acme", has_operator_tools=True)
-    without_tools = build_chatbot_system_prompt(company_name="Acme", has_operator_tools=False)
+    # Pinned to the betting pack — see test_chatbot_prompt_has_scope_guardrails.
+    with_tools = build_chatbot_system_prompt(
+        company_name="Acme", has_operator_tools=True, prompt_pack="betting")
+    without_tools = build_chatbot_system_prompt(
+        company_name="Acme", has_operator_tools=False, prompt_pack="betting")
     assert "Call the operator tool" in with_tools
     assert "get_operator_games_config" in with_tools
     assert "no real-time operator lookup tools" in without_tools
     assert "only concept-level answers are licensed" in without_tools
     # The no-tool branch must still forbid guessing specifics.
     assert "never name or describe a specific game" in without_tools
+
+
+def test_chatbot_prompt_betting_pack_matches_pre_split_output() -> None:
+    # Regression guard for the prompts.py/packs split (Task 1 of the
+    # decouple-betting-vertical plan): the betting pack must reproduce every
+    # SCOPE + example-phrase spot that moved out of the inline text,
+    # byte-for-byte, for every has_player_tools/has_operator_tools
+    # combination — proving no behavior change for the production CRM.
+    for has_player_tools in (False, True):
+        for has_operator_tools in (False, True):
+            prompt = build_chatbot_system_prompt(
+                company_name="Acme",
+                has_player_tools=has_player_tools,
+                has_operator_tools=has_operator_tools,
+                prompt_pack="betting",
+            )
+            assert "KYC" in prompt
+            assert "WITHDRAWAL STATUS" in prompt
+            assert "self-exclusion, account closure, a refund" in prompt
+            assert "'I want to self-exclude'" in prompt
+            assert "self-exclusion/cooling-off" in prompt
+            assert "matka mein kya games hain" in prompt
+            assert "'go update your KYC/bank details'" in prompt
+            assert (
+                "account balances, transaction IDs, the player's own bank/UPI "
+                "details, bonus amounts" in prompt
+            )
+            assert "responsible gaming tips, game rules" in prompt
+
+
+def test_chatbot_prompt_generic_pack_has_no_gambling_vocabulary() -> None:
+    # A CRM with prompt_pack unset (default "generic") must get a neutral
+    # SCOPE + example phrases — no gambling vocabulary at all.
+    for has_player_tools in (False, True):
+        for has_operator_tools in (False, True):
+            for has_deposit_verification_tool in (False, True):
+                prompt = build_chatbot_system_prompt(
+                    company_name="Acme",
+                    has_player_tools=has_player_tools,
+                    has_operator_tools=has_operator_tools,
+                    has_deposit_verification_tool=has_deposit_verification_tool,
+                )  # prompt_pack defaults to "generic"
+                # DEPOSIT DISPUTE VERIFICATION is legitimately unchanged/out-of-scope
+                # (gated by has_deposit_verification_tool, not part of the pack split —
+                # see Task 1's scope note) — it's expected to say "deposit"/"withdraw"
+                # when that flag is set, so strip it before the banned-word check
+                # rather than weakening the check for the rest of the prompt.
+                checked = prompt
+                start = checked.find("DEPOSIT DISPUTE VERIFICATION:")
+                if start != -1:
+                    end = checked.index("\n\nDEPTH-MATCHING:", start)
+                    checked = checked[:start] + checked[end + 2:]
+                lowered = checked.lower()
+                # NB: "wallet" is a known, out-of-scope residual — it appears only in
+                # the identity/anti-leak paragraph's illustrative example of an
+                # internal API category name ('"Player Profile & Wallet APIs"'),
+                # which is unchanged "identity/anti-leak core" per Task 1's scope
+                # (not one of the SCOPE/DATA RULE/DEPTH-MATCHING/TOOL USE/RESOLVED
+                # spots approved for pack-splitting) — not asserted here.
+                for banned in (
+                    "kyc", "deposit", "withdraw", "self-exclu", "casino",
+                    "matka", "bonus", "responsible gaming", "betting works",
+                ):
+                    assert banned not in lowered, f"found banned term {banned!r} in generic prompt"
+                assert "SCOPE" in prompt
+                assert "BUSINESS/PLATFORM" in prompt
+                assert "a subscription cancellation, account closure, a refund" in prompt
+                assert "'go update your billing details'" in prompt
+
+
+def test_chatbot_prompt_unrecognized_pack_falls_back_to_generic() -> None:
+    prompt = build_chatbot_system_prompt(
+        company_name="Acme", prompt_pack="totally-unknown-vertical")
+    assert "BUSINESS/PLATFORM" in prompt
+    assert "kyc" not in prompt.lower()
+    assert "casino" not in prompt.lower()
 
 
 def test_chatbot_prompt_includes_local_time() -> None:
