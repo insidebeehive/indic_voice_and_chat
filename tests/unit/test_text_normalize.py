@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import importlib.util
 import logging
+from pathlib import Path
 
 from src.pipeline.text_normalize import (
     DEFAULT_PRONUNCIATIONS,
@@ -9,12 +11,32 @@ from src.pipeline.text_normalize import (
 )
 
 
+def _load_migration_betting_pronunciations() -> dict[str, str]:
+    """Load ``_BETTING_PRONUNCIATIONS`` straight from the migration module
+    (alembic/versions/0018_crm_pronunciation_overrides.py) rather than
+    duplicating the dict here -- a future transcription error in the
+    migration's actual backfill data must fail this test, not go unnoticed
+    behind a second, independent copy. ``alembic/versions`` has no
+    ``__init__.py`` (not a regular importable package, and the installed
+    ``alembic`` pip package shadows it), so load the file directly by path.
+    """
+    path = (
+        Path(__file__).resolve().parents[2]
+        / "alembic" / "versions" / "0018_crm_pronunciation_overrides.py"
+    )
+    spec = importlib.util.spec_from_file_location("_migration_0018_crm_pronunciation_overrides", path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module._BETTING_PRONUNCIATIONS
+
+
 def test_rewrites_known_terms_to_devanagari() -> None:
-    out = apply_pronunciations("WhatsApp par link bhejun? Casino bhi hai.")
+    out = apply_pronunciations("WhatsApp par link bhejun? Bonus bhi hai.")
     # Mispronounced English terms are gone, replaced by Devanagari.
-    assert "WhatsApp" not in out and "Casino" not in out and "link" not in out
+    assert "WhatsApp" not in out and "Bonus" not in out and "link" not in out
     assert DEFAULT_PRONUNCIATIONS["WhatsApp"] in out
-    assert DEFAULT_PRONUNCIATIONS["Casino"] in out
+    assert DEFAULT_PRONUNCIATIONS["bonus"] in out
     assert DEFAULT_PRONUNCIATIONS["link"] in out
     # Surrounding text is preserved.
     assert "bhejun" in out and "bhi hai" in out
@@ -34,35 +56,80 @@ def test_empty_and_no_match_passthrough() -> None:
 
 
 def test_extra_overrides_merge_over_defaults() -> None:
-    out = apply_pronunciations("Khelo Aviator aur ZyxBrand", extra={"ZyxBrand": "ज़िक्सब्रांड"})
+    out = apply_pronunciations("Cash lo aur ZyxBrand", extra={"ZyxBrand": "ज़िक्सब्रांड"})
     assert "ज़िक्सब्रांड" in out
-    assert DEFAULT_PRONUNCIATIONS["Aviator"] in out
+    assert DEFAULT_PRONUNCIATIONS["cash"] in out
 
 
-def test_rewrites_newly_added_sports_and_gaming_terms() -> None:
-    # These specific words were observed un-transliterated in real Stage test
-    # transcripts (still in Latin script when reaching TTS) before this
-    # expansion — this test guards against a future accidental removal.
+def test_rewrites_generic_gaming_adjacent_terms_by_default() -> None:
+    # "join"/"explore"/"risk" are generic English loanwords (not betting-vertical)
+    # and stay in the shared default regardless of which CRM/vertical is active.
     out = apply_pronunciations(
-        "Cricket aur Football dono hai, aap join karke explore kar sakte hain, "
-        "koi risk nahi. Matka bhi khel sakte hain."
+        "Aap join karke explore kar sakte hain, koi risk nahi."
     )
-    assert "Cricket" not in out and DEFAULT_PRONUNCIATIONS["Cricket"] in out
-    assert "Football" not in out and DEFAULT_PRONUNCIATIONS["Football"] in out
     assert "join" not in out and DEFAULT_PRONUNCIATIONS["join"] in out
     assert "explore" not in out and DEFAULT_PRONUNCIATIONS["explore"] in out
     assert "risk" not in out and DEFAULT_PRONUNCIATIONS["risk"] in out
-    assert "Matka" not in out and DEFAULT_PRONUNCIATIONS["Matka"] in out
+    # Surrounding Hindi/Hinglish text is preserved untouched.
+    assert "koi" in out and "nahi" in out
+
+
+def test_betting_vertical_terms_not_in_shared_default() -> None:
+    # Casino/Cricket/Football/Matka/Sports/Tennis/Basketball/market/match/
+    # matches/IPL/Aviator/betting are betting-vertical vocabulary, moved to
+    # per-CRM Crm.pronunciation_overrides (see src/models/crm.py) instead of
+    # the shared, industry-neutral DEFAULT_PRONUNCIATIONS -- a CRM with no
+    # overrides must NOT get these substitutions.
+    betting_words = [
+        "Casino", "Aviator", "betting", "Cricket", "Football", "Matka",
+        "Sports", "Tennis", "Basketball", "market", "match", "matches", "IPL",
+    ]
+    for word in betting_words:
+        assert word not in DEFAULT_PRONUNCIATIONS
+    out = apply_pronunciations("Casino mein Cricket aur Matka ka market hai.")
+    # No overrides supplied -> passes through completely unchanged (whole-word
+    # betting terms have no default entry to match against).
+    assert out == "Casino mein Cricket aur Matka ka market hai."
+
+
+def test_betting_crm_override_reproduces_prior_behavior() -> None:
+    # A CRM whose Crm.pronunciation_overrides was backfilled with the removed
+    # betting entries (see alembic/versions/0018_crm_pronunciation_overrides.py)
+    # gets byte-for-byte the same substitution as before this change.
+    betting_overrides = _load_migration_betting_pronunciations()
+    # Pin the migration's actual values independently of the loaded dict —
+    # without this, every assertion below compares betting_overrides against
+    # itself and a mistyped Devanagari string in the backfill would still
+    # pass. This is the literal set alembic/versions/0018_crm_pronunciation_overrides.py
+    # ships to the production CRM's pronunciation_overrides.
+    assert betting_overrides == {
+        "Casino": "कसीनो",
+        "Aviator": "एविएटर",
+        "betting": "बेटिंग",
+        "Cricket": "क्रिकेट",
+        "Football": "फुटबॉल",
+        "Matka": "मटका",
+        "Sports": "स्पोर्ट्स",
+        "Tennis": "टेनिस",
+        "Basketball": "बास्केटबॉल",
+        "market": "मार्केट",
+        "match": "मैच",
+        "matches": "मैचेस",
+        "IPL": "आईपीएल",
+    }
+    out = apply_pronunciations(
+        "Cricket aur Football dono hai, aap join karke explore kar sakte hain, "
+        "koi risk nahi. Matka bhi khel sakte hain.",
+        extra=betting_overrides,
+    )
+    assert "Cricket" not in out and betting_overrides["Cricket"] in out
+    assert "Football" not in out and betting_overrides["Football"] in out
+    assert "join" not in out and DEFAULT_PRONUNCIATIONS["join"] in out
+    assert "explore" not in out and DEFAULT_PRONUNCIATIONS["explore"] in out
+    assert "risk" not in out and DEFAULT_PRONUNCIATIONS["risk"] in out
+    assert "Matka" not in out and betting_overrides["Matka"] in out
     # Surrounding Hindi/Hinglish text is preserved untouched.
     assert "aur" in out and "dono hai" in out and "koi" in out and "nahi" in out
-
-
-def test_rewrites_caller_name_manoj() -> None:
-    # The dev-console defaults the caller name to "Manoj" for IndicF5/ElevenLabs
-    # (see static/dev_console.html applyTTSProviderDefaults) — it must be in the
-    # dictionary or IndicF5 mispronounces the agent's own self-introduction.
-    out = apply_pronunciations("Main Manoj baat kar raha hoon.")
-    assert "Manoj" not in out and DEFAULT_PRONUNCIATIONS["Manoj"] in out
 
 
 def test_normalize_for_tts_warns_on_devanagari_language_gap(caplog) -> None:

@@ -119,13 +119,26 @@
 **Interfaces:**
 - `normalize_for_tts(text, extra=crm.pronunciation_overrides)` at every TTS call site, where `extra` merges over (or is merged with, confirm precedence in the existing function) the trimmed generic `DEFAULT_PRONUNCIATIONS`.
 
-- [ ] **Step 1:** Re-read `src/pipeline/text_normalize.py` in full; classify every entry in `DEFAULT_PRONUNCIATIONS` as generic-loanword vs betting-vertical. Write the split down (this becomes the backfill data for the migration in Step 3).
-- [ ] **Step 2:** Trace every call site of `normalize_for_tts`/`apply_pronunciations` and confirm what context (tenant, CRM, or neither) is available there today.
-- [ ] **Step 3:** Add `pronunciation_overrides` to `Crm`, generate + hand-edit the Alembic migration with the explicit backfill from Step 1's betting-specific list.
-- [ ] **Step 4:** Trim `DEFAULT_PRONUNCIATIONS` in `text_normalize.py` to the generic-only entries; delete the `"Manoj"` entry.
-- [ ] **Step 5:** Thread CRM context through the call sites found in Step 2 to `normalize_for_tts`'s `extra=` parameter.
-- [ ] **Step 6:** Add/update a unit test asserting: the existing CRM's TTS output for a betting term (e.g. "Casino") is unchanged; a hypothetical CRM with no overrides does not get betting-term substitutions.
-- [ ] **Step 7:** Run `.venv/bin/python -m pytest tests/ -q`, confirm no new failures.
+- [x] **Step 1:** Re-read `src/pipeline/text_normalize.py` in full; classify every entry in `DEFAULT_PRONUNCIATIONS` as generic-loanword vs betting-vertical. Write the split down (this becomes the backfill data for the migration in Step 3).
+- [x] **Step 2:** Trace every call site of `normalize_for_tts`/`apply_pronunciations` and confirm what context (tenant, CRM, or neither) is available there today.
+- [x] **Step 3:** Add `pronunciation_overrides` to `Crm`, generate + hand-edit the Alembic migration with the explicit backfill from Step 1's betting-specific list.
+- [x] **Step 4:** Trim `DEFAULT_PRONUNCIATIONS` in `text_normalize.py` to the generic-only entries; delete the `"Manoj"` entry.
+- [x] **Step 5:** Thread CRM context through the call sites found in Step 2 to `normalize_for_tts`'s `extra=` parameter.
+- [x] **Step 6:** Add/update a unit test asserting: the existing CRM's TTS output for a betting term (e.g. "Casino") is unchanged; a hypothetical CRM with no overrides does not get betting-term substitutions.
+- [x] **Step 7:** Run `.venv/bin/python -m pytest tests/ -q`, confirm no new failures.
+
+**Status: DONE (2026-09-05).** Implemented by a Sonnet subagent, verified by two independent Opus review rounds. Round 1 found a real production regression in `src/agents/voicebot.py::play_opening` (unconditionally replaced, rather than merged with, the CRM-level `extra_pronunciations` already set by the bootstrap factory — since no campaign sets `script.pronunciations`, this silently wiped the betting CRM's pronunciation overrides on the opening line of every cascade call) plus a test-quality gap; both fixed and round 2 confirmed the fix via mutation testing (reverting each half of the merge independently made the corresponding regression test fail) across 6 traced edge cases, with no cross-call state leakage. One further test-strength gap (the migration-backfill regression test checked keys but not values, so a mistyped Devanagari string would have stayed green) was fixed directly as a trivial, mechanical one-line addition, re-verified by mutation (a corrupted migration value now fails the test; migration file confirmed restored byte-identical). Full suite: 1943 passed, 3 failed (documented pre-existing baseline — unaffected by the project owner's own concurrent, unrelated work also present in the tree). Uncommitted pending the project owner's decision to commit.
+
+**Classification of all 47 original `DEFAULT_PRONUNCIATIONS` entries** (independently re-derived twice, once by the implementer and once by review — both matched this plan's own guess exactly): 13 moved to the betting-pack backfill (Casino, Aviator, betting, Cricket, Football, Matka, Sports, Tennis, Basketball, market, match, matches, IPL), 1 deleted outright (`"Manoj"`, per explicit instruction), 33 kept generic.
+
+**Deploy blocker, same class as Tasks 1/2:** `alembic/versions/0018_crm_pronunciation_overrides.py` is generated but **not applied** (chains after Task 2's `0017`). `src/auth/db_resolver.py` now selects `Crm.pronunciation_overrides` in the same unconditional `reload()` query as `prompt_pack`/`bundled_kb_pack` — apply `0018` together with `0016`/`0017` before/with deploying this change.
+
+**Known Low-priority residuals, left for the owner's call (none block Task 3):**
+- Deleting `"Manoj"` is not fully inert: `static/dev_console.html`/`static/bridge_console.html` default the dev-console's IndicF5/ElevenLabs caller-name field to `"Manoj"` — that default self-introduction will now mispronounce in the dev tool. Real but dev-tool-only; not fixed, per the plan's explicit instruction to delete the entry regardless.
+- `market`/`match`/`matches` were classified as betting-vertical and moved out of the generic default, but are arguably generic enough (e.g. "stock market", "matches your record") that a future generic CRM loses them entirely — could live in both places at zero risk to the betting CRM, if the owner wants that.
+- `"fan"` was kept in the generic default but is sports-adjacent in this corpus (added in the same commit as the other sports terms) — low-harm since it's also the generic loanword for the appliance.
+- Only 2 of 6 TTS providers (`sarvam.py`, `indicf5.py`) call `normalize_for_tts` at all — `azure.py`, `google.py`, `gemini.py`, `elevenlabs.py` never did and still don't, so a tenant on those providers gets no pronunciation substitution (generic or CRM) at all. Pre-existing, unchanged by this task.
+- Migration 0018 cannot be rendered via `alembic ... --sql` (offline mode) due to a SQLAlchemy JSON-literal rendering limitation — online `alembic upgrade head` execution is unaffected and was verified correct.
 
 ---
 

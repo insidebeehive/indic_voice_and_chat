@@ -59,6 +59,14 @@ class Crm(Base):
     # never matches any ``kb_dir``'s pack name, so it also seeds nothing —
     # nothing here ever raises on a missing/unknown pack name.
     bundled_kb_pack: Mapped[Optional[str]] = mapped_column(String(50))
+    # Per-CRM TTS pronunciation overrides (English/brand term -> Devanagari
+    # phonetic spelling), merged over the generic
+    # ``src.pipeline.text_normalize.DEFAULT_PRONUNCIATIONS`` at TTS-synthesis
+    # time (denormalized onto ``TenantSettings.pronunciation_overrides`` at
+    # tenant-resolution time, src/auth/db_resolver.py — same pattern as
+    # ``prompt_pack``). NULL/empty means this CRM gets no extra terms beyond
+    # the generic default — nothing here ever raises on a missing value.
+    pronunciation_overrides: Mapped[Optional[dict]] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=False), server_default=func.now())
 

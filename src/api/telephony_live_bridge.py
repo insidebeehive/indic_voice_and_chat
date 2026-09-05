@@ -41,6 +41,7 @@ class TelephonyLiveBridge(_BaseLiveBridge):
     def __init__(self, *, websocket, agent, config: RealtimeConfig, connect_session,
                  llm=None, tts=None, tenant_timezone: str = "Asia/Kolkata",
                  tenant_id: str | None = None,
+                 pronunciation_overrides: dict[str, str] | None = None,
                  encoding: str = "mulaw", sid_field: str = "streamSid",
                  supports_clear: bool = True, call_sid_field: str = "callSid",
                  transfer_webhook_url: str | None = None,
@@ -51,6 +52,10 @@ class TelephonyLiveBridge(_BaseLiveBridge):
         self._ws = websocket
         self._tts = tts
         self._tenant_id = tenant_id
+        # CRM-level TTS pronunciation overrides (src.models.crm.Crm.pronunciation_overrides),
+        # denormalized onto tenant.settings at resolution time — merged over the generic
+        # DEFAULT_PRONUNCIATIONS default for the transfer-failure apology below.
+        self._pronunciation_overrides = pronunciation_overrides
         self._encoding = encoding
         self._sid_field = sid_field
         self._supports_clear = supports_clear
@@ -266,7 +271,10 @@ class TelephonyLiveBridge(_BaseLiveBridge):
                 or "Maaf kijiye, abhi koi agent uplabdh nahi hai. Dhanyavaad.")
         from src.interfaces.tts import TTSConfig
         try:
-            result = await self._tts.synthesize(text, TTSConfig(sample_rate=16000))
+            result = await self._tts.synthesize(
+                text,
+                TTSConfig(sample_rate=16000, extra_pronunciations=self._pronunciation_overrides),
+            )
             pcm8k, self._down_state = resample_pcm16(
                 result.audio, result.sample_rate, _TEL_RATE, self._down_state)
             self._audio_q.put_nowait(pcm8k)

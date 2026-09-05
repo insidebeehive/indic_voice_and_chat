@@ -704,6 +704,7 @@ def _build_s2s_telephony_bridge(
     return TelephonyLiveBridge(
         websocket=websocket, agent=agent, config=config, connect_session=connect, llm=llm,
         tts=tts, tenant_timezone=tenant_timezone, tenant_id=tenant.id,
+        pronunciation_overrides=getattr(tenant.settings, "pronunciation_overrides", None),
         encoding=encoding, sid_field=sid_field, supports_clear=supports_clear,
         call_sid_field=call_sid_field,
         transfer_webhook_url=_wh_url,
@@ -897,6 +898,7 @@ def make_bridge_factory(
                 language=tenant.settings.pipeline.tts.language or "hi-IN",
                 voice_id=tts_voice_id,
                 sample_rate=16000,
+                extra_pronunciations=getattr(tenant.settings, "pronunciation_overrides", None),
             ),
         )
         engine = PipelineEngine(stt, llm, tts, pipeline_cfg)
@@ -1062,6 +1064,7 @@ def make_exotel_bridge_factory(
                 language=tenant.settings.pipeline.tts.language or "hi-IN",
                 voice_id=tts_voice_id,
                 sample_rate=16000,
+                extra_pronunciations=getattr(tenant.settings, "pronunciation_overrides", None),
             ),
         )
         engine = PipelineEngine(stt, llm, tts, pipeline_cfg)
@@ -1139,6 +1142,7 @@ def make_stringee_bridge_factory(
                 language=tenant.settings.pipeline.tts.language or "hi-IN",
                 voice_id=tenant.settings.pipeline.tts.voice_id,
                 sample_rate=16000,
+                extra_pronunciations=getattr(tenant.settings, "pronunciation_overrides", None),
             ),
         )
         engine = PipelineEngine(stt, llm, tts, pipeline_cfg)

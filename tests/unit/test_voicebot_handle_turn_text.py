@@ -549,7 +549,57 @@ async def test_play_opening_passes_script_pronunciations_to_tts():
         pass
 
     await agent.play_opening(sink)
-    assert captured["extra_pronunciations"] == {"XYZ": "एक्स वाय ज़ेड"}
+    # Superset check, not exact-equality: play_opening now MERGES the script's
+    # pronunciations over whatever's already on the engine's TTS config (e.g. a
+    # CRM's pronunciation_overrides) rather than replacing it outright -- see
+    # test_play_opening_merges_crm_overrides_with_script_pronunciations below.
+    assert captured["extra_pronunciations"] is not None
+    assert captured["extra_pronunciations"]["XYZ"] == "एक्स वाय ज़ेड"
+
+
+@pytest.mark.asyncio
+async def test_play_opening_preserves_crm_overrides_when_script_has_none():
+    """A CRM-level pronunciation override already on the engine's TTS config
+    (threaded in at engine-construction time, src/bootstrap.py) must survive
+    play_opening even when the campaign script itself sets no pronunciations
+    -- script.pronunciations is empty on essentially every real campaign today,
+    so `extra_pronunciations=script.pronunciations or None` used to silently
+    wipe the CRM's overrides for the opening line. Regression test for that."""
+    captured = {}
+
+    class _CapturingTTS:
+        async def synthesize(self, text, config):
+            captured["extra_pronunciations"] = config.extra_pronunciations
+            return TTSResult(audio=b"\x00\x00", duration_ms=1.0, sample_rate=16000)
+
+    crm_overrides = {"Casino": "कसीनो", "Cricket": "क्रिकेट"}
+    engine = PipelineEngine(
+        stt=None, llm=None, tts=_CapturingTTS(),
+        config=PipelineConfig(
+            stt=STTConfig(), llm=LLMConfig(),
+            tts=TTSConfig(language="hi-IN", extra_pronunciations=crm_overrides),
+        ),
+    )
+    script = VoiceBotScript(
+        agent_name="Priya", agent_role="sales", company_name="XYZ",
+        opening="Hello from {company_name}",
+        # No pronunciations set -- the real-world case for every campaign today.
+    )
+    agent = VoiceBotAgent(
+        session=AgentSession(session_id="t1", lead_data={}),
+        state_machine=AgentStateMachine(), slot_schema=SlotSchema(),
+        script=script, engine=engine, store=None,
+    )
+    # __init__ leaves engine._config.tts untouched (script.pronunciations is
+    # falsy) -- the CRM overrides set at engine-construction time survive.
+    assert engine._config.tts.extra_pronunciations == crm_overrides
+
+    async def sink(audio: bytes):
+        pass
+
+    await agent.play_opening(sink)
+    # ... and play_opening must not wipe them either.
+    assert captured["extra_pronunciations"] == crm_overrides
 
 
 @pytest.mark.asyncio
@@ -570,6 +620,39 @@ async def test_voicebot_agent_threads_script_pronunciations_onto_engine_config()
         script=script, engine=engine, store=None,
     )
     assert engine._config.tts.extra_pronunciations == {"XYZ": "एक्स वाय ज़ेड"}
+
+
+@pytest.mark.asyncio
+async def test_voicebot_agent_init_merges_script_pronunciations_with_crm_overrides():
+    """When BOTH a CRM-level override (already on engine._config.tts, set at
+    engine-construction time) and campaign script.pronunciations are present,
+    __init__ must MERGE them (script wins on key collision) rather than the
+    script fully replacing the CRM's overrides."""
+    engine = PipelineEngine(
+        stt=None, llm=None, tts=None,
+        config=PipelineConfig(
+            stt=STTConfig(), llm=LLMConfig(),
+            tts=TTSConfig(language="hi-IN", extra_pronunciations={
+                "Casino": "कसीनो", "Cricket": "क्रिकेट",
+            }),
+        ),
+    )
+    script = VoiceBotScript(
+        agent_name="Priya", agent_role="sales", company_name="XYZ",
+        # "Casino" collides with the CRM override -- script should win here;
+        # "XYZ" is script-only and should simply be added.
+        pronunciations={"Casino": "SCRIPT-OVERRIDE", "XYZ": "एक्स वाय ज़ेड"},
+    )
+    VoiceBotAgent(
+        session=AgentSession(session_id="t1", lead_data={}),
+        state_machine=AgentStateMachine(), slot_schema=SlotSchema(),
+        script=script, engine=engine, store=None,
+    )
+    assert engine._config.tts.extra_pronunciations == {
+        "Casino": "SCRIPT-OVERRIDE",   # script wins on collision
+        "Cricket": "क्रिकेट",           # CRM-only entry preserved
+        "XYZ": "एक्स वाय ज़ेड",          # script-only entry added
+    }
 
 
 @pytest.mark.asyncio

@@ -19,10 +19,14 @@ log = logging.getLogger(__name__)
 # English / brand term -> Devanagari phonetic spelling. Matched whole-word and
 # case-insensitively. Keep entries high-confidence; a wrong spelling just trades
 # one mispronunciation for another.
+#
+# Generic (industry-neutral) only -- betting/gambling-vertical vocabulary
+# (Casino, Aviator, Cricket, market, etc.) lives in a CRM's own
+# ``Crm.pronunciation_overrides`` instead (see ``apply_pronunciations``'s
+# ``extra`` param and src/auth/db_resolver.py), so a non-gambling CRM doesn't
+# inherit gambling-flavored substitutions by default.
 DEFAULT_PRONUNCIATIONS: dict[str, str] = {
     "WhatsApp": "व्हाट्सऐप",
-    "Casino": "कसीनो",
-    "Aviator": "एविएटर",
     "app": "ऐप",
     "link": "लिंक",
     "bonus": "बोनस",
@@ -42,15 +46,8 @@ DEFAULT_PRONUNCIATIONS: dict[str, str] = {
     "automatic": "ऑटोमैटिक",
     "minimum": "मिनिमम",
     "join": "जॉइन",
-    "betting": "बेटिंग",
-    "Cricket": "क्रिकेट",
-    "Football": "फुटबॉल",
-    "Matka": "मटका",
     "download": "डाउनलोड",
     "platform": "प्लेटफॉर्म",
-    "Sports": "स्पोर्ट्स",
-    "Tennis": "टेनिस",
-    "Basketball": "बास्केटबॉल",
     "live": "लाइव",
     "guide": "गाइड",
     "explore": "एक्सप्लोर",
@@ -60,13 +57,8 @@ DEFAULT_PRONUNCIATIONS: dict[str, str] = {
     "Sales": "सेल्स",
     "team": "टीम",
     "refer": "रेफर",
-    "market": "मार्केट",
-    "match": "मैच",
-    "matches": "मैचेस",
     "international": "इंटरनेशनल",
     "fan": "फैन",
-    "IPL": "आईपीएल",
-    "Manoj": "मनोज",
 }
 
 

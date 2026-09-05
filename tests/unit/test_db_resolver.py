@@ -95,6 +95,46 @@ async def test_resolver_denormalizes_crm_prompt_pack(sm):
     assert unlinked.settings.prompt_pack == "generic"
 
 
+@pytest.mark.asyncio
+async def test_resolver_denormalizes_crm_pronunciation_overrides(sm):
+    """crm_id=tenant.crm_id has a companion denormalization onto
+    settings.pronunciation_overrides (mirrors prompt_pack): a tenant linked to
+    a Crm with pronunciation_overrides set gets that dict; a tenant with no
+    linked CRM, or linked to a Crm with no overrides set, gets None (that
+    CRM's TTS then uses only the generic DEFAULT_PRONUNCIATIONS default)."""
+    async with sm() as s:
+        s.add(Crm(
+            id="betstudio", name="BetStudio", base_url="https://x",
+            pronunciation_overrides={"Casino": "कसीनो"},
+        ))
+        s.add(Crm(id="plain_crm", name="Plain", base_url="https://y"))
+        s.add(Tenant(
+            id="t_linked", slug="linked", name="Linked", status="active",
+            timezone="Asia/Kolkata", default_language="hi", mode="layered",
+            max_concurrent_calls=1, crm_id="betstudio", pipeline_config={}))
+        s.add(Tenant(
+            id="t_linked_no_overrides", slug="linked-no-overrides", name="LinkedNoOverrides",
+            status="active", timezone="Asia/Kolkata", default_language="hi", mode="layered",
+            max_concurrent_calls=1, crm_id="plain_crm", pipeline_config={}))
+        s.add(Tenant(
+            id="t_unlinked", slug="unlinked", name="Unlinked", status="active",
+            timezone="Asia/Kolkata", default_language="hi", mode="layered",
+            max_concurrent_calls=1, pipeline_config={}))
+        await s.commit()
+
+    r = DbTenantResolver(sm)
+    assert await r.reload() == 3
+
+    linked = await r.resolve_by_slug("linked")
+    assert linked.settings.pronunciation_overrides == {"Casino": "कसीनो"}
+
+    linked_no_overrides = await r.resolve_by_slug("linked-no-overrides")
+    assert linked_no_overrides.settings.pronunciation_overrides is None
+
+    unlinked = await r.resolve_by_slug("unlinked")
+    assert unlinked.settings.pronunciation_overrides is None
+
+
 def test_secret_optional_tenant_then_env_then_none(monkeypatch):
     """Optional secrets (e.g. webhook signing) resolve from the decrypted per-tenant
     secrets first, then process env, and return None (NOT raise) when unset."""
