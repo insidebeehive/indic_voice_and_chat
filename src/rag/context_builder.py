@@ -212,6 +212,32 @@ class GuardConfig:
         "Mujhe yeh humari documentation mein nahi mil raha. "
         "Kya aap dobara puch sakte hain ya main aapko team se connect karaun?"
     )
+    # Unverified-data guard fallbacks (ticket #1762 fix, Step 5 / review Fix 4
+    # + Fix 5). Language-selected the same way as fallback_text_en/hi above —
+    # not hardcoded English. Phrased as an OFFER requiring the customer's
+    # confirmation ("would you like me to connect you...?"), not a
+    # declarative promise ("let me connect you now") — consistent with the
+    # existing ESCALATION prompt rule (offer first, wait for a yes; never
+    # promise a handoff that isn't actually triggered yet). The "_with_figure"
+    # variant takes one ``{figure}`` placeholder for the customer's own
+    # disputed figure (e.g. "₹19,600").
+    unverified_data_fallback_en: str = (
+        "I'm not able to verify that right now — would you like me to connect you "
+        "to someone who can check?"
+    )
+    unverified_data_fallback_en_with_figure: str = (
+        "I can see you've reported {figure}, but I'm not able to verify it right "
+        "now — would you like me to connect you to someone who can check?"
+    )
+    unverified_data_fallback_hi: str = (
+        "Mujhe abhi ispe confirm karne mein dikkat ho rahi hai. Kya aap chahenge ki "
+        "main aapko team se connect karaun jo ise check kar sake?"
+    )
+    unverified_data_fallback_hi_with_figure: str = (
+        "Aapne {figure} bataya hai, lekin mujhe abhi ispe confirm karne mein dikkat "
+        "ho rahi hai. Kya aap chahenge ki main aapko team se connect karaun jo ise "
+        "check kar sake?"
+    )
 
 
 def apply_hallucination_guard(
@@ -277,7 +303,9 @@ def apply_hallucination_guard(
 _TIME_OF_DAY_PATTERN = re.compile(
     r"\b\d{1,2}:\d{2}\s*(am|pm|AM|PM)?\b|\b\d{1,2}\.\d{2}\s*(am|pm|AM|PM)\b"
 )
-_CURRENCY_FIGURE_PATTERN = re.compile(r"(?:₹|\bRs\.?|\bINR)\s?\d[\d,]*\b", re.IGNORECASE)
+_CURRENCY_FIGURE_PATTERN = re.compile(
+    r"(?:₹|\bRs\.?|\bINR)\s?\d[\d,]*(?:\.\d+)?\b", re.IGNORECASE
+)
 
 
 def apply_no_grounding_guard(
@@ -321,3 +349,149 @@ def apply_no_grounding_guard(
         extra={"response_text": text[:200]},
     )
     return new
+
+
+# --- Unverified-data guard (ticket #1762 fix, Step 5) ---------------------
+
+_NUMERIC_TOKEN_PATTERN = re.compile(r"\d[\d,]*(?:\.\d+)?")
+
+
+def _normalize_number(token: str) -> str:
+    """Canonical, floating-point-safe form of a numeric string.
+
+    '4,250.75', '4250.75', and '4250.750' must all normalize to the SAME
+    value ('4250.75'); '2,075' and '2075.00' must both normalize to '2075'.
+    Deliberately string-based (never float()/Decimal()) — a float round-trip
+    can itself introduce representation drift (e.g. 4250.75 -> 4250.7499999),
+    which would reintroduce the exact class of false-positive this fixes.
+
+    Review Fix 1 (ticket #1762): the reply-side figure (matched via
+    _CURRENCY_FIGURE_PATTERN) and the grounded-text side (matched via
+    _NUMERIC_TOKEN_PATTERN) must run through this SAME normalization, or a
+    real tool amount like 4250.75 fails to match a reply that states it.
+    """
+    cleaned = token.replace(",", "").strip()
+    if "." in cleaned:
+        integer_part, _, frac_part = cleaned.partition(".")
+        frac_part = frac_part.rstrip("0")
+        integer_part = integer_part.lstrip("0") or "0"
+        return f"{integer_part}.{frac_part}" if frac_part else integer_part
+    return cleaned.lstrip("0") or "0"
+
+
+def _normalize_currency_match(match: str) -> str:
+    """Strip a currency-figure regex match (e.g. '₹8,100' or '₹4,250.75')
+    down to its normalized numeric token ('8100' / '4250.75') for comparison
+    against grounded text."""
+    m = _NUMERIC_TOKEN_PATTERN.search(match)
+    return _normalize_number(m.group()) if m else match
+
+
+def _numeric_tokens(text: str) -> set[str]:
+    """Every bare numeric token in *text*, normalized the SAME way as
+    _normalize_currency_match (see _normalize_number) — both sides of the
+    comparison must treat equal values as equal regardless of comma/decimal
+    rendering. Deliberately not restricted to currency-prefixed numbers: a
+    tool result's raw JSON often carries an amount as a plain number (e.g.
+    {"amount": 19600}) with no ₹/Rs prefix at all, and that must still count
+    as grounding.
+
+    Review Fix 1 (round 3, ticket #1762): a grounded decimal value (e.g.
+    4250.75) also grounds its whole-rupee truncation and round-to-nearest-
+    rupee forms ('4250' / '4251'), since a reply is allowed to state "about
+    ₹4,250" for a real ₹4,250.75 balance without being flagged. Only ever
+    ADDS forms derived from an already-grounded value — cannot loosen the
+    guard against a value that was never grounded in the first place."""
+    out: set[str] = set()
+    for t in _NUMERIC_TOKEN_PATTERN.findall(text or ""):
+        n = _normalize_number(t)
+        out.add(n)
+        if "." in n:
+            whole, _, frac = n.partition(".")
+            out.add(whole)
+            rounded_up = str(int(whole) + 1) if frac and int(frac[0]) >= 5 else whole
+            out.add(rounded_up)
+    return out
+
+
+def apply_unverified_data_guard(
+    response: ChatBotResponse,
+    grounded_text: str,
+    customer_text: str = "",
+    config: Optional[GuardConfig] = None,
+) -> ChatBotResponse:
+    """Model-independent last-line-of-defense guard (ticket #1762 fix, Step 5).
+
+    Checks every currency figure (₹ / Rs / INR ...) in the reply against
+    ``grounded_text`` — the caller assembles this from THIS turn's actually
+    grounded sources: successful tool results, RAG context, the customer's
+    query, and the customer's own prior turns (see the call site in
+    src/agents/chatbot.py for exactly what goes in). If any figure in the
+    reply is not backed by a matching numeric token anywhere in
+    ``grounded_text``, the ENTIRE reply is replaced with a safe fallback
+    (never partially edited — an unverified number is a signal the whole
+    reply may not be trustworthy), confidence is downgraded to "low", and an
+    error is logged.
+
+    Deliberately independent of whether a tool was *called* this turn —
+    unlike ``apply_no_grounding_guard``, which skips its check whenever any
+    tool call happened THIS turn, even a FAILED one (the second concrete bug
+    behind ticket #1762: a called-but-failed tool is exactly the case with no
+    real grounding). This guard only asks whether the number is actually
+    present in grounded text, never whether machinery ran.
+
+    ``customer_text`` — the customer-authored portion of the conversation
+    (their current query plus their own prior turns), used ONLY to pick a
+    disputed figure to name in the fallback (e.g. "I can see you've reported
+    a ₹19,600 withdrawal..." rather than a generic "I can't verify this"),
+    per the incident's actual resolution wording. Deliberately not sourced
+    from tool results or RAG content, so the guard can never end up
+    "confirming" a number back to the customer that came from the model's own
+    unverified claim.
+
+    Known limitations (documented, not fixed — product decisions for the
+    project owner, not defaults to change unilaterally):
+    - ``customer_text`` only ever includes string-content turns. A figure the
+      customer supplied via an IMAGE (e.g. a screenshot of their own
+      transaction history, as in the original #1762 dispute) is invisible to
+      the disputed-figure fallback wording, and a reply that correctly reads
+      a number off that screenshot is blocked exactly like a fabricated one
+      (fails safe, but isn't ideal) — there's no OCR path today.
+    - Only digit-string figures are recognized. Hinglish multiplier phrasing
+      ("2 lakh", "50 hazaar") is not parsed and will be treated as ungrounded
+      even when correct.
+    """
+    if not response.response_text:
+        return response
+    matches = _CURRENCY_FIGURE_PATTERN.findall(response.response_text)
+    if not matches:
+        return response
+    grounded_numbers = _numeric_tokens(grounded_text)
+    unverified = [m for m in matches if _normalize_currency_match(m) not in grounded_numbers]
+    if not unverified:
+        return response
+
+    log.error(
+        "unverified-data guard: reply contained a currency figure with no grounding "
+        "in this turn's tool results/RAG context/query/history — reply replaced",
+        extra={"unverified_figures": unverified, "response_text": response.response_text[:200]},
+    )
+    cfg = config or GuardConfig()
+    is_hindi = (response.language or "").startswith("hi")
+    disputed = _CURRENCY_FIGURE_PATTERN.search(customer_text or "")
+    if disputed:
+        template = cfg.unverified_data_fallback_hi_with_figure if is_hindi \
+            else cfg.unverified_data_fallback_en_with_figure
+        text_out = template.format(figure=disputed.group())
+    else:
+        text_out = cfg.unverified_data_fallback_hi if is_hindi else cfg.unverified_data_fallback_en
+    return ChatBotResponse(
+        response_text=text_out,
+        language=response.language,
+        sources_used=[],
+        confidence="low",
+        action=response.action,
+        suggested_followups=list(response.suggested_followups),
+        raw=dict(response.raw),
+        parse_error=response.parse_error,
+    )

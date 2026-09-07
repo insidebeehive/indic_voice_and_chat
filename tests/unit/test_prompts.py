@@ -259,6 +259,63 @@ def test_chatbot_prompt_hinglish_script_matching() -> None:
     assert "Devanagari" in prompt
 
 
+def test_chatbot_prompt_tool_failure_section_positioned_after_response_quality() -> None:
+    # Ticket #1762 fix: TOOL FAILURE was moved out of the DATA RULE block into
+    # its own standalone section, placed after RESPONSE QUALITY and immediately
+    # before the JSON schema instruction (the last substantive rule the model
+    # sees before the response-format instruction).
+    prompt = build_chatbot_system_prompt(company_name="Acme")
+    assert "RESPONSE QUALITY:" in prompt
+    assert "TOOL FAILURE:" in prompt
+    assert "Respond with a single JSON object matching this schema:" in prompt
+    assert (
+        prompt.index("RESPONSE QUALITY:")
+        < prompt.index("TOOL FAILURE:")
+        < prompt.index("Respond with a single JSON object matching this schema:")
+    )
+
+
+def test_chatbot_prompt_tool_failure_listed_in_protected_rules() -> None:
+    # The conflict-tiebreaker paragraph must name TOOL FAILURE alongside the
+    # other rules that can never be overridden, so the "err on the side of
+    # helping" flexibility can't be read as license to fabricate on tool
+    # failure.
+    prompt = build_chatbot_system_prompt(company_name="Acme")
+    assert "not the DATA RULE above" in prompt
+    assert "not TOOL FAILURE below" in prompt
+
+
+def test_chatbot_prompt_tool_failure_forbids_fabrication_and_is_not_duplicated() -> None:
+    # The new standalone TOOL FAILURE section must explicitly forbid stating a
+    # specific number/status/verification claim on tool failure, and the old
+    # embedded sentence inside the DATA RULE block must be genuinely gone
+    # (not duplicated in two places).
+    prompt = build_chatbot_system_prompt(company_name="Acme")
+    tool_failure_idx = prompt.index("TOOL FAILURE:\n")
+    tool_failure_section = prompt[tool_failure_idx:]
+    assert "FORBIDDEN" in tool_failure_section
+
+    data_rule_idx = prompt.index("DATA RULE (a hard rule):")
+    data_rule_section = prompt[data_rule_idx:tool_failure_idx]
+    assert "FORBIDDEN" not in data_rule_section
+    assert (
+        "say so honestly (e.g. 'I'm not able to pull that up right now"
+        not in data_rule_section
+    )
+    # Only one TOOL FAILURE section header should exist in the whole prompt.
+    assert prompt.count("TOOL FAILURE:\n") == 1
+
+
+def test_chatbot_prompt_response_quality_references_tool_failure() -> None:
+    # RESPONSE QUALITY must point forward to TOOL FAILURE so the "always give
+    # substance" instruction isn't read as overriding it on tool failure.
+    prompt = build_chatbot_system_prompt(company_name="Acme")
+    response_quality_idx = prompt.index("RESPONSE QUALITY:")
+    tool_failure_idx = prompt.index("TOOL FAILURE:")
+    response_quality_section = prompt[response_quality_idx:tool_failure_idx]
+    assert "TOOL FAILURE below overrides this section's" in response_quality_section
+
+
 def test_response_schemas_are_valid_json() -> None:
     # Smoke test — assert they're JSON-serializable
     json.dumps(VOICEBOT_RESPONSE_SCHEMA)

@@ -14,8 +14,8 @@ inbound (customers chat with us).
 |---|---|
 | Agent | `src/agents/chatbot.py` `ChatBotAgent` (text counterpart to `VoiceBotAgent`) |
 | LLM | provider registry (`get_llm`); Gemini multimodal + function-calling (`src/providers/llm/gemini.py`) |
-| RAG | `src/rag/*` (ingestion, `LocalEmbedder` multilingual MiniLM, `HybridRetriever` = FAISS + BM25, context builder + hallucination guard) |
-| Vector store | per-tenant `FAISSAdapter` (index path `data/faiss/{tenant_id}/`) via the runtime registry |
+| RAG | `src/rag/*` (ingestion, `GeminiEmbedder` 384-dim multilingual embeddings, `HybridRetriever` = vector search + BM25, context builder + hallucination/no-grounding/unverified-data guards) |
+| Vector store | per-tenant, config-selected (`vector_store.provider`): `pgvector` by default, or file-backed `faiss` as an alternative — via `src/providers/get_vector_store` and the runtime registry. The CRM-level shared KB (below) is **pgvector-only**: FAISS has no CRM-level tier by design, so a CRM with `vector_store.provider != pgvector` simply gets no CRM-shared KB. `LocalEmbedder` (`sentence-transformers`) also exists in `src/rag/embeddings.py` but isn't what's wired into the live retriever factory. |
 | Sessions | Redis `SessionStore` (history/state) + Postgres (`chat_sessions`, `chat_messages`) |
 | Tools | builtin `ToolSpec`s + per-tenant `chat_tools` rows; tokens encrypted in `tenant_secrets` |
 | Voice handoff | the browser voice bridge (`make_browser_bridge_factory`) |
@@ -79,11 +79,17 @@ Knowledge base:
   product-module content it has opted into, see below) are included in
   voice calls too, not just chat's per-turn retrieval (`ChatBotAgent`,
   `/knowledge/query`).
-- **Frontend UI/navigation KB:** `data/kb/global/frontend-ui/` (8 files,
-  `ui-`-prefixed to keep every stem under `data/kb/global/` unique — see the
-  design spec) documents UI/navigation behavior common to every layout; it
-  rides the same CRM-wide auto-seed as the backend docs above, no extra
-  step needed. `data/kb/layouts/layout-N.md` (one per frontend package —
+- **Bundled KB packs (opt-in per CRM):** the backend docs above and a
+  companion frontend/UI-navigation set live together under
+  `data/kb/packs/<pack-name>/` (e.g. `data/kb/packs/betting-default/`, with
+  the UI docs in its `frontend-ui/` subfolder, 8 files, `ui-`-prefixed to
+  keep every stem under the pack directory unique — see the design spec).
+  A `Crm` row's `bundled_kb_pack` column names which pack (if any) gets
+  auto-seeded into that CRM's shared KB at boot (`_seed_crm_kb` in
+  `src/main.py`); a CRM with `bundled_kb_pack` unset gets no bundled docs at
+  all. Seeding is all-or-nothing per pack — a CRM that opts in gets both the
+  backend and frontend-ui docs together, no extra step needed.
+  `data/kb/layouts/layout-N.md` (one per frontend package —
   `layout-1` … `layout-9`, `layout-sports`) documents UI **deltas** specific
   to one layout — these are NOT auto-seeded (they'd contradict each other
   across tenants on different layouts) and must be ingested per-tenant.
@@ -105,12 +111,11 @@ Knowledge base:
 - **Product-module KB (opt-in per tenant):** `data/kb/modules/` (6 ingestible
   docs — one backend doc plus its `ui-`-prefixed UI-help counterpart for each
   of casino, sports betting, and matka/lottery — plus a reference-only
-  `README.md`) is a third tier, and unlike
-  `data/kb/global/` it is **NOT** force-seeded CRM-wide. These files used to
-  live under `data/kb/global/` and `data/kb/global/frontend-ui/` and rode the
-  auto-seed, which handed every tenant content for verticals it may not run —
-  not every operator offers casino, sports, and matka. A tenant now opts in
-  explicitly, either via `POST /api/v1/knowledge/ingest-layout` with the key
+  `README.md`) is a third tier, independent of the CRM-level bundled-pack
+  opt-in above: it is **NOT** seeded automatically for any CRM, regardless
+  of that CRM's `bundled_kb_pack` choice — not every operator offers casino,
+  sports, and matka. A tenant opts in explicitly, either via
+  `POST /api/v1/knowledge/ingest-layout` with the key
   `casino`, `sports`, or `matka`, or from the backoffice's **Ingest KB doc**
   dropdown under the **Product modules** optgroup. One key ingests that
   vertical's **pair** of files as two separate tenant-scoped `KBDocument` rows

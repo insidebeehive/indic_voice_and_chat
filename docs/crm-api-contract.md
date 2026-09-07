@@ -11,6 +11,7 @@
 - Authentication: **Bearer token** (sent as `Authorization: Bearer <token>`) — token is configured once during tenant onboarding
 - All responses are free-form JSON; the AI reads and interprets them — no strict schema required, but the fields listed below are expected
 - Failures (4xx/5xx) are handled gracefully — the AI will tell the customer it couldn't retrieve the information and offer to escalate
+- Every endpoint below is registered as a named tool; the tool name (shown under each heading) is what you pass in the **Onboarding** call at the bottom of this document
 
 ---
 
@@ -21,6 +22,7 @@ These are called when a logged-in player starts a chat session. The chatbot auto
 ---
 
 ### 1. Player Wallet
+**Tool name:** `get_player_wallet`
 
 ```
 GET /players/{user_id}/wallet?operator_id={operator_id}
@@ -47,6 +49,7 @@ GET /players/{user_id}/wallet?operator_id={operator_id}
 ---
 
 ### 2. Player Transactions
+**Tool name:** `get_player_transactions`
 
 ```
 GET /players/{user_id}/transactions?operator_id={operator_id}&type={type}&limit={limit}
@@ -88,6 +91,7 @@ Negative `amount` = debit from player wallet.
 ---
 
 ### 3. Player Bets
+**Tool name:** `get_player_bets`
 
 ```
 GET /players/{user_id}/bets?operator_id={operator_id}&status={status}&limit={limit}
@@ -136,6 +140,7 @@ GET /players/{user_id}/bets?operator_id={operator_id}&status={status}&limit={lim
 ---
 
 ### 4. Player Bonuses
+**Tool name:** `get_player_bonuses`
 
 ```
 GET /players/{user_id}/bonuses?operator_id={operator_id}
@@ -167,6 +172,7 @@ GET /players/{user_id}/bonuses?operator_id={operator_id}
 ---
 
 ### 5. Player Profile
+**Tool name:** `get_player_profile`
 
 ```
 GET /players/{user_id}/profile?operator_id={operator_id}
@@ -199,6 +205,7 @@ GET /players/{user_id}/profile?operator_id={operator_id}
 ---
 
 ### 6. Player Responsible Gaming
+**Tool name:** `get_player_responsible_gaming`
 
 ```
 GET /players/{user_id}/responsible-gaming?operator_id={operator_id}
@@ -226,6 +233,7 @@ GET /players/{user_id}/responsible-gaming?operator_id={operator_id}
 ---
 
 ### 7. Player Referral Code
+**Tool name:** `get_referral_code`
 
 ```
 GET /players/{user_id}/referral-code
@@ -247,6 +255,7 @@ GET /players/{user_id}/referral-code
 ---
 
 ### 8. Player Sports Open Bets
+**Tool name:** `get_sports_open_bets`
 
 ```
 GET /players/{user_id}/sports-bets/open?limit={limit}
@@ -282,6 +291,7 @@ GET /players/{user_id}/sports-bets/open?limit={limit}
 ---
 
 ### 9. Player Sports Match Status (Today's Results)
+**Tool name:** `get_sports_match_status`
 
 ```
 GET /players/{user_id}/sports-bets/today-results
@@ -327,6 +337,7 @@ Include all main-market bets placed today (settled and still pending).
 ---
 
 ### 10. Player Casino Game History
+**Tool name:** `get_casino_game_history`
 
 ```
 GET /players/{user_id}/casino-game-history?game_name={game_name}&limit={limit}
@@ -368,12 +379,13 @@ Return `null` (or 404) if the player has no history for the requested game.
 ---
 
 ### 11. Player Matka Bids
+**Tool name:** `get_matka_bids`
 
 ```
 GET /players/{user_id}/matka-bids?operator_id={operator_id}&status={status}&market={market}&limit={limit}
 ```
 
-**When called:** Player asks about their OWN Matka bids or results — open/pending bids, bid history, whether a bid was accepted, cancellation/refund status, or why a win wasn't credited (e.g. "Matka mein open bets dikhao", "meri Matka history dikhao", "kya mera bet accept hua?", "Kalyan ka result kya aaya mera bet ka?", "market cancel hua toh refund milega?", "meri jeet credit kyu nahi hui?"). For a market's raw declared result with no reference to the player's own bet, use endpoint 12 under Operator Endpoints (Matka Result) instead.
+**When called:** Player asks about their OWN Matka bids or results — open/pending bids, bid history, whether a bid was accepted, cancellation/refund status, or why a win wasn't credited (e.g. "Matka mein open bets dikhao", "meri Matka history dikhao", "kya mera bet accept hua?", "Kalyan ka result kya aaya mera bet ka?", "market cancel hua toh refund milega?", "meri jeet credit kyu nahi hui?"). For a market's raw declared result with no reference to the player's own bet, use **Matka Result** under Operator Endpoints instead.
 
 **Query params set by AI:**
 - `status` — `open` | `settled` | `cancelled` | `all` (default: `all`)
@@ -429,6 +441,7 @@ GET /players/{user_id}/matka-bids?operator_id={operator_id}&status={status}&mark
 ---
 
 ### 12. Player Latest Deposit Order
+**Tool name:** `get_player_latest_deposit_order`
 
 ```
 GET /players/{user_id}/latest-deposit-order
@@ -454,23 +467,19 @@ Return the single most recent attempt only, not a list. Return `null` (or 404) i
 
 ---
 
-## Operator Endpoints
-
-These are called for any question about how the platform works — payment methods, games, promotions, platform settings. Only `operator_id` is injected (no `user_id`).
-
----
-
-### 7. Payment Configuration
+### 13. Player Payment Configuration
+**Tool name:** `get_payment_config`
 
 ```
-GET /operators/{operator_id}/payment-config
+GET /operators/{operator_id}/players/{user_id}/payment-config
 ```
 
-**When called:** Questions about deposit/withdrawal methods, min/max amounts, supported banks, UPI support, processing time.
+**When called:** Player asks which bank account or UPI ID to deposit into, where to send money, what their deposit options are, or what withdrawal channels/limits apply to them. **This is player-personalized, not a flat platform-wide config** — the destination account, and sometimes the limits, vary by player tier/rating, so `user_id` is required and the response must reflect that specific player's assignment.
 
 **Expected response:**
 ```json
 {
+  "deposit_destination": { "bank": "HDFC", "account_number": "50100123456789", "ifsc": "HDFC0001234", "upi_id": "operatorpay@hdfcbank" },
   "deposit_methods": ["UPI", "Net Banking", "Debit Card", "Paytm"],
   "withdrawal_channels": ["Bank Transfer", "UPI"],
   "deposit_limits": { "min": 100, "max": 100000, "currency": "INR" },
@@ -482,15 +491,73 @@ GET /operators/{operator_id}/payment-config
 }
 ```
 
+`deposit_destination` is this specific player's assigned deposit account for their tier — this is the field that makes the endpoint player-specific rather than a static platform config; the remaining fields may be shared platform-wide values reflected back per player.
+
 ---
 
-### 8. Games Configuration
+## Operator Endpoints
+
+These are called for any question about how the platform works — payment methods, games, promotions, platform settings. Only `operator_id` is injected (no `user_id`), except where noted.
+
+---
+
+### 1. Game Search
+**Tool name:** `get_game`
+
+```
+GET /operators/{operator_id}/games?name={name}
+```
+
+**When called:** Customer asks about a named game, wants to know how many variants exist, or wants to list games of a specific type (e.g. "how many Andar Bahar games?", "list all roulette variants", "what Teen Patti games are available?", "is Andar Bahar available?", "what are the limits for roulette?").
+
+**Query params set by AI:**
+- `name` — name or type of game to search for (e.g. `Andar Bahar`, `Roulette`, `Teen Patti`) — returns all matching variants
+
+**Expected response:**
+```json
+{
+  "games": [
+    { "title": "Andar Bahar Classic", "provider": "Ezugi", "available": true, "min_bet": 10, "max_bet": 50000, "rtp": 97.5 },
+    { "title": "Andar Bahar VIP", "provider": "Evolution", "available": true, "min_bet": 100, "max_bet": 200000, "rtp": 98.0 }
+  ],
+  "total": 2
+}
+```
+
+Return an empty `games` array (not 404) if the search matches nothing.
+
+---
+
+### 2. Game Providers
+**Tool name:** `get_game_providers`
+
+```
+GET /operators/{operator_id}/providers
+```
+
+**When called:** Customer asks general questions about available games or providers without naming a specific game (e.g. "what games do you have?", "which providers are available?", "how many games are there?").
+
+**Expected response:**
+```json
+{
+  "providers": [
+    { "name": "Evolution Gaming", "game_count": 42 },
+    { "name": "Ezugi", "game_count": 28 },
+    { "name": "Pragmatic Play", "game_count": 65 }
+  ]
+}
+```
+
+---
+
+### 3. Games Configuration
+**Tool name:** `get_operator_games_config`
 
 ```
 GET /operators/{operator_id}/games-config
 ```
 
-**When called:** Questions about available games, sports, live casino, Matka, lottery.
+**When called:** Questions about available games, sports, live casino, Matka, lottery — which product **categories** are on, not specific games or providers (use Game Search / Game Providers above for that).
 
 **Actual response** (per-category `enabled` flags, nested — not flat lists/bools):
 ```json
@@ -507,13 +574,14 @@ No provider/league lists, no `virtual_sports`/`in_play_betting`/`cashout_availab
 
 ---
 
-### 9. Promotions & VIP
+### 4. Promotions & VIP
+**Tool name:** `get_operator_promotions`
 
 ```
 GET /operators/{operator_id}/promotions
 ```
 
-**When called:** Questions about welcome bonus, cashback, active promotions, referral program, VIP tiers and benefits.
+**When called:** Questions about welcome bonus, cashback, active promotions, referral program, VIP tiers and benefits. Does **not** cover a specific player's own referral code/link — that's **Player Referral Code** above.
 
 **Expected response:**
 ```json
@@ -545,7 +613,8 @@ GET /operators/{operator_id}/promotions
 
 ---
 
-### 10. Platform Configuration
+### 5. Platform Configuration
+**Tool name:** `get_operator_platform_config`
 
 ```
 GET /operators/{operator_id}/platform-config
@@ -580,13 +649,14 @@ GET /operators/{operator_id}/platform-config
 
 ---
 
-### 11. Matka Configuration
+### 6. Matka Configuration
+**Tool name:** `get_matka_config`
 
 ```
 GET /operators/{operator_id}/matka-config?market_name={market_name}
 ```
 
-**When called:** Questions about Matka platform config, game types, odds, or timing — NOT an actual declared result (see endpoint 12, Matka Result, for that). E.g. "which Matka markets are available?", "is Starline available?", "is Jackpot Matka available?", "what bet types are supported?", "what are the payout rates for Jodi?", "when does Kalyan close?", "what is the minimum Matka bet?".
+**When called:** Questions about Matka platform config, game types, odds, or timing — NOT an actual declared result (see **Matka Result** below for that). E.g. "which Matka markets are available?", "is Starline available?", "is Jackpot Matka available?", "what bet types are supported?", "what are the payout rates for Jodi?", "when does Kalyan close?", "what is the minimum Matka bet?".
 
 **Query params set by AI:**
 - `market_name` — optional, filter to a specific market (e.g. `Kalyan`, `Milan Day`, `Starline`). Omit for the full Matka config.
@@ -611,11 +681,12 @@ GET /operators/{operator_id}/matka-config?market_name={market_name}
 }
 ```
 
-**Not to be confused with:** endpoint 12 (Matka Result) — this endpoint describes the market's *rules and schedule*, not what number was actually declared.
+**Not to be confused with:** **Matka Result** below — this endpoint describes the market's *rules and schedule*, not what number was actually declared.
 
 ---
 
-### 12. Matka Result
+### 7. Matka Result
+**Tool name:** `get_matka_result`
 
 ```
 GET /operators/{operator_id}/matka-results?market={market}&date={date}
@@ -642,7 +713,60 @@ GET /operators/{operator_id}/matka-results?market={market}&date={date}
 
 `status` — `declared` | `pending` (result not out yet) | `not_found` (invalid market/date). `sessions` may contain one entry (single-session markets like Starline) or two (Open/Close markets). This endpoint does **not** need to know about any player's bets — it's a lookup of the market's own declared number, same data as would appear in an app's public "Results" screen.
 
-**Not to be confused with:** endpoint 11 (Player Matka Bids, under Player Endpoints) — that returns the *player's own* bid outcome/settlement (tied to a bet they placed), not the market's raw declared result.
+**Not to be confused with:** **Player Matka Bids** under Player Endpoints — that returns the *player's own* bid outcome/settlement (tied to a bet they placed), not the market's raw declared result.
+
+---
+
+### 8. Casino Bet Limit
+**Tool name:** `get_bet_limit`
+
+```
+GET /casino/{operator_id}/players/{user_id}/games/{game_name}/bet-limit
+```
+
+**When called:** Player asks about bet limits for a named casino game (e.g. "what's the bet limit for Teen Patti?", "minimum bet on Andar Bahar?"). Requires `user_id` — this is a per-player effective limit (the CRM resolves tier-based rules or per-user overrides internally and returns the single applicable limit; the chatbot never guesses or reconciles limits itself). Does not cover Matka — Matka stake/bet-type limits come from **Matka Configuration** above.
+
+**Query params set by AI:**
+- `game_name` — name of the casino game to check (e.g. `Teen Patti`, `Andar Bahar`)
+
+**Expected response:**
+```json
+{
+  "game": "Teen Patti",
+  "min_stake": 10,
+  "max_stake": 50000,
+  "max_profit": 200000,
+  "currency": "INR"
+}
+```
+
+`max_profit` is the upper limit on potential winnings for a single bet on this game, independent of `max_stake`.
+
+---
+
+### 9. Market Holiday Schedule
+**Tool name:** `get_market_holiday_schedule`
+
+```
+GET /matka/{operator_id}/markets/{market_name}/holiday-schedule
+```
+
+**When called:** Player asks whether markets are open or closed on a specific date or holiday (e.g. "are markets closed on Independence Day?", "is Kalyan open tomorrow?").
+
+**Query params set by AI:**
+- `market_name` — name of the matka market to check (e.g. `Kalyan`, `Milan Day`)
+
+**Expected response:**
+```json
+{
+  "market": "Kalyan",
+  "date": "2026-08-15",
+  "closed": true,
+  "reason": "Independence Day"
+}
+```
+
+`closed: false` and `reason: null` for a normal trading day.
 
 ---
 
@@ -736,17 +860,28 @@ Content-Type: application/json
   "tools": [
     "get_player_wallet",
     "get_player_transactions",
-    "get_player_latest_deposit_order",
     "get_player_bets",
     "get_player_bonuses",
     "get_player_profile",
     "get_player_responsible_gaming",
-    "get_operator_payment_config",
+    "get_referral_code",
+    "get_sports_open_bets",
+    "get_sports_match_status",
+    "get_casino_game_history",
+    "get_matka_bids",
+    "get_player_latest_deposit_order",
+    "get_payment_config",
+    "get_game",
+    "get_game_providers",
     "get_operator_games_config",
     "get_operator_promotions",
-    "get_operator_platform_config"
+    "get_operator_platform_config",
+    "get_matka_config",
+    "get_matka_result",
+    "get_bet_limit",
+    "get_market_holiday_schedule"
   ]
 }
 ```
 
-Omit the `tools` array to register every tool in this contract at once. This call is idempotent — safe to re-run when your base URL or token changes.
+The list above is every tool this contract documents (13 player + 9 operator). You don't have to implement all of them on day one — pass only the `tools` you've actually built; the chatbot answers from general knowledge or escalates for anything you haven't registered. Omit the `tools` array entirely to register every tool in this contract at once (harmless for ones you haven't implemented yet — they simply won't be called until you add them to a later registration). This call is idempotent — safe to re-run when your base URL, token, or tool list changes.

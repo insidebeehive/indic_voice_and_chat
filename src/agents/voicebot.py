@@ -34,6 +34,7 @@ from src.dialogue.response_parser import (
 from src.dialogue.slots import SlotFiller, SlotSchema
 from src.interfaces.llm import LLMMessage
 from src.pipeline.engine import AudioSink, PipelineEngine, TurnMetrics, TurnResult
+from src.utils.trace_id import new_trace_id, trace_id_scope
 
 
 log = logging.getLogger(__name__)
@@ -460,54 +461,55 @@ class VoiceBotAgent(BaseAgent):
             )
 
         # Utterance complete (the telephony layer determined this via VAD).
-        await self.state.fire(Event.UTTERANCE_COMPLETE)
+        with trace_id_scope(new_trace_id()):
+            await self.state.fire(Event.UTTERANCE_COMPLETE)
 
-        cancel_event = asyncio.Event()
-        try:
-            pipeline_result = await self._run_turn_with_backstop(
-                self._engine.run_turn(
-                    captured_audio=captured_audio,
-                    history=self._history_window(),
-                    audio_sink=audio_sink,
-                    cancel_event=cancel_event,
-                    language=to_bcp47(self._active_language),
-                ),
-                cancel_event,
-            )
-        except Exception as exc:  # noqa: BLE001 - a provider failure (incl. timeout) must not drop the call
-            # STT/LLM/TTS outage (e.g. a retired model 404). Walk the state
-            # machine back to LISTENING (PROCESSING -> RESPONDING -> LISTENING)
-            # so the conversation survives instead of crashing the call.
-            log.exception("pipeline turn failed; recovering to LISTENING")
-            await self.state.fire(Event.LLM_RESPONSE_READY)
-            await self.state.fire(Event.RESPONSE_DELIVERED)
-            return TurnOutcome(
-                response=VoiceBotResponse(
-                    response_text="",
-                    action="continue",
-                    parse_error=f"pipeline error: {type(exc).__name__}: {exc}",
-                ),
-                pipeline=TurnResult(
-                    user_text="",
-                    user_language=None,
-                    user_confidence=0.0,
-                    agent_text="",
-                    audio_bytes_sent=0,
-                    metrics=TurnMetrics(),
-                ),
-            )
+            cancel_event = asyncio.Event()
+            try:
+                pipeline_result = await self._run_turn_with_backstop(
+                    self._engine.run_turn(
+                        captured_audio=captured_audio,
+                        history=self._history_window(),
+                        audio_sink=audio_sink,
+                        cancel_event=cancel_event,
+                        language=to_bcp47(self._active_language),
+                    ),
+                    cancel_event,
+                )
+            except Exception as exc:  # noqa: BLE001 - a provider failure (incl. timeout) must not drop the call
+                # STT/LLM/TTS outage (e.g. a retired model 404). Walk the state
+                # machine back to LISTENING (PROCESSING -> RESPONDING -> LISTENING)
+                # so the conversation survives instead of crashing the call.
+                log.exception("pipeline turn failed; recovering to LISTENING")
+                await self.state.fire(Event.LLM_RESPONSE_READY)
+                await self.state.fire(Event.RESPONSE_DELIVERED)
+                return TurnOutcome(
+                    response=VoiceBotResponse(
+                        response_text="",
+                        action="continue",
+                        parse_error=f"pipeline error: {type(exc).__name__}: {exc}",
+                    ),
+                    pipeline=TurnResult(
+                        user_text="",
+                        user_language=None,
+                        user_confidence=0.0,
+                        agent_text="",
+                        audio_bytes_sent=0,
+                        metrics=TurnMetrics(),
+                    ),
+                )
 
-        if pipeline_result.cancelled:
-            await self.state.fire(Event.LLM_RESPONSE_READY)
-            await self.state.fire(Event.RESPONSE_DELIVERED)
-            return TurnOutcome(
-                response=VoiceBotResponse(
-                    response_text="", action="continue", parse_error="barge-in"
-                ),
-                pipeline=pipeline_result,
-            )
+            if pipeline_result.cancelled:
+                await self.state.fire(Event.LLM_RESPONSE_READY)
+                await self.state.fire(Event.RESPONSE_DELIVERED)
+                return TurnOutcome(
+                    response=VoiceBotResponse(
+                        response_text="", action="continue", parse_error="barge-in"
+                    ),
+                    pipeline=pipeline_result,
+                )
 
-        return await self._finish_turn(pipeline_result, audio_sink=audio_sink, cancel_event=cancel_event)
+            return await self._finish_turn(pipeline_result, audio_sink=audio_sink, cancel_event=cancel_event)
 
     async def _finish_turn(
         self,
@@ -780,59 +782,60 @@ class VoiceBotAgent(BaseAgent):
                 f"handle_turn_text called from {self.state.state.value}, expected listening"
             )
 
-        await self.state.fire(Event.UTTERANCE_COMPLETE)
+        with trace_id_scope(new_trace_id()):
+            await self.state.fire(Event.UTTERANCE_COMPLETE)
 
-        cancel_event = cancel_event or asyncio.Event()
-        try:
-            pipeline_result = await self._run_turn_with_backstop(
-                self._engine.run_turn_text(
-                    user_text,
-                    self._history_window(),
-                    audio_sink,
+            cancel_event = cancel_event or asyncio.Event()
+            try:
+                pipeline_result = await self._run_turn_with_backstop(
+                    self._engine.run_turn_text(
+                        user_text,
+                        self._history_window(),
+                        audio_sink,
+                        cancel_event,
+                        language=to_bcp47(self._active_language),
+                    ),
                     cancel_event,
-                    language=to_bcp47(self._active_language),
-                ),
-                cancel_event,
-            )
-        except Exception as exc:  # noqa: BLE001 - a provider failure (incl. timeout) must not drop the call
-            log.exception("pipeline turn (text) failed; recovering to LISTENING")
-            await self.state.fire(Event.LLM_RESPONSE_READY)
-            await self.state.fire(Event.RESPONSE_DELIVERED)
-            return TurnOutcome(
-                response=VoiceBotResponse(
-                    response_text="",
-                    action="continue",
-                    parse_error=f"pipeline error: {type(exc).__name__}: {exc}",
-                ),
-                pipeline=TurnResult(
-                    user_text="",
-                    user_language=None,
-                    user_confidence=0.0,
-                    agent_text="",
-                    audio_bytes_sent=0,
-                    metrics=TurnMetrics(),
-                ),
-            )
-
-        if pipeline_result.cancelled:
-            # Barge-in: user interrupted before hearing the reply. Keep the user
-            # turn (it was said and processed); drop the abandoned agent reply;
-            # return to LISTENING. The interruption follows as the next turn.
-            if pipeline_result.user_text:
-                self.session.turns.append(
-                    LLMMessage(role="user", content=pipeline_result.user_text)
                 )
-                await self.persist_turn("user", pipeline_result.user_text)
-            await self.state.fire(Event.LLM_RESPONSE_READY)
-            await self.state.fire(Event.RESPONSE_DELIVERED)
-            return TurnOutcome(
-                response=VoiceBotResponse(
-                    response_text="", action="continue", parse_error="barge-in"
-                ),
-                pipeline=pipeline_result,
-            )
+            except Exception as exc:  # noqa: BLE001 - a provider failure (incl. timeout) must not drop the call
+                log.exception("pipeline turn (text) failed; recovering to LISTENING")
+                await self.state.fire(Event.LLM_RESPONSE_READY)
+                await self.state.fire(Event.RESPONSE_DELIVERED)
+                return TurnOutcome(
+                    response=VoiceBotResponse(
+                        response_text="",
+                        action="continue",
+                        parse_error=f"pipeline error: {type(exc).__name__}: {exc}",
+                    ),
+                    pipeline=TurnResult(
+                        user_text="",
+                        user_language=None,
+                        user_confidence=0.0,
+                        agent_text="",
+                        audio_bytes_sent=0,
+                        metrics=TurnMetrics(),
+                    ),
+                )
 
-        return await self._finish_turn(pipeline_result, audio_sink=audio_sink, cancel_event=cancel_event)
+            if pipeline_result.cancelled:
+                # Barge-in: user interrupted before hearing the reply. Keep the user
+                # turn (it was said and processed); drop the abandoned agent reply;
+                # return to LISTENING. The interruption follows as the next turn.
+                if pipeline_result.user_text:
+                    self.session.turns.append(
+                        LLMMessage(role="user", content=pipeline_result.user_text)
+                    )
+                    await self.persist_turn("user", pipeline_result.user_text)
+                await self.state.fire(Event.LLM_RESPONSE_READY)
+                await self.state.fire(Event.RESPONSE_DELIVERED)
+                return TurnOutcome(
+                    response=VoiceBotResponse(
+                        response_text="", action="continue", parse_error="barge-in"
+                    ),
+                    pipeline=pipeline_result,
+                )
+
+            return await self._finish_turn(pipeline_result, audio_sink=audio_sink, cancel_event=cancel_event)
 
     async def handle_silence_timeout(self, audio_sink: AudioSink) -> Optional[TurnOutcome]:
         """User went silent in LISTENING — re-prompt or end the call.

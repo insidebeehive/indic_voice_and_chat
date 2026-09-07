@@ -6,6 +6,7 @@ from src.rag.context_builder import (
     GuardConfig,
     apply_hallucination_guard,
     apply_no_grounding_guard,
+    apply_unverified_data_guard,
     build_rag_context,
     build_voicebot_kb_context,
 )
@@ -312,3 +313,197 @@ def test_no_grounding_guard_passes_through_unrelated_text() -> None:
     )
     out = apply_no_grounding_guard(response, retrieved_any=False, tool_calls_made=[])
     assert out.confidence == "high"
+
+
+# --- Unverified-data guard (Step 5, ticket #1762) -------------------------
+
+
+def test_unverified_data_guard_regression_ticket_1762() -> None:
+    """The literal regression case: the bot claimed 'the only pending
+    withdrawal amount showing is ₹8,100' with zero grounding (every
+    get_player_transactions call had timed out), while the customer's real,
+    documented ₹19,600 withdrawal went unmentioned. This must be replaced,
+    and the fallback must name the customer's own real figure."""
+    response = ChatBotResponse(
+        response_text=(
+            "According to our system records, the only pending withdrawal amount "
+            "showing on your account is ₹8,100."
+        ),
+        language="en",
+        confidence="high",
+    )
+    out = apply_unverified_data_guard(
+        response,
+        grounded_text="",  # every tool call failed; nothing was retrieved
+        customer_text="I have a ₹19,600 withdrawal that's not showing.",
+    )
+    assert "8,100" not in out.response_text and "8100" not in out.response_text
+    assert "19,600" in out.response_text
+    assert out.confidence == "low"
+
+
+def test_unverified_data_guard_passes_grounded_figure() -> None:
+    """A figure that genuinely appears in grounded text (a real tool result,
+    RAG content, or the customer's own words) must survive untouched — false
+    positives here are as bad as the original bug."""
+    response = ChatBotResponse(
+        response_text="I can see your ₹19,600 withdrawal is showing as SUBMITTED.",
+        language="en",
+        confidence="high",
+    )
+    out = apply_unverified_data_guard(
+        response,
+        grounded_text='{"amount": 19600, "status": "SUBMITTED"}',
+        customer_text="",
+    )
+    assert out.response_text == response.response_text
+    assert out.confidence == "high"
+
+
+def test_unverified_data_guard_customer_own_figure_survives_even_unquoted_elsewhere() -> None:
+    """The customer's own real number, restated back to them, must remain
+    sayable even when no tool succeeded — it's grounded via customer_text/
+    grounded_text (their own prior words), not via a tool result."""
+    response = ChatBotResponse(
+        response_text="I can see you mentioned a ₹19,600 withdrawal.",
+        language="en",
+        confidence="high",
+    )
+    out = apply_unverified_data_guard(
+        response,
+        grounded_text="I have a ₹19,600 withdrawal that's not showing.",
+        customer_text="I have a ₹19,600 withdrawal that's not showing.",
+    )
+    assert out.response_text == response.response_text
+
+
+def test_unverified_data_guard_no_currency_figure_passes_through() -> None:
+    out = apply_unverified_data_guard(
+        ChatBotResponse(response_text="Let me check that for you.", confidence="high"),
+        grounded_text="",
+        customer_text="",
+    )
+    assert out.response_text == "Let me check that for you."
+
+
+def test_unverified_data_guard_empty_reply_passes_through() -> None:
+    response = ChatBotResponse(response_text="", confidence="low")
+    out = apply_unverified_data_guard(response, grounded_text="", customer_text="")
+    assert out is response  # short-circuit, no copy needed
+
+
+def test_unverified_data_guard_generic_fallback_when_no_disputed_figure() -> None:
+    """No customer-side figure to name -> generic (not fabricated) fallback."""
+    response = ChatBotResponse(response_text="Your balance is ₹500.", confidence="high")
+    out = apply_unverified_data_guard(response, grounded_text="", customer_text="")
+    assert "500" not in out.response_text
+    assert "I'm not able to verify" in out.response_text
+
+
+def test_unverified_data_guard_partial_number_is_not_a_false_match() -> None:
+    """A grounded '19600' must not spuriously 'ground' an unrelated reply
+    figure like '600' via naive substring matching -- token comparison must
+    be on the FULL numeric token, not a substring."""
+    response = ChatBotResponse(response_text="Your fee is ₹600.", confidence="high")
+    out = apply_unverified_data_guard(
+        response, grounded_text='{"amount": 19600}', customer_text="",
+    )
+    assert out.response_text != response.response_text
+    assert out.confidence == "low"
+
+
+def test_unverified_data_guard_decimal_figure_from_real_wallet_payload_survives() -> None:
+    """Review Fix 1 regression: docs/crm-api-contract.md's real wallet
+    payload shape uses decimal amounts (e.g. real_balance: 4250.75,
+    bonus_balance: 500.00). A reply that states these exact figures must NOT
+    be wrongly blocked just because the reply-side and grounded-text-side
+    number-extraction regexes used to normalize decimals differently
+    (₹4,250.75 -> '4250' vs a grounded '4250.75' -> no match)."""
+    response = ChatBotResponse(
+        response_text="Your real balance is ₹4,250.75 and your bonus balance is ₹500.00.",
+        language="en",
+        confidence="high",
+    )
+    out = apply_unverified_data_guard(
+        response,
+        grounded_text='{"real_balance": 4250.75, "bonus_balance": 500.00}',
+        customer_text="",
+    )
+    assert out.response_text == response.response_text
+    assert out.confidence == "high"
+
+
+def test_unverified_data_guard_decimal_and_integer_forms_of_same_value_match() -> None:
+    """A grounded whole-number amount (e.g. a real 'amount': 1000) must still
+    ground a reply that states it with a trailing '.00' (₹1,000.00), and
+    vice versa -- both sides must normalize to the same canonical value."""
+    response = ChatBotResponse(response_text="Your deposit of ₹1,000.00 was received.",
+                                confidence="high")
+    out = apply_unverified_data_guard(
+        response, grounded_text='{"amount": 1000}', customer_text="",
+    )
+    assert out.response_text == response.response_text
+    assert out.confidence == "high"
+
+
+def test_unverified_data_guard_rounded_decimal_survives() -> None:
+    """Round-3 review finding: a reply that rounds a real decimal balance to
+    the nearest rupee ("about ₹4,250" for a real ₹4,250.75) must NOT be
+    blocked -- this is the same false-positive class as Fix 1, one step
+    removed. Covers both truncation (4250.75 -> 4250) and round-up
+    (4750.75 -> 4751 is NOT what the reply says here, but the whole-number
+    truncation 4750 must still ground)."""
+    response = ChatBotResponse(
+        response_text="You have about ₹4,250 in your wallet, and ₹4,750 available in total.",
+        language="en",
+        confidence="high",
+    )
+    out = apply_unverified_data_guard(
+        response,
+        grounded_text='{"real_balance": 4250.75, "total_available": 4750.75}',
+        customer_text="",
+    )
+    assert out.response_text == response.response_text
+    assert out.confidence == "high"
+
+
+def test_unverified_data_guard_rounding_cannot_ground_an_unrelated_figure() -> None:
+    """The rounding widening only ADDS forms derived from an already-grounded
+    value -- it must never make an unrelated fabricated figure (e.g. the
+    original ₹8,100 incident) pass just because some other grounded decimal
+    happens to round near it."""
+    response = ChatBotResponse(
+        response_text="The only pending withdrawal amount showing is ₹8,100.",
+        language="en",
+        confidence="high",
+    )
+    out = apply_unverified_data_guard(
+        response,
+        grounded_text='{"real_balance": 4250.75, "total_available": 4750.75}',
+        customer_text="I reported a ₹19,600 withdrawal",
+    )
+    assert "8,100" not in out.response_text and "8100" not in out.response_text
+    assert out.confidence == "low"
+
+
+def test_unverified_data_guard_hindi_fallback_used_for_hindi_response() -> None:
+    """Review Fix 4 regression: the fallback must be language-selected like
+    the sibling guards (apply_hallucination_guard/apply_no_grounding_guard),
+    not hardcoded English."""
+    response = ChatBotResponse(response_text="Aapka balance ₹8,100 hai.",
+                                language="hi", confidence="high")
+    out = apply_unverified_data_guard(response, grounded_text="", customer_text="")
+    assert out.language == "hi"
+    assert "8,100" not in out.response_text and "8100" not in out.response_text
+    # Not the English fallback text.
+    assert "I'm not able to verify" not in out.response_text
+
+
+def test_unverified_data_guard_fallback_is_an_offer_not_a_promise() -> None:
+    """Review Fix 5 regression: the fallback must OFFER a handoff and require
+    confirmation (consistent with the existing ESCALATION prompt pattern),
+    not declare one is already happening."""
+    response = ChatBotResponse(response_text="Your balance is ₹8,100.", confidence="high")
+    out = apply_unverified_data_guard(response, grounded_text="", customer_text="")
+    assert "would you like" in out.response_text.lower()
+    assert "let me connect you" not in out.response_text.lower()

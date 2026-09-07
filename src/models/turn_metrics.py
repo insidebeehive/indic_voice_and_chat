@@ -45,8 +45,12 @@ class TurnMetric(Base):
     # perceived responsiveness, compare tts_first_chunk_ms instead.
     total_latency_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     tts_segments_dropped: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # Indexed: the Phase 2 aggregation job (src/observability/turn_metrics_push.py)
+    # filters on created_at >= cutoff every METRICS_PUSH_INTERVAL_S seconds
+    # forever, so an unindexed full-table scan would get worse every day as
+    # this table grows. See alembic/versions/0019_turn_metrics_created_at_index.py.
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=False), server_default=func.now()
+        DateTime(timezone=False), server_default=func.now(), index=True,
     )
 
 

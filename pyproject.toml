@@ -41,6 +41,7 @@ dependencies = [
     "python-multipart>=0.0.9",
     "cryptography>=42.0",
     "aiobotocore>=2.7",
+    "prometheus-client>=0.20",
 ]
 
 [project.optional-dependencies]

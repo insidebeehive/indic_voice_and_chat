@@ -60,6 +60,7 @@ from src.models.chat import ChatMessage, ChatSession
 import src.utils.http_fetch as http_fetch
 from src.utils.http_fetch import MAX_FETCH_BYTES as _MAX_MEDIA_FETCH_BYTES
 from src.utils.http_fetch import fetch_capped as _fetch_capped
+from src.utils.trace_id import new_trace_id, trace_id_scope
 
 log = logging.getLogger(__name__)
 router = APIRouter(prefix="/chat", tags=["chat"])
@@ -1699,6 +1700,13 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
                 await websocket.send_text(json.dumps({"type": "ended", "summary": summary, "reason": "customer_ended"}))
                 break
 
+            # Minted once per inbound message (not per session), before the
+            # duplicate-turn guard runs, so both outcomes — a turn let
+            # through and a turn dropped as a duplicate — carry their own
+            # trace id. Two turn-start log lines with different trace ids
+            # close together in time is the grep signature of the
+            # double-reply bug this whole mechanism exists to catch.
+            turn_trace_id = new_trace_id()
             fingerprint = _turn_fingerprint(msg)
             guard_token = _try_begin_turn(session_id, fingerprint)
             if guard_token is None:
@@ -1710,286 +1718,288 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
                 log.warning("duplicate chat turn dropped", extra={
                     "session_id": session_id, "ticket_id": ticket_id,
                     "message_type": mtype, "fingerprint": fingerprint,
+                    "trace_id": turn_trace_id,
                 })
                 continue
 
             # A single turn's failure must not black-hole the conversation: send an
             # error frame and keep the socket open (a real disconnect re-raises).
-            try:
-                if mtype == "audio":
-                    raw_data = msg.get("data")
-                    audio_media_url = (msg.get("media_url") or "").strip()
-                    mime = (msg.get("mime") or "").strip()
-                    if not raw_data and not audio_media_url:
-                        await websocket.send_text(json.dumps(
-                            {"type": "error", "message": "audio needs 'data' (base64) or 'media_url'"}))
-                        continue
-                    if raw_data and (not mime or not mime.startswith("audio/")):
-                        await websocket.send_text(json.dumps(
-                            {"type": "error", "message": "audio needs 'data' (base64) + 'mime' (audio/*)"}))
-                        continue
-                    if _media_store is None:
-                        await websocket.send_text(json.dumps(
-                            {"type": "error", "message": "voice messages not available — media storage not configured"}))
-                        continue
-                    audio_bytes: bytes | None = None
-                    if raw_data:
-                        try:
-                            audio_bytes = base64.b64decode(raw_data)
-                        except Exception:
+            with trace_id_scope(turn_trace_id):
+                try:
+                    if mtype == "audio":
+                        raw_data = msg.get("data")
+                        audio_media_url = (msg.get("media_url") or "").strip()
+                        mime = (msg.get("mime") or "").strip()
+                        if not raw_data and not audio_media_url:
                             await websocket.send_text(json.dumps(
-                                {"type": "error", "message": "invalid base64 in audio data"}))
+                                {"type": "error", "message": "audio needs 'data' (base64) or 'media_url'"}))
                             continue
-
-                    await websocket.send_text(json.dumps({"type": "typing"}))
-
-                    # Keepalive spans the whole pre-turn media window (fetch,
-                    # upload, transcription) plus the turn itself — a slow
-                    # voice note can stall here just as long as a slow CRM
-                    # tool call, so coverage can't start only at the turn.
-                    _ka_stop = asyncio.Event()
-                    _ka = asyncio.ensure_future(_interim_wait_keepalive(
-                        websocket, _ka_stop, session_id=session_id, language=row.language))
-                    try:
-                        if audio_bytes is None:
+                        if raw_data and (not mime or not mime.startswith("audio/")):
+                            await websocket.send_text(json.dumps(
+                                {"type": "error", "message": "audio needs 'data' (base64) + 'mime' (audio/*)"}))
+                            continue
+                        if _media_store is None:
+                            await websocket.send_text(json.dumps(
+                                {"type": "error", "message": "voice messages not available — media storage not configured"}))
+                            continue
+                        audio_bytes: bytes | None = None
+                        if raw_data:
                             try:
-                                audio_bytes, fetched_mime = await _fetch_media_url(audio_media_url)
+                                audio_bytes = base64.b64decode(raw_data)
                             except Exception:
-                                log.exception("media_url fetch failed", extra={
+                                await websocket.send_text(json.dumps(
+                                    {"type": "error", "message": "invalid base64 in audio data"}))
+                                continue
+
+                        await websocket.send_text(json.dumps({"type": "typing"}))
+
+                        # Keepalive spans the whole pre-turn media window (fetch,
+                        # upload, transcription) plus the turn itself — a slow
+                        # voice note can stall here just as long as a slow CRM
+                        # tool call, so coverage can't start only at the turn.
+                        _ka_stop = asyncio.Event()
+                        _ka = asyncio.ensure_future(_interim_wait_keepalive(
+                            websocket, _ka_stop, session_id=session_id, language=row.language))
+                        try:
+                            if audio_bytes is None:
+                                try:
+                                    audio_bytes, fetched_mime = await _fetch_media_url(audio_media_url)
+                                except Exception:
+                                    log.exception("media_url fetch failed", extra={
+                                        "ticket_id": ticket_id, "session_id": session_id})
+                                    await _stop_keepalive(_ka, _ka_stop)
+                                    await websocket.send_text(json.dumps({
+                                        "type": "error",
+                                        "message": "Could not fetch media_url — check it's reachable and points at an audio file.",
+                                    }))
+                                    continue
+                                mime = mime or fetched_mime
+                                if not mime.startswith("audio/"):
+                                    await _stop_keepalive(_ka, _ka_stop)
+                                    await websocket.send_text(json.dumps(
+                                        {"type": "error", "message": "audio media_url must serve an audio/* content type"}))
+                                    continue
+
+                            object_key = _media_key(tenant.id, session_id, mime)
+                            # Upload to S3 and transcribe in parallel
+                            transcript = ""
+                            try:
+                                upload_coro = _media_store.upload(audio_bytes, object_key, mime.split(";")[0])
+                                _transcriber = getattr(agent, "_llm", None) or getattr(agent, "llm", None)
+                                if _transcriber and hasattr(_transcriber, "transcribe_audio"):
+                                    transcript, _ = await asyncio.gather(
+                                        _transcriber.transcribe_audio(audio_bytes, mime.split(";")[0]),
+                                        upload_coro,
+                                    )
+                                else:
+                                    await upload_coro
+                            except Exception:
+                                log.exception("audio upload/transcription failed", extra={
                                     "ticket_id": ticket_id, "session_id": session_id})
                                 await _stop_keepalive(_ka, _ka_stop)
+                                await websocket.send_text(json.dumps(
+                                    {"type": "error", "message": "Could not save voice message — please try again."}))
+                                continue
+
+                            # If transcription succeeded, get AI response; else inform customer
+                            if transcript:
+                                result = await _run_turn(agent.handle_message(transcript))
+                                # Stop the keepalive now, before ANY customer-visible
+                                # frame goes out (audio_ack / the real reply) and
+                                # before any human-handoff escalation:
+                                # `_run_human_mode` below is an unbounded loop for
+                                # the rest of the human conversation, and the
+                                # branch-level `finally` only fires once that loop
+                                # exits. With the old silent `typing` frame, stopping
+                                # late (after the reply) was harmless; with a real
+                                # visible interim message it is not — the customer
+                                # could see the actual answer and THEN see "still
+                                # working on it" appear after it. Safe to call again
+                                # in the `finally` below (idempotent).
+                                await _stop_keepalive(_ka, _ka_stop)
+                                msg_id = await _persist_turn(
+                                    session_id, transcript, result,
+                                    user_type="audio", media_mime=mime, media_url=object_key,
+                                    ticket_id=ticket_id,
+                                )
+                                if msg_id is not None:
+                                    await websocket.send_text(json.dumps({
+                                        "type": "audio_ack",
+                                        "media_url": f"/api/v1/chat/media/{msg_id}",
+                                    }))
+                                await _send_reply(websocket, session_id, result, tenant.id)
+                                if result.escalation:
+                                    if await _handle_escalation(websocket, session_id, tenant, row, result):
+                                        if await _run_human_mode(websocket, session_id, tenant, ticket_id=ticket_id):
+                                            break
+                            else:
+                                # Persist audio without agent reply. Stop the
+                                # keepalive first — the audio_ack/error frames sent
+                                # below are the last customer-visible frames for
+                                # this branch, no interim message must arrive after.
+                                await _stop_keepalive(_ka, _ka_stop)
+                                async with _sm()() as db:
+                                    r = await db.get(ChatSession, session_id)
+                                    if r:
+                                        audio_msg = ChatMessage(
+                                            session_id=session_id, role="customer", type="audio",
+                                            content="[audio]", media_mime=mime, media_url=object_key,
+                                        )
+                                        db.add(audio_msg)
+                                        r.message_count = (r.message_count or 0) + 1
+                                        await db.flush()
+                                        msg_id = audio_msg.id
+                                        await db.commit()
+                                    else:
+                                        msg_id = None
+                                if msg_id is not None:
+                                    await websocket.send_text(json.dumps({
+                                        "type": "audio_ack",
+                                        "media_url": f"/api/v1/chat/media/{msg_id}",
+                                    }))
                                 await websocket.send_text(json.dumps({
                                     "type": "error",
-                                    "message": "Could not fetch media_url — check it's reachable and points at an audio file.",
+                                    "message": "Could not transcribe voice message — please type your message instead.",
                                 }))
-                                continue
-                            mime = mime or fetched_mime
-                            if not mime.startswith("audio/"):
+                        finally:
+                            await _stop_keepalive(_ka, _ka_stop)
+                        continue
+
+                    if mtype in ("image", "video"):
+                        data = msg.get("data")
+                        media_url = (msg.get("media_url") or "").strip()
+                        mime = msg.get("mime") or ""
+                        if not data and not media_url:
+                            await websocket.send_text(json.dumps(
+                                {"type": "error", "message": "image/video needs 'data' (base64) or 'media_url'"}))
+                            continue
+                        caption = (msg.get("text") or "").strip()
+                        await websocket.send_text(json.dumps({"type": "typing"}))
+
+                        # Keepalive spans the whole pre-turn media window (fetch,
+                        # upload) plus the turn itself — a slow media_url fetch or
+                        # large upload can stall here just as long as a slow CRM
+                        # tool call, so coverage can't start only at the turn.
+                        _ka_stop = asyncio.Event()
+                        _ka = asyncio.ensure_future(_interim_wait_keepalive(
+                            websocket, _ka_stop, session_id=session_id, language=row.language))
+                        try:
+                            fetched_bytes: Optional[bytes] = None
+                            if media_url:
+                                try:
+                                    fetched_bytes, fetched_mime = await _fetch_media_url(media_url)
+                                    mime = mime or fetched_mime
+                                except Exception:
+                                    log.exception("media_url fetch failed", extra={
+                                        "ticket_id": ticket_id, "session_id": session_id})
+                                    await _stop_keepalive(_ka, _ka_stop)
+                                    await websocket.send_text(json.dumps({
+                                        "type": "error",
+                                        "message": "Could not fetch media_url — check it's reachable and points at an image/video.",
+                                    }))
+                                    continue
+                            if not mime:
                                 await _stop_keepalive(_ka, _ka_stop)
                                 await websocket.send_text(json.dumps(
-                                    {"type": "error", "message": "audio media_url must serve an audio/* content type"}))
+                                    {"type": "error", "message": "image/video needs 'mime'"}))
                                 continue
 
-                        object_key = _media_key(tenant.id, session_id, mime)
-                        # Upload to S3 and transcribe in parallel
-                        transcript = ""
-                        try:
-                            upload_coro = _media_store.upload(audio_bytes, object_key, mime.split(";")[0])
-                            _transcriber = getattr(agent, "_llm", None) or getattr(agent, "llm", None)
-                            if _transcriber and hasattr(_transcriber, "transcribe_audio"):
-                                transcript, _ = await asyncio.gather(
-                                    _transcriber.transcribe_audio(audio_bytes, mime.split(";")[0]),
-                                    upload_coro,
-                                )
-                            else:
-                                await upload_coro
-                        except Exception:
-                            log.exception("audio upload/transcription failed", extra={
-                                "ticket_id": ticket_id, "session_id": session_id})
-                            await _stop_keepalive(_ka, _ka_stop)
-                            await websocket.send_text(json.dumps(
-                                {"type": "error", "message": "Could not save voice message — please try again."}))
-                            continue
+                            # Upload to S3 if storage is configured
+                            object_key: Optional[str] = None
+                            if _media_store is not None:
+                                try:
+                                    raw_bytes = fetched_bytes if fetched_bytes is not None else base64.b64decode(data)
+                                    object_key = _media_key(tenant.id, session_id, mime)
+                                    await _media_store.upload(raw_bytes, object_key, mime.split(";")[0])
+                                except Exception:
+                                    log.exception("media upload failed", extra={
+                                        "ticket_id": ticket_id, "session_id": session_id})
+                                    object_key = None
 
-                        # If transcription succeeded, get AI response; else inform customer
-                        if transcript:
-                            result = await _run_turn(agent.handle_message(transcript))
+                            result = await _run_turn(
+                                agent.handle_image(fetched_bytes if fetched_bytes is not None else data, mime, caption))
                             # Stop the keepalive now, before ANY customer-visible
-                            # frame goes out (audio_ack / the real reply) and
-                            # before any human-handoff escalation:
-                            # `_run_human_mode` below is an unbounded loop for
-                            # the rest of the human conversation, and the
-                            # branch-level `finally` only fires once that loop
-                            # exits. With the old silent `typing` frame, stopping
-                            # late (after the reply) was harmless; with a real
-                            # visible interim message it is not — the customer
-                            # could see the actual answer and THEN see "still
-                            # working on it" appear after it. Safe to call again
-                            # in the `finally` below (idempotent).
+                            # frame goes out (the real reply) and before any
+                            # human-handoff escalation: `_run_human_mode` below is
+                            # an unbounded loop for the rest of the human
+                            # conversation, and the branch-level `finally` only
+                            # fires once that loop exits. With the old silent
+                            # `typing` frame, stopping late (after the reply) was
+                            # harmless; with a real visible interim message it is
+                            # not — the customer could see the actual answer and
+                            # THEN see "still working on it" appear after it. Safe
+                            # to call again in the `finally` below (idempotent).
                             await _stop_keepalive(_ka, _ka_stop)
-                            msg_id = await _persist_turn(
-                                session_id, transcript, result,
-                                user_type="audio", media_mime=mime, media_url=object_key,
-                                ticket_id=ticket_id,
-                            )
-                            if msg_id is not None:
-                                await websocket.send_text(json.dumps({
-                                    "type": "audio_ack",
-                                    "media_url": f"/api/v1/chat/media/{msg_id}",
-                                }))
+                            await _persist_turn(session_id, caption or f"[{mtype}]", result,
+                                                user_type=mtype, media_mime=mime, media_url=object_key,
+                                                ticket_id=ticket_id)
                             await _send_reply(websocket, session_id, result, tenant.id)
                             if result.escalation:
                                 if await _handle_escalation(websocket, session_id, tenant, row, result):
                                     if await _run_human_mode(websocket, session_id, tenant, ticket_id=ticket_id):
                                         break
-                        else:
-                            # Persist audio without agent reply. Stop the
-                            # keepalive first — the audio_ack/error frames sent
-                            # below are the last customer-visible frames for
-                            # this branch, no interim message must arrive after.
+                        finally:
                             await _stop_keepalive(_ka, _ka_stop)
-                            async with _sm()() as db:
-                                r = await db.get(ChatSession, session_id)
-                                if r:
-                                    audio_msg = ChatMessage(
-                                        session_id=session_id, role="customer", type="audio",
-                                        content="[audio]", media_mime=mime, media_url=object_key,
-                                    )
-                                    db.add(audio_msg)
-                                    r.message_count = (r.message_count or 0) + 1
-                                    await db.flush()
-                                    msg_id = audio_msg.id
-                                    await db.commit()
-                                else:
-                                    msg_id = None
-                            if msg_id is not None:
-                                await websocket.send_text(json.dumps({
-                                    "type": "audio_ack",
-                                    "media_url": f"/api/v1/chat/media/{msg_id}",
-                                }))
-                            await websocket.send_text(json.dumps({
-                                "type": "error",
-                                "message": "Could not transcribe voice message — please type your message instead.",
-                            }))
-                    finally:
-                        await _stop_keepalive(_ka, _ka_stop)
-                    continue
-
-                if mtype in ("image", "video"):
-                    data = msg.get("data")
-                    media_url = (msg.get("media_url") or "").strip()
-                    mime = msg.get("mime") or ""
-                    if not data and not media_url:
-                        await websocket.send_text(json.dumps(
-                            {"type": "error", "message": "image/video needs 'data' (base64) or 'media_url'"}))
                         continue
-                    caption = (msg.get("text") or "").strip()
+
+                    user_text = (msg.get("text") or msg.get("message") or "").strip()
+                    if not user_text:
+                        await websocket.send_text(json.dumps({"type": "error", "message": "missing 'text'"}))
+                        continue
+
                     await websocket.send_text(json.dumps({"type": "typing"}))
-
-                    # Keepalive spans the whole pre-turn media window (fetch,
-                    # upload) plus the turn itself — a slow media_url fetch or
-                    # large upload can stall here just as long as a slow CRM
-                    # tool call, so coverage can't start only at the turn.
-                    _ka_stop = asyncio.Event()
-                    _ka = asyncio.ensure_future(_interim_wait_keepalive(
-                        websocket, _ka_stop, session_id=session_id, language=row.language))
-                    try:
-                        fetched_bytes: Optional[bytes] = None
-                        if media_url:
-                            try:
-                                fetched_bytes, fetched_mime = await _fetch_media_url(media_url)
-                                mime = mime or fetched_mime
-                            except Exception:
-                                log.exception("media_url fetch failed", extra={
-                                    "ticket_id": ticket_id, "session_id": session_id})
-                                await _stop_keepalive(_ka, _ka_stop)
-                                await websocket.send_text(json.dumps({
-                                    "type": "error",
-                                    "message": "Could not fetch media_url — check it's reachable and points at an image/video.",
-                                }))
-                                continue
-                        if not mime:
-                            await _stop_keepalive(_ka, _ka_stop)
-                            await websocket.send_text(json.dumps(
-                                {"type": "error", "message": "image/video needs 'mime'"}))
-                            continue
-
-                        # Upload to S3 if storage is configured
-                        object_key: Optional[str] = None
-                        if _media_store is not None:
-                            try:
-                                raw_bytes = fetched_bytes if fetched_bytes is not None else base64.b64decode(data)
-                                object_key = _media_key(tenant.id, session_id, mime)
-                                await _media_store.upload(raw_bytes, object_key, mime.split(";")[0])
-                            except Exception:
-                                log.exception("media upload failed", extra={
-                                    "ticket_id": ticket_id, "session_id": session_id})
-                                object_key = None
-
-                        result = await _run_turn(
-                            agent.handle_image(fetched_bytes if fetched_bytes is not None else data, mime, caption))
-                        # Stop the keepalive now, before ANY customer-visible
-                        # frame goes out (the real reply) and before any
-                        # human-handoff escalation: `_run_human_mode` below is
-                        # an unbounded loop for the rest of the human
-                        # conversation, and the branch-level `finally` only
-                        # fires once that loop exits. With the old silent
-                        # `typing` frame, stopping late (after the reply) was
-                        # harmless; with a real visible interim message it is
-                        # not — the customer could see the actual answer and
-                        # THEN see "still working on it" appear after it. Safe
-                        # to call again in the `finally` below (idempotent).
-                        await _stop_keepalive(_ka, _ka_stop)
-                        await _persist_turn(session_id, caption or f"[{mtype}]", result,
-                                            user_type=mtype, media_mime=mime, media_url=object_key,
-                                            ticket_id=ticket_id)
-                        await _send_reply(websocket, session_id, result, tenant.id)
-                        if result.escalation:
-                            if await _handle_escalation(websocket, session_id, tenant, row, result):
-                                if await _run_human_mode(websocket, session_id, tenant, ticket_id=ticket_id):
-                                    break
-                    finally:
-                        await _stop_keepalive(_ka, _ka_stop)
-                    continue
-
-                user_text = (msg.get("text") or msg.get("message") or "").strip()
-                if not user_text:
-                    await websocket.send_text(json.dumps({"type": "error", "message": "missing 'text'"}))
-                    continue
-
-                await websocket.send_text(json.dumps({"type": "typing"}))
-                result = await _run_turn_with_keepalive(
-                    websocket, agent.handle_message(user_text),
-                    session_id=session_id, language=row.language)
-                await _persist_turn(session_id, user_text, result, ticket_id=ticket_id)
-                call_url: Optional[str] = None
-                if result.call_offer and _handoff_store is not None:
-                    summary = await agent.summarize_session()
-                    token = uuid.uuid4().hex
-                    context = {
-                        "chat_session_id": session_id,
-                        "customer_name": row.customer_name,
-                        "customer_id": row.customer_id,
-                        "language": row.language,
-                        "chat_summary": summary,
-                    }
-                    await _handoff_store.redis.set(
-                        f"chat_handoff:{token}", json.dumps(context), ex=600)
-                    call_url = _voice_call_url(websocket, tenant.slug, token)
-                await _send_reply(websocket, session_id, result, tenant.id, call_url=call_url)
-                if result.response.action == "resolved":
-                    # Agent confirmed the user has no more questions — close immediately
-                    # without waiting for the idle timeout.
-                    summary = await agent.summarize_session()
-                    await _end_session(session_id, summary, ticket_id=ticket_id)
-                    await _send_close_webhook(tenant, session_id, "ai", summary, ticket_id=ticket_id)
+                    result = await _run_turn_with_keepalive(
+                        websocket, agent.handle_message(user_text),
+                        session_id=session_id, language=row.language)
+                    await _persist_turn(session_id, user_text, result, ticket_id=ticket_id)
+                    call_url: Optional[str] = None
+                    if result.call_offer and _handoff_store is not None:
+                        summary = await agent.summarize_session()
+                        token = uuid.uuid4().hex
+                        context = {
+                            "chat_session_id": session_id,
+                            "customer_name": row.customer_name,
+                            "customer_id": row.customer_id,
+                            "language": row.language,
+                            "chat_summary": summary,
+                        }
+                        await _handoff_store.redis.set(
+                            f"chat_handoff:{token}", json.dumps(context), ex=600)
+                        call_url = _voice_call_url(websocket, tenant.slug, token)
+                    await _send_reply(websocket, session_id, result, tenant.id, call_url=call_url)
+                    if result.response.action == "resolved":
+                        # Agent confirmed the user has no more questions — close immediately
+                        # without waiting for the idle timeout.
+                        summary = await agent.summarize_session()
+                        await _end_session(session_id, summary, ticket_id=ticket_id)
+                        await _send_close_webhook(tenant, session_id, "ai", summary, ticket_id=ticket_id)
+                        await websocket.send_text(json.dumps({
+                            "type": "ended", "summary": summary, "reason": "resolved",
+                        }))
+                        break
+                    if result.escalation:
+                        if await _handle_escalation(websocket, session_id, tenant, row, result):
+                            if await _run_human_mode(websocket, session_id, tenant, ticket_id=ticket_id):
+                                break
+                except WebSocketDisconnect:
+                    raise
+                except Exception as turn_exc:  # noqa: BLE001 — one bad turn must not drop the chat
+                    log.exception("chat turn failed", extra={
+                        "ticket_id": ticket_id, "session_id": session_id})
+                    reason, message = _classify_turn_error(turn_exc)
+                    if reason == "llm_billing":
+                        # Distinct from ordinary quota noise: this needs a human to
+                        # raise the cap, it won't clear on its own.
+                        log.error(
+                            "gemini monthly spending cap exceeded — raise it at "
+                            "https://ai.studio/spend to restore chat",
+                            extra={"ticket_id": ticket_id, "session_id": session_id},
+                        )
                     await websocket.send_text(json.dumps({
-                        "type": "ended", "summary": summary, "reason": "resolved",
+                        "type": "error", "message": message, "reason": reason,
                     }))
-                    break
-                if result.escalation:
-                    if await _handle_escalation(websocket, session_id, tenant, row, result):
-                        if await _run_human_mode(websocket, session_id, tenant, ticket_id=ticket_id):
-                            break
-            except WebSocketDisconnect:
-                raise
-            except Exception as turn_exc:  # noqa: BLE001 — one bad turn must not drop the chat
-                log.exception("chat turn failed", extra={
-                    "ticket_id": ticket_id, "session_id": session_id})
-                reason, message = _classify_turn_error(turn_exc)
-                if reason == "llm_billing":
-                    # Distinct from ordinary quota noise: this needs a human to
-                    # raise the cap, it won't clear on its own.
-                    log.error(
-                        "gemini monthly spending cap exceeded — raise it at "
-                        "https://ai.studio/spend to restore chat",
-                        extra={"ticket_id": ticket_id, "session_id": session_id},
-                    )
-                await websocket.send_text(json.dumps({
-                    "type": "error", "message": message, "reason": reason,
-                }))
-            finally:
-                _end_turn(session_id, guard_token)
+                finally:
+                    _end_turn(session_id, guard_token)
     except WebSocketDisconnect:
         log.info("chat ws client disconnected", extra={
             "ticket_id": ticket_id, "session_id": session_id})

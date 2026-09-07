@@ -159,7 +159,43 @@
 
 **Interfaces:** none — pure documentation task.
 
-- [ ] **Step 1:** Read every file in the list above in full.
-- [ ] **Step 2:** Rewrite each one to describe the system **as it now stands** — prompt packs (generic default, betting as one named pack), CRM-level opt-in KB bundling (with tenant-level casino/sports/matka module docs unchanged), CRM-level pronunciation overrides. Write these as plain, current-state facts. **Do not** add "this used to be global," "previously this was hardcoded," "note: stale," or any diff/history framing anywhere in the rewritten docs — a reader six months from now should not be able to tell this was ever any other way from the doc text itself. (Git history is where the "how it changed" story belongs, not the docs.)
-- [ ] **Step 3:** Grep the whole repo for `data/kb/global` **and also** the looser relative forms `global/` and `../global/` (the literal-only grep misses real hits — confirmed during Task 2's review to exist in `data/kb/modules/README.md` and `data/kb/layouts/README.md`) and confirm zero remaining references outside git history/this plan file itself.
-- [ ] **Step 4:** Confirm no doc still asserts the RAG/ChatBot subsystem is "untouched scaffold" or similar outdated framing unrelated to this plan but caught in the same sweep — fix opportunistically if trivial, otherwise leave a separate note for the owner rather than scope-creeping this task.
+- [x] **Step 1:** Read every file in the list above in full.
+- [x] **Step 2:** Rewrite each one to describe the system **as it now stands** — prompt packs (generic default, betting as one named pack), CRM-level opt-in KB bundling (with tenant-level casino/sports/matka module docs unchanged), CRM-level pronunciation overrides. Write these as plain, current-state facts. **Do not** add "this used to be global," "previously this was hardcoded," "note: stale," or any diff/history framing anywhere in the rewritten docs — a reader six months from now should not be able to tell this was ever any other way from the doc text itself. (Git history is where the "how it changed" story belongs, not the docs.)
+- [x] **Step 3:** Grep the whole repo for `data/kb/global` **and also** the looser relative forms `global/` and `../global/` (the literal-only grep misses real hits — confirmed during Task 2's review to exist in `data/kb/modules/README.md` and `data/kb/layouts/README.md`) and confirm zero remaining references outside git history/this plan file itself.
+- [x] **Step 4:** Confirm no doc still asserts the RAG/ChatBot subsystem is "untouched scaffold" or similar outdated framing unrelated to this plan but caught in the same sweep — fix opportunistically if trivial, otherwise leave a separate note for the owner rather than scope-creeping this task.
+
+**Status: DONE (2026-09-07).** Implemented by a Sonnet subagent; the coordinator
+personally re-read every diff against the "no history framing" rule (the most
+subjective, easy-to-violate instruction in this task) and confirmed compliance —
+several history-framing sentences the subagent correctly caught and rewrote are
+visible in the diffs (e.g. `data/kb/modules/README.md` previously said "Same
+provenance as the docs previously under `global/`", now reads as a plain
+present-tense statement with no reference to `global/` ever existing).
+
+**Files changed:** `docs/chatbot.md`, `docs/chatbot-report.md`, `docs/HANDOVER.md`,
+`docs/PROJECT-STATUS.md` (opportunistic Step 4 fix: removed the stale "RAG/ChatBot —
+untouched scaffold" claim), `README.md` (same fix), `data/kb/modules/README.md`,
+`data/kb/layouts/README.md`, plus two files outside the original list turned up by
+the widened Step 3 grep (`data/kb/layouts/layout-sports.md`,
+`data/kb/layouts/operator-to-layout.md` — both had stale relative-path references).
+
+**No changes needed, confirmed not skipped:** `docs/ARCHITECTURE.md` (pure
+voice/call-flow content, never referenced prompt/KB/pronunciation vocabulary),
+`docs/crm-api-contract.md` and `docs/crm-chat-media-contract.md` (correctly document
+one specific live CRM's actual contract — appropriately vertical-specific, unaffected
+by the core decoupling), `.env.example` (no new env vars from Tasks 1-3, only DB
+columns).
+
+**Step 3 grep: confirmed clean.** Zero remaining `data/kb/global` / `global/` /
+`../global/` references anywhere outside git history and the historical
+`docs/superpowers/plans/*.md` / `docs/superpowers/specs/*.md` records, which
+correctly keep their original references as-is.
+
+**Step 4, left for the owner (not scope-creeped into this task):**
+`docs/PROJECT-STATUS.md` is stale well beyond the RAG/ChatBot line it already fixed
+(missing LiveKit, the Telnyx/Infobip removal, the security remediation sprint,
+deposit verification, and more) — `docs/HANDOVER.md` already flags this and
+recommends the owner decide whether to retire `PROJECT-STATUS.md` or fully rewrite
+it; that's a larger job than this plan's scope.
+
+**All 4 tasks of this plan are now complete.**
