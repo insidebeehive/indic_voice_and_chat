@@ -24,9 +24,10 @@ flowchart TB
     direction TB
     API["REST API — /api/v1<br/>tenants · catalog (providers/models/voices + costs)<br/>campaigns · calls (Call Lead async + status)"]
     AUTH["Auth &amp; tenancy<br/>DbTenantResolver → TenantContext · bearer/admin<br/>Fernet-encrypted per-tenant telephony keys"]
-    BRIDGE["Media bridges — _BaseLiveBridge<br/>browser S2S · Twilio/Exotel (S2S + cascade)<br/>Stringee IVR · LiveKit (room-join) · SIP/DiDLogic (RTP, branch)"]
-    AGENT["VoiceBotAgent<br/>state machine · slots · prompts · outcome analysis"]
-    MODES["Two pipeline modes<br/>① Cascade: STT → LLM → TTS<br/>② S2S: Gemini Live (audio ↔ audio, ~1.4s)"]:::note
+    BRIDGE["Media bridges — _BaseLiveBridge<br/>normalizes every transport's wire format (Twilio/Exotel<br/>mu-law 8kHz, Stringee turn-based WAV, browser PCM16 16kHz,<br/>SIP/DiDLogic RTP) to one internal PCM16 stream"]
+    AGENT["VoiceBotAgent — the shared 'brain'<br/>state machine · slot filling · prompt/system-instruction<br/>building · outcome analysis"]:::note
+    CASCADE["Cascade pipeline<br/>VAD endpoint → STT → LLM → TTS"]
+    S2S["S2S pipeline<br/>Gemini Live (audio ↔ audio, ~1.4s, native barge-in)"]
     REG["Per-tenant provider registry"]
     COST["call_store + cost catalog<br/>insert_call · record_outcome · per-min cost<br/>(telephony shown tentative, excluded from total)"]
   end
@@ -48,9 +49,12 @@ flowchart TB
   API -->|"Call Lead → dial out"| TEL
   TEL <-->|"media: WS (Twilio/Exotel) / RTP (SIP)<br/>or participant_joined webhook (LiveKit)"| BRIDGE
   TEL --- PSTN
-  BRIDGE --> AGENT
-  AGENT --> MODES
-  MODES --> REG
+  BRIDGE <-->|"caller / reply audio"| CASCADE
+  BRIDGE <-->|"caller / reply audio"| S2S
+  CASCADE <-->|"slots · action · prompt<br/>(JSON envelope)"| AGENT
+  S2S <-->|"slots · action<br/>(record_turn_signal tool call)"| AGENT
+  CASCADE --> REG
+  S2S --> REG
   REG --> AI
   AGENT --> COST
   AUTH --> PG
@@ -138,12 +142,52 @@ flowchart TB
    database as the voice side; the tenant's own or backoffice's console reads it back for
    history, handoff, and analytics.
 
+## Shared knowledge base (VoiceBot + ChatBot)
+
+```mermaid
+flowchart TB
+  classDef store fill:#0b1220,stroke:#334155,color:#93c5fd;
+  classDef note  fill:#1c1407,stroke:#7c5e1e,color:#fde68a;
+
+  VOICEKB["VoiceBotAgent<br/>one-shot KB context, built once at call start<br/>(6 call sites: 4 in bootstrap.py, 2 in dev_console.py)"]
+  CHATKB["ChatBotAgent<br/>search_knowledge_base tool, called per turn"]
+
+  TENANTKB[("Tenant KB — KBDocument rows<br/>own ingested docs + opted-in product-module KB<br/>(casino/sports/matka)")]:::store
+  CRMKB[("CRM-shared KB — CrmKBDocument rows<br/>admin-managed docs + opted-in bundled KB pack")]:::store
+
+  MERGE["Merged by relevance score, not tenant-wins<br/>same HybridRetriever code path for voice and chat"]:::note
+
+  TENANTKB --> MERGE
+  CRMKB --> MERGE
+  MERGE --> VOICEKB
+  MERGE --> CHATKB
+```
+
+A tenant's own knowledge base and its linked CRM's shared knowledge base are never
+searched in isolation — every retrieval, whether it's the VoiceBot's one-shot
+per-call context or the ChatBot's per-turn `search_knowledge_base` tool call, runs
+against **both** and merges the results by relevance score, through the same
+`HybridRetriever` code path either way. VoiceBot and ChatBot are two different
+front ends onto one shared knowledge base per tenant/CRM pair, not two separate KB
+systems that happen to look similar. A tenant with no linked CRM (`crm_id is None`)
+simply gets tenant-docs-only results, never an error — the same graceful
+degradation as CRM-tool resolution above.
+
+Both feeder tiers are opt-in, at different scopes: product-module KB
+(casino/sports/matka) is opted into per **tenant**, feeding the Tenant KB box;
+bundled KB packs are opted into per **CRM** (`Crm.bundled_kb_pack`), feeding the
+CRM-shared KB box. See `docs/chatbot.md` for how each is ingested.
+
 ## Key properties
 - **Multi-tenant, DB-backed.** All state lives in Postgres under the `voicebot` schema (shared
   DB); tenants resolve from the DB via bearer token / admin. No YAML at runtime.
-- **Two pipeline modes (VoiceBot).** Cascade (STT→LLM→TTS, the controllable default, ~3.2s
-  first word) and S2S (Gemini Live, ~1.4s, native barge-in). Selectable per tenant
-  (`pipeline.mode`); LiveKit calls also run through the S2S path.
+- **Two pipeline modes, one shared brain (VoiceBot).** Cascade (STT→LLM→TTS, the
+  controllable default, ~3.2s first word) and S2S (Gemini Live, ~1.4s, native
+  barge-in) are two different audio-processing paths in front of the *same*
+  `VoiceBotAgent` — the state machine, slot filling, and prompt/system-instruction
+  building don't change based on which pipeline is active, only how state gets in
+  (a JSON envelope vs. a `record_turn_signal` tool call) and how audio gets out.
+  Selectable per tenant (`pipeline.mode`); LiveKit calls also run through the S2S path.
 - **Key isolation.** Only telephony keys are per-tenant (Fernet-encrypted); STT/LLM/TTS/S2S use
   shared platform master keys. LiveKit credentials are CRM-level (`Crm.livekit_url`), not
   per-tenant — a third tier alongside "per-tenant" and "shared platform."
