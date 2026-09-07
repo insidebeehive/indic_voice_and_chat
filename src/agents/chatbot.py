@@ -44,6 +44,7 @@ from src.rag.context_builder import (
     GuardConfig,
     apply_hallucination_guard,
     apply_no_grounding_guard,
+    apply_unverified_data_guard,
     build_rag_context,
     search_combined,
 )
@@ -112,10 +113,15 @@ _KB_SEARCH_TIMEOUT_S = 15.0
 # this (never the module-level object itself) — the result is JSON-serialized
 # per-call and callers/tests may hold onto it.
 _TOOL_BUDGET_EXHAUSTED = {
-    "error": "timed out",
-    "message": ("This data source did not respond in time. Answer now using what you "
-                "already have, briefly acknowledge you could not fetch that detail, and "
-                "do not ask the customer for any account details."),
+    "error": "This data source did not respond in time.",
+    "failure": "timeout",
+    "message": (
+        "You could not verify this — do NOT state any specific number, amount, "
+        "status, or date for it, and do not claim you checked or verified it. Tell "
+        "the customer honestly that you can't verify this right now and offer to "
+        "connect them to a human. That fully satisfies the response-quality bar for "
+        "this turn."
+    ),
 }
 
 # Executes a tenant-registered (CRM) tool call → a JSON-able result dict.
@@ -123,6 +129,97 @@ _TOOL_BUDGET_EXHAUSTED = {
 # (see _TOOL_BUDGET_S) — keyword-only so a positional-arg executor can't
 # silently swallow it as some other parameter.
 CrmExecutor = Callable[[ToolCall, float], Awaitable[dict]]
+
+# --- Failure-category classification + directive (Ticket #1762 fix, Steps 2/3) --
+#
+# Plain-English labels for the catalog CRM tools (src/chatbot/catalog.py) —
+# LABELS ONLY, never a tool/endpoint name. The system prompt already has a
+# "keep internals internal" rule; this directive text must not violate it
+# either, so tool names never appear in anything built from this map. Not
+# every tenant registers every one of these (tenants pick a subset via
+# POST /chat/tools/from-catalog), but the map covers the full catalog so a
+# label is always available without touching tenant config here.
+_TOOL_CATEGORY_LABELS: dict[str, str] = {
+    "get_player_wallet": "your wallet balance",
+    "get_player_transactions": "your transaction history (deposits and withdrawals)",
+    "get_player_latest_deposit_order": "your latest deposit order status",
+    "get_player_bets": "your bet history",
+    "get_player_bonuses": "your bonus and promotion details",
+    "get_player_profile": "your account profile",
+    "get_player_responsible_gaming": "your responsible-gaming settings",
+    "get_payment_config": "your payment/deposit configuration",
+    "get_referral_code": "your referral code",
+    "get_sports_open_bets": "your open sports bets",
+    "get_sports_match_status": "your bet results",
+    "get_casino_game_history": "your casino game history",
+    "get_matka_bids": "your Matka bid history",
+    "get_game": "game availability",
+    "get_game_providers": "game provider information",
+    "get_operator_games_config": "which game categories are available",
+    "get_matka_config": "Matka market configuration",
+    "get_matka_result": "the Matka market result",
+    "get_operator_promotions": "current promotions",
+    "get_operator_platform_config": "platform configuration",
+    "get_bet_limit": "the applicable bet limit",
+    "get_market_holiday_schedule": "the market holiday schedule",
+    "submit_deposit_verification": "your deposit verification request",
+}
+# Fallback for a custom tenant tool name not in the catalog above (tenants can
+# register arbitrary CRM tools, not just catalog ones) — still never leaks the
+# literal tool name.
+_GENERIC_CATEGORY_LABEL = "some of your account details"
+
+
+def _category_label(tool_name: str) -> str:
+    return _TOOL_CATEGORY_LABELS.get(tool_name, _GENERIC_CATEGORY_LABEL)
+
+
+def _tool_result_is_failure(result: object) -> bool:
+    """True when a tool-result dict represents a failed/degraded call.
+
+    Recognizes tool_executor.py's ``{"error": ..., "failure": ...}`` shape
+    (Step 1), the corrected fallback payloads below (which now also carry
+    both keys), — defensively — any dict with a genuinely non-empty
+    ``"error"`` value even without a ``"failure"`` key, AND
+    src/chatbot/deposit_verification.py's own error shape (review Fix 6),
+    which uses ``{"status": "error", "message": ...}`` with NEITHER
+    ``"error"`` nor ``"failure"`` — without this, a genuinely failed deposit-
+    verification submit was invisible to this check and got folded into
+    grounded text as if it had succeeded.
+    """
+    if not isinstance(result, dict):
+        return False
+    if result.get("failure"):
+        return True
+    if result.get("error"):
+        return True
+    return result.get("status") == "error"
+
+
+def _build_failure_directive(labels: list[str], escalate: bool) -> str:
+    """Synthetic role=user directive (Step 2). Deliberately role="user", not
+    "system" — both the Gemini and Claude adapters hoist system messages into
+    the top-level instruction, which would move this away from the tool
+    results it must sit next to. Labels only, never a tool/endpoint name.
+    """
+    joined = "; ".join(labels)
+    lines = [
+        f"SYSTEM NOTE (not from the customer): the data needed to answer about "
+        f"{joined} could NOT be retrieved or verified just now.",
+        "Do not state any specific number, amount, status, or date for this, and do "
+        "not claim you have checked, verified, or looked this up — you have not.",
+        'Saying plainly "I can\'t verify this right now, let me connect you to a '
+        'human who can check" fully satisfies the response-quality requirement for '
+        "this turn — it is not an incomplete or lesser answer.",
+    ]
+    if escalate:
+        lines.append(
+            "This same information has now failed to load on more than one turn in a "
+            "row — do not promise to check again or ask the customer to wait further; "
+            "proactively offer to connect them to a human right now (the customer "
+            "still must confirm before you actually escalate)."
+        )
+    return "\n".join(lines)
 
 # Unicode block boundaries for common Indic scripts.
 _SCRIPT_RANGES: list[tuple[int, int, str]] = [
@@ -314,6 +411,14 @@ class ChatBotAgent(BaseAgent):
         # make_chatbot_factory) has no crm_ticket_id for this session.
         self._session_id = session_id
         self._ticket_id = ticket_id
+        # Ticket #1762 fix, Step 3: per-agent-instance (== per WS connection)
+        # counter of CONSECUTIVE turns where the same category (keyed by its
+        # plain-English label, never a tool name) failed. In-memory only —
+        # resets on reconnect (explicit, documented tradeoff; durability across
+        # reconnects is a follow-up, not part of this fix). Drives the
+        # escalation sentence in _build_failure_directive once a category has
+        # failed on 2 turns running.
+        self._consecutive_category_failures: dict[str, int] = {}
 
     async def handle_message(self, user_text: str) -> ChatTurnResult:
         if not user_text or not user_text.strip():
@@ -429,6 +534,22 @@ class ChatBotAgent(BaseAgent):
         text = ""
         in_tok = 0
         out_tok = 0
+        # Ticket #1762 fix, Steps 2/3: which CRM-data-tool categories (keyed by
+        # tool NAME internally — converted to labels only when building
+        # customer-facing/model-facing text) are currently unresolved-failed
+        # THIS turn, the index of the single synthetic directive message
+        # currently in `messages` (kept in sync every round, never
+        # accumulated), and the text this turn actually grounded in real data
+        # (successful CRM/deposit-verification tool results only — KB results
+        # are already covered by rag_context below) for the Step 5 guard.
+        failed_category_names: set[str] = set()
+        directive_index: int | None = None
+        grounded_tool_texts: list[str] = []
+        # Snapshot of the PRIOR turns' consecutive-failure counts, taken before
+        # this turn mutates them — used to decide whether THIS turn's directive
+        # should escalate (i.e. this is the 2nd turn running with the same
+        # failure), never the post-this-turn state.
+        _prior_failure_counts = dict(self._consecutive_category_failures)
         # JSON response-format is incompatible with tools (Gemini), so the loop
         # runs in text mode; the structured fields are derived from tool results.
         cfg = LLMConfig(
@@ -455,6 +576,8 @@ class ChatBotAgent(BaseAgent):
                 text = result.text
                 break
             messages.append(LLMMessage(role="assistant", content="", tool_calls=result.tool_calls))
+            round_failed_names: set[str] = set()
+            round_succeeded_names: set[str] = set()
             for i, tc in enumerate(result.tool_calls):
                 tool_start = time.perf_counter()
                 if tc.name == SEARCH_KB:
@@ -485,6 +608,17 @@ class ChatBotAgent(BaseAgent):
                 elapsed = time.perf_counter() - tool_start
                 if tc.name not in (SEARCH_KB, ESCALATE, OFFER_CALL):
                     tool_elapsed_s += elapsed
+                    # Ticket #1762 fix, Steps 2/5: classify this CRM/deposit-
+                    # verification call as failed or succeeded (SEARCH_KB is
+                    # excluded — its content is already covered by rag_context
+                    # below; ESCALATE/OFFER_CALL are zero-I/O local builders
+                    # that cannot fail). A successful result's JSON is also
+                    # collected as grounded text for the Step 5 guard.
+                    if _tool_result_is_failure(out):
+                        round_failed_names.add(tc.name)
+                    else:
+                        round_succeeded_names.add(tc.name)
+                        grounded_tool_texts.append(json.dumps(out))
                 tool_ms_list.append((tc.name, elapsed * 1000))
                 retrieved_all.extend(chunks)
                 if tc.name not in (ESCALATE, OFFER_CALL):
@@ -493,6 +627,28 @@ class ChatBotAgent(BaseAgent):
                 call_offer = off or call_offer
                 messages.append(LLMMessage(
                     role="tool", name=tc.name, tool_call_id=tc.id, content=json.dumps(out)))
+            # A category that recovers this round must be cleared, not flagged
+            # (success always wins within the round it happens in).
+            failed_category_names -= round_succeeded_names
+            failed_category_names |= (round_failed_names - round_succeeded_names)
+            # Keep exactly one synthetic directive message in `messages`,
+            # always freshest-last (adjacent to the tool results it must sit
+            # next to) — remove the stale one before deciding whether to add a
+            # new one, so a resolved turn never leaves a stale "can't verify
+            # X" message behind after X actually succeeded.
+            if directive_index is not None:
+                del messages[directive_index]
+                directive_index = None
+            if failed_category_names:
+                labels = list(dict.fromkeys(
+                    _category_label(n) for n in sorted(failed_category_names)))
+                escalate = any(
+                    _prior_failure_counts.get(_category_label(n), 0) >= 1
+                    for n in failed_category_names
+                )
+                messages.append(LLMMessage(
+                    role="user", content=_build_failure_directive(labels, escalate)))
+                directive_index = len(messages) - 1
         else:
             # Ran out of rounds still wanting tools — force a final plain answer.
             llm_start = time.perf_counter()
@@ -504,6 +660,21 @@ class ChatBotAgent(BaseAgent):
             in_tok += _forced_in
             out_tok += _forced_out
             text = result.text
+
+        # Step 3: advance the consecutive-turn-failure counters for the NEXT
+        # turn's escalation decision, based on how this turn actually ended.
+        # A category not in the final failed set this turn is implicitly
+        # reset to 0 by omission (fresh dict, not a merge).
+        final_failed_labels = {_category_label(n) for n in failed_category_names}
+        self._consecutive_category_failures = {
+            label: _prior_failure_counts.get(label, 0) + 1 for label in final_failed_labels
+        }
+        if failed_category_names:
+            log.warning(
+                "chat turn ended with unresolved tool-data failures: %s",
+                sorted(failed_category_names),
+                extra={"ticket_id": self._ticket_id, "session_id": self._session_id},
+            )
 
         rag = build_rag_context(retrieved_all, max_chars=self._max_context_chars)
         # Dedupe tool-retrieved sources, preserving order.
@@ -571,6 +742,43 @@ class ChatBotAgent(BaseAgent):
             response = apply_no_grounding_guard(
                 response, retrieved_any=bool(retrieved_all), tool_calls_made=tool_calls_made,
             )
+        # Step 5 (ticket #1762): deterministic, model-independent check — runs
+        # unconditionally, regardless of which branch above fired. Grounded
+        # text = successful CRM/deposit-verification tool results + the FULL
+        # (untruncated) content of every KB chunk the model actually saw in a
+        # search_knowledge_base tool result — NOT rag.text, which
+        # build_rag_context separately truncates to max_context_chars (review
+        # Fix 3: a real figure in a chunk truncated out of rag.text must still
+        # count as grounded, since the model itself read the full chunk in
+        # its own tool-result message) — + the customer's current query +
+        # EVERY prior turn's content, both customer AND assistant (review Fix
+        # 2: a number the bot already legitimately stated in an earlier turn,
+        # e.g. "your balance is ₹2,075", must remain sayable in a later
+        # no-tool-call turn that just restates it). customer_text stays
+        # narrower (query + the customer's OWN prior turns only, no tool/RAG/
+        # assistant content) — used only to pick which figure to name in the
+        # fallback, so the guard can never end up "confirming" a number back
+        # to the customer that came from the model's own unverified claim.
+        # At this point session.turns does NOT yet include this turn's own
+        # messages (that happens in _persist, right below), so this
+        # naturally only sees prior turns, never a same-turn echo.
+        prior_turns_text = "\n".join(
+            m.content for m in self.session.turns if isinstance(m.content, str)
+        )
+        customer_turns_text = "\n".join(
+            m.content for m in self.session.turns
+            if m.role == "user" and isinstance(m.content, str)
+        )
+        kb_chunk_text = "\n".join(c.document.content for c in retrieved_all)
+        grounded_text = "\n".join([
+            *grounded_tool_texts, kb_chunk_text, query_text, prior_turns_text,
+        ])
+        response = apply_unverified_data_guard(
+            response,
+            grounded_text=grounded_text,
+            customer_text=f"{query_text}\n{customer_turns_text}",
+            config=self._guard,
+        )
         await self._persist(user_msg, query_text, response, len(retrieved_all))
         log.info(
             "chat turn done in %.2fs: llm=%s tools=%s rounds=%d retrieved=%d",
@@ -688,19 +896,27 @@ class ChatBotAgent(BaseAgent):
                     "ticket_id": self._ticket_id, "session_id": self._session_id, "tool": tc.name,
                 })
                 return {
-                    "status": "pending",
+                    "status": "error",
+                    "error": "the CRM call failed",
+                    "failure": "transport_error",
                     "message": (
-                        "This is a player-specific query. The data is being retrieved — "
-                        "give the customer a brief holding message and do not ask them for "
-                        "any account details."
+                        "You could not verify this — do NOT state any specific number, "
+                        "amount, status, or date for it, and do not claim you checked or "
+                        "verified it. Tell the customer honestly that you can't verify this "
+                        "right now and offer to connect them to a human. That fully "
+                        "satisfies the response-quality bar for this turn."
                     ),
                 }, [], None, None
         return {
-            "status": "pending",
+            "status": "error",
+            "error": "no CRM integration is connected for this tool",
+            "failure": "transport_error",
             "message": (
-                "This is a player-specific query. The integration is not yet connected — "
-                "give the customer a brief holding message and do not ask them for any "
-                "account details."
+                "You could not verify this — do NOT state any specific number, amount, "
+                "status, or date for it, and do not claim you checked or verified it. Tell "
+                "the customer honestly that you can't verify this right now and offer to "
+                "connect them to a human. That fully satisfies the response-quality bar for "
+                "this turn."
             ),
         }, [], None, None
 

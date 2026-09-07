@@ -13,6 +13,8 @@ import logging
 import re
 from typing import Optional
 
+import httpx
+
 log = logging.getLogger(__name__)
 
 # Placeholder substituted for any internal-id-shaped value this module
@@ -184,7 +186,6 @@ async def execute_crm_tool(
     client = http_client
     own = client is None
     if own:
-        import httpx
         client = httpx.AsyncClient(timeout=httpx.Timeout(timeout_s, connect=5.0))
     log.info("crm tool call", extra={
         "ticket_id": ticket_id, "session_id": session_id,
@@ -212,14 +213,39 @@ async def execute_crm_tool(
         # kyc_documents, bank_saved). Only url (UUID-scrubbed) + status_code
         # go to the log, above. Redact internal ids before the body reaches
         # the LLM's context — see _REDACTED_RESPONSE_KEYS.
-        return {"status_code": resp.status_code, "data": _redact_internal_ids(body)}
+        result: dict = {"status_code": resp.status_code, "data": _redact_internal_ids(body)}
+        if resp.status_code >= 400:
+            # A 4xx/5xx is a real failure even though the HTTP call itself
+            # succeeded (no exception) — previously this had no "error" key
+            # at all and was invisible to any failure check downstream.
+            result["failure"] = "http_error"
+            result["error"] = f"The upstream service returned an error (HTTP {resp.status_code})."
+        return result
     except Exception as e:  # noqa: BLE001 — a failing CRM call must not kill the turn
         log.exception("crm tool http call failed", extra={
             "ticket_id": ticket_id, "session_id": session_id, "endpoint": endpoint,
         })
+        # Ticket #1762 root cause #1: str(httpx.ReadTimeout()) is "" for a bare
+        # timeout with no message — the caller (src/agents/chatbot.py) fed that
+        # literal empty string to the LLM as the tool's error, giving the "say
+        # so honestly" prompt rule nothing to react to. Always produce a real,
+        # non-empty phrase, and add a machine-readable "failure" discriminator
+        # so the caller can classify without string-sniffing.
+        if isinstance(e, httpx.TimeoutException):
+            failure = "timeout"
+            message = f"The request to fetch this data timed out ({type(e).__name__})."
+        elif isinstance(e, httpx.HTTPError):
+            failure = "transport_error"
+            message = str(e) or f"A network error occurred ({type(e).__name__})."
+        else:
+            failure = "transport_error"
+            message = str(e) or f"An unexpected error occurred ({type(e).__name__})."
         # A future raise_for_status() (or similar) could embed a UUID-bearing
         # URL/id in the exception text — scrub it before it reaches the LLM.
-        return {"error": _UUID_RE.sub(REDACTED_PLACEHOLDER, str(e))}
+        return {
+            "error": _UUID_RE.sub(REDACTED_PLACEHOLDER, message),
+            "failure": failure,
+        }
     finally:
         if own:
             try:

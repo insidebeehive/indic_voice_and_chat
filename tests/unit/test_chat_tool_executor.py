@@ -90,6 +90,7 @@ async def test_http_failure_returns_error_dict() -> None:
         auth_type=None, token=None, args={}, http_client=_Boom(),
     )
     assert "error" in out
+    assert out["failure"] == "transport_error"
 
 
 @pytest.mark.asyncio
@@ -191,7 +192,13 @@ async def test_read_timeout_returns_error_dict_not_raise() -> None:
         method="GET", parameters={}, auth_type=None, token=None, args={},
         http_client=_TimingOutClient(),
     )
-    assert out == {"error": "boom"}
+    # Ticket #1762 fix: a bare httpx timeout carries an EMPTY str(e) -- the
+    # message must always be a real, non-empty phrase (never that literal
+    # empty string), plus a machine-readable "failure" discriminator.
+    assert out == {
+        "error": "The request to fetch this data timed out (ReadTimeout).",
+        "failure": "timeout",
+    }
 
 
 @pytest.mark.asyncio
@@ -280,7 +287,8 @@ async def test_uuid_in_exception_message_is_scrubbed_from_error_path() -> None:
         auth_type=None, token=None, args={}, http_client=_Boom(),
     )
     assert out == {
-        "error": "404 for url https://crm.example.com/players/[redacted]"
+        "error": "404 for url https://crm.example.com/players/[redacted]",
+        "failure": "transport_error",
     }
 
 
@@ -433,3 +441,92 @@ def test_pgs_order_id_non_string_value_is_not_blindly_passed_through() -> None:
     assert out == {
         "PgsOrderId": {"user_id": tool_executor.REDACTED_PLACEHOLDER, "keep": "me"},
     }
+
+
+# --- Step 1 (ticket #1762 fix): failure legibility ------------------------
+
+
+@pytest.mark.asyncio
+async def test_timeout_error_message_is_non_empty_with_failure_discriminator() -> None:
+    """The exact ticket #1762 shape: a BARE httpx timeout with no message at
+    all -- str(httpx.ReadTimeout()) is "". The error text reaching the LLM
+    must never be that empty string, and must carry the "timeout" discriminator."""
+
+    class _TimingOutClient:
+        async def get(self, *a, **k):
+            raise httpx.ReadTimeout("")  # empty message -- str(e) == ""
+
+    out = await execute_crm_tool(
+        endpoint="https://crm.example.com/api/wallet",
+        method="GET", parameters={}, auth_type=None, token=None, args={},
+        http_client=_TimingOutClient(),
+    )
+    assert out["error"]  # non-empty
+    assert out["error"] != ""
+    assert out["failure"] == "timeout"
+
+
+@pytest.mark.asyncio
+async def test_status_code_4xx_is_detected_as_failure() -> None:
+    class _404Client(_FakeClient):
+        async def get(self, url, params=None, headers=None):
+            self.calls.append(("GET", url, params, headers))
+            return _FakeResp(self._payload, status=404)
+
+    out = await execute_crm_tool(
+        endpoint="https://crm.example.com/api/wallet",
+        method="GET", parameters={}, auth_type=None, token=None, args={},
+        http_client=_404Client({"message": "player not found"}),
+    )
+    assert out["status_code"] == 404
+    assert out["failure"] == "http_error"
+    assert out["error"]
+    assert out["data"] == {"message": "player not found"}
+
+
+@pytest.mark.asyncio
+async def test_status_code_5xx_is_detected_as_failure() -> None:
+    class _503Client(_FakeClient):
+        async def get(self, url, params=None, headers=None):
+            self.calls.append(("GET", url, params, headers))
+            return _FakeResp(self._payload, status=503)
+
+    out = await execute_crm_tool(
+        endpoint="https://crm.example.com/api/wallet",
+        method="GET", parameters={}, auth_type=None, token=None, args={},
+        http_client=_503Client({"error": "unavailable"}),
+    )
+    assert out["status_code"] == 503
+    assert out["failure"] == "http_error"
+    assert out["error"]
+
+
+@pytest.mark.asyncio
+async def test_status_code_2xx_has_no_failure_key() -> None:
+    client = _FakeClient({"ok": True})
+    out = await execute_crm_tool(
+        endpoint="https://crm.example.com/api/wallet",
+        method="GET", parameters={}, auth_type=None, token=None, args={},
+        http_client=client,
+    )
+    assert out == {"status_code": 200, "data": {"ok": True}}
+    assert "failure" not in out
+    assert "error" not in out
+
+
+@pytest.mark.asyncio
+async def test_transport_error_uuid_still_scrubbed_with_failure_discriminator() -> None:
+    class _Boom:
+        async def get(self, *a, **k):
+            raise RuntimeError(
+                "404 for url https://crm.example.com/players/"
+                "6c1a77a6-20b0-4fc9-ba4c-8add58aba9ef"
+            )
+
+    out = await execute_crm_tool(
+        endpoint="https://x/y", method="GET", parameters={},
+        auth_type=None, token=None, args={}, http_client=_Boom(),
+    )
+    assert out["failure"] == "transport_error"
+    assert "6c1a77a6" not in out["error"]
+    assert "[redacted]" in out["error"]

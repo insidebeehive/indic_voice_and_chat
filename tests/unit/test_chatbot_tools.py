@@ -25,7 +25,7 @@ from src.interfaces.llm import (
 from src.interfaces.vector_store import Document
 from src.providers.vector_store.faiss_store import FAISSAdapter
 from src.rag.embeddings import HashEmbedder, IdentityReranker
-from src.rag.retriever import HybridRetriever, RetrievalConfig
+from src.rag.retriever import HybridRetriever, RetrievalConfig, RetrievedChunk
 
 
 class ScriptedLLM(ILLMProvider):
@@ -667,3 +667,272 @@ async def test_deposit_verification_executor_result_is_passed_through_and_budget
         ScriptedLLM([]), retriever, deposit_verification_executor=deposit_exec_non_dict)
     non_dict_result, _, _, _ = await agent_non_dict._dispatch_tool(tc, timeout_s=10.0)
     assert non_dict_result == {"result": "submitted"}
+
+
+# --- Failure-category directive (Steps 2/3, ticket #1762) ---------------
+
+
+@pytest.mark.asyncio
+async def test_failed_crm_tool_triggers_directive_with_label_not_tool_name(retriever) -> None:
+    async def crm_exec(tc: ToolCall, *, timeout_s: float = 0.0) -> dict:
+        return {"error": "timed out", "failure": "timeout"}
+
+    crm_tools = [ToolSpec(name="get_player_transactions", description="txns",
+                          parameters={"type": "object", "properties": {}})]
+    llm = ScriptedLLM([
+        LLMResult(text="", finish_reason="tool_calls", tool_calls=[
+            ToolCall(id="t1", name="get_player_transactions", arguments={})]),
+        LLMResult(text="I can't verify this right now, let me connect you to a human.",
+                  finish_reason="stop"),
+    ])
+    agent = _agent(llm, retriever, crm_tools=crm_tools, crm_executor=crm_exec)
+    await agent.handle_message("where is my withdrawal?")
+    second_call_messages = llm.calls[1][0]
+    directive_msgs = [m for m in second_call_messages
+                       if m.role == "user" and "SYSTEM NOTE" in (m.content or "")]
+    assert len(directive_msgs) == 1
+    directive_text = directive_msgs[0].content
+    assert "transaction history" in directive_text
+    assert "get_player_transactions" not in directive_text
+
+
+@pytest.mark.asyncio
+async def test_category_recovered_in_round_two_is_not_flagged(retriever) -> None:
+    calls = {"n": 0}
+
+    async def crm_exec(tc: ToolCall, *, timeout_s: float = 0.0) -> dict:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return {"error": "timed out", "failure": "timeout"}
+        return {"balance": 500}
+
+    crm_tools = [ToolSpec(name="get_player_wallet", description="wallet",
+                          parameters={"type": "object", "properties": {}})]
+    llm = ScriptedLLM([
+        LLMResult(text="", finish_reason="tool_calls", tool_calls=[
+            ToolCall(id="t1", name="get_player_wallet", arguments={})]),
+        LLMResult(text="", finish_reason="tool_calls", tool_calls=[
+            ToolCall(id="t2", name="get_player_wallet", arguments={})]),
+        LLMResult(text="Your balance is ₹500.", finish_reason="stop"),
+    ])
+    agent = _agent(llm, retriever, crm_tools=crm_tools, crm_executor=crm_exec,
+                    max_tool_rounds=3)
+    await agent.handle_message("what's my balance?")
+    # The final (3rd) generate() call must NOT carry the synthetic directive —
+    # the category recovered in round 2.
+    third_call_messages = llm.calls[2][0]
+    directive_msgs = [m for m in third_call_messages
+                       if m.role == "user" and "SYSTEM NOTE" in (m.content or "")]
+    assert directive_msgs == []
+
+
+@pytest.mark.asyncio
+async def test_directive_reaches_forced_final_answer_path(retriever) -> None:
+    """The exact path ticket #1762 took: rounds run out while the tool is
+    still failing, forcing a final plain-text answer -- the directive must
+    still be present in that forced call's messages."""
+    async def crm_exec(tc: ToolCall, *, timeout_s: float = 0.0) -> dict:
+        return {"error": "timed out", "failure": "timeout"}
+
+    crm_tools = [ToolSpec(name="get_player_transactions", description="txns",
+                          parameters={"type": "object", "properties": {}})]
+    llm = ScriptedLLM([
+        LLMResult(text="", finish_reason="tool_calls", tool_calls=[
+            ToolCall(id="t1", name="get_player_transactions", arguments={})]),
+        LLMResult(text="", finish_reason="tool_calls", tool_calls=[
+            ToolCall(id="t2", name="get_player_transactions", arguments={})]),
+        # max_tool_rounds default is 2 -- the loop's `else` branch fires here,
+        # forcing this 3rd call as a plain-text-only synthesis.
+        LLMResult(text="I can't verify this right now, let me connect you to a human.",
+                  finish_reason="stop"),
+    ])
+    agent = _agent(llm, retriever, crm_tools=crm_tools, crm_executor=crm_exec)
+    result = await agent.handle_message("where is my ₹19,600 withdrawal?")
+    forced_call_messages = llm.calls[2][0]
+    directive_msgs = [m for m in forced_call_messages
+                       if m.role == "user" and "SYSTEM NOTE" in (m.content or "")]
+    assert len(directive_msgs) == 1
+    assert "connect you to a human" in directive_msgs[0].content
+    assert result.response.response_text == (
+        "I can't verify this right now, let me connect you to a human.")
+
+
+@pytest.mark.asyncio
+async def test_repeated_failure_across_turns_escalates_directive(retriever) -> None:
+    async def crm_exec(tc: ToolCall, *, timeout_s: float = 0.0) -> dict:
+        return {"error": "timed out", "failure": "timeout"}
+
+    crm_tools = [ToolSpec(name="get_player_wallet", description="wallet",
+                          parameters={"type": "object", "properties": {}})]
+    llm = ScriptedLLM([
+        LLMResult(text="", finish_reason="tool_calls", tool_calls=[
+            ToolCall(id="t1", name="get_player_wallet", arguments={})]),
+        LLMResult(text="I can't check that right now.", finish_reason="stop"),
+        LLMResult(text="", finish_reason="tool_calls", tool_calls=[
+            ToolCall(id="t2", name="get_player_wallet", arguments={})]),
+        LLMResult(text="Still can't check that.", finish_reason="stop"),
+    ])
+    agent = _agent(llm, retriever, crm_tools=crm_tools, crm_executor=crm_exec)
+    await agent.handle_message("what's my balance?")   # turn 1: 1st failure
+    await agent.handle_message("please check again")   # turn 2: 2nd turn running
+    turn2_directive = [
+        m for c in llm.calls[2:] for m in c[0]
+        if m.role == "user" and "SYSTEM NOTE" in (m.content or "")
+    ]
+    assert turn2_directive
+    assert "more than one turn in a row" in turn2_directive[-1].content
+
+
+def test_tool_budget_exhausted_fallback_forbids_answering_anyway() -> None:
+    """Regression for the corrected _TOOL_BUDGET_EXHAUSTED payload -- it must
+    no longer tell the model to 'answer now using what you already have'."""
+    assert "answer now" not in chatbot_mod._TOOL_BUDGET_EXHAUSTED["message"].lower()
+    assert chatbot_mod._TOOL_BUDGET_EXHAUSTED["failure"] == "timeout"
+    assert chatbot_mod._TOOL_BUDGET_EXHAUSTED["error"]  # non-empty
+
+
+@pytest.mark.asyncio
+async def test_crm_executor_exception_fallback_forbids_pending_framing(retriever) -> None:
+    """Regression for the CRM-executor-exception payload -- it must no longer
+    claim 'the data is being retrieved' when nothing is; must be detected as
+    a Step 2 failure."""
+    async def crm_exec(tc: ToolCall, *, timeout_s: float = 0.0) -> dict:
+        raise RuntimeError("boom")
+
+    crm_tools = [ToolSpec(name="get_player_wallet", description="wallet",
+                          parameters={"type": "object", "properties": {}})]
+    llm = ScriptedLLM([
+        LLMResult(text="", finish_reason="tool_calls", tool_calls=[
+            ToolCall(id="t1", name="get_player_wallet", arguments={})]),
+        LLMResult(text="I can't verify this right now, let me connect you to a human.",
+                  finish_reason="stop"),
+    ])
+    agent = _agent(llm, retriever, crm_tools=crm_tools, crm_executor=crm_exec)
+    await agent.handle_message("what's my balance?")
+    tool_msgs = [m for m in llm.calls[1][0] if m.role == "tool"]
+    payload = json.loads(tool_msgs[0].content)
+    assert "the data is being retrieved" not in payload.get("message", "").lower()
+    assert payload.get("error")
+    directive_msgs = [m for m in llm.calls[1][0]
+                       if m.role == "user" and "SYSTEM NOTE" in (m.content or "")]
+    assert directive_msgs  # detected as a failure -> directive fired
+
+
+@pytest.mark.asyncio
+async def test_no_executor_fallback_forbids_pending_framing(retriever) -> None:
+    """Regression for the no-crm-executor-configured payload."""
+    crm_tools = [ToolSpec(name="get_player_wallet", description="wallet",
+                          parameters={"type": "object", "properties": {}})]
+    llm = ScriptedLLM([
+        LLMResult(text="", finish_reason="tool_calls", tool_calls=[
+            ToolCall(id="t1", name="get_player_wallet", arguments={})]),
+        LLMResult(text="I can't verify this right now, let me connect you to a human.",
+                  finish_reason="stop"),
+    ])
+    agent = _agent(llm, retriever, crm_tools=crm_tools, crm_executor=None)
+    await agent.handle_message("what's my balance?")
+    tool_msgs = [m for m in llm.calls[1][0] if m.role == "tool"]
+    payload = json.loads(tool_msgs[0].content)
+    assert "integration is not yet connected" not in payload.get("message", "").lower()
+    assert payload.get("error")
+    directive_msgs = [m for m in llm.calls[1][0]
+                       if m.role == "user" and "SYSTEM NOTE" in (m.content or "")]
+    assert directive_msgs
+
+
+# --- Post-review fixes to the Step 5 guard's wiring (false-positive fixes) ---
+
+
+@pytest.mark.asyncio
+async def test_correct_followup_turn_keeps_grounding_from_prior_assistant_turn(retriever) -> None:
+    """Review Fix 2 regression: turn 1 correctly grounds a real figure via a
+    tool call; turn 2 has NO tool call at all and just restates that same
+    figure (e.g. 'can I use it right away?'). It must NOT be wrongly blocked
+    just because grounded-text construction only looked at the customer's
+    OWN prior turns and excluded the bot's own (legitimate) prior turn."""
+    async def crm_exec(tc: ToolCall, *, timeout_s: float = 0.0) -> dict:
+        return {"balance": 2075}
+
+    crm_tools = [ToolSpec(name="get_player_wallet", description="wallet",
+                          parameters={"type": "object", "properties": {}})]
+    llm = ScriptedLLM([
+        LLMResult(text="", finish_reason="tool_calls", tool_calls=[
+            ToolCall(id="t1", name="get_player_wallet", arguments={})]),
+        LLMResult(text="Your balance is ₹2,075.", finish_reason="stop"),
+        LLMResult(text="Yes, your ₹2,075 balance is available right away.",
+                  finish_reason="stop"),
+    ])
+    agent = _agent(llm, retriever, crm_tools=crm_tools, crm_executor=crm_exec)
+    turn1 = await agent.handle_message("what's my balance?")
+    assert turn1.response.response_text == "Your balance is ₹2,075."
+    turn2 = await agent.handle_message("can I use it right away?")
+    assert turn2.response.response_text == "Yes, your ₹2,075 balance is available right away."
+
+
+@pytest.mark.asyncio
+async def test_kb_truncated_chunk_still_grounds_reply(retriever) -> None:
+    """Review Fix 3 regression: rag.text is separately truncated to
+    max_context_chars by build_rag_context and can drop whole chunks, but
+    the model's own search_knowledge_base TOOL RESULT always carries every
+    retrieved chunk's FULL content, untruncated. A real figure that only
+    appears in a chunk truncated OUT of rag.text must still ground the
+    reply, since the model itself read the full chunk."""
+    chunks = [
+        RetrievedChunk(document=Document(id="c1", content="Minimum bet is ₹10.",
+                                          metadata={"filename": "kb.md"}), score=0.9),
+        RetrievedChunk(document=Document(id="c2", content="Maximum bet is ₹99,999.",
+                                          metadata={"filename": "kb.md"}), score=0.5),
+    ]
+
+    class _StubRetriever:
+        async def search(self, *a, **k):
+            return chunks
+
+    llm = ScriptedLLM([
+        LLMResult(text="", finish_reason="tool_calls", tool_calls=[
+            ToolCall(id="t1", name="search_knowledge_base", arguments={"query": "bet limits"})]),
+        LLMResult(text="The maximum bet is ₹99,999.", finish_reason="stop"),
+    ])
+    agent = ChatBotAgent(
+        session=AgentSession(session_id="s"), llm=llm, retriever=_StubRetriever(),
+        company_name="Acme", language_default="en", enable_tools=True,
+        max_context_chars=20,   # small enough that build_rag_context truncates to ONE chunk
+    )
+    result = await agent.handle_message("what are the bet limits?")
+    assert result.response.response_text == "The maximum bet is ₹99,999."
+
+
+def test_tool_result_is_failure_recognizes_deposit_verification_error_shape() -> None:
+    """Review Fix 6 regression: src/chatbot/deposit_verification.py returns
+    {"status": "error", "message": ...} on failure -- NEITHER an "error" nor
+    a "failure" key. Without this, a genuinely failed deposit-verification
+    submit was invisible to the failure check and got folded into grounded
+    text as if it had succeeded."""
+    assert chatbot_mod._tool_result_is_failure(
+        {"status": "error", "message": "Verification is not available for this account."}
+    )
+    # A real success payload must still NOT be flagged.
+    assert not chatbot_mod._tool_result_is_failure({"status": "submitted"})
+
+
+@pytest.mark.asyncio
+async def test_failed_deposit_verification_does_not_ground_and_triggers_directive(retriever) -> None:
+    """End-to-end version of the Fix 6 regression: a failed
+    submit_deposit_verification call must be classified as a Step 2 failure
+    (directive fires) rather than silently treated as a successful,
+    grounding tool result."""
+    async def deposit_exec(tc: ToolCall, *, timeout_s: float = 0.0) -> dict:
+        return {"status": "error", "message": "Verification is not available for this account."}
+
+    llm = ScriptedLLM([
+        LLMResult(text="", finish_reason="tool_calls", tool_calls=[
+            ToolCall(id="t1", name="submit_deposit_verification", arguments={"order_id": "ORD-1"})]),
+        LLMResult(text="I can't verify this right now, let me connect you to a human.",
+                  finish_reason="stop"),
+    ])
+    agent = _agent(llm, retriever, deposit_verification_executor=deposit_exec)
+    await agent.handle_message("please verify my deposit")
+    directive_msgs = [m for m in llm.calls[1][0]
+                       if m.role == "user" and "SYSTEM NOTE" in (m.content or "")]
+    assert directive_msgs
+    assert "deposit verification request" in directive_msgs[0].content
