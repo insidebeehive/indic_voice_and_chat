@@ -291,6 +291,28 @@ class Secrets(BaseSettings):
     VOX_CONFIG_PATH: str = "config/default.yaml"
     VOX_LOG_LEVEL: Optional[str] = None
 
+    # Grafana Cloud Loki log push (Phase 1 observability). Both unset ->
+    # configure_logging() no-ops and behavior is unchanged from today.
+    GRAFANA_LOKI_PUSH_URL: Optional[str] = None  # e.g. https://logs-prod-xxx.grafana.net/loki/api/v1/push
+    GRAFANA_LOKI_PUSH_AUTH: Optional[str] = None  # "user:api_key" for HTTP basic auth
+
+    # Grafana Cloud Prometheus metrics push (Phase 2 observability, TurnMetric
+    # aggregation). Unset -> aggregate_and_push_turn_metrics() no-ops and
+    # behavior is unchanged from today. See
+    # src/observability/turn_metrics_push.py for the exact push protocol
+    # (classic Pushgateway, not remote-write) and why.
+    GRAFANA_PROMETHEUS_PUSH_URL: Optional[str] = None  # e.g. https://prometheus-prod-xxx.grafana.net/api/prom/push
+    GRAFANA_PROMETHEUS_PUSH_AUTH: Optional[str] = None  # "user:api_key" for HTTP basic auth
+    # How often the TurnMetric aggregation job runs. Floored well above 0:
+    # each run does a full aggregation query over the rolling window (see
+    # src/observability/turn_metrics_push.py), on the same process serving
+    # live calls -- 0 or a negative value would turn src/main.py's background
+    # loop into a hot loop hammering that query with no sleep in between.
+    # 5s is a practical floor -- there's no legitimate reason to aggregate
+    # dashboard metrics more often than that, and it still fails fast at
+    # config-load time on an obvious misconfiguration (e.g. "0").
+    METRICS_PUSH_INTERVAL_S: float = Field(default=60.0, ge=5.0)
+
 
 class Settings(BaseModel):
     """Merged settings: YAML defaults overlaid with env-derived secrets."""

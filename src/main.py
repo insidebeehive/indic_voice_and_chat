@@ -37,7 +37,7 @@ if "pytest" not in sys.modules:
 
 import redis.asyncio as redis_async
 from fastapi import FastAPI
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from sqlalchemy import text
 
 from src.api import (
@@ -178,6 +178,29 @@ async def _reap_stale_calls_loop() -> None:
         except Exception:  # noqa: BLE001 - the reaper must never die (CancelledError still propagates)
             log.exception("stale-call reaper failed")
         await asyncio.sleep(_REAP_INTERVAL_S)
+
+
+async def _push_turn_metrics_loop(
+    interval_s: float, push_url: Optional[str], push_auth: Optional[str]
+) -> None:
+    """Periodically aggregate recent TurnMetric rows (per-turn voice-call
+    latency, see src.models.turn_metrics) into Prometheus metric families and
+    push them to Grafana Cloud (Phase 2 observability). A clean no-op each
+    iteration when push_url is unset — see aggregate_and_push_turn_metrics.
+    Runs once at startup, then every interval_s."""
+    from src.observability.turn_metrics_push import aggregate_and_push_turn_metrics
+
+    sm = get_sessionmaker()
+    while True:
+        try:
+            n = await aggregate_and_push_turn_metrics(
+                sm, push_url, push_auth, window_s=interval_s * 2,
+            )
+            if n:
+                log.info("pushed turn metrics", extra={"count": n})
+        except Exception:  # noqa: BLE001 - the push loop must never die (CancelledError still propagates)
+            log.exception("turn-metrics push failed")
+        await asyncio.sleep(interval_s)
 
 
 async def _seed_crm_kb(
@@ -383,7 +406,12 @@ async def _seed_crm_kb(
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings: Settings = get_settings()
-    configure_logging(settings.app.log_level)
+    configure_logging(
+        settings.app.log_level,
+        loki_url=settings.secrets.GRAFANA_LOKI_PUSH_URL,
+        loki_auth=settings.secrets.GRAFANA_LOKI_PUSH_AUTH,
+        service_name=settings.app.name,
+    )
     log.info("startup", extra={"app": settings.app.name, "version": settings.app.version})
 
     # Eagerly create engine + redis pool so missing config fails on boot, not first request.
@@ -602,6 +630,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     reaper_task = asyncio.create_task(_reap_stale_calls_loop())
     kb_seed_task = asyncio.create_task(_seed_crm_kb(crm_retrievers, sessionmaker))
+    metrics_push_task = asyncio.create_task(_push_turn_metrics_loop(
+        settings.secrets.METRICS_PUSH_INTERVAL_S,
+        settings.secrets.GRAFANA_PROMETHEUS_PUSH_URL,
+        settings.secrets.GRAFANA_PROMETHEUS_PUSH_AUTH,
+    ))
 
     try:
         yield
@@ -609,6 +642,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         log.info("shutdown")
         reaper_task.cancel()
         kb_seed_task.cancel()
+        metrics_push_task.cancel()
         telephony_hooks.set_bridge_factory(None)
         telephony_hooks.set_exotel_bridge_factory(None)
         telephony_hooks.set_stringee_bridge_factory(None)
@@ -738,11 +772,12 @@ async def chat_widget() -> FileResponse:
     return FileResponse(_STATIC_DIR / "chat_widget.html", media_type="text/html")
 
 
-@app.get("/health")
-async def health() -> dict:
-    """Liveness + dependency probe + per-tenant provider routing."""
-    settings: Settings = app.state.settings if hasattr(app.state, "settings") else get_settings()
+async def _probe_dependencies(app: FastAPI) -> tuple[str, str]:
+    """Probe Redis and the DB, returning (redis_status, db_status) as "ok"/"down".
 
+    Shared by /health and /ready so the two routes can never drift on what
+    counts as "down".
+    """
     redis_status = "down"
     try:
         if hasattr(app.state, "redis"):
@@ -759,6 +794,16 @@ async def health() -> dict:
         db_status = "ok"
     except Exception as e:  # noqa: BLE001
         log.warning("db probe failed", extra={"error": str(e)})
+
+    return redis_status, db_status
+
+
+@app.get("/health")
+async def health() -> dict:
+    """Liveness + dependency probe + per-tenant provider routing."""
+    settings: Settings = app.state.settings if hasattr(app.state, "settings") else get_settings()
+
+    redis_status, db_status = await _probe_dependencies(app)
 
     tenants_summary = []
     tenants: dict[str, TenantSettings] = getattr(app.state, "tenants", {})
@@ -792,3 +837,25 @@ async def health() -> dict:
         "redis": redis_status,
         "db": db_status,
     }
+
+
+@app.get("/ready")
+async def ready() -> JSONResponse:
+    """Readiness probe: 503 when Redis or the DB is down.
+
+    Unlike /health (which always returns 200 for Northflank's liveness
+    check), /ready reflects real dependency health so callers that need to
+    gate on it (e.g. a load balancer or orchestrator doing readiness-based
+    routing) can do so.
+    """
+    redis_status, db_status = await _probe_dependencies(app)
+
+    if redis_status == "down" or db_status == "down":
+        return JSONResponse(
+            status_code=503,
+            content={"redis": redis_status, "db": db_status, "status": "not_ready"},
+        )
+
+    return JSONResponse(
+        content={"redis": redis_status, "db": db_status, "status": "ready"},
+    )

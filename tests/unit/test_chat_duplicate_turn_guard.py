@@ -24,7 +24,9 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import io
 import json
+import logging
 import threading
 
 import pytest
@@ -38,6 +40,7 @@ from fastapi.testclient import TestClient
 from src.api import chat as chat_api
 from src.models.database import Base
 from src.models.chat import ChatMessage, ChatSession
+from src.utils.logging import configure_logging
 
 # Note: no local `_clear_turn_guards` autouse fixture here -- the shared
 # `_reset_chat_turn_guards` autouse fixture in tests/conftest.py already
@@ -601,3 +604,124 @@ def test_dict_bounding_sweep_removes_stale_completed_entries(monkeypatch) -> Non
                for sid in [f"stale-{i}" for i in range(4)])
     for i in range(4):
         assert f"stale-{i}" not in chat_api._turn_guards
+
+
+# --- 9. Per-turn trace id (Phase 4a observability stopgap) -----------------
+#
+# Mirrors tests/unit/test_client_ip.py's json_log_stream fixture: install the
+# REAL production logging config, redirected to a buffer, so trace_id shows
+# up exactly as it would in production JSON log lines (ambient stamping via
+# _TraceIdLogFilter, not something the test fabricates).
+
+
+@pytest.fixture
+def json_log_stream():
+    root = logging.getLogger()
+    saved_handlers = root.handlers[:]
+    saved_level = root.level
+
+    configure_logging("INFO")
+    handler = root.handlers[-1]
+    buffer = io.StringIO()
+    handler.setStream(buffer)
+    try:
+        yield buffer
+    finally:
+        root.handlers[:] = saved_handlers
+        root.setLevel(saved_level)
+
+
+def _log_records(buffer: io.StringIO) -> list[dict]:
+    return [json.loads(line) for line in buffer.getvalue().splitlines() if line.strip()]
+
+
+@pytest.mark.asyncio
+async def test_distinct_turns_get_distinct_trace_ids(ws_ctx, monkeypatch, json_log_stream) -> None:
+    """Two distinct (non-duplicate) WS turns for one session must carry two
+    different trace ids in their log output -- the whole point being that an
+    operator can grep for two turn-scoped log lines with different trace ids
+    close together in time as evidence of a duplicate-reply bug."""
+    sm, fake_agent = ws_ctx
+    monkeypatch.setattr(chat_api, "_INTERIM_INTERVAL_S", 0.05)
+
+    turn_logger = logging.getLogger("tests.unit.test_chat_duplicate_turn_guard.turn")
+
+    async def _handle(text):
+        # Emitted from deep inside the turn's call stack (as a real handler
+        # would log from within engine.py/voicebot.py) -- picks up the
+        # ambient trace id via _TraceIdLogFilter with no explicit passing.
+        turn_logger.info("fake turn processed", extra={"text": text})
+        return _FakeTurnResult()
+
+    fake_agent.handle_message = AsyncMock(side_effect=_handle)
+
+    patcher, client = _connect(_make_tenant())
+    try:
+        with client.websocket_connect("/api/v1/chat/ws/sess1") as ws:
+            ws.send_text(json.dumps({"type": "message", "text": "first message"}))
+            frame = json.loads(ws.receive_text())
+            assert frame["type"] == "typing"
+            frame = json.loads(ws.receive_text())
+            assert frame["type"] == "message"
+
+            ws.send_text(json.dumps({"type": "message", "text": "second message"}))
+            frame = json.loads(ws.receive_text())
+            assert frame["type"] == "typing"
+            frame = json.loads(ws.receive_text())
+            assert frame["type"] == "message"
+    finally:
+        patcher.stop()
+
+    records = [r for r in _log_records(json_log_stream) if r.get("message") == "fake turn processed"]
+    assert len(records) == 2
+    trace_ids = [r.get("trace_id") for r in records]
+    assert all(trace_ids), f"expected every turn-scoped log line to carry a trace_id: {records}"
+    assert trace_ids[0] != trace_ids[1]
+
+
+@pytest.mark.asyncio
+async def test_dropped_duplicate_turn_has_its_own_distinct_trace_id(
+    ws_ctx, monkeypatch, json_log_stream
+) -> None:
+    """The dropped duplicate's log line must carry a trace id distinct from
+    the turn it duplicated -- that's the grep signature for the double-reply
+    bug this mechanism exists to catch."""
+    sm, fake_agent = ws_ctx
+    monkeypatch.setattr(chat_api, "_INTERIM_INTERVAL_S", 0.05)
+
+    turn_logger = logging.getLogger("tests.unit.test_chat_duplicate_turn_guard.turn")
+
+    async def _handle(text):
+        turn_logger.info("fake turn processed", extra={"text": text})
+        return _FakeTurnResult()
+
+    fake_agent.handle_message = AsyncMock(side_effect=_handle)
+
+    patcher, client = _connect(_make_tenant())
+    try:
+        with client.websocket_connect("/api/v1/chat/ws/sess1") as ws:
+            # Two identical frames back-to-back, before draining either --
+            # the second is dropped by the duplicate-turn guard.
+            ws.send_text(json.dumps({"type": "message", "text": "How to deposit"}))
+            ws.send_text(json.dumps({"type": "message", "text": "How to deposit"}))
+
+            frame = json.loads(ws.receive_text())
+            assert frame["type"] == "typing"
+            frame = json.loads(ws.receive_text())
+            assert frame["type"] == "message"
+
+            await _drain_for(ws, 0.3)
+    finally:
+        patcher.stop()
+
+    records = _log_records(json_log_stream)
+    processed = [r for r in records if r.get("message") == "fake turn processed"]
+    dropped = [r for r in records if r.get("message") == "duplicate chat turn dropped"]
+    assert len(processed) == 1
+    assert len(dropped) == 1
+
+    winning_trace_id = processed[0].get("trace_id")
+    dropped_trace_id = dropped[0].get("trace_id")
+    assert winning_trace_id
+    assert dropped_trace_id
+    assert winning_trace_id != dropped_trace_id
