@@ -14,8 +14,8 @@ inbound (customers chat with us).
 |---|---|
 | Agent | `src/agents/chatbot.py` `ChatBotAgent` (text counterpart to `VoiceBotAgent`) |
 | LLM | provider registry (`get_llm`); Gemini multimodal + function-calling (`src/providers/llm/gemini.py`) |
-| RAG | `src/rag/*` (ingestion, `LocalEmbedder` multilingual MiniLM, `HybridRetriever` = FAISS + BM25, context builder + hallucination guard) |
-| Vector store | per-tenant `FAISSAdapter` (index path `data/faiss/{tenant_id}/`) via the runtime registry |
+| RAG | `src/rag/*` (ingestion, `GeminiEmbedder` 384-dim multilingual embeddings, `HybridRetriever` = vector search + BM25, context builder + hallucination/no-grounding/unverified-data guards) |
+| Vector store | per-tenant, config-selected (`vector_store.provider`): `pgvector` by default, or file-backed `faiss` as an alternative — via `src/providers/get_vector_store` and the runtime registry. The CRM-level shared KB (below) is **pgvector-only**: FAISS has no CRM-level tier by design, so a CRM with `vector_store.provider != pgvector` simply gets no CRM-shared KB. `LocalEmbedder` (`sentence-transformers`) also exists in `src/rag/embeddings.py` but isn't what's wired into the live retriever factory. |
 | Sessions | Redis `SessionStore` (history/state) + Postgres (`chat_sessions`, `chat_messages`) |
 | Tools | builtin `ToolSpec`s + per-tenant `chat_tools` rows; tokens encrypted in `tenant_secrets` |
 | Voice handoff | the browser voice bridge (`make_browser_bridge_factory`) |

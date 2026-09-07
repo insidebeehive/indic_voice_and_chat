@@ -165,6 +165,28 @@ flowchart TB
   `/dev/voice` (live voice test — recorded + billed like a real call), `/chat-widget` (reference
   chat UI — recorded + billed like a real chat session).
 
+## Tools & providers by module
+
+Every provider below is config-selected per tenant (or per CRM, where noted) through
+`src/providers/get_*` — swapping one is a config change, not a code change, except
+where noted.
+
+| Module | Options | Notes |
+|---|---|---|
+| STT (batch) | Sarvam · Groq (Whisper) · Gemini | |
+| STT (streaming) | Deepgram | the only streaming STT provider; batch providers above are the fallback |
+| LLM | Gemini (also the S2S/Live provider) · Groq · Anthropic Claude · self-hosted vLLM (OpenAI-compatible, e.g. an IndicF5 RunPod pod) | Gemini is the active default for both VoiceBot and ChatBot |
+| TTS | Sarvam · Gemini · Google · Azure · ElevenLabs · self-hosted IndicF5 | Sarvam (`bulbul:v2`) is the active default |
+| Telephony (dial-out) | Twilio · Exotel · Stringee | behind the common `ITelephonyProvider` interface |
+| Telephony (room-join) | LiveKit — CRM-hosted SIP, CRM-level credentials | separate integration, not behind `ITelephonyProvider` (no dial-out leg on this side) |
+| Telephony (in progress) | SIP trunk / DiDLogic (pyVoIP, in-app RTP) | built on a branch, not merged |
+| Vector store (RAG) | `pgvector` (the configured default) · file-backed `faiss` (alternative, per-tenant only) | selected via `vector_store.provider` config; **CRM-level shared KB requires pgvector** — FAISS has no CRM-level tier by design |
+| Embeddings | Gemini (`GeminiEmbedder`, 384-dim, multilingual) | `LocalEmbedder` (`sentence-transformers`) also exists in `src/rag/embeddings.py` but isn't what's wired into the live retriever factory |
+| Sparse retrieval | BM25 (`rank-bm25`) | fused with the vector-store dense results in `HybridRetriever` (default 70/30 dense/sparse weighting) |
+| Primary datastore | Postgres, schema `voicebot` | shared DB — no dedicated database needed, `search_path`-scoped |
+| Session/cache store | Redis | |
+| Deployment | Docker image on Northflank, auto-deploy from git | |
+
 See `docs/PROJECT-STATUS.md` for component-by-component status,
 `docs/chatbot.md` for the full ChatBot API/DB reference, and
 `docs/sip-didlogic-integration-plan.md` for the SIP path.
