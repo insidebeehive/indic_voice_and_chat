@@ -37,10 +37,13 @@ assessment — handle those directly in the main session.
 
 ## Verification
 
-Tests live in `tests/` (pytest, run via `.venv/bin/python -m pytest`). One
-known pre-existing failure on main (unrelated to most work):
-`test_chat_routes.py::test_claim_session_and_agent_ws` — don't chase
-this unless the task is about it.
+Tests live in `tests/` (pytest, run via `.venv/bin/python -m pytest`). Three
+known pre-existing failures (unrelated to most work), currently the standing
+baseline — re-verify the count before trusting it, since it drifts:
+`test_chat_routes.py::test_claim_session_and_agent_ws`,
+`test_dev_console.py::test_place_call_passes_tenant_creds_to_adapter`,
+`test_pgvector_crm_scoping.py::test_crm_scoped_chunk_is_isolated_from_tenant_scoped_chunk`
+— don't chase these unless the task is about one of them.
 
 ## Existing standing preferences
 

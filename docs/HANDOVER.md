@@ -103,9 +103,12 @@ Both sides write to Postgres (`conversations`/`turns` for voice, `chat_sessions`
   shared CRM catalog).
 - A code-level hallucination guard prevents the bot from inventing player-specific
   data (balances, tx IDs) — not just a prompt instruction.
-- **RAG/KB is real and wired**: FAISS+BM25 hybrid retrieval, per-tenant index, plus a
+- **RAG/KB is real and wired**: hybrid dense+BM25 retrieval, per-tenant index, plus a
   CRM-level shared KB (`crm_kb_documents`) merged in at query time, plus opt-in
-  "product module" KB layers (casino/sports/matka).
+  "product module" KB layers (casino/sports/matka). The vector store is config-selected
+  (`pgvector` is the actual default; file-backed `faiss` is a per-tenant-only
+  alternative — CRM-level shared KB requires pgvector by design), embeddings via
+  `GeminiEmbedder` (384-dim).
 - **The chatbot's base system prompt and its CRM-shared KB are both vertical-agnostic
   by default — industry content is opt-in per CRM.** A `Crm.prompt_pack` column selects
   which prompt pack (`src/dialogue/packs/*.py`) supplies the SCOPE section and a

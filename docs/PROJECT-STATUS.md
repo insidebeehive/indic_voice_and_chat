@@ -1,6 +1,13 @@
 # Project Status
 
-**Last updated:** 2026-06-15
+**Last updated:** 2026-06-15. **This document is stale beyond that date** — it predates
+the ChatBot/CRM subsystem becoming the platform's primary active workstream, LiveKit,
+the security remediation work, and deposit verification, among other things. A couple
+of individual lines below have been corrected in place since (so parts of this doc are
+more current than its own header implies), but it has not had a full pass. For an
+accurate, current picture, use **`docs/HANDOVER.md`** instead — this file is kept
+around as a historical snapshot pending a decision on whether to retire or fully
+rewrite it.
 
 Ground-truth status of what has actually been **built, validated, and worked on** —
 as opposed to what merely exists in the tree. Several modules were scaffolded during

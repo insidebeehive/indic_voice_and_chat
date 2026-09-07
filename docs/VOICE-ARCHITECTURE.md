@@ -1,5 +1,9 @@
 # Voice architecture (the conversation runtime)
 
+This is the zoom-in on VoiceBot's turn-by-turn runtime; see `docs/ARCHITECTURE.md`
+for the system-wide view (multi-tenant platform, API surface, ChatBot, the shared
+knowledge base) that this document's diagram sits inside.
+
 How one **voice turn** flows: caller audio comes in over a telephony/browser
 transport, a **bridge** adapts it, it runs through one of **two pipelines** —
 ① the STT→LLM→TTS **cascade** or ② **speech-to-speech** (Gemini Live) — and the
@@ -20,11 +24,12 @@ flowchart TB
     SIP["SIP trunk · DiDLogic<br/>RTP · PCMU 8k"]:::io
     STR["Stringee<br/>turn IVR · record→WAV"]:::io
     BWS["Browser console<br/>PCM16 16k · WS"]:::io
+    LK["LiveKit<br/>CRM-hosted SIP → room-join · SDK-decoded PCM"]:::io
   end
 
   subgraph BRIDGE["Bridge layer — _BaseLiveBridge · audio_utils (resample, μ-law↔PCM, VAD framing)"]
     direction LR
-    BL["live / S2S bridges<br/>TelephonyLiveBridge · SipMediaBridge · GeminiLiveBridge"]
+    BL["live / S2S bridges<br/>TelephonyLiveBridge · SipMediaBridge · GeminiLiveBridge · LiveKitBridge"]
     BC["cascade bridges<br/>Twilio/ExotelMediaBridge · BrowserVoiceBridge · StringeeIvrBridge"]
   end
 
@@ -68,8 +73,10 @@ flowchart TB
 
 ## The turn loop
 1. **In** — caller audio arrives over the transport (Twilio/Exotel Media Streams μ-law/PCM @ 8 kHz,
-   SIP/DiDLogic RTP @ 8 kHz, Stringee recorded WAV, or the browser at 16 kHz). The **bridge**
-   (`_BaseLiveBridge` family) normalizes/resamples it (`audio_utils`).
+   SIP/DiDLogic RTP @ 8 kHz, Stringee recorded WAV, the browser at 16 kHz, or LiveKit — the CRM
+   fronts its own PSTN/SIP and drops the caller into a room; this app joins as a participant and
+   receives already-decoded PCM frames from the LiveKit SDK, no raw wire codec to handle). The
+   **bridge** (`_BaseLiveBridge` family) normalizes/resamples it (`audio_utils`).
 2. **Understand** —
    - **Cascade:** VAD/endpointing detects end-of-utterance → **STT** → **LLM** (returns a JSON
      envelope: `response_text` + `updated_slots` + `action`) → **TTS** synthesizes the reply.
@@ -89,8 +96,12 @@ flowchart TB
 - **Interfaces decouple providers.** `ISTTProvider`/`IStreamingSTTProvider`, `ILLMProvider`,
   `ITTSProvider`, `IRealtimeSession`, `ITelephonyProvider` — each provider is a swappable adapter
   behind its interface (Sarvam, Groq, Deepgram, Gemini, Anthropic, Gemini Live; Twilio/Exotel/
-  Stringee/SIP).
+  Stringee/SIP). LiveKit sits outside `ITelephonyProvider` — it's a room-join, not a dial-out
+  provider, and has no inbound HTTP leg of its own (a `participant_joined` webhook is the only
+  trigger); it always runs S2S, never cascade.
 - **Audio formats.** Telephony is 8 kHz mono (μ-law on Twilio, PCM on Exotel, PCMU/RTP on SIP);
-  the browser is 16 kHz; bridges resample to the model's rate and back.
-- **Barge-in.** S2S has it natively; the browser cascade has server-side barge-in; telephony
-  cascade barge-in is a pending fast-follow.
+  the browser is 16 kHz; LiveKit hands the bridge SDK-decoded PCM (resampled to 16 kHz in,
+  24 kHz out to match Gemini Live's native rate); bridges resample to the model's rate and back.
+- **Barge-in.** S2S has it natively (so LiveKit gets it for free, since it's S2S-only); the
+  browser cascade has server-side barge-in; telephony cascade barge-in (Twilio/Exotel/Stringee
+  in cascade mode) is a pending fast-follow.

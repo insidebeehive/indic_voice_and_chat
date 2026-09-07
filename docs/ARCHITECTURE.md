@@ -231,6 +231,8 @@ where noted.
 | Session/cache store | Redis | |
 | Deployment | Docker image on Northflank, auto-deploy from git | |
 
-See `docs/PROJECT-STATUS.md` for component-by-component status,
+See `docs/HANDOVER.md` for current component-by-component status,
+`docs/VOICE-ARCHITECTURE.md` for a turn-by-turn zoom-in on the VoiceBot runtime
+(cascade/S2S internals, provider interfaces, audio formats, barge-in),
 `docs/chatbot.md` for the full ChatBot API/DB reference, and
 `docs/sip-didlogic-integration-plan.md` for the SIP path.

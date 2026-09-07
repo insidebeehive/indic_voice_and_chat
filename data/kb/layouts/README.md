@@ -14,7 +14,7 @@ When answering a UI/navigation question for a specific operator:
 2. Check `layouts/layout-N.md` for that layout's deltas (menu structure, screen flow, features shown/hidden).
 3. Anything not overridden there falls back to the shared baseline in the CRM's bundled KB pack's
    `frontend-ui/` subfolder (e.g. `../packs/betting-default/frontend-ui/`).
-4. Anything requiring live operator config (amounts, limits, brand assets, payment methods enabled) is out of scope here — defer to the backend KB's `operator-specific-queries.md`.
+4. Anything requiring live operator config (amounts, limits, brand assets, payment methods enabled) is out of scope here — that data varies per operator and per moment, so it's answered from the operator's live CRM tools at runtime (see `docs/crm-api-contract.md`), not a static KB doc.
 
 ## Contents
 

@@ -104,5 +104,8 @@ admin tokens per `src/main.py` (`TENANT_<SLUG>_API_TOKENS`).
 - **`/health` is always 200** (degraded vs ok in the body) — don't use the body's `status` as the
   health gate; the HTTP code is the gate.
 - **Image size:** base + `voice` extra (faiss-cpu, onnxruntime). No torch/sentence-transformers (the
-  `embeddings` extra is omitted — RAG isn't needed for the voice agent).
+  `embeddings` extra is omitted) — not because RAG is unused (it's a major, active part of both
+  VoiceBot and ChatBot), but because the live embedder is `GeminiEmbedder` (API-based, no local
+  model weights), so the torch-dependent `LocalEmbedder` in `src/rag/embeddings.py` is simply
+  never invoked and its dependency isn't needed.
 - **Secrets hygiene:** never bake keys into the image; use Northflank secret groups. `.env` is gitignored.
