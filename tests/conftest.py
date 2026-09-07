@@ -65,3 +65,22 @@ async def test_session(test_engine: AsyncEngine) -> AsyncIterator[AsyncSession]:
 @pytest.fixture
 def tmp_faiss_index(tmp_path: Path) -> str:
     return str(tmp_path / "test_index")
+
+
+@pytest.fixture(autouse=True)
+def _reset_chat_turn_guards():
+    """``_turn_guards`` (src/api/chat.py's duplicate-turn guard) is a
+    process-global dict keyed only by ``session_id`` -- and a great many chat
+    WS tests across this suite reuse the literal session_id ``"sess1"`` (and
+    identical message text like ``"hi"``) from one test to the next. Without
+    resetting it here, the guard's post-completion echo window
+    (``_DUPLICATE_ECHO_WINDOW_S``, 3s by default) would treat an identical
+    ``"sess1"``/``"hi"`` message in a LATER, unrelated test as a false-positive
+    duplicate of an EARLIER test's already-completed turn -- real wall-clock
+    time between two tests in the same run is often under 3s. The
+    message would be silently dropped, and the test's websocket would then
+    hang forever waiting for a reply/typing frame that was never sent."""
+    from src.api import chat as chat_api
+    chat_api._turn_guards.clear()
+    yield
+    chat_api._turn_guards.clear()

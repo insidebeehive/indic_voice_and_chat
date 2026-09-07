@@ -23,7 +23,9 @@ import asyncio
 import base64
 import json
 import logging
+import time
 import uuid
+from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Awaitable, Callable, NamedTuple, NoReturn, Optional
 
@@ -279,6 +281,178 @@ async def _run_turn_with_keepalive(websocket: WebSocket, coro, *, session_id: st
         return await turn
     finally:
         await _stop_keepalive(ka, stop)
+
+
+# --- Duplicate-turn guard -------------------------------------------------
+#
+# Why this exists, in three parts:
+#
+# 1. The WS message loop (see `chat_websocket` below) is strictly sequential:
+#    the text-turn call site does `result = await _run_turn_with_keepalive(...)`
+#    (an inline await, not a fire-and-forget task), so the loop never comes
+#    back around to `websocket.receive_text()` for the NEXT frame until the
+#    current turn — including sending its reply — is fully done. That means a
+#    same-connection duplicate frame (e.g. a relay resending the customer's
+#    message because it never saw an ack) is never even READ until the first
+#    turn has already finished. An in-flight-only flag would be too late to
+#    catch that: by the time the duplicate frame is read, the guard entry
+#    would already show `in_flight=False`. That's why this guard needs a
+#    POST-COMPLETION echo window (Part B below), not just an in-flight check
+#    (Part A) — the in-flight check alone only helps the second scenario below.
+#
+# 2. The guard is keyed by `session_id`, not by connection object or a
+#    closure-local variable scoped to one `chat_websocket` call. That's what
+#    lets it also catch a SECOND, concurrent WebSocket connection for the
+#    SAME session — e.g. the CRM's downstream relay reconnecting mid-turn
+#    (see `_interim_wait_keepalive`'s docstring above for why the relay
+#    reconnects at all) and replaying the still-pending customer message on
+#    the new connection while the old connection's turn is still finishing.
+#    A per-connection guard would never see the old turn from the new
+#    connection's code path; a per-session dict does.
+#
+# 3. This is deliberately in-process — a plain module-level dict, matching
+#    this file's other per-session in-memory registries (e.g.
+#    `_active_voice_ws`, `_async_push_queues`). That's correct ONLY because
+#    deployment is single-process (uvicorn with no `--workers`, see
+#    Dockerfile) — if this service ever runs multiple worker processes or
+#    replicas, a duplicate frame could land on a different process than the
+#    one holding the in-flight entry, and this dict would need to move to a
+#    shared store (e.g. Redis `SET NX EX` for the acquire, keyed the same
+#    way). `_try_begin_turn`/`_end_turn` below are a clean, swappable seam
+#    for that migration precisely because the dict itself is never touched
+#    inline anywhere else — every read/write goes through these two
+#    functions.
+
+# Stale-takeover safety net: if a `finally` release path is ever missed (a
+# bug, or a process-level crash mid-turn that somehow leaves the entry
+# behind), an entry stuck `in_flight` for longer than any real turn could
+# possibly take must not permanently wedge the session. `_TURN_TIMEOUT_S` is
+# the longest a real turn is ever allowed to run; +30s is margin for the
+# keepalive teardown/persist/reply work that happens after the turn coroutine
+# itself returns but before `_end_turn` runs.
+_TURN_GUARD_MAX_HOLD_S = _TURN_TIMEOUT_S + 30.0
+# Drop an identical repeat within this many seconds of the PREVIOUS turn
+# completing (Part B — see comment above). Set to 0.0 to disable this half of
+# the guard.
+#
+# 3.0s: the CS relay this backend talks to is documented to wait ~1s and
+# reconnect after an AI Platform WS drop (docs/integrations/
+# coordination-service-prd.md, "Reconnection" — 1 s wait, re-connect, discard
+# re-sent history), so 3s gives ~3x margin against that specific replay
+# threat while keeping the window a customer's own legitimate identical
+# repeat (e.g. answering "1" to two different menu prompts in a row) can fall
+# into and get silently dropped as short as practical.
+_DUPLICATE_ECHO_WINDOW_S = 3.0
+# Trigger threshold for the opportunistic best-effort cleanup sweep in
+# `_try_begin_turn`, NOT a hard cap: the sweep only removes entries that are
+# both not in-flight and past the echo window, so the dict can sit above this
+# count indefinitely if many sessions are simultaneously in-flight or within
+# their echo window, and once the threshold is crossed every acquire re-scans
+# the whole dict (O(n)) whether or not that scan frees anything. Sized as a
+# rough backstop against stragglers (sessions end via `_end_session`, which
+# pops their entry, but a crash/kill between turn-end and session-end could
+# leave one behind) rather than as a bound the dict is guaranteed to respect.
+_TURN_GUARD_MAX_ENTRIES = 10_000
+
+
+@dataclass
+class _TurnGuard:
+    fingerprint: str
+    started_at: float
+    finished_at: float | None = None
+    in_flight: bool = True
+    # Opaque identity token: `_end_turn` only clears an entry it was itself
+    # given ownership of, so a stale-takeover (above) can never let an old,
+    # slow-to-finish turn clobber the fresh entry that took its place.
+    token: object = field(default_factory=object)
+
+
+# session_id -> guard entry. See the module comment above for why this is a
+# plain in-process dict rather than a shared store.
+_turn_guards: dict[str, _TurnGuard] = {}
+
+
+def _turn_fingerprint(msg: dict) -> str:
+    """Canonicalize an inbound WS frame into a short, non-reversible id used
+    only to detect an identical repeat — never store or log the raw content
+    itself, only this fingerprint.
+
+    Mirrors the field-by-field parsing each `mtype` branch in the WS loop
+    does on the same raw `msg` dict, so two frames that would be handled
+    identically downstream fingerprint identically too.
+    """
+    mtype = msg.get("type", "message")
+    if mtype in ("audio", "image", "video"):
+        parts = [
+            (msg.get("mime") or "").strip(),  # matches the audio branch's own mime handling below
+            (msg.get("media_url") or "").strip(),
+            (msg.get("text") or "").strip(),  # caption, for image/video
+            msg.get("data") or "",  # base64 payload
+        ]
+        # Length-prefix each field before joining: a plain "|".join would let
+        # two different field-value splits collide into the same string (e.g.
+        # parts ["a", "b"] vs ["a|b", ""] both naively join to "a|b"). Only
+        # matters for missed dedup (two distinct frames fingerprinting the
+        # same), never a false drop, but cheap to close off.
+        content = "|".join(f"{len(p)}:{p}" for p in parts)
+    else:
+        content = (msg.get("text") or msg.get("message") or "").strip()
+    canonical = f"{mtype}:{content}"
+    return token_fingerprint(canonical, domain="vox-logfp-turn-v1")
+
+
+def _try_begin_turn(session_id: str, fingerprint: str) -> object | None:
+    """Attempt to claim ownership of a new turn for ``session_id``.
+
+    Returns an opaque truthy token on success (pass it to ``_end_turn`` when
+    the turn is done); returns ``None`` if the caller should silently drop
+    the frame — either another turn is actively in flight for this session
+    (Part A), or this exact fingerprint just completed within
+    ``_DUPLICATE_ECHO_WINDOW_S`` (Part B).
+    """
+    now = time.monotonic()
+    entry = _turn_guards.get(session_id)
+
+    if entry is not None and entry.in_flight and (now - entry.started_at) > _TURN_GUARD_MAX_HOLD_S:
+        log.error("turn guard held past max hold; taking it over",
+                  extra={"session_id": session_id})
+        entry = None  # fall through to acquire fresh
+
+    if entry is not None and entry.in_flight:
+        return None  # Part A: another turn is actively in flight for this session
+
+    if (entry is not None and not entry.in_flight and entry.finished_at is not None
+            and entry.fingerprint == fingerprint
+            and (now - entry.finished_at) <= _DUPLICATE_ECHO_WINDOW_S):
+        return None  # Part B: identical repeat within the post-completion echo window
+
+    # Bound the dict: opportunistically sweep stale, completed entries once
+    # the size cap is exceeded, rather than maintaining a separate eviction
+    # timer/task for what should be rare (sessions normally clean up their
+    # own entry via `_end_session`).
+    if len(_turn_guards) > _TURN_GUARD_MAX_ENTRIES:
+        stale_cutoff = now - _DUPLICATE_ECHO_WINDOW_S
+        for sid in [k for k, v in _turn_guards.items()
+                    if not v.in_flight and (v.finished_at or 0) < stale_cutoff]:
+            _turn_guards.pop(sid, None)
+
+    new_entry = _TurnGuard(fingerprint=fingerprint, started_at=now, in_flight=True)
+    _turn_guards[session_id] = new_entry
+    return new_entry.token
+
+
+def _end_turn(session_id: str, token: object) -> None:
+    """Release ownership of the turn previously claimed via
+    ``_try_begin_turn``. Deliberately does NOT delete the entry — it must
+    survive past completion so a later call's Part B echo-window check can
+    still see it (including from a reconnect on a different connection for
+    the same session_id).
+    """
+    entry = _turn_guards.get(session_id)
+    if entry is None or entry.token is not token:
+        return  # a stale-takeover already handed ownership to a newer turn; don't clobber it
+    entry.in_flight = False
+    entry.finished_at = time.monotonic()
 
 
 def _classify_turn_error(exc: Exception) -> tuple[str, str]:
@@ -1525,6 +1699,20 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
                 await websocket.send_text(json.dumps({"type": "ended", "summary": summary, "reason": "customer_ended"}))
                 break
 
+            fingerprint = _turn_fingerprint(msg)
+            guard_token = _try_begin_turn(session_id, fingerprint)
+            if guard_token is None:
+                # Another turn is already in flight for this session, or this
+                # exact frame just completed within the echo window — see the
+                # duplicate-turn guard comment above `_TurnGuard`. Drop it
+                # silently: no customer-visible frame here, the legitimately
+                # in-flight or just-completed turn owns the frame stream.
+                log.warning("duplicate chat turn dropped", extra={
+                    "session_id": session_id, "ticket_id": ticket_id,
+                    "message_type": mtype, "fingerprint": fingerprint,
+                })
+                continue
+
             # A single turn's failure must not black-hole the conversation: send an
             # error frame and keep the socket open (a real disconnect re-raises).
             try:
@@ -1800,6 +1988,8 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
                 await websocket.send_text(json.dumps({
                     "type": "error", "message": message, "reason": reason,
                 }))
+            finally:
+                _end_turn(session_id, guard_token)
     except WebSocketDisconnect:
         log.info("chat ws client disconnected", extra={
             "ticket_id": ticket_id, "session_id": session_id})
@@ -2008,6 +2198,9 @@ async def _end_session(
     except Exception:  # noqa: BLE001
         log.exception("chat session end failed", extra={
             "ticket_id": ticket_id, "session_id": session_id})
+    # Drop the duplicate-turn guard entry too — nothing should still be
+    # deduplicating turns for a session that's over.
+    _turn_guards.pop(session_id, None)
     # Close any live voice call that was started from this chat session.
     voice_ws = _active_voice_ws.pop(session_id, None)
     if voice_ws:
