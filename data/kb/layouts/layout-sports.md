@@ -1,6 +1,6 @@
 # Layout Sports (+ layout-sports-1) — Deltas from Global Baseline
 
-These packages ARE the in-house exchange sportsbook that other layouts embed on their `/sports` page. They are **not operator shells**: no appConfigs, no login/register, no wallet, no KYC, no static pages — all of that belongs to the host operator app. The betting UI itself is documented in `global/06-sports.md`.
+These packages ARE the in-house exchange sportsbook that other layouts embed on their `/sports` page. They are **not operator shells**: no appConfigs, no login/register, no wallet, no KYC, no static pages — all of that belongs to the host operator app. The betting UI itself is documented in `../modules/ui-06-sports.md`.
 
 ## layout-sports (token-based iframe host)
 
@@ -24,4 +24,4 @@ Same betting UI, restructured to mount **inside a host app's own routes** (`/spo
 
 ## Support triage rule
 
-For sports questions, first determine the surface: money/account questions (deposits, balances, limits shown in the host header) belong to the **host layout's** docs; in-play betting questions (odds, betslip, "Ball Running", "Market Suspended", cashout, My Bets) belong to the shared sports UI (`global/06-sports.md`).
+For sports questions, first determine the surface: money/account questions (deposits, balances, limits shown in the host header) belong to the **host layout's** docs; in-play betting questions (odds, betslip, "Ball Running", "Market Suspended", cashout, My Bets) belong to the shared sports UI (`../modules/ui-06-sports.md`).

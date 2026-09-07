@@ -1,6 +1,6 @@
 # Operator → Layout Lookup
 
-Mechanical mapping from operator app to layout package, generated from `apps/*/package.json` `@frontend/layout-*` dependencies and each layout's `app-configs/` directory. Use this to resolve which layout doc in `kb/frontend/layouts/` applies to an operator; fall back to `kb/frontend/global/` for anything not listed as a layout delta.
+Mechanical mapping from operator app to layout package, generated from `apps/*/package.json` `@frontend/layout-*` dependencies and each layout's `app-configs/` directory. Use this to resolve which layout doc in `data/kb/layouts/` applies to an operator; fall back to the operator's CRM's bundled KB pack (e.g. `data/kb/packs/betting-default/frontend-ui/`) for anything not listed as a layout delta.
 
 - **App / appConfig name** — directory name under `apps/` and (where applicable) the config file under the layout's `app-configs/`.
 - **Operator ID** — from the app's local `.env` `OPERATOR_ID` where present. Blank means the ID is injected via deployment environment and is not readable from this repo.

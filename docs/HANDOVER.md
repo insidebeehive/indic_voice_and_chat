@@ -8,9 +8,12 @@ docs](#whats-stale-in-the-old-docs) before trusting them. `docs/chatbot.md` and
 
 ## What this is
 
-`vox-agent` is a multi-tenant AI platform for an online gaming/betting operator
-(casino / sports betting / matka-lottery verticals), with two products sharing one
-backend:
+`vox-agent` is a multi-tenant, industry-agnostic AI platform, with two products sharing
+one backend. Vertical-specific content (system-prompt vocabulary, bundled knowledge
+base, TTS pronunciation) is an explicit, opt-in, per-CRM choice rather than baked into
+the core — see the ChatBot/CRM subsection below. The platform's live production CRM
+today is an online gaming/betting operator (casino / sports betting / matka-lottery
+verticals), configured on top of that same generic core.
 
 1. **VoiceBot** — outbound AI phone calls (originally the project's starting point).
 2. **ChatBot** — a customer-support chat widget backed by the operator's live CRM APIs
@@ -32,7 +35,7 @@ shared DB), deployed to Northflank with auto-deploy from git.
 | Telnyx / Infobip | **removed entirely** (old docs call it "scaffold" — it's gone) |
 | SIP / DiDLogic (pyVoIP) | parked on a branch, not merged, superseded by LiveKit |
 | **ChatBot + CRM tool-calling** | **mature, primary active area** — old docs call this "untouched scaffold," which is false |
-| **RAG / Knowledge base** | **fully wired**: FAISS+BM25 hybrid, per-tenant + CRM-shared KB — old docs call this scaffold too |
+| **RAG / Knowledge base** | **fully wired**: FAISS+BM25 hybrid, per-tenant + CRM-shared KB (the CRM-shared layer is an opt-in bundled pack per CRM, not automatic) — old docs call this scaffold too |
 | **Deposit verification** (screenshot-based dispute resolution) | new, actively evolving, two vendor webhook contracts — treat as unstable |
 | Multi-tenant platform (5 core APIs, admin/console UIs) | live in production |
 | **Security posture** | **remediation sprint just completed** (2026-09-01/02) — read the section below before assuming anything is safe |
@@ -85,6 +88,12 @@ Both sides write to Postgres (`conversations`/`turns` for voice, `chat_sessions`
 - **SIP/DiDLogic**: parked, not merged, deprioritized in favor of LiveKit.
 - Key files: `src/api/live_bridge_base.py`, `src/api/livekit_bridge.py`,
   `src/api/telephony_twilio.py`/`telephony_exotel.py`, `src/pipeline/engine.py`.
+- **TTS pronunciation is split generic/per-CRM.** `src/pipeline/text_normalize.py`'s
+  `DEFAULT_PRONUNCIATIONS` holds only genuinely generic English-loanword fixes (WhatsApp,
+  app, link, account, etc.); vertical-specific vocabulary (Casino, Aviator, Cricket,
+  Matka, IPL, and similar for the betting operator) lives in `Crm.pronunciation_overrides`
+  and is merged in via `normalize_for_tts(text, extra=...)` at each TTS call site with
+  CRM context available. A CRM with no overrides gets only the generic set.
 
 ### ChatBot / CRM
 - Read `docs/chatbot.md` first — it's accurate and dense.
@@ -97,6 +106,17 @@ Both sides write to Postgres (`conversations`/`turns` for voice, `chat_sessions`
 - **RAG/KB is real and wired**: FAISS+BM25 hybrid retrieval, per-tenant index, plus a
   CRM-level shared KB (`crm_kb_documents`) merged in at query time, plus opt-in
   "product module" KB layers (casino/sports/matka).
+- **The chatbot's base system prompt and its CRM-shared KB are both vertical-agnostic
+  by default — industry content is opt-in per CRM.** A `Crm.prompt_pack` column selects
+  which prompt pack (`src/dialogue/packs/*.py`) supplies the SCOPE section and a
+  handful of illustrative example phrases in the system prompt — `"generic"` (no
+  gambling vocabulary, the default for a CRM with no pack set) or `"betting"` (the
+  existing betting operator's content). Separately, `Crm.bundled_kb_pack` names which
+  bundled KB pack (`data/kb/packs/<name>/`, e.g. `betting-default`) gets auto-seeded
+  into that CRM's shared KB at boot — unset means no bundled docs at all. Both are
+  resolved once at tenant-resolution time (`src/auth/db_resolver.py`) and are
+  independent of the tenant-level casino/sports/matka product-module KB above, which
+  stays tenant-scoped and opt-in regardless of either CRM-level choice.
 - Production tenants are DB-backed; `config/tenants/*.yaml` (`dev.yaml`,
   `example.yaml`) is legacy/dev-console-only fallback, not the live path.
 - No open TODO/FIXME/NotImplementedError found in this subsystem — unusually clean,

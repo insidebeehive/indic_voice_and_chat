@@ -29,7 +29,7 @@ campaign), tested through the browser dev console.
 | **SIP trunk / DiDLogic (outbound)** | 🟡 built on a branch — pending live creds (not on `main`) |
 | Campaign orchestration | ✅ logic done; DB-backed create/end + per-lead Call Lead |
 | **Telephony barge-in** | ⬜ **pending across all telephony** (S2S path has native barge-in) |
-| **RAG / ChatBot** | ⬜ **untouched scaffold — not worked on** |
+| **RAG / ChatBot** | ✅ **mature, primary active workstream — see `docs/HANDOVER.md` and `docs/chatbot.md`** |
 | **Benchmarking** | ⬜ **very basic skeleton — much more to do** |
 | **Code-switching / multilingual** | ⬜ **not considered — Hindi-only today** |
 
@@ -126,7 +126,6 @@ Replaced YAML-on-boot + in-memory state with real DB tables and a clean API surf
 ## ⬜ Not started / not touched
 
 - **Telephony barge-in — PENDING for all telephony.** Barge-in is **dev-console only**. Twilio/Exotel streaming barge isn't built (their `handle_turn` has no `cancel_event` yet); Stringee has only the coarse SCCO `bargeIn` flag, not real detection. Documented fast-follow, not started.
-- **RAG / ChatBot — untouched scaffold.** `src/rag/*`, `src/agents/chatbot.py`, `src/api/chat.py`, `src/api/knowledge.py`, and the FAISS vector store exist as early-generation scaffold but have **not** been worked on, wired to an active tenant, or validated. Not part of current work.
 - **Benchmarking — very basic.** `src/benchmarks/*` is an early skeleton; substantial work is still required before it's a usable harness. Not "done."
 - **Code-switching / multilingual — not considered.** The system is **Hindi-only** today. The "write `response_text` in Devanagari only" prompt rule merely makes the single-language Hindi path work with the Hindi TTS — it is **not** a multilingual or code-switch feature. No transliteration engine, no second language.
 - **Other:** second/fallback TTS provider; multi-instance scale for the Stringee call registry (currently in-memory, single-instance by design).
