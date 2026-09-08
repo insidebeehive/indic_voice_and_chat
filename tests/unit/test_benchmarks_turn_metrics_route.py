@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from src.api import benchmarks
 from src.api.deps import get_db_session
 from src.auth.middleware import set_admin_tokens
+from src.models.chat_turn_metrics import record_chat_turn_metric
 from src.models.database import Base
 from src.models.turn_metrics import TurnMetric, record_turn_metric
 
@@ -176,3 +177,68 @@ async def test_record_turn_metric_then_summary_e2e(
     assert entry["avg_tts_total_ms"] == 1800.0
     assert entry["avg_total_latency_ms"] == 3300.0
     assert entry["avg_tts_segments_dropped"] == 2.0
+
+
+async def test_chat_turn_metrics_rows_do_not_affect_voice_summary(
+    client: AsyncClient, monkeypatch,
+) -> None:
+    """Turn-metrics plan §9 item 6 -- the executable proof of §2's central
+    argument for splitting chat into its own sibling tables rather than
+    extending TurnMetric: seeding chat_turn_metrics/chat_tool_metrics rows
+    into the SAME database must leave GET /benchmarks/turn-metrics/summary's
+    response byte-identical, because that endpoint's query
+    (src/api/benchmarks.py::turn_metrics_summary) only ever selects from
+    TurnMetric and has no WHERE clause to exclude a fictional "combo" row a
+    shared table would have produced."""
+    baseline_resp = await client.get("/benchmarks/turn-metrics/summary", headers=ADMIN_HEADERS)
+    assert baseline_resp.status_code == 200, baseline_resp.text
+
+    monkeypatch.setattr(
+        "src.models.chat_turn_metrics.get_sessionmaker", lambda: client.sm  # type: ignore[attr-defined]
+    )
+    # Seed a handful of chat_turn_metrics rows (+ their chat_tool_metrics
+    # children) via the real write-path helper -- not just a bare INSERT --
+    # so this exercises the same code path production traffic would.
+    for i in range(5):
+        await record_chat_turn_metric(
+            tenant_id="dev",
+            crm_id="betstudio",
+            session_id=f"chat_sess_{i}",
+            trace_id=f"trace-{i}",
+            path="tools" if i % 2 == 0 else "single_shot",
+            llm_provider="GeminiLLMAdapter",
+            llm_model="gemini-2.0-flash",
+            action="continue",
+            metrics={
+                "total_ms": 900 + i, "llm_total_ms": 500, "llm_calls": 2,
+                "tool_total_ms": 200, "tool_calls": 2, "tool_failures": 1,
+                "tool_timeouts": 1, "tool_calls_skipped": 0, "kb_search_ms": 100,
+                "kb_searches": 1, "retrieved_chunks": 3, "rounds": 2,
+                "rounds_exhausted": False, "retry_fired": False,
+                "failure_directive_fired": True, "failure_directive_escalated": False,
+                "guard_hallucination_fired": False, "guard_no_grounding_fired": False,
+                "guard_unverified_data_fired": True, "escalated": False,
+            },
+            tools=[
+                {"tool_name": "get_player_wallet", "kind": "crm", "latency_ms": 80,
+                 "outcome": "ok", "budget_slice_ms": 5000, "round_index": 0},
+                {"tool_name": "get_player_transactions", "kind": "crm", "latency_ms": 120,
+                 "outcome": "timeout", "budget_slice_ms": 5000, "round_index": 1},
+            ],
+        )
+
+    # Sanity check the rows actually landed (a no-op seed would make this
+    # test's "byte-identical" assertion vacuous).
+    async with client.sm() as db:  # type: ignore[attr-defined]
+        from sqlalchemy import func, select
+
+        from src.models.chat_turn_metrics import ChatToolMetricRow, ChatTurnMetric
+
+        turn_count = (await db.execute(select(func.count()).select_from(ChatTurnMetric))).scalar_one()
+        tool_count = (await db.execute(select(func.count()).select_from(ChatToolMetricRow))).scalar_one()
+    assert turn_count == 5
+    assert tool_count == 10
+
+    seeded_resp = await client.get("/benchmarks/turn-metrics/summary", headers=ADMIN_HEADERS)
+    assert seeded_resp.status_code == 200, seeded_resp.text
+    assert seeded_resp.content == baseline_resp.content

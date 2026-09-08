@@ -94,6 +94,21 @@ _TOOL_CALL_CEILING_S = 35.0
 # round-trip on a call that would immediately be cut short anyway.
 _TOOL_MIN_SLICE_S = 1.0
 
+# Ceiling on the injected record_metric callback's own wall-clock time (see
+# _emit_turn_metric). record_chat_turn_metric never raises, but it has no
+# internal timeout of its own -- it does a flush then a commit, and
+# src/models/database.py's engine sets no pool_timeout/statement_timeout, so
+# an unbounded call there could stall for a long time. _emit_turn_metric runs
+# as the LAST statement of handle_message, which sits INSIDE src/api/chat.py's
+# 90s asyncio.wait_for(_run_turn(...)) turn-timeout wrapper -- on a turn that
+# already spent most of that budget (the CRM tool budget alone is 45s), an
+# unbounded metrics write could push the turn's total past 90s and get the
+# whole reply (already fully computed) cancelled and discarded by the WS
+# layer's timeout handler. A metrics row is never worth an errored reply, so
+# this is bounded far below the turn timeout and swallowed like any other
+# metrics-write failure.
+_RECORD_METRIC_TIMEOUT_S = 2.0
+
 # search_knowledge_base gets its OWN fixed timeout, entirely independent of
 # _TOOL_BUDGET_S/_TOOL_CALL_CEILING_S. It is a RAG/embedding lookup, not a
 # tenant CRM call — it never draws from, and is never shortened by, the CRM
@@ -491,6 +506,7 @@ class ChatBotAgent(BaseAgent):
         llm_model: str = "",
         session_id: str | None = None,
         ticket_id: str | None = None,
+        record_metric: Callable[[dict], Awaitable[None]] | None = None,
     ) -> None:
         # ChatBot doesn't need slots — pass an empty schema so BaseAgent is happy.
         super().__init__(
@@ -533,6 +549,18 @@ class ChatBotAgent(BaseAgent):
         # make_chatbot_factory) has no crm_ticket_id for this session.
         self._session_id = session_id
         self._ticket_id = ticket_id
+        # Phase 2 of the turn-metrics plan (docs/superpowers/plans/
+        # 2026-09-08-chatbot-turn-metrics.md, §4): injected write-path
+        # callback, mirroring VoiceBotAgent's record_metric inversion of
+        # control exactly. This module intentionally imports ZERO model
+        # modules -- importing one here would make the ~50 unit tests in
+        # this file DB-aware. The closure that builds this callable (see
+        # make_chatbot_factory in src/bootstrap.py) owns tenant_id/crm_id and
+        # the actual DB write (record_chat_turn_metric); this agent only
+        # ever hands it a plain dict of ids/enums/numbers -- see the PII
+        # docstring in src/models/chat_turn_metrics.py for what that dict may
+        # never contain.
+        self._record_metric = record_metric
         # Ticket #1762 fix, Step 3: per-agent-instance (== per WS connection)
         # counter of CONSECUTIVE turns where the same category (keyed by its
         # plain-English label, never a tool name) failed. In-memory only —
@@ -541,6 +569,80 @@ class ChatBotAgent(BaseAgent):
         # escalation sentence in _build_failure_directive once a category has
         # failed on 2 turns running.
         self._consecutive_category_failures: dict[str, int] = {}
+
+    async def _emit_turn_metric(self, metrics: ChatTurnMetrics | None) -> None:
+        """Persist ``metrics`` via the injected ``record_metric`` callback
+        (turn-metrics plan §4), if one was supplied and turn-metrics assembly
+        actually succeeded this turn. Two layers of protection against a
+        metrics-write failure ever reaching a live turn, same as voice's
+        record_metric idiom (src/agents/voicebot.py): the callback itself
+        (``record_chat_turn_metric``, src/models/chat_turn_metrics.py) never
+        raises internally, and this call site catches anyway in case the
+        injected callable is something else entirely (e.g. a test double).
+
+        Does nothing when ``metrics`` is None -- that already means
+        ChatTurnMetrics construction failed and was logged as a warning at
+        the call site above, so there is nothing correct left to persist.
+        Only ids, provider/model names, bounded enum strings, integers, and
+        booleans ever go into this payload -- see the PII section of
+        src/models/chat_turn_metrics.py's module docstring for what must
+        never land here.
+
+        The callback is additionally bounded by ``_RECORD_METRIC_TIMEOUT_S``:
+        this method runs as the LAST statement of ``handle_message``, which is
+        inside the WS layer's 90s per-turn ``asyncio.wait_for`` (see
+        ``_TURN_TIMEOUT_S`` in src/api/chat.py) -- an unbounded metrics write
+        stalling near that ceiling would otherwise get the turn's already-
+        computed reply cancelled and discarded, a failure mode that did not
+        exist before this write path (``_persist_turn``'s own DB write runs
+        strictly after that wrapper returns).
+        """
+        if self._record_metric is None or metrics is None:
+            return
+        try:
+            await asyncio.wait_for(self._record_metric({
+                "session_id": self._session_id or "",
+                "trace_id": metrics.trace_id,
+                "path": metrics.path,
+                "llm_provider": metrics.llm_provider,
+                "llm_model": metrics.llm_model,
+                "action": metrics.action,
+                "metrics": {
+                    "total_ms": metrics.total_ms,
+                    "llm_total_ms": metrics.llm_total_ms,
+                    "llm_calls": metrics.llm_calls,
+                    "tool_total_ms": metrics.tool_total_ms,
+                    "tool_calls": metrics.tool_calls,
+                    "tool_failures": metrics.tool_failures,
+                    "tool_timeouts": metrics.tool_timeouts,
+                    "tool_calls_skipped": metrics.tool_calls_skipped,
+                    "kb_search_ms": metrics.kb_search_ms,
+                    "kb_searches": metrics.kb_searches,
+                    "retrieved_chunks": metrics.retrieved_chunks,
+                    "rounds": metrics.rounds,
+                    "rounds_exhausted": metrics.rounds_exhausted,
+                    "retry_fired": metrics.retry_fired,
+                    "failure_directive_fired": metrics.failure_directive_fired,
+                    "failure_directive_escalated": metrics.failure_directive_escalated,
+                    "guard_hallucination_fired": metrics.guard_hallucination_fired,
+                    "guard_no_grounding_fired": metrics.guard_no_grounding_fired,
+                    "guard_unverified_data_fired": metrics.guard_unverified_data_fired,
+                    "escalated": metrics.escalated,
+                },
+                "tools": [
+                    {
+                        "tool_name": t.tool_name, "kind": t.kind, "latency_ms": t.latency_ms,
+                        "outcome": t.outcome, "budget_slice_ms": t.budget_slice_ms,
+                        "round_index": t.round_index,
+                    }
+                    for t in metrics.tools
+                ],
+            }), timeout=_RECORD_METRIC_TIMEOUT_S)
+        except Exception:  # noqa: BLE001 - never break a live turn on a metrics-write failure
+            # Catches asyncio.TimeoutError (from the wait_for above) the same
+            # way as any other metrics-write failure -- a slow/stalled DB
+            # write degrades to "no row, one WARNING", never an errored turn.
+            log.warning("record_metric failed; continuing without persistence", exc_info=True)
 
     async def handle_message(self, user_text: str) -> ChatTurnResult:
         if not user_text or not user_text.strip():
@@ -710,6 +812,7 @@ class ChatBotAgent(BaseAgent):
                 "escalated": escalated_flag,
             },
         )
+        await self._emit_turn_metric(metrics)
         return ChatTurnResult(
             response=response, retrieved=retrieved, rag_context_chars=len(rag.text),
             input_tokens=in_tok, output_tokens=out_tok,
@@ -1167,6 +1270,7 @@ class ChatBotAgent(BaseAgent):
                 "action": response.action,
             },
         )
+        await self._emit_turn_metric(metrics)
         return ChatTurnResult(
             response=response, retrieved=retrieved_all, rag_context_chars=len(rag.text),
             escalation=escalation, call_offer=call_offer,

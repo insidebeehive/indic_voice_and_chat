@@ -41,6 +41,7 @@ from src.dialogue.slots import SlotSchema
 from src.interfaces.llm import LLMConfig
 from src.interfaces.stt import STTConfig
 from src.interfaces.tts import TTSConfig
+from src.models.chat_turn_metrics import record_chat_turn_metric
 from src.models.turn_metrics import record_turn_metric
 from src.pipeline.engine import PipelineConfig, PipelineEngine
 from src.pipeline.vad import EnergyVAD
@@ -576,6 +577,13 @@ def make_chatbot_factory(registry, sessionmaker=None, crm_retrievers: "PerCrmRet
             llm_model=_llm_defaults.get("model") or "",
             session_id=bare_session_id,
             ticket_id=ticket_id,
+            # Turn-metrics plan §4: same inversion-of-control as the voice
+            # record_metric sites above -- getattr-defensive since some tests
+            # stub registry/tenant as a bare SimpleNamespace without a
+            # crm_id-bearing settings object (see _crm_retriever_for above and
+            # the _llm_defaults comment).
+            record_metric=lambda payload: record_chat_turn_metric(
+                tenant_id=tenant.id, crm_id=getattr(tenant.settings, "crm_id", None), **payload),
         )
 
     return factory
