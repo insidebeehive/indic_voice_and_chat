@@ -57,6 +57,7 @@ from src.auth.audit import log_denied, token_fingerprint
 from src.dialogue.language import normalize_lang
 from src.interfaces.llm import LLMMessage
 from src.models.chat import ChatMessage, ChatSession
+from src.models.chat_turn_metrics import record_chat_turn_metric
 import src.utils.http_fetch as http_fetch
 from src.utils.http_fetch import MAX_FETCH_BYTES as _MAX_MEDIA_FETCH_BYTES
 from src.utils.http_fetch import fetch_capped as _fetch_capped
@@ -481,6 +482,74 @@ def _classify_turn_error(exc: Exception) -> tuple[str, str]:
     if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
         return "timeout", "That took longer than expected — please try again."
     return "internal", "Sorry, something went wrong — please try again."
+
+
+# Ceiling on the failure-row metrics write below, mirroring
+# src/agents/chatbot.py's _RECORD_METRIC_TIMEOUT_S: this runs inside the same
+# except-block that's about to send the customer-visible error frame, so an
+# unbounded DB write here must not delay that reply.
+_WS_FAILURE_RECORD_TIMEOUT_S = 2.0
+
+
+async def _record_ws_turn_failure_metric(
+    tenant: TenantContext, session_id: str, trace_id: str, agent: object,
+    reason: str, *, elapsed_ms: int,
+) -> None:
+    """Write a minimal ``chat_turn_metrics`` row for a turn that raised or
+    timed out before the agent ever produced a ``ChatTurnResult`` — closing
+    Phase 2's deliberately-accepted gap (see the "Known, accepted gap"
+    paragraph in ``src/models/chat_turn_metrics.py``'s module docstring):
+    ``ChatBotAgent``'s own ``record_metric`` callback never runs on this
+    path, because ``_run_turn``'s ``asyncio.wait_for`` *cancels* the agent
+    coroutine on timeout, and awaiting a DB insert in a ``finally`` on that
+    cancellation path is unreliable by construction (the ``await`` itself
+    re-raises ``CancelledError``). This function runs from the WS layer's
+    own except-block instead — it isn't itself being cancelled, and it
+    already knows tenant/session/trace-id/elapsed.
+
+    Deliberately minimal: only identity fields, ``total_ms`` from the
+    caller's elapsed-time measurement, and a bounded ``action`` marker
+    (``failed_<reason>``, where ``reason`` comes from
+    ``_classify_turn_error``'s fixed 4-value set — NEVER the raw exception
+    string, which can embed player data via a CRM error message; see the PII
+    section of ``src/models/chat_turn_metrics.py``). Every other numeric/
+    boolean column is left at its 0/False default via
+    ``record_chat_turn_metric``'s own ``metrics.get(..., 0/False)``
+    convention — there is nothing honest to fill in for a turn/tool-calls
+    that never finished.
+
+    Best-effort like every metrics write in this codebase: never raises. This
+    runs BEFORE the error-frame reply (see the call site's own comment on
+    why), so it does delay that reply — bounded by
+    ``_WS_FAILURE_RECORD_TIMEOUT_S`` so a stalled DB write can only delay it
+    by that much, not hang it indefinitely.
+    """
+    try:
+        await asyncio.wait_for(
+            record_chat_turn_metric(
+                tenant_id=tenant.id,
+                crm_id=getattr(tenant.settings, "crm_id", None),
+                session_id=session_id,
+                trace_id=trace_id,
+                # Approximation: _enable_tools is the agent's CAPABILITY, not
+                # necessarily the path this specific failed turn actually
+                # took (a tools-enabled agent can still fail inside
+                # _single_shot -- see chatbot.py's dispatch). Acceptable for
+                # a minimal failure row; not worth threading the real
+                # dispatch choice through for a turn that never completed.
+                path="tools" if getattr(agent, "_enable_tools", False) else "single_shot",
+                llm_provider=getattr(agent, "_llm_provider", "") or "",
+                llm_model=getattr(agent, "_llm_model", "") or "",
+                action=f"failed_{reason}",
+                metrics={"total_ms": max(0, elapsed_ms)},
+            ),
+            timeout=_WS_FAILURE_RECORD_TIMEOUT_S,
+        )
+    except Exception:  # noqa: BLE001 - never break the error-frame reply on a metrics-write failure
+        log.warning(
+            "record_chat_turn_metric (ws failure row) failed; continuing without persistence",
+            extra={"session_id": session_id}, exc_info=True,
+        )
 
 
 def _raise_turn_http_error(
@@ -1725,6 +1794,10 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
             # A single turn's failure must not black-hole the conversation: send an
             # error frame and keep the socket open (a real disconnect re-raises).
             with trace_id_scope(turn_trace_id):
+                # Covers the whole turn regardless of message type (audio/
+                # image/text) -- used only by the failure-row metrics write
+                # below if this turn raises or times out.
+                turn_started_at = time.monotonic()
                 try:
                     if mtype == "audio":
                         raw_data = msg.get("data")
@@ -1995,6 +2068,18 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
                             "https://ai.studio/spend to restore chat",
                             extra={"ticket_id": ticket_id, "session_id": session_id},
                         )
+                    # Deliberately BEFORE the customer-visible error frame,
+                    # not after: once that frame goes out the client may
+                    # close the socket immediately, which can cancel whatever
+                    # the server is still doing on this connection. Writing
+                    # first means the attempt (success or the
+                    # _WS_FAILURE_RECORD_TIMEOUT_S-bounded give-up) always
+                    # completes before that risk exists, at the cost of
+                    # delaying the reply by up to that same bound.
+                    await _record_ws_turn_failure_metric(
+                        tenant, session_id, turn_trace_id, agent, reason,
+                        elapsed_ms=int((time.monotonic() - turn_started_at) * 1000),
+                    )
                     await websocket.send_text(json.dumps({
                         "type": "error", "message": message, "reason": reason,
                     }))

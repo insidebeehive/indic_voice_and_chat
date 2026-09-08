@@ -185,9 +185,15 @@ async def _push_turn_metrics_loop(
 ) -> None:
     """Periodically aggregate recent TurnMetric rows (per-turn voice-call
     latency, see src.models.turn_metrics) into Prometheus metric families and
-    push them to Grafana Cloud (Phase 2 observability). A clean no-op each
-    iteration when push_url is unset — see aggregate_and_push_turn_metrics.
-    Runs once at startup, then every interval_s."""
+    push them to Grafana Cloud (Phase 2 observability), THEN do the same for
+    ChatBot's per-turn/per-tool metrics (turn-metrics plan, Phase 3, §5) —
+    sequentially, in the same iteration, on the same interval/config
+    (METRICS_PUSH_INTERVAL_S is reused, not duplicated: no second background
+    task, no new config knob). Each push is independently a clean no-op when
+    push_url is unset — see aggregate_and_push_turn_metrics /
+    aggregate_and_push_chat_metrics. Runs once at startup, then every
+    interval_s."""
+    from src.observability.chat_metrics_push import aggregate_and_push_chat_metrics
     from src.observability.turn_metrics_push import aggregate_and_push_turn_metrics
 
     sm = get_sessionmaker()
@@ -200,7 +206,117 @@ async def _push_turn_metrics_loop(
                 log.info("pushed turn metrics", extra={"count": n})
         except Exception:  # noqa: BLE001 - the push loop must never die (CancelledError still propagates)
             log.exception("turn-metrics push failed")
+        try:
+            n_chat = await aggregate_and_push_chat_metrics(
+                sm, push_url, push_auth, window_s=interval_s * 2,
+            )
+            if n_chat:
+                log.info("pushed chat turn metrics", extra={"count": n_chat})
+        except Exception:  # noqa: BLE001 - the push loop must never die (CancelledError still propagates)
+            log.exception("chat-metrics push failed")
         await asyncio.sleep(interval_s)
+
+
+# How often the chat-turn-metrics retention prune runs. Not itself
+# configurable (unlike the retention WINDOW -- see
+# Secrets.CHAT_METRICS_RETENTION_DAYS): this only needs to keep pace with
+# ~4.7k parent rows/month (turn-metrics plan §11.2), so a fixed interval is
+# enough. Mirrors _REAP_INTERVAL_S's hardcoded-constant convention above.
+_CHAT_METRICS_PRUNE_INTERVAL_S = 6 * 3600
+
+# Per-DELETE row cap for the prune loop below. A single unbounded DELETE over
+# a large, continuously-written table can hold a long-lived lock and bloat
+# the table/WAL -- deleting oldest-first in bounded batches avoids both.
+_CHAT_METRICS_PRUNE_BATCH_SIZE = 1000
+
+
+async def prune_chat_turn_metrics(sessionmaker, retention_days: float) -> int:
+    """Delete ``chat_turn_metrics`` rows older than ``retention_days``,
+    returning the number of parent rows deleted (turn-metrics plan, Phase 3,
+    §11.2).
+
+    Chat runs ~90x voice's ``TurnMetric`` volume (~4.7k parent rows/month +
+    ~12-15k child rows/month, vs. voice's 747 LIFETIME rows) -- unlike voice,
+    which is deliberately left unbounded because it will never grow enough to
+    matter, unbounded growth here is not acceptable, hence this prune job.
+
+    ``chat_tool_metrics`` rows are FK ``ondelete="CASCADE"`` to
+    ``chat_turn_metrics.id`` (see ``src/models/chat_turn_metrics.py``), so
+    deleting only the parent here is sufficient -- the DB removes matching
+    children itself; no separate child-table delete is needed. (On Postgres
+    this CASCADE is always enforced; SQLite -- test-only -- only enforces it
+    when ``PRAGMA foreign_keys=ON`` has been set on the connection, same as
+    ``tests/unit/test_chat_turn_metrics_model.py`` already does for its own
+    CASCADE assertion.)
+
+    Deletes oldest-first in bounded batches (``_CHAT_METRICS_PRUNE_BATCH_SIZE``
+    rows per statement) rather than one unbounded ``DELETE`` — a single huge
+    delete against a large, continuously-written table can hold a long-lived
+    lock and bloat the table/WAL; batching avoids both.
+
+    Pure logic, deliberately separate from ``_prune_chat_turn_metrics_loop``
+    below (mirrors ``src/api/call_store.py::reap_stale_calls`` vs.
+    ``_reap_stale_calls_loop``'s split) so this is directly unit-testable
+    without fighting an infinite loop.
+    """
+    from sqlalchemy import delete, func, select
+
+    from src.models.chat_turn_metrics import ChatTurnMetric
+
+    # Cutoff evaluated against the DB SERVER's own clock (not Python's
+    # datetime.utcnow()) on Postgres -- matches turn_metrics_push.py's
+    # identical reasoning: created_at is DateTime(timezone=False) populated
+    # by the server's own func.now(), so both sides of the `<` comparison
+    # below must be evaluated by that same clock, or a server clock in a
+    # non-UTC timezone would silently make `retention_days` mean something
+    # else. Built as a reusable SQL expression (not evaluated to a Python
+    # value here) so the SAME cutoff applies across every batch iteration's
+    # own session below, evaluated fresh by the DB each time -- exactly
+    # turn_metrics_push.py's pattern, never a pre-fetched Python datetime
+    # compared against a naive column (which risks an aware/naive mismatch).
+    # SQLite (test-only) has no separate server clock to disagree with
+    # Python's, so it gets a plain Python cutoff instead.
+    async with sessionmaker() as probe:
+        dialect_name = probe.get_bind().dialect.name
+    if dialect_name == "sqlite":
+        from datetime import datetime, timedelta
+        cutoff = datetime.utcnow() - timedelta(days=retention_days)
+    else:
+        cutoff = func.now() - func.make_interval(0, 0, 0, 0, 0, 0, retention_days * 86400.0)
+
+    total_deleted = 0
+    while True:
+        async with sessionmaker() as s:
+            ids = (await s.execute(
+                select(ChatTurnMetric.id)
+                .where(ChatTurnMetric.created_at < cutoff)
+                .order_by(ChatTurnMetric.created_at)
+                .limit(_CHAT_METRICS_PRUNE_BATCH_SIZE)
+            )).scalars().all()
+            if not ids:
+                break
+            await s.execute(delete(ChatTurnMetric).where(ChatTurnMetric.id.in_(ids)))
+            await s.commit()
+        total_deleted += len(ids)
+        if len(ids) < _CHAT_METRICS_PRUNE_BATCH_SIZE:
+            break  # last (partial) batch -- nothing older left to prune this pass
+    return total_deleted
+
+
+async def _prune_chat_turn_metrics_loop(retention_days: float) -> None:
+    """Periodically run ``prune_chat_turn_metrics`` (turn-metrics plan, Phase
+    3, §11.2). Best-effort like every other background loop here: never dies,
+    one try/except per iteration. Runs once at startup, then every
+    ``_CHAT_METRICS_PRUNE_INTERVAL_S``."""
+    sm = get_sessionmaker()
+    while True:
+        try:
+            n = await prune_chat_turn_metrics(sm, retention_days)
+            if n:
+                log.info("pruned old chat turn metrics", extra={"count": n})
+        except Exception:  # noqa: BLE001 - the prune loop must never die (CancelledError still propagates)
+            log.exception("chat-turn-metrics prune failed")
+        await asyncio.sleep(_CHAT_METRICS_PRUNE_INTERVAL_S)
 
 
 async def _seed_crm_kb(
@@ -635,6 +751,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         settings.secrets.GRAFANA_PROMETHEUS_PUSH_URL,
         settings.secrets.GRAFANA_PROMETHEUS_PUSH_AUTH,
     ))
+    chat_metrics_prune_task = asyncio.create_task(_prune_chat_turn_metrics_loop(
+        settings.secrets.CHAT_METRICS_RETENTION_DAYS,
+    ))
 
     try:
         yield
@@ -643,6 +762,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         reaper_task.cancel()
         kb_seed_task.cancel()
         metrics_push_task.cancel()
+        chat_metrics_prune_task.cancel()
         telephony_hooks.set_bridge_factory(None)
         telephony_hooks.set_exotel_bridge_factory(None)
         telephony_hooks.set_stringee_bridge_factory(None)

@@ -91,6 +91,22 @@ log = logging.getLogger(__name__)
 # the parent row and all its children silently).
 _TOOL_NAME_MAX_LEN = 100
 
+# `action` values a chat_turn_metrics row carries when it represents a
+# WS-layer turn failure (a turn that raised or timed out before the agent
+# ever produced a ChatTurnResult -- see src/api/chat.py's
+# _record_ws_turn_failure_metric) rather than a completed turn. Each value is
+# "failed_" + one of src/api/chat.py::_classify_turn_error's fixed 4-value
+# `reason` set -- never a free-text exception string (see this module's PII
+# section above). Shared here, rather than duplicated in
+# src/api/tenants.py's read endpoint and src/observability/chat_metrics_push.py
+# (both of which need to tell a failure row apart from a completed turn so
+# a turn that never ran does not silently drag down completed-turn averages),
+# so all three call sites stay in sync if _classify_turn_error's reason set
+# ever changes.
+WS_TURN_FAILURE_ACTIONS = frozenset({
+    "failed_llm_billing", "failed_llm_quota", "failed_timeout", "failed_internal",
+})
+
 
 class ChatTurnMetric(Base):
     __tablename__ = "chat_turn_metrics"

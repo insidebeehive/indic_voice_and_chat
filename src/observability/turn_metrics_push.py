@@ -86,6 +86,46 @@ def _percentile(sorted_values: list[int], pct: int) -> int:
     return sorted_values[idx]
 
 
+class _PushFailureWarner:
+    """Rate-limits a push-failure warning to one per outage, re-arming on the
+    next success — the same idiom ``LokiPushHandler`` already uses for its
+    own push failures (``src/utils/logging.py``, "warn once per outage, a
+    success re-arms it"). Needed here because, at the default 60s push
+    interval, logging on every failed push would produce ~1,440 warnings/day
+    once ``GRAFANA_PROMETHEUS_PUSH_URL`` is set but unreachable (turn-metrics
+    plan §11.3).
+
+    A small stateful object rather than a bare module-level flag so this
+    module and ``src/observability/chat_metrics_push.py`` — which imports
+    this class and instantiates its own, separate warner — each track their
+    own outage independently: one product's push failures/recoveries must
+    never silence or re-arm the other's warnings.
+
+    Deliberately does NOT reuse ``LokiPushHandler``'s stderr-writing
+    (``_warn_stderr``) — that exists specifically so a Loki-shipping failure
+    never feeds back into the very logging pipeline that ships to Loki. Ordinary
+    module logger warnings here carry no such feedback risk, so a plain
+    ``log.warning(...)`` (this module's existing convention) is correct.
+    """
+
+    def __init__(self) -> None:
+        self._warned = False
+
+    def warn_once(self, msg: str) -> None:
+        if self._warned:
+            return
+        self._warned = True
+        log.warning(f"{msg} (further warnings suppressed until the next successful push)")
+
+    def mark_recovered(self) -> None:
+        # Allow the next failure (if any) to warn again, so a real new outage
+        # isn't silenced forever by one earlier, already-resolved glitch.
+        self._warned = False
+
+
+_push_failure_warner = _PushFailureWarner()
+
+
 def _build_registry(groups: dict[tuple[Optional[str], ...], list[TurnMetric]]) -> CollectorRegistry:
     registry = CollectorRegistry()
     count_gauge = Gauge(
@@ -116,10 +156,22 @@ def _build_registry(groups: dict[tuple[Optional[str], ...], list[TurnMetric]]) -
     return registry
 
 
-async def _push(registry: CollectorRegistry, push_url: str, push_auth: Optional[str]) -> None:
+async def _push(
+    registry: CollectorRegistry, push_url: str, push_auth: Optional[str],
+    job_name: str = _JOB_NAME,
+) -> None:
     """PUT the registry's exposition-format payload to
-    ``{push_url}/metrics/job/<job>`` (classic Pushgateway protocol — see
+    ``{push_url}/metrics/job/<job_name>`` (classic Pushgateway protocol — see
     module docstring). Raises on failure/non-2xx; the caller catches it.
+
+    ``job_name`` defaults to this module's own ``_JOB_NAME`` so the existing
+    voice caller (``aggregate_and_push_turn_metrics`` below) is unaffected —
+    parameterized only so ``src/observability/chat_metrics_push.py`` can
+    reuse this function with its own, DISTINCT job name
+    (``vox_chat_turn_metrics``). Sharing a job name between products would be
+    actively wrong: a Pushgateway PUT replaces the ENTIRE job/group's prior
+    state, so a shared name would let one product's empty push window wipe
+    out the other's still-live data.
 
     Uses ``httpx.AsyncClient`` (not ``prometheus_client.push_to_gateway``,
     which shells out to a blocking ``urllib`` call) so this never blocks the
@@ -135,7 +187,7 @@ async def _push(registry: CollectorRegistry, push_url: str, push_auth: Optional[
                 "GRAFANA_PROMETHEUS_PUSH_AUTH set without a ':' separator; "
                 "pushing unauthenticated (expected 'user:api_key')"
             )
-    url = f"{push_url.rstrip('/')}/metrics/job/{_JOB_NAME}"
+    url = f"{push_url.rstrip('/')}/metrics/job/{job_name}"
     data = generate_latest(registry)
     async with httpx.AsyncClient(timeout=10.0, auth=auth) as client:
         resp = await client.put(url, content=data, headers={"Content-Type": CONTENT_TYPE_LATEST})
@@ -223,10 +275,14 @@ async def aggregate_and_push_turn_metrics(
         # active, potentially ship them to an external log aggregator too.
         # Log only the exception type + a redacted push_url instead, mirroring
         # LokiPushHandler's own push-failure logging (src/utils/logging.py).
-        log.warning(
-            "turn-metrics push failed: %s (%s)",
-            type(exc).__name__, redact_url(push_url),
+        # Rate-limited to one warning per outage (re-arms on the next
+        # success, below) -- see _PushFailureWarner's docstring for why: at
+        # the default 60s push interval, an unreachable/misconfigured
+        # push_url would otherwise log ~1,440 times/day.
+        _push_failure_warner.warn_once(
+            f"turn-metrics push failed: {type(exc).__name__} ({redact_url(push_url)})"
         )
         return len(rows)
 
+    _push_failure_warner.mark_recovered()
     return len(rows)

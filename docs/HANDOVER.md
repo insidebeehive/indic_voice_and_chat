@@ -38,8 +38,9 @@ shared DB), deployed to Northflank with auto-deploy from git.
 | **RAG / Knowledge base** | **fully wired**: FAISS+BM25 hybrid, per-tenant + CRM-shared KB (the CRM-shared layer is an opt-in bundled pack per CRM, not automatic) — old docs call this scaffold too |
 | **Deposit verification** (screenshot-based dispute resolution) | new, actively evolving, two vendor webhook contracts — treat as unstable |
 | Multi-tenant platform (5 core APIs, admin/console UIs) | live in production |
+| **ChatBot turn-metrics** (`chat_turn_metrics`/`chat_tool_metrics`, `GET /tenants/{id}/chat-turn-metrics`, Prometheus push, 90-day prune) | done — parity with voice's `TurnMetric`/`turn-metrics/summary` pipeline |
 | **Security posture** | **remediation sprint just completed** (2026-09-01/02) — read the section below before assuming anything is safe |
-| Tests | 1927 passing, 3 failing (1 known, 2 environmental — see [Testing](#testing)) |
+| Tests | 2441 passing, 3 failing (1 known, 2 environmental — see [Testing](#testing)) |
 | Campaign → live outbound calling | orchestration logic done; live dispatch/outcome wiring not fully validated |
 | Benchmarking harness | still a basic skeleton |
 | Code-switching / multilingual | not implemented — Hindi-only on voice |
@@ -181,11 +182,13 @@ mini security changelog — read them.
   (Alembic has no cross-process lock).
 - **Datastores**: Postgres under schema `voicebot` (shared DB, `VOX_DB_SCHEMA`
   configurable), Redis for session storage.
-- **Schema** (16 migrations, actively maintained): tenants/secrets/api-keys/phone
+- **Schema** (20 migrations, actively maintained): tenants/secrets/api-keys/phone
   numbers; `provider_costs`; campaigns/leads; conversations/turns/events (voice);
   chat_sessions/chat_messages/chat_tools; crms/crm_tools/crm_secrets/crm_kb_documents
   (CRM-partner-level, shared across tenants under that CRM); deposit_verification_requests;
-  turn_metrics; benchmark_runs/kb_documents (early scaffold).
+  turn_metrics; chat_turn_metrics/chat_tool_metrics (ChatBot's per-turn/per-tool
+  latency+outcome pipeline, pruned to a 90-day rolling window — see the at-a-glance
+  row above); benchmark_runs/kb_documents (early scaffold).
 - **No CI** — no `.github/workflows`. Only automation is Northflank's git-triggered
   build/deploy. Worth flagging: nothing currently blocks a broken commit from
   auto-deploying.
@@ -197,7 +200,7 @@ mini security changelog — read them.
   handover UI), `/dev/voice` (live voice testing), embeddable chat widget.
 
 ### Testing
-Current run: **1927 passed, 3 failed**, 58s.
+Current run: **2441 passed, 3 failed**.
 1. `test_chat_routes.py::test_claim_session_and_agent_ws` — pre-existing, documented
    in `CLAUDE.md`, unrelated to most work. Still failing, unchanged.
 2. `test_dev_console.py::test_place_call_passes_tenant_creds_to_adapter` — **new**,

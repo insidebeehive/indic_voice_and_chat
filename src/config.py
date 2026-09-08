@@ -313,6 +313,16 @@ class Secrets(BaseSettings):
     # config-load time on an obvious misconfiguration (e.g. "0").
     METRICS_PUSH_INTERVAL_S: float = Field(default=60.0, ge=5.0)
 
+    # Retention window for chat_turn_metrics/chat_tool_metrics (turn-metrics
+    # plan, Phase 3, §11.2). Chat runs ~90x voice's TurnMetric volume (~4.7k
+    # parent rows/month + ~12-15k child rows/month, vs. voice's 747 LIFETIME
+    # rows) -- unlike TurnMetric, which is deliberately left unbounded because
+    # it will never grow enough to matter, unbounded growth here is not
+    # acceptable, hence src/main.py's periodic prune loop. Floored at 1 day so
+    # a misconfiguration (e.g. "0") can't turn that loop into something that
+    # deletes same-day rows on every run.
+    CHAT_METRICS_RETENTION_DAYS: float = Field(default=90.0, ge=1.0)
+
 
 class Settings(BaseModel):
     """Merged settings: YAML defaults overlaid with env-derived secrets."""

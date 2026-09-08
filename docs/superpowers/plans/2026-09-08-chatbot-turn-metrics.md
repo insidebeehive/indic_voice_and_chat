@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 >
-> **Status: PLAN ONLY, not yet approved for implementation.** Produced by an Opus planning pass on 2026-09-08. §11's open questions (child table vs. aggregate-only, retention, Prometheus scope) should be settled with the project owner before Phase 2. Phase 1 is independently valuable, needs no schema change, and could start earlier.
+> **Status: implemented, all three phases.** §11's open questions (child table vs. aggregate-only, retention, Prometheus scope) were settled with the project owner and are recorded in §11 below. See §10 for the phase-by-phase breakdown.
 
 **Goal:** Give ChatBot the aggregate latency/failure insight VoiceBot already has. Resolves Open Question #5 of `docs/superpowers/plans/2026-09-07-llm-conversation-tracing.md`.
 
@@ -170,9 +170,9 @@ Baseline: re-verify `.venv/bin/python -m pytest tests/ -q` before starting (CLAU
 
 ## 10. Phased rollout
 
-- [ ] **Phase 1 — Structured turn telemetry, no schema change. Independently valuable, near-zero risk.** `ChatTurnMetrics` dataclass; collect on both paths; attach to `ChatTurnResult.metrics`. Convert the two `log.info("chat turn done...")` calls from formatted strings to structured `extra={...}` fields (keeping a readable message) — this alone turns the #1762 diagnosis workflow from "parse a string by eye" into a Loki field query, using data already in memory. Populate the dead `ChatMessage.latency_ms` in `_persist_turn` from `result.metrics.total_ms` — retires a dead column, gives the transcript UI per-turn latency, no migration. Tests run against the dataclass, no DB.
-- [ ] **Phase 2 — Tables and write path.** Migration `0020` (owner applies manually); `src/models/chat_turn_metrics.py` with `record_chat_turn_metric`; register in `src/models/__init__.py`; `record_metric` param on `ChatBotAgent`; wire from `make_chatbot_factory`. Tests 1-3. Accepted gap: timed-out/errored turns write no row.
-- [ ] **Phase 3 — Read path and alerting.** `GET /tenants/{id}/chat-turn-metrics`; tests 4 and 6. WS-layer failure row (closes Phase 2's gap, correctly located outside the cancelled coroutine). `chat_metrics_push.py` + `_push` job-name parameterization + hook into the existing loop; test 5. Docs: `docs/HANDOVER.md` at-a-glance row and schema list; the §6 tracing-plan edits.
+- [x] **Phase 1 — Structured turn telemetry, no schema change. Independently valuable, near-zero risk.** `ChatTurnMetrics` dataclass; collect on both paths; attach to `ChatTurnResult.metrics`. Convert the two `log.info("chat turn done...")` calls from formatted strings to structured `extra={...}` fields (keeping a readable message) — this alone turns the #1762 diagnosis workflow from "parse a string by eye" into a Loki field query, using data already in memory. Populate the dead `ChatMessage.latency_ms` in `_persist_turn` from `result.metrics.total_ms` — retires a dead column, gives the transcript UI per-turn latency, no migration. Tests run against the dataclass, no DB. (Committed `b01376b`.)
+- [x] **Phase 2 — Tables and write path.** Migration `0020` (owner applies manually); `src/models/chat_turn_metrics.py` with `record_chat_turn_metric`; register in `src/models/__init__.py`; `record_metric` param on `ChatBotAgent`; wire from `make_chatbot_factory`. Tests 1-3. Accepted gap: timed-out/errored turns write no row. (Committed `f2eb969`.)
+- [x] **Phase 3 — Read path and alerting.** `GET /tenants/{id}/chat-turn-metrics`; tests 4 and 6. WS-layer failure row (closes Phase 2's gap, correctly located outside the cancelled coroutine) — its rows are counted separately and excluded from the read endpoint's and push module's averages/latency gauges, since a turn that never ran carries no real timing signal. `chat_metrics_push.py` + `_push` job-name parameterization + hook into the existing loop; test 5. Retention prune job (§11.2), 90-day default. Docs: `docs/HANDOVER.md` at-a-glance row and schema list; the §6 tracing-plan edits.
 
 ## 11. Owner decisions (settled 2026-09-08)
 

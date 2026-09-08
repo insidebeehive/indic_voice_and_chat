@@ -15,12 +15,13 @@ import logging
 import re
 import secrets as pysecrets
 import uuid
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 from typing import Literal, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.answer_paths import answer_url_for
@@ -1174,6 +1175,256 @@ async def tenant_billing(
         chat_output_tokens=int(chat_out_tok or 0),
         chat_cost=round(float(chat_cost or 0.0), 6),
     )
+
+
+class ChatTurnMetricsTurns(BaseModel):
+    samples: int
+    avg_total_ms: float
+    p50_total_ms: int
+    p95_total_ms: int
+    avg_llm_total_ms: float
+    avg_tool_total_ms: float
+    avg_kb_search_ms: float
+    avg_rounds: float
+    rounds_exhausted_rate_pct: float
+    retry_fired_rate_pct: float
+    failure_directive_fired_rate_pct: float
+    guard_hallucination_fired_rate_pct: float
+    guard_no_grounding_fired_rate_pct: float
+    guard_unverified_data_fired_rate_pct: float
+    escalated_rate_pct: float
+    turns_with_tool_failure: int
+    # WS-layer failure rows (src/api/chat.py::_record_ws_turn_failure_metric,
+    # a turn that raised or timed out before the agent produced a
+    # ChatTurnResult) are counted here and EXCLUDED from every average/
+    # percentile/rate field above -- their llm_total_ms/rounds/guard flags
+    # etc. are all 0/False placeholders, not real signal, and averaging them
+    # in would silently understate every healthy-turn number by a WS-layer
+    # outage that has nothing to do with LLM/tool/guard behavior.
+    failed_turns: int
+    turn_failure_rate_pct: float
+
+
+class ChatTurnMetricsTool(BaseModel):
+    tool_name: str
+    calls: int
+    p50_latency_ms: int
+    p95_latency_ms: int
+    timeouts: int
+    transport_errors: int
+    skipped: int
+    avg_budget_slice_ms: float
+    failure_rate_pct: float
+
+
+class ChatTurnMetricsSummary(BaseModel):
+    tenant_id: str
+    window_h: int
+    turns: ChatTurnMetricsTurns
+    tools: list[ChatTurnMetricsTool]
+
+
+# Bounds how many rows the percentile queries below will ever pull into
+# Python for one request, independent of window_h — an admin passing an
+# enormous window (e.g. window_h=999999) must not be able to turn this
+# endpoint into a DoS against the DB/process. See turn_metrics_push.py's
+# module docstring for why percentiles are computed in Python at all
+# (SQLite, which the whole unit suite runs on, has no portable percentile
+# aggregate) rather than in SQL.
+_CHAT_TURN_METRICS_MAX_ROWS = 50_000
+
+
+@router.get("/{tenant_id}/chat-turn-metrics", response_model=ChatTurnMetricsSummary)
+async def tenant_chat_turn_metrics(
+    tenant_id: str,
+    window_h: int = Query(24, ge=1),
+    session: AsyncSession = Depends(get_db_session),
+    _: None = Depends(require_admin),
+) -> ChatTurnMetricsSummary:
+    """Aggregate ChatBot per-turn latency/failure metrics for one tenant over
+    the last ``window_h`` hours (turn-metrics plan §5).
+
+    Aggregate-only, admin-gated: this endpoint MUST NEVER return a raw
+    ``session_id`` or ``trace_id`` — both are capabilities/correlators
+    (``ChatSession.id`` *is* the WebSocket auth token; see
+    ``src/models/chat_turn_metrics.py``'s module docstring). Count/sum/avg
+    are computed in SQL (portable to SQLite); p50/p95 are computed in Python
+    by reusing ``turn_metrics_push.py``'s ``_percentile`` (already a tested
+    pure function — see that module's docstring for why percentiles aren't
+    pushed into SQL). The underlying row fetch is capped at
+    ``_CHAT_TURN_METRICS_MAX_ROWS`` so a large ``window_h`` can't be turned
+    into a DoS.
+
+    WS-layer failure rows (``action`` in ``WS_TURN_FAILURE_ACTIONS`` — a turn
+    that raised or timed out before the agent produced a ``ChatTurnResult``)
+    are counted separately (``failed_turns``/``turn_failure_rate_pct``) and
+    EXCLUDED from every average/percentile/rate field: their numeric/boolean
+    columns are all 0/False placeholders, and folding them into the same
+    averages as completed turns would silently understate every healthy-turn
+    number by however many turns simply never ran.
+    """
+    from sqlalchemy import and_
+
+    from src.models.chat_turn_metrics import (
+        WS_TURN_FAILURE_ACTIONS,
+        ChatToolMetricRow,
+        ChatTurnMetric,
+    )
+    from src.observability.turn_metrics_push import _percentile
+
+    await _require_tenant(session, tenant_id)
+
+    # Cutoff evaluated against the DB SERVER's own clock (not Python's
+    # datetime.utcnow()) on Postgres, matching turn_metrics_push.py's
+    # identical reasoning: created_at is DateTime(timezone=False) populated
+    # by the server's own func.now(), so both sides of the comparison must be
+    # evaluated by that same clock, or a server clock in a non-UTC timezone
+    # would silently make window_h mean something else. SQLite (test-only)
+    # has no separate server clock to disagree with Python's.
+    dialect_name = session.get_bind().dialect.name
+    if dialect_name == "sqlite":
+        cutoff = datetime.utcnow() - timedelta(hours=window_h)
+    else:
+        cutoff = func.now() - func.make_interval(0, 0, 0, 0, window_h)
+
+    turn_filter = (
+        ChatTurnMetric.tenant_id == tenant_id,
+        ChatTurnMetric.created_at >= cutoff,
+    )
+    healthy = ChatTurnMetric.action.not_in(WS_TURN_FAILURE_ACTIONS)
+    failed = ChatTurnMetric.action.in_(WS_TURN_FAILURE_ACTIONS)
+
+    def _h_avg(col):
+        # AVG ignores NULL, so a CASE that's NULL on non-healthy rows
+        # (else_ omitted) computes the average over healthy rows only,
+        # without a second query or a Python-side filter.
+        return func.avg(case((healthy, col)))
+
+    def _h_cond_sum(cond):
+        return func.sum(case((and_(healthy, cond), 1), else_=0))
+
+    agg = (await session.execute(
+        select(
+            func.sum(case((healthy, 1), else_=0)),
+            func.sum(case((failed, 1), else_=0)),
+            _h_avg(ChatTurnMetric.total_ms),
+            _h_avg(ChatTurnMetric.llm_total_ms),
+            _h_avg(ChatTurnMetric.tool_total_ms),
+            _h_avg(ChatTurnMetric.kb_search_ms),
+            _h_avg(ChatTurnMetric.rounds),
+            _h_cond_sum(ChatTurnMetric.rounds_exhausted.is_(True)),
+            _h_cond_sum(ChatTurnMetric.retry_fired.is_(True)),
+            _h_cond_sum(ChatTurnMetric.failure_directive_fired.is_(True)),
+            _h_cond_sum(ChatTurnMetric.guard_hallucination_fired.is_(True)),
+            _h_cond_sum(ChatTurnMetric.guard_no_grounding_fired.is_(True)),
+            _h_cond_sum(ChatTurnMetric.guard_unverified_data_fired.is_(True)),
+            _h_cond_sum(ChatTurnMetric.escalated.is_(True)),
+            _h_cond_sum(ChatTurnMetric.tool_failures > 0),
+        ).where(*turn_filter)
+    )).one()
+    (
+        samples, n_failed_turns, avg_total, avg_llm_total, avg_tool_total, avg_kb_search, avg_rounds,
+        n_rounds_exhausted, n_retry_fired, n_failure_directive, n_guard_hallucination,
+        n_guard_no_grounding, n_guard_unverified, n_escalated, n_tool_failure,
+    ) = agg
+    samples = int(samples or 0)
+    failed_turns = int(n_failed_turns or 0)
+    total_turns = samples + failed_turns
+
+    def _rate_pct(n: object) -> float:
+        return round(int(n or 0) * 100 / samples, 1) if samples else 0.0
+
+    total_ms_values = sorted((await session.execute(
+        select(ChatTurnMetric.total_ms).where(*turn_filter, healthy)
+        .order_by(ChatTurnMetric.created_at)
+        .limit(_CHAT_TURN_METRICS_MAX_ROWS)
+    )).scalars().all())
+
+    turns = ChatTurnMetricsTurns(
+        samples=samples,
+        avg_total_ms=round(float(avg_total or 0.0), 1),
+        p50_total_ms=_percentile(total_ms_values, 50) if total_ms_values else 0,
+        p95_total_ms=_percentile(total_ms_values, 95) if total_ms_values else 0,
+        avg_llm_total_ms=round(float(avg_llm_total or 0.0), 1),
+        avg_tool_total_ms=round(float(avg_tool_total or 0.0), 1),
+        avg_kb_search_ms=round(float(avg_kb_search or 0.0), 1),
+        avg_rounds=round(float(avg_rounds or 0.0), 2),
+        rounds_exhausted_rate_pct=_rate_pct(n_rounds_exhausted),
+        retry_fired_rate_pct=_rate_pct(n_retry_fired),
+        failure_directive_fired_rate_pct=_rate_pct(n_failure_directive),
+        guard_hallucination_fired_rate_pct=_rate_pct(n_guard_hallucination),
+        guard_no_grounding_fired_rate_pct=_rate_pct(n_guard_no_grounding),
+        guard_unverified_data_fired_rate_pct=_rate_pct(n_guard_unverified),
+        escalated_rate_pct=_rate_pct(n_escalated),
+        turns_with_tool_failure=int(n_tool_failure or 0),
+        failed_turns=failed_turns,
+        turn_failure_rate_pct=round(failed_turns * 100 / total_turns, 1) if total_turns else 0.0,
+    )
+
+    # Per-tool breakdown: join to the parent so the tenant_id + window filter
+    # (only present on the parent row) applies to child rows too. Only the
+    # bounded enum/int columns are selected — never turn_id/tenant_id-adjacent
+    # identifiers that could combine into a correlator. Ordered by the
+    # parent's created_at so the LIMIT below truncates deterministically
+    # (oldest-first) rather than to an arbitrary, non-reproducible subset.
+    tool_rows = (await session.execute(
+        select(
+            ChatToolMetricRow.tool_name, ChatToolMetricRow.latency_ms,
+            ChatToolMetricRow.outcome, ChatToolMetricRow.budget_slice_ms,
+        )
+        .join(ChatTurnMetric, ChatToolMetricRow.turn_id == ChatTurnMetric.id)
+        .where(*turn_filter)
+        .order_by(ChatTurnMetric.created_at)
+        .limit(_CHAT_TURN_METRICS_MAX_ROWS)
+    )).all()
+
+    by_tool: dict[str, list[tuple[int, str, int]]] = {}
+    for tool_name, latency_ms, outcome, budget_slice_ms in tool_rows:
+        by_tool.setdefault(tool_name, []).append((latency_ms, outcome, budget_slice_ms))
+
+    tools: list[ChatTurnMetricsTool] = []
+    for tool_name, rows_ in sorted(by_tool.items()):
+        calls = len(rows_)
+        # skipped_budget calls were never dispatched -- chatbot.py's own
+        # skip-branch records latency_ms as the ~0ms elapsed time to DECIDE to
+        # skip, not a real call duration. Mixing that into the latency
+        # population would drag p50/p95 toward 0 for a tool with many skips,
+        # which is exactly backwards for "is this tool saturating its
+        # timeout" (the question this endpoint exists to answer per the
+        # plan's §2). skipped_budget calls still count toward `calls`/
+        # `skipped` below, just not toward the latency percentiles.
+        latencies = sorted(r[0] for r in rows_ if r[1] != "skipped_budget")
+        timeouts = sum(1 for r in rows_ if r[1] == "timeout")
+        transport_errors = sum(1 for r in rows_ if r[1] == "transport_error")
+        skipped = sum(1 for r in rows_ if r[1] == "skipped_budget")
+        errors = sum(1 for r in rows_ if r[1] == "error")
+        # failure_rate_pct definition, pinned here per the model's own
+        # documented ambiguity (src/agents/chatbot.py's ChatTurnMetrics.tool_calls
+        # docstring, which is explicit and in caps: a naive
+        # tool_failures/tool_calls UNDERSTATES degradation whenever calls were
+        # skipped, and "a true 'how bad' number needs
+        # (tool_failures + tool_calls_skipped) / tool_calls"). This mirrors
+        # that exactly: the denominator is ALL calls including skipped_budget
+        # ones (the model asked, we counted it), and the numerator counts
+        # BOTH calls that were attempted and failed (timeout/transport_error/
+        # error) AND calls that were never even tried (skipped_budget) --
+        # "never tried" is not a success for the purpose of "how bad is this
+        # tool doing for users", it's the same outcome as a failure from the
+        # caller's point of view (no useful result came back either way).
+        failed_or_skipped = timeouts + transport_errors + errors + skipped
+        tools.append(ChatTurnMetricsTool(
+            tool_name=tool_name,
+            calls=calls,
+            p50_latency_ms=_percentile(latencies, 50) if latencies else 0,
+            p95_latency_ms=_percentile(latencies, 95) if latencies else 0,
+            timeouts=timeouts,
+            transport_errors=transport_errors,
+            skipped=skipped,
+            avg_budget_slice_ms=round(sum(r[2] for r in rows_) / calls, 1) if calls else 0.0,
+            failure_rate_pct=round(failed_or_skipped * 100 / calls, 1) if calls else 0.0,
+        ))
+
+    return ChatTurnMetricsSummary(tenant_id=tenant_id, window_h=window_h, turns=turns, tools=tools)
 
 
 # --- Campaign script editor (backoffice) --------------------------------
