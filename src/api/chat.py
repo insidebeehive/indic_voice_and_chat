@@ -2100,6 +2100,19 @@ async def _persist_turn(
                 session_id=session_id, role="agent", type="text",
                 content=result.response.response_text,
                 sources=result.response.sources_used or None,
+                # Phase 1 of the turn-metrics plan: retires the previously
+                # dead latency_ms column using data the agent already
+                # computed this turn. getattr-defensive (matching
+                # _crm_retriever_for's convention) since several unit tests
+                # pass a minimal duck-typed stand-in with no ``metrics``
+                # attribute at all — None when metrics assembly itself
+                # failed (see ChatBotAgent._single_shot/_handle_with_tools)
+                # or the attribute is simply absent; never block persistence
+                # on it either way.
+                latency_ms=(
+                    metrics.total_ms if (metrics := getattr(result, "metrics", None)) is not None
+                    else None
+                ),
             )
             db.add(agent_msg)
             row.message_count = (row.message_count or 0) + 2

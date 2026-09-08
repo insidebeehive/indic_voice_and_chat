@@ -49,6 +49,7 @@ from src.rag.context_builder import (
     search_combined,
 )
 from src.rag.retriever import HybridRetriever, RetrievedChunk
+from src.utils.trace_id import current_trace_id
 
 log = logging.getLogger(__name__)
 
@@ -196,6 +197,58 @@ def _tool_result_is_failure(result: object) -> bool:
     return result.get("status") == "error"
 
 
+def _tool_kind(tool_name: str) -> str:
+    """Classify a tool call for metrics grouping (chat_tool_metrics.kind in
+    the turn-metrics plan) -- lets zero-I/O local builders (escalate/offer
+    call) be excluded from latency stats later, and CRM calls be told apart
+    from the deposit-verification submit path and KB search."""
+    if tool_name == SEARCH_KB:
+        return "kb"
+    if tool_name in (ESCALATE, OFFER_CALL):
+        return "local"
+    if tool_name == SUBMIT_DEPOSIT_VERIFICATION:
+        return "deposit_verification"
+    return "crm"
+
+
+def _tool_outcome(result: object) -> str:
+    """Classify a tool-result dict into a bounded outcome enum for metrics:
+    ``ok`` | ``timeout`` | ``transport_error`` | ``error``. Deliberately a
+    fixed enum, never a free-text error string -- a CRM error message can
+    embed player data (see the plan's PII section), so there must be no
+    column/field for it to land in.
+
+    Does not classify ``skipped_budget`` -- the min-slice skip is a call-site
+    decision (the call is never attempted at all), not something derivable
+    from a result dict, so callers set that outcome themselves before ever
+    reaching this function.
+
+    KNOWN LIMITATION (documented, not fixed here -- a Phase 2 candidate):
+    tool_executor.py's ``failure="http_error"`` (a CRM 4xx/5xx response --
+    the HTTP call itself succeeded, but the upstream returned an error
+    status) currently falls through to the generic ``"error"`` bucket below,
+    same as an internal/deposit-verification error with neither an
+    ``error``/``failure`` key. This is deliberately safer than a literal
+    reading of the plan's derivation (`failure=="timeout"` /
+    `failure=="transport_error"` / else "error" for a status=="error"
+    shape), which would have missed http_error entirely and misclassified a
+    real CRM 500 as ``ok``. But for the CRM-vendor-accountability argument
+    this whole metrics pipeline exists to support, folding "the vendor
+    returned a 500" and "our own code raised" into one enum value loses
+    signal that would matter for a per-tool failure-rate dashboard. Add a
+    dedicated ``http_error`` outcome value in Phase 2 rather than now.
+    """
+    if not _tool_result_is_failure(result):
+        return "ok"
+    if isinstance(result, dict):
+        failure = result.get("failure")
+        if failure == "timeout":
+            return "timeout"
+        if failure == "transport_error":
+            return "transport_error"
+    return "error"
+
+
 def _build_failure_directive(labels: list[str], escalate: bool) -> str:
     """Synthetic role=user directive (Step 2). Deliberately role="user", not
     "system" — both the Gemini and Claude adapters hoist system messages into
@@ -328,6 +381,70 @@ def _usage_tokens(result: LLMResult | None) -> tuple[int, int]:
     return usage.get("prompt_tokens", 0) or 0, usage.get("completion_tokens", 0) or 0
 
 
+@dataclass(frozen=True)
+class ChatToolMetric:
+    """One tool-call's metrics within a turn (chat_tool_metrics grain in the
+    turn-metrics plan). ``id``/``turn_id``/``tenant_id``/``created_at`` are
+    the future DB row's business (Phase 2), not this dataclass's."""
+    tool_name: str
+    kind: str            # "crm" | "kb" | "local" | "deposit_verification"
+    latency_ms: int
+    outcome: str          # "ok" | "timeout" | "transport_error" | "error" | "skipped_budget"
+    budget_slice_ms: int
+    round_index: int
+
+
+@dataclass(frozen=True)
+class ChatTurnMetrics:
+    """Aggregate + per-tool-call timing/outcome data for one agent turn
+    (chat_turn_metrics grain in the turn-metrics plan). Phase 1: in-process
+    only -- attached to ChatTurnResult, never persisted here. Fields omit
+    ``id``/``tenant_id``/``crm_id``/``created_at``, which are the future
+    write path's (a factory closure / the DB), not the agent's, business.
+    """
+    trace_id: str | None
+    path: str             # "tools" | "single_shot"
+    llm_provider: str
+    llm_model: str
+    action: str
+    total_ms: int
+    llm_total_ms: int
+    llm_calls: int
+    # Budgeted CRM tool time only (tool_elapsed_s * 1000) -- directly
+    # comparable to _TOOL_BUDGET_S. KB search is deliberately excluded (see
+    # kb_search_ms/kb_searches below) since it draws from its own independent
+    # budget (_KB_SEARCH_TIMEOUT_S), not this one.
+    tool_total_ms: int
+    # tool_calls counts every CRM/deposit-verification call the model made,
+    # INCLUDING ones that were skipped_budget (never actually dispatched --
+    # see tool_calls_skipped). tool_failures/tool_timeouts count only calls
+    # that were actually attempted and failed/timed out -- skipped_budget is
+    # excluded from both, since "never tried" isn't the same failure mode as
+    # "tried and failed". Consequence, PINNED HERE before anyone builds a
+    # dashboard on it: a naive `tool_failures / tool_calls` UNDERSTATES
+    # degradation whenever calls were skipped -- those calls didn't fail
+    # outright, but they also didn't succeed, and the ratio silently treats
+    # them as successes. A true "how bad" number needs
+    # `(tool_failures + tool_calls_skipped) / tool_calls`.
+    tool_calls: int
+    tool_failures: int
+    tool_timeouts: int
+    tool_calls_skipped: int
+    kb_search_ms: int
+    kb_searches: int
+    retrieved_chunks: int
+    rounds: int
+    rounds_exhausted: bool
+    retry_fired: bool
+    failure_directive_fired: bool
+    failure_directive_escalated: bool
+    guard_hallucination_fired: bool
+    guard_no_grounding_fired: bool
+    guard_unverified_data_fired: bool
+    escalated: bool
+    tools: tuple[ChatToolMetric, ...] = ()
+
+
 @dataclass
 class ChatTurnResult:
     response: ChatBotResponse
@@ -343,6 +460,11 @@ class ChatTurnResult:
     output_tokens: int = 0
     llm_provider: str = ""
     llm_model: str = ""
+    # Phase 1 of the turn-metrics plan: rich in-process timing/outcome data,
+    # assembled defensively (never breaks a turn on a metrics-assembly bug —
+    # see _single_shot/_handle_with_tools). None only when metrics assembly
+    # itself failed; a turn is never blocked on this.
+    metrics: ChatTurnMetrics | None = None
 
 
 class ChatBotAgent(BaseAgent):
@@ -465,6 +587,7 @@ class ChatBotAgent(BaseAgent):
         llm_ms_list = [(time.perf_counter() - llm_start) * 1000]
         in_tok, out_tok = _usage_tokens(result)
         response = parse_chatbot_response(result.text)
+        retry_fired = False
         # Only retry a genuinely unusable turn — one where the parser had to
         # fall back to one of its canned lines (empty input, missing
         # response_text, or truncated/malformed JSON — see
@@ -477,6 +600,7 @@ class ChatBotAgent(BaseAgent):
             # response, unlike voice's incremental TTS) — safe to regenerate
             # once before falling back to the canned "couldn't formulate an
             # answer" line.
+            retry_fired = True
             retried_result, retry_ms = await self._retry_if_unusable(
                 result.finish_reason, messages, self._llm_config,
             )
@@ -496,20 +620,101 @@ class ChatBotAgent(BaseAgent):
         # answer is grounded in the image, not the (empty) knowledge base, so the
         # no-retrieval fallback would wrongly clobber it. Text turns are unchanged.
         multimodal = isinstance(user_msg.content, list)
+        _guard_before = (response.response_text, response.confidence)
         if retrieved or not multimodal:
             response = apply_hallucination_guard(response, rag, self._guard)
+        guard_hallucination_fired = (response.response_text, response.confidence) != _guard_before
         # 6. Persist
         await self._persist(user_msg, query_text, response, len(retrieved))
+        total_ms = (time.perf_counter() - turn_start) * 1000
+        # Computed outside the try/except below (same reasoning as
+        # _handle_with_tools): the log line must show real measurements even
+        # in the narrow case where ChatTurnMetrics construction itself fails.
+        llm_total_ms_val = round(sum(llm_ms_list))
+        escalated_flag = response.action == "escalate"
+        metrics: ChatTurnMetrics | None = None
+        try:
+            # Never let a metrics-assembly bug break a live turn — see
+            # src/agents/voicebot.py's record_metric idiom and
+            # src/models/turn_metrics.py's never-raises docstring for the
+            # established house style this mirrors.
+            metrics = ChatTurnMetrics(
+                trace_id=current_trace_id(),
+                path="single_shot",
+                llm_provider=self._llm_provider,
+                llm_model=self._llm_model,
+                action=response.action,
+                total_ms=round(total_ms),
+                llm_total_ms=llm_total_ms_val,
+                llm_calls=len(llm_ms_list),
+                tool_total_ms=0,
+                tool_calls=0,
+                tool_failures=0,
+                tool_timeouts=0,
+                tool_calls_skipped=0,
+                # DECISION (documented, not a bug): the single-shot path's
+                # retrieval (search_combined, above) is measured as
+                # retrieval_ms and logged, but deliberately NOT written into
+                # kb_search_ms/kb_searches here -- those two fields are
+                # scoped specifically to the tool-calling loop's
+                # search_knowledge_base TOOL CALL (see _handle_with_tools),
+                # which is a different mechanism (explicit model-invoked tool
+                # vs. automatic pre-retrieval) even though both do a KB
+                # lookup. Consequence: a future cross-path aggregate like
+                # "avg_kb_search_ms across all turns" would silently exclude
+                # every single-shot turn's real retrieval time rather than
+                # averaging it in -- any such consumer must filter/group by
+                # `path`, or this field must be revisited to populate
+                # retrieval_ms here too.
+                kb_search_ms=0,
+                kb_searches=0,
+                retrieved_chunks=len(retrieved),
+                rounds=1,
+                rounds_exhausted=False,
+                retry_fired=retry_fired,
+                failure_directive_fired=False,
+                failure_directive_escalated=False,
+                # DECISION (documented, not a bug — see the plan's §11.6):
+                # this can under-report. The before/after (response_text,
+                # confidence) snapshot is the plan-prescribed way to detect a
+                # guard firing without changing the guards themselves (which
+                # always return a fresh copy, making identity comparison
+                # useless). But apply_hallucination_guard's citation-dropping
+                # branch (context_builder.py) only mutates sources_used, not
+                # response_text/confidence, when confidence was ALREADY
+                # "low" going in -- that specific case is a false negative
+                # here (guard did something, snapshot shows no change).
+                guard_hallucination_fired=guard_hallucination_fired,
+                guard_no_grounding_fired=False,
+                guard_unverified_data_fired=False,
+                escalated=escalated_flag,
+            )
+        except Exception:  # noqa: BLE001 - metrics assembly must never break a reply
+            log.warning("chat turn metrics assembly failed; continuing without metrics",
+                        exc_info=True,
+                        extra={"ticket_id": self._ticket_id, "session_id": self._session_id})
         log.info(
-            "chat turn done in %.2fs: llm=%s retrieval=%.0fms retrieved=%d",
-            time.perf_counter() - turn_start,
-            [f"{ms:.0f}ms" for ms in llm_ms_list], retrieval_ms, len(retrieved),
-            extra={"ticket_id": self._ticket_id, "session_id": self._session_id},
+            "chat turn done (single_shot path)",
+            extra={
+                "ticket_id": self._ticket_id, "session_id": self._session_id,
+                "path": "single_shot",
+                "total_ms": round(total_ms),
+                "llm_ms_list": [round(ms) for ms in llm_ms_list],
+                "llm_calls": len(llm_ms_list),
+                "llm_total_ms": llm_total_ms_val,
+                "retrieval_ms": round(retrieval_ms),
+                "retrieved_count": len(retrieved),
+                "action": response.action,
+                "retry_fired": retry_fired,
+                "guard_hallucination_fired": guard_hallucination_fired,
+                "escalated": escalated_flag,
+            },
         )
         return ChatTurnResult(
             response=response, retrieved=retrieved, rag_context_chars=len(rag.text),
             input_tokens=in_tok, output_tokens=out_tok,
-            llm_provider=self._llm_provider, llm_model=self._llm_model)
+            llm_provider=self._llm_provider, llm_model=self._llm_model,
+            metrics=metrics)
 
     # --- Tool-calling path (agentic) -----------------------------------
 
@@ -517,7 +722,27 @@ class ChatBotAgent(BaseAgent):
         turn_start = time.perf_counter()
         llm_ms_list: list[float] = []
         tool_ms_list: list[tuple[str, float]] = []
+        tool_metrics: list[ChatToolMetric] = []
         rounds = 0
+        rounds_exhausted = False
+        retry_fired = False
+        # Turn-scoped flags for the failure directive (ticket #1762 fix) —
+        # deliberately NOT derived from failed_category_names/directive_index
+        # at the end of the turn. The distinguishing case is SAME-TURN
+        # RECOVERY: round 1's tool call fails (directive appended,
+        # directive_index set), round 2's retry of the SAME tool succeeds --
+        # failed_category_names is cleared and the stale directive message is
+        # deleted, resetting directive_index back to None (see the "Keep
+        # exactly one synthetic directive message" block below). An
+        # end-of-turn derivation (`directive_index is not None`) would then
+        # report False for a turn where the directive genuinely fired and
+        # reached the model in round 1 -- these flags remember that instead.
+        # (A mid-loop `break`, by contrast, does NOT create this discrepancy:
+        # it happens before the per-round failed_category_names/directive
+        # bookkeeping for that round runs, so directive_index simply retains
+        # whatever value the prior round left it at.)
+        directive_fired_this_turn = False
+        directive_escalated_this_turn = False
         # Cumulative tool time spent so far THIS TURN — persists across both
         # rounds (initialized here, outside the round loop below), which is
         # what makes _TOOL_BUDGET_S a per-turn budget rather than a per-round
@@ -580,6 +805,7 @@ class ChatBotAgent(BaseAgent):
             round_succeeded_names: set[str] = set()
             for i, tc in enumerate(result.tool_calls):
                 tool_start = time.perf_counter()
+                slice_s = 0.0
                 if tc.name == SEARCH_KB:
                     # KB search has its own independent budget (see
                     # _KB_SEARCH_TIMEOUT_S) — it must never draw from, or be
@@ -620,6 +846,47 @@ class ChatBotAgent(BaseAgent):
                         round_succeeded_names.add(tc.name)
                         grounded_tool_texts.append(json.dumps(out))
                 tool_ms_list.append((tc.name, elapsed * 1000))
+                try:
+                    # Narrow on purpose — this wraps ONLY the per-tool metric
+                    # construction, never the surrounding tool-dispatch logic
+                    # above (which must keep running/raising normally). This
+                    # code runs on every production chat turn's hot tool loop,
+                    # so "metrics must never break a live turn" has to hold
+                    # here too, not just at the end-of-turn ChatTurnMetrics
+                    # assembly below.
+                    kind = _tool_kind(tc.name)
+                    # The min-slice skip (_exec_tool's timeout_s <
+                    # _TOOL_MIN_SLICE_S branch, "the model asked for a tool
+                    # and we never even tried") only applies to the
+                    # fair-shared CRM/deposit-verification path — KB search
+                    # and the zero-I/O local builders never go through that
+                    # branch, so they can never be "skipped_budget".
+                    if kind in ("crm", "deposit_verification") and slice_s < _TOOL_MIN_SLICE_S:
+                        outcome = "skipped_budget"
+                    else:
+                        outcome = _tool_outcome(out)
+                    # budget_slice_ms: the CRM/deposit-verification fair-share
+                    # slice computed above; KB search's own fixed, independent
+                    # timeout for a KB call; 0 (unbudgeted) for the zero-I/O
+                    # local builders, which never draw from any budget.
+                    if kind == "kb":
+                        budget_slice_ms = round(_KB_SEARCH_TIMEOUT_S * 1000)
+                    elif kind == "local":
+                        budget_slice_ms = 0
+                    else:
+                        budget_slice_ms = round(slice_s * 1000)
+                    tool_metrics.append(ChatToolMetric(
+                        tool_name=tc.name, kind=kind, latency_ms=round(elapsed * 1000),
+                        outcome=outcome, budget_slice_ms=budget_slice_ms,
+                        round_index=rounds - 1,
+                    ))
+                except Exception:  # noqa: BLE001 - per-tool metrics must never break a live turn
+                    log.warning(
+                        "chat per-tool metrics collection failed; continuing without this entry",
+                        exc_info=True,
+                        extra={"ticket_id": self._ticket_id, "session_id": self._session_id,
+                               "tool": tc.name},
+                    )
                 retrieved_all.extend(chunks)
                 if tc.name not in (ESCALATE, OFFER_CALL):
                     tool_calls_made.append(tc.name)
@@ -646,11 +913,15 @@ class ChatBotAgent(BaseAgent):
                     _prior_failure_counts.get(_category_label(n), 0) >= 1
                     for n in failed_category_names
                 )
+                directive_fired_this_turn = True
+                if escalate:
+                    directive_escalated_this_turn = True
                 messages.append(LLMMessage(
                     role="user", content=_build_failure_directive(labels, escalate)))
                 directive_index = len(messages) - 1
         else:
             # Ran out of rounds still wanting tools — force a final plain answer.
+            rounds_exhausted = True
             llm_start = time.perf_counter()
             result = await self._llm.generate(
                 messages, LLMConfig(temperature=cfg.temperature, max_tokens=cfg.max_tokens,
@@ -704,6 +975,7 @@ class ChatBotAgent(BaseAgent):
                 response_format="text",
                 tools=None,
             )
+            retry_fired = True
             retried, retry_ms = await self._retry_if_unusable(
                 result.finish_reason, messages, retry_cfg,
             )
@@ -736,12 +1008,17 @@ class ChatBotAgent(BaseAgent):
         # must not clobber it. But a turn with NEITHER retrieval NOR any tool call
         # at all gets the narrower no-grounding guard instead, since that's a turn
         # where nothing at all was consulted.
+        guard_hallucination_fired = False
+        guard_no_grounding_fired = False
+        _guard_before = (response.response_text, response.confidence)
         if retrieved_all:
             response = apply_hallucination_guard(response, rag, self._guard)
+            guard_hallucination_fired = (response.response_text, response.confidence) != _guard_before
         else:
             response = apply_no_grounding_guard(
                 response, retrieved_any=bool(retrieved_all), tool_calls_made=tool_calls_made,
             )
+            guard_no_grounding_fired = (response.response_text, response.confidence) != _guard_before
         # Step 5 (ticket #1762): deterministic, model-independent check — runs
         # unconditionally, regardless of which branch above fired. Grounded
         # text = successful CRM/deposit-verification tool results + the FULL
@@ -773,26 +1050,129 @@ class ChatBotAgent(BaseAgent):
         grounded_text = "\n".join([
             *grounded_tool_texts, kb_chunk_text, query_text, prior_turns_text,
         ])
+        _guard_before_unverified = (response.response_text, response.confidence)
         response = apply_unverified_data_guard(
             response,
             grounded_text=grounded_text,
             customer_text=f"{query_text}\n{customer_turns_text}",
             config=self._guard,
         )
+        guard_unverified_data_fired = (
+            (response.response_text, response.confidence) != _guard_before_unverified
+        )
         await self._persist(user_msg, query_text, response, len(retrieved_all))
+        total_ms = (time.perf_counter() - turn_start) * 1000
+        # Computed OUTSIDE the ChatTurnMetrics try/except below, and used for
+        # BOTH the dataclass and the log line — so the log's per-tool/
+        # aggregate numbers are correct even in the (defensive, narrow-guard)
+        # case where ChatTurnMetrics construction itself somehow fails; the
+        # log must never fall back to a fabricated 0 for a real measurement.
+        crm_metrics = [tm for tm in tool_metrics if tm.kind in ("crm", "deposit_verification")]
+        kb_metrics = [tm for tm in tool_metrics if tm.kind == "kb"]
+        tool_calls_count = len(crm_metrics)
+        tool_failures_count = sum(
+            1 for tm in crm_metrics if tm.outcome in ("timeout", "transport_error", "error")
+        )
+        tool_timeouts_count = sum(1 for tm in crm_metrics if tm.outcome == "timeout")
+        tool_calls_skipped_count = sum(1 for tm in tool_metrics if tm.outcome == "skipped_budget")
+        kb_search_ms_total = round(sum(tm.latency_ms for tm in kb_metrics))
+        kb_searches_count = len(kb_metrics)
+        llm_total_ms_val = round(sum(llm_ms_list))
+        escalated_flag = response.action == "escalate"
+        metrics: ChatTurnMetrics | None = None
+        try:
+            # Never let a metrics-assembly bug break a live turn — see
+            # src/agents/voicebot.py's record_metric idiom and
+            # src/models/turn_metrics.py's never-raises docstring for the
+            # established house style this mirrors.
+            metrics = ChatTurnMetrics(
+                trace_id=current_trace_id(),
+                path="tools",
+                llm_provider=self._llm_provider,
+                llm_model=self._llm_model,
+                action=response.action,
+                total_ms=round(total_ms),
+                llm_total_ms=llm_total_ms_val,
+                llm_calls=len(llm_ms_list),
+                # Budgeted CRM total only (tool_elapsed_s * 1000) — directly
+                # comparable to _TOOL_BUDGET_S. KB search is excluded (see
+                # kb_search_ms below): it draws from its own independent
+                # budget, so folding it in would make this incomparable to
+                # the 45s CRM budget.
+                tool_total_ms=round(tool_elapsed_s * 1000),
+                tool_calls=tool_calls_count,
+                tool_failures=tool_failures_count,
+                tool_timeouts=tool_timeouts_count,
+                tool_calls_skipped=tool_calls_skipped_count,
+                kb_search_ms=kb_search_ms_total,
+                kb_searches=kb_searches_count,
+                retrieved_chunks=len(retrieved_all),
+                rounds=rounds,
+                rounds_exhausted=rounds_exhausted,
+                retry_fired=retry_fired,
+                failure_directive_fired=directive_fired_this_turn,
+                failure_directive_escalated=directive_escalated_this_turn,
+                guard_hallucination_fired=guard_hallucination_fired,
+                guard_no_grounding_fired=guard_no_grounding_fired,
+                guard_unverified_data_fired=guard_unverified_data_fired,
+                escalated=escalated_flag,
+                tools=tuple(tool_metrics),
+            )
+        except Exception:  # noqa: BLE001 - metrics assembly must never break a reply
+            log.warning("chat turn metrics assembly failed; continuing without metrics",
+                        exc_info=True,
+                        extra={"ticket_id": self._ticket_id, "session_id": self._session_id})
         log.info(
-            "chat turn done in %.2fs: llm=%s tools=%s rounds=%d retrieved=%d",
-            time.perf_counter() - turn_start,
-            [f"{ms:.0f}ms" for ms in llm_ms_list],
-            [f"{name}:{ms:.0f}ms" for name, ms in tool_ms_list],
-            rounds, len(retrieved_all),
-            extra={"ticket_id": self._ticket_id, "session_id": self._session_id},
+            "chat turn done (tools path)",
+            extra={
+                "ticket_id": self._ticket_id, "session_id": self._session_id,
+                "path": "tools",
+                "total_ms": round(total_ms),
+                "llm_ms_list": [round(ms) for ms in llm_ms_list],
+                "llm_calls": len(llm_ms_list),
+                "llm_total_ms": llm_total_ms_val,
+                # Human-readable string, genuinely useful for reading one turn
+                # by hand — but NOT the only representation: "tools" below
+                # carries the full structured detail (kind/outcome/budget
+                # slice/round), which is what makes per-tool diagnosis (e.g.
+                # ticket #1762) a Loki field query instead of eyeballing a
+                # string. outcome + budget_slice_ms specifically are, per the
+                # plan, "the most diagnostic pair in the design."
+                "tool_ms_list": [f"{name}:{ms:.0f}ms" for name, ms in tool_ms_list],
+                "tools": [
+                    {
+                        "name": tm.tool_name, "kind": tm.kind, "ms": tm.latency_ms,
+                        "outcome": tm.outcome, "slice_ms": tm.budget_slice_ms,
+                        "round": tm.round_index,
+                    }
+                    for tm in tool_metrics
+                ],
+                "tool_total_ms": round(tool_elapsed_s * 1000),
+                "tool_calls": tool_calls_count,
+                "tool_failures": tool_failures_count,
+                "tool_timeouts": tool_timeouts_count,
+                "tool_calls_skipped": tool_calls_skipped_count,
+                "kb_search_ms": kb_search_ms_total,
+                "kb_searches": kb_searches_count,
+                "rounds": rounds,
+                "rounds_exhausted": rounds_exhausted,
+                "retrieved_count": len(retrieved_all),
+                "retry_fired": retry_fired,
+                "failure_directive_fired": directive_fired_this_turn,
+                "failure_directive_escalated": directive_escalated_this_turn,
+                "guard_hallucination_fired": guard_hallucination_fired,
+                "guard_no_grounding_fired": guard_no_grounding_fired,
+                "guard_unverified_data_fired": guard_unverified_data_fired,
+                "escalated": escalated_flag,
+                "action": response.action,
+            },
         )
         return ChatTurnResult(
             response=response, retrieved=retrieved_all, rag_context_chars=len(rag.text),
             escalation=escalation, call_offer=call_offer,
             input_tokens=in_tok, output_tokens=out_tok,
-            llm_provider=self._llm_provider, llm_model=self._llm_model)
+            llm_provider=self._llm_provider, llm_model=self._llm_model,
+            metrics=metrics)
 
     async def _exec_tool(self, tc: ToolCall, timeout_s: float):
         """Bound a tool call's dispatch to its budget slice.

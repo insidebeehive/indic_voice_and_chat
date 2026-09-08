@@ -68,18 +68,23 @@ def _agent(llm, retriever, **kw) -> ChatBotAgent:
 
 @pytest.mark.asyncio
 async def test_single_shot_logs_turn_summary(retriever, caplog) -> None:
+    """Phase 1 of the turn-metrics plan converted this log line from a
+    formatted string to structured `extra={...}` fields (Loki-queryable)
+    while keeping a human-readable message -- assert on the fields, not on
+    string interpolation."""
     llm = ScriptedLLM([LLMResult(text="Hello there!", finish_reason="stop")])
     agent = _agent(llm, retriever)
     with caplog.at_level(logging.INFO, logger="src.agents.chatbot"):
         await agent.handle_message("hi")
-    records = [r for r in caplog.records if "chat turn done in" in r.getMessage()]
+    records = [r for r in caplog.records if "chat turn done" in r.getMessage()]
     assert len(records) == 1
-    msg = records[0].getMessage()
-    assert "llm=" in msg
-    assert "retrieval=" in msg
-    assert "retrieved=" in msg
-    # One LLM call was made -> one timing entry rendered in the llm list.
-    assert msg.count("ms") >= 1
+    rec = records[0]
+    assert rec.path == "single_shot"
+    assert rec.total_ms >= 0
+    assert isinstance(rec.llm_ms_list, list) and len(rec.llm_ms_list) == 1
+    assert rec.llm_calls == 1
+    assert rec.retrieval_ms >= 0
+    assert rec.retrieved_count >= 0
 
 
 # --- chatbot.py: tool-path summary log -----------------------------------
@@ -87,6 +92,8 @@ async def test_single_shot_logs_turn_summary(retriever, caplog) -> None:
 
 @pytest.mark.asyncio
 async def test_tool_path_logs_turn_summary_with_tool_name(retriever, caplog) -> None:
+    """Same structured-log conversion as the single-shot case above, for the
+    tool-calling path's summary log line."""
     llm = ScriptedLLM([
         LLMResult(text="", finish_reason="tool_calls", tool_calls=[
             ToolCall(id="t1", name="search_knowledge_base", arguments={"query": "Plan B"})]),
@@ -96,12 +103,13 @@ async def test_tool_path_logs_turn_summary_with_tool_name(retriever, caplog) -> 
     with caplog.at_level(logging.INFO, logger="src.agents.chatbot"):
         result = await agent.handle_message("Tell me about Plan B")
     assert result.response.response_text == "Plan B has 500GB unlimited data."
-    records = [r for r in caplog.records if "chat turn done in" in r.getMessage()]
+    records = [r for r in caplog.records if "chat turn done" in r.getMessage()]
     assert len(records) == 1
-    msg = records[0].getMessage()
-    assert "search_knowledge_base" in msg
-    assert "rounds=" in msg
-    assert "tools=" in msg
+    rec = records[0]
+    assert rec.path == "tools"
+    assert any("search_knowledge_base" in entry for entry in rec.tool_ms_list)
+    assert rec.rounds == 2
+    assert rec.kb_searches == 1
 
 
 # --- gemini.py: sem-wait / backoff logging -------------------------------
