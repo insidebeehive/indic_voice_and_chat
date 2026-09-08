@@ -40,6 +40,12 @@
   .stat.tnt .v { color:#94a3b8; font-style:italic; }
   .kv { font-size:.82rem; } .kv div { padding:.15rem 0; border-bottom:1px solid #141a24; }
   a { color:#93c5fd; }
+  table.metrics tbody tr { cursor:default; }
+  table.metrics tbody tr:hover { background:transparent; }
+  table.metrics th { color:#8a94a6; font-size:.72rem; text-transform:uppercase; letter-spacing:.03em; font-weight:600; }
+  table.metrics th.n, table.metrics td.n { text-align:right; font-variant-numeric:tabular-nums; }
+  .metrics-wrap { overflow-x:auto; margin-bottom:.4rem; }
+  .warnbox { background:#1a0f10; border:1px solid #7f1d1d; border-radius:.5rem; padding:.7rem .8rem; margin:1rem 0 .4rem; }
 </style>
 </head>
 <body>
@@ -125,6 +131,7 @@ async function apiSend(method, path, body) {
 
 const lay = (l) => l && l.provider ? `${l.provider}${l.model ? " · " + l.model : ""}` : "—";
 let SELECTED = null;
+let CHAT_WINDOW_H = 24;
 
 async function loadTenants() {
   const r = await api("/api/v1/tenants");
@@ -209,6 +216,10 @@ async function rotateApiToken() {
 }
 
 function statBox(k, v, cls) { return `<div class="stat ${cls || ""}"><div class="v">${v}</div><div class="k">${k}</div></div>`; }
+const ms0  = (v) => Math.round(Number(v) || 0) + " ms";
+const pct1 = (v) => (Number(v) || 0).toFixed(1) + "%";
+const n2   = (v) => (Number(v) || 0).toFixed(2);
+function setChatWindow(v) { CHAT_WINDOW_H = Number(v) || 24; if (SELECTED) loadAnalytics(SELECTED); }
 
 async function loadAnalytics(id) {
   const r = await api(`/api/v1/tenants/${id}/analytics`);
@@ -217,8 +228,15 @@ async function loadAnalytics(id) {
   const rows = (obj) => Object.keys(obj).length
     ? Object.entries(obj).map(([k, v]) => `<div>${k}: <b>${v}</b></div>`).join("") : '<span class="hint">none</span>';
 
-  const cr = await api(`/api/v1/tenants/${id}/chat-analytics`);
-  const ca = cr.ok ? cr.json : null;
+  const [cr, tmr, bmr] = await Promise.all([
+    api(`/api/v1/tenants/${id}/chat-analytics`),
+    api(`/api/v1/tenants/${id}/chat-turn-metrics?window_h=${CHAT_WINDOW_H}`),
+    api(`/api/v1/benchmarks/turn-metrics/summary`),
+  ]);
+  const ca = cr.ok  ? cr.json  : null;
+  const ct = tmr.ok ? tmr.json : null;
+  const bm = bmr.ok ? bmr.json : null;
+
   const chatHtml = ca ? `
     <h2 style="margin:1.4rem 0 .6rem;">Chat sessions</h2>
     <div class="stats">
@@ -232,6 +250,128 @@ async function loadAnalytics(id) {
       <div><h2>By mode</h2><div class="kv">${rows(ca.by_mode)}</div></div>
       <div><h2>By source</h2><div class="kv">${rows(ca.by_source)}</div></div>
     </div>` : "";
+
+  const winLabel = CHAT_WINDOW_H === 168 ? "7d" : CHAT_WINDOW_H + "h";
+
+  // --- Voice per-turn latency (platform-wide, no tenant/window filter) ---
+  let voiceTurnHtml = "";
+  if (bm) {
+    const combos = (bm.entries || []).slice().sort((x, y) => (Number(y.samples) || 0) - (Number(x.samples) || 0));
+    const platformNote = `<div class="hint" style="margin-bottom:.5rem;">Platform-wide across all tenants and all time —
+      this endpoint has no tenant or window filter, so it is <b>not</b> scoped to the selected tenant.</div>`;
+    voiceTurnHtml = `
+      <h2 style="margin:1.4rem 0 .3rem;">Voice per-turn latency <small class="hint">(platform-wide)</small></h2>
+      ${platformNote}` + (combos.length === 0
+      ? `<span class="hint">No voice turn metrics recorded yet.</span>`
+      : `<div class="metrics-wrap"><table class="metrics">
+          <thead><tr>
+            <th>Mode</th><th>STT provider</th><th>LLM provider</th><th>TTS provider</th>
+            <th class="n">Samples</th><th class="n">Avg STT</th><th class="n">Avg LLM TTFT</th>
+            <th class="n">Avg LLM total</th><th class="n">Avg TTS first chunk</th><th class="n">Avg TTS total</th>
+            <th class="n">Avg total latency</th><th class="n">Avg TTS segs dropped</th>
+          </tr></thead>
+          <tbody>${combos.map(c => `<tr>
+            <td>${escT(c.mode)}</td>
+            <td>${escT(c.stt_provider || "—")}</td>
+            <td>${escT(c.llm_provider)}</td>
+            <td>${escT(c.tts_provider || "—")}</td>
+            <td class="n">${c.samples}</td>
+            <td class="n">${ms0(c.avg_stt_latency_ms)}</td>
+            <td class="n">${ms0(c.avg_llm_ttft_ms)}</td>
+            <td class="n">${ms0(c.avg_llm_total_ms)}</td>
+            <td class="n">${ms0(c.avg_tts_first_chunk_ms)}</td>
+            <td class="n">${ms0(c.avg_tts_total_ms)}</td>
+            <td class="n">${ms0(c.avg_total_latency_ms)}</td>
+            <td class="n">${n2(c.avg_tts_segments_dropped)}</td>
+          </tr>`).join("")}</tbody>
+        </table></div>
+        <div class="hint" style="margin-top:.3rem;">Total latency spans the full turn, including response speaking
+          time; TTS first-chunk is the better proxy for perceived responsiveness. For <code>mode="s2s"</code> rows,
+          compare against other s2s rows (not layered) — the anchors differ.</div>`);
+  }
+
+  // --- Chat turn/tool performance ---
+  let chatPerfHtml = "";
+  if (ct) {
+    const t = ct.turns || {};
+    const heading = `<h2 style="margin:1.4rem 0 .3rem;">Chat performance (last <span id="cp_winlabel">${winLabel}</span>)
+      <select onchange="setChatWindow(this.value)" style="margin-left:.6rem;font-size:.78rem;">
+        <option value="24"${CHAT_WINDOW_H === 24 ? " selected" : ""}>24h</option>
+        <option value="168"${CHAT_WINDOW_H === 168 ? " selected" : ""}>7d</option>
+      </select></h2>`;
+    if (t.samples === 0 && !t.failed_turns) {
+      chatPerfHtml = `${heading}<span class="hint">No chat turns recorded in the last ${winLabel}.</span>`;
+    } else {
+      const wsFailureBox = `
+        <div class="warnbox">
+          <div style="font-weight:700;color:#fca5a5;margin-bottom:.5rem;">WS-layer turn failures — excluded from the numbers above</div>
+          <div class="stats">
+            ${statBox("Failed turns", t.failed_turns)}
+            ${statBox("Turn failure rate", pct1(t.turn_failure_rate_pct))}
+          </div>
+          <div class="hint" style="margin-top:.5rem;">These are WS-layer failures — turns that raised or timed out
+            before the agent produced a result. Their numeric/boolean fields are 0/false placeholders, so they're
+            excluded from every average/percentile/rate above. Denominator = completed turns + failed turns.</div>
+        </div>`;
+      if (t.samples === 0 && t.failed_turns > 0) {
+        chatPerfHtml = `${heading}<span class="hint">No completed turns in the last ${winLabel} — no averages available.</span>${wsFailureBox}`;
+      } else {
+        const toolRows = (ct.tools || []).slice().sort((x, y) =>
+          (Number(y.failure_rate_pct) || 0) - (Number(x.failure_rate_pct) || 0) ||
+          (Number(y.p95_latency_ms)   || 0) - (Number(x.p95_latency_ms)   || 0) ||
+          String(x.tool_name).localeCompare(String(y.tool_name)));
+        const toolTable = !ct.tools || !ct.tools.length
+          ? `<span class="hint">No tool calls in the last ${winLabel}.</span>`
+          : `<div class="metrics-wrap"><table class="metrics">
+              <thead><tr>
+                <th>Tool</th><th class="n">Calls</th><th class="n">p50</th><th class="n">p95</th>
+                <th class="n">Budget slice avg</th><th class="n">Timeouts</th><th class="n">Transport errors</th>
+                <th class="n">Skipped</th><th class="n">Failure rate</th>
+              </tr></thead>
+              <tbody>${toolRows.map(tl => `<tr>
+                <td>${escT(tl.tool_name)}</td>
+                <td class="n">${tl.calls}</td>
+                <td class="n">${ms0(tl.p50_latency_ms)}</td>
+                <td class="n">${ms0(tl.p95_latency_ms)}</td>
+                <td class="n">${ms0(tl.avg_budget_slice_ms)}</td>
+                <td class="n">${tl.timeouts}</td>
+                <td class="n">${tl.transport_errors}</td>
+                <td class="n">${tl.skipped}</td>
+                <td class="n">${pct1(tl.failure_rate_pct)}</td>
+              </tr>`).join("")}</tbody>
+            </table></div>
+            <div class="hint" style="margin-top:.3rem;">Failure rate = (timeouts + transport errors + errors + skipped)
+              / calls. Skipped calls are excluded from p50/p95. Compare p95 against budget slice to see if a tool is
+              saturating its timeout.</div>`;
+        chatPerfHtml = `${heading}
+          <div class="stats">
+            ${statBox("Turn samples", t.samples)}
+            ${statBox("Avg turn", ms0(t.avg_total_ms))}
+            ${statBox("p50 turn", ms0(t.p50_total_ms))}
+            ${statBox("p95 turn", ms0(t.p95_total_ms))}
+            ${statBox("Avg LLM", ms0(t.avg_llm_total_ms))}
+            ${statBox("Avg tools", ms0(t.avg_tool_total_ms))}
+            ${statBox("Avg KB search", ms0(t.avg_kb_search_ms))}
+            ${statBox("Avg rounds", n2(t.avg_rounds))}
+          </div>
+          <h2 style="margin:1.2rem 0 .6rem;">Quality &amp; degradation</h2>
+          <div class="stats">
+            ${statBox("Rounds exhausted", pct1(t.rounds_exhausted_rate_pct))}
+            ${statBox("Retry fired", pct1(t.retry_fired_rate_pct))}
+            ${statBox("Failure directive", pct1(t.failure_directive_fired_rate_pct))}
+            ${statBox("Guard: hallucination", pct1(t.guard_hallucination_fired_rate_pct))}
+            ${statBox("Guard: no grounding", pct1(t.guard_no_grounding_fired_rate_pct))}
+            ${statBox("Guard: unverified data", pct1(t.guard_unverified_data_fired_rate_pct))}
+            ${statBox("Escalated", pct1(t.escalated_rate_pct))}
+            ${statBox("Turns w/ tool failure (count)", t.turns_with_tool_failure)}
+          </div>
+          <div class="hint" style="margin-top:.4rem;">Rates are % of completed turns (${t.samples} samples).</div>
+          ${wsFailureBox}
+          <h2 style="margin:1.2rem 0 .6rem;">Per-tool performance</h2>
+          ${toolTable}`;
+      }
+    }
+  }
 
   $("pane_an").innerHTML = `
     <h2 style="margin:0 0 .6rem;">Voice calls</h2>
@@ -247,7 +387,7 @@ async function loadAnalytics(id) {
       <div><h2>By call type</h2><div class="kv">${rows(a.by_agent_type || {})}</div></div>
       <div><h2>By channel</h2><div class="kv">${rows(a.by_channel || {})}</div></div>
       <div><h2>By provider</h2><div class="kv">${rows(a.by_provider || {})}</div></div>
-    </div>${chatHtml}`;
+    </div>${voiceTurnHtml}${chatHtml}${chatPerfHtml}`;
 }
 
 async function loadBilling(id) {
