@@ -13,7 +13,7 @@ no ``WHERE`` clause).
 the parent (deleting a turn deletes its tool-call rows).
 
 Both `created_at` alone and `(tenant_id, created_at)` are indexed on the
-parent from day one — see 0019_turn_metrics_created_at_index.py's own
+parent from day one — see 0019_turn_metrics_created_idx.py's own
 docstring for the incident (an unindexed created_at column on a
 continuously-queried, growing table) this is written to avoid repeating.
 
@@ -29,7 +29,7 @@ since ``record_chat_turn_metric`` (src/models/chat_turn_metrics.py) swallows
 every DB error, but the intended ordering is still: apply 0020, then deploy.
 
 Revision: 0020_chat_turn_metrics
-Down: 0019_turn_metrics_created_at_index
+Down: 0019_turn_metrics_created_idx
 """
 
 from __future__ import annotations
@@ -38,7 +38,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision = "0020_chat_turn_metrics"
-down_revision = "0019_turn_metrics_created_at_index"
+down_revision = "0019_turn_metrics_created_idx"
 branch_labels = None
 depends_on = None
 

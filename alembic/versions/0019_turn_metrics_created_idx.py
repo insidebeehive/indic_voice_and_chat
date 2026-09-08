@@ -1,4 +1,4 @@
-"""alembic/versions/0019_turn_metrics_created_at_index.py
+"""alembic/versions/0019_turn_metrics_created_idx.py
 
 Adds a plain B-tree index on turn_metrics.created_at.
 
@@ -12,7 +12,7 @@ full sequential scan of an ever-growing table. created_at is a simple
 monotonically-growing timestamp column, so a plain B-tree index is enough;
 nothing more exotic (e.g. BRIN) is warranted here.
 
-Revision: 0019_turn_metrics_created_at_index
+Revision: 0019_turn_metrics_created_idx
 Down: 0018_crm_pronunciation_overrides
 """
 
@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from alembic import op
 
-revision = "0019_turn_metrics_created_at_index"
+revision = "0019_turn_metrics_created_idx"
 down_revision = "0018_crm_pronunciation_overrides"
 branch_labels = None
 depends_on = None

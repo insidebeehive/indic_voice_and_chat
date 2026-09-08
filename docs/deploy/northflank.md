@@ -64,16 +64,40 @@ Add a Northflank **PostgreSQL** addon. Set `DATABASE_URL` using the **asyncpg** 
 addon's URI from `postgresql://USER:PASS@HOST:PORT/DB` to
 `postgresql+asyncpg://USER:PASS@HOST:PORT/DB` (the app uses the async driver).
 
-Migrations run **automatically on container start** — the Docker `CMD` is
-`alembic upgrade head && uvicorn …`, so every deploy applies pending migrations
-before serving (fail-fast: a failed migration won't start a stale app). The DB
-role only needs rights on an already-provisioned schema; `env.py` skips
+Migrations run on container start, but the step is **non-blocking and fails
+open**. The Docker `CMD` is:
+
+```
+timeout 60 alembic upgrade head; exec uvicorn src.main:app --host 0.0.0.0 --port 8000
+```
+
+Note the `timeout 60` and the `;` (not `&&`): if the migration errors or
+exceeds 60 seconds, **uvicorn starts anyway against an unmigrated database.**
+This was deliberate — it broke a crash loop caused by an alembic hang — but it
+means a deploy is *not* a reliable way to apply a migration, and a failure is
+quiet rather than loud.
+
+**Apply pending migrations yourself before deploying** (`alembic upgrade head`),
+and confirm with `alembic current` afterwards. Two things make the quiet failure
+easy to miss:
+
+- A stale `alembic/versions/__pycache__` can make `alembic heads` report a
+  revision whose source file no longer exists. Clear it before trusting that
+  output.
+- Alembic's `alembic_version.version_num` is `VARCHAR(32)`. A revision id
+  longer than that raises `StringDataRightTruncationError` at the point the
+  version is recorded, so the migration can never be applied — and with the
+  fail-open `CMD` above, every deploy would skip it silently. Keep revision ids
+  comfortably under 32 characters.
+
+The DB role only needs rights on an already-provisioned schema; `env.py` skips
 `CREATE SCHEMA` when the schema already exists (first-time provisioning still
 needs a role with database-level CREATE, or pre-create the schema once).
 
 For a **multi-replica** service, drop the in-container step and run
 `alembic upgrade head` as a single **pre-deploy Job** instead (Alembic has no
-cross-process lock, so replicas shouldn't migrate concurrently).
+cross-process lock, so replicas shouldn't migrate concurrently). That is the
+safer arrangement generally, not just for multi-replica.
 
 ### Telephony (real calls)
 Set `WEBHOOK_BASE_URL=https://<service>.<project>.code.run/api/v1/telephony` and repoint your

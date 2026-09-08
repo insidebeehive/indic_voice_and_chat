@@ -112,7 +112,7 @@ class ChatTurnMetric(Base):
     __tablename__ = "chat_turn_metrics"
     __table_args__ = (
         # Both a standalone created_at index AND this composite are needed —
-        # see alembic/versions/0019_turn_metrics_created_at_index.py's own
+        # see alembic/versions/0019_turn_metrics_created_idx.py's own
         # docstring for why voice's table went a full migration without the
         # standalone index and paid for it with an ever-worsening full scan
         # in the periodic push loop. Don't repeat that here.
