@@ -11,7 +11,7 @@ from src.dialogue.context import SessionStore
 from src.interfaces.llm import ILLMProvider, LLMConfig, LLMMessage, LLMResult
 from src.interfaces.vector_store import Document
 from src.providers.vector_store.faiss_store import FAISSAdapter
-from src.rag.embeddings import HashEmbedder, IdentityReranker
+from src.rag.embeddings import HashEmbedder
 from src.rag.retriever import HybridRetriever, RetrievalConfig
 
 
@@ -77,12 +77,10 @@ async def retriever(tmp_faiss_index: str) -> HybridRetriever:
     r = HybridRetriever(
         embedder=HashEmbedder(dim=64),
         vector_store=store,
-        reranker=IdentityReranker(),
         config=RetrievalConfig(
             strategy="hybrid",
             top_k=2,
             oversample_k=8,
-            reranking=True,
             similarity_threshold=0.0,
         ),
     )

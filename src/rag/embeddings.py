@@ -1,6 +1,6 @@
-"""Embedding + reranking interfaces.
+"""Embedding interfaces.
 
-Three implementations of each:
+Three implementations:
 
 - ``IEmbedder`` Protocol — ``embed_documents`` and ``embed_query`` returning
   unit-norm float vectors.
@@ -8,18 +8,12 @@ Three implementations of each:
   Default model: ``paraphrase-multilingual-MiniLM-L12-v2`` (384-dim).
 - ``HashEmbedder`` — deterministic, dependency-free, used by tests so the
   unit suite stays under a second and never downloads model weights.
-
-Same pattern for ``IReranker``:
-- ``LocalReranker`` lazy-loads a cross-encoder.
-- ``IdentityReranker`` returns scores derived from substring overlap; works
-  for tests and provides a graceful no-model fallback.
 """
 
 from __future__ import annotations
 
 import hashlib
 import math
-from dataclasses import dataclass
 from typing import Optional, Protocol
 
 
@@ -165,74 +159,11 @@ class GeminiEmbedder:
         return self.embed_documents([text])[0]
 
 
-# --- Rerankers ----------------------------------------------------------
-
-
-@dataclass
-class RerankItem:
-    text: str
-    score: float
-
-
-class IReranker(Protocol):
-    model_name: str
-
-    def rerank(self, query: str, documents: list[str]) -> list[float]: ...
-
-
-class IdentityReranker:
-    """No-op reranker that scores by token overlap. Useful as a fallback
-    and as a deterministic test double."""
-
-    model_name = "test/identity-reranker"
-
-    def rerank(self, query: str, documents: list[str]) -> list[float]:
-        if not query or not documents:
-            return [0.0] * len(documents)
-        q_tokens = set(_tokenize(query))
-        scores: list[float] = []
-        for d in documents:
-            d_tokens = set(_tokenize(d))
-            overlap = len(q_tokens & d_tokens)
-            denom = math.sqrt(len(q_tokens) * len(d_tokens)) or 1.0
-            scores.append(overlap / denom)
-        return scores
-
-
-class LocalReranker:
-    """Cross-encoder reranker, lazy-loaded."""
-
-    DEFAULT_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
-
-    def __init__(self, model_name: str = DEFAULT_MODEL) -> None:
-        self.model_name = model_name
-        self._model = None
-
-    def _ensure_model(self) -> None:
-        if self._model is not None:
-            return
-        try:
-            from sentence_transformers import CrossEncoder
-        except ImportError as e:
-            raise RuntimeError(
-                "LocalReranker requires 'sentence-transformers'."
-            ) from e
-        self._model = CrossEncoder(self.model_name)
-
-    def rerank(self, query: str, documents: list[str]) -> list[float]:
-        self._ensure_model()
-        if not documents:
-            return []
-        pairs = [(query, d) for d in documents]
-        scores = self._model.predict(pairs)
-        return [float(s) for s in scores]
-
-
 # --- helpers -----------------------------------------------------------
 
 
 def _tokenize(text: str) -> list[str]:
-    """Cheap tokenizer for hash embedding / identity reranker.
+    """Cheap tokenizer for hash embedding / BM25 indexing.
 
     Lowercases, splits on whitespace + a few punctuation chars. Devanagari
     and Latin both flow through unchanged.

@@ -17,7 +17,7 @@ from src.auth.middleware import set_admin_tokens
 from src.models.crm import Crm
 from src.models.database import Base
 from src.providers.vector_store.faiss_store import FAISSAdapter
-from src.rag.embeddings import HashEmbedder, IdentityReranker
+from src.rag.embeddings import HashEmbedder
 from src.rag.retriever import HybridRetriever, RetrievalConfig
 
 ADMIN_HEADERS = {"Authorization": "Bearer admin-token"}
@@ -52,7 +52,6 @@ async def client(tmp_faiss_index: str):
     store = FAISSAdapter({"embedding_dim": 64, "index_path": tmp_faiss_index})
     retriever = HybridRetriever(
         embedder=HashEmbedder(dim=64), vector_store=store,
-        reranker=IdentityReranker(),
         config=RetrievalConfig(strategy="hybrid", top_k=3, oversample_k=8),
     )
 

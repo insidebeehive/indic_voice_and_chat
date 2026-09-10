@@ -18,7 +18,7 @@ from src.main import _seed_crm_kb
 from src.models.crm import Crm, CrmKBDocument
 from src.models.database import Base
 from src.providers.vector_store.faiss_store import FAISSAdapter
-from src.rag.embeddings import HashEmbedder, IdentityReranker
+from src.rag.embeddings import HashEmbedder
 from src.rag.retriever import HybridRetriever, RetrievalConfig
 
 OPTED_IN_CRM_ID = "betstudio"
@@ -30,7 +30,6 @@ def _make_retriever(index_path: str) -> HybridRetriever:
     store = FAISSAdapter({"embedding_dim": 64, "index_path": index_path})
     return HybridRetriever(
         embedder=HashEmbedder(dim=64), vector_store=store,
-        reranker=IdentityReranker(),
         config=RetrievalConfig(strategy="hybrid", top_k=3, oversample_k=8),
     )
 

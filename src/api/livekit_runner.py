@@ -332,7 +332,7 @@ async def run_call(tenant, room_name: str, meta: dict, *, bridge_factory, sessio
             await room.disconnect()
 
         try:
-            from src.bootstrap import LiveKitModeNotSupported
+            from src.exceptions import LiveKitModeNotSupported
             build = await bridge_factory(tenant, room_name, meta)
             bridge = await build(
                 audio_stream=audio_stream, audio_source=audio_source,

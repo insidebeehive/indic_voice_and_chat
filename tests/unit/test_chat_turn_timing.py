@@ -23,7 +23,7 @@ from src.interfaces.llm import ILLMProvider, LLMConfig, LLMMessage, LLMResult, T
 from src.interfaces.vector_store import Document
 from src.providers.llm.gemini import GeminiLLMAdapter
 from src.providers.vector_store.faiss_store import FAISSAdapter
-from src.rag.embeddings import HashEmbedder, IdentityReranker
+from src.rag.embeddings import HashEmbedder
 from src.rag.retriever import HybridRetriever, RetrievalConfig
 
 
@@ -47,9 +47,9 @@ class ScriptedLLM(ILLMProvider):
 async def retriever(tmp_faiss_index: str) -> HybridRetriever:
     store = FAISSAdapter({"embedding_dim": 64, "index_path": tmp_faiss_index})
     r = HybridRetriever(
-        embedder=HashEmbedder(dim=64), vector_store=store, reranker=IdentityReranker(),
+        embedder=HashEmbedder(dim=64), vector_store=store,
         config=RetrievalConfig(strategy="hybrid", top_k=2, oversample_k=8,
-                               reranking=True, similarity_threshold=0.0))
+                               similarity_threshold=0.0))
     await r.index([
         Document(id="c1", content="Plan B has 500GB unlimited data.",
                  metadata={"filename": "plans.pdf", "page": 2}),

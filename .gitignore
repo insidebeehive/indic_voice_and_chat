@@ -37,6 +37,11 @@ data/*
 !data/kb/
 !data/kb/**
 data/kb/**/.DS_Store
+# Hand-labelled retrieval eval set — source material, not a build artifact.
+# It must be versioned: comparing a retrieval change against a baseline is
+# only meaningful if both runs scored against the same, reviewable dataset.
+!data/eval/
+!data/eval/**
 *.faiss
 *.index
 

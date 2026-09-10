@@ -19,7 +19,7 @@ from src.config_tenant import TenantSettings
 from src.models.database import Base
 from src.models.tenant import Tenant
 from src.providers.vector_store.faiss_store import FAISSAdapter
-from src.rag.embeddings import HashEmbedder, IdentityReranker
+from src.rag.embeddings import HashEmbedder
 from src.rag.ingestion import ChunkConfig
 from src.rag.retriever import HybridRetriever, RetrievalConfig
 
@@ -40,7 +40,6 @@ async def app(tmp_faiss_index: str) -> FastAPI:
     retriever = HybridRetriever(
         embedder=HashEmbedder(dim=64),
         vector_store=store,
-        reranker=IdentityReranker(),
         config=RetrievalConfig(strategy="hybrid", top_k=3, oversample_k=8),
     )
     engine = create_async_engine("sqlite+aiosqlite:///:memory:", future=True)
@@ -466,13 +465,12 @@ def test_ingest_layout_rejects_raw_filename_stem(app: FastAPI, stem: str) -> Non
 def test_query_mixes_tenant_and_linked_crm_docs(app: FastAPI) -> None:
     from src.api import knowledge
     from src.providers.vector_store.faiss_store import FAISSAdapter
-    from src.rag.embeddings import HashEmbedder, IdentityReranker
+    from src.rag.embeddings import HashEmbedder
     from src.rag.retriever import HybridRetriever, RetrievalConfig
 
     crm_store = FAISSAdapter({"embedding_dim": 64, "index_path": "/tmp/crm_kb_test_index"})
     crm_retriever = HybridRetriever(
         embedder=HashEmbedder(dim=64), vector_store=crm_store,
-        reranker=IdentityReranker(),
         config=RetrievalConfig(strategy="hybrid", top_k=3, oversample_k=8),
     )
     import asyncio

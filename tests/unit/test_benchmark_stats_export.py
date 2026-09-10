@@ -9,17 +9,24 @@ import pytest
 
 from src.benchmarks.export import (
     recommend_providers,
+    retrieval_csv_meta_path,
     to_jsonable,
     write_json,
     write_latency_csv,
     write_rag_csv,
+    write_retrieval_csv,
     write_stt_csv,
     write_task_csv,
     write_tts_csv,
 )
 from src.benchmarks.latency_benchmark import LatencyMatrixResult, LatencyRunResult
 from src.benchmarks.metrics import AggregateAccuracy, LatencyStats, latency_stats
-from src.benchmarks.rag_benchmark import RAGRunResult, RAGSampleResult
+from src.benchmarks.rag_benchmark import (
+    RAGRunResult,
+    RAGSampleResult,
+    RetrievalRunResult,
+    RetrievalSampleResult,
+)
 from src.benchmarks.stats import one_way_anova
 from src.benchmarks.stt_benchmark import STTRunResult, STTSampleResult
 from src.benchmarks.task_benchmark import TaskRunResult, TaskScenarioResult
@@ -150,6 +157,117 @@ def test_write_rag_csv() -> None:
     n = write_rag_csv(buf, r)
     assert n == 1
     assert "c1;c2" in buf.getvalue()
+
+
+def test_write_retrieval_csv_is_plain_rectangular_no_preamble_row() -> None:
+    # Finding 5: an earlier version prepended a "#"-prefixed config row ahead
+    # of the header. Both csv.DictReader and pandas.read_csv()'s default
+    # parsing mis-parse that (see _open_writer's docstring for the measured
+    # specifics) -- so the CSV itself must now be plain header + data rows,
+    # nothing else. Config provenance moved to a sidecar JSON -- see
+    # test_write_retrieval_csv_writes_sidecar_meta_and_dict_reader_aligns.
+    r = RetrievalRunResult(
+        sample_count=1, answerable_count=1, unanswerable_count=0,
+        precision_mean=1.0, recall_mean=1.0, mrr_mean=1.0,
+        file_hit_rate=1.0, false_positive_rate=0.0,
+        latency=latency_stats([10.0]),
+        strategy="hybrid", top_k=5, bm25_weight=0.3, dense_weight=0.7,
+        similarity_threshold=0.1, fp_threshold=0.5,
+        per_sample=[RetrievalSampleResult(
+            sample_id="r1", query="q", lang="en", intent="deposit",
+            unanswerable=False, retrieved_ids=["c1"],
+            precision_at_k=1.0, recall_at_k=1.0, reciprocal_rank=1.0,
+            file_hit=True, false_positive=False, latency_ms=10.0,
+            tier="pack", unindexed=False,
+        )],
+    )
+    buf = io.StringIO()
+    n = write_retrieval_csv(buf, r)
+    assert n == 1
+    lines = buf.getvalue().splitlines()
+    # Row 0 is the real header -- no leading "#"-prefixed config row.
+    assert not lines[0].startswith("#")
+    header = lines[0].split(",")
+    assert "tier" in header
+    assert "unindexed" in header
+    assert "r1" in lines[1]
+    assert "pack" in lines[1]
+    assert len(lines) == 2  # header + exactly one data row, nothing else
+
+
+def test_write_retrieval_csv_writes_sidecar_meta_and_dict_reader_aligns(tmp_path: Path) -> None:
+    # The missing test flagged by Finding 5: prove csv.DictReader (a standard
+    # reader, not this suite's own line-index assertions) parses the file
+    # with the correct fieldnames and correct per-column alignment, and that
+    # the run's config/provenance survives via the sidecar JSON.
+    r = RetrievalRunResult(
+        sample_count=1, answerable_count=1, unanswerable_count=0,
+        precision_mean=1.0, recall_mean=1.0, mrr_mean=1.0,
+        file_hit_rate=1.0, false_positive_rate=0.0,
+        latency=latency_stats([10.0]),
+        strategy="hybrid", top_k=5, bm25_weight=0.3, dense_weight=0.7,
+        similarity_threshold=0.1, fp_threshold=0.5,
+        per_sample=[RetrievalSampleResult(
+            sample_id="r1", query="q", lang="en", intent="deposit",
+            unanswerable=False, retrieved_ids=["c1"],
+            precision_at_k=1.0, recall_at_k=1.0, reciprocal_rank=1.0,
+            file_hit=True, false_positive=False, latency_ms=10.0,
+            tier="pack", unindexed=False,
+        )],
+    )
+    out = tmp_path / "sweep.csv"
+    n = write_retrieval_csv(out, r)
+    assert n == 1
+
+    with out.open(newline="", encoding="utf-8") as fh:
+        reader = csv.DictReader(fh)
+        assert reader.fieldnames == [
+            "sample_id", "query", "lang", "intent", "tier", "unanswerable",
+            "unindexed", "retrieved_ids", "precision_at_k", "recall_at_k",
+            "reciprocal_rank", "file_hit", "false_positive", "latency_ms",
+        ]
+        rows = list(reader)
+    assert len(rows) == 1
+    row = rows[0]
+    # No restkey (None) column -- every field landed under its real name.
+    assert None not in row
+    assert row["sample_id"] == "r1"
+    assert row["tier"] == "pack"
+    assert row["precision_at_k"] == "1.0000"
+    assert row["latency_ms"] == "10.00"
+
+    meta_path = retrieval_csv_meta_path(out)
+    assert meta_path.exists()
+    meta = json.loads(meta_path.read_text())
+    assert meta["strategy"] == "hybrid"
+    assert meta["top_k"] == 5
+    assert meta["bm25_weight"] == 0.3
+    assert meta["dense_weight"] == 0.7
+    assert meta["similarity_threshold"] == 0.1
+    assert meta["fp_threshold"] == 0.5
+
+
+def test_write_retrieval_csv_marks_unindexed_rows() -> None:
+    r = RetrievalRunResult(
+        sample_count=1, answerable_count=0, unanswerable_count=0,
+        precision_mean=0.0, recall_mean=0.0, mrr_mean=0.0,
+        file_hit_rate=0.0, false_positive_rate=0.0,
+        latency=latency_stats([5.0]),
+        unindexed_sample_count=1, unindexed_sample_ids=["r1"],
+        per_sample=[RetrievalSampleResult(
+            sample_id="r1", query="q", lang=None, intent=None,
+            unanswerable=False, retrieved_ids=[],
+            precision_at_k=0.0, recall_at_k=0.0, reciprocal_rank=0.0,
+            file_hit=False, false_positive=False, latency_ms=5.0,
+            unindexed=True,
+        )],
+    )
+    buf = io.StringIO()
+    write_retrieval_csv(buf, r)
+    rows = list(csv.reader(io.StringIO(buf.getvalue())))
+    header = rows[0]
+    data_row = rows[1]
+    assert data_row[header.index("unindexed")] == "1"
 
 
 def test_write_task_csv() -> None:

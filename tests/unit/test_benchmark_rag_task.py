@@ -111,7 +111,7 @@ async def test_run_rag_benchmark_basic(tmp_faiss_index: str) -> None:
     retriever = HybridRetriever(
         embedder=HashEmbedder(dim=64),
         vector_store=store,
-        config=RetrievalConfig(strategy="hybrid", top_k=3, oversample_k=8, reranking=False),
+        config=RetrievalConfig(strategy="hybrid", top_k=3, oversample_k=8),
     )
     await retriever.index([
         Document(id="c1", content="Plan B has 500GB unlimited", metadata={"filename": "plans.md", "page": 0}),

@@ -71,12 +71,24 @@ rag:
   retrieval:
     strategy: hybrid
     top_k: 5
-    reranking: true
-    reranker_model: cross-encoder/ms-marco-MiniLM-L-6-v2
-    reranker_top_n: 3
     bm25_weight: 0.3
     dense_weight: 0.7
-    similarity_threshold: 0.4
+    # Deliberately 0.0, not a "real" threshold: this floor applies to
+    # min-max-normalised fusion scores with no reranker in the loop (the
+    # reranker was removed as dead code — no PRODUCTION wiring ever
+    # instantiated one; some tests did).
+    #
+    # Know what the floor actually does before raising it. _minmax gives each
+    # backend's top hit 1.0, so on the hybrid path the best dense hit always
+    # scores >= dense_weight (0.7). A floor at 0.4 can therefore only empty
+    # the result set on a BM25-only match (max 0.3); a floor above 0.7 empties
+    # it unconditionally. Emptiness is the hazard worth respecting: an empty
+    # retrieved_all silently disables apply_hallucination_guard, the same
+    # dangerous state reached from a different cause in the incident at
+    # src/agents/chatbot.py:112-123 (KB search sharing the CRM tool budget and
+    # timing out). Raise this only after measuring against the retrieval eval
+    # set.
+    similarity_threshold: 0.0
 
 compliance:
   calling_hours:

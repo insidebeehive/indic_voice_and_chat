@@ -122,7 +122,7 @@ vox-agent/
 │   │   ├── __init__.py
 │   │   ├── ingestion.py          # Document parsing + chunking
 │   │   ├── embeddings.py         # Embedding generation
-│   │   ├── retriever.py          # Dense / hybrid / reranked retrieval
+│   │   ├── retriever.py          # Dense / hybrid retrieval
 │   │   └── context_builder.py    # Assemble RAG context for LLM
 │   │
 │   ├── campaign/                 # Campaign orchestration
@@ -503,12 +503,9 @@ rag:
   retrieval:
     strategy: hybrid               # dense | hybrid
     top_k: 5
-    reranking: true
-    reranker_model: cross-encoder/ms-marco-MiniLM-L-6-v2
-    reranker_top_n: 3
     bm25_weight: 0.3
     dense_weight: 0.7
-    similarity_threshold: 0.4
+    similarity_threshold: 0.0      # see config/default.yaml for why 0.0
 
 compliance:
   calling_hours:
@@ -946,7 +943,7 @@ EVENTS = {
 □ Embedding generation pipeline
 □ FAISS indexing + search
 □ BM25 index for hybrid retrieval
-□ Retriever (dense + hybrid + reranking)
+□ Retriever (dense + hybrid)
 □ RAG context builder
 □ ChatBotAgent class
 □ WebSocket chat endpoint

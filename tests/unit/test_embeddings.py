@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 
-from src.rag.embeddings import HashEmbedder, IdentityReranker
+from src.rag.embeddings import HashEmbedder
 
 
 def test_hash_embedder_dim() -> None:
@@ -45,24 +45,6 @@ def test_hash_embedder_batch_matches_single() -> None:
     batch = e.embed_documents(["a", "b", "c"])
     single = [e.embed_query(t) for t in ["a", "b", "c"]]
     assert batch == single
-
-
-def test_identity_reranker_orders_by_overlap() -> None:
-    r = IdentityReranker()
-    query = "plan b data unlimited"
-    docs = [
-        "plan a has 100GB data",                  # some overlap
-        "plan b has 500GB unlimited data",        # most overlap
-        "completely unrelated text about cooking",  # no overlap
-    ]
-    scores = r.rerank(query, docs)
-    assert scores[1] > scores[0] > scores[2]
-
-
-def test_identity_reranker_empty_inputs() -> None:
-    r = IdentityReranker()
-    assert r.rerank("", ["x", "y"]) == [0.0, 0.0]
-    assert r.rerank("hello", []) == []
 
 
 # --- GeminiEmbedder (Phase 5 deploy: no-torch embeddings) ----------------

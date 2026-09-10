@@ -21,6 +21,7 @@ vllm serve Qwen/Qwen2.5-14B-Instruct-AWQ \
   --host 0.0.0.0 --port 8001 \
   --max-model-len 8192 \
   --gpu-memory-utilization 0.55 \
+  --enable-prefix-caching \
   --enable-auto-tool-choice \
   --tool-call-parser hermes
 ```
@@ -30,7 +31,19 @@ vllm serve Qwen/Qwen2.5-14B-Instruct-AWQ \
   benchmark later: `sarvamai/sarvam-m` (AWQ) — swap the model id and check
   which `--tool-call-parser` its card recommends.
 - `--max-model-len 8192` covers our chat prompts (~4K tokens with RAG) and
-  caps KV-cache growth.
+  caps KV-cache growth. Qwen2.5-14B uses GQA (8 KV heads, not 40 query heads),
+  so a full-length sequence costs ~1.5GB of KV, not the ~7.5GB an MHA
+  calculation would suggest — with ~10GB of AWQ weights inside a 0.55 × 32GB
+  budget, that leaves room for roughly 4 max-length or ~8 typical-length
+  concurrent sequences. Raise `--gpu-memory-utilization` only if IndicF5 TTS
+  still has headroom; it shares this GPU and sits on the voice critical path.
+- `--enable-prefix-caching` reuses the KV blocks for a shared prompt prefix
+  across requests instead of recomputing them. Our chat/voice prompts are a
+  large identical system block (rules + ~22 CRM tool schemas) followed by a
+  short variable turn, which is close to the ideal case for it. Note the
+  caching is only as good as the prefix is stable — see the prompt-assembly
+  ordering work, since a per-turn block placed mid-prompt truncates the
+  reusable prefix at that point.
 - `--enable-auto-tool-choice --tool-call-parser hermes` is required for the
   chat agent's CRM tools; `hermes` is the parser for Qwen 2.5 models.
 - Expose port **8001** in the RunPod config (proxy URL becomes

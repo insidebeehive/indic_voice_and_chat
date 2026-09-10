@@ -202,20 +202,28 @@ class ChunkingConfig(BaseModel):
     chunk_overlap: int = 100
 
 
-class RetrievalConfig(BaseModel):
+class RetrievalSettings(BaseModel):
+    """YAML-sourced retrieval knobs (``rag.retrieval`` in config/default.yaml).
+
+    Bridged into the runtime ``src.rag.retriever.RetrievalConfig`` dataclass
+    via ``retrieval_config_from_settings`` — this class is never passed to
+    ``HybridRetriever`` directly.
+    """
+
     strategy: str = "hybrid"
     top_k: int = 5
-    reranking: bool = True
-    reranker_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
-    reranker_top_n: int = 3
     bm25_weight: float = 0.3
     dense_weight: float = 0.7
-    similarity_threshold: float = 0.4
+    # Must match config/default.yaml's pinned 0.0 (see the comment there for
+    # why): this default is now live wherever a config omits the key, so a
+    # nonzero default here would silently reintroduce the empty-retrieval
+    # failure mode the YAML pin exists to avoid.
+    similarity_threshold: float = 0.0
 
 
 class RAGConfig(BaseModel):
     chunking: ChunkingConfig = Field(default_factory=ChunkingConfig)
-    retrieval: RetrievalConfig = Field(default_factory=RetrievalConfig)
+    retrieval: RetrievalSettings = Field(default_factory=RetrievalSettings)
 
 
 class CallingHours(BaseModel):

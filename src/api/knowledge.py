@@ -2,7 +2,7 @@
 
 A retriever instance is injected via ``set_retriever`` at app startup so the
 endpoints stay testable in isolation. The retriever pairs a vector store
-with an embedder and (optionally) a reranker — see ``src.rag.retriever``.
+with an embedder — see ``src.rag.retriever``.
 
 Endpoints:
 - POST   /knowledge/ingest         multipart upload, parses + chunks + indexes
@@ -166,7 +166,6 @@ class QueryHit(BaseModel):
     score: float
     dense_score: Optional[float] = None
     bm25_score: Optional[float] = None
-    rerank_score: Optional[float] = None
     metadata: dict
 
 
@@ -429,7 +428,6 @@ async def query(
             score=r.score,
             dense_score=r.dense_score,
             bm25_score=r.bm25_score,
-            rerank_score=r.rerank_score,
             metadata=r.document.metadata or {},
         )
         for r in results

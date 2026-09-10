@@ -14,7 +14,7 @@ from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any, Iterable, Optional, Union
 
-from src.benchmarks.rag_benchmark import RAGRunResult
+from src.benchmarks.rag_benchmark import RAGRunResult, RetrievalRunResult
 from src.benchmarks.stt_benchmark import STTRunResult
 from src.benchmarks.task_benchmark import TaskRunResult
 from src.benchmarks.tts_benchmark import TTSRunResult
@@ -27,8 +27,25 @@ PathLike = Union[Path, str]
 # --- Helpers -----------------------------------------------------------
 
 
-def _open_writer(target: Union[PathLike, io.TextIOBase], header: list[str]) -> tuple[Any, Any, bool]:
-    """Return (csv_writer, closer, should_close)."""
+def _open_writer(
+    target: Union[PathLike, io.TextIOBase],
+    header: list[str],
+) -> tuple[Any, Any, bool]:
+    """Return (csv_writer, closer, should_close).
+
+    Every writer here produces a PLAIN rectangular CSV -- header row, then
+    one data row per sample, nothing else. (Finding 5: an earlier version
+    let ``write_retrieval_csv`` prepend a "#"-prefixed provenance row ahead
+    of the real header. Measured against both standard readers: ``csv.
+    DictReader`` took that row AS ``fieldnames``, consumed the real header as
+    a data row, and collapsed 8 of 14 columns into the ``None`` restkey;
+    ``pandas.read_csv()`` with its default comment handling returned a bogus
+    [3 rows x 6 columns] frame with every value misaligned under the wrong
+    label. Neither raised an error -- a reader that doesn't already know to
+    pass ``comment='#'`` gets silently wrong numbers. See
+    ``retrieval_csv_meta_path`` / ``write_retrieval_csv`` for where that
+    run's provenance goes instead.)
+    """
     if isinstance(target, (str, Path)):
         path = Path(target)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -147,6 +164,77 @@ def write_rag_csv(target: Union[PathLike, io.TextIOBase], result: RAGRunResult) 
     finally:
         if should_close:
             fh.close()
+    return n
+
+
+def retrieval_csv_meta_path(csv_path: PathLike) -> Path:
+    """Sidecar JSON path carrying a retrieval CSV's run provenance.
+
+    Same basename as the CSV plus ``.meta.json`` (e.g. ``sweep1.csv`` ->
+    ``sweep1.csv.meta.json``), kept next to it. A shared helper so
+    ``write_retrieval_csv`` and any CLI reporting the path use the identical
+    naming convention rather than two copies that could drift.
+    """
+    p = Path(csv_path)
+    return p.parent / f"{p.name}.meta.json"
+
+
+def write_retrieval_csv(target: Union[PathLike, io.TextIOBase], result: RetrievalRunResult) -> int:
+    """Write the per-sample retrieval rows as a PLAIN rectangular CSV.
+
+    Config provenance (strategy/weights/thresholds -- constant for the whole
+    run, not per-sample) used to be carried as a leading "#"-prefixed row
+    ahead of the header (Finding 5). That corrupted both ``csv.DictReader``
+    (which took the preamble AS the header, consuming the real header as a
+    data row and collapsing most columns into the `None` restkey) and
+    ``pandas.read_csv()``'s default parsing (silently misaligned columns) --
+    see ``_open_writer``'s docstring for the measured specifics. Provenance
+    now goes to a sidecar JSON next to the CSV (see
+    ``retrieval_csv_meta_path``) instead, written only when ``target`` is a
+    real path -- an in-memory buffer target (tests, embedding callers) has no
+    path to name a sidecar after, and is left exactly as before.
+    """
+    header = [
+        "sample_id", "query", "lang", "intent", "tier", "unanswerable",
+        "unindexed", "retrieved_ids", "precision_at_k", "recall_at_k",
+        "reciprocal_rank", "file_hit", "false_positive", "latency_ms",
+    ]
+    writer, fh, should_close = _open_writer(target, header)
+    n = 0
+    try:
+        for row in result.per_sample:
+            writer.writerow([
+                row.sample_id, row.query,
+                row.lang or "", row.intent or "", row.tier or "",
+                "1" if row.unanswerable else "0",
+                "1" if row.unindexed else "0",
+                ";".join(row.retrieved_ids),
+                f"{row.precision_at_k:.4f}",
+                f"{row.recall_at_k:.4f}",
+                f"{row.reciprocal_rank:.4f}",
+                "1" if row.file_hit else "0",
+                "1" if row.false_positive else "0",
+                f"{row.latency_ms:.2f}",
+            ])
+            n += 1
+    finally:
+        if should_close:
+            fh.close()
+
+    if isinstance(target, (str, Path)):
+        write_json(retrieval_csv_meta_path(target), {
+            "strategy": result.strategy,
+            "top_k": result.top_k,
+            "bm25_weight": result.bm25_weight,
+            "dense_weight": result.dense_weight,
+            "similarity_threshold": result.similarity_threshold,
+            "fp_threshold": result.fp_threshold,
+            "sample_count": result.sample_count,
+            "answerable_count": result.answerable_count,
+            "unanswerable_count": result.unanswerable_count,
+            "unindexed_sample_count": result.unindexed_sample_count,
+            "unindexed_detection_truncated": result.unindexed_detection_truncated,
+        })
     return n
 
 

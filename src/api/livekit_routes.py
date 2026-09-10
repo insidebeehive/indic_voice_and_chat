@@ -30,8 +30,8 @@ from src.api.call_store import count_active_calls
 from src.api.deps import get_db_session
 from src.api.livekit_runner import run_call
 from src.auth.middleware import tenant_from_slug
-from src.bootstrap import LiveKitModeNotSupported
 from src.config_tenant import resolve_livekit_creds
+from src.exceptions import LiveKitModeNotSupported
 from src.models.database import get_sessionmaker
 
 log = logging.getLogger(__name__)

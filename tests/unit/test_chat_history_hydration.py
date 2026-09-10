@@ -65,7 +65,7 @@ async def app(tmp_faiss_index: str, fake_redis):
     retriever = HybridRetriever(
         embedder=HashEmbedder(dim=64),
         vector_store=store,
-        config=RetrievalConfig(strategy="hybrid", top_k=2, oversample_k=8, reranking=False),
+        config=RetrievalConfig(strategy="hybrid", top_k=2, oversample_k=8),
     )
     await retriever.index([
         Document(id="c1", content="Plan B has 500GB unlimited.", metadata={"filename": "plans.md", "page": 0})

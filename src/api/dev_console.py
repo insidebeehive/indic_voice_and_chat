@@ -32,7 +32,12 @@ from src.auth.context import TenantContext
 from src.auth.middleware import require_admin, require_admin_ws
 from src.auth.registry import TenantProviders
 from src.api.call_store import insert_call
-from src.bootstrap import DEFAULT_DEMO_SCRIPT
+# NOT `from src.bootstrap import DEFAULT_DEMO_SCRIPT`: src.bootstrap top-level
+# imports src.api.telephony_* modules, which pull in src.api/__init__.py --
+# if dev_console is ever added to that package's import list, a top-level
+# bootstrap import here would reintroduce the cycle fixed for
+# LiveKitModeNotSupported (see src.exceptions / src.defaults docstrings).
+from src.defaults import DEFAULT_DEMO_SCRIPT
 from src.config_tenant import platform_webhook_base_url
 from src.models.database import get_sessionmaker
 from src.models.turn_metrics import record_turn_metric

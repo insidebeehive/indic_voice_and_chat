@@ -12,10 +12,40 @@ from __future__ import annotations
 import logging
 import re
 from typing import Optional
+from urllib.parse import quote
 
 import httpx
 
 log = logging.getLogger(__name__)
+
+# A value destined for a `{placeholder}` in the endpoint PATH must not be
+# able to change the shape of the path itself. `/` or `\` lets a value splice
+# in extra path segments (or a full second path after a host-relative
+# escape); `?`/`#` lets it terminate the path early and inject query params
+# or a fragment the server-side router never intended; `..` is the classic
+# traversal segment. This is checked BEFORE quote() below runs, not instead
+# of it — quote() alone would happily percent-encode a literal ".." into
+# "..%2F" or similar and some routers/proxies normalize percent-decoded path
+# segments before matching, so encoding is not a substitute for rejecting the
+# structurally dangerous shapes outright. Tenant-registered chat_tools rows
+# (arbitrary endpoint templates, not just the two known-bad built-in catalog
+# entries) make this a general placeholder-substitution guard, not a
+# per-endpoint patch.
+_PATH_VALUE_DANGEROUS_RE = re.compile(r"[/\\?#]|\.\.")
+
+# A value that is EMPTY, or consists solely of one or more dots (".", "..",
+# "...", ...), also reshapes the path even though a single "." doesn't match
+# the two-dot traversal pattern above and quote() leaves a lone "." alone
+# (it's in urllib's always-safe set). httpx normalises a "/./" path segment
+# away client-side before the request is sent, so
+# ".../markets/{market_name}/holiday-schedule" with market_name="." is
+# rewritten to ".../markets/holiday-schedule" — a different, real endpoint
+# the template never described, reachable from a model-supplied argument
+# alone. An empty value collapses to "//", which some upstream routers
+# normalise the same way. This is a check on the value AS A WHOLE (`^\.*$`),
+# not on the dot character appearing anywhere in it — a legitimate value like
+# "teen-patti.v2" contains a dot and must still be accepted.
+_PATH_VALUE_EMPTY_OR_ALL_DOTS_RE = re.compile(r"^\.*$")
 
 # Placeholder substituted for any internal-id-shaped value this module
 # redacts (by key, in _redact_internal_ids, or by UUID pattern, in both
@@ -159,12 +189,50 @@ async def execute_crm_tool(
         source = (spec or {}).get("source", "llm")
         values[pname] = context.get(pname) if source == "session" else args.get(pname)
 
+    def _reject_invalid_path_param(param_name: str) -> dict:
+        # Reject, don't raise. The turn would survive either way — the caller
+        # in src/agents/chatbot.py already catches Exception around the
+        # executor — but a raise would be classified as "transport_error",
+        # which is a lie: nothing was ever sent. Returning lets the model see
+        # an accurate invalid_parameter failure, and avoids a log.exception
+        # traceback whose message would echo the offending value back into
+        # the logs. Log the param NAME only — never the value, which is
+        # exactly the attacker-controlled (or coincidentally PII-shaped)
+        # string this check exists to keep out of logs.
+        log.warning("crm tool call rejected invalid path parameter", extra={
+            "ticket_id": ticket_id, "session_id": session_id, "param_name": param_name,
+        })
+        return {
+            "error": "One of the request parameters had an invalid value.",
+            "failure": "invalid_parameter",
+        }
+
     url = endpoint
     path_used = set()
     for k, v in values.items():
         placeholder = "{" + k + "}"
         if placeholder in url and v is not None:
-            url = url.replace(placeholder, str(v))
+            str_v = str(v)
+            if (
+                _PATH_VALUE_DANGEROUS_RE.search(str_v)
+                or _PATH_VALUE_EMPTY_OR_ALL_DOTS_RE.match(str_v)
+            ):
+                return _reject_invalid_path_param(k)
+            # safe="" (not the urllib default safe="/") because a `/` in the
+            # ENCODED output would re-introduce exactly the path-splicing
+            # this substitution must prevent — the default exists for
+            # callers building whole paths, not single path segments.
+            try:
+                encoded = quote(str_v, safe="")
+            except UnicodeEncodeError:
+                # A lone UTF-16 surrogate (e.g. "\ud800") can arrive through
+                # json.loads() of the model's tool-call arguments — Python's
+                # JSON parser does not reject lone surrogates, but quote()
+                # cannot encode one to UTF-8 and raises. Treat it as just
+                # another rejected path value instead of letting it escape
+                # this function as an unhandled exception.
+                return _reject_invalid_path_param(k)
+            url = url.replace(placeholder, encoded)
             path_used.add(k)
     rest = {k: v for k, v in values.items() if k not in path_used and v is not None}
 

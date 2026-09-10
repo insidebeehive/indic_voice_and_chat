@@ -38,6 +38,10 @@ from src.auth.registry import TenantProviders
 from src.dialogue.context import SessionStore
 from src.dialogue.prompts import VoiceBotScript
 from src.dialogue.slots import SlotSchema
+from src.exceptions import LiveKitModeNotSupported  # noqa: F401 -- re-exported for
+# existing `from src.bootstrap import LiveKitModeNotSupported` callers; the real
+# definition lives in src.exceptions to break the bootstrap<->api import cycle
+# (see that module's docstring). Do not move the class back here.
 from src.interfaces.llm import LLMConfig
 from src.interfaces.stt import STTConfig
 from src.interfaces.tts import TTSConfig
@@ -58,30 +62,14 @@ log = logging.getLogger(__name__)
 
 # --- Demo script -------------------------------------------------------
 
-
-DEFAULT_DEMO_SCRIPT = VoiceBotScript(
-    agent_name="Priya",
-    agent_role="Customer Engagement Specialist",
-    company_name="Vox Demo",
-    language_default="hi-IN",
-    opening=(
-        "Namaste! Main Priya bol rahi hoon Vox Demo se. "
-        "Aapse ek choti si baat karni thi — kya aapke paas do minute hain?"
-    ),
-    talking_points=[
-        "Vox Demo ek end-to-end AI voice agent platform hai.",
-    ],
-    qualifying_questions=["Aap abhi kya use kar rahe hain customer calls ke liye?"],
-    objection_responses={
-        "is_ai": "Haan, main ek AI assistant hoon — Vox Demo ki taraf se.",
-        "busy": "Bilkul, samajh sakti hoon. Kya main baad mein call karun?",
-    },
-    closing={
-        "positive": "Bahut accha! Dhanyavaad aapke time ke liye.",
-        "negative": "Koi baat nahi. Aapka din shubh ho!",
-    },
-)
-
+# The constant itself lives in src.defaults (no src.bootstrap/src.api
+# dependency of its own) so that other modules -- e.g. src.api.dev_console --
+# can import it without pulling in src.bootstrap's own src.api.telephony_*
+# imports and reintroducing the cycle fixed by src.exceptions.
+# LiveKitModeNotSupported. Do not move the definition back here; re-export
+# only, so a caller doing `from src.bootstrap import DEFAULT_DEMO_SCRIPT`
+# keeps working even though the definition lives elsewhere now.
+from src.defaults import DEFAULT_DEMO_SCRIPT  # noqa: E402
 
 # --- Per-tenant runtime builders ---------------------------------------
 
@@ -99,9 +87,10 @@ def build_crm_retriever(
     this environment) — callers treat ``None`` exactly like "this CRM has no
     KB", never an error.
     """
+    from src.config import get_settings
     from src.providers import get_vector_store
     from src.rag.embeddings import GeminiEmbedder
-    from src.rag.retriever import HybridRetriever, RetrievalConfig
+    from src.rag.retriever import HybridRetriever, retrieval_config_from_settings
 
     vs_cfg = dict((global_defaults or {}).get("vector_store", {}))
     provider = vs_cfg.get("provider", "faiss")
@@ -113,13 +102,18 @@ def build_crm_retriever(
 
     try:
         vector_store = get_vector_store(vs_cfg)
+        # Settings load (YAML read + validation) lives inside this try too:
+        # both can raise, and the docstring above promises this function
+        # never does — callers must see a config load failure as "no KB",
+        # not a live-turn exception.
+        retrieval_config = retrieval_config_from_settings(get_settings().rag.retrieval)
     except Exception:
         log.exception("build_crm_retriever: failed to build vector store", extra={"crm_id": crm_id})
         return None
     return HybridRetriever(
         embedder=GeminiEmbedder(dim=384),
         vector_store=vector_store,
-        config=RetrievalConfig(),
+        config=retrieval_config,
     )
 
 
@@ -206,10 +200,11 @@ def build_runtime_registry(providers: TenantProviders, base_session_store: Sessi
     from src.auth.registry import TenantRuntimeRegistry, _PerTenantRegistry
     from src.campaign.dnd_filter import CallingHoursPolicy, DNDFilter, InMemoryDNDStore
     from src.campaign.scheduler import CallScheduler, RateLimitConfig, RetryConfig
+    from src.config import get_settings
     from src.integration.crm_client import FakeChatChannel, FakeCRMClient
     from src.integration.webhooks import WebhookManager
     from src.rag.embeddings import GeminiEmbedder
-    from src.rag.retriever import HybridRetriever, RetrievalConfig
+    from src.rag.retriever import HybridRetriever, retrieval_config_from_settings
 
     def _dnd(tenant: TenantContext) -> TenantDnd:
         c = getattr(tenant.settings, "compliance", None)
@@ -241,7 +236,7 @@ def build_runtime_registry(providers: TenantProviders, base_session_store: Sessi
         return HybridRetriever(
             embedder=GeminiEmbedder(dim=384),
             vector_store=providers.get_vector_store(tenant),
-            config=RetrievalConfig())
+            config=retrieval_config_from_settings(get_settings().rag.retrieval))
 
     def _session_store(tenant: TenantContext) -> SessionStore:
         return SessionStore(redis=base_session_store.redis,
@@ -724,12 +719,6 @@ async def _build_kb_context(crm_retriever, tenant_retriever) -> str:
     from src.rag.context_builder import build_voicebot_kb_context
     retrievers = [r for r in [crm_retriever, tenant_retriever] if r is not None]
     return await build_voicebot_kb_context(retrievers)
-
-
-class LiveKitModeNotSupported(Exception):
-    """Raised by ``make_livekit_bridge_factory``'s factory when the tenant isn't
-    in s2s pipeline mode. LiveKit room-join is s2s-only — there is no cascade
-    (STT->LLM->TTS) LiveKit path, and no per-call mode override for it."""
 
 
 def make_livekit_bridge_factory(

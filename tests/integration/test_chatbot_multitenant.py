@@ -23,7 +23,7 @@ from src.config_tenant import TenantSettings
 from src.models.database import Base
 from src.models.tenant import Tenant
 from src.providers.vector_store.faiss_store import FAISSAdapter
-from src.rag.embeddings import HashEmbedder, IdentityReranker
+from src.rag.embeddings import HashEmbedder
 from src.rag.ingestion import ChunkConfig
 from src.rag.retriever import HybridRetriever, RetrievalConfig
 
@@ -35,9 +35,8 @@ def _retriever(path: str) -> HybridRetriever:
     return HybridRetriever(
         embedder=HashEmbedder(dim=64),
         vector_store=FAISSAdapter({"embedding_dim": 64, "index_path": path}),
-        reranker=IdentityReranker(),
         config=RetrievalConfig(strategy="hybrid", top_k=3, oversample_k=8,
-                               reranking=True, similarity_threshold=0.0))
+                               similarity_threshold=0.0))
 
 
 @pytest_asyncio.fixture

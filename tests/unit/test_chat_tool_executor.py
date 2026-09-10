@@ -514,6 +514,98 @@ async def test_status_code_2xx_has_no_failure_key() -> None:
     assert "error" not in out
 
 
+# --- Phase 0 task 2: path-parameter injection (bare string-replace into the
+# endpoint URL had no encoding or validation — an LLM-sourced value like
+# game_name/market_name could carry "/", "..", "?", or "#" and rewrite the
+# request path/query against the tenant's real CRM host+credentials) -------
+
+
+@pytest.mark.asyncio
+async def test_path_traversal_in_llm_param_is_rejected_without_http_call() -> None:
+    client = _FakeClient({"ok": True})
+    out = await execute_crm_tool(
+        endpoint="https://crm.example.com/casino/{operator_id}/players/{user_id}/games/{game_name}/bet-limit",
+        method="GET",
+        parameters={
+            "operator_id": {"type": "string", "source": "session"},
+            "user_id": {"type": "string", "source": "session"},
+            "game_name": {"type": "string", "source": "llm"},
+        },
+        auth_type=None, token=None,
+        args={"game_name": "../../operators/x/platform-config"},
+        context={"operator_id": "op1", "user_id": "u1"},
+        http_client=client,
+    )
+    assert out == {
+        "error": "One of the request parameters had an invalid value.",
+        "failure": "invalid_parameter",
+    }
+    assert client.calls == []  # rejected before any HTTP call was attempted
+
+
+@pytest.mark.asyncio
+async def test_query_and_fragment_chars_in_llm_param_are_rejected() -> None:
+    client = _FakeClient({"ok": True})
+    for bad_value in ("foo?admin=true", "foo#frag"):
+        out = await execute_crm_tool(
+            endpoint="https://crm.example.com/matka/{operator_id}/markets/{market_name}/holiday-schedule",
+            method="GET",
+            parameters={
+                "operator_id": {"type": "string", "source": "session"},
+                "market_name": {"type": "string", "source": "llm"},
+            },
+            auth_type=None, token=None,
+            args={"market_name": bad_value},
+            context={"operator_id": "op1"},
+            http_client=client,
+        )
+        assert out["failure"] == "invalid_parameter"
+    assert client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_legitimate_path_value_is_percent_encoded_and_call_is_made() -> None:
+    client = _FakeClient({"ok": True})
+    out = await execute_crm_tool(
+        endpoint="https://crm.example.com/casino/{operator_id}/players/{user_id}/games/{game_name}/bet-limit",
+        method="GET",
+        parameters={
+            "operator_id": {"type": "string", "source": "session"},
+            "user_id": {"type": "string", "source": "session"},
+            "game_name": {"type": "string", "source": "llm"},
+        },
+        auth_type=None, token=None,
+        args={"game_name": "Teen Patti & Co"},
+        context={"operator_id": "op1", "user_id": "u1"},
+        http_client=client,
+    )
+    assert "error" not in out
+    method, url, params, headers = client.calls[0]
+    assert url == (
+        "https://crm.example.com/casino/op1/players/u1/games/"
+        "Teen%20Patti%20%26%20Co/bet-limit"
+    )
+    assert params == {}
+
+
+@pytest.mark.asyncio
+async def test_session_sourced_uuid_path_param_still_works_unchanged() -> None:
+    """Regression guard: the common path (a server-derived session param, not
+    LLM-controlled) must still resolve exactly as before -- no rejection, no
+    unexpected re-encoding of characters a UUID never contains anyway."""
+    client = _FakeClient({"profile": "ok"})
+    user_id = "6c1a77a6-20b0-4fc9-ba4c-8add58aba9ef"
+    out = await execute_crm_tool(
+        endpoint="https://crm.example.com/players/{user_id}/profile",
+        method="GET",
+        parameters={"user_id": {"type": "string", "source": "session"}},
+        auth_type=None, token=None,
+        args={}, context={"user_id": user_id}, http_client=client,
+    )
+    assert "error" not in out
+    assert client.calls[0][1] == f"https://crm.example.com/players/{user_id}/profile"
+
+
 @pytest.mark.asyncio
 async def test_transport_error_uuid_still_scrubbed_with_failure_discriminator() -> None:
     class _Boom:
@@ -530,3 +622,253 @@ async def test_transport_error_uuid_still_scrubbed_with_failure_discriminator() 
     assert out["failure"] == "transport_error"
     assert "6c1a77a6" not in out["error"]
     assert "[redacted]" in out["error"]
+
+
+# --- Review findings: bare "." / empty path values, encode-failure surrogate,
+# and the untested edges of the check-then-encode path-value guard ---------
+
+
+@pytest.mark.asyncio
+async def test_bare_dot_path_value_is_rejected_without_http_call() -> None:
+    """A single "." doesn't match the two-dot traversal regex and quote()
+    leaves it alone (it's in urllib's always-safe set) — but httpx normalises
+    a "/./" segment away client-side, so market_name="." would resolve to a
+    real endpoint the template never described."""
+    client = _FakeClient({"ok": True})
+    out = await execute_crm_tool(
+        endpoint="https://crm.example.com/matka/{operator_id}/markets/{market_name}/holiday-schedule",
+        method="GET",
+        parameters={
+            "operator_id": {"type": "string", "source": "session"},
+            "market_name": {"type": "string", "source": "llm"},
+        },
+        auth_type=None, token=None,
+        args={"market_name": "."},
+        context={"operator_id": "op1"},
+        http_client=client,
+    )
+    assert out == {
+        "error": "One of the request parameters had an invalid value.",
+        "failure": "invalid_parameter",
+    }
+    assert client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_empty_string_path_value_is_rejected_without_http_call() -> None:
+    client = _FakeClient({"ok": True})
+    out = await execute_crm_tool(
+        endpoint="https://crm.example.com/matka/{operator_id}/markets/{market_name}/holiday-schedule",
+        method="GET",
+        parameters={
+            "operator_id": {"type": "string", "source": "session"},
+            "market_name": {"type": "string", "source": "llm"},
+        },
+        auth_type=None, token=None,
+        args={"market_name": ""},
+        context={"operator_id": "op1"},
+        http_client=client,
+    )
+    assert out["failure"] == "invalid_parameter"
+    assert client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_dotted_but_not_all_dots_value_still_works() -> None:
+    """Regression guard for over-tightening: a legitimate value that merely
+    CONTAINS a dot (not solely dots) must still be accepted and encoded."""
+    client = _FakeClient({"ok": True})
+    out = await execute_crm_tool(
+        endpoint="https://crm.example.com/matka/{operator_id}/markets/{market_name}/holiday-schedule",
+        method="GET",
+        parameters={
+            "operator_id": {"type": "string", "source": "session"},
+            "market_name": {"type": "string", "source": "llm"},
+        },
+        auth_type=None, token=None,
+        args={"market_name": "teen-patti.v2"},
+        context={"operator_id": "op1"},
+        http_client=client,
+    )
+    assert "error" not in out
+    method, url, params, headers = client.calls[0]
+    assert url == (
+        "https://crm.example.com/matka/op1/markets/teen-patti.v2/holiday-schedule"
+    )
+
+
+@pytest.mark.asyncio
+async def test_whitespace_only_path_value_is_accepted_and_encoded() -> None:
+    """Whitespace-only is DELIBERATELY accepted, not an oversight.
+
+    Unlike "." (which httpx normalises away, reaching a different real
+    endpoint), " " percent-encodes to a literal "%20" segment that no RFC 3986
+    or httpx rule removes — so it is a distinct, non-existent path segment that
+    404s at the CRM rather than a change to the path's SHAPE. Pinned here so a
+    future "tidy-up" of _PATH_VALUE_EMPTY_OR_ALL_DOTS_RE into something like
+    ``^[\\s.]*$`` has to justify itself against a failing test.
+    """
+    client = _FakeClient({"ok": True})
+    out = await execute_crm_tool(
+        endpoint="https://crm.example.com/matka/{operator_id}/markets/{market_name}/holiday-schedule",
+        method="GET",
+        parameters={
+            "operator_id": {"type": "string", "source": "session"},
+            "market_name": {"type": "string", "source": "llm"},
+        },
+        auth_type=None, token=None,
+        args={"market_name": " "},
+        context={"operator_id": "op1"},
+        http_client=client,
+    )
+    assert "error" not in out
+    method, url, params, headers = client.calls[0]
+    assert url == (
+        "https://crm.example.com/matka/op1/markets/%20/holiday-schedule"
+    )
+
+
+@pytest.mark.asyncio
+async def test_backslash_path_value_is_rejected() -> None:
+    client = _FakeClient({"ok": True})
+    out = await execute_crm_tool(
+        endpoint="https://crm.example.com/matka/{operator_id}/markets/{market_name}/holiday-schedule",
+        method="GET",
+        parameters={
+            "operator_id": {"type": "string", "source": "session"},
+            "market_name": {"type": "string", "source": "llm"},
+        },
+        auth_type=None, token=None,
+        args={"market_name": "foo\\bar"},
+        context={"operator_id": "op1"},
+        http_client=client,
+    )
+    assert out["failure"] == "invalid_parameter"
+    assert client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_session_sourced_slash_value_is_also_rejected() -> None:
+    """The path-value guard is source-agnostic by design (defence in depth) —
+    a "session" param carrying "/" must be rejected exactly like an "llm" one,
+    proving the check isn't scoped to source == "llm"."""
+    client = _FakeClient({"ok": True})
+    out = await execute_crm_tool(
+        endpoint="https://crm.example.com/customers/{customer_id}/history",
+        method="GET",
+        parameters={"customer_id": {"type": "string", "source": "session"}},
+        auth_type=None, token=None,
+        args={}, context={"customer_id": "cust/42"}, http_client=client,
+    )
+    assert out["failure"] == "invalid_parameter"
+    assert client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_non_str_path_value_is_stringified_then_rejected() -> None:
+    """Pins the stringify-then-check ordering: a non-str value (e.g. a list)
+    is str()'d before the danger check runs, so its str() form ("['..', 'x']")
+    is what gets rejected — it must not bypass the check by virtue of not
+    being a string to begin with."""
+    client = _FakeClient({"ok": True})
+    out = await execute_crm_tool(
+        endpoint="https://crm.example.com/matka/{operator_id}/markets/{market_name}/holiday-schedule",
+        method="GET",
+        parameters={
+            "operator_id": {"type": "string", "source": "session"},
+            "market_name": {"type": "string", "source": "llm"},
+        },
+        auth_type=None, token=None,
+        args={"market_name": ["..", "x"]},
+        context={"operator_id": "op1"},
+        http_client=client,
+    )
+    assert out["failure"] == "invalid_parameter"
+    assert client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_pre_encoded_traversal_is_neutralised_by_double_encoding() -> None:
+    """The subtlest property of check-then-encode: "%2e%2e%2f" doesn't match
+    the raw-character danger regex (no literal "/", "\\", "?", "#", or ".."),
+    so it's accepted — but quote() then percent-encodes the literal "%"
+    characters themselves, turning it into "%252e%252e%252f". That double
+    encoding is inert: no proxy or router decodes twice, so it can never
+    collapse back into a real ".." traversal segment server-side."""
+    client = _FakeClient({"ok": True})
+    out = await execute_crm_tool(
+        endpoint="https://crm.example.com/matka/{operator_id}/markets/{market_name}/holiday-schedule",
+        method="GET",
+        parameters={
+            "operator_id": {"type": "string", "source": "session"},
+            "market_name": {"type": "string", "source": "llm"},
+        },
+        auth_type=None, token=None,
+        args={"market_name": "%2e%2e%2f"},
+        context={"operator_id": "op1"},
+        http_client=client,
+    )
+    assert "error" not in out
+    method, url, params, headers = client.calls[0]
+    assert "%252e%252e%252f" in url
+
+
+@pytest.mark.asyncio
+async def test_lone_surrogate_path_value_returns_invalid_parameter_not_raise() -> None:
+    """quote() raises UnicodeEncodeError on a lone UTF-16 surrogate, which can
+    arrive through json.loads() of the model's tool-call arguments (Python's
+    JSON parser does not reject lone surrogates). That must surface as the
+    same invalid_parameter error dict as any other rejected value, not
+    escape execute_crm_tool as an unhandled exception."""
+    client = _FakeClient({"ok": True})
+    out = await execute_crm_tool(
+        endpoint="https://crm.example.com/matka/{operator_id}/markets/{market_name}/holiday-schedule",
+        method="GET",
+        parameters={
+            "operator_id": {"type": "string", "source": "session"},
+            "market_name": {"type": "string", "source": "llm"},
+        },
+        auth_type=None, token=None,
+        args={"market_name": "\ud800"},
+        context={"operator_id": "op1"},
+        http_client=client,
+    )
+    assert out == {
+        "error": "One of the request parameters had an invalid value.",
+        "failure": "invalid_parameter",
+    }
+    assert client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_rejection_log_does_not_contain_the_param_value(caplog) -> None:
+    """Explicit requirement of the original fix: only the param NAME may be
+    logged on rejection, never the (potentially attacker-controlled or
+    PII-shaped) value itself."""
+    client = _FakeClient({"ok": True})
+    secret_value = "../../operators/x/platform-config"
+
+    with caplog.at_level(logging.WARNING, logger="src.chatbot.tool_executor"):
+        out = await execute_crm_tool(
+            endpoint="https://crm.example.com/matka/{operator_id}/markets/{market_name}/holiday-schedule",
+            method="GET",
+            parameters={
+                "operator_id": {"type": "string", "source": "session"},
+                "market_name": {"type": "string", "source": "llm"},
+            },
+            auth_type=None, token=None,
+            args={"market_name": secret_value},
+            context={"operator_id": "op1"},
+            http_client=client,
+        )
+
+    assert out["failure"] == "invalid_parameter"
+    reject_records = [
+        r for r in caplog.records
+        if r.getMessage() == "crm tool call rejected invalid path parameter"
+    ]
+    assert len(reject_records) == 1
+    record = reject_records[0]
+    assert record.__dict__.get("param_name") == "market_name"
+    assert secret_value not in repr(record.__dict__)
+    assert secret_value not in record.getMessage()

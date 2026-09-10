@@ -118,7 +118,7 @@ _RECORD_METRIC_TIMEOUT_S = 2.0
 # hallucination guard (apply_hallucination_guard, gated on `if retrieved_all`
 # below) silently never fired — ungrounded, unguarded answers with no signal
 # anything went wrong. 15.0s is a generous fixed ceiling for an embedding
-# search/rerank (RAG quality matters and this call type wasn't the source of
+# search (RAG quality matters and this call type wasn't the source of
 # the incident this budget was added for) while still bounding overall turn
 # latency rather than leaving it truly unbounded.
 _KB_SEARCH_TIMEOUT_S = 15.0

@@ -21,6 +21,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 from typing import Any, Optional
 
 import numpy as np
@@ -30,11 +31,33 @@ from src.interfaces.vector_store import Document, IVectorStore, SearchResult
 
 log = logging.getLogger(__name__)
 
-# Module-level shared pool — one pool for all PGVectorAdapter instances.
-_pool: Any = None  # asyncpg.Pool
+# Module-level shared pools, one per distinct DSN -- NOT one global pool.
+# Two PGVectorAdapter instances configured with different database_url values
+# (e.g. two tenants on separate managed Postgres instances) must never share a
+# connection pool: keying by DSN is what stops the second adapter from
+# silently querying the first adapter's database.
+_pools: dict[str, Any] = {}  # dsn -> asyncpg.Pool
 _pool_lock: Optional[asyncio.Lock] = None
-_schema_ready = False
+_schema_ready: set[str] = set()  # dsn's whose table existence has been verified
 _schema_lock: Optional[asyncio.Lock] = None
+# (dsn, embedding_dim) pairs already checked against the live table's
+# `embedding` column width. Tracked separately from _schema_ready (which only
+# covers table *existence*) because a single DSN's pool is shared across
+# every PGVectorAdapter instance pointed at it, and different instances
+# (e.g. a tenant KB vs. a CRM KB) can be configured with different
+# embedding_dim values. If we only ever ran the dimension check once per DSN,
+# the first adapter to call _ensure_schema would mark that DSN "ready" and
+# every later adapter against the SAME DSN with a *different* (possibly
+# wrong) dim would skip verification entirely -- deferring a
+# misconfiguration to a confusing asyncpg.DataError at INSERT time instead of
+# failing loudly at connect time. Keyed by (dsn, dim) -- not dim alone -- so
+# that keying stays consistent with _pools/_schema_ready now that pools are
+# DSN-scoped: keying this cache by dim alone while the pool is keyed by DSN
+# would let a second adapter against a *different* database skip
+# verification just because some other database was already checked at the
+# same dim.
+_verified_dims: set[tuple[str, int]] = set()
+_dim_lock: Optional[asyncio.Lock] = None
 
 
 def _to_asyncpg_dsn(url: str) -> str:
@@ -54,45 +77,120 @@ async def _init_conn(conn: Any) -> None:
         log.exception("pgvector asyncpg codec registration failed")
 
 
-async def _get_pool(database_url: str) -> Any:
-    global _pool, _pool_lock
+async def _get_pool(database_url: str) -> tuple[Any, str]:
+    """Return (pool, normalized_dsn) for ``database_url``, creating a new
+    pool the first time this DSN is seen. Returns the normalized DSN too so
+    callers can key the dim-verification cache the same way this function
+    keys the pool cache -- see _verified_dims above for why that consistency
+    matters."""
+    global _pools, _pool_lock
+    dsn = _to_asyncpg_dsn(database_url)
     if _pool_lock is None:
         _pool_lock = asyncio.Lock()
-    if _pool is not None:
-        return _pool
+    if dsn in _pools:
+        return _pools[dsn], dsn
     async with _pool_lock:
-        if _pool is None:
+        if dsn not in _pools:
             import asyncpg  # type: ignore[import-not-found]
-            dsn = _to_asyncpg_dsn(database_url)
-            _pool = await asyncpg.create_pool(
+            _pools[dsn] = await asyncpg.create_pool(
                 dsn, min_size=1, max_size=10, init=_init_conn
             )
             log.info("pgvector pool created")
-    return _pool
+    return _pools[dsn], dsn
 
 
-async def _ensure_schema(pool: Any, dim: int) -> None:
+async def _ensure_schema(pool: Any, dsn: str, dim: int) -> None:
     """Verify the table exists; do NOT attempt CREATE EXTENSION (needs superuser).
-    Run the setup SQL from docs/pgvector_setup.sql once as the postgres user."""
-    global _schema_ready, _schema_lock
-    if _schema_ready:
+    Run the setup SQL from docs/pgvector_setup.sql once as the postgres user.
+
+    Also verifies that this adapter's configured ``embedding_dim`` matches
+    the live table's ``embedding`` column width, so a tenant with the wrong
+    embedding_dim learns about it here -- at connect time, with both numbers
+    named -- instead of from an opaque asyncpg.DataError on their first
+    ingest. See _verified_dims above for why this is cached per-(dsn, dim)
+    rather than folded into the one-shot-per-dsn _schema_ready set.
+
+    ``dsn`` must be the same normalized DSN _get_pool used to look up
+    ``pool`` -- both caches key on it so a second adapter against a
+    *different* database never rides on the first adapter's verification.
+    """
+    global _schema_ready, _schema_lock, _verified_dims, _dim_lock
+    if dsn not in _schema_ready:
+        if _schema_lock is None:
+            _schema_lock = asyncio.Lock()
+        async with _schema_lock:
+            if dsn not in _schema_ready:
+                async with pool.acquire() as conn:
+                    exists = await conn.fetchval(
+                        "SELECT 1 FROM information_schema.tables "
+                        "WHERE table_schema = 'voicebot' AND table_name = 'knowledge_chunks'"
+                    )
+                if not exists:
+                    raise RuntimeError(
+                        "voicebot.knowledge_chunks table not found. "
+                        "Run docs/pgvector_setup.sql as the postgres superuser first."
+                    )
+                _schema_ready.add(dsn)
+                log.info("pgvector schema verified (table exists)")
+
+    dim_key = (dsn, dim)
+    if dim_key in _verified_dims:
         return
-    if _schema_lock is None:
-        _schema_lock = asyncio.Lock()
-    async with _schema_lock:
-        if _schema_ready:
+    if _dim_lock is None:
+        _dim_lock = asyncio.Lock()
+    async with _dim_lock:
+        if dim_key in _verified_dims:
             return
         async with pool.acquire() as conn:
-            exists = await conn.fetchval(
-                "SELECT 1 FROM information_schema.tables "
-                "WHERE table_schema = 'voicebot' AND table_name = 'knowledge_chunks'"
+            # format_type() renders the column's declared type, e.g.
+            # "vector(384)" -- reading it beats inferring the dimension from
+            # atttypmod's raw encoding, which is type-specific and not
+            # documented as stable across pgvector versions.
+            col_type = await conn.fetchval(
+                """
+                SELECT format_type(a.atttypid, a.atttypmod)
+                FROM pg_attribute a
+                JOIN pg_class c ON a.attrelid = c.oid
+                JOIN pg_namespace n ON c.relnamespace = n.oid
+                WHERE n.nspname = 'voicebot'
+                  AND c.relname = 'knowledge_chunks'
+                  AND a.attname = 'embedding'
+                  AND a.attnum > 0
+                  AND NOT a.attisdropped
+                """
             )
-            if not exists:
+            # re.search (not re.match): format_type() schema-qualifies the
+            # type when it isn't on search_path (e.g. Supabase installs
+            # pgvector into "extensions" by default, rendering
+            # "extensions.vector(384)"). An anchored re.match would silently
+            # fail to find the dimension in that case.
+            match = re.search(r"vector\((\d+)\)", col_type or "")
+            actual_dim = int(match.group(1)) if match else None
+            if actual_dim is not None and actual_dim != dim:
                 raise RuntimeError(
-                    "voicebot.knowledge_chunks table not found. "
-                    "Run docs/pgvector_setup.sql as the postgres superuser first."
+                    f"embedding_dim mismatch: voicebot.knowledge_chunks.embedding "
+                    f"is vector({actual_dim}) but this PGVectorAdapter is "
+                    f"configured with embedding_dim={dim}. Fix the "
+                    f"'embedding_dim' config key to match the live table "
+                    f"(the table is not altered automatically)."
                 )
-        _schema_ready = True
+            if actual_dim is None:
+                # col_type NULL (column renamed/dropped), a non-vector type,
+                # or a vector column with no dimension modifier all land
+                # here. Fail OPEN (let the caller proceed -- the table might
+                # still work) but do NOT cache this as verified: an
+                # indeterminate result must not be remembered as success, or
+                # a real mismatch introduced later would never be caught.
+                log.warning(
+                    "pgvector dim check inconclusive for "
+                    "voicebot.knowledge_chunks.embedding: format_type "
+                    "returned %r (expected something matching "
+                    "'vector(<dim>)'); configured embedding_dim=%d will NOT "
+                    "be verified against the live column",
+                    col_type, dim,
+                )
+                return
+        _verified_dims.add(dim_key)
         log.info("pgvector schema verified (dim=%d)", dim)
 
 
@@ -120,8 +218,8 @@ class PGVectorAdapter(IVectorStore):
     # --- helpers -----------------------------------------------------------
 
     async def _pool(self) -> Any:
-        pool = await _get_pool(self._database_url)
-        await _ensure_schema(pool, self._dim)
+        pool, dsn = await _get_pool(self._database_url)
+        await _ensure_schema(pool, dsn, self._dim)
         return pool
 
     def _scope_clause(self, param_start: int) -> tuple[str, list]:
@@ -236,10 +334,24 @@ class PGVectorAdapter(IVectorStore):
         pool = await self._pool()
         scope_clause, scope_params = self._scope_clause(1)
         limit_pos = 1 + len(scope_params)
+        # ORDER BY id: without it Postgres is free to return an arbitrary
+        # subset when LIMIT truncates, and free to order it differently on
+        # each call. That's silent for a small corpus (nothing gets cut) but
+        # breaks reproducibility once row count exceeds `limit` -- two
+        # identical benchmark sweep runs could hydrate the BM25 arm with
+        # different chunks while the dense arm (which has no such limit at
+        # query time) sees everything, so the two arms drift apart between
+        # runs for reasons that have nothing to do with the config being
+        # swept. Ordering by filename/section instead would also work but id
+        # is stable and cheap (no extra predicate on jsonb metadata); callers
+        # that care about document order (src/rag/context_builder.py's
+        # voicebot KB dump) already re-sort by (filename, section) themselves
+        # before use, so this ordering choice is invisible to them.
         sql = f"""
             SELECT id, content, metadata
             FROM voicebot.knowledge_chunks
             WHERE {scope_clause}
+            ORDER BY id
             LIMIT ${limit_pos}::integer
         """
         async with pool.acquire() as conn:

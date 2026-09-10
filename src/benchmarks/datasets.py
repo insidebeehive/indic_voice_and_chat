@@ -5,11 +5,22 @@ generate from CRM exports. The four canonical schemas:
 
 STTSample           {id, audio_path | audio_bytes_b64, transcript, language, code_switch?}
 TTSSample           {id, text, language, voice_id?}
-RAGSample           {id, query, expected_chunks: [id, ...], expected_answer?}
+RAGSample           {id, query, expected_chunks: [id, ...], expected_answer?,
+                     expected_spans: [str, ...], expected_files: [str, ...],
+                     lang?, intent?, unanswerable?}
 TaskScenario        {id, user_turns: [...], expected_disposition, required_slots: {...}}
 
 Each loader can either consume an inlined records list (for tests) or a
 ``Path`` to a JSONL file.
+
+RAGSample note: ``expected_chunks`` (chunk ids) is legacy and stays for
+backward compatibility, but it's fragile — chunk ids are
+``f"{doc_id}::chunk-{index}"`` and both halves are unstable (re-chunking
+renumbers ``index``; a non-seeded doc gets a random ``doc_id``). New datasets
+should label with ``expected_spans`` (verbatim KB text) + ``expected_files``
+(source filename) instead, which survive a re-chunk / re-ingest since they're
+resolved against whatever chunks are actually in the index at scoring time
+(see ``src/benchmarks/rag_benchmark.py``).
 """
 
 from __future__ import annotations
@@ -58,6 +69,32 @@ class RAGSample:
     query: str
     expected_chunks: list[str] = field(default_factory=list)
     expected_answer: Optional[str] = None
+    # Verbatim substrings of KB documents — a retrieved chunk counts as
+    # relevant if it contains at least one of these (whitespace-normalised
+    # containment, see score_retrieval_spans). Anchored to text rather than
+    # chunk ids so the label survives a re-chunk / re-ingest.
+    expected_spans: list[str] = field(default_factory=list)
+    # Source filenames (e.g. "04-deposits.md") for the coarser document-level
+    # file_hit diagnostic.
+    expected_files: list[str] = field(default_factory=list)
+    # Script/language of the query: "en" | "hinglish" | "hi".
+    lang: Optional[str] = None
+    # Short slug grouping queries that mean the same thing across languages
+    # (e.g. "deposit_not_credited"), so retrieval quality can be compared
+    # across lang for the same underlying question.
+    intent: Optional[str] = None
+    # True when the KB genuinely has no answer -- retrieval SHOULD come back
+    # empty or weak. Scored separately (false_positive_rate), never folded
+    # into the normal precision/recall/MRR means.
+    unanswerable: bool = False
+    # Which corpus tier the expected document belongs to: "pack" (auto-seeded
+    # for every tenant), "module" (opt-in KB module), or "layout" (a tenant
+    # picks exactly one). Only the "pack" tier is guaranteed present in a
+    # default-seeded index -- see run_retrieval_benchmark's unindexed-sample
+    # detection and the --tier CLI filter in scripts/run_benchmark.py, both
+    # of which exist because scoring a "module"/"layout" sample against an
+    # index that never ingested that file isn't a retrieval failure.
+    tier: Optional[str] = None
 
 
 @dataclass
@@ -150,6 +187,12 @@ def load_rag_dataset(source: SourceLike) -> list[RAGSample]:
             query=str(r["query"]),
             expected_chunks=list(r.get("expected_chunks") or []),
             expected_answer=r.get("expected_answer"),
+            expected_spans=list(r.get("expected_spans") or []),
+            expected_files=list(r.get("expected_files") or []),
+            lang=r.get("lang"),
+            intent=r.get("intent"),
+            unanswerable=bool(r.get("unanswerable", False)),
+            tier=r.get("tier"),
         )
         for r in _read_records(source)
     ]
