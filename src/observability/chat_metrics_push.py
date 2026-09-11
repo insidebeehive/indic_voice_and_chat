@@ -76,6 +76,7 @@ _push_failure_warner = _PushFailureWarner()
 
 _TURN_GROUP_LABELS = ("tenant_id", "path")
 _TURN_LATENCY_COLUMNS = ("total_ms", "llm_total_ms", "tool_total_ms", "kb_search_ms")
+_TOKEN_COLUMNS = ("input_tokens", "output_tokens", "cached_tokens")
 
 # WS-layer failure rows (action in WS_TURN_FAILURE_ACTIONS -- a turn that
 # raised or timed out before the agent produced a ChatTurnResult, see
@@ -117,6 +118,27 @@ def _build_registry(
         _TURN_GROUP_LABELS + ("stage", "quantile"),
         registry=registry,
     )
+    turn_tokens_gauge = Gauge(
+        "vox_chat_turn_metric_tokens_total",
+        "Summed token counts (input/output/cached) over COMPLETED (non-failure) "
+        "turns in this push window -- a total, not a percentile, since token "
+        "counts aren't a latency distribution and a summed total is what's "
+        "needed both for cost tracking and as the input to "
+        "vox_chat_turn_cache_hit_rate_pct",
+        _TURN_GROUP_LABELS + ("kind",),
+        registry=registry,
+    )
+    turn_cache_hit_rate_gauge = Gauge(
+        "vox_chat_turn_cache_hit_rate_pct",
+        "sum(cached_tokens) * 100 / sum(input_tokens) over COMPLETED (non-failure) "
+        "turns in this push window -- a ratio of sums, not an average of "
+        "per-turn ratios. Set to 0.0 when the group's summed input_tokens is "
+        "0: that reading means NO DATA for the window, not a genuine 0% cache "
+        "hit rate -- don't alert on it without also checking "
+        "vox_chat_turn_metric_tokens_total{kind=\"input\"} is nonzero.",
+        _TURN_GROUP_LABELS,
+        registry=registry,
+    )
     for key, rows in turn_groups.items():
         labels = dict(zip(_TURN_GROUP_LABELS, key, strict=True))
         turn_count_gauge.labels(**labels).set(len(rows))
@@ -128,6 +150,17 @@ def _build_registry(
                 turn_latency_gauge.labels(**labels, stage=column, quantile=f"p{pct}").set(
                     _percentile(values, pct)
                 )
+
+        token_sums = {column: sum(getattr(r, column) for r in rows) for column in _TOKEN_COLUMNS}
+        for column, kind in zip(_TOKEN_COLUMNS, ("input", "output", "cached"), strict=True):
+            turn_tokens_gauge.labels(**labels, kind=kind).set(token_sums[column])
+        # Guard division by zero -- see the gauge's help text above for why
+        # this reads as "no data", not "0% hit rate".
+        summed_input = token_sums["input_tokens"]
+        hit_rate = (
+            token_sums["cached_tokens"] * 100 / summed_input if summed_input else 0.0
+        )
+        turn_cache_hit_rate_gauge.labels(**labels).set(hit_rate)
 
     turn_failure_gauge = Gauge(
         "vox_chat_turn_failure_count",

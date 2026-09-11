@@ -143,6 +143,13 @@ class ChatTurnMetric(Base):
     total_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     llm_total_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     llm_calls: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # Prompt/completion/cached-prompt token counts for the turn. These exist
+    # specifically to answer "is prompt caching actually happening" without
+    # requiring log-scraping. cached_tokens should always be <= input_tokens
+    # for a healthy row (not enforced at the DB level -- just the expectation).
+    input_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    output_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    cached_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     # Budgeted CRM/deposit-verification tool time only — kb_search_ms below is
     # deliberately separate (it draws from its own independent timeout, not
     # the CRM tool-call budget); folding them would make tool_total_ms
@@ -248,6 +255,9 @@ async def record_chat_turn_metric(
                 total_ms=metrics.get("total_ms", 0),
                 llm_total_ms=metrics.get("llm_total_ms", 0),
                 llm_calls=metrics.get("llm_calls", 0),
+                input_tokens=metrics.get("input_tokens", 0),
+                output_tokens=metrics.get("output_tokens", 0),
+                cached_tokens=metrics.get("cached_tokens", 0),
                 tool_total_ms=metrics.get("tool_total_ms", 0),
                 tool_calls=metrics.get("tool_calls", 0),
                 tool_failures=metrics.get("tool_failures", 0),

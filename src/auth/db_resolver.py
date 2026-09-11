@@ -93,7 +93,7 @@ def tenant_context_from_row(
             resolved[s.name] = secret_crypto.decrypt(s.value_encrypted)
         except secret_crypto.SecretsError:
             log.exception("failed to decrypt tenant secret", extra={
-                "tenant": tenant.slug, "name": s.name})
+                "tenant": tenant.slug, "secret_name": s.name})
     return TenantContext(settings=settings, secrets_resolved=resolved)
 
 

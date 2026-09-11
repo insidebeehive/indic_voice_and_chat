@@ -208,6 +208,63 @@ async def test_push_http_failure_is_caught_and_does_not_raise(sessionmaker) -> N
     assert n == 1  # aggregation itself succeeded; only the push failed
 
 
+@respx.mock
+async def test_token_totals_and_cache_hit_rate_ratio_of_sums(sessionmaker) -> None:
+    """3 rows with input_tokens=100 each and cached_tokens=50/0/50 -> the hit
+    rate must be computed as sum(cached)/sum(input) = 100/300 ~= 33.3%, NOT
+    the average of each row's own ratio (50%, 0%, 50% -> 33.3% too here by
+    coincidence, so this also seeds output_tokens asymmetrically to make sure
+    the tokens-total gauge reflects a genuine per-column sum, not an average)."""
+    route = respx.put(CHAT_PUSH_ROUTE).mock(return_value=httpx.Response(200))
+    for i, cached in enumerate([50, 0, 50]):
+        await _seed_turn(
+            sessionmaker, session_id=f"cs_tok_{i}", path="tools",
+            input_tokens=100, cached_tokens=cached, output_tokens=10 * (i + 1),
+        )
+
+    n = await aggregate_and_push_chat_metrics(sessionmaker, PUSH_URL, None, window_s=100)
+
+    assert n == 3
+    assert route.called
+    body = route.calls.last.request.content.decode()
+
+    assert (
+        'vox_chat_turn_metric_tokens_total{kind="input",path="tools",tenant_id="dev"} 300.0'
+        in body
+    )
+    assert (
+        'vox_chat_turn_metric_tokens_total{kind="output",path="tools",tenant_id="dev"} 60.0'
+        in body
+    )
+    assert (
+        'vox_chat_turn_metric_tokens_total{kind="cached",path="tools",tenant_id="dev"} 100.0'
+        in body
+    )
+    assert 'vox_chat_turn_cache_hit_rate_pct{path="tools",tenant_id="dev"} 33.3' in body
+
+
+@respx.mock
+async def test_cache_hit_rate_is_zero_not_error_when_input_tokens_is_zero(sessionmaker) -> None:
+    """A turn group with zero summed input_tokens must yield a 0.0 ratio
+    gauge reading (documented as "no data"), never a ZeroDivisionError/NaN/inf
+    that would take down the whole push."""
+    route = respx.put(CHAT_PUSH_ROUTE).mock(return_value=httpx.Response(200))
+    await _seed_turn(
+        sessionmaker, session_id="cs_no_tokens", path="tools",
+        input_tokens=0, cached_tokens=0, output_tokens=0,
+    )
+
+    n = await aggregate_and_push_chat_metrics(sessionmaker, PUSH_URL, None, window_s=100)
+
+    assert n == 1
+    assert route.called
+    body = route.calls.last.request.content.decode()
+
+    # Exact 0.0 reading -- not nan/inf, which a bare ZeroDivisionError-avoidance
+    # attempt (e.g. cached/input with input possibly 0.0) could otherwise yield.
+    assert 'vox_chat_turn_cache_hit_rate_pct{path="tools",tenant_id="dev"} 0.0' in body
+
+
 async def test_db_query_failure_is_caught_and_does_not_raise() -> None:
     class _BrokenSessionmaker:
         def __call__(self):

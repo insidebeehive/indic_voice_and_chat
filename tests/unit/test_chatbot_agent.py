@@ -323,6 +323,63 @@ def test_latin_language_hint_classifies_deterministically() -> None:
     assert _latin_language_hint("") is None
 
 
+def test_latin_language_hint_real_transcript_regression() -> None:
+    """4th recurrence of the language-misdetection bug class (see the history
+    comment above ChatBotAgent._compose): a live session got ENGLISH replies
+    to messages 2 and 3 below because "kiya"/"tha"/"maine" and
+    "baar"/"firse"/"kariye" weren't in _HINGLISH_MARKERS. All four real
+    transcript messages must classify as Hinglish, or this exact regression
+    is back."""
+    assert _latin_language_hint("balance kya hai mera") == "Hinglish"
+    assert _latin_language_hint("deposit kiya tha maine") == "Hinglish"
+    assert _latin_language_hint("ek baar firse check kariye") == "Hinglish"
+    assert _latin_language_hint("balance check karo fir se") == "Hinglish"
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        # -- Real transcript (regression-pinned above too; kept here for the
+        # table-driven view) --
+        ("balance kya hai mera", "Hinglish"),
+        ("deposit kiya tha maine", "Hinglish"),
+        ("ek baar firse check kariye", "Hinglish"),
+        ("balance check karo fir se", "Hinglish"),
+        # -- Realistic English support queries: must NOT flip to Hinglish.
+        # This is bug #1's mirror image — a greedy lexicon here would
+        # reintroduce it from the other direction. --
+        ("what is my balance", "English"),
+        ("I made a deposit but it is not showing", "English"),
+        ("can you check again please", "English"),
+        ("how long does a withdrawal take", "English"),
+        # -- Short-token collision guard: "hai" is the shortest marker in
+        # _HINGLISH_MARKERS and short enough that substring matching would
+        # false-positive on it inside other words ("me"/"to"/"is"/"are"
+        # aren't markers at all, so they can't false-positive regardless of
+        # matching strategy — this only tests the one short token that
+        # actually is). Whole-word matching (re.findall + set membership)
+        # must not be fooled by "hai" sitting inside "Shahid" or "chahiye",
+        # or by "to" inside "auto"/"tomorrow" if "to" were ever added. --
+        ("Shahid can you help me", "English"),
+        ("I need to top up my auto-pay tomorrow", "English"),
+        # -- Ambiguous/mixed: one Hindi marker embedded in an otherwise
+        # English sentence is still a real Hinglish signal, not noise — the
+        # customer is code-switching, and the marker lexicon is curated
+        # precisely so a single genuine hit can be trusted. --
+        ("please check karo my balance again", "Hinglish"),
+        # -- Very short / marker-free: too little evidence either way, so
+        # the classifier deliberately abstains (None) rather than guessing —
+        # the caller falls back to following the conversation's established
+        # language instead of forcing a switch on a bare ack. --
+        ("ok", None),
+        ("thanks", None),
+        ("balance", None),  # single word, no marker — abstain, not "English"
+    ],
+)
+def test_latin_language_hint_table(text: str, expected: str | None) -> None:
+    assert _latin_language_hint(text) == expected
+
+
 @pytest.mark.asyncio
 async def test_romanized_hindi_message_gets_firm_hinglish_directive(retriever) -> None:
     llm = FakeLLM({

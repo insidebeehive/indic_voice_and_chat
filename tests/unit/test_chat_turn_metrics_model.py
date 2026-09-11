@@ -210,3 +210,95 @@ async def test_record_chat_turn_metric_truncates_overlong_tool_name(sessionmaker
     assert len(tools) == 1
     assert len(tools[0].tool_name) == 100
     assert tools[0].tool_name == overlong_name[:100]
+
+
+async def test_record_chat_turn_metric_round_trips_token_counts(sessionmaker, monkeypatch) -> None:
+    """The three token-count columns (input_tokens/output_tokens/cached_tokens,
+    added alongside llm_calls to answer "is prompt caching actually
+    happening") must flow through record_chat_turn_metric's metrics dict like
+    every other int column on this table."""
+    monkeypatch.setattr("src.models.chat_turn_metrics.get_sessionmaker", lambda: sessionmaker)
+
+    await record_chat_turn_metric(
+        tenant_id="dev", crm_id=None, session_id="chat_tokens", trace_id=None,
+        path="tools", llm_provider="p", llm_model="m", action="continue",
+        metrics=_metrics_dict(input_tokens=1200, output_tokens=340, cached_tokens=900),
+        tools=[],
+    )
+
+    async with sessionmaker() as db:
+        row = (await db.execute(select(ChatTurnMetric))).scalars().one()
+
+    assert row.input_tokens == 1200
+    assert row.output_tokens == 340
+    assert row.cached_tokens == 900
+
+
+async def test_record_chat_turn_metric_defaults_token_counts_when_absent(
+    sessionmaker, monkeypatch,
+) -> None:
+    """An older/mismatched caller whose metrics dict predates the token-count
+    columns must not raise -- record_chat_turn_metric reads them with
+    ``.get(..., 0)``, same as every other field, so a partial dict degrades
+    to 0 rather than a KeyError."""
+    monkeypatch.setattr("src.models.chat_turn_metrics.get_sessionmaker", lambda: sessionmaker)
+
+    metrics = _metrics_dict()
+    assert "input_tokens" not in metrics  # sanity: simulating the old shape
+
+    await record_chat_turn_metric(
+        tenant_id="dev", crm_id=None, session_id="chat_no_tokens", trace_id=None,
+        path="tools", llm_provider="p", llm_model="m", action="continue",
+        metrics=metrics,
+        tools=[],
+    )
+
+    async with sessionmaker() as db:
+        row = (await db.execute(select(ChatTurnMetric))).scalars().one()
+
+    assert row.input_tokens == 0
+    assert row.output_tokens == 0
+    assert row.cached_tokens == 0
+
+
+# Mirrors tests/unit/test_chat_metrics_push.py's _TURN_DEFAULTS -- deliberately
+# NOT importing that one (this file shouldn't reach into another test
+# module's private fixtures) and deliberately NOT including the three new
+# token columns, so this dict doubles as the "pre-existing caller" fixture
+# for the ORM-level default assertion below.
+_TURN_DEFAULTS_NO_TOKENS = dict(
+    tenant_id="dev", crm_id="betstudio", session_id="cs_1", trace_id="tr_1",
+    path="tools", llm_provider="GeminiLLMAdapter", llm_model="gemini-2.0-flash",
+    action="continue", total_ms=0, llm_total_ms=0, llm_calls=0, tool_total_ms=0,
+    tool_calls=0, tool_failures=0, tool_timeouts=0, tool_calls_skipped=0,
+    kb_search_ms=0, kb_searches=0, retrieved_chunks=0, rounds=0,
+    rounds_exhausted=False, retry_fired=False, failure_directive_fired=False,
+    failure_directive_escalated=False, guard_hallucination_fired=False,
+    guard_no_grounding_fired=False, guard_unverified_data_fired=False, escalated=False,
+)
+
+
+async def test_chat_turn_metric_orm_defaults_token_counts_to_zero(sessionmaker) -> None:
+    """A directly-constructed ChatTurnMetric (bypassing record_chat_turn_metric
+    entirely, the way tests/unit/test_chat_metrics_push.py's _seed_turn helper
+    does) that omits input_tokens/output_tokens/cached_tokens must still
+    insert cleanly, proving the ORM-level ``default=0`` on the model itself
+    -- not just record_chat_turn_metric's ``.get(..., 0)`` or the migration's
+    server_default -- is what makes this column safe for any caller."""
+    assert "input_tokens" not in _TURN_DEFAULTS_NO_TOKENS  # sanity: no token keys here
+
+    async with sessionmaker() as db:
+        row = ChatTurnMetric(**_TURN_DEFAULTS_NO_TOKENS)
+        db.add(row)
+        await db.flush()
+        await db.commit()
+        row_id = row.id
+
+    async with sessionmaker() as db:
+        fetched = (
+            await db.execute(select(ChatTurnMetric).where(ChatTurnMetric.id == row_id))
+        ).scalars().one()
+
+    assert fetched.input_tokens == 0
+    assert fetched.output_tokens == 0
+    assert fetched.cached_tokens == 0

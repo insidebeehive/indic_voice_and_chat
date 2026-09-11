@@ -424,6 +424,8 @@ class GeminiLLMAdapter(ILLMProvider):
         return {
             "prompt_tokens": getattr(u, "prompt_token_count", 0) or 0,
             "completion_tokens": getattr(u, "candidates_token_count", 0) or 0,
+            # Optional — absent on older SDK responses or when nothing was cached.
+            "cached_tokens": getattr(u, "cached_content_token_count", 0) or 0,
         }
 
     @staticmethod

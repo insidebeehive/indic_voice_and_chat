@@ -12,16 +12,26 @@ import pytest
 from src.interfaces.llm import LLMConfig, LLMMessage, ToolCall, ToolSpec
 from src.providers.llm.openai_compat import OpenAICompatLLMAdapter
 
+_UNSET = object()
+
 
 def _response(text: str | None = "ok", finish: str = "stop",
-              tool_calls: list | None = None) -> SimpleNamespace:
-    """Fake openai ChatCompletion response shape."""
+              tool_calls: list | None = None, usage: Any = _UNSET) -> SimpleNamespace:
+    """Fake openai ChatCompletion response shape.
+
+    ``usage=_UNSET`` (the sentinel) builds a CompletionUsage-like object
+    with no ``prompt_tokens_details`` attribute at all, matching a vLLM
+    server that doesn't populate it. Pass an explicit ``usage=None`` or a
+    custom SimpleNamespace to exercise other shapes.
+    """
+    if usage is _UNSET:
+        usage = SimpleNamespace(prompt_tokens=10, completion_tokens=5)
     return SimpleNamespace(
         choices=[SimpleNamespace(
             message=SimpleNamespace(content=text, tool_calls=tool_calls),
             finish_reason=finish,
         )],
-        usage=SimpleNamespace(prompt_tokens=10, completion_tokens=5),
+        usage=usage,
     )
 
 
@@ -48,12 +58,44 @@ async def test_generate_returns_text_usage_and_finish() -> None:
     )
     assert result.text == '{"x": 1}'
     assert result.finish_reason == "stop"
-    assert result.usage == {"prompt_tokens": 10, "completion_tokens": 5}
+    # No prompt_tokens_details on the fake usage -> falls back to 0, not a raise.
+    assert result.usage == {"prompt_tokens": 10, "completion_tokens": 5, "cached_tokens": 0}
     kwargs = client.chat.completions.create.await_args.kwargs
     assert kwargs["model"] == "test-model"
     assert kwargs["messages"][0] == {"role": "system", "content": "be terse"}
     assert kwargs["temperature"] == 0.4
     assert kwargs["max_tokens"] == 128
+
+
+@pytest.mark.asyncio
+async def test_generate_reports_cached_tokens_when_present() -> None:
+    usage = SimpleNamespace(prompt_tokens=10, completion_tokens=5,
+                            prompt_tokens_details=SimpleNamespace(cached_tokens=4))
+    client = _make_client(return_value=_response("ok", usage=usage))
+    adapter = OpenAICompatLLMAdapter({"client": client})
+    result = await adapter.generate([LLMMessage(role="user", content="hi")], LLMConfig())
+    assert result.usage["cached_tokens"] == 4
+
+
+@pytest.mark.asyncio
+async def test_generate_cached_tokens_none_falls_back_to_zero() -> None:
+    # prompt_tokens_details present, but its cached_tokens field is itself
+    # None (vLLM may populate the wrapper without the count) -> must be 0,
+    # not None, not a raise.
+    usage = SimpleNamespace(prompt_tokens=10, completion_tokens=5,
+                            prompt_tokens_details=SimpleNamespace(cached_tokens=None))
+    client = _make_client(return_value=_response("ok", usage=usage))
+    adapter = OpenAICompatLLMAdapter({"client": client})
+    result = await adapter.generate([LLMMessage(role="user", content="hi")], LLMConfig())
+    assert result.usage["cached_tokens"] == 0
+
+
+@pytest.mark.asyncio
+async def test_generate_usage_none_yields_empty_usage_dict() -> None:
+    client = _make_client(return_value=_response("ok", usage=None))
+    adapter = OpenAICompatLLMAdapter({"client": client})
+    result = await adapter.generate([LLMMessage(role="user", content="hi")], LLMConfig())
+    assert result.usage == {}
 
 
 @pytest.mark.asyncio

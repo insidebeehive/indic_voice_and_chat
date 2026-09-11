@@ -128,11 +128,16 @@ async def test_ws_failure_rows_excluded_from_averages_but_visible_separately(ctx
     not silently drag down the numbers for turns that did."""
     client, sm = ctx
     for total_ms in (1000, 1000):
-        await _seed_turn(sm, total_ms=total_ms, llm_total_ms=1000, rounds=2)
+        await _seed_turn(
+            sm, total_ms=total_ms, llm_total_ms=1000, rounds=2,
+            input_tokens=100, output_tokens=20, cached_tokens=10,
+        )
     # A WS-layer timeout row: only total_ms + the failure-marker action are
-    # real; everything else stays at its dataclass default (0/False).
+    # real; everything else stays at its dataclass default (0/False), which
+    # for the new token columns means input/output/cached_tokens=0 too.
     await _seed_turn(
         sm, total_ms=90000, llm_total_ms=0, rounds=0, action="failed_timeout",
+        input_tokens=999999, output_tokens=999999, cached_tokens=999999,
     )
 
     resp = await client.get("/tenants/dev/chat-turn-metrics", headers=ADMIN_HEADERS)
@@ -148,6 +153,45 @@ async def test_ws_failure_rows_excluded_from_averages_but_visible_separately(ctx
     assert turns["avg_llm_total_ms"] == 1000.0
     assert turns["avg_rounds"] == 2.0
     assert turns["p95_total_ms"] == 1000
+    # Same exclusion for the new token averages/ratio -- if the failure row's
+    # 999999 token counts leaked in, these would be wildly higher than 100/
+    # 20/10/10.0.
+    assert turns["avg_input_tokens"] == 100.0
+    assert turns["avg_output_tokens"] == 20.0
+    assert turns["avg_cached_tokens"] == 10.0
+    assert turns["cache_hit_rate_pct"] == 10.0
+
+
+async def test_token_averages(ctx) -> None:
+    client, sm = ctx
+    await _seed_turn(sm, input_tokens=100, output_tokens=20, cached_tokens=10)
+    await _seed_turn(sm, input_tokens=300, output_tokens=40, cached_tokens=30)
+
+    resp = await client.get("/tenants/dev/chat-turn-metrics", headers=ADMIN_HEADERS)
+    assert resp.status_code == 200, resp.text
+    turns = resp.json()["turns"]
+    assert turns["avg_input_tokens"] == 200.0  # (100+300)/2
+    assert turns["avg_output_tokens"] == 30.0  # (20+40)/2
+    assert turns["avg_cached_tokens"] == 20.0  # (10+30)/2
+    # sum(cached)/sum(input) = (10+30)/(100+300) = 10.0%
+    assert turns["cache_hit_rate_pct"] == 10.0
+
+
+async def test_cache_hit_rate_is_ratio_of_sums_not_average_of_ratios(ctx) -> None:
+    """cache_hit_rate_pct MUST be sum(cached_tokens)/sum(input_tokens), not an
+    average of each turn's own cached/input ratio -- averaging per-turn
+    ratios over-weights low-token turns. A 10-token turn with a 100% hit and
+    a 1000-token turn with a 0% hit average to a misleading 50%, but the
+    ratio of sums (10 / 1010) correctly reports ~1.0%."""
+    client, sm = ctx
+    await _seed_turn(sm, input_tokens=10, cached_tokens=10)
+    await _seed_turn(sm, input_tokens=1000, cached_tokens=0)
+
+    resp = await client.get("/tenants/dev/chat-turn-metrics", headers=ADMIN_HEADERS)
+    assert resp.status_code == 200, resp.text
+    turns = resp.json()["turns"]
+    assert turns["cache_hit_rate_pct"] == round(10 * 100 / 1010, 1)
+    assert turns["cache_hit_rate_pct"] != 50.0
 
 
 async def test_window_h_excludes_out_of_window_rows(ctx) -> None:

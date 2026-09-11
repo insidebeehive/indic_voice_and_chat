@@ -1185,6 +1185,14 @@ class ChatTurnMetricsTurns(BaseModel):
     avg_llm_total_ms: float
     avg_tool_total_ms: float
     avg_kb_search_ms: float
+    avg_input_tokens: float
+    avg_output_tokens: float
+    avg_cached_tokens: float
+    # Ratio of SUMS (sum(cached_tokens) / sum(input_tokens)), NOT an average
+    # of per-turn ratios -- averaging per-turn ratios over-weights low-token
+    # turns (a 2-token turn with an incidental 100% "hit" would count the
+    # same as a 5000-token turn with a real 98% hit rate).
+    cache_hit_rate_pct: float
     avg_rounds: float
     rounds_exhausted_rate_pct: float
     retry_fired_rate_pct: float
@@ -1311,6 +1319,13 @@ async def tenant_chat_turn_metrics(
             _h_avg(ChatTurnMetric.llm_total_ms),
             _h_avg(ChatTurnMetric.tool_total_ms),
             _h_avg(ChatTurnMetric.kb_search_ms),
+            _h_avg(ChatTurnMetric.input_tokens),
+            _h_avg(ChatTurnMetric.output_tokens),
+            _h_avg(ChatTurnMetric.cached_tokens),
+            # Summed (not averaged) so cache_hit_rate_pct below can be a
+            # ratio-of-sums -- see ChatTurnMetricsTurns.cache_hit_rate_pct.
+            func.sum(case((healthy, ChatTurnMetric.input_tokens), else_=0)),
+            func.sum(case((healthy, ChatTurnMetric.cached_tokens), else_=0)),
             _h_avg(ChatTurnMetric.rounds),
             _h_cond_sum(ChatTurnMetric.rounds_exhausted.is_(True)),
             _h_cond_sum(ChatTurnMetric.retry_fired.is_(True)),
@@ -1323,7 +1338,8 @@ async def tenant_chat_turn_metrics(
         ).where(*turn_filter)
     )).one()
     (
-        samples, n_failed_turns, avg_total, avg_llm_total, avg_tool_total, avg_kb_search, avg_rounds,
+        samples, n_failed_turns, avg_total, avg_llm_total, avg_tool_total, avg_kb_search,
+        avg_input_tok, avg_output_tok, avg_cached_tok, sum_input_tok, sum_cached_tok, avg_rounds,
         n_rounds_exhausted, n_retry_fired, n_failure_directive, n_guard_hallucination,
         n_guard_no_grounding, n_guard_unverified, n_escalated, n_tool_failure,
     ) = agg
@@ -1333,6 +1349,11 @@ async def tenant_chat_turn_metrics(
 
     def _rate_pct(n: object) -> float:
         return round(int(n or 0) * 100 / samples, 1) if samples else 0.0
+
+    sum_input_tok = int(sum_input_tok or 0)
+    cache_hit_rate_pct = (
+        round(int(sum_cached_tok or 0) * 100 / sum_input_tok, 1) if sum_input_tok else 0.0
+    )
 
     total_ms_values = sorted((await session.execute(
         select(ChatTurnMetric.total_ms).where(*turn_filter, healthy)
@@ -1348,6 +1369,10 @@ async def tenant_chat_turn_metrics(
         avg_llm_total_ms=round(float(avg_llm_total or 0.0), 1),
         avg_tool_total_ms=round(float(avg_tool_total or 0.0), 1),
         avg_kb_search_ms=round(float(avg_kb_search or 0.0), 1),
+        avg_input_tokens=round(float(avg_input_tok or 0.0), 1),
+        avg_output_tokens=round(float(avg_output_tok or 0.0), 1),
+        avg_cached_tokens=round(float(avg_cached_tok or 0.0), 1),
+        cache_hit_rate_pct=cache_hit_rate_pct,
         avg_rounds=round(float(avg_rounds or 0.0), 2),
         rounds_exhausted_rate_pct=_rate_pct(n_rounds_exhausted),
         retry_fired_rate_pct=_rate_pct(n_retry_fired),

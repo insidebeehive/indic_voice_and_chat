@@ -44,6 +44,19 @@ _FINISH_REASONS = {
 }
 
 
+def _cached_prompt_tokens(usage: Any) -> int:
+    """Cached-prompt-token count from a CompletionUsage, defensively.
+
+    ``prompt_tokens_details`` and its ``cached_tokens`` field are both
+    Optional — a self-hosted vLLM OpenAI-compatible server may not populate
+    either layer even when real OpenAI would.
+    """
+    details = getattr(usage, "prompt_tokens_details", None)
+    if details is None:
+        return 0
+    return getattr(details, "cached_tokens", 0) or 0
+
+
 def _text_of(content: Any) -> str:
     """Flatten our message content (str or ContentPart list) to plain text."""
     if isinstance(content, str):
@@ -145,7 +158,8 @@ class OpenAICompatLLMAdapter(ILLMProvider):
         usage: dict[str, int] = {}
         if resp.usage is not None:
             usage = {"prompt_tokens": resp.usage.prompt_tokens,
-                     "completion_tokens": resp.usage.completion_tokens}
+                     "completion_tokens": resp.usage.completion_tokens,
+                     "cached_tokens": _cached_prompt_tokens(resp.usage)}
         return LLMResult(
             text=choice.message.content or "",
             finish_reason=_FINISH_REASONS.get(choice.finish_reason or "stop", "stop"),

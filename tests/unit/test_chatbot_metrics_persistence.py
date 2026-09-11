@@ -138,6 +138,98 @@ async def test_two_round_tool_turn_emits_correct_parent_and_child_payload(retrie
         }
 
 
+async def test_cached_tokens_sum_across_tool_rounds_in_emitted_payload(retriever) -> None:
+    """Each round's LLMResult carries a different cached_tokens value -- the
+    emitted payload's metrics.cached_tokens must be the SUM across every
+    round, not just the first (or last) call's value."""
+    async def crm_exec(tc: ToolCall, *, timeout_s: float = 0.0) -> dict:
+        return {"balance": 500}
+
+    crm_tools = [ToolSpec(name="get_player_wallet", description="wallet",
+                          parameters={"type": "object", "properties": {}})]
+    llm = ScriptedLLM([
+        LLMResult(text="", finish_reason="tool_calls", tool_calls=[
+            ToolCall(id="t1", name="get_player_wallet", arguments={})],
+            usage={"prompt_tokens": 50, "completion_tokens": 5, "cached_tokens": 20}),
+        LLMResult(text="Your balance is ₹500.", finish_reason="stop",
+                  usage={"prompt_tokens": 60, "completion_tokens": 8, "cached_tokens": 15}),
+    ])
+    recorder = RecordingMetric()
+    agent = _agent(llm, retriever, crm_tools=crm_tools, crm_executor=crm_exec,
+                   record_metric=recorder)
+    await agent.handle_message("what's my balance?")
+
+    assert len(recorder.calls) == 1
+    m = recorder.calls[0]["metrics"]
+    assert m["input_tokens"] == 110
+    assert m["output_tokens"] == 13
+    assert m["cached_tokens"] == 35  # 20 + 15, summed across both rounds
+
+
+async def test_cached_tokens_accumulate_through_rounds_exhausted_forced_final_answer(
+    retriever,
+) -> None:
+    """Rounds-exhausted path: every LLM call, including the forced final
+    answer generated OUTSIDE the round loop's for-else, must contribute its
+    cached_tokens to the total."""
+    async def crm_exec(tc: ToolCall, *, timeout_s: float = 0.0) -> dict:
+        return {"error": "timed out", "failure": "timeout"}
+
+    crm_tools = [ToolSpec(name="get_player_transactions", description="txns",
+                          parameters={"type": "object", "properties": {}})]
+    llm = ScriptedLLM([
+        LLMResult(text="", finish_reason="tool_calls", tool_calls=[
+            ToolCall(id="t1", name="get_player_transactions", arguments={})],
+            usage={"prompt_tokens": 10, "completion_tokens": 1, "cached_tokens": 5}),
+        LLMResult(text="", finish_reason="tool_calls", tool_calls=[
+            ToolCall(id="t2", name="get_player_transactions", arguments={})],
+            usage={"prompt_tokens": 20, "completion_tokens": 2, "cached_tokens": 7}),
+        # max_tool_rounds default is 2 -- the loop's `else` branch (forced
+        # final answer) fires for this third call.
+        LLMResult(text="I can't verify this right now, let me connect you to a human.",
+                  finish_reason="stop",
+                  usage={"prompt_tokens": 30, "completion_tokens": 12, "cached_tokens": 3}),
+    ])
+    recorder = RecordingMetric()
+    agent = _agent(llm, retriever, crm_tools=crm_tools, crm_executor=crm_exec,
+                   record_metric=recorder)
+    await asyncio.wait_for(agent.handle_message("where is my ₹19,600 withdrawal?"), timeout=5.0)
+
+    assert len(recorder.calls) == 1
+    m = recorder.calls[0]["metrics"]
+    assert m["rounds_exhausted"] is True
+    assert m["cached_tokens"] == 15  # 5 + 7 + 3
+
+
+async def test_cached_tokens_accumulate_through_explicit_retry_path(retriever) -> None:
+    """The unusable-final-answer retry branch (tools path) must contribute
+    its own cached_tokens on top of every round that ran before it."""
+    async def crm_exec(tc: ToolCall, *, timeout_s: float = 0.0) -> dict:
+        return {"status": "settled", "result": "won"}
+
+    crm_tools = [ToolSpec(name="get_matka_bids", description="Get Matka bids",
+                          parameters={"type": "object", "properties": {}})]
+    llm = ScriptedLLM([
+        LLMResult(text="", finish_reason="tool_calls", tool_calls=[
+            ToolCall(id="t1", name="get_matka_bids", arguments={"status": "settled"})],
+            usage={"prompt_tokens": 10, "completion_tokens": 1, "cached_tokens": 4}),
+        # Final synthesis: empty text -> unusable -> fires the explicit retry.
+        LLMResult(text="", finish_reason="stop",
+                  usage={"prompt_tokens": 20, "completion_tokens": 0, "cached_tokens": 6}),
+        LLMResult(text="Your last Matka bid was settled as a win.", finish_reason="stop",
+                  usage={"prompt_tokens": 25, "completion_tokens": 9, "cached_tokens": 9}),
+    ])
+    recorder = RecordingMetric()
+    agent = _agent(llm, retriever, crm_tools=crm_tools, crm_executor=crm_exec,
+                   record_metric=recorder)
+    await agent.handle_message("meri jeet credit kyu nahi hui?")
+
+    assert len(recorder.calls) == 1
+    m = recorder.calls[0]["metrics"]
+    assert m["retry_fired"] is True
+    assert m["cached_tokens"] == 19  # 4 + 6 + 9
+
+
 async def test_timeout_turn_emits_timeout_outcome_and_directive_flag(retriever, monkeypatch) -> None:
     monkeypatch.setattr(chatbot_mod, "_TOOL_BUDGET_S", 0.05)
     monkeypatch.setattr(chatbot_mod, "_TOOL_CALL_CEILING_S", 0.05)

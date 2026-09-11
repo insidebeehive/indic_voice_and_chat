@@ -11,19 +11,27 @@ from src.providers.llm.gemini import GeminiLLMAdapter
 
 
 def _response(text: str, finish_reason: str = "STOP",
-              prompt_tokens: int = 10, completion_tokens: int = 5) -> SimpleNamespace:
-    """Build a fake response shape mirroring google.genai's GenerateContentResponse."""
+              prompt_tokens: int = 10, completion_tokens: int = 5,
+              cached_tokens: int | None = None) -> SimpleNamespace:
+    """Build a fake response shape mirroring google.genai's GenerateContentResponse.
+
+    ``cached_tokens=None`` (the default) omits ``cached_content_token_count``
+    from usage_metadata entirely, matching older SDK responses / no cache hit.
+    """
     candidate = SimpleNamespace(
         content=SimpleNamespace(parts=[SimpleNamespace(text=text)]),
         finish_reason=SimpleNamespace(name=finish_reason),
     )
+    usage_kwargs = dict(
+        prompt_token_count=prompt_tokens,
+        candidates_token_count=completion_tokens,
+    )
+    if cached_tokens is not None:
+        usage_kwargs["cached_content_token_count"] = cached_tokens
     return SimpleNamespace(
         text=text,
         candidates=[candidate],
-        usage_metadata=SimpleNamespace(
-            prompt_token_count=prompt_tokens,
-            candidates_token_count=completion_tokens,
-        ),
+        usage_metadata=SimpleNamespace(**usage_kwargs),
     )
 
 
@@ -64,12 +72,26 @@ async def test_generate_returns_text_and_usage() -> None:
     )
     assert result.text == '{"x": 1}'
     assert result.finish_reason == "stop"
-    assert result.usage == {"prompt_tokens": 10, "completion_tokens": 5}
+    # No cached_content_token_count on the fake response -> falls back to 0,
+    # not a raise.
+    assert result.usage == {"prompt_tokens": 10, "completion_tokens": 5, "cached_tokens": 0}
 
     call_kwargs = client.aio.models.generate_content.await_args.kwargs
     assert call_kwargs["model"] == "gemini-2.0-flash"
     assert call_kwargs["config"]["temperature"] == 0.4
     assert call_kwargs["config"]["max_output_tokens"] == 128
+
+
+@pytest.mark.asyncio
+async def test_generate_reports_cached_tokens_when_present() -> None:
+    client = _make_client(generate_return=_response("hi", cached_tokens=7))
+    adapter = GeminiLLMAdapter({"client": client, "model": "gemini-2.0-flash"})
+
+    result = await adapter.generate(
+        [LLMMessage(role="user", content="hi")],
+        LLMConfig(model="gemini-2.0-flash"),
+    )
+    assert result.usage["cached_tokens"] == 7
 
 
 @pytest.mark.asyncio

@@ -352,6 +352,26 @@ def _detect_script(text: str) -> str | None:
 # with English words ("do", "ho", "par", "se", "the", "kar"…) — a false
 # positive would flip an English reply into Hinglish. Word-boundary matched,
 # lowercase.
+#
+# 4th recurrence of this bug class (see the history comment above
+# _compose): "deposit kiya tha maine" and "ek baar firse check kariye" were
+# both misread as English because none of their Hindi tokens were in this
+# set. Fix: "kiya" (past-tense "did") and "firse"/"kariye" ("again"/
+# imperative "do") below — each alone is enough to catch its message, so
+# that's the whole addition. Deliberately NOT adding "tha"/"maine"/"baar"/
+# bare "fir", even though they appear in the same two messages: they're
+# redundant for fixing this bug (the messages already match via the tokens
+# above) and each carries a real collision risk that isn't worth it for zero
+# marginal benefit — "maine" is the US state ("I live in Maine"), "tha" is a
+# plausible fast-typed truncation of "that"/"thanks", and "fir" collides
+# with FIR (First Information Report — the police-complaint term customers
+# use in fraud/chargeback disputes on this platform), which would flip an
+# English fraud complaint into a forced Hinglish reply. "firse" (this
+# transcript's concatenated one-word spelling) is safe from that collision
+# since matching is whole-word, not substring — see the note in
+# _latin_language_hint. The two-word spelling "fir se" is an accepted gap:
+# it isn't in any observed transcript, and covering it would mean adding
+# bare "fir" back.
 _HINGLISH_MARKERS = frozenset({
     "kya", "hai", "hain", "mera", "mere", "meri", "nahi", "nahin", "kaise",
     "kaisa", "karo", "raha", "rahi", "rahe", "aap", "aapka", "aapki", "kab",
@@ -361,6 +381,7 @@ _HINGLISH_MARKERS = frozenset({
     "jaldi", "madad", "shukriya", "dhanyavaad", "haan", "theek", "thik",
     "accha", "acha", "bolo", "suno", "dekho", "milega", "milegi", "karna",
     "kahan", "kaun", "kaunsa", "toh", "abhi", "kardo", "krdo", "karde",
+    "kiya", "firse", "kariye",
 })
 
 
@@ -374,9 +395,22 @@ def _latin_language_hint(text: str) -> str | None:
     replying in Hinglish even to plain English ("tell me about this site").
     The classification must be deterministic so the directive can be firm.
     """
+    # Word-boundary matched (re.findall splits on non-letter chars, so this
+    # is whole-token membership, never a substring check) — a substring test
+    # would call "hai" a hit inside "chahiye" or "Shahid", or "to" a hit
+    # inside "auto", which is exactly how a classifier starts mislabeling
+    # English as Hinglish.
     words = [w for w in re.findall(r"[a-z']+", text.lower()) if w]
     if not words:
         return None
+    # One marker hit is enough — no weighing against total word count. The
+    # marker set is curated (see _HINGLISH_MARKERS above) to exclude every
+    # token that collides with common English vocabulary, so a single hit is
+    # already low-noise signal; requiring N hits or a marker/word ratio would
+    # only suppress genuine short Hinglish messages ("deposit kiya" — 2
+    # words, 1 marker) without buying back any real precision, since the
+    # false-positive risk lives in the lexicon's contents, not in how many
+    # times it matches.
     if any(w in _HINGLISH_MARKERS for w in words):
         return "Hinglish"
     if len(words) >= 3:
@@ -391,15 +425,21 @@ def _chunk_source(chunk: RetrievedChunk) -> str:
     return f"{fn}:{page}" if page is not None else str(fn)
 
 
-def _usage_tokens(result: LLMResult | None) -> tuple[int, int]:
-    """(prompt_tokens, completion_tokens) from an LLMResult, defensively —
-    ``LLMResult.usage`` is typed as a dict but at least one adapter
-    (openai_compat, pre-fix) has been seen to pass ``None``; treat that (and a
-    None result, e.g. a failed retry) as ``{}`` rather than raising."""
+def _usage_tokens(result: LLMResult | None) -> tuple[int, int, int]:
+    """(prompt_tokens, completion_tokens, cached_tokens) from an LLMResult,
+    defensively — ``LLMResult.usage`` is typed as a dict but at least one
+    adapter (openai_compat, pre-fix) has been seen to pass ``None``; treat
+    that (and a None result, e.g. a failed retry) as ``{}`` rather than
+    raising. ``cached_tokens`` reflects prompt-cache hits when the underlying
+    provider populates it; absent/None is treated as 0, not an error."""
     if result is None:
-        return 0, 0
+        return 0, 0, 0
     usage = result.usage or {}
-    return usage.get("prompt_tokens", 0) or 0, usage.get("completion_tokens", 0) or 0
+    return (
+        usage.get("prompt_tokens", 0) or 0,
+        usage.get("completion_tokens", 0) or 0,
+        usage.get("cached_tokens", 0) or 0,
+    )
 
 
 @dataclass(frozen=True)
@@ -431,6 +471,14 @@ class ChatTurnMetrics:
     total_ms: int
     llm_total_ms: int
     llm_calls: int
+    # Added to answer "is prompt caching actually happening": input_tokens/
+    # output_tokens are the turn's summed LLM usage (all rounds + retries),
+    # cached_tokens is the subset of input_tokens the provider reported as
+    # served from its prompt cache -- cached_tokens should always be
+    # <= input_tokens.
+    input_tokens: int
+    output_tokens: int
+    cached_tokens: int
     # Budgeted CRM tool time only (tool_elapsed_s * 1000) -- directly
     # comparable to _TOOL_BUDGET_S. KB search is deliberately excluded (see
     # kb_search_ms/kb_searches below) since it draws from its own independent
@@ -617,6 +665,9 @@ class ChatBotAgent(BaseAgent):
                     "total_ms": metrics.total_ms,
                     "llm_total_ms": metrics.llm_total_ms,
                     "llm_calls": metrics.llm_calls,
+                    "input_tokens": metrics.input_tokens,
+                    "output_tokens": metrics.output_tokens,
+                    "cached_tokens": metrics.cached_tokens,
                     "tool_total_ms": metrics.tool_total_ms,
                     "tool_calls": metrics.tool_calls,
                     "tool_failures": metrics.tool_failures,
@@ -693,7 +744,7 @@ class ChatBotAgent(BaseAgent):
         llm_start = time.perf_counter()
         result = await self._llm.generate(messages, self._llm_config)
         llm_ms_list = [(time.perf_counter() - llm_start) * 1000]
-        in_tok, out_tok = _usage_tokens(result)
+        in_tok, out_tok, cached_tok = _usage_tokens(result)
         response = parse_chatbot_response(result.text)
         retry_fired = False
         # Only retry a genuinely unusable turn — one where the parser had to
@@ -713,9 +764,10 @@ class ChatBotAgent(BaseAgent):
                 result.finish_reason, messages, self._llm_config,
             )
             llm_ms_list.append(retry_ms)
-            retry_in, retry_out = _usage_tokens(retried_result)
+            retry_in, retry_out, retry_cached = _usage_tokens(retried_result)
             in_tok += retry_in
             out_tok += retry_out
+            cached_tok += retry_cached
             if retried_result is not None:
                 # Adopt whatever the retry produces unconditionally — including
                 # legitimate plain (non-JSON) text, which parse_chatbot_response
@@ -755,6 +807,9 @@ class ChatBotAgent(BaseAgent):
                 total_ms=round(total_ms),
                 llm_total_ms=llm_total_ms_val,
                 llm_calls=len(llm_ms_list),
+                input_tokens=in_tok,
+                output_tokens=out_tok,
+                cached_tokens=cached_tok,
                 tool_total_ms=0,
                 tool_calls=0,
                 tool_failures=0,
@@ -868,6 +923,7 @@ class ChatBotAgent(BaseAgent):
         text = ""
         in_tok = 0
         out_tok = 0
+        cached_tok = 0
         # Ticket #1762 fix, Steps 2/3: which CRM-data-tool categories (keyed by
         # tool NAME internally — converted to labels only when building
         # customer-facing/model-facing text) are currently unresolved-failed
@@ -898,9 +954,10 @@ class ChatBotAgent(BaseAgent):
             llm_start = time.perf_counter()
             result = await self._llm.generate(messages, cfg)
             llm_ms_list.append((time.perf_counter() - llm_start) * 1000)
-            _round_in, _round_out = _usage_tokens(result)
+            _round_in, _round_out, _round_cached = _usage_tokens(result)
             in_tok += _round_in
             out_tok += _round_out
+            cached_tok += _round_cached
             log.debug(
                 "chatbot llm turn: finish=%s usage=%s text_len=%d tool_calls=%d",
                 result.finish_reason, result.usage, len(result.text or ""), len(result.tool_calls),
@@ -1036,9 +1093,10 @@ class ChatBotAgent(BaseAgent):
                 messages, LLMConfig(temperature=cfg.temperature, max_tokens=cfg.max_tokens,
                                     response_format="text"))
             llm_ms_list.append((time.perf_counter() - llm_start) * 1000)
-            _forced_in, _forced_out = _usage_tokens(result)
+            _forced_in, _forced_out, _forced_cached = _usage_tokens(result)
             in_tok += _forced_in
             out_tok += _forced_out
+            cached_tok += _forced_cached
             text = result.text
 
         # Step 3: advance the consecutive-turn-failure counters for the NEXT
@@ -1089,9 +1147,10 @@ class ChatBotAgent(BaseAgent):
                 result.finish_reason, messages, retry_cfg,
             )
             llm_ms_list.append(retry_ms)
-            _retry_in, _retry_out = _usage_tokens(retried)
+            _retry_in, _retry_out, _retry_cached = _usage_tokens(retried)
             in_tok += _retry_in
             out_tok += _retry_out
+            cached_tok += _retry_cached
             if retried is not None:
                 # Adopt whatever the retry produces unconditionally — including
                 # legitimate plain (non-JSON) text, which parse_chatbot_response
@@ -1203,6 +1262,9 @@ class ChatBotAgent(BaseAgent):
                 total_ms=round(total_ms),
                 llm_total_ms=llm_total_ms_val,
                 llm_calls=len(llm_ms_list),
+                input_tokens=in_tok,
+                output_tokens=out_tok,
+                cached_tokens=cached_tok,
                 # Budgeted CRM total only (tool_elapsed_s * 1000) — directly
                 # comparable to _TOOL_BUDGET_S. KB search is excluded (see
                 # kb_search_ms below): it draws from its own independent

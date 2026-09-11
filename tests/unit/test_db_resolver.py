@@ -135,6 +135,37 @@ async def test_resolver_denormalizes_crm_pronunciation_overrides(sm):
     assert unlinked.settings.pronunciation_overrides is None
 
 
+@pytest.mark.asyncio
+async def test_undecryptable_secret_is_skipped_without_killing_the_reload(sm):
+    """Regression for the `extra={"name": ...}` LogRecord collision: a tenant
+    secret that fails to decrypt (e.g. VOX_SECRET_KEY rotated/absent) used to
+    blow up the except-handler itself (`KeyError: "Attempt to overwrite
+    'name' in LogRecord"`), aborting reload() for every tenant, not just the
+    broken one. One good secret + one corrupt secret on the same tenant must
+    still let reload() return cleanly, keeping the good secret and skipping
+    the bad one."""
+    async with sm() as s:
+        s.add(Tenant(
+            id="t_acme", slug="acme", name="Acme", status="active",
+            timezone="Asia/Kolkata", default_language="hi", mode="layered",
+            max_concurrent_calls=1, pipeline_config={}))
+        s.add(TenantSecret(tenant_id="t_acme", name="twilio_sid",
+                            value_encrypted=crypto.encrypt("AC-real-sid")))
+        s.add(TenantSecret(tenant_id="t_acme", name="twilio_token",
+                            value_encrypted="not-a-valid-fernet-token"))
+        await s.commit()
+
+    r = DbTenantResolver(sm)
+    # Without the fix, this raises KeyError from inside the logging call
+    # instead of returning cleanly.
+    assert await r.reload() == 1
+
+    ctx = await r.resolve_by_slug("acme")
+    assert ctx is not None
+    assert ctx.secrets_resolved["twilio_sid"] == "AC-real-sid"
+    assert "twilio_token" not in ctx.secrets_resolved
+
+
 def test_secret_optional_tenant_then_env_then_none(monkeypatch):
     """Optional secrets (e.g. webhook signing) resolve from the decrypted per-tenant
     secrets first, then process env, and return None (NOT raise) when unset."""

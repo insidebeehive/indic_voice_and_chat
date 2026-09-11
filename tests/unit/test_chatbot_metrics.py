@@ -17,7 +17,7 @@ import pytest
 
 from src.agents import chatbot as chatbot_mod
 from src.agents.base import AgentSession
-from src.agents.chatbot import ChatBotAgent
+from src.agents.chatbot import ChatBotAgent, _usage_tokens
 from src.interfaces.llm import ILLMProvider, LLMMessage, LLMResult, ToolCall, ToolSpec
 from src.interfaces.vector_store import Document
 from src.providers.vector_store.faiss_store import FAISSAdapter
@@ -353,6 +353,68 @@ async def test_single_shot_path_reports_path_and_zero_kb_searches(retriever) -> 
     assert result.metrics is not None
     assert result.metrics.path == "single_shot"
     assert result.metrics.kb_searches == 0
+
+
+# --- Prompt-cache token accounting (_usage_tokens / ChatTurnMetrics) --------
+
+
+async def test_usage_tokens_helper_returns_zero_triple_without_raising() -> None:
+    """Both a None result (e.g. a failed retry) and a result with usage=None
+    (seen from at least one adapter, pre-fix) must degrade to (0, 0, 0)
+    rather than raising."""
+    assert _usage_tokens(None) == (0, 0, 0)
+    assert _usage_tokens(LLMResult(text="x", finish_reason="stop", usage=None)) == (0, 0, 0)
+
+
+async def test_cached_tokens_partial_when_one_call_has_no_usage(retriever) -> None:
+    """One LLMResult with no usage at all (defaults to {} per the dataclass
+    field factory) mixed with one that does -- the usage-less call must
+    contribute exactly 0, never raise, and the other call's cached_tokens
+    must still land correctly in the final total."""
+    llm = ScriptedLLM([
+        # First (unusable, empty) response has no usage set -> defaults to {}.
+        LLMResult(text="", finish_reason="stop"),
+        LLMResult(text="Plan B has 500GB unlimited data.", finish_reason="stop",
+                  usage={"prompt_tokens": 30, "completion_tokens": 6, "cached_tokens": 12}),
+    ])
+    agent = ChatBotAgent(
+        session=AgentSession(session_id="cb-partial-usage"), llm=llm, retriever=retriever,
+        company_name="Acme", language_default="en")  # enable_tools defaults False -> single_shot
+
+    result = await agent.handle_message("Tell me about Plan B")
+
+    assert result.metrics is not None
+    assert result.metrics.retry_fired is True
+    assert result.metrics.input_tokens == 30
+    assert result.metrics.output_tokens == 6
+    assert result.metrics.cached_tokens == 12  # 0 (usage-less call) + 12
+
+
+async def test_cached_tokens_from_single_call_single_shot_turn(retriever) -> None:
+    """A plain, single-shot, single-call turn (no retry, no tools) --
+    isolates _single_shot's INITIAL ``_usage_tokens(result)`` accumulation
+    site (the `in_tok, out_tok, cached_tok = ...` unpacking on the first,
+    non-retry call). Unlike test_cached_tokens_partial_when_one_call_has_no_usage
+    (whose first call carries no usage, so it can't tell "correctly
+    contributed 0" from "silently dropped a non-zero value"), this test's
+    one-and-only call carries a distinct nonzero cached_tokens count, so a
+    regression that zeroed out that accumulation would be caught here."""
+    llm = ScriptedLLM([
+        LLMResult(text="Plan B has 500GB unlimited data.", finish_reason="stop",
+                  usage={"prompt_tokens": 40, "completion_tokens": 8, "cached_tokens": 9}),
+    ])
+    agent = ChatBotAgent(
+        session=AgentSession(session_id="cb-single-cached"), llm=llm, retriever=retriever,
+        company_name="Acme", language_default="en")  # enable_tools defaults False -> single_shot
+
+    result = await agent.handle_message("Tell me about Plan B")
+
+    assert result.metrics is not None
+    assert result.metrics.path == "single_shot"
+    assert result.metrics.retry_fired is False
+    assert result.metrics.input_tokens == 40
+    assert result.metrics.output_tokens == 8
+    assert result.metrics.cached_tokens == 9
 
 
 # --- Metrics assembly must never break a live turn --------------------------
