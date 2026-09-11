@@ -32,7 +32,12 @@ from src.chatbot.catalog import OPERATOR_TOOLS, PLAYER_TOOLS
 from src.chatbot.media import prepare_multimodal_content
 from src.chatbot.tools import BUILTIN_TOOLS, ESCALATE, OFFER_CALL, SEARCH_KB, SUBMIT_DEPOSIT_VERIFICATION
 from src.dialogue.context import SessionStore
-from src.dialogue.prompts import build_chatbot_system_prompt
+from src.dialogue.prompts import (
+    SOURCES_CLOSE_MARKER,
+    SOURCES_DATA_WARNING,
+    SOURCES_OPEN_MARKER,
+    build_chatbot_system_prompt,
+)
 from src.dialogue.response_parser import (
     ChatBotResponse,
     is_unusable_response,
@@ -46,6 +51,7 @@ from src.rag.context_builder import (
     apply_no_grounding_guard,
     apply_unverified_data_guard,
     build_rag_context,
+    neutralize_sources_markers,
     search_combined,
 )
 from src.rag.retriever import HybridRetriever, RetrievedChunk
@@ -1335,9 +1341,36 @@ class ChatBotAgent(BaseAgent):
                     "query": args.get("query", ""),
                 })
                 return {"error": "knowledge search is temporarily unavailable", "results": []}, [], None, None
+            # Review Fix 3: on this path (self._enable_tools=True, the production
+            # chat path — see bootstrap.py) rag_context is never built at all
+            # (_handle_with_tools composes the system prompt with an empty
+            # rag_text); KB content instead arrives here as a role="tool"
+            # message (json.dumps(out) a few lines up the call stack). It was
+            # going out completely unwrapped and undelimited. Give it the same
+            # boundary treatment as the prompt builders: the shared SOURCES_*
+            # constants (so this can never drift from build_chatbot_system_prompt
+            # et al — see review Fix 5) and the same marker-neutralisation as
+            # build_rag_context (review Fix 2), per result so a single poisoned
+            # chunk can't taint the others' framing. Deliberately NOT
+            # restructured beyond that — same "results" list shape, same
+            # content/source/score keys, just each content wrapped and a
+            # top-level warning note added once.
             return (
-                {"results": [{"content": c.document.content, "source": _chunk_source(c),
-                              "score": c.score} for c in chunks]},
+                {
+                    "note": SOURCES_DATA_WARNING,
+                    "results": [
+                        {
+                            "content": (
+                                f"{SOURCES_OPEN_MARKER}\n"
+                                f"{neutralize_sources_markers(c.document.content, source=_chunk_source(c))}\n"
+                                f"{SOURCES_CLOSE_MARKER}"
+                            ),
+                            "source": _chunk_source(c),
+                            "score": c.score,
+                        }
+                        for c in chunks
+                    ],
+                },
                 chunks, None, None,
             )
         if tc.name == ESCALATE:

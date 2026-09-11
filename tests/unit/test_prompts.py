@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 
 import yaml
@@ -448,3 +449,188 @@ def test_from_campaign_yaml_parses_pronunciations():
 def test_from_campaign_yaml_pronunciations_defaults_empty():
     script = VoiceBotScript.from_campaign_yaml({"agent_name": "Priya", "company_name": "XYZ"})
     assert script.pronunciations == {}
+
+
+# ── Phase 2: cacheable prefix + injection boundary for retrieved sources ────
+#
+# Provider prompt caching needs a byte-identical prefix across requests. The
+# chatbot and S2S builders used to splice the per-turn RAG/KB block in the
+# middle of the static rules, so only the portion before it could ever be
+# reused. These tests pin: (1) the actual caching precondition — the static
+# body is unaffected by what rag_context/kb_context/extra_directives/the
+# clock contain — so a future edit that reintroduces a variable block
+# mid-prompt fails loudly; (2) the sources block's final position (after all
+# static rules, before extra_directives); and (3) the untrusted-data
+# delimiter around it.
+#
+# Review Fix 4: the original version of test 1 asserted only
+# `common_len >= sources_marker_idx` (common prefix of two rag_context
+# variants reaches the sources marker). That's nearly tautological — since
+# everything upstream of the sources block IS invariant in rag_context by
+# construction, the assertion holds no matter where the marker sits,
+# including its old mid-prompt position (mutation-tested: caught by neither
+# this assertion nor anything else in the old suite). It also missed a new
+# per-turn value rendered mid-prompt, and built its two prompts via separate
+# real-clock calls, so a genuine minute rollover between them could fail it
+# spuriously. Rewritten below to: freeze the clock (no spurious failures);
+# compare prompts differing in BOTH rag_context AND extra_directives (not
+# just one); require the shared prefix be a large FRACTION of the prompt
+# (catches the block moving back to a small mid-prompt position, not just
+# "reaches some marker" which is trivially true at any position); and assert
+# that prefix is exactly what a prompt with NO per-turn inputs at all
+# produces up to the same point (catches anything upstream of the boundary
+# that isn't genuinely invariant). A second test freezes the clock at two
+# DIFFERENT instants with identical per-turn inputs to specifically catch a
+# reintroduced clock-varying block anywhere in the prompt, mid or not.
+
+
+def _freeze_clock(monkeypatch, when) -> None:
+    """Freeze datetime.datetime.now() (used by build_chatbot_system_prompt)
+    to a fixed instant, so a real minute/day rollover between two calls in
+    the same test can never cause a spurious failure. datetime.datetime is a
+    C type and can't be patched in place, so a subclass overriding ``now``
+    is swapped in for the module attribute — build_chatbot_system_prompt
+    does `from datetime import UTC, datetime` INSIDE the function body, so
+    it re-resolves this attribute on every call rather than binding it once
+    at import time, which is what makes this monkeypatch effective at all.
+    """
+    import datetime as _dt_module
+
+    class _Frozen(_dt_module.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return when if tz is None else when.astimezone(tz)
+
+    monkeypatch.setattr(_dt_module, "datetime", _Frozen)
+
+
+def test_chatbot_prompt_static_prefix_is_stable_across_rag_context(monkeypatch) -> None:
+    import datetime as _dt
+
+    _freeze_clock(monkeypatch, _dt.datetime(2026, 1, 15, 10, 30, tzinfo=_dt.UTC))
+
+    prompt_a = build_chatbot_system_prompt(
+        company_name="Acme",
+        rag_context="Doc 1: alpha content only.",
+        extra_directives=["Reply in Hindi."],
+    )
+    prompt_b = build_chatbot_system_prompt(
+        company_name="Acme",
+        rag_context="Doc 2: totally different beta content.",
+        extra_directives=["Reply in Tamil, this turn only."],
+    )
+    prompt_none = build_chatbot_system_prompt(company_name="Acme")
+
+    # Cut right before the sources block's own paragraph starts (its label,
+    # not the marker inside it) — the label text itself is part of what
+    # rag_context being ABSENT (prompt_none) skips entirely, so the marker's
+    # own position would overstate what's shared with prompt_none.
+    stable_prefix = prompt_a[:prompt_a.index("Reference sources —")]
+
+    # (1) Byte-identical up to the boundary despite different rag_context AND
+    # different extra_directives.
+    assert prompt_b.startswith(stable_prefix), (
+        "prompts with different per-turn inputs diverged before the sources "
+        "marker — something upstream of it is no longer invariant"
+    )
+    # (2) That boundary is exactly what a prompt built with NO per-turn
+    # inputs at all produces up to the same point — nothing per-turn sneaks
+    # in upstream of the marker even when it goes unrendered here.
+    assert prompt_none.startswith(stable_prefix), (
+        "the stable prefix isn't what a no-per-turn-input prompt produces — "
+        "something conditioned on rag_context/extra_directives being ABSENT "
+        "changed content upstream of the sources marker"
+    )
+    # (3) The boundary must be a LARGE fraction of the prompt, not just
+    # "reach some marker" — this is what actually catches the sources block
+    # moving back to a small mid-prompt position (a marker index alone is
+    # satisfied trivially at any position).
+    fraction = len(stable_prefix) / len(prompt_a)
+    assert fraction >= 0.85, (
+        f"stable prefix is only {fraction:.1%} of the prompt — the sources "
+        "block is sitting too early for the static body to be a useful "
+        "cacheable prefix"
+    )
+
+
+def test_chatbot_prompt_static_prefix_stable_across_clock_ticks(monkeypatch) -> None:
+    # Same per-turn inputs, two DIFFERENT frozen instants (a different minute
+    # AND a different day) — isolates the clock specifically, so a clock-
+    # varying block reintroduced ANYWHERE in the prompt (not just back at its
+    # original top-of-prompt position) is caught even though the two prompts
+    # above already share every OTHER per-turn input.
+    import datetime as _dt
+
+    kwargs = dict(
+        company_name="Acme",
+        rag_context="Doc 1: alpha content only.",
+        extra_directives=["Reply in Hindi."],
+    )
+    _freeze_clock(monkeypatch, _dt.datetime(2026, 1, 15, 10, 31, tzinfo=_dt.UTC))
+    prompt_t1 = build_chatbot_system_prompt(**kwargs)
+    _freeze_clock(monkeypatch, _dt.datetime(2026, 3, 2, 23, 59, tzinfo=_dt.UTC))
+    prompt_t2 = build_chatbot_system_prompt(**kwargs)
+
+    common_len = len(os.path.commonprefix([prompt_t1, prompt_t2]))
+    fraction = common_len / len(prompt_t1)
+    assert fraction >= 0.85, (
+        f"only {fraction:.1%} of the prompt is stable across a clock tick — "
+        "a clock-varying block was reintroduced somewhere in the prompt"
+    )
+
+
+def test_chatbot_prompt_rag_context_after_static_sections_before_extra_directives() -> None:
+    prompt = build_chatbot_system_prompt(
+        company_name="Acme",
+        rag_context="SENTINEL_RAG_TEXT",
+        extra_directives=["SENTINEL_DIRECTIVE"],
+    )
+    schema_idx = prompt.index("Respond with a single JSON object matching this schema:")
+    sources_idx = prompt.index("SENTINEL_RAG_TEXT")
+    directives_idx = prompt.index("Additional directives:")
+    assert schema_idx < sources_idx < directives_idx
+
+
+def test_chatbot_prompt_delimits_rag_context_as_untrusted_data() -> None:
+    prompt = build_chatbot_system_prompt(
+        company_name="Acme", rag_context="SENTINEL_RAG_TEXT")
+    warn_idx = prompt.index("not instructions")
+    open_idx = prompt.index("<<<SOURCES>>>")
+    close_idx = prompt.index("<<<END SOURCES>>>")
+    sentinel_idx = prompt.index("SENTINEL_RAG_TEXT")
+    # Warning precedes the opening marker, so a top-to-bottom reader is warned
+    # before reaching the untrusted span; the sentinel sits between the markers.
+    assert warn_idx < open_idx < sentinel_idx < close_idx
+
+
+def test_voicebot_prompt_delimits_kb_context_as_untrusted_data() -> None:
+    script = VoiceBotScript.from_campaign_yaml(SCRIPT)
+    schema = SlotSchema.from_campaign_yaml(yaml.safe_load(SLOT_YAML))
+    prompt = build_voicebot_system_prompt(script, schema, kb_context="SENTINEL_KB_TEXT")
+    warn_idx = prompt.index("not instructions")
+    open_idx = prompt.index("<<<SOURCES>>>")
+    close_idx = prompt.index("<<<END SOURCES>>>")
+    sentinel_idx = prompt.index("SENTINEL_KB_TEXT")
+    assert warn_idx < open_idx < sentinel_idx < close_idx
+
+
+def test_s2s_instruction_kb_context_after_tool_control_block() -> None:
+    from src.dialogue.prompts import build_s2s_system_instruction
+    script = VoiceBotScript.from_campaign_yaml(SCRIPT)
+    schema = SlotSchema.from_campaign_yaml(yaml.safe_load(SLOT_YAML))
+    instr = build_s2s_system_instruction(script, schema, kb_context="SENTINEL_KB_TEXT")
+    tool_control_idx = instr.index("record_turn_signal function")
+    sentinel_idx = instr.index("SENTINEL_KB_TEXT")
+    assert tool_control_idx < sentinel_idx
+
+
+def test_s2s_instruction_delimits_kb_context_as_untrusted_data() -> None:
+    from src.dialogue.prompts import build_s2s_system_instruction
+    script = VoiceBotScript.from_campaign_yaml(SCRIPT)
+    schema = SlotSchema.from_campaign_yaml(yaml.safe_load(SLOT_YAML))
+    instr = build_s2s_system_instruction(script, schema, kb_context="SENTINEL_KB_TEXT")
+    warn_idx = instr.index("not instructions")
+    open_idx = instr.index("<<<SOURCES>>>")
+    close_idx = instr.index("<<<END SOURCES>>>")
+    sentinel_idx = instr.index("SENTINEL_KB_TEXT")
+    assert warn_idx < open_idx < sentinel_idx < close_idx

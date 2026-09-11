@@ -21,6 +21,7 @@ import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Optional
 
+from src.dialogue.prompts import SOURCES_CLOSE_MARKER, SOURCES_OPEN_MARKER
 from src.dialogue.response_parser import ChatBotResponse
 from src.interfaces.vector_store import Document
 from src.rag.retriever import RetrievedChunk
@@ -29,6 +30,51 @@ if TYPE_CHECKING:
     from src.rag.retriever import HybridRetriever
 
 log = logging.getLogger(__name__)
+
+# Matches either boundary marker literally. Retrieved KB content is inserted
+# verbatim between SOURCES_OPEN_MARKER/SOURCES_CLOSE_MARKER with nothing else
+# escaping it (see build_rag_context/build_voicebot_kb_context below); a
+# document containing one of these literal strings could forge a close-marker
+# + re-open pair, and the re-open is the dangerous half — pairwise marker
+# parsing treats a segment that opens after a close as OUTSIDE the untrusted
+# span, i.e. as trusted instructions. Only tenant-API-key holders
+# (src/api/knowledge.py) and platform admins (src/api/crm_kb.py) can write KB
+# documents today — no player-controlled path exists — but an operator can
+# still ingest a document authored elsewhere, so we neutralise unconditionally
+# rather than trusting the ingestion path.
+# Deliberately broader than an exact match on the two marker constants. The
+# boundary is enforced by how the MODEL reads the prompt, not by a parser, and
+# a model would plausibly honour "<<< end sources >>>" or "<<<End Sources>>>"
+# as a close marker even though `==` never would. So match any run of three or
+# more angle brackets, in either direction, regardless of case or internal
+# spacing. Legitimate KB text does not contain a "<<<" run -- single brackets
+# ("<b>Withdraw</b>", "x < y", ">5000 needs KYC") are untouched, which is what
+# keeps this from mangling real content. Git conflict markers ("<<<<<<<") are
+# caught too, which is fine and arguably desirable in a KB document.
+_SOURCES_MARKER_PATTERN = re.compile(r"<{3,}[^<>\n]{0,40}>{0,3}|<{0,3}[^<>\n]{0,40}>{3,}")
+
+
+def neutralize_sources_markers(text: str, *, source: str = "") -> str:
+    """Defang a literal boundary-marker string found inside retrieved content.
+
+    Neutralise rather than reject: a legitimate document should never be
+    silently dropped over an incidental substring match. Mangles just the
+    angle brackets of a matched marker into look-alike characters so the
+    string can no longer match SOURCES_OPEN_MARKER/SOURCES_CLOSE_MARKER
+    (and so can't close or re-open the boundary), while staying visually
+    close to the original for anyone reading the raw document. Logs at
+    WARNING when it fires — that's either an attempted prompt injection or a
+    very odd document, and either is worth a log line.
+    """
+    if not text or not _SOURCES_MARKER_PATTERN.search(text):
+        return text
+    log.warning(
+        "retrieved content contained a sources-boundary marker string; neutralising",
+        extra={"source": source},
+    )
+    return _SOURCES_MARKER_PATTERN.sub(
+        lambda m: m.group(0).replace("<", "‹").replace(">", "›"), text
+    )
 
 
 @dataclass
@@ -56,7 +102,7 @@ def build_rag_context(
     used_chars = 0
     for i, c in enumerate(chunks, start=1):
         tag = _source_tag(c)
-        body = c.document.content.strip()
+        body = neutralize_sources_markers(c.document.content.strip(), source=tag)
         block = f"[{i}] {tag}\n{body}"
         if used_chars + len(block) > max_chars and parts:
             break
@@ -190,7 +236,7 @@ async def build_voicebot_kb_context(
     total = 0
     for doc in all_docs:
         fn = _filename(doc)
-        entry = f"[{fn}]\n{doc.content.strip()}"
+        entry = f"[{fn}]\n{neutralize_sources_markers(doc.content.strip(), source=fn)}"
         if total + len(entry) + 2 > max_chars:
             break
         parts.append(entry)
