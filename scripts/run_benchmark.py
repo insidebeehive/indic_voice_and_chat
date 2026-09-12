@@ -74,19 +74,40 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="override rag.retrieval.top_k from config for this run "
              "(defaults to the config value when omitted)")
     p_retrieval.add_argument(
-        "--strategy", choices=["dense", "hybrid"], default=None,
+        "--strategy", choices=["dense", "hybrid", "rrf"], default=None,
         help="override rag.retrieval.strategy from config for this run. "
              "NOTE: when strategy is 'dense', --bm25-weight/--dense-weight are "
              "never read by HybridRetriever.search (src/rag/retriever.py) -- "
-             "the CLI warns if you pass them together with a dense strategy.")
+             "the CLI warns if you pass them together with a dense strategy. "
+             "'rrf' fuses by per-arm rank instead of normalized score, still "
+             "reads --bm25-weight/--dense-weight (they multiply the "
+             "reciprocal-rank terms), additionally reads --rrf-k, and refuses "
+             "a nonzero --similarity-threshold.")
     p_retrieval.add_argument(
         "--bm25-weight", type=float, default=None,
         help="override rag.retrieval.bm25_weight from config for this run "
-             "(no-op if the strategy in force is 'dense' -- see --strategy)")
+             "(no-op if the strategy in force is 'dense' -- see --strategy). "
+             "under 'rrf' this multiplies the reciprocal-rank term rather "
+             "than a min-max-normalised score -- see --strategy")
     p_retrieval.add_argument(
         "--dense-weight", type=float, default=None,
         help="override rag.retrieval.dense_weight from config for this run "
-             "(no-op if the strategy in force is 'dense' -- see --strategy)")
+             "(no-op if the strategy in force is 'dense' -- see --strategy). "
+             "under 'rrf' this multiplies the reciprocal-rank term rather "
+             "than a min-max-normalised score -- see --strategy")
+    p_retrieval.add_argument(
+        "--rrf-k", type=int, default=None,
+        help="override rag.retrieval.rrf_k (the RRF smoothing constant) for this run. "
+             "Only read when the strategy in force is 'rrf' -- the CLI warns if you "
+             "pass it with dense/hybrid. Larger k flattens the gap between rank 1 and "
+             "later ranks; the config default is 60.")
+    p_retrieval.add_argument(
+        "--query-task-type", default=None,
+        help="embed queries with this Gemini task_type (e.g. RETRIEVAL_QUERY). MUST "
+             "match the --document-task-type the target index was built with "
+             "(scripts/build_experiment_index.py): querying a RETRIEVAL_DOCUMENT index "
+             "with an untyped query mixes two encodings and measures the mismatch, not "
+             "retrieval quality. Omit for the live index, which is untyped.")
     p_retrieval.add_argument(
         "--similarity-threshold", type=float, default=None,
         help="override rag.retrieval.similarity_threshold from config for this run")
@@ -112,6 +133,21 @@ def _build_arg_parser() -> argparse.ArgumentParser:
              "hydration and unindexed-sample detection. A logged WARNING "
              "means this run returned exactly this many chunks, i.e. the "
              "corpus may be larger and got truncated by the cap")
+    p_retrieval.add_argument(
+        "--max-context-chars", type=int, default=2000,
+        help="char budget passed to build_rag_context (src/rag/context_"
+             "builder.py, not modified) when scoring context_recall/"
+             "chunks_in_context -- i.e. how much of the retrieved-chunk text "
+             "actually reaches the LLM before truncation. Defaults to 2000 "
+             "to match ChatBotAgent's ACTUAL runtime default "
+             "(src/agents/chatbot.py's max_context_chars=2000) -- "
+             "deliberately NOT build_rag_context's own signature default of "
+             "4000, since the agent overrides it. That silent mismatch is "
+             "exactly what let recall_at_k (scored against the full "
+             "retrieved list) read as healthy while ranks 2-10 were being "
+             "truncated away before the LLM ever saw them; pass this "
+             "explicitly if the deployment under test configures a "
+             "different budget")
     p_retrieval.add_argument(
         "--tenant-id", default=None,
         help="scope the retriever to one tenant's KB (pgvector only). "
@@ -180,11 +216,8 @@ async def _run(args: argparse.Namespace) -> int:
         # empty -- a --bm25-weight sweep over an empty sparse index would
         # silently degrade to dense-only for every sample and report
         # meaningless numbers with no error. Hydrate from the persistent
-        # dense store and refuse to run if that comes back empty. Gated on
-        # strategy == "hybrid": HybridRetriever.search never touches the BM25
-        # arm in dense mode (src/rag/retriever.py), so hydrating it (or
-        # refusing to run when it can't be hydrated) for a --strategy dense
-        # run rejects a legitimate run for a reason that doesn't apply to it.
+        # dense store and refuse to run if that comes back empty (see the
+        # hydration gate below for which strategies this applies to).
         if retriever.config.strategy == "dense" and (
             args.bm25_weight is not None or args.dense_weight is not None
         ):
@@ -195,7 +228,20 @@ async def _run(args: argparse.Namespace) -> int:
                 "-- every point in this sweep will return identical numbers.",
                 file=sys.stderr,
             )
-        if retriever.config.strategy == "hybrid":
+        if args.rrf_k is not None and retriever.config.strategy != "rrf":
+            print(
+                f"retrieval CLI: WARNING -- --rrf-k is supplied but the strategy in "
+                f"force is '{retriever.config.strategy}'; rrf_k is read only by the "
+                f"'rrf' fusion path (src/rag/retriever.py) -- it changes nothing in "
+                f"this run.",
+                file=sys.stderr,
+            )
+        # Gated on strategy in ("hybrid", "rrf"): HybridRetriever.search never
+        # touches the BM25 arm in dense mode (src/rag/retriever.py), so
+        # hydrating it (or refusing to run when it can't be hydrated) for a
+        # --strategy dense run rejects a legitimate run for a reason that
+        # doesn't apply to it.
+        if retriever.config.strategy in ("hybrid", "rrf"):
             try:
                 hydrated = await retriever.hydrate_sparse_from_persistent(max_chunks=args.max_chunks)
             except Exception as e:  # noqa: BLE001
@@ -204,7 +250,7 @@ async def _run(args: argparse.Namespace) -> int:
             if hydrated == 0:
                 print(
                     "retrieval CLI: BM25 hydration loaded 0 chunks from the persistent "
-                    "store -- refusing to run a hybrid/bm25 benchmark against an empty "
+                    "store -- refusing to run a hybrid/rrf benchmark against an empty "
                     "sparse index (results would silently read as dense-only). Check "
                     "--tenant-id/--crm-id/--index-path and that the store has been "
                     "ingested into.",
@@ -217,6 +263,7 @@ async def _run(args: argparse.Namespace) -> int:
         # -- args.top_k is None whenever the flag was omitted.
         run_kwargs: dict[str, Any] = {
             "top_k": retriever.config.top_k, "tier_filter": args.tier, "max_chunks": args.max_chunks,
+            "max_context_chars": args.max_context_chars,
         }
         if args.fp_threshold is not None:
             run_kwargs["fp_threshold"] = args.fp_threshold
@@ -227,11 +274,22 @@ async def _run(args: argparse.Namespace) -> int:
             return 2
         n = write_retrieval_csv(args.out, result)
         meta_path = retrieval_csv_meta_path(args.out)
+        # RetrievalBenchmarkResult (src/benchmarks, untouched) carries no
+        # rrf_k field, so this console line -- sourced from the retriever's
+        # own config, not the result -- is the only provenance for it. Only
+        # emit it for 'rrf' runs: rrf_k is inert for dense/hybrid (see the
+        # --rrf-k WARNING above) and printing it unconditionally there is
+        # misleading.
+        rrf_k_fragment = (
+            f"rrf_k={retriever.config.rrf_k} " if retriever.config.strategy == "rrf" else ""
+        )
         print(
             f"wrote {n} rows to {args.out} (config/provenance in {meta_path}); "
             f"strategy={result.strategy} top_k={result.top_k} "
+            f"{rrf_k_fragment}"
             f"bm25_weight={result.bm25_weight} dense_weight={result.dense_weight} "
             f"similarity_threshold={result.similarity_threshold} "
+            f"max_context_chars={result.max_context_chars} "
             f"fp_threshold={result.fp_threshold}"
         )
         fp_rate_str = (
@@ -239,9 +297,17 @@ async def _run(args: argparse.Namespace) -> int:
             if result.false_positive_rate is None
             else f"{result.false_positive_rate:.4f}"
         )
+        # recall_at_k (scored against the full retrieved list) next to
+        # context_recall (scored against what build_rag_context actually
+        # admits) and chunks_in_context_mean -- someone sweeping --top-k
+        # needs to see, in this one line, that raising it past what
+        # max_context_chars admits moves recall_mean without moving
+        # context_recall_mean or chunks_in_context_mean at all.
         print(
             f"precision_mean={result.precision_mean:.4f} "
             f"recall_mean={result.recall_mean:.4f} "
+            f"context_recall_mean={result.context_recall_mean:.4f} "
+            f"chunks_in_context_mean={result.chunks_in_context_mean:.4f} "
             f"mrr_mean={result.mrr_mean:.4f} "
             f"file_hit_rate={result.file_hit_rate:.4f} "
             f"false_positive_rate={fp_rate_str} "
@@ -293,11 +359,20 @@ def _build_retriever_for_cli(args: argparse.Namespace):
     search, for backends like pgvector that connect lazily) is left to
     propagate with its own message; the caller wraps both in a clear
     operator-facing print.
+
+    The ``validate_retrieval_config`` call at the end can itself raise
+    ``ValueError`` (e.g. ``--strategy rrf --similarity-threshold 0.3``) --
+    that is intentionally left to propagate to the caller's ``except`` above,
+    same as any other failure in this function.
     """
     from src.config import load_settings
     from src.providers import get_vector_store
     from src.rag.embeddings import GeminiEmbedder
-    from src.rag.retriever import HybridRetriever, retrieval_config_from_settings
+    from src.rag.retriever import (
+        HybridRetriever,
+        retrieval_config_from_settings,
+        validate_retrieval_config,
+    )
 
     settings = load_settings()
     vs_cfg: dict[str, Any] = settings.pipeline.vector_store.model_dump()
@@ -324,10 +399,16 @@ def _build_retriever_for_cli(args: argparse.Namespace):
         retrieval_cfg.bm25_weight = args.bm25_weight
     if args.dense_weight is not None:
         retrieval_cfg.dense_weight = args.dense_weight
+    if args.rrf_k is not None:
+        retrieval_cfg.rrf_k = args.rrf_k
     if args.similarity_threshold is not None:
         retrieval_cfg.similarity_threshold = args.similarity_threshold
     if args.top_k is not None:
         retrieval_cfg.top_k = args.top_k
+    # The overrides above are plain attribute assignments, which bypass
+    # __post_init__ -- re-validate here, otherwise "--strategy rrf
+    # --similarity-threshold 0.3" would build fine and only blow up mid-benchmark.
+    validate_retrieval_config(retrieval_cfg)
 
     vector_store = get_vector_store(vs_cfg)
     return HybridRetriever(
@@ -335,9 +416,16 @@ def _build_retriever_for_cli(args: argparse.Namespace):
         # reads the GEMINI_API_KEY process env var, which a CLI run started
         # from a shell that only has .env does not have. Take it from
         # settings so config resolution is identical to the app's.
+        # --query-task-type must MATCH the task type the target index was built
+        # with (scripts/build_experiment_index.py --document-task-type). Querying
+        # a RETRIEVAL_DOCUMENT index with an untyped query -- or vice versa --
+        # mixes two encodings, and the resulting scores measure the mismatch
+        # rather than retrieval quality. Default None keeps the live index's
+        # untyped encoding, so omitting the flag is always the safe choice.
         embedder=GeminiEmbedder(
             dim=vs_cfg.get("embedding_dim", 384),
             api_key=settings.secrets.GEMINI_API_KEY,
+            query_task_type=args.query_task_type,
         ),
         vector_store=vector_store,
         config=retrieval_cfg,

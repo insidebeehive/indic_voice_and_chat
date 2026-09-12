@@ -110,7 +110,21 @@ class GeminiEmbedder:
     keeps the deploy image slim and reuses the platform GEMINI_API_KEY. Uses
     ``output_dimensionality`` to match the FAISS index dim, and L2-normalizes the
     vectors itself (Gemini does NOT normalize when the output dim is reduced) so
-    cosine == inner product (matches our IndexFlatIP)."""
+    cosine == inner product (matches our IndexFlatIP).
+
+    ``document_task_type`` / ``query_task_type`` are opt-in asymmetric-encoding
+    knobs (``gemini-embedding-001`` supports a ``task_type`` request field, e.g.
+    ``"RETRIEVAL_DOCUMENT"`` / ``"RETRIEVAL_QUERY"`` — verified against the
+    installed ``google-genai`` SDK's own ``EmbedContentConfig`` and its
+    ``tests/models/test_embed_content.py`` request-shape fixtures, not taken
+    from memory). Both default to ``None``, in which case neither
+    ``embed_documents`` nor ``embed_query`` sends a ``task_type`` at all —
+    byte-identical to the pre-existing request shape, which is load-bearing:
+    the live pgvector index was embedded with no task type, so its documents
+    and any query against it MUST keep going through this same symmetric,
+    task-type-free path forever. Only construct an instance with these set
+    when embedding into a *separate* index built for that pairing end-to-end
+    (see scripts/build_experiment_index.py)."""
 
     DEFAULT_MODEL = "gemini-embedding-001"
 
@@ -120,11 +134,15 @@ class GeminiEmbedder:
         dim: int = 384,
         api_key: Optional[str] = None,
         client: object = None,
+        document_task_type: Optional[str] = None,
+        query_task_type: Optional[str] = None,
     ) -> None:
         self.model_name = model_name
         self.dim = dim
         self._api_key = api_key
         self._client = client  # injectable for tests
+        self._document_task_type = document_task_type
+        self._query_task_type = query_task_type
 
     def _ensure_client(self):
         if self._client is not None:
@@ -140,14 +158,20 @@ class GeminiEmbedder:
         self._client = genai.Client(api_key=api_key)
         return self._client
 
-    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+    def _embed(self, texts: list[str], task_type: Optional[str]) -> list[list[float]]:
         if not texts:
             return []
         client = self._ensure_client()
+        config: dict = {"output_dimensionality": self.dim}
+        # Only added when explicitly configured -- an absent key here (not a
+        # key present with value None) is what keeps the default request
+        # shape identical to before this feature existed.
+        if task_type:
+            config["task_type"] = task_type
         resp = client.models.embed_content(
             model=self.model_name,
             contents=texts,
-            config={"output_dimensionality": self.dim},
+            config=config,
         )
         out: list[list[float]] = []
         for emb in (getattr(resp, "embeddings", None) or []):
@@ -155,8 +179,11 @@ class GeminiEmbedder:
             out.append(_l2_normalize(list(values if values is not None else emb)))
         return out
 
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        return self._embed(texts, self._document_task_type)
+
     def embed_query(self, text: str) -> list[float]:
-        return self.embed_documents([text])[0]
+        return self._embed([text], self._query_task_type)[0]
 
 
 # --- helpers -----------------------------------------------------------

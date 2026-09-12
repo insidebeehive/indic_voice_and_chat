@@ -225,6 +225,7 @@ def test_write_retrieval_csv_writes_sidecar_meta_and_dict_reader_aligns(tmp_path
             "sample_id", "query", "lang", "intent", "tier", "unanswerable",
             "unindexed", "retrieved_ids", "precision_at_k", "recall_at_k",
             "reciprocal_rank", "file_hit", "false_positive", "latency_ms",
+            "context_recall", "chunks_in_context",
         ]
         rows = list(reader)
     assert len(rows) == 1
@@ -245,6 +246,7 @@ def test_write_retrieval_csv_writes_sidecar_meta_and_dict_reader_aligns(tmp_path
     assert meta["dense_weight"] == 0.7
     assert meta["similarity_threshold"] == 0.1
     assert meta["fp_threshold"] == 0.5
+    assert meta["max_context_chars"] == 0
 
 
 def test_write_retrieval_csv_marks_unindexed_rows() -> None:

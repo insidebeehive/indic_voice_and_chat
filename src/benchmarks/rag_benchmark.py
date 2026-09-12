@@ -40,7 +40,7 @@ from typing import TYPE_CHECKING, Optional
 
 from src.benchmarks.datasets import RAGSample
 from src.benchmarks.metrics import LatencyStats, latency_stats
-from src.rag.context_builder import search_combined
+from src.rag.context_builder import build_rag_context, search_combined
 from src.rag.embeddings import _tokenize
 from src.rag.retriever import RetrievedChunk
 
@@ -194,6 +194,63 @@ def score_retrieval_spans(
         recall_at_k=recall,
         reciprocal_rank=mrr,
         file_hit=file_hit,
+    )
+
+
+@dataclass
+class ContextRecallScore:
+    context_recall: float
+    chunks_in_context: int
+
+
+def score_context_recall(
+    expected_spans: list[str],
+    retrieved: list[RetrievedChunk],
+    *,
+    max_chars: int,
+) -> ContextRecallScore:
+    """Does each expected span survive ``build_rag_context``'s char-budget
+    truncation, i.e. does it reach the text the LLM actually sees?
+
+    ``score_retrieval_spans`` above scores every chunk the retriever
+    returned; the production agent (``src/agents/chatbot.py``) never sees
+    that -- it sees ``build_rag_context(retrieved, max_chars=...).text``,
+    which stops admitting whole chunks once the running total would exceed
+    ``max_chars`` (``src/rag/context_builder.py``, not modified here, only
+    imported). A high ``recall_at_k`` computed against the full retrieved
+    list can therefore be entirely illusory: the chunk carrying the answer
+    span may have been retrieved at a rank the budget never reaches.
+
+    Reuses ``_normalize_ws`` -- the SAME normaliser ``score_retrieval_spans``
+    uses -- rather than a second one, so a span differing only by
+    newline-vs-space is treated identically by both, and the gap between
+    ``recall_at_k`` and ``context_recall`` reflects truncation, never a
+    normalisation mismatch between the two scorers.
+
+    Denominator is SPANS, not chunks, matching ``score_retrieval_spans``'s
+    ``recall_at_k`` convention -- the two numbers must be directly
+    comparable to make the truncation gap legible.
+
+    ``chunks_in_context`` always reflects ``build_rag_context``'s actual
+    ``chunk_count`` (computed even when ``expected_spans`` is empty), since
+    it exists to expose the budget's binding behaviour independent of any
+    particular sample's spans -- including ``build_rag_context``'s
+    always-admit-the-first-chunk rule (an oversized single chunk alone still
+    yields ``chunk_count == 1``, never 0).
+
+    Callers with ``sample.unanswerable`` set must NOT call this -- same
+    convention as ``score_retrieval_spans``.
+    """
+    context = build_rag_context(retrieved, max_chars=max_chars)
+    context_text = _normalize_ws(context.text)
+    norm_spans = [_normalize_ws(s) for s in expected_spans if _normalize_ws(s)]
+    context_recall = (
+        sum(1 for span in norm_spans if span in context_text) / len(norm_spans)
+        if norm_spans else 0.0
+    )
+    return ContextRecallScore(
+        context_recall=context_recall,
+        chunks_in_context=context.chunk_count,
     )
 
 
@@ -424,6 +481,20 @@ class RetrievalSampleResult:
     file_hit: bool
     latency_ms: float
     tier: Optional[str] = None
+    # Context-level counterpart to recall_at_k -- does each expected span
+    # survive build_rag_context's char-budget truncation into the text the
+    # LLM actually receives, vs. recall_at_k which scores the full retrieved
+    # list regardless of what the agent later discards. See
+    # score_context_recall's docstring. 0.0 placeholder (not a measurement)
+    # on unanswerable/unindexed rows, same convention as recall_at_k.
+    context_recall: float = 0.0
+    # RAGContext.chunk_count from that same build_rag_context call -- how
+    # many of the retrieved chunks actually reached the LLM after
+    # truncation. This is the number that exposes the budget binding: a
+    # --top-k sweep that keeps this flat while recall_at_k climbs means the
+    # extra ranks are being retrieved, scored, and then thrown away. 0
+    # placeholder on unanswerable/unindexed rows, same convention as above.
+    chunks_in_context: int = 0
     # True when this sample's expected_files were never found in the index at
     # all (see run_retrieval_benchmark's unindexed-sample detection below).
     # precision/recall/mrr/file_hit are forced to 0.0/False on this row --
@@ -448,6 +519,24 @@ class RetrievalRunResult:
     mrr_mean: float
     file_hit_rate: float
     latency: LatencyStats
+    # Context-level recall: fraction of expected spans (across all
+    # answerable, non-unindexed samples) that survive build_rag_context's
+    # char-budget truncation into the text the LLM actually receives, vs.
+    # recall_mean which scores the full retrieved list regardless of what
+    # the agent later discards. Span-denominated, same convention as
+    # recall_mean, so the two are directly comparable -- the GAP between
+    # them is the whole point of this metric: a config sweep can report a
+    # rising recall_mean while context_recall_mean stays flat, because
+    # ranks beyond what the char budget admits are retrieved, scored, and
+    # then thrown away before the LLM ever sees them. 0.0 when there are no
+    # answerable samples, matching the other empty-input conventions above.
+    context_recall_mean: float = 0.0
+    # Mean RAGContext.chunk_count across the same sample set -- how many
+    # retrieved chunks actually reached the LLM after truncation, averaged.
+    # This is the number that exposes the budget binding directly: flat
+    # across a --top-k sweep means raising top_k past what the budget admits
+    # buys nothing. 0.0 when there are no answerable samples.
+    chunks_in_context_mean: float = 0.0
     # Mean recall@k grouped by RAGSample.lang / .intent / .tier -- an
     # aggregate mean hides exactly the question this dataset exists to
     # answer (does a Hinglish/Devanagari phrasing of the same intent
@@ -516,6 +605,14 @@ class RetrievalRunResult:
     bm25_weight: float = 0.0
     dense_weight: float = 0.0
     similarity_threshold: float = 0.0
+    # The char budget passed to build_rag_context for context_recall_mean /
+    # chunks_in_context_mean above. Carried here (rather than left implicit)
+    # because the mismatch between this and build_rag_context's OWN
+    # signature default (4000) vs. ChatBotAgent's actual runtime default
+    # (2000, src/agents/chatbot.py) is exactly what made the truncation gap
+    # invisible in the first place -- see run_retrieval_benchmark's
+    # max_context_chars parameter docstring.
+    max_context_chars: int = 0
     per_sample: list[RetrievalSampleResult] = field(default_factory=list)
 
 
@@ -573,6 +670,7 @@ async def run_retrieval_benchmark(
     fp_threshold: Optional[float] = None,
     tier_filter: Optional[str] = None,
     max_chunks: int = 2000,
+    max_context_chars: int = 2000,
 ) -> RetrievalRunResult:
     """Score retrieval quality alone, via ``search_combined`` -- no LLM call,
     no ``ChatBotAgent``. This is the loop meant to run dozens of times while
@@ -584,6 +682,19 @@ async def run_retrieval_benchmark(
     excluded from the precision/recall/MRR means entirely -- folding them in
     would silently inflate those means (an empty/weak retrieval on an
     unanswerable query is the CORRECT outcome, not a miss).
+
+    ``max_context_chars`` -- the char budget every answerable, non-unindexed
+    sample's retrieved chunks are fed through (via ``build_rag_context``,
+    ``src/rag/context_builder.py``, imported not modified) to compute
+    ``context_recall``/``chunks_in_context`` -- see ``score_context_recall``.
+    Defaults to 2000 to match ``ChatBotAgent``'s ACTUAL runtime default
+    (``src/agents/chatbot.py``'s ``max_context_chars: int = 2000``), which is
+    deliberately NOT the same as ``build_rag_context``'s own signature
+    default of 4000 -- the agent overrides it. That silent mismatch is
+    exactly what let ``recall_at_k`` (scored against the full retrieved list)
+    read as healthy while the agent was truncating ranks 2-10 before the LLM
+    ever saw them; pass this explicitly if the deployment under test
+    configures a different budget.
 
     ``fp_threshold`` -- the bar a RAW ``dense_score`` (never the fused
     ``.score`` -- see ``is_false_positive``'s docstring) must clear for a
@@ -645,6 +756,8 @@ async def run_retrieval_benchmark(
     unanswerable_dense_scores: list[float] = []
     answerable_dense_scores: list[float] = []
     unindexed_ids: list[str] = []
+    context_recalls: list[float] = []
+    chunks_in_context_list: list[int] = []
     recall_by_lang: dict[str, list[float]] = defaultdict(list)
     recall_by_intent: dict[str, list[float]] = defaultdict(list)
     recall_by_tier: dict[str, list[float]] = defaultdict(list)
@@ -705,13 +818,23 @@ async def run_retrieval_benchmark(
         if sample.tier:
             recall_by_tier[sample.tier].append(score.recall_at_k)
 
+        # Context-level counterpart: does the same expected span survive
+        # build_rag_context's truncation into what the LLM actually
+        # receives, vs. score_retrieval_spans above which scores the full
+        # (already top-k-capped) retrieved list regardless of the budget.
+        ctx_score = score_context_recall(
+            sample.expected_spans, retrieved, max_chars=max_context_chars)
+        context_recalls.append(ctx_score.context_recall)
+        chunks_in_context_list.append(ctx_score.chunks_in_context)
+
         rows.append(RetrievalSampleResult(
             sample_id=sample.id, query=sample.query, lang=sample.lang,
             intent=sample.intent, unanswerable=False,
             retrieved_ids=retrieved_ids, precision_at_k=score.precision_at_k,
             recall_at_k=score.recall_at_k, reciprocal_rank=score.reciprocal_rank,
             file_hit=score.file_hit, false_positive=None, latency_ms=dt,
-            tier=sample.tier,
+            tier=sample.tier, context_recall=ctx_score.context_recall,
+            chunks_in_context=ctx_score.chunks_in_context,
         ))
 
     cfg = retrievers[0].config if retrievers else None
@@ -723,6 +846,10 @@ async def run_retrieval_benchmark(
         recall_mean=float(mean(recalls)) if recalls else 0.0,
         mrr_mean=float(mean(mrrs)) if mrrs else 0.0,
         file_hit_rate=(file_hit_count / answerable) if answerable else 0.0,
+        context_recall_mean=float(mean(context_recalls)) if context_recalls else 0.0,
+        chunks_in_context_mean=(
+            float(mean(chunks_in_context_list)) if chunks_in_context_list else 0.0
+        ),
         false_positive_rate=(
             None if fp_threshold is None
             else (false_positive_count / unanswerable) if unanswerable else 0.0
@@ -752,5 +879,6 @@ async def run_retrieval_benchmark(
         bm25_weight=cfg.bm25_weight if cfg else 0.0,
         dense_weight=cfg.dense_weight if cfg else 0.0,
         similarity_threshold=cfg.similarity_threshold if cfg else 0.0,
+        max_context_chars=max_context_chars,
         per_sample=rows,
     )

@@ -4,6 +4,7 @@ import io
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from fastapi import FastAPI
@@ -181,6 +182,70 @@ def test_cli_rag_returns_2_until_app_bootstrap(tmp_path: Path, capsys) -> None:
     rag_dataset.write_text("{}\n", encoding="utf-8")
     rc = main(["rag", "--dataset", str(rag_dataset), "--out", str(tmp_path / "x.csv")])
     assert rc == 2
+
+
+def test_cli_retrieval_accepts_rrf_strategy_and_rrf_k() -> None:
+    from scripts.run_benchmark import _build_arg_parser
+
+    parser = _build_arg_parser()
+    args = parser.parse_args(
+        ["retrieval", "--dataset", "x", "--out", "y", "--strategy", "rrf", "--rrf-k", "30"]
+    )
+    assert args.strategy == "rrf"
+    assert args.rrf_k == 30
+
+    args_no_k = parser.parse_args(["retrieval", "--dataset", "x", "--out", "y"])
+    assert args_no_k.rrf_k is None
+
+
+def test_cli_retrieval_rejects_unknown_strategy() -> None:
+    from scripts.run_benchmark import _build_arg_parser
+
+    parser = _build_arg_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            ["retrieval", "--dataset", "x", "--out", "y", "--strategy", "bm25"]
+        )
+
+
+def test_cli_retrieval_validates_config_after_applying_overrides(monkeypatch) -> None:
+    """``_build_retriever_for_cli`` must call ``validate_retrieval_config``
+    AFTER applying the CLI overrides (--strategy/--similarity-threshold/etc.),
+    not before -- otherwise it would validate the pre-override settings and
+    let an invalid combination like --strategy rrf --similarity-threshold 0.3
+    build a retriever instead of raising. This pins that ordering so a future
+    reshuffle of _build_retriever_for_cli regresses this test instead of
+    shipping a silently-inert validation.
+    """
+    import src.config as config_module
+    from scripts.run_benchmark import _build_arg_parser, _build_retriever_for_cli
+    from src.config import RetrievalSettings, VectorStoreConfig
+
+    # A valid settings object on its own (strategy="hybrid", threshold=0.0) --
+    # only the CLI overrides below make it invalid.
+    fake_settings = SimpleNamespace(
+        pipeline=SimpleNamespace(vector_store=VectorStoreConfig(provider="faiss")),
+        secrets=SimpleNamespace(DATABASE_URL=None, GEMINI_API_KEY=None),
+        rag=SimpleNamespace(
+            retrieval=RetrievalSettings(
+                strategy="hybrid",
+                top_k=5,
+                bm25_weight=0.3,
+                dense_weight=0.7,
+                rrf_k=60,
+                similarity_threshold=0.0,
+            )
+        ),
+    )
+    monkeypatch.setattr(config_module, "load_settings", lambda *a, **k: fake_settings)
+
+    args = _build_arg_parser().parse_args(
+        ["retrieval", "--dataset", "x", "--out", "y",
+         "--strategy", "rrf", "--similarity-threshold", "0.3"]
+    )
+
+    with pytest.raises(ValueError, match="similarity_threshold"):
+        _build_retriever_for_cli(args)
 
 
 def test_export_results_script_writes_per_kind_files(tmp_path: Path) -> None:

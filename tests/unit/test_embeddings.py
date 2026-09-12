@@ -102,3 +102,73 @@ def test_gemini_embedder_requires_key_without_client(monkeypatch) -> None:
     monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
     with pytest.raises(RuntimeError):
         GeminiEmbedder().embed_documents(["x"])
+
+
+# --- GeminiEmbedder task_type (asymmetric encoding, opt-in) --------------
+
+
+def test_gemini_embedder_no_task_type_config_is_unchanged() -> None:
+    """Pins the default (no task type configured) request shape byte-for-byte
+    against what shipped before task_type support existed -- this is what
+    protects the live pgvector index and its queries."""
+    from src.rag.embeddings import GeminiEmbedder
+
+    client, calls = _fake_gemini_client(dim=16)
+    emb = GeminiEmbedder(dim=16, client=client)
+
+    emb.embed_documents(["a", "b"])
+    emb.embed_query("q")
+
+    assert len(calls) == 2
+    for call in calls:
+        assert call["config"] == {"output_dimensionality": 16}
+        assert "task_type" not in call["config"]
+
+
+def test_gemini_embedder_document_task_type_sent_for_embed_documents() -> None:
+    from src.rag.embeddings import GeminiEmbedder
+
+    client, calls = _fake_gemini_client(dim=16)
+    emb = GeminiEmbedder(dim=16, client=client, document_task_type="RETRIEVAL_DOCUMENT")
+
+    emb.embed_documents(["a", "b"])
+
+    assert calls[0]["config"] == {
+        "output_dimensionality": 16,
+        "task_type": "RETRIEVAL_DOCUMENT",
+    }
+
+
+def test_gemini_embedder_query_task_type_sent_for_embed_query() -> None:
+    from src.rag.embeddings import GeminiEmbedder
+
+    client, calls = _fake_gemini_client(dim=16)
+    emb = GeminiEmbedder(dim=16, client=client, query_task_type="RETRIEVAL_QUERY")
+
+    emb.embed_query("q")
+
+    assert calls[0]["config"] == {
+        "output_dimensionality": 16,
+        "task_type": "RETRIEVAL_QUERY",
+    }
+
+
+def test_gemini_embedder_document_and_query_task_types_independent() -> None:
+    """Each path sends its own configured task type -- setting one does not
+    leak into the other, and embed_query does not silently delegate to the
+    document-task-typed path."""
+    from src.rag.embeddings import GeminiEmbedder
+
+    client, calls = _fake_gemini_client(dim=16)
+    emb = GeminiEmbedder(
+        dim=16,
+        client=client,
+        document_task_type="RETRIEVAL_DOCUMENT",
+        query_task_type="RETRIEVAL_QUERY",
+    )
+
+    emb.embed_documents(["doc text"])
+    emb.embed_query("query text")
+
+    assert calls[0]["config"]["task_type"] == "RETRIEVAL_DOCUMENT"
+    assert calls[1]["config"]["task_type"] == "RETRIEVAL_QUERY"

@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 import yaml
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -208,17 +208,42 @@ class RetrievalSettings(BaseModel):
     Bridged into the runtime ``src.rag.retriever.RetrievalConfig`` dataclass
     via ``retrieval_config_from_settings`` — this class is never passed to
     ``HybridRetriever`` directly.
+
+    The rrf/similarity_threshold check below duplicates
+    ``src.rag.retriever.validate_retrieval_config`` on purpose: it makes bad
+    YAML fail at ``load_settings()``/startup instead of being swallowed by
+    ``build_crm_retriever``'s ``except Exception`` (src/bootstrap.py) into a
+    silent "no KB".
     """
 
     strategy: str = "hybrid"
     top_k: int = 5
     bm25_weight: float = 0.3
     dense_weight: float = 0.7
+    # Read only under strategy: rrf -- see config/default.yaml's comment for
+    # the full rationale (RRF fuses by rank, not score).
+    rrf_k: int = Field(default=60, ge=1)
     # Must match config/default.yaml's pinned 0.0 (see the comment there for
     # why): this default is now live wherever a config omits the key, so a
     # nonzero default here would silently reintroduce the empty-retrieval
     # failure mode the YAML pin exists to avoid.
     similarity_threshold: float = 0.0
+
+    @model_validator(mode="after")
+    def _rrf_forbids_nonzero_threshold(self) -> "RetrievalSettings":
+        if self.strategy == "rrf" and self.similarity_threshold != 0.0:
+            raise ValueError(
+                "rag.retrieval: strategy='rrf' does not support a nonzero "
+                f"similarity_threshold (got {self.similarity_threshold!r}). "
+                "RRF scores are reciprocal-rank sums on a much smaller scale "
+                "than the 0-1 min-max scale 'hybrid' produces, so a "
+                "hybrid-tuned floor would silently empty every result set. "
+                "Set rag.retrieval.similarity_threshold to 0.0 for RRF and "
+                "bound the result set with top_k -- see "
+                "src.rag.retriever.validate_retrieval_config, this "
+                "validation's runtime twin."
+            )
+        return self
 
 
 class RAGConfig(BaseModel):

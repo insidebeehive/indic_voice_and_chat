@@ -14,8 +14,10 @@ from src.rag.retriever import (
     HybridRetriever,
     RetrievalConfig,
     _fuse,
+    _fuse_rrf,
     _minmax,
     retrieval_config_from_settings,
+    validate_retrieval_config,
 )
 
 
@@ -34,6 +36,7 @@ def test_retrieval_config_from_settings_maps_fields_explicitly() -> None:
         top_k=42,
         bm25_weight=0.11,
         dense_weight=0.89,
+        rrf_k=17,
         similarity_threshold=0.4,
     )
     cfg = retrieval_config_from_settings(settings)
@@ -41,6 +44,7 @@ def test_retrieval_config_from_settings_maps_fields_explicitly() -> None:
     assert cfg.top_k == 42
     assert cfg.bm25_weight == 0.11
     assert cfg.dense_weight == 0.89
+    assert cfg.rrf_k == 17
     assert cfg.similarity_threshold == 0.4  # passed through as configured, not clamped
 
 
@@ -115,6 +119,291 @@ def test_minmax_handles_constant_scores() -> None:
 
 def test_minmax_empty_input() -> None:
     assert _minmax({}) == {}
+
+
+# --- RRF fusion -----------------------------------------------------------
+
+
+def test_rrf_surfaces_bm25_top_hit_that_minmax_fusion_buries_dep001() -> None:
+    """Reproduces the real dep-001 support-query shape: a support query about
+    a bank deduction not reflecting in the wallet balance. The dense arm
+    clusters a handful of semantically-similar-but-wrong docs in a narrow
+    0.63-0.73 score band (an embedding that barely discriminates); the BM25
+    arm has the correct doc as a clear rank-1 lexical match.
+
+    _minmax stretches that narrow dense band across the full 0-1 range,
+    manufacturing a confident-looking gap that _fuse's 0.7 dense weight then
+    multiplies -- burying the correct doc. RRF ignores score magnitude
+    entirely and fuses by rank, so it wins here: the dense-top doc
+    ("wrong-1") is entirely absent from BM25, while the correct doc
+    ("dep-001") is BM25-rank-1 and still present (if dense-last) in the
+    dense arm, so its contributions from both arms add up. This is not a
+    guarantee against every dense/lexical disagreement -- just a fix for
+    this measured shape.
+    """
+    dense_results = [
+        SearchResult(document=Document(id="wrong-1", content="wrong doc 1"), score=0.73),
+        SearchResult(document=Document(id="wrong-2", content="wrong doc 2"), score=0.72),
+        SearchResult(document=Document(id="wrong-3", content="wrong doc 3"), score=0.71),
+        SearchResult(document=Document(id="wrong-4", content="wrong doc 4"), score=0.70),
+        SearchResult(document=Document(id="wrong-5", content="wrong doc 5"), score=0.69),
+        SearchResult(document=Document(id="wrong-6", content="wrong doc 6"), score=0.68),
+        SearchResult(document=Document(id="wrong-7", content="wrong doc 7"), score=0.67),
+        SearchResult(
+            document=Document(id="dep-001", content="bank deduction not reflected in wallet balance"),
+            score=0.63,
+        ),
+    ]
+    bm25_results = [
+        (Document(id="dep-001", content="bank deduction not reflected in wallet balance"), 8.2),
+        (Document(id="filler-1", content="filler"), 1.2),
+        (Document(id="filler-2", content="filler"), 1.0),
+    ]
+
+    fused_hybrid = _fuse(dense_results, bm25_results, dense_weight=0.7, bm25_weight=0.3)
+    assert fused_hybrid[0].document.id == "wrong-1"  # pins the failure: _fuse itself is unchanged
+
+    fused_rrf = _fuse_rrf(dense_results, bm25_results, dense_weight=0.7, bm25_weight=0.3, rrf_k=60)
+    assert fused_rrf[0].document.id == "dep-001"
+
+
+def test_rrf_uses_rank_position_not_score_magnitude() -> None:
+    docs = [Document(id="d1", content="d1"), Document(id="d2", content="d2"), Document(id="d3", content="d3")]
+    dense_a = [SearchResult(document=docs[i], score=s) for i, s in enumerate([0.9, 0.8, 0.7])]
+    dense_b = [SearchResult(document=docs[i], score=s) for i, s in enumerate([900.0, 2.0, 1.0])]
+
+    bdocs = [Document(id="e1", content="e1"), Document(id="e2", content="e2"), Document(id="e3", content="e3")]
+    bm25_a = [(bdocs[i], s) for i, s in enumerate([5.0, 3.0, 1.0])]
+    bm25_b = [(bdocs[i], s) for i, s in enumerate([500.0, 3.1, 1.05])]
+
+    fused_a = _fuse_rrf(dense_a, bm25_a, dense_weight=0.7, bm25_weight=0.3, rrf_k=60)
+    fused_b = _fuse_rrf(dense_b, bm25_b, dense_weight=0.7, bm25_weight=0.3, rrf_k=60)
+
+    assert [rc.document.id for rc in fused_a] == [rc.document.id for rc in fused_b]
+
+    scores_a = {rc.document.id: rc.score for rc in fused_a}
+    scores_b = {rc.document.id: rc.score for rc in fused_b}
+    for doc_id in scores_a:
+        assert scores_a[doc_id] == pytest.approx(scores_b[doc_id])
+
+
+def test_rrf_scores_document_present_in_only_one_arm() -> None:
+    dense_results = [
+        SearchResult(document=Document(id="dense-only", content="x"), score=0.5),
+    ]
+    bm25_results = [
+        (Document(id="bm25-first", content="y"), 5.0),
+        (Document(id="bm25-only", content="z"), 3.0),  # bm25 rank 2 (1-based)
+    ]
+    fused = _fuse_rrf(dense_results, bm25_results, dense_weight=0.7, bm25_weight=0.3, rrf_k=60)
+    by_id = {rc.document.id: rc for rc in fused}
+
+    bm25_only = by_id["bm25-only"]
+    assert bm25_only.score == pytest.approx(0.3 / (60 + 2))
+    assert bm25_only.dense_score is None
+
+    dense_only = by_id["dense-only"]
+    assert dense_only.score == pytest.approx(0.7 / (60 + 1))
+    assert dense_only.bm25_score is None
+
+
+def test_rrf_larger_k_flattens_the_rank1_to_rankn_gap() -> None:
+    dense_results = [
+        SearchResult(document=Document(id="r1", content="r1"), score=0.9),
+        SearchResult(document=Document(id="r2", content="r2"), score=0.8),
+        SearchResult(document=Document(id="r3", content="r3"), score=0.7),
+    ]
+    fused_k1 = _fuse_rrf(dense_results, [], dense_weight=1.0, bm25_weight=0.3, rrf_k=1)
+    fused_k60 = _fuse_rrf(dense_results, [], dense_weight=1.0, bm25_weight=0.3, rrf_k=60)
+
+    scores_k1 = {rc.document.id: rc.score for rc in fused_k1}
+    scores_k60 = {rc.document.id: rc.score for rc in fused_k60}
+
+    ratio_k1 = scores_k1["r1"] / scores_k1["r3"]
+    ratio_k60 = scores_k60["r1"] / scores_k60["r3"]
+    assert ratio_k1 > ratio_k60
+
+    gap_k1 = scores_k1["r1"] - scores_k1["r3"]
+    gap_k60 = scores_k60["r1"] - scores_k60["r3"]
+    assert gap_k60 < gap_k1
+
+    assert [rc.document.id for rc in fused_k1] == ["r1", "r2", "r3"]
+    assert [rc.document.id for rc in fused_k60] == ["r1", "r2", "r3"]
+
+
+def test_rrf_populates_raw_arm_scores_not_rrf_partials() -> None:
+    dense_results = [SearchResult(document=Document(id="a", content="a"), score=0.73)]
+    bm25_results = [(Document(id="a", content="a"), 8.209)]
+    fused = _fuse_rrf(dense_results, bm25_results, dense_weight=0.7, bm25_weight=0.3, rrf_k=60)
+    rc = fused[0]
+    assert rc.dense_score == pytest.approx(0.73)
+    assert rc.bm25_score == pytest.approx(8.209)
+    assert rc.score != pytest.approx(rc.dense_score)
+    assert rc.score != pytest.approx(rc.bm25_score)
+
+
+def test_rrf_weights_scale_each_arms_rank_contribution() -> None:
+    dense_results = [
+        SearchResult(document=Document(id="d1", content="d1"), score=0.9),
+        SearchResult(document=Document(id="d2", content="d2"), score=0.5),
+    ]
+    bm25_results = [
+        (Document(id="d2", content="d2"), 9.0),
+        (Document(id="d1", content="d1"), 1.0),
+    ]
+    dense_only = _fuse_rrf(dense_results, bm25_results, dense_weight=1.0, bm25_weight=0.0, rrf_k=60)
+    assert [rc.document.id for rc in dense_only] == ["d1", "d2"]
+
+    bm25_only = _fuse_rrf(dense_results, bm25_results, dense_weight=0.0, bm25_weight=1.0, rrf_k=60)
+    assert [rc.document.id for rc in bm25_only] == ["d2", "d1"]
+
+    equal = _fuse_rrf(dense_results, bm25_results, dense_weight=1.0, bm25_weight=1.0, rrf_k=60)
+    by_id = {rc.document.id: rc.score for rc in equal}
+    # d1: dense rank 1, bm25 rank 2. d2: dense rank 2, bm25 rank 1.
+    assert by_id["d1"] == pytest.approx(1 / 61 + 1 / 62)
+    assert by_id["d2"] == pytest.approx(1 / 62 + 1 / 61)
+
+
+def test_rrf_asymmetric_weights_scale_arms_independently() -> None:
+    dense_results = [
+        SearchResult(document=Document(id="both", content="both"), score=0.9),
+        SearchResult(document=Document(id="dense-only", content="dense-only"), score=0.5),
+    ]
+    bm25_results = [
+        (Document(id="both", content="both"), 9.0),
+    ]
+
+    asymmetric = _fuse_rrf(dense_results, bm25_results, dense_weight=1.0, bm25_weight=0.5, rrf_k=60)
+    asym_by_id = {rc.document.id: rc.score for rc in asymmetric}
+    # "both" is dense rank 1 and bm25 rank 1.
+    assert asym_by_id["both"] == pytest.approx(1 / 61 + 0.5 / 61)
+
+    equal = _fuse_rrf(dense_results, bm25_results, dense_weight=1.0, bm25_weight=1.0, rrf_k=60)
+    equal_by_id = {rc.document.id: rc.score for rc in equal}
+    assert asym_by_id["both"] != pytest.approx(equal_by_id["both"])
+
+    # Raising bm25_weight should raise "both"'s score relative to a doc that
+    # only ever appears in the dense arm.
+    low_bm25 = _fuse_rrf(dense_results, bm25_results, dense_weight=1.0, bm25_weight=0.1, rrf_k=60)
+    low_by_id = {rc.document.id: rc.score for rc in low_bm25}
+    ratio_low = low_by_id["both"] / low_by_id["dense-only"]
+    ratio_high = asym_by_id["both"] / asym_by_id["dense-only"]
+    assert ratio_high > ratio_low
+
+
+@pytest.mark.asyncio
+async def test_search_rrf_strategy_returns_fused_chunks(store: FAISSAdapter) -> None:
+    retriever = HybridRetriever(
+        embedder=HashEmbedder(dim=64),
+        vector_store=store,
+        config=RetrievalConfig(strategy="rrf", top_k=3, oversample_k=10, similarity_threshold=0.0),
+    )
+    await retriever.index([
+        Document(id="a", content="plan b has 500GB unlimited data"),
+        Document(id="b", content="cooking recipes for biryani"),
+        Document(id="c", content="plan a is the basic 100GB plan"),
+    ])
+    results = await retriever.search("unlimited data plan b", top_k=3)
+    assert results
+    assert any(r.dense_score is not None and r.bm25_score is not None for r in results), (
+        "at least one returned chunk should have been recalled by both arms"
+    )
+
+
+@pytest.mark.asyncio
+async def test_lazy_hydration_runs_for_rrf_strategy() -> None:
+    docs = [
+        Document(id="a", content="plan b has 500GB unlimited data"),
+        Document(id="b", content="cooking recipes for biryani"),
+        Document(id="c", content="plan a is the basic 100GB plan"),
+    ]
+    store = _CountingListDocumentsStore(docs)
+    retriever = HybridRetriever(
+        embedder=HashEmbedder(dim=64),
+        vector_store=store,
+        config=RetrievalConfig(strategy="rrf", top_k=3, oversample_k=10, similarity_threshold=0.0),
+    )
+    assert retriever._bm25.count() == 0
+
+    results = await retriever.search("unlimited data plan b")
+    assert results
+    assert any(r.bm25_score is not None for r in results), (
+        "first rrf search against an empty-BM25/populated-dense retriever "
+        "must self-heal and return fused results"
+    )
+    assert store.list_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_unknown_strategy_still_raises(store: FAISSAdapter) -> None:
+    # Constructing RetrievalConfig(strategy="bm25") must NOT raise from
+    # __post_init__ -- only rrf+nonzero-threshold and rrf_k<1 raise there.
+    cfg = RetrievalConfig(strategy="bm25")
+    retriever = HybridRetriever(embedder=HashEmbedder(dim=64), vector_store=store, config=cfg)
+    with pytest.raises(ValueError, match="unknown retrieval strategy: bm25"):
+        await retriever.search("anything")
+
+
+def test_rrf_with_nonzero_similarity_threshold_refused_at_construction() -> None:
+    with pytest.raises(ValueError, match="similarity_threshold") as exc_info:
+        RetrievalConfig(strategy="rrf", similarity_threshold=0.5)
+    assert "rrf" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_rrf_with_threshold_mutated_after_construction_refused_at_search(store: FAISSAdapter) -> None:
+    cfg = RetrievalConfig(strategy="rrf", top_k=3, oversample_k=10, similarity_threshold=0.0)
+    retriever = HybridRetriever(embedder=HashEmbedder(dim=64), vector_store=store, config=cfg)
+    # Mimics the CLI's pattern of mutating a config's fields after
+    # construction (_build_retriever_for_cli), which bypasses __post_init__.
+    retriever.config.similarity_threshold = 0.3
+    with pytest.raises(ValueError, match="similarity_threshold"):
+        await retriever.search("anything")
+
+
+def test_hybrid_with_nonzero_similarity_threshold_is_still_allowed() -> None:
+    cfg = RetrievalConfig(strategy="hybrid", similarity_threshold=0.99)
+    assert cfg.similarity_threshold == 0.99
+
+
+def test_rrf_k_below_one_is_refused() -> None:
+    with pytest.raises(ValueError):
+        RetrievalConfig(rrf_k=0)
+    with pytest.raises(ValueError):
+        RetrievalConfig(rrf_k=-60)
+
+
+def test_validate_retrieval_config_is_the_public_entry_point_used_by_the_cli() -> None:
+    # scripts/run_benchmark.py's _build_retriever_for_cli calls this directly
+    # (after mutating a config's fields, bypassing __post_init__) -- exercise
+    # that same call shape here rather than only indirectly via construction.
+    valid = RetrievalConfig(strategy="rrf", similarity_threshold=0.0)
+    validate_retrieval_config(valid)  # must not raise
+
+    valid.similarity_threshold = 0.4  # CLI-style post-construction mutation
+    with pytest.raises(ValueError, match="similarity_threshold"):
+        validate_retrieval_config(valid)
+
+
+def test_fuse_hybrid_minmax_scores_are_unchanged_golden() -> None:
+    """Pins _fuse's exact numeric behavior as an explicit regression guard --
+    _fuse must not change at all as part of adding RRF."""
+    dense_results = [
+        SearchResult(document=Document(id="x", content="x"), score=1.0),
+        SearchResult(document=Document(id="y", content="y"), score=5.0),
+        SearchResult(document=Document(id="z", content="z"), score=3.0),
+    ]
+    bm25_results = [
+        (Document(id="z", content="z"), 10.0),
+        (Document(id="w", content="w"), 2.0),
+    ]
+    fused = _fuse(dense_results, bm25_results, dense_weight=0.7, bm25_weight=0.3)
+    scores = {rc.document.id: rc.score for rc in fused}
+    assert scores["y"] == pytest.approx(0.7)
+    assert scores["z"] == pytest.approx(0.65)
+    assert scores["x"] == pytest.approx(0.0)
+    assert scores["w"] == pytest.approx(0.0)
+    assert [rc.document.id for rc in fused] == ["y", "z", "x", "w"]
 
 
 # --- HybridRetriever ----------------------------------------------------

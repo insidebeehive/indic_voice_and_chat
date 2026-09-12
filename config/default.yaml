@@ -69,10 +69,18 @@ rag:
     chunk_size: 500
     chunk_overlap: 100
   retrieval:
-    strategy: hybrid
+    strategy: hybrid  # dense | hybrid | rrf
     top_k: 5
     bm25_weight: 0.3
     dense_weight: 0.7
+    # Read only by strategy: rrf; ignored by dense/hybrid. RRF fuses by rank,
+    # not score (weight / (rrf_k + rank)), 1-based rank within each arm's
+    # already-sorted candidate list. 60 is the conventional default -- larger
+    # k flattens the rank-1-vs-rank-N gap, smaller k makes rank 1 dominate.
+    # bm25_weight/dense_weight above still apply under rrf: they multiply the
+    # reciprocal-rank terms, so set both to 1.0 for textbook unweighted RRF
+    # (the 0.7/0.3 shipped here makes it *weighted* RRF instead).
+    rrf_k: 60
     # Deliberately 0.0, not a "real" threshold: this floor applies to
     # min-max-normalised fusion scores with no reranker in the loop (the
     # reranker was removed as dead code — no PRODUCTION wiring ever
@@ -88,6 +96,14 @@ rag:
     # src/agents/chatbot.py:112-123 (KB search sharing the CRM tool budget and
     # timing out). Raise this only after measuring against the retrieval eval
     # set.
+    #
+    # Under strategy: rrf, any nonzero value here is refused outright at
+    # settings-load and at retriever construction (validate_retrieval_config
+    # in src/rag/retriever.py), because the RRF scale tops out near
+    # (dense_weight + bm25_weight) / (rrf_k + 1) -- about 0.016 at the values
+    # above -- and a hybrid-tuned floor would empty every result set: the
+    # same apply_hallucination_guard hazard the paragraph above already
+    # describes.
     similarity_threshold: 0.0
 
 compliance:

@@ -9,8 +9,11 @@ Indexing is dual-write: every chunk is added to both the dense store and the
 BM25 index in lockstep. The retriever exposes a single ``search(query)`` that:
 
 1. Pulls top ``oversample_k`` candidates from each backend.
-2. Combines them via weighted score fusion (dense_weight + bm25_weight) when
-   ``strategy == "hybrid"``; otherwise uses just the configured backend.
+2. Combines them depending on ``strategy``: ``dense`` reads only the dense
+   arm; ``hybrid`` min-max normalizes each arm's raw scores, then weights and
+   sums them (dense_weight + bm25_weight); ``rrf`` discards raw scores
+   entirely and fuses by each arm's rank order (reciprocal rank fusion) --
+   see ``_fuse`` vs. ``_fuse_rrf`` below.
 3. Drops anything below ``similarity_threshold`` and trims to ``top_k``.
 
 This keeps the API surface small (one ``index``, one ``search``, one
@@ -19,12 +22,12 @@ This keeps the API surface small (one ``index``, one ``search``, one
 Process-local vs. durable state: BM25Index lives only in this process's
 memory. The dense store (FAISS file, pgvector) is durable and shared across
 workers/restarts. ``search()`` self-heals the sparse arm the first time a
-``hybrid``-strategy retriever runs a search, regardless of whether BM25 is
-already non-empty from an in-process ``index()`` call -- an in-process
-``index()`` only covers what this process ingested, a subset of (not a
-mirror of) the persistent corpus -- see ``HybridRetriever`` below for the
-mechanics. ``index()`` remains the eager, dual-write path used by ingestion;
-nothing about the self-heal changes it.
+``hybrid``- or ``rrf``-strategy retriever runs a search, regardless of
+whether BM25 is already non-empty from an in-process ``index()`` call -- an
+in-process ``index()`` only covers what this process ingested, a subset of
+(not a mirror of) the persistent corpus -- see ``HybridRetriever`` below for
+the mechanics. ``index()`` remains the eager, dual-write path used by
+ingestion; nothing about the self-heal changes it.
 
 There used to be a fourth, cross-encoder reranking stage here. It was removed
 (see ``retrieval_config_from_settings`` below and Phase 0 cleanup) because no
@@ -63,12 +66,89 @@ log = logging.getLogger(__name__)
 
 @dataclass
 class RetrievalConfig:
-    strategy: str = "hybrid"          # dense | hybrid
+    """Runtime knobs for ``HybridRetriever.search()``.
+
+    Three strategies, each reading a different subset of the fields below:
+
+    - ``dense``: reads only the dense (FAISS/pgvector) arm. ``bm25_weight``,
+      ``dense_weight``, and ``rrf_k`` are all ignored.
+    - ``hybrid``: min-max normalizes each arm's raw scores to 0-1, then
+      combines them as ``dense_norm * dense_weight + bm25_norm * bm25_weight``
+      (see ``_fuse``). ``rrf_k`` is ignored.
+    - ``rrf``: discards raw scores and fuses by each arm's rank position
+      instead (see ``_fuse_rrf``): ``dense_weight / (rrf_k + rank)`` summed
+      across arms, 1-based rank within that arm's already-sorted list.
+
+    ``bm25_weight``/``dense_weight`` are live under BOTH ``hybrid`` and
+    ``rrf``, but mean different things: under ``hybrid`` they weight
+    min-max-normalized scores; under ``rrf`` they multiply reciprocal-rank
+    terms (``weight / (rrf_k + rank)``). Equal weights under ``rrf`` (e.g.
+    1.0/1.0) give textbook unweighted RRF; the shipped 0.7/0.3 weights make
+    it *weighted* RRF, not textbook RRF -- see the module-level rationale in
+    ``_fuse_rrf`` for why weighting the rank term doesn't reintroduce the
+    failure the ``rrf`` strategy exists to fix.
+
+    ``rrf_k`` is read ONLY by ``rrf`` -- ignored by ``dense``/``hybrid``. Must
+    be >= 1 (enforced by ``validate_retrieval_config``). Larger k flattens
+    the rank-1-vs-rank-N gap (all terms shrink toward each other); smaller k
+    makes rank 1 dominate.
+
+    ``similarity_threshold`` is on a completely different scale per
+    strategy, and a nonzero value under ``rrf`` is REFUSED outright rather
+    than silently applied -- see ``validate_retrieval_config``.
+    """
+
+    strategy: str = "hybrid"          # dense | hybrid | rrf
     top_k: int = 5
     oversample_k: int = 20            # candidates pulled from each backend before fusion
     bm25_weight: float = 0.3
     dense_weight: float = 0.7
+    rrf_k: int = 60
     similarity_threshold: float = 0.0  # final post-fusion floor
+
+    def __post_init__(self) -> None:
+        validate_retrieval_config(self)
+
+
+def validate_retrieval_config(cfg: RetrievalConfig) -> None:
+    """Reject config combinations that would otherwise fail silently.
+
+    Public (not a leading-underscore helper) because ``__post_init__`` alone
+    doesn't catch every construction path: ``scripts/run_benchmark.py``'s
+    ``_build_retriever_for_cli`` builds a config via
+    ``retrieval_config_from_settings`` and then mutates fields on it directly
+    (plain attribute assignment, to apply CLI overrides) -- that bypasses
+    ``__post_init__`` entirely, since it only runs at construction time.
+
+    Called from three places so a bad config is caught wherever it can arise:
+    1. ``RetrievalConfig.__post_init__`` -- every ordinary construction.
+    2. the ``rrf`` arm of ``HybridRetriever.search()`` -- catches
+       post-construction attribute mutation (the CLI's pattern above).
+    3. a pydantic ``@model_validator`` on ``RetrievalSettings``
+       (src/config.py) -- so bad YAML fails at ``load_settings()``/startup
+       rather than being swallowed by ``build_crm_retriever``'s
+       ``except Exception`` (src/bootstrap.py) into a silent "no KB".
+    """
+    if cfg.rrf_k < 1:
+        raise ValueError(
+            f"retrieval config: rrf_k must be >= 1 (got {cfg.rrf_k!r}) -- "
+            "rrf_k <= 0 makes the 1/(rrf_k + rank) term explode, and divides "
+            "by zero at rank == -rrf_k."
+        )
+    if cfg.strategy == "rrf" and cfg.similarity_threshold != 0.0:
+        raise ValueError(
+            "retrieval config: strategy='rrf' does not support a nonzero "
+            f"similarity_threshold (got {cfg.similarity_threshold!r}). RRF "
+            "scores are reciprocal-rank sums bounded by (dense_weight + "
+            "bm25_weight) / (rrf_k + 1) -- about 0.016 at the shipped 0.7/0.3 "
+            "weights and rrf_k=60 -- not the 0-1 min-max scale the 'hybrid' "
+            "strategy produces, so a floor carried over from a hybrid config "
+            "would silently empty every result set instead of filtering weak "
+            "matches. An empty result set disables apply_hallucination_guard "
+            "(see config/default.yaml's rag.retrieval comment). Set "
+            "rag.retrieval.similarity_threshold to 0.0 for RRF and bound the "
+            "result set with top_k."
+        )
 
 
 def retrieval_config_from_settings(settings: RetrievalSettings) -> RetrievalConfig:
@@ -90,6 +170,7 @@ def retrieval_config_from_settings(settings: RetrievalSettings) -> RetrievalConf
         top_k=settings.top_k,
         bm25_weight=settings.bm25_weight,
         dense_weight=settings.dense_weight,
+        rrf_k=settings.rrf_k,
         similarity_threshold=settings.similarity_threshold,
         # oversample_k has no YAML knob (yet) -- keep the dataclass default.
     )
@@ -172,8 +253,8 @@ class HybridRetriever:
     persistent store earlier, so a non-empty BM25 index is not on its own
     proof that BM25 mirrors the full corpus.
 
-    ``search()`` is the self-healing path: on the first ``hybrid`` search
-    against an instance that hasn't yet attempted hydration, it hydrates
+    ``search()`` is the self-healing path: on the first ``hybrid`` or ``rrf``
+    search against an instance that hasn't yet attempted hydration, it hydrates
     BM25 from the persistent store (see ``hydrate_sparse_from_persistent``)
     before running the query -- regardless of whether BM25 is already
     non-empty from an in-process ``index()`` call -- so neither a
@@ -331,11 +412,11 @@ class HybridRetriever:
         return await self._dense.delete(doc_ids)
 
     async def _ensure_sparse_hydrated(self) -> None:
-        """Self-heal the process-local BM25 arm before a ``hybrid`` search,
-        at most once per instance.
+        """Self-heal the process-local BM25 arm before a ``hybrid`` or
+        ``rrf`` search, at most once per instance.
 
-        Called from ``search()`` only on the ``hybrid`` path -- ``dense``
-        never reads BM25, so hydrating for it would be pure waste.
+        Called from ``search()`` only on the ``hybrid`` and ``rrf`` paths --
+        ``dense`` never reads BM25, so hydrating for it would be pure waste.
 
         Invariant: hydration runs at most once per instance, gated ONLY by
         ``_sparse_hydration_attempted`` -- NOT by ``self._bm25.count()``. A
@@ -368,7 +449,10 @@ class HybridRetriever:
         shipped) -- up to 0.3 for the best-matching BM25 hit, less for
         others, but with the shipped ``similarity_threshold: 0.0`` floor,
         even a near-zero one still clears it -- so that deleted chunk can
-        still reach the LLM context via worker B's sparse arm. The moment a
+        still reach the LLM context via worker B's sparse arm. Under ``rrf``
+        the same resurrected chunk scores ``bm25_weight / (rrf_k + rank)``
+        and, with the mandatory 0.0 floor there too, still reaches the LLM
+        context -- i.e. the hazard is identical, not smaller. The moment a
         second process shares a dense store (``--workers`` on uvicorn, or a
         second replica), this needs either cross-process
         BM25 invalidation (e.g. a delete broadcast/pub-sub all workers
@@ -409,15 +493,15 @@ class HybridRetriever:
                 n = await self.hydrate_sparse_from_persistent()
             except Exception:
                 log.exception(
-                    "lazy sparse hydration failed on first hybrid search; "
-                    "continuing with dense-only results for this and all "
-                    "subsequent searches on this retriever instance",
+                    "lazy sparse hydration failed on first fused (hybrid/rrf) "
+                    "search; continuing with dense-only results for this and "
+                    "all subsequent searches on this retriever instance",
                     extra={"store": type(self._dense).__name__},
                 )
             else:
                 log.info(
                     "lazy sparse hydration: populated BM25 with %d chunk(s) "
-                    "from the persistent store on first hybrid search",
+                    "from the persistent store on first fused (hybrid/rrf) search",
                     n,
                     extra={"store": type(self._dense).__name__},
                 )
@@ -439,18 +523,32 @@ class HybridRetriever:
                 RetrievedChunk(document=r.document, score=r.score, dense_score=r.score)
                 for r in dense_results
             ]
-        elif cfg.strategy == "hybrid":
+        elif cfg.strategy in ("hybrid", "rrf"):
+            # Re-validate here (not just __post_init__): callers -- the
+            # benchmark CLI's _build_retriever_for_cli -- mutate a config's
+            # fields in place after construction, which bypasses
+            # __post_init__ entirely.
+            validate_retrieval_config(cfg)
             await self._ensure_sparse_hydrated()
             dense_results, bm25_results = await asyncio.gather(
                 self._dense_search(query, cfg.oversample_k, filters),
                 asyncio.to_thread(self._bm25.search, query, cfg.oversample_k),
             )
-            fused = _fuse(
-                dense_results=dense_results,
-                bm25_results=bm25_results,
-                dense_weight=cfg.dense_weight,
-                bm25_weight=cfg.bm25_weight,
-            )
+            if cfg.strategy == "hybrid":
+                fused = _fuse(
+                    dense_results=dense_results,
+                    bm25_results=bm25_results,
+                    dense_weight=cfg.dense_weight,
+                    bm25_weight=cfg.bm25_weight,
+                )
+            else:
+                fused = _fuse_rrf(
+                    dense_results=dense_results,
+                    bm25_results=bm25_results,
+                    dense_weight=cfg.dense_weight,
+                    bm25_weight=cfg.bm25_weight,
+                    rrf_k=cfg.rrf_k,
+                )
         else:
             raise ValueError(f"unknown retrieval strategy: {cfg.strategy}")
 
@@ -504,6 +602,80 @@ def _fuse(
         d = dense_norm.get(doc_id, 0.0)
         b = bm25_norm.get(doc_id, 0.0)
         rc.score = d * dense_weight + b * bm25_weight
+
+    fused = list(by_id.values())
+    fused.sort(key=lambda rc: rc.score, reverse=True)
+    return fused
+
+
+def _fuse_rrf(
+    dense_results: list[SearchResult],
+    bm25_results: list[tuple[Document, float]],
+    dense_weight: float,
+    bm25_weight: float,
+    rrf_k: int,
+) -> list[RetrievedChunk]:
+    """Reciprocal rank fusion: combine arms by rank position, not score
+    magnitude.
+
+    Weighting is applied to the reciprocal-rank terms, not to scores, so it
+    does not reintroduce the failure this strategy exists to fix. The
+    dep-001 failure was not caused by weighting as such -- it was caused by
+    ``_minmax`` stretching a 0.63-0.73 dense noise band across the full 0-1
+    range, manufacturing a confident-looking gap out of an embedding that
+    barely discriminated, which the 0.7 dense weight then multiplied. Under
+    RRF the per-arm term is a fixed function of rank alone; no property of
+    the data can inflate it, so a constant multiplier on it is a stable,
+    data-independent preference for one arm's ordering rather than an
+    amplifier of a fabricated gap. Keeping the existing two weight fields
+    live under all three strategies also means a weight sweep and the
+    benchmark CSV's weight provenance stay meaningful when the strategy
+    changes -- ignoring them here would make ``bm25_weight=0.6`` silently
+    inert in exactly the runs an operator is most likely to be comparing.
+    Textbook unweighted RRF remains reachable by setting both weights equal
+    (e.g. 1.0/1.0).
+
+    ``dense_score``/``bm25_score`` on the returned ``RetrievedChunk``s are
+    the RAW per-arm scores, never RRF partials -- ``src/benchmarks/
+    rag_benchmark.py`` bars false positives on ``dense_score``, and a
+    partial-score value there would be silently wrong.
+    """
+    # Both input lists arrive already sorted best-first by their backends
+    # (FAISS descending score / pgvector ORDER BY distance / BM25Index.
+    # search's descending sort) so list position IS the rank -- no
+    # re-sorting here, and a backend that stopped sorting would silently
+    # corrupt the ranks.
+    dense_rr = {
+        r.document.id: dense_weight / (rrf_k + i + 1)
+        for i, r in enumerate(dense_results)
+    }
+    bm25_rr = {
+        d.id: bm25_weight / (rrf_k + i + 1)
+        for i, (d, _s) in enumerate(bm25_results)
+    }
+
+    # Same construction as _fuse: dense first (dense_score=r.score), then
+    # bm25 (setting bm25_score=s and inserting BM25-only docs) so insertion
+    # order, tie-breaking, and diagnostic fields match _fuse exactly.
+    by_id: dict[str, RetrievedChunk] = {}
+    for r in dense_results:
+        rc = RetrievedChunk(
+            document=r.document,
+            score=0.0,
+            dense_score=r.score,
+        )
+        by_id[r.document.id] = rc
+    for d, s in bm25_results:
+        rc = by_id.get(d.id)
+        if rc is None:
+            rc = RetrievedChunk(document=d, score=0.0, bm25_score=s)
+            by_id[d.id] = rc
+        rc.bm25_score = s
+
+    for doc_id, rc in by_id.items():
+        # An arm that doesn't contain the doc contributes literally nothing
+        # -- no sentinel rank.
+        rc.score = dense_rr.get(doc_id, 0.0) + bm25_rr.get(doc_id, 0.0)
 
     fused = list(by_id.values())
     fused.sort(key=lambda rc: rc.score, reverse=True)

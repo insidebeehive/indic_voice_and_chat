@@ -198,6 +198,7 @@ def write_retrieval_csv(target: Union[PathLike, io.TextIOBase], result: Retrieva
         "sample_id", "query", "lang", "intent", "tier", "unanswerable",
         "unindexed", "retrieved_ids", "precision_at_k", "recall_at_k",
         "reciprocal_rank", "file_hit", "false_positive", "latency_ms",
+        "context_recall", "chunks_in_context",
     ]
     writer, fh, should_close = _open_writer(target, header)
     n = 0
@@ -215,6 +216,8 @@ def write_retrieval_csv(target: Union[PathLike, io.TextIOBase], result: Retrieva
                 "1" if row.file_hit else "0",
                 "1" if row.false_positive else "0",
                 f"{row.latency_ms:.2f}",
+                f"{row.context_recall:.4f}",
+                row.chunks_in_context,
             ])
             n += 1
     finally:
@@ -229,6 +232,11 @@ def write_retrieval_csv(target: Union[PathLike, io.TextIOBase], result: Retrieva
             "dense_weight": result.dense_weight,
             "similarity_threshold": result.similarity_threshold,
             "fp_threshold": result.fp_threshold,
+            # The char budget context_recall/chunks_in_context were computed
+            # against -- see RetrievalRunResult.max_context_chars's docstring
+            # for why this can't be assumed from build_rag_context's own
+            # signature default.
+            "max_context_chars": result.max_context_chars,
             "sample_count": result.sample_count,
             "answerable_count": result.answerable_count,
             "unanswerable_count": result.unanswerable_count,

@@ -33,6 +33,7 @@ def test_build_crm_retriever_bridges_non_default_top_k(monkeypatch) -> None:
         top_k=17,
         bm25_weight=0.6,
         dense_weight=0.7,
+        rrf_k=60,
         similarity_threshold=0.0,
     )
     fake_settings = SimpleNamespace(rag=SimpleNamespace(retrieval=fake_retrieval_settings))
@@ -61,6 +62,7 @@ def test_build_runtime_registry_bridges_non_default_top_k(monkeypatch) -> None:
         top_k=23,
         bm25_weight=0.6,
         dense_weight=0.7,
+        rrf_k=60,
         similarity_threshold=0.0,
     )
     fake_settings = SimpleNamespace(rag=SimpleNamespace(retrieval=fake_retrieval_settings))
@@ -79,3 +81,28 @@ def test_build_runtime_registry_bridges_non_default_top_k(monkeypatch) -> None:
 
     assert retriever.config.top_k == 23
     assert retriever.config.bm25_weight == 0.6
+
+
+def test_build_crm_retriever_bridges_non_default_rrf_k(monkeypatch) -> None:
+    # strategy="hybrid" to avoid the rrf/nonzero-threshold refusal rule --
+    # this test is only about rrf_k reaching the runtime dataclass.
+    fake_retrieval_settings = SimpleNamespace(
+        strategy="hybrid",
+        top_k=5,
+        bm25_weight=0.3,
+        dense_weight=0.7,
+        rrf_k=13,
+        similarity_threshold=0.0,
+    )
+    fake_settings = SimpleNamespace(rag=SimpleNamespace(retrieval=fake_retrieval_settings))
+    monkeypatch.setattr(config_module, "get_settings", lambda: fake_settings)
+
+    dummy_vector_store = object()
+    monkeypatch.setattr(providers_module, "get_vector_store", lambda cfg: dummy_vector_store)
+
+    retriever = bootstrap.build_crm_retriever(
+        "crm-1", {"vector_store": {"provider": "pgvector"}}
+    )
+
+    assert retriever is not None
+    assert retriever.config.rrf_k == 13

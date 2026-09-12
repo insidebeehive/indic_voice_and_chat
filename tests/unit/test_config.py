@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from src.config import Secrets, load_settings, reset_settings_cache
+import pytest
+from pydantic import ValidationError
+
+from src.config import RetrievalSettings, Secrets, load_settings, reset_settings_cache
 
 
 def test_loads_default_yaml() -> None:
@@ -110,3 +113,17 @@ compliance: {}
     s = load_settings(str(custom))
     assert s.app.name == "custom-app"
     assert s.server.port == 1234
+
+
+def test_rag_retrieval_defaults_load_from_yaml() -> None:
+    s = load_settings()
+    assert s.rag.retrieval.strategy == "hybrid"
+    assert s.rag.retrieval.rrf_k == 60
+    assert s.rag.retrieval.similarity_threshold == 0.0
+
+
+def test_rrf_strategy_with_nonzero_threshold_rejected_by_settings() -> None:
+    with pytest.raises(ValidationError):
+        RetrievalSettings(strategy="rrf", similarity_threshold=0.2)
+    # 0.0 is fine -- this is the only value rrf supports.
+    RetrievalSettings(strategy="rrf", similarity_threshold=0.0)
