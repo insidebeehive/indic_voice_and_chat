@@ -33,7 +33,13 @@ from src.dialogue.response_parser import (
 )
 from src.dialogue.slots import SlotFiller, SlotSchema
 from src.interfaces.llm import LLMMessage
-from src.pipeline.engine import AudioSink, PipelineEngine, TurnMetrics, TurnResult
+from src.pipeline.engine import AudioSink, PipelineEngine, SentenceGuard, TurnMetrics, TurnResult
+from src.rag.context_builder import (
+    _CURRENCY_FIGURE_PATTERN,
+    _normalize_currency_match,
+    _numeric_tokens,
+    GuardConfig,
+)
 from src.utils.trace_id import new_trace_id, trace_id_scope
 
 
@@ -50,6 +56,180 @@ def _join_spoken_sentences(sentences: list[str]) -> str:
     fidelity to the original streamed text.
     """
     return re.sub(r"\s+", " ", " ".join(sentences)).strip()
+
+
+# --- Pre-TTS output guard -------------------------------------------------
+#
+# The chat agent (src/agents/chatbot.py) runs THREE output guards from
+# src/rag/context_builder.py: apply_hallucination_guard,
+# apply_no_grounding_guard, apply_unverified_data_guard. The voicebot runs
+# NONE of them, and can't simply adopt all three:
+#
+# - apply_hallucination_guard would fire on EVERY voice turn and is not
+#   ported here. It rejects a response whenever `rag_context.chunk_count ==
+#   0`, which is chat's signal for "retrieval ran and found nothing". The
+#   voicebot has no per-turn retrieval at all — its KB material is a single
+#   dump built once at call start (build_voicebot_kb_context, injected as
+#   `self._kb_context`) — so chunk_count would be 0 on every single turn and
+#   every spoken answer would be replaced with "I can't find that".
+# - apply_no_grounding_guard and the "no citations" half of
+#   apply_hallucination_guard both key off chat-only signals (sources_used,
+#   tool_calls_made) that don't exist on the voice side either.
+# - apply_unverified_data_guard's core check — does a currency figure in the
+#   reply appear anywhere in this turn's grounded material — has NO
+#   dependency on retrieval having happened, so it's the one guard that
+#   transfers. `_voice_sentence_guard` below reuses its exact helpers
+#   (_CURRENCY_FIGURE_PATTERN / _normalize_currency_match / _numeric_tokens)
+#   rather than re-implementing figure matching, so voice and chat can never
+#   silently drift on what counts as "grounded" — but it ALSO adds its own
+#   voice-specific currency pattern alongside chat's (see
+#   _VOICE_CURRENCY_WORD_PATTERN below): chat's _CURRENCY_FIGURE_PATTERN only
+#   matches a currency token BEFORE the number ("Rs 8,100"), which is how
+#   chat text renders an amount but NOT how this voicebot states one —
+#   normalize_for_tts/normalize_currency (src/pipeline/text_normalize.py)
+#   actively rewrites "₹8,100" into "8100 रुपये" (number, then currency word)
+#   before synthesis, so voice needs the mirror-image pattern too or it
+#   would only catch a representation the voice path is designed to
+#   eliminate.
+#
+# Where it runs is the other half of why this isn't a straight port: voice
+# speaks a sentence as soon as SentenceDetector completes it, overlapped
+# with the LLM still generating the rest (see pipeline/engine.py's module
+# docstring) — a POST-response check like the chat guards run as would be
+# too late, since audio for earlier sentences (and often the offending one
+# itself) has already gone out by the time a full response exists to check
+# (see the parse-error recovery below at _finish_turn, which explicitly
+# relies on partial audio already having been spoken). So this guard plugs
+# into PipelineEngine.run_turn[_text]'s `sentence_guard` callback instead,
+# which runs PRE-synthesis, per sentence — the latest point that can still
+# stop a given sentence's own audio from being spoken. See
+# pipeline/engine.py's `_emit_sentence` for the mechanics (including why a
+# trip silently drops every later sentence in the turn instead of checking
+# each one).
+
+
+# Devanagari digits (०-९, U+0966-096F) already satisfy \d in Python's re
+# module (it matches any Unicode decimal digit, not just ASCII 0-9), so
+# _CURRENCY_FIGURE_PATTERN / _NUMERIC_TOKEN_PATTERN find them fine on their
+# own. But context_builder._normalize_number does plain ASCII string ops
+# ('0'.lstrip, ','.replace) to canonicalize a match, and a Devanagari-digit
+# string contains none of those ASCII characters — so it normalizes to
+# itself, unchanged, rather than to the same canonical form as its ASCII
+# equivalent: '५००' would never equal '500'. Translating to ASCII before
+# either pattern runs (rather than teaching context_builder's normalizer
+# about Devanagari, which the chat path has no need for) closes that gap
+# while keeping the chat-side helpers themselves untouched.
+_DEVANAGARI_DIGITS = str.maketrans("०१२३४५६७८९", "0123456789")
+
+
+def _to_ascii_digits(text: str) -> str:
+    return (text or "").translate(_DEVANAGARI_DIGITS)
+
+
+# Voice-specific currency detector: a number FOLLOWED BY a currency word
+# ("8,100 rupees" / "8100 rupaye" / "8100 रुपये") — the mirror image of
+# _CURRENCY_FIGURE_PATTERN's "currency token BEFORE the number" shape (see
+# the module comment above _voice_sentence_guard for why voice needs both).
+# Spellings covered: Latin rupee(s)/rupaye/rupaya/rs/INR, and Devanagari
+# रुपये/रुपया/रुपए (रुपये is the one src/pipeline/text_normalize.py's
+# normalize_currency itself produces; the others are spellings this
+# product's LLM/STT are observed to use in transcripts and replies, kept
+# consistent with that vocabulary rather than inventing a second one).
+# Matched against ASCII-digit text (see _voice_currency_matches), so a plain
+# \d suffices here — it never has to know about Devanagari digits itself.
+#
+# Deliberately does NOT parse spelled-out numbers ("eight thousand one
+# hundred rupees") or Hinglish multiplier phrasing ("2 lakh", "50 hazaar").
+# Same class of gap as apply_unverified_data_guard's documented Hinglish-
+# multiplier limitation (context_builder.py) — a real number parser is out
+# of scope here, and the false-positive surface (matching arbitrary number
+# words) is large for the safety gained.
+#
+# Deliberately does NOT trip on a BARE number with no currency word at all
+# ("Your balance is 19600."). The currency word is this guard's only
+# reliable anchor that a sentence states a MONEY figure rather than a date,
+# a duration ("24 hours"), a menu option ("press 1"), an OTP length ("6
+# digits"), or any other bare number ordinary conversation legitimately
+# contains. Dropping that anchor would trade a real but narrow gap (an
+# invented amount spoken with no currency word — not how this product's
+# prompts instruct amounts to be stated) for a much broader false-positive
+# surface across completely innocent turns. A deliberate choice, covered by
+# tests, not an oversight.
+#
+# Trailing boundary is a hand-rolled negative lookahead, NOT \b: a Devanagari
+# currency word routinely ENDS in a dependent vowel sign ("matra") — e.g.
+# रुपये's final े — and those combining marks are Unicode category Mn, which
+# Python's \w (and therefore \b) does not treat as a word character. \b right
+# after such a character sees non-word-char on both sides (the mark itself,
+# and the following space) and reports NO boundary, silently failing to
+# match "रुपये" at the end of a sentence. Asserting "not immediately followed
+# by a letter/digit in either script" sidesteps \w's blind spot entirely.
+_WORD_CHAR_CLASS = r"[0-9A-Za-zऀ-ॿ]"
+_VOICE_CURRENCY_WORD_PATTERN = re.compile(
+    r"\d[\d,]*(?:\.\d+)?\s?"
+    rf"(?:rupees?|rupaye|rupaya|rs|inr|रुपये|रुपया|रुपए)(?!{_WORD_CHAR_CLASS})",
+    re.IGNORECASE,
+)
+
+
+def _voice_currency_matches(text: str) -> list[str]:
+    """Every currency-figure substring in `text` — chat's prefix form
+    (_CURRENCY_FIGURE_PATTERN) plus the voice-specific suffix form above —
+    after normalizing Devanagari digits to ASCII (_to_ascii_digits) so a
+    figure written in either digit script is found and later normalizes to
+    the same value as its counterpart in the other script."""
+    ascii_text = _to_ascii_digits(text)
+    return _CURRENCY_FIGURE_PATTERN.findall(ascii_text) + _VOICE_CURRENCY_WORD_PATTERN.findall(ascii_text)
+
+
+def _voice_sentence_guard(
+    sentence: str,
+    *,
+    grounded_text: str,
+    customer_text: str,
+    is_hindi: bool,
+    config: Optional[GuardConfig] = None,
+) -> Optional[str]:
+    """Replace `sentence` with a safe, language-appropriate fallback if it
+    states a currency figure not backed by `grounded_text`; otherwise return
+    None (speak unchanged).
+
+    Checks BOTH currency-figure shapes via `_voice_currency_matches`: chat's
+    prefix form ("Rs 8,100", via _CURRENCY_FIGURE_PATTERN) and voice's own
+    suffix form ("8,100 rupees" / "8100 रुपये", via
+    _VOICE_CURRENCY_WORD_PATTERN — see its docstring for why voice needs
+    this and what it deliberately doesn't catch).
+
+    `grounded_text` = this turn's available material (the one-shot KB dump
+    plus everything the caller has said in the call so far — see
+    VoiceBotAgent._make_sentence_guard). `customer_text` is the
+    caller-authored subset of that, used ONLY to name a disputed figure in
+    the fallback line (mirrors apply_unverified_data_guard's `customer_text`
+    param and its reasoning for keeping it caller-authored, never
+    reply-authored).
+
+    The fallback copy is GuardConfig's existing unverified_data_fallback_*
+    strings (chat's, reused verbatim) — phrased as an OFFER pending the
+    caller's confirmation, matching the prompt's escalation rule (offer,
+    don't declare a handoff that hasn't happened).
+    """
+    matches = _voice_currency_matches(sentence)
+    if not matches:
+        return None
+    grounded_numbers = _numeric_tokens(_to_ascii_digits(grounded_text))
+    unverified = [m for m in matches if _normalize_currency_match(m) not in grounded_numbers]
+    if not unverified:
+        return None
+
+    cfg = config or GuardConfig()
+    disputed = _CURRENCY_FIGURE_PATTERN.search(customer_text or "")
+    if disputed:
+        template = (
+            cfg.unverified_data_fallback_hi_with_figure if is_hindi
+            else cfg.unverified_data_fallback_en_with_figure
+        )
+        return template.format(figure=disputed.group())
+    return cfg.unverified_data_fallback_hi if is_hindi else cfg.unverified_data_fallback_en
 
 
 # Targeted field recovery for a JSON envelope whose overall parse failed. The
@@ -295,6 +475,85 @@ class VoiceBotAgent(BaseAgent):
             return list(turns)
         return turns[:1] + turns[1:][-(2 * MAX_HISTORY_TURNS):]
 
+    def _caller_speech_so_far(self) -> str:
+        """Every user turn transcribed so far this call, newline-joined.
+
+        Uses the FULL untruncated ``session.turns`` (not ``_history_window``'s
+        bounded slice) — grounding for the pre-TTS guard should cover
+        everything the caller has actually said in the call, independent of
+        how much of that the LLM's own context window still sees."""
+        return "\n".join(m.content for m in self.session.turns if m.role == "user")
+
+    def _make_sentence_guard(self, current_user_text: str = "") -> SentenceGuard:
+        """Build this turn's pre-TTS guard callback (see the module-level
+        comment above _voice_sentence_guard for what it checks and why).
+
+        Grounded material = self._kb_context (the one-shot KB dump from call
+        start) + the caller's own transcribed speech this call. The latter is
+        session.turns' user messages plus, when the caller already has it in
+        hand, ``current_user_text`` — the streaming-STT path
+        (handle_turn_text) already knows this turn's transcript before
+        calling the engine and passes it here; the batch-STT path
+        (handle_turn) does not (STT happens inside engine.run_turn itself),
+        so for that path grounding covers every PRIOR turn's speech but not
+        the in-flight one. This is a deliberate, narrow gap, not an
+        oversight: closing it would mean threading the transcript back out
+        of the engine before the guard runs, which the engine's
+        policy-free/single-string-arg `SentenceGuard` contract (see
+        pipeline/engine.py) doesn't support, and "this call" is otherwise
+        fully covered.
+
+        Built once per turn (a plain closure over already-computed strings),
+        not per-sentence — cheap, and keeps the actual guard call
+        (_voice_sentence_guard) to pure string/regex work with no I/O.
+
+        `customer_text` is a SUBSET of `grounded_text` here (both fold in the
+        same caller speech) — mirroring chat's own apply_unverified_data_guard
+        call site (src/agents/chatbot.py: grounded_text includes
+        prior_turns_text, which customer_turns_text is itself a subset of).
+        That's required, not incidental: it's exactly what makes "the caller
+        said it, so it's grounded" work (a figure the caller stated — 'I
+        deposited 500 rupees' — must never trip the guard just because it
+        isn't in the KB dump). One side effect, inherited unchanged from
+        chat's design: when the guard DOES trip, the disputed figure named in
+        the `_with_figure` fallback (see _voice_sentence_guard) is necessarily
+        some OTHER figure the caller mentioned earlier in the call, since the
+        actual tripped figure can't itself be one the caller already said.
+        Not a new gap introduced here — accepted as-is because diverging from
+        chat's construction would mean the two paths could disagree on what
+        "grounded" means, which is the one thing this guard exists to avoid.
+        """
+        caller_speech = self._caller_speech_so_far()
+        grounded_text = "\n".join([self._kb_context or "", caller_speech, current_user_text])
+        customer_text = "\n".join([caller_speech, current_user_text])
+        is_hindi = (self._active_language or "").startswith("hi")
+        session_id = self.session.session_id
+
+        def _guard(sentence: str) -> Optional[str]:
+            replacement = _voice_sentence_guard(
+                sentence,
+                grounded_text=grounded_text,
+                customer_text=customer_text,
+                is_hindi=is_hindi,
+            )
+            if replacement is not None:
+                # WARNING, not ERROR (unlike apply_unverified_data_guard's chat-side
+                # log.error): this is a normal, expected safety valve on a path with
+                # no per-turn retrieval to lean on, not itself evidence of a bug.
+                # No caller PII beyond the figure itself (which is the whole point
+                # of the log — investigating what got blocked).
+                log.warning(
+                    "voice pre-TTS guard tripped: unverified currency figure",
+                    extra={
+                        "session_id": session_id,
+                        "campaign_id": self.session.campaign_id,
+                        "figures": _voice_currency_matches(sentence),
+                    },
+                )
+            return replacement
+
+        return _guard
+
     async def start(self) -> None:
         """Move from IDLE to LISTENING. Call once when the call connects."""
         await self.state.fire_if_possible(Event.CALL_CONNECTED)
@@ -473,6 +732,7 @@ class VoiceBotAgent(BaseAgent):
                         audio_sink=audio_sink,
                         cancel_event=cancel_event,
                         language=to_bcp47(self._active_language),
+                        sentence_guard=self._make_sentence_guard(),
                     ),
                     cancel_event,
                 )
@@ -582,6 +842,7 @@ class VoiceBotAgent(BaseAgent):
                             stt_latency_ms=pipeline_result.metrics.stt_latency_ms,
                             t_overall=t_recovery_start,
                             language=to_bcp47(self._active_language),
+                            sentence_guard=self._make_sentence_guard(pipeline_result.user_text),
                         ),
                         cancel_event,
                         hard_timeout_s=_RETRY_HARD_TIMEOUT_S,
@@ -794,6 +1055,7 @@ class VoiceBotAgent(BaseAgent):
                         audio_sink,
                         cancel_event,
                         language=to_bcp47(self._active_language),
+                        sentence_guard=self._make_sentence_guard(user_text),
                     ),
                     cancel_event,
                 )

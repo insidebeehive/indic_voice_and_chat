@@ -47,6 +47,16 @@ from src.pipeline.sentence_detector import SentenceDetector
 
 AudioSink = Callable[[bytes], Awaitable[None]]
 
+# Pre-TTS sentence guard, injected by the caller (VoiceBotAgent) — see
+# run_turn_text below. Deliberately synchronous and content-agnostic: the
+# engine has no idea what the callable checks (KB grounding, profanity,
+# anything else) or why. It just runs it on each candidate sentence in the
+# one spot that can still stop that sentence from being spoken, and treats
+# `None` as "unchanged" / a string as "speak this instead". Default `None`
+# everywhere means a caller that never passes one gets byte-identical
+# behaviour to before this existed.
+SentenceGuard = Callable[[str], Optional[str]]
+
 LLM_TURN_TIMEOUT_S = 10.0  # legitimate end-to-end LLM-generation budget for one turn
 LLM_FIRST_TOKEN_TIMEOUT_S = 7.0  # bounds the wait for the FIRST token specifically —
                                   # the LLM_TURN_TIMEOUT_S check above only runs once a
@@ -191,6 +201,13 @@ class TurnMetrics:
     tts_total_ms: int = 0
     total_latency_ms: int = 0
     tts_segments_dropped: int = 0
+    # Incremented once per turn when the (optional) sentence_guard replaces a
+    # sentence — see run_turn_text. Generic on purpose (mirrors
+    # tts_segments_dropped): the engine only counts that a substitution
+    # happened, never why, so this flows through the existing metrics_dict /
+    # "voice turn metrics" log path (VoiceBotAgent.apply_signal) without the
+    # engine needing to know anything about guard policy.
+    sentence_guard_trips: int = 0
 
 
 @dataclass
@@ -237,6 +254,7 @@ class PipelineEngine:
         cancel_event: Optional[asyncio.Event] = None,
         *,
         language: Optional[str] = None,
+        sentence_guard: Optional[SentenceGuard] = None,
     ) -> TurnResult:
         """Run one perception-reasoning-action cycle.
 
@@ -248,6 +266,10 @@ class PipelineEngine:
         ``language`` (when set) overrides the configured STT + TTS language for
         this turn — the dialogue layer passes the conversation's active language
         so STT transcribes and TTS speaks in the caller's current language.
+
+        ``sentence_guard`` — see run_turn_text — is forwarded unchanged; STT
+        happens here first, then the LLM->TTS overlap runs exactly as in
+        run_turn_text.
         """
         cancel_event = cancel_event or asyncio.Event()
         metrics = TurnMetrics()
@@ -283,6 +305,7 @@ class PipelineEngine:
             stt_latency_ms=metrics.stt_latency_ms,
             t_overall=t_overall,
             language=language,
+            sentence_guard=sentence_guard,
         )
 
     async def run_turn_text(
@@ -297,6 +320,7 @@ class PipelineEngine:
         stt_latency_ms: int = 0,
         t_overall: Optional[float] = None,
         language: Optional[str] = None,
+        sentence_guard: Optional[SentenceGuard] = None,
     ) -> TurnResult:
         """LLM->TTS for an already-transcribed user turn (no STT).
 
@@ -306,6 +330,15 @@ class PipelineEngine:
         ``language`` (when set) overrides the configured TTS language for this
         turn — the conversation's active language, so the reply is spoken in the
         caller's current language.
+
+        ``sentence_guard``, when given, is called with each sentence right
+        before it would be handed to TTS (see ``_emit_sentence`` below).
+        Returning ``None`` speaks the sentence unchanged; returning a string
+        substitutes it AND stops any further sentences this turn from being
+        spoken. The engine has no opinion on what the guard checks — see the
+        module-level ``SentenceGuard`` docstring. Default ``None`` reproduces
+        today's behaviour exactly (no guard call, no substitution, nothing
+        dropped).
         """
         cancel_event = cancel_event or asyncio.Event()
         tts_cfg = replace(self._config.tts, language=language) if language else self._config.tts
@@ -327,6 +360,50 @@ class PipelineEngine:
 
         t_llm_start = time.perf_counter()
         sentence_queue: asyncio.Queue[Optional[str]] = asyncio.Queue()
+        guard_tripped = False
+
+        async def _emit_sentence(sentence: str) -> None:
+            """Give ``sentence_guard`` (if any) a chance to veto this
+            sentence, then enqueue whatever should actually be spoken.
+
+            This runs on the PRODUCER side — right where a completed
+            sentence comes out of ``SentenceDetector`` — rather than after
+            the full response is assembled, because that's the only point
+            left where a check can still stop THIS sentence's own audio
+            from going out: by the time the full response is parseable,
+            earlier (and this) sentence's TTS may already be in flight or
+            done (see the module docstring's overlap design, and
+            voicebot.py's handling of `sentences_spoken`).
+
+            Once tripped, later sentences in the same turn are dropped here
+            silently (not even passed to the guard): the sentence that
+            stated the ungrounded figure has already been swapped for the
+            safe line, earlier audio that went out before it can't be
+            unsaid, and speaking on past the substitute would just bury it.
+
+            A guard exception is treated exactly like a `None` return
+            (unchanged) — logged, never raised further. No `await` happens
+            around the guard call itself, so a slow or hung guard can't
+            stall this loop or the TTS queue; only a plain regex-speed
+            callable belongs here (see PipelineEngine docstring / callers).
+            """
+            nonlocal guard_tripped
+            if guard_tripped:
+                return
+            if sentence_guard is None:
+                await sentence_queue.put(sentence)
+                return
+            try:
+                replacement = sentence_guard(sentence)
+            except Exception:  # noqa: BLE001 - fail OPEN: a guard bug must never break a live call
+                log.exception("sentence_guard raised; speaking sentence unchanged")
+                replacement = None
+            if replacement is None:
+                await sentence_queue.put(sentence)
+                return
+            guard_tripped = True
+            metrics.sentence_guard_trips += 1
+            await sentence_queue.put(replacement)
 
         async def tts_worker() -> None:
             nonlocal first_audio_at, bytes_sent
@@ -422,16 +499,16 @@ class PipelineEngine:
                 if speakable:
                     spoke_anything = True
                     for sentence in detector.feed(speakable):
-                        await sentence_queue.put(sentence)
+                        await _emit_sentence(sentence)
 
             if not cancel_event.is_set():
                 if is_json and not spoke_anything:
                     for sentence in detector.feed(
                         _speakable_from_json("".join(full_text_parts))
                     ):
-                        await sentence_queue.put(sentence)
+                        await _emit_sentence(sentence)
                 for sentence in detector.flush():
-                    await sentence_queue.put(sentence)
+                    await _emit_sentence(sentence)
         finally:
             # Captured here, BEFORE draining the TTS queue: this must reflect
             # only the LLM's own work (token generation + flush), not however
