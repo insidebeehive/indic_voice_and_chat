@@ -704,6 +704,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                              crm_retrievers=crm_retrievers))
     chat_api.set_chat_sessionmaker(sessionmaker)
     chat_api.set_chat_handoff_store(base_session_store)
+    # Voice-note replies: reuses the SAME per-tenant TTS client cache the
+    # voice/telephony paths already build (`providers.get_tts`), so a
+    # tenant's pipeline_config.tts is the single source of truth for both.
+    chat_api.set_tts_providers(providers)
     ext_chat_api.set_ext_redis(redis_client)
     if settings.media_storage is not None:
         from src.providers.media.s3 import S3MediaStorage
@@ -772,6 +776,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         chat_api.set_chat_sessionmaker(None)
         chat_api.set_chat_handoff_store(None)
         chat_api.set_media_store(None)
+        chat_api.set_tts_providers(None)
         ext_chat_api.set_ext_redis(None)
         knowledge_api.set_retriever_factory(None)
         knowledge_api.set_crm_retrievers(None)

@@ -46,22 +46,45 @@ class _FakeResult:
 
 @pytest.mark.asyncio
 async def test_persist_turn_returns_customer_msg_id(db_session):
-    msg_id = await chat_api._persist_turn("s1", "hello", _FakeResult())
-    assert isinstance(msg_id, int)
-    assert msg_id > 0
+    persisted = await chat_api._persist_turn("s1", "hello", _FakeResult())
+    assert isinstance(persisted, chat_api.PersistedTurnIds)
+    assert isinstance(persisted.customer_message_id, int)
+    assert persisted.customer_message_id > 0
+    assert isinstance(persisted.agent_message_id, int)
+    assert persisted.agent_message_id > 0
 
 
 @pytest.mark.asyncio
 async def test_persist_turn_with_media_url(db_session):
     from sqlalchemy import select
     from src.models.chat import ChatMessage
-    msg_id = await chat_api._persist_turn(
+    persisted = await chat_api._persist_turn(
         "s1", "[audio]", _FakeResult(),
         user_type="audio", media_mime="audio/webm",
         media_url="chat/t1/s1/abc.webm",
     )
     async with db_session() as db:
-        row = await db.get(ChatMessage, msg_id)
+        row = await db.get(ChatMessage, persisted.customer_message_id)
     assert row.media_url == "chat/t1/s1/abc.webm"
     assert row.media_mime == "audio/webm"
     assert row.type == "audio"
+
+
+@pytest.mark.asyncio
+async def test_persist_turn_with_reply_media_extends_agent_row(db_session):
+    """`reply_media_mime`/`reply_media_url` (the synthesized voice-note reply's
+    audio) land on the AGENT's own row, not a parallel record — same media
+    columns the customer's inbound attachment already uses."""
+    persisted = await chat_api._persist_turn(
+        "s1", "hello", _FakeResult(),
+        reply_media_mime="audio/mpeg", reply_media_url="chat/t1/s1/reply.mp3",
+    )
+    async with db_session() as db:
+        agent_row = await db.get(ChatMessage, persisted.agent_message_id)
+        customer_row = await db.get(ChatMessage, persisted.customer_message_id)
+    assert agent_row.role == "agent"
+    assert agent_row.media_url == "chat/t1/s1/reply.mp3"
+    assert agent_row.media_mime == "audio/mpeg"
+    assert agent_row.type == "audio"
+    # The customer's own row is untouched by the reply's media fields.
+    assert customer_row.media_url is None
