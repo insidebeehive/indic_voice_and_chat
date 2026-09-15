@@ -13,6 +13,7 @@ from src.rag.context_builder import (
     GuardConfig,
     apply_hallucination_guard,
     apply_no_grounding_guard,
+    apply_pii_guard,
     apply_unverified_data_guard,
     build_rag_context,
     build_voicebot_kb_context,
@@ -633,3 +634,723 @@ def test_unverified_data_guard_fallback_is_an_offer_not_a_promise() -> None:
     out = apply_unverified_data_guard(response, grounded_text="", customer_text="")
     assert "would you like" in out.response_text.lower()
     assert "let me connect you" not in out.response_text.lower()
+
+
+def test_pii_guard_redacts_mobile_number_and_keeps_surrounding_text() -> None:
+    response = ChatBotResponse(
+        response_text="Sure, I can see your registered mobile is 9876543210 on file.",
+        confidence="high",
+    )
+    out = apply_pii_guard(response)
+    assert "9876543210" not in out.response_text
+    assert "Sure, I can see your registered mobile is" in out.response_text
+    assert "on file." in out.response_text
+    assert out.confidence == "low"
+
+
+def test_pii_guard_redacts_email_and_keeps_surrounding_text() -> None:
+    response = ChatBotResponse(
+        response_text="Your account email on file is player123@gmail.com, confirmed.",
+        confidence="high",
+    )
+    out = apply_pii_guard(response)
+    assert "player123@gmail.com" not in out.response_text
+    assert "Your account email on file is" in out.response_text
+    assert "confirmed." in out.response_text
+    assert out.confidence == "low"
+
+
+def test_pii_guard_redacts_bank_account_number_near_anchor_word() -> None:
+    response = ChatBotResponse(
+        response_text="Your registered bank account number is 50100123456789 for the refund.",
+        confidence="high",
+    )
+    out = apply_pii_guard(response)
+    assert "50100123456789" not in out.response_text
+    assert "Your registered bank account number is" in out.response_text
+    assert "for the refund." in out.response_text
+    assert out.confidence == "low"
+
+
+def test_pii_guard_does_not_mutate_input() -> None:
+    original_text = "Contact us: 9876543210."
+    response = ChatBotResponse(response_text=original_text, confidence="high")
+    apply_pii_guard(response)
+    assert response.response_text == original_text
+    assert response.confidence == "high"
+
+
+def test_pii_guard_logs_type_not_value(caplog) -> None:
+    # Review Fix 6: `"9876543210" not in caplog.text` is vacuous --
+    # caplog.text renders only the formatted LOG MESSAGE, never `extra`
+    # fields, so an implementation that logged the raw value via
+    # `extra={"leaked_value": ...}` would still pass that assertion. Scan
+    # every field of every log record instead (matching what the
+    # chatbot-side test, test_pii_guard_redacts_final_reply_even_though_it_
+    # runs_after_no_grounding_guard in test_chatbot_tools.py, already does
+    # correctly) so a value logged via `extra` is actually caught.
+    import logging
+    response = ChatBotResponse(response_text="Your number is 9876543210.", confidence="high")
+    with caplog.at_level(logging.ERROR, logger="src.rag.context_builder"):
+        apply_pii_guard(response)
+    matching = [r for r in caplog.records if getattr(r, "pii_types", None) == ["mobile"]]
+    assert matching, caplog.records
+    assert not any(
+        "9876543210" in str(v)
+        for record in caplog.records
+        for v in record.__dict__.values()
+    )
+
+
+def test_pii_guard_passes_through_clean_response_with_no_match() -> None:
+    response = ChatBotResponse(response_text="Your bet has settled as a win. Enjoy!", confidence="high")
+    out = apply_pii_guard(response)
+    assert out.response_text == response.response_text
+    assert out.confidence == "high"
+
+
+def test_pii_guard_passes_through_currency_figure_with_symbol() -> None:
+    text = "Your balance after the deposit is ₹19,600 in your wallet."
+    response = ChatBotResponse(response_text=text, confidence="high")
+    out = apply_pii_guard(response)
+    assert out.response_text == text
+    assert out.confidence == "high"
+
+
+def test_pii_guard_passes_through_bare_rupee_word_amount() -> None:
+    text = "That withdrawal was for 8100 rupees, processed yesterday."
+    response = ChatBotResponse(response_text=text, confidence="high")
+    out = apply_pii_guard(response)
+    assert out.response_text == text
+
+
+def test_pii_guard_passes_through_date_and_time_window() -> None:
+    text = "Withdrawals are processed within 24 hours, typically by 2026-09-20."
+    response = ChatBotResponse(response_text=text, confidence="high")
+    out = apply_pii_guard(response)
+    assert out.response_text == text
+
+
+def test_pii_guard_passes_through_ivr_style_menu_digit() -> None:
+    text = "Press 1 for deposits, press 2 for withdrawals."
+    response = ChatBotResponse(response_text=text, confidence="high")
+    out = apply_pii_guard(response)
+    assert out.response_text == text
+
+
+def test_pii_guard_passes_through_otp_length_and_value() -> None:
+    text = "Please enter the 6-digit OTP; for reference, a sample code is 483920."
+    response = ChatBotResponse(response_text=text, confidence="high")
+    out = apply_pii_guard(response)
+    assert out.response_text == text
+
+
+def test_pii_guard_passes_through_transaction_reference() -> None:
+    text = "Your transaction reference is TXN9876543210 for this deposit."
+    response = ChatBotResponse(response_text=text, confidence="high")
+    out = apply_pii_guard(response)
+    assert out.response_text == text
+
+
+def test_pii_guard_passes_through_bet_id() -> None:
+    text = "Your bet ID BET9123456780 has been settled as a win."
+    response = ChatBotResponse(response_text=text, confidence="high")
+    out = apply_pii_guard(response)
+    assert out.response_text == text
+
+
+def test_pii_guard_passes_through_bare_year() -> None:
+    text = "That promotion ran in 2026 and has since ended."
+    response = ChatBotResponse(response_text=text, confidence="high")
+    out = apply_pii_guard(response)
+    assert out.response_text == text
+
+
+def test_pii_guard_does_not_mistake_long_currency_figure_for_account_near_bank_word() -> None:
+    # Adversarial-ish: an anchor word ("bank account") sits right next to a
+    # large currency figure that happens to normalize to a 9-digit run.
+    # The currency-figure exclusion must win over the anchor-word match.
+    text = "Your winnings of ₹123456789 have been credited to your bank account."
+    response = ChatBotResponse(response_text=text, confidence="high")
+    out = apply_pii_guard(response)
+    assert out.response_text == text
+
+
+def test_pii_guard_does_not_flag_long_digit_run_with_unrelated_anchor() -> None:
+    # A long digit run near a NON-account anchor word ("order confirmation")
+    # must not be treated as a bank account number -- known, documented gap.
+    text = "Your order confirmation number is 123456789012 today."
+    response = ChatBotResponse(response_text=text, confidence="high")
+    out = apply_pii_guard(response)
+    assert out.response_text == text
+
+
+def test_pii_guard_does_not_flag_embedded_run_inside_longer_digit_sequence() -> None:
+    text = "Reference 19876543210999 for the deposit."
+    response = ChatBotResponse(response_text=text, confidence="high")
+    out = apply_pii_guard(response)
+    assert out.response_text == text
+
+
+def test_pii_guard_passes_through_order_id_near_account_word() -> None:
+    text = "Your deposit of Rs 500 to your account is pending; the PgsOrderId is 202609151234567."
+    response = ChatBotResponse(response_text=text, confidence="high")
+    out = apply_pii_guard(response)
+    assert out.response_text == text
+
+
+def test_pii_guard_passes_through_utr_reference_near_account_word() -> None:
+    text = "Your account was credited. UTR: 123456789012."
+    response = ChatBotResponse(response_text=text, confidence="high")
+    out = apply_pii_guard(response)
+    assert out.response_text == text
+
+
+def test_pii_guard_passes_through_reference_number_near_account_word() -> None:
+    text = "The deposit was credited to your account; reference number 123456789012."
+    response = ChatBotResponse(response_text=text, confidence="high")
+    out = apply_pii_guard(response)
+    assert out.response_text == text
+
+
+def test_pii_guard_passes_through_order_number_in_wallet_account_context() -> None:
+    text = "Your wallet account shows 12 transactions and order 1234567890 is settled."
+    response = ChatBotResponse(response_text=text, confidence="high")
+    out = apply_pii_guard(response)
+    assert out.response_text == text
+
+
+def test_pii_guard_still_redacts_real_account_number_with_plural_accounts_word() -> None:
+    text = "Refunds for closed accounts go to account number 50100123456789 on file."
+    response = ChatBotResponse(response_text=text, confidence="high")
+    out = apply_pii_guard(response)
+    assert "50100123456789" not in out.response_text
+    assert out.confidence == "low"
+
+
+def test_pii_guard_passes_through_bare_word_amount_with_many_digits() -> None:
+    text = "That jackpot payout was 987654321 rupees, credited yesterday."
+    response = ChatBotResponse(response_text=text, confidence="high")
+    out = apply_pii_guard(response)
+    assert out.response_text == text
+
+
+def test_pii_guard_still_redacts_account_number_with_distant_order_word() -> None:
+    text = "We will refund to your bank account 50100123456789 against order 88123."
+    response = ChatBotResponse(response_text=text, confidence="high")
+    out = apply_pii_guard(response)
+    assert "50100123456789" not in out.response_text
+    assert out.confidence == "low"
+
+
+def test_pii_guard_still_redacts_account_number_with_trailing_utr_mention() -> None:
+    text = "Your bank account number is 50100123456789; the UTR will follow shortly."
+    response = ChatBotResponse(response_text=text, confidence="high")
+    out = apply_pii_guard(response)
+    assert "50100123456789" not in out.response_text
+    assert out.confidence == "low"
+
+
+def test_pii_guard_still_redacts_account_number_with_trailing_receipt_mention() -> None:
+    text = "Your bank account number is 50100123456789. We will email the receipt shortly."
+    response = ChatBotResponse(response_text=text, confidence="high")
+    out = apply_pii_guard(response)
+    assert "50100123456789" not in out.response_text
+    assert out.confidence == "low"
+
+
+def test_pii_guard_still_redacts_account_number_with_trailing_ticket_mention() -> None:
+    text = "I have noted your bank account 50100123456789 and raised a ticket."
+    response = ChatBotResponse(response_text=text, confidence="high")
+    out = apply_pii_guard(response)
+    assert "50100123456789" not in out.response_text
+    assert out.confidence == "low"
+
+
+def test_pii_guard_passes_through_bare_word_amount_near_account_anchor() -> None:
+    text = "Your account balance is 123456789 rupees after the bonus."
+    response = ChatBotResponse(response_text=text, confidence="high")
+    out = apply_pii_guard(response)
+    assert out.response_text == text
+
+
+def test_pii_guard_passes_through_bare_currency_figure_shaped_like_mobile_number() -> None:
+    text = "The refund of Rs 9876543210 was processed."
+    response = ChatBotResponse(response_text=text, confidence="high")
+    out = apply_pii_guard(response)
+    assert out.response_text == text
+
+
+def test_pii_guard_redacts_customers_own_echoed_mobile_number() -> None:
+    # The prompt's IDENTITY CONFIRMATION rule forbids confirming a
+    # customer-supplied value even when it's their own -- this guard has no
+    # notion of provenance and must redact it regardless of source.
+    text = "Yes, your registered mobile number is 9876543210 as you mentioned."
+    response = ChatBotResponse(response_text=text, confidence="high")
+    out = apply_pii_guard(response)
+    assert "9876543210" not in out.response_text
+    assert out.confidence == "low"
+
+
+def test_pii_guard_redacts_customers_own_echoed_email() -> None:
+    text = "Yes, that's the email we have on file: player@example.com."
+    response = ChatBotResponse(response_text=text, confidence="high")
+    out = apply_pii_guard(response)
+    assert "player@example.com" not in out.response_text
+    assert out.confidence == "low"
+
+
+def test_unverified_data_guard_then_pii_guard_matches_production_order(caplog) -> None:
+    # Review Fix 6: this test used to claim (wrongly) that production "runs
+    # apply_pii_guard first, then apply_unverified_data_guard". The REAL
+    # order (src/agents/chatbot.py::_handle_with_tools, line ~1275 then
+    # ~1294) is the opposite: apply_unverified_data_guard runs first,
+    # apply_pii_guard runs LAST. The real reason (see apply_pii_guard's own
+    # docstring "Known limitations"): PII guard's confidence downgrade must
+    # never disturb a sibling guard's own confidence=="high" gate -- running
+    # it last is what protects that, not the reverse.
+    #
+    # This is independently checkable, not just documentation: for a reply
+    # that trips BOTH guards, running them in the REAL order means
+    # apply_unverified_data_guard's full-reply substitution (a canned
+    # fallback template with no digits in it at all) already removes the
+    # mobile number as a side effect, before apply_pii_guard ever runs -- so
+    # apply_pii_guard finds nothing left to redact and does NOT fire its own
+    # ERROR log. Running them in the (wrong, previously-pinned) reverse
+    # order would fire BOTH guards' ERROR logs instead, since apply_pii_guard
+    # would redact the mobile number from the ORIGINAL text first, and
+    # apply_unverified_data_guard would then still independently replace the
+    # whole (already-redacted) reply because the currency figure remains
+    # unverified either way.
+    import logging
+    text = "Your mobile 9876543210 has an unverified balance of ₹55,000 pending."
+    response = ChatBotResponse(response_text=text, confidence="high")
+
+    with caplog.at_level(logging.ERROR, logger="src.rag.context_builder"):
+        after_unverified = apply_unverified_data_guard(response, grounded_text="", customer_text="")
+        final = apply_pii_guard(after_unverified)
+
+    # apply_unverified_data_guard's canned fallback already contains neither
+    # the unverified figure nor (incidentally) the mobile number.
+    assert "₹55,000" not in after_unverified.response_text
+    assert "9876543210" not in after_unverified.response_text
+    assert after_unverified.confidence == "low"
+
+    # apply_pii_guard, running last, finds nothing left to redact and passes
+    # the fallback through completely unchanged.
+    assert final.response_text == after_unverified.response_text
+    assert final.confidence == "low"
+
+    # Exactly one guard fired an ERROR log (apply_unverified_data_guard).
+    # Two ERROR records here would mean the guards ran in the WRONG (reverse)
+    # order -- see the docstring above.
+    error_records = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(error_records) == 1
+
+
+def test_pii_guard_keeps_operator_account_number_in_safe_to_state() -> None:
+    # The operator's own deposit account (returned by get_payment_config this
+    # turn) is not customer PII -- when the caller vouches for it via
+    # safe_to_state, it must survive untouched.
+    text = (
+        "You can deposit to our bank account number 50100234567890, "
+        "IFSC HDFC0001234, name BetStudio Pvt Ltd."
+    )
+    response = ChatBotResponse(response_text=text, confidence="high")
+    out = apply_pii_guard(response, safe_to_state={"50100234567890"})
+    assert out.response_text == text
+    assert out.confidence == response.confidence
+
+
+def test_pii_guard_redacts_same_account_number_without_safe_to_state() -> None:
+    # Same input as above, but with no allow-set at all -- proves the
+    # exemption is opt-in per call, not a blanket allow for this shape of
+    # number.
+    text = (
+        "You can deposit to our bank account number 50100234567890, "
+        "IFSC HDFC0001234, name BetStudio Pvt Ltd."
+    )
+    response = ChatBotResponse(response_text=text, confidence="high")
+    out = apply_pii_guard(response)
+    assert "[redacted]" in out.response_text
+    assert "50100234567890" not in out.response_text
+
+
+def test_pii_guard_safe_to_state_does_not_leak_customers_bank_saved_via_naive_any_tool_output_exemption() -> None:
+    # This is the case a naive "exempt anything returned by any tool this
+    # turn" implementation would get wrong: safe_to_state here holds the
+    # OPERATOR's account number, but the reply states a DIFFERENT number (the
+    # customer's own saved bank account) -- that one must still be redacted.
+    text = "Your saved bank account number is 91234567891234 for withdrawals."
+    response = ChatBotResponse(response_text=text, confidence="high")
+    out = apply_pii_guard(response, safe_to_state={"50100234567890"})
+    assert "[redacted]" in out.response_text
+    assert "91234567891234" not in out.response_text
+
+
+def test_pii_guard_safe_to_state_matches_despite_formatting_difference() -> None:
+    # The safe_to_state value is spaced/hyphenated the way a CRM payload
+    # might render it; the reply spells it as a contiguous digit run (it has
+    # to be, to have been flagged as account-shaped at all under
+    # _pii_account_matches/_PII_DIGIT_RUN_PATTERN -- a spaced/hyphenated
+    # reply wouldn't be flagged in the first place, so it wouldn't exercise
+    # this normalization). Matching must be on digit identity, not raw text.
+    text = (
+        "You can deposit to our bank account number 50100234567890, "
+        "IFSC HDFC0001234, name BetStudio Pvt Ltd."
+    )
+    response = ChatBotResponse(response_text=text, confidence="high")
+    out = apply_pii_guard(response, safe_to_state={"5010 0234-5678 90"})
+    assert out.response_text == text
+
+
+def test_pii_guard_safe_to_state_does_not_affect_mobile_redaction() -> None:
+    text = "Sure, I can see your registered mobile is 9876543210 on file."
+    response = ChatBotResponse(response_text=text, confidence="high")
+    out = apply_pii_guard(response, safe_to_state={"50100234567890"})
+    assert "9876543210" not in out.response_text
+    assert out.confidence == "low"
+
+
+def test_pii_guard_safe_to_state_does_not_affect_email_redaction() -> None:
+    text = "Your account email on file is player123@gmail.com, confirmed."
+    response = ChatBotResponse(response_text=text, confidence="high")
+    out = apply_pii_guard(response, safe_to_state={"50100234567890"})
+    assert "player123@gmail.com" not in out.response_text
+    assert out.confidence == "low"
+
+
+def test_pii_guard_preserves_surrounding_text_around_exempted_and_redacted_spans() -> None:
+    # Regression pin: the exempt branch used to append the exempted match
+    # WITHOUT first appending the gap since the previous span (or string
+    # start) -- exactly what the redact branch already does before its own
+    # placeholder -- silently deleting every character in between. A reply
+    # with both an exempted operator account number AND a non-exempted
+    # customer-facing mobile number, compared against the FULL expected
+    # string, is what catches this (a substring-only check would not).
+    text = (
+        "Deposit to our bank account number 50100234567890. "
+        "Your mobile 9876543210 is on file."
+    )
+    response = ChatBotResponse(response_text=text, confidence="high")
+    out = apply_pii_guard(response, safe_to_state={"50100234567890"})
+    assert out.response_text == (
+        "Deposit to our bank account number 50100234567890. "
+        "Your mobile [redacted] is on file."
+    )
+    assert "50100234567890" in out.response_text  # (a) operator number unredacted
+    assert "9876543210" not in out.response_text  # (b) mobile number redacted
+
+
+def test_pii_guard_safe_to_state_never_exempts_email_or_short_digit_matches() -> None:
+    # (a) A short safe_to_state value (e.g. a 3-digit SLA-hours field or
+    # deposit limit harvested generically from a CRM payload by
+    # _walk_digit_bearing_values in chatbot.py) must never exempt an EMAIL
+    # hit just because its local part happens to contain those digits.
+    response_a = ChatBotResponse(
+        response_text="Email us at support100@operator.com for help.", confidence="high",
+    )
+    out_a = apply_pii_guard(response_a, safe_to_state={"100"})
+    assert "support100@operator.com" not in out_a.response_text
+    assert "[redacted]" in out_a.response_text
+
+    # (b) A coincidental short match against a mobile/account-shaped digit
+    # run below the 9-digit floor (_PII_ACCOUNT_MIN_DIGITS) must not exempt
+    # it either -- only a mobile/account hit of realistic length can ever be
+    # exempted via safe_to_state.
+    response_b = ChatBotResponse(
+        response_text="Your registered bank account number is 123456789 for the refund.",
+        confidence="high",
+    )
+    out_b = apply_pii_guard(response_b, safe_to_state={"12345678"})  # 8 digits, below the floor
+    assert "123456789" not in out_b.response_text
+    assert "[redacted]" in out_b.response_text
+
+
+def test_pii_guard_bare_word_amount_pattern_is_redos_safe() -> None:
+    # Before the fix, _PII_BARE_WORD_AMOUNT_PATTERN's unbounded `[\d,]*` blew
+    # up on a long pure-digit run with no trailing currency word (~13.8s
+    # measured on 16,000 digits) via catastrophic backtracking. Mirrors
+    # tests/unit/test_trace_redaction.py's TestReDoSFix style: a large
+    # adversarial input, asserted to complete well within a generous budget.
+    import time
+
+    adversarial = "9" * 20000  # no trailing rupees/rs/inr word to match against
+    response = ChatBotResponse(response_text=adversarial, confidence="high")
+    start = time.perf_counter()
+    apply_pii_guard(response)
+    elapsed = time.perf_counter() - start
+    assert elapsed < 2.0, (
+        f"adversarial digit-run input took {elapsed:.3f}s -- "
+        "possible ReDoS regression in _PII_BARE_WORD_AMOUNT_PATTERN"
+    )
+
+
+def test_pii_guard_default_safe_to_state_reproduces_current_behavior() -> None:
+    # Confirms the signature change (safe_to_state defaulting to None) is
+    # backward compatible: calling with no second argument at all reproduces
+    # the exact same redaction as the pre-existing mobile-redaction test.
+    response = ChatBotResponse(
+        response_text="Sure, I can see your registered mobile is 9876543210 on file.",
+        confidence="high",
+    )
+    out = apply_pii_guard(response)
+    assert "9876543210" not in out.response_text
+    assert "Sure, I can see your registered mobile is" in out.response_text
+    assert "on file." in out.response_text
+    assert out.confidence == "low"
+
+
+# --- Review Fix 1: sibling guards must never log raw PII ------------------
+
+
+def test_no_grounding_guard_warning_log_redacts_pii_in_response_text(caplog) -> None:
+    # Reproduced leak: a reply tripping the no-grounding guard's own
+    # lexical risk pattern (a stated time-of-day) that ALSO contains a
+    # mobile number used to put the raw mobile straight into the WARNING
+    # log's `extra["response_text"]`, since apply_pii_guard runs strictly
+    # after this guard in the pipeline (and stays that way -- the fix is in
+    # the logging, not the order).
+    import logging
+    text = "It's 11:24 PM right now. Call me back at 9876543210."
+    response = ChatBotResponse(response_text=text, confidence="high")
+    with caplog.at_level(logging.WARNING, logger="src.rag.context_builder"):
+        apply_no_grounding_guard(response, retrieved_any=False, tool_calls_made=[])
+    assert not any(
+        "9876543210" in str(v) for r in caplog.records for v in r.__dict__.values()
+    )
+    # Still diagnostically useful -- logs the redacted text, not nothing.
+    assert any(
+        "[redacted]" in str(r.__dict__.get("response_text", "")) for r in caplog.records
+    )
+
+
+def test_unverified_data_guard_error_log_redacts_pii_in_response_text(caplog) -> None:
+    # Reproduced leak: a reply with both an unverified currency figure AND a
+    # mobile number used to put the raw mobile into the ERROR log's
+    # `extra["response_text"]`, at context_builder.py's apply_unverified_
+    # data_guard -- this is the ERROR-level path the pre-fix docstring did
+    # not even acknowledge (it only documented the no-grounding WARNING
+    # path).
+    import logging
+    text = "Your mobile is 9876543210 and the pending amount is ₹8,100."
+    response = ChatBotResponse(response_text=text, confidence="high")
+    with caplog.at_level(logging.ERROR, logger="src.rag.context_builder"):
+        apply_unverified_data_guard(response, grounded_text="", customer_text="")
+    assert not any(
+        "9876543210" in str(v) for r in caplog.records for v in r.__dict__.values()
+    )
+    assert any(
+        "[redacted]" in str(r.__dict__.get("response_text", "")) for r in caplog.records
+    )
+
+
+# --- Review Fix 2: suggested_followups scanned and PII-leaking ones dropped
+
+
+def test_pii_guard_drops_followup_containing_mobile_number() -> None:
+    # Reproduced leak: apply_pii_guard used to scan only response_text and
+    # copy suggested_followups through verbatim. A followup is a SUGGESTED
+    # REPLY the customer might tap/say verbatim -- "Should I send the OTP to
+    # [redacted]?" is not a coherent thing to offer as a one-tap suggestion,
+    # so a leaking followup is DROPPED entirely rather than redacted in
+    # place (see apply_pii_guard's own docstring for the full reasoning).
+    response = ChatBotResponse(
+        response_text="Sure, I can help with that.",
+        confidence="high",
+        suggested_followups=[
+            "Should I send the OTP to 9876543210?",
+            "Do you want a callback instead?",
+        ],
+    )
+    out = apply_pii_guard(response)
+    assert out.suggested_followups == ["Do you want a callback instead?"]
+    assert out.confidence == "low"
+    # response_text itself had no PII -- only the followup did.
+    assert out.response_text == response.response_text
+
+
+def test_pii_guard_keeps_followup_containing_safe_to_state_value() -> None:
+    # A followup that only mentions the operator's OWN vouched-for account
+    # (safe_to_state) is not a leak and must survive untouched, exactly like
+    # the response_text exemption.
+    followup = "Should I resend the deposit account number 50100234567890?"
+    response = ChatBotResponse(
+        response_text="Here are your deposit details.",
+        confidence="high",
+        suggested_followups=[followup],
+    )
+    out = apply_pii_guard(response, safe_to_state={"50100234567890"})
+    assert out is response  # nothing redacted or dropped anywhere -- pure passthrough
+
+
+def test_pii_guard_raw_field_is_not_scanned_or_needed() -> None:
+    # Verified (see apply_pii_guard's docstring, review Fix 2): `raw` is
+    # never surfaced to a customer on any of the three chat surfaces --
+    # src/api/chat.py's REST _to_message_response (builds ChatMessageResponse
+    # from named fields only, no `raw`), its WebSocket "message" frame (only
+    # text/sources/suggestions/action), and src/api/external_chat.py's
+    # ExternalMessageResponse (text/suggestions/session_id only). So a PII
+    # value sitting only in `raw` (never in response_text or
+    # suggested_followups) must NOT trigger the guard at all.
+    response = ChatBotResponse(
+        response_text="Your request has been noted.",
+        confidence="high",
+        raw={"internal_debug_mobile": "9876543210"},
+    )
+    out = apply_pii_guard(response)
+    assert out is response
+    assert out.raw == {"internal_debug_mobile": "9876543210"}
+
+
+# --- Review Fix 3: account digit-run word boundary + "on account of" ------
+
+
+def test_pii_guard_does_not_redact_digit_run_embedded_in_reference_token() -> None:
+    # Reproduced false positive: a transaction reference glued directly to
+    # an anchor-adjacent digit run ("TXN9876543210") used to be extracted as
+    # a bare digit run (the account pattern had no word boundary, unlike the
+    # mobile pattern's own \b) and wrongly redacted as a bank account number
+    # just because "bank account" appeared nearby.
+    text = "Use TXN9876543210 while depositing to your bank account."
+    response = ChatBotResponse(response_text=text, confidence="high")
+    out = apply_pii_guard(response)
+    assert out.response_text == text
+    assert out.confidence == "high"
+
+
+def test_pii_guard_on_account_of_idiom_does_not_flag_unrelated_digit_run() -> None:
+    # Reproduced false positive: "on account of" is ordinary English with no
+    # relation to a bank account, but its bare "account" token used to
+    # satisfy the anchor pattern and wrongly redact an unrelated nearby
+    # refund/reference id.
+    text = "On account of the delay, your refund id 123456789012 was reissued."
+    response = ChatBotResponse(response_text=text, confidence="high")
+    out = apply_pii_guard(response)
+    assert out.response_text == text
+    assert out.confidence == "high"
+
+
+def test_pii_guard_on_account_of_idiom_does_not_suppress_genuine_leak_nearby() -> None:
+    # The idiom exclusion must be narrow: a GENUINE bank-account anchor
+    # elsewhere in the same window must still fire even when "on account of"
+    # also appears in it.
+    text = "On account of a KYC hold, refunds go to bank account number 50100123456789."
+    response = ChatBotResponse(response_text=text, confidence="high")
+    out = apply_pii_guard(response)
+    assert "50100123456789" not in out.response_text
+    assert out.confidence == "low"
+
+
+# --- Review Fix 4: mobile-shaped run wins over a trailing currency word ---
+
+
+def test_pii_guard_redacts_mobile_followed_by_bare_inr_word() -> None:
+    # Reproduced leak: _PII_BARE_WORD_AMOUNT_PATTERN claimed "9876543210
+    # INR" as a money span, and the mobile hit overlapping that span was
+    # dropped -- the mobile number reached the customer untouched.
+    text = "Your registered mobile 9876543210 INR balance is low."
+    response = ChatBotResponse(response_text=text, confidence="high")
+    out = apply_pii_guard(response)
+    assert "9876543210" not in out.response_text
+    assert "[redacted]" in out.response_text
+    assert out.confidence == "low"
+
+
+def test_pii_guard_redacts_mobile_followed_by_bare_rs_word_hinglish() -> None:
+    # Same leak, everyday Hinglish phrasing ("rs" as a bare trailing unit
+    # word, not formal currency notation).
+    text = "Aapka number 9876543210 rs par register hai."
+    response = ChatBotResponse(response_text=text, confidence="high")
+    out = apply_pii_guard(response)
+    assert "9876543210" not in out.response_text
+    assert "[redacted]" in out.response_text
+    assert out.confidence == "low"
+
+
+def test_pii_guard_prefix_currency_notation_still_wins_over_mobile_shape() -> None:
+    # Fix 4 is scoped to the SUFFIX form only. A PREFIX currency figure
+    # (₹/Rs/INR literally before the digits) is unambiguous -- it can only
+    # be an amount -- and must still be excluded from mobile detection, same
+    # as before the fix. This is an existing "must keep working" case.
+    text = "The refund of Rs 9876543210 was processed."
+    response = ChatBotResponse(response_text=text, confidence="high")
+    out = apply_pii_guard(response)
+    assert out.response_text == text
+    assert out.confidence == "high"
+
+
+def test_pii_guard_large_bare_word_amount_shaped_like_mobile_is_redacted_as_mobile_documented_tradeoff() -> None:
+    # Accepted, documented tradeoff (see _find_pii_hits's docstring, review
+    # Fix 4): a genuine 10-digit rupee amount starting 6-9, followed by a
+    # bare currency word, is now indistinguishable from a mobile number by
+    # shape and gets misclassified/redacted as one. Pinned deliberately, not
+    # a bug -- a real payout this large is vanishingly rare for this
+    # product, and the alternative (leaving the suffix-form exclusion in
+    # place) is exactly the leak Fix 4 closes.
+    text = "Your jackpot payout was 9500000000 rupees, credited yesterday."
+    response = ChatBotResponse(response_text=text, confidence="high")
+    out = apply_pii_guard(response)
+    assert "9500000000" not in out.response_text
+    assert "[redacted]" in out.response_text
+    assert out.confidence == "low"
+
+
+# --- Review Fix 5: separator groupings, "acct" anchor, wider window -------
+
+
+def test_pii_guard_redacts_mobile_with_3_3_4_space_grouping() -> None:
+    text = "Call me on 987 654 3210 anytime."
+    response = ChatBotResponse(response_text=text, confidence="high")
+    out = apply_pii_guard(response)
+    assert "987 654 3210" not in out.response_text
+    assert "[redacted]" in out.response_text
+    assert out.confidence == "low"
+
+
+def test_pii_guard_redacts_mobile_with_4_3_3_space_grouping() -> None:
+    text = "9876 543 210"
+    response = ChatBotResponse(response_text=text, confidence="high")
+    out = apply_pii_guard(response)
+    assert out.response_text == "[redacted]"
+    assert out.confidence == "low"
+
+
+def test_pii_guard_recognizes_acct_anchor() -> None:
+    # "acct" was previously not in the anchor word list at all.
+    text = "Your acct no. is 50100123456789."
+    response = ChatBotResponse(response_text=text, confidence="high")
+    out = apply_pii_guard(response)
+    assert "50100123456789" not in out.response_text
+    assert out.confidence == "low"
+
+
+def test_pii_guard_widened_window_catches_distant_anchor() -> None:
+    # Reproduced gap: the anchor sits 53 chars from the digit run (old
+    # window was ±40); "...as follows for the pending refund case:..." is
+    # realistic phrasing that pushed the anchor out of range.
+    text = (
+        "Your bank account details are as follows for the pending refund "
+        "case: 50100123456789"
+    )
+    response = ChatBotResponse(response_text=text, confidence="high")
+    out = apply_pii_guard(response)
+    assert "50100123456789" not in out.response_text
+    assert out.confidence == "low"
+
+
+def test_pii_guard_devanagari_digit_account_number_is_matched() -> None:
+    # Docstring fix (review Fix 5): "Only ASCII-digit numerals are matched"
+    # was false -- Python's \d matches any Unicode decimal digit, Devanagari
+    # included, and the account pattern (_PII_DIGIT_RUN_PATTERN = \b\d+\b)
+    # uses bare \d, so a Devanagari-digit account number near an anchor word
+    # is in fact matched. (The MOBILE pattern is unaffected by this and
+    # stays ASCII-only in practice: its leading class is the literal
+    # ASCII-range `[6-9]`, which does NOT match Devanagari digit codepoints
+    # -- only the anchor-gated account path exercises this.)
+    text = "Your bank account number is ९८७६५४३२१०१२ for the refund."
+    response = ChatBotResponse(response_text=text, confidence="high")
+    out = apply_pii_guard(response)
+    assert "९८७६५४३२१०१२" not in out.response_text
+    assert "[redacted]" in out.response_text
+    assert out.confidence == "low"

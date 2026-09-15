@@ -301,6 +301,56 @@ async def test_no_tool_call_answers_directly(retriever) -> None:
 
 
 @pytest.mark.asyncio
+async def test_pii_guard_redacts_final_reply_even_though_it_runs_after_no_grounding_guard(
+    retriever, caplog,
+) -> None:
+    """Regression pin for the guard ordering in _handle_with_tools:
+    apply_pii_guard runs LAST, after apply_no_grounding_guard (the `else`
+    branch below, hit here since no retrieval/tool call happens this turn)
+    -- see apply_pii_guard's docstring "Known limitations" list for why the
+    order itself is not changing (PII guard's confidence downgrade must not
+    disturb apply_no_grounding_guard's own confidence=="high" gate). The
+    customer-facing final text must still be fully redacted regardless of
+    ordering.
+
+    Review Fix 1: apply_no_grounding_guard's own WARNING log line -- which
+    fires in its own branch, before apply_pii_guard ever runs -- used to
+    carry the raw, un-redacted value despite the guard order (a previously
+    accepted, documented gap). That is now fixed: the WARNING log redacts
+    PII out of the logged text (via _redact_pii_for_log, context_builder.py)
+    before this guard ever runs, so the raw mobile number must not appear
+    anywhere in ANY log record's fields -- only the [redacted] placeholder
+    should.
+    """
+    payload = json.dumps({
+        "response_text": "Sure, call us at 9876543210 tomorrow at 5:00pm.",
+        "language": "en", "confidence": "high", "action": "none",
+    })
+    llm = ScriptedLLM([LLMResult(text=payload, finish_reason="stop")])
+    agent = _agent(llm, retriever)
+    with caplog.at_level(logging.WARNING):
+        result = await agent.handle_message("hi")
+    # Customer-facing text: always fully redacted, regardless of guard order.
+    assert "9876543210" not in result.response.response_text
+    assert "[redacted]" in result.response.response_text
+    # Fixed (review Fix 1): the raw mobile number must not leak into ANY log
+    # record's fields, including apply_no_grounding_guard's own WARNING line
+    # that fires before apply_pii_guard ever runs.
+    assert not any(
+        "9876543210" in str(v)
+        for record in caplog.records
+        for v in record.__dict__.values()
+    )
+    # The no-grounding guard's WARNING line still fired and still logged a
+    # (now-redacted) response_text -- proving this isn't vacuous by having
+    # simply stopped logging the field at all.
+    warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert any(
+        "[redacted]" in str(r.__dict__.get("response_text", "")) for r in warning_records
+    )
+
+
+@pytest.mark.asyncio
 async def test_tool_loop_retries_once_when_final_answer_is_empty(retriever) -> None:
     """The tool round(s) can complete fine but the final answer-synthesis call
     still comes back empty (e.g. a safety-filter block) — retry that final
@@ -1001,3 +1051,183 @@ async def test_failed_deposit_verification_does_not_ground_and_triggers_directiv
                        if m.role == "user" and "SYSTEM NOTE" in (m.content or "")]
     assert directive_msgs
     assert "deposit verification request" in directive_msgs[0].content
+
+
+# --- PII guard safe_to_state / get_payment_config exemption --------------
+
+
+@pytest.mark.asyncio
+async def test_payment_config_account_number_survives_pii_guard_when_called_this_turn(retriever) -> None:
+    async def crm_exec(tc: ToolCall, *, timeout_s: float = 0.0) -> dict:
+        if tc.name == "get_payment_config":
+            return {"account_number": "50100234567890", "ifsc": "HDFC0001234",
+                     "bank_name": "BetStudio Pvt Ltd"}
+        raise AssertionError(f"unexpected tool call: {tc.name}")
+
+    crm_tools = [ToolSpec(name="get_payment_config", description="payment config",
+                          parameters={"type": "object", "properties": {}})]
+    llm = ScriptedLLM([
+        LLMResult(text="", finish_reason="tool_calls", tool_calls=[
+            ToolCall(id="t1", name="get_payment_config", arguments={})]),
+        LLMResult(
+            text="You can deposit to our bank account number 50100234567890, "
+                 "IFSC HDFC0001234, name BetStudio Pvt Ltd.",
+            finish_reason="stop"),
+    ])
+    agent = _agent(llm, retriever, crm_tools=crm_tools, crm_executor=crm_exec)
+    result = await agent.handle_message("how do I deposit?")
+    assert "50100234567890" in result.response.response_text
+    assert "[redacted]" not in result.response.response_text
+
+
+@pytest.mark.asyncio
+async def test_payment_config_account_number_redacted_when_not_called_this_turn(retriever) -> None:
+    # Same reply text as above, but get_payment_config was never called this
+    # turn -- the exemption must not leak in from anywhere else.
+    llm = ScriptedLLM([
+        LLMResult(
+            text="You can deposit to our bank account number 50100234567890, "
+                 "IFSC HDFC0001234, name BetStudio Pvt Ltd.",
+            finish_reason="stop"),
+    ])
+    agent = _agent(llm, retriever)
+    result = await agent.handle_message("how do I deposit?")
+    assert "[redacted]" in result.response.response_text
+    assert "50100234567890" not in result.response.response_text
+
+
+@pytest.mark.asyncio
+async def test_naive_any_tool_output_exemption_would_leak_customers_bank_saved_but_scoped_exemption_does_not(
+    retriever,
+) -> None:
+    """Both get_player_profile and get_payment_config are called in the same
+    turn. get_player_profile's result carries the CUSTOMER's own saved bank
+    account; get_payment_config's result carries the OPERATOR's deposit
+    account. The final reply states the CUSTOMER's number. A naive "exempt
+    anything returned by any tool this turn" implementation would wrongly let
+    this through just because get_payment_config was also called in the same
+    round -- the scoped exemption (keyed to get_payment_config's OWN result
+    values only) must still redact it."""
+    async def crm_exec(tc: ToolCall, *, timeout_s: float = 0.0) -> dict:
+        if tc.name == "get_player_profile":
+            return {"bank_saved": "91234567891234", "name": "Test Player"}
+        if tc.name == "get_payment_config":
+            return {"account_number": "50100234567890", "ifsc": "HDFC0001234"}
+        raise AssertionError(f"unexpected tool call: {tc.name}")
+
+    crm_tools = [
+        ToolSpec(name="get_player_profile", description="profile",
+                 parameters={"type": "object", "properties": {}}),
+        ToolSpec(name="get_payment_config", description="payment config",
+                 parameters={"type": "object", "properties": {}}),
+    ]
+    llm = ScriptedLLM([
+        LLMResult(text="", finish_reason="tool_calls", tool_calls=[
+            ToolCall(id="t1", name="get_player_profile", arguments={}),
+            ToolCall(id="t2", name="get_payment_config", arguments={}),
+        ]),
+        LLMResult(
+            text="Your saved bank account for withdrawals is 91234567891234.",
+            finish_reason="stop"),
+    ])
+    agent = _agent(llm, retriever, crm_tools=crm_tools, crm_executor=crm_exec)
+    result = await agent.handle_message("what's my saved withdrawal account?")
+    assert "[redacted]" in result.response.response_text
+    assert "91234567891234" not in result.response.response_text
+
+
+# --- PII guard ordering relative to the other reply guards (Fix 2) --------
+
+
+@pytest.mark.asyncio
+async def test_hallucination_guard_fallback_wins_over_pii_redaction_on_uncited_leaky_reply(
+    retriever,
+) -> None:
+    """apply_pii_guard must run LAST, after apply_hallucination_guard, so the
+    latter's `confidence == "high"` gate sees the model's ORIGINAL
+    confidence, not one already downgraded by the PII guard's own redaction.
+
+    Reply is both (a) high-confidence with no sources_used on a turn where
+    retrieval genuinely happened -- apply_hallucination_guard's classic
+    uncited-answer hallucination tell -- AND (b) contains a PII-shaped
+    mobile number. If apply_pii_guard ran FIRST (the bug this pins against),
+    its confidence downgrade to "low" would defeat
+    apply_hallucination_guard's own confidence gate, and the risky, uncited
+    claim would reach the customer with only the phone number stripped out
+    instead of being replaced by the safe fallback."""
+    payload = json.dumps({
+        "response_text": "Yes, that's correct, call our support at 9876543210 to confirm.",
+        "language": "en", "confidence": "high", "sources_used": [], "action": "none",
+    })
+    llm = ScriptedLLM([LLMResult(text=payload, finish_reason="stop")])
+    # Single-shot path (enable_tools=False): retrieval runs unconditionally
+    # and apply_hallucination_guard is unconditionally reachable there,
+    # unlike _handle_with_tools where a search_knowledge_base call forces
+    # sources_used non-empty and makes the uncited-answer branch unreachable.
+    agent = ChatBotAgent(
+        session=AgentSession(session_id="cb-pii-order"), llm=llm, retriever=retriever,
+        company_name="Acme", language_default="en", enable_tools=False,
+    )
+    result = await agent.handle_message("Tell me about Plan B")
+    # The final reply must be apply_hallucination_guard's safe fallback text
+    # -- not a PII-redacted version of the risky, uncited claim.
+    assert "not able to find" in result.response.response_text.lower()
+    assert "9876543210" not in result.response.response_text
+    assert "[redacted]" not in result.response.response_text
+    assert result.response.confidence == "low"
+
+
+# --- Review Fix 7: _walk_digit_bearing_values recursion bound -------------
+
+
+def test_walk_digit_bearing_values_does_not_crash_on_pathologically_deep_payload() -> None:
+    """Reproduced crash: a CRM-controlled payload nested ~2000 levels deep
+    survives json.loads/json.dumps but blew the pure-Python "yield from"
+    recursion in _walk_digit_bearing_values, raising RecursionError under
+    Python's default recursion limit (1000) and killing the whole turn.
+    Guard-input extraction must never break a live turn -- this pins the
+    depth bound directly against the walker function."""
+    obj = {"account_number": "50100234567890"}
+    for _ in range(2000):
+        obj = {"nested": obj}
+    # Must not raise. The deeply-nested leaf is beyond the depth cap and so
+    # is legitimately NOT yielded (an accepted, documented tradeoff -- see
+    # _walk_digit_bearing_values's own docstring) -- the assertion here is
+    # only that this completes without a RecursionError.
+    result = list(chatbot_mod._walk_digit_bearing_values(obj))
+    assert isinstance(result, list)
+
+
+@pytest.mark.asyncio
+async def test_deeply_nested_payment_config_payload_does_not_crash_the_turn(retriever) -> None:
+    """End-to-end version of the same reproduction, through the real tool
+    loop: get_payment_config returning a pathologically deep payload must
+    not crash the turn even though the safe_to_state extraction can no
+    longer see the account number buried past the depth cap -- the turn
+    still completes and still replies (with the account number redacted,
+    since it was never added to the allow-set)."""
+    deep_value = {"account_number": "50100234567890"}
+    for _ in range(2000):
+        deep_value = {"nested": deep_value}
+
+    async def crm_exec(tc: ToolCall, *, timeout_s: float = 0.0) -> dict:
+        if tc.name == "get_payment_config":
+            return deep_value
+        raise AssertionError(f"unexpected tool call: {tc.name}")
+
+    crm_tools = [ToolSpec(name="get_payment_config", description="payment config",
+                          parameters={"type": "object", "properties": {}})]
+    llm = ScriptedLLM([
+        LLMResult(text="", finish_reason="tool_calls", tool_calls=[
+            ToolCall(id="t1", name="get_payment_config", arguments={})]),
+        LLMResult(
+            text="You can deposit to our bank account number 50100234567890.",
+            finish_reason="stop"),
+    ])
+    agent = _agent(llm, retriever, crm_tools=crm_tools, crm_executor=crm_exec)
+    result = await agent.handle_message("how do I deposit?")
+    # The turn completed at all -- the real regression was a RecursionError
+    # here, not a specific redaction outcome.
+    assert result.response.response_text
+    assert "[redacted]" in result.response.response_text
+    assert "50100234567890" not in result.response.response_text

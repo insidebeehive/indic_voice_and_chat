@@ -22,7 +22,7 @@ import json
 import logging
 import re
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterator
 from dataclasses import dataclass
 from dataclasses import replace as _replace_cfg
 from typing import Any
@@ -49,6 +49,7 @@ from src.rag.context_builder import (
     GuardConfig,
     apply_hallucination_guard,
     apply_no_grounding_guard,
+    apply_pii_guard,
     apply_unverified_data_guard,
     build_rag_context,
     neutralize_sources_markers,
@@ -191,6 +192,12 @@ _TOOL_CATEGORY_LABELS: dict[str, str] = {
 # literal tool name.
 _GENERIC_CATEGORY_LABEL = "some of your account details"
 
+# Catalog's canonical name (src/chatbot/catalog.py) for the operator's own
+# deposit/payment config tool — also the literal key _TOOL_CATEGORY_LABELS
+# uses above. This is the actual runtime tool-call name apply_pii_guard's
+# safe_to_state exemption keys off of below.
+_PAYMENT_CONFIG_TOOL_NAME = "get_payment_config"
+
 
 def _category_label(tool_name: str) -> str:
     return _TOOL_CATEGORY_LABELS.get(tool_name, _GENERIC_CATEGORY_LABEL)
@@ -216,6 +223,67 @@ def _tool_result_is_failure(result: object) -> bool:
     if result.get("error"):
         return True
     return result.get("status") == "error"
+
+
+# Review Fix 7: a CRM-controlled payload nested deep enough (~2000 levels)
+# survives json.loads/json.dumps fine (the C-accelerated JSON codec has no
+# comparable recursion ceiling in practice for this shape) but blows
+# _walk_digit_bearing_values's own pure-Python "yield from" recursion,
+# raising RecursionError and killing the whole turn. This walker exists
+# specifically to handle CRM-controlled shapes (see its own docstring below)
+# -- so it must never be the thing that turns a weird-but-harmless payload
+# shape into a crashed turn. Bounded well under Python's default recursion
+# limit (sys.getrecursionlimit(), typically 1000) with generous headroom,
+# since each "yield from" level here costs more stack than a plain call.
+# Bounding cheaply (stop descending, don't raise) rather than only wrapping
+# the call site in try/except: a payload that's ACTUALLY ~2000 levels deep
+# would otherwise still blow the recursion limit walking level ~1000, deep
+# inside the generator chain, which try/except at the call site can still
+# catch (RecursionError is an Exception) but only after doing up to 1000
+# levels of wasted, still-somewhat-risky recursion first.
+_WALK_DIGIT_BEARING_VALUES_MAX_DEPTH = 50
+
+
+def _walk_digit_bearing_values(obj: object, _depth: int = 0) -> Iterator[str]:
+    """Recursively yield every string/number leaf value in *obj* that
+    contains at least one digit.
+
+    Used to build apply_pii_guard's safe_to_state allow-set from a CRM
+    tool payload GENERICALLY -- the payload's shape (which field actually
+    holds the account number / UPI id) is CRM-controlled and has drifted
+    before (get_payment_config's own catalog description says the
+    returned account "varies by player tier/rating"), so hardcoding a
+    field name would be brittle. Walking every leaf is deliberately
+    broader than necessary: exempting an extra non-sensitive digit string
+    (a deposit limit, an SLA hour count) from the PII guard costs nothing,
+    because the guard only ever fires on spans ALREADY shaped like a
+    mobile/account number in the model's own reply -- this never widens
+    what gets flagged, only what's allowed through once flagged.
+
+    Recursion is bounded at _WALK_DIGIT_BEARING_VALUES_MAX_DEPTH (review
+    Fix 7) -- past the cap this simply stops descending into that branch
+    rather than raising. Silently exempting a few extra-deeply-nested leaf
+    values from the safe_to_state allow-set costs nothing, for the same
+    reason walking every leaf in the first place is safe: this only ever
+    WIDENS what's allowed through once already flagged, never what gets
+    flagged. Metrics/guard-input machinery must never break a live turn --
+    that rule is already load-bearing elsewhere in this file (see the
+    per-tool metrics try/except a little further down).
+    """
+    if _depth > _WALK_DIGIT_BEARING_VALUES_MAX_DEPTH:
+        return
+    if isinstance(obj, dict):
+        for v in obj.values():
+            yield from _walk_digit_bearing_values(v, _depth + 1)
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from _walk_digit_bearing_values(v, _depth + 1)
+    elif isinstance(obj, bool):
+        return
+    elif isinstance(obj, (str, int, float)):
+        s = str(obj)
+        if any(ch.isdigit() for ch in s):
+            yield s
 
 
 def _tool_kind(tool_name: str) -> str:
@@ -776,14 +844,22 @@ class ChatBotAgent(BaseAgent):
                 # this parses to the same canned fallback as before — no worse
                 # off than not retrying at all.
                 response = parse_chatbot_response(retried_result.text)
-        # 5. Guard. Skip only for a multimodal turn with no retrieval — that
-        # answer is grounded in the image, not the (empty) knowledge base, so the
+        # 5. Guard. apply_hallucination_guard runs first so its own
+        # confidence == "high" gate sees the model's ORIGINAL confidence, not
+        # one already downgraded by apply_pii_guard -- apply_pii_guard runs
+        # LAST, immediately before the response is returned, so its
+        # confidence downgrade never disturbs a sibling guard's own gate or
+        # fallback substitution (see apply_pii_guard's docstring "Known
+        # limitations" list for the full rationale).
+        # Skip only for a multimodal turn with no retrieval — that answer is
+        # grounded in the image, not the (empty) knowledge base, so the
         # no-retrieval fallback would wrongly clobber it. Text turns are unchanged.
         multimodal = isinstance(user_msg.content, list)
         _guard_before = (response.response_text, response.confidence)
         if retrieved or not multimodal:
             response = apply_hallucination_guard(response, rag, self._guard)
         guard_hallucination_fired = (response.response_text, response.confidence) != _guard_before
+        response = apply_pii_guard(response)
         # 6. Persist
         await self._persist(user_msg, query_text, response, len(retrieved))
         total_ms = (time.perf_counter() - turn_start) * 1000
@@ -935,6 +1011,12 @@ class ChatBotAgent(BaseAgent):
         failed_category_names: set[str] = set()
         directive_index: int | None = None
         grounded_tool_texts: list[str] = []
+        # Same turn-scoping as grounded_tool_texts above: freshly initialized
+        # every call to _handle_with_tools (i.e. every turn), never persisted
+        # across turns, plain local variable, not on self. Collects the
+        # operator's own payment-config values from THIS turn's tool result(s)
+        # so apply_pii_guard's safe_to_state can exempt them below.
+        payment_config_safe_values: set[str] = set()
         # Snapshot of the PRIOR turns' consecutive-failure counts, taken before
         # this turn mutates them — used to decide whether THIS turn's directive
         # should escalate (i.e. this is the 2nd turn running with the same
@@ -1011,6 +1093,27 @@ class ChatBotAgent(BaseAgent):
                     else:
                         round_succeeded_names.add(tc.name)
                         grounded_tool_texts.append(json.dumps(out))
+                        if tc.name == _PAYMENT_CONFIG_TOOL_NAME:
+                            try:
+                                payment_config_safe_values.update(
+                                    _walk_digit_bearing_values(out)
+                                )
+                            except RecursionError:  # noqa: BLE001 - guard-input extraction must never break a live turn
+                                # Defense-in-depth alongside the walker's own
+                                # depth cap (review Fix 7): should be
+                                # unreachable given that cap, but a turn must
+                                # never crash over safe_to_state extraction
+                                # either way -- proceeding with a partially
+                                # (or entirely un-)populated allow-set only
+                                # ever narrows what apply_pii_guard exempts,
+                                # never what it flags.
+                                log.warning(
+                                    "payment-config safe_to_state extraction hit a "
+                                    "recursion limit; continuing without a fully "
+                                    "populated allow-set for this turn",
+                                    extra={"ticket_id": self._ticket_id,
+                                           "session_id": self._session_id},
+                                )
                 tool_ms_list.append((tc.name, elapsed * 1000))
                 try:
                     # Narrow on purpose — this wraps ONLY the per-tool metric
@@ -1228,6 +1331,17 @@ class ChatBotAgent(BaseAgent):
         guard_unverified_data_fired = (
             (response.response_text, response.confidence) != _guard_before_unverified
         )
+        # PII guard runs LAST, after every sibling guard in this method (see
+        # apply_pii_guard's docstring "Known limitations" list) -- so its own
+        # confidence downgrade never disturbs apply_hallucination_guard's or
+        # apply_unverified_data_guard's own confidence gates, both of which
+        # need to see the model's original confidence to decide whether to
+        # fire their own fallback substitution. Running it after
+        # apply_unverified_data_guard is also correct, not just safe: when
+        # that guard fires it fully replaces response_text with a canned
+        # fallback, so there is no real PII left in the text for this guard
+        # to find -- nothing to redact, nothing lost.
+        response = apply_pii_guard(response, safe_to_state=payment_config_safe_values)
         await self._persist(user_msg, query_text, response, len(retrieved_all))
         total_ms = (time.perf_counter() - turn_start) * 1000
         # Computed OUTSIDE the ChatTurnMetrics try/except below, and used for

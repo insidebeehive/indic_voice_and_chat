@@ -21,6 +21,7 @@ import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Optional
 
+from src.chatbot.tool_executor import REDACTED_PLACEHOLDER as _PII_REDACTED_PLACEHOLDER
 from src.dialogue.prompts import SOURCES_CLOSE_MARKER, SOURCES_OPEN_MARKER
 from src.dialogue.response_parser import ChatBotResponse
 from src.interfaces.vector_store import Document
@@ -392,7 +393,13 @@ def apply_no_grounding_guard(
     log.warning(
         "no-grounding guard: high-confidence response with no retrieval/tool call "
         "matched a risk pattern",
-        extra={"response_text": text[:200]},
+        # Review Fix 1: redact PII out of the logged slice BEFORE truncating
+        # to 200 chars -- this guard runs before apply_pii_guard ever sees
+        # this text (see apply_pii_guard's own docstring for why the guard
+        # ORDER itself isn't changing), so without this a mobile/email/
+        # account number sitting in an otherwise-risk-flagged reply landed
+        # in this WARNING log completely unredacted.
+        extra={"response_text": _redact_pii_for_log(text)[:200]},
     )
     return new
 
@@ -520,7 +527,17 @@ def apply_unverified_data_guard(
     log.error(
         "unverified-data guard: reply contained a currency figure with no grounding "
         "in this turn's tool results/RAG context/query/history — reply replaced",
-        extra={"unverified_figures": unverified, "response_text": response.response_text[:200]},
+        # Review Fix 1: same redact-before-truncate treatment as
+        # apply_no_grounding_guard's WARNING above -- this guard runs before
+        # apply_pii_guard too, so a mobile/email/account number co-occurring
+        # with the unverified figure that triggered this ERROR used to reach
+        # the log completely unredacted. `unverified_figures` itself is a
+        # list of currency-figure substrings (amounts, not customer PII) and
+        # is left as-is.
+        extra={
+            "unverified_figures": unverified,
+            "response_text": _redact_pii_for_log(response.response_text)[:200],
+        },
     )
     cfg = config or GuardConfig()
     is_hindi = (response.language or "").startswith("hi")
@@ -538,6 +555,676 @@ def apply_unverified_data_guard(
         confidence="low",
         action=response.action,
         suggested_followups=list(response.suggested_followups),
+        raw=dict(response.raw),
+        parse_error=response.parse_error,
+    )
+
+
+# --- PII guard (outbound counterpart to tool_executor._redact_internal_ids) -
+
+# Reused/adapted from the (unrelated, deliberately NOT imported) aggressive
+# trace-redaction module at src/observability/trace_redaction.py, which
+# solves a different problem: it is a blunt, deny-by-default scrubber for
+# payloads headed to a debugging backend, where over-redaction is the
+# explicitly preferred failure mode. This guard runs on text a customer is
+# about to receive; mangling a legitimate reply happens on every clean turn,
+# so it is tuned in the OPPOSITE direction -- catch the shapes below with
+# high confidence, leave everything else (amounts, dates, bet/transaction
+# references, OTPs) alone. Defined locally rather than imported so a future
+# change to the tracing module's aggressive ruleset can never silently
+# change what reaches a customer.
+
+# Email: same bounded-quantifier shape as trace_redaction.py's _EMAIL_RE
+# (64-char local part, 63-char domain labels, up to 8 labels, 24-char TLD) --
+# copied for the same reason it exists there: unbounded quantifiers on
+# `local@domain`-shaped adversarial text are a measured ReDoS (~38s on 100KB
+# of crafted input in that module's own regression test). \b on both ends
+# means a genuine email is always fully bounded by non-word characters.
+_PII_EMAIL_PATTERN = re.compile(
+    r"\b[A-Za-z0-9][A-Za-z0-9._%+\-]{0,63}"
+    r"@(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.){1,8}[A-Za-z]{2,24}\b"
+)
+
+# Indian mobile number: optional +91/91/0 prefix, then 10 digits starting
+# 6-9, with EITHER no separator, or a single space/hyphen separator at one
+# of the three groupings realistically seen in this product's replies: 5-5
+# ("98765 43210"), 3-3-4 ("987 654 3210", review Fix 5), or 4-3-3
+# ("9876 543 210", review Fix 5) -- 3-3-4/4-3-3 were a documented gap before
+# Fix 5; only 5-5 (and no separator) were matched.
+# Uses \b WORD boundaries, not the digit-adjacency lookarounds
+# ((?<!\d)/(?!\d)) trace_redaction.py uses for its own phone pattern. This is
+# a deliberate divergence, not an oversight: \b also refuses to match when
+# the character on either side is a LETTER (letters are \w too), so a
+# transaction/bet reference formatted as "TXN9876543210" or "BET9123456780"
+# -- both realistic in this product's replies -- is correctly left alone,
+# where a digit-adjacency lookaround would still fire on the embedded
+# digits (verified empirically against both patterns before choosing this
+# one). \b still rejects a 10-digit-shaped substring embedded in a longer
+# PURE digit run (a 12-digit Aadhaar, a 14-digit account number) the same as
+# the lookaround would, since digit-to-digit is also a \w-to-\w, non-boundary
+# transition. The one thing \b gives up versus the lookaround: a "+"
+# immediately before the digits is dropped from the match when preceded by
+# whitespace (\W-to-\W is not a boundary), e.g. "+91-98765-43210" matches as
+# "91-98765-43210" -- harmless, since the "+" itself is not sensitive and the
+# digits are still fully redacted.
+_PII_MOBILE_PATTERN = re.compile(
+    r"\b(?:\+?91[-\s]?|0)?"
+    r"(?:[6-9]\d{9}"                      # no separator: 9876543210
+    r"|[6-9]\d{4}[-\s]\d{5}"              # 5-5: 98765 43210
+    r"|[6-9]\d{2}[-\s]\d{3}[-\s]\d{4}"    # 3-3-4: 987 654 3210
+    r"|[6-9]\d{3}[-\s]\d{3}[-\s]\d{3})"   # 4-3-3: 9876 543 210
+    r"\b"
+)
+
+# Bank account number: any contiguous digit run 9-18 characters long, found
+# via a maximal-match \d+ scan (not a fixed-width \d{9,18} regex) so a run
+# LONGER than 18 digits is rejected in full rather than partially matched at
+# whatever 18-digit window happens to sit next to a non-digit boundary --
+# "reject runs that are part of a longer sequence," not just the
+# embedded-in-something-else case the mobile pattern handles above.
+#
+# \b on both ends (review Fix 3): without it, a digit run embedded in a
+# larger alphanumeric token -- "TXN9876543210", a realistic deposit/
+# transaction reference -- was extracted as its own bare 10-digit run and,
+# if an account anchor word happened to sit nearby (e.g. "...while
+# depositing to your bank account"), wrongly redacted as a bank account
+# number. \b closes exactly the gap the mobile pattern's own \b already
+# closes for mobile-shaped runs (see its comment above): a digit-to-letter
+# transition is \w-to-\w, never a boundary, so \b\d+\b simply never matches
+# starting mid-token. A run bounded by non-word characters on both sides
+# (the real bank-account case) is unaffected.
+#
+# This is the highest false-positive-risk category in this guard, so unlike
+# mobile/email it is NOT emitted on shape alone. It additionally requires an
+# "account"-flavoured word within _PII_ACCOUNT_ANCHOR_WINDOW characters on
+# either side -- the same anchor-word discipline the voice sentence guard
+# uses for currency detection ("a guard that fires on 'press 1 for support'
+# gets switched off"). Without this, a 9-18 digit transaction/bet reference
+# (realistic in this product: "TXN9876543210", a PGS order number) would be
+# indistinguishable from a real bank account number by shape alone.
+# Known limitation (documented, not fixed): a bank account number relayed
+# with NO account-ish wording anywhere nearby is not caught -- the
+# alternative (shape-only matching) was measured to false-positive on
+# exactly the transaction/reference content this guard must not touch.
+_PII_DIGIT_RUN_PATTERN = re.compile(r"\b\d+\b")
+# Bank-account anchor words. The optional "no./number" suffix is a SHARED
+# trailing group applied to whichever prefix branch matches (not duplicated
+# per-branch) so that "bank account number" is captured as ONE match instead
+# of stopping at "bank account" and leaving "number" as an unclaimed gap --
+# that gap was previously wide enough for a disqualifier word appearing
+# right after the digit run (e.g. "...account number is 5010...789; the UTR
+# will follow") to end up NEARER to the digit run than the anchor match,
+# defeating the nearest-wins logic below. ifsc/beneficiary have no such
+# suffix and are kept as separate bare alternatives.
+_PII_ACCOUNT_ANCHOR_PATTERN = re.compile(
+    r"\b(?:bank\s*accounts?|a/c|acct|acc(?:ounts?)?)\.?\s*(?:no\.?|number)?\b"
+    r"|\bifsc\b|\bbeneficiary\b",
+    re.IGNORECASE,
+)
+# Review Fix 5: "acct" (e.g. "Your acct no. is ...") is common shorthand this
+# product's replies can plausibly use and was previously not recognized at
+# all -- note it needs its own alternative rather than relying on
+# "acc(?:ounts?)?": that branch requires "acc" to be followed by either
+# nothing or "ount(s)", so "acct" fails its own trailing \b (the "t" sits
+# right before the shared "no./number" suffix group with no boundary before
+# it) and the whole alternative fails outright for this input, same as it
+# would for any other non-"acc(ount(s))" word starting with "acc".
+
+# Review Fix 3: "on account of" is ordinary English ("On account of the
+# delay, your refund id ... was reissued") that has nothing to do with a
+# bank account, but its bare "account" token still satisfies
+# _PII_ACCOUNT_ANCHOR_PATTERN. Checked explicitly (not just left to the
+# disqualifier list above, which is about a CO-OCCURRING reference word, not
+# about the anchor word itself being idiomatic) so this specific idiom's
+# "account" token is never treated as a real anchor no matter how close it
+# sits to an unrelated digit run.
+_PII_ACCOUNT_ANCHOR_IDIOM_PATTERN = re.compile(r"\bon\s+account\s+of\b", re.IGNORECASE)
+# Reference-type words that mean the nearby digit run is a transaction/order
+# reference rather than a bank account number, even if an account-ish word
+# ALSO happens to be in the same window (e.g. "credited to your account;
+# reference number 123456789012" -- "account" and "reference" both present,
+# but this is a reference number, not an account number). Checked FIRST,
+# and wins over a positive anchor match if both are present -- consistent
+# with this guard's overall bias toward under- rather than over-redacting.
+# Deliberately narrow (reference/order/UTR/ticket-shaped words only, not
+# "transaction" or "bet") -- a broader list risks suppressing a genuine
+# leaked account number in phrasing like "...used for this transaction" or
+# "your bet win goes to account 501234567890", which are realistic in this
+# product and must still be redacted.
+_PII_ACCOUNT_DISQUALIFIER_PATTERN = re.compile(
+    r"\b(?:order|utr|reference|pgsorderid|ticket|confirmation|invoice|receipt)\b",
+    re.IGNORECASE,
+)
+# Review Fix 5: widened from 40 to 60. Reproduced gap: "Your bank account
+# details are as follows for the pending refund case: 50100123456789" -- the
+# anchor ("bank account") sits 53 chars from the digit run, comfortably past
+# the old 40-char window, and "...as follows for..." (or "...as follows:...")
+# is ordinary phrasing this product's replies can plausibly use before
+# stating a number. 60 was chosen as the smallest round number that covers
+# this reproduction with headroom, not the largest window that still avoids
+# false positives -- the trade re-checked against the full existing test
+# suite before landing: widening does not flip any currently-passing
+# "must stay unredacted" case (e.g. "on account of ... refund id ...", the
+# unrelated-anchor/reference-number cases) into a false positive, because
+# those are excluded by the disqualifier/idiom checks above, not by window
+# size. A window this size does make it more likely for an unrelated
+# disqualifier word further down the same sentence to now fall inside the
+# window too -- but _pii_account_matches's nearest-wins comparison (not
+# any-match-vetoes) already handles that: only a disqualifier STRICTLY
+# CLOSER than the anchor overrides it.
+_PII_ACCOUNT_ANCHOR_WINDOW = 60
+_PII_ACCOUNT_MIN_DIGITS = 9
+_PII_ACCOUNT_MAX_DIGITS = 18
+
+# Currency amount with the currency word AFTER the number instead of a
+# ₹/Rs/INR prefix before it (e.g. "8100 rupees", "123456789 rupees") --
+# _CURRENCY_FIGURE_PATTERN only covers the prefixed form. Needed here (not
+# added to _CURRENCY_FIGURE_PATTERN itself, which the OTHER guards in this
+# module also use and were not asked to change) because a bare amount in
+# this suffix form is exactly the kind of number this guard must not treat
+# as a leaked bank account digit run.
+# Bounded to 24 repeats of `[\d,]` (generous headroom for any realistic
+# currency amount, thousands separators included) rather than the unbounded
+# `[\d,]*` this used to be -- an unbounded leading-\d, unanchored quantifier
+# here is a measured ReDoS: ~13.8s on a 16,000-digit string with no trailing
+# currency word, since the engine backtracks over every possible split point
+# once the required (?:rupees?|rs\.?|inr)\b tail fails to match at the end of
+# a long pure-digit run. Same fix shape as _PII_EMAIL_PATTERN's own bounded
+# quantifiers above, and the same class of bug src/observability/
+# trace_redaction.py's TestReDoSFix regression tests guard against.
+_PII_BARE_WORD_AMOUNT_PATTERN = re.compile(
+    r"\d[\d,]{0,24}(?:\.\d+)?\s?(?:rupees?|rs\.?|inr)\b", re.IGNORECASE
+)
+
+# _PII_REDACTED_PLACEHOLDER is imported at module top as an alias for
+# src/chatbot/tool_executor.py's REDACTED_PLACEHOLDER ("so it can never
+# silently drift out of sync" per that module's own comment) -- no circular
+# import risk, since tool_executor.py imports nothing from src.rag.
+
+
+def _normalize_digits(value: str) -> str:
+    """Strip every character except ASCII digits from *value*.
+
+    Used only by apply_pii_guard's safe_to_state matching, to compare a
+    value's digit identity across cosmetic formatting differences
+    (spaces/hyphens) between a CRM payload and the reply text; deliberately
+    distinct from _normalize_number above, which is decimal/comma-aware for
+    CURRENCY AMOUNT comparison and strips leading zeros -- an account/UPI
+    number has no fractional part, and a leading zero is part of its
+    identity, not noise to strip.
+    """
+    return "".join(ch for ch in value if ch.isdigit())
+
+
+def _nearest_match_distance(
+    pattern: re.Pattern, window: str, run_start: int, run_end: int,
+) -> Optional[int]:
+    """Character distance from the closest match of *pattern* in *window* to
+    the digit-run span [run_start, run_end) (both window-relative offsets
+    into *window*). 0 if some match overlaps the run itself; None if
+    *pattern* has no match in *window* at all."""
+    best: Optional[int] = None
+    for cand in pattern.finditer(window):
+        if cand.end() <= run_start:
+            dist = run_start - cand.end()
+        elif cand.start() >= run_end:
+            dist = cand.start() - run_end
+        else:
+            dist = 0
+        if best is None or dist < best:
+            best = dist
+    return best
+
+
+def _account_anchor_distance(window: str, run_start: int, run_end: int) -> Optional[int]:
+    """Like ``_nearest_match_distance(_PII_ACCOUNT_ANCHOR_PATTERN, ...)``, but
+    a candidate anchor match that falls entirely inside an "on account of"
+    idiom span (_PII_ACCOUNT_ANCHOR_IDIOM_PATTERN) is skipped -- review
+    Fix 3. Kept as its own function rather than an extra parameter on
+    _nearest_match_distance, since the idiom exclusion is specific to the
+    account anchor (the disqualifier-word lookup a few lines below still
+    uses the generic function unmodified)."""
+    idiom_spans = [m.span() for m in _PII_ACCOUNT_ANCHOR_IDIOM_PATTERN.finditer(window)]
+    best: Optional[int] = None
+    for cand in _PII_ACCOUNT_ANCHOR_PATTERN.finditer(window):
+        if any(cand.start() >= s and cand.end() <= e for s, e in idiom_spans):
+            continue
+        if cand.end() <= run_start:
+            dist = run_start - cand.end()
+        elif cand.start() >= run_end:
+            dist = cand.start() - run_end
+        else:
+            dist = 0
+        if best is None or dist < best:
+            best = dist
+    return best
+
+
+def _pii_account_matches(
+    text: str, exclude_spans: list[tuple[int, int]],
+) -> list[re.Match]:
+    """Bank-account-shaped digit runs in *text*, anchor-gated and
+    disqualifier-aware (see _PII_ACCOUNT_ANCHOR_PATTERN /
+    _PII_ACCOUNT_DISQUALIFIER_PATTERN above), excluding any span already
+    claimed by *exclude_spans* -- this guard's own mobile matches, plus
+    money-figure spans from _CURRENCY_FIGURE_PATTERN and
+    _PII_BARE_WORD_AMOUNT_PATTERN, so a legitimate amount is never mistaken
+    for an account number just because it normalizes to a long digit run.
+
+    NEAREST-WINS, not any-match-vetoes: a candidate is redacted only if an
+    account-anchor word exists in the window AND no disqualifier word is
+    STRICTLY CLOSER to the digit run than the nearest anchor. An earlier
+    version skipped redaction whenever ANY disqualifier word appeared
+    anywhere in the (±40 char) window, which correctly fixed the
+    reference-number false positives (see the disqualifier pattern's own
+    docstring) but over-corrected: it also suppressed genuine leaked account
+    numbers in realistic phrasing like "Your bank account number is
+    5010...789; the UTR will follow shortly" -- the UTR mention, though
+    clearly unrelated to the account number two clauses earlier, still fell
+    inside the same window. Comparing distances instead of presence keeps
+    both fixed: a disqualifier word sitting right next to the digit run
+    (the true reference-number case) still wins, but a disqualifier word
+    elsewhere in the same sentence no longer overrides an anchor word
+    sitting immediately next to the number.
+    """
+    out: list[re.Match] = []
+    for m in _PII_DIGIT_RUN_PATTERN.finditer(text):
+        run_len = len(m.group())
+        if not (_PII_ACCOUNT_MIN_DIGITS <= run_len <= _PII_ACCOUNT_MAX_DIGITS):
+            continue
+        if any(m.start() < e and m.end() > s for s, e in exclude_spans):
+            continue
+        window_start = max(0, m.start() - _PII_ACCOUNT_ANCHOR_WINDOW)
+        window_end = min(len(text), m.end() + _PII_ACCOUNT_ANCHOR_WINDOW)
+        window = text[window_start:window_end]
+        run_start_rel = m.start() - window_start
+        run_end_rel = m.end() - window_start
+        anchor_dist = _account_anchor_distance(window, run_start_rel, run_end_rel)
+        if anchor_dist is None:
+            continue
+        disqualifier_dist = _nearest_match_distance(
+            _PII_ACCOUNT_DISQUALIFIER_PATTERN, window, run_start_rel, run_end_rel,
+        )
+        if disqualifier_dist is not None and disqualifier_dist < anchor_dist:
+            continue
+        out.append(m)
+    return out
+
+
+def _find_pii_hits(text: str) -> list[tuple[int, int, str]]:
+    """Every PII-shaped span in *text*: ``(start, end, type)`` with type in
+    ``{"mobile", "email", "account"}``, sorted start-ascending / longest-
+    first on a tie (see apply_pii_guard's own sort comment below for why).
+
+    This is the shared detection core, factored out so it can be applied
+    to a bare log string (review Fix 1, see ``_redact_pii_for_log`` below)
+    or to a ``suggested_followups`` entry (review Fix 2) without dragging in
+    the full ``ChatBotResponse``-shaped machinery of ``apply_pii_guard``
+    itself.
+
+    Money-span handling (review Fix 4): a PREFIX currency figure (``₹``/
+    ``Rs``/``INR`` before the digits, `_CURRENCY_FIGURE_PATTERN`) is
+    unambiguous -- the currency marker literally precedes the number, so it
+    can only be an amount -- and continues to suppress an overlapping mobile
+    match, e.g. "Rs 9876543210" stays an amount, never a mobile number. A
+    SUFFIX currency word trailing the digits (``rupees``/``rs``/``inr``
+    AFTER the number, `_PII_BARE_WORD_AMOUNT_PATTERN`) does NOT suppress an
+    overlapping mobile match any more: "9876543210 INR" / "9876543210 rs"
+    (the latter is everyday Hinglish, not just formal currency notation)
+    were leaking a real 10-digit mobile-shaped run because the trailing
+    currency word happened to make it look like an amount. Shape (10 digits
+    starting 6-9) is a stronger and more dangerous signal than an ambiguous
+    trailing unit word, so the mobile interpretation wins.
+    Accepted, documented tradeoff: a genuine 10-digit amount starting 6-9
+    immediately followed by a currency word (e.g. "9500000000 rupees", a
+    literal 950-crore payout) is now indistinguishable from a mobile number
+    by shape alone and gets misclassified/redacted as one -- see
+    ``test_pii_guard_large_bare_word_amount_shaped_like_mobile_is_redacted_as_mobile_documented_tradeoff``.
+    This is deliberately accepted: a false positive on an amount that large
+    is vanishingly rare for this product, whereas the false negative it
+    replaces (a real mobile number reaching the customer) is the exact class
+    of leak this guard exists to prevent. A PREFIX-form amount of the same
+    size ("Rs 9500000000") is unaffected, since that overlap check is
+    unchanged.
+
+    Suffix-form money spans are still used, unchanged, to keep an account-
+    shaped bare amount ("123456789 rupees") from being mistaken for a bank
+    account number -- only the MOBILE overlap check narrowed to prefix-only.
+    """
+    prefix_money_spans = [m.span() for m in _CURRENCY_FIGURE_PATTERN.finditer(text)]
+    suffix_money_spans = [m.span() for m in _PII_BARE_WORD_AMOUNT_PATTERN.finditer(text)]
+    money_spans = prefix_money_spans + suffix_money_spans
+
+    mobile_matches = [
+        m for m in _PII_MOBILE_PATTERN.finditer(text)
+        if not any(m.start() < e and m.end() > s for s, e in prefix_money_spans)
+    ]
+    email_matches = list(_PII_EMAIL_PATTERN.finditer(text))
+    mobile_spans = [m.span() for m in mobile_matches]
+    account_matches = _pii_account_matches(text, money_spans + mobile_spans)
+
+    hits: list[tuple[int, int, str]] = (
+        [(m.start(), m.end(), "mobile") for m in mobile_matches]
+        + [(m.start(), m.end(), "email") for m in email_matches]
+        + [(m.start(), m.end(), "account") for m in account_matches]
+    )
+    # Sort by start ascending, longest-first on a tie, so a span that fully
+    # CONTAINS another (e.g. an email whose local part happens to also be
+    # mobile-shaped, "9876543210@gmail.com") is the one applied, rather than
+    # the smaller contained span leaving the rest of the containing match
+    # (the "@gmail.com" domain) unredacted.
+    hits.sort(key=lambda h: (h[0], -(h[1] - h[0])))
+    return hits
+
+
+def _pii_hit_is_exempt(matched_text: str, typ: str, safe_digits: set[str]) -> bool:
+    """True if a single PII hit is covered by ``safe_to_state`` (see
+    apply_pii_guard's own docstring for the full contract). Restricted to
+    account/mobile hits of a realistic minimum length -- never "email" --
+    and shared between response_text redaction and suggested_followups
+    filtering (review Fix 2) so both apply the exact same exemption rule."""
+    return (
+        bool(safe_digits)
+        and typ in ("account", "mobile")
+        and len(_normalize_digits(matched_text)) >= _PII_ACCOUNT_MIN_DIGITS
+        and _normalize_digits(matched_text) in safe_digits
+    )
+
+
+def _redact_pii_hits(
+    text: str, hits: list[tuple[int, int, str]], safe_digits: set[str],
+) -> tuple[str, set[str]]:
+    """Rebuild *text* with every hit in *hits* either left untouched (if
+    exempt via ``safe_digits``, see ``_pii_hit_is_exempt``) or replaced with
+    ``_PII_REDACTED_PLACEHOLDER``. Returns ``(rebuilt_text, types_found)``,
+    where ``types_found`` excludes exempted hits -- the same bookkeeping
+    apply_pii_guard itself used to do inline, now shared with
+    ``_redact_pii_for_log``."""
+    out_parts: list[str] = []
+    last = 0
+    types_found: set[str] = set()
+    for start, end, typ in hits:
+        if start < last:
+            continue  # already covered by a preceding, larger/earlier span
+        matched_text = text[start:end]
+        if _pii_hit_is_exempt(matched_text, typ, safe_digits):
+            # Caller has vouched for this exact value (e.g. the operator's
+            # own deposit account from get_payment_config this turn) --
+            # leave it untouched, and don't count it toward types_found, so
+            # a reply made up entirely of exempted matches doesn't trigger
+            # the confidence downgrade below. Preserve the gap since the
+            # previous span (or string start) too, exactly like the redact
+            # branch below does -- without this, the untouched text between
+            # spans was silently dropped from the rebuilt string.
+            out_parts.append(text[last:start])
+            out_parts.append(matched_text)
+            last = end
+            continue
+        out_parts.append(text[last:start])
+        out_parts.append(_PII_REDACTED_PLACEHOLDER)
+        last = end
+        types_found.add(typ)
+    out_parts.append(text[last:])
+    return "".join(out_parts), types_found
+
+
+def _redact_pii_for_log(text: str) -> str:
+    """Redact PII shapes out of *text* before it is embedded in a log
+    payload (review Fix 1).
+
+    apply_no_grounding_guard's WARNING and apply_unverified_data_guard's
+    ERROR log calls both include a slice of the model's raw response_text
+    for diagnostics. apply_pii_guard -- the guard that would otherwise catch
+    a mobile/email/account number in that text -- runs LAST in the pipeline,
+    deliberately AFTER both of these (see apply_pii_guard's own "Known
+    limitations": the ordering itself is not changing, since running PII
+    first would force confidence="low" and disable the other guards'
+    confidence=="high" gates). Without this, a reply that tripped one of
+    those sibling guards WHILE also containing real PII put the raw PII
+    value straight into an ERROR/WARNING log, never reaching apply_pii_guard
+    at all.
+
+    This is the SAME detection core apply_pii_guard uses (``_find_pii_hits``
+    / ``_redact_pii_hits``), applied here purely as a log-safety pass -- it
+    never touches the customer-facing response_text, and it deliberately
+    ignores safe_to_state entirely (passing an empty exemption set): a log
+    line has no notion of a per-turn allow-set, and over-redacting an
+    operator's own account number in a diagnostic log line costs nothing.
+    Keeps logging the redacted text rather than dropping it -- it's still
+    diagnostically useful to see the shape/length of the reply that tripped
+    the guard, just never the PII itself.
+    """
+    if not text:
+        return text
+    hits = _find_pii_hits(text)
+    if not hits:
+        return text
+    redacted, _types = _redact_pii_hits(text, hits, safe_digits=set())
+    return redacted
+
+
+def apply_pii_guard(
+    response: ChatBotResponse, safe_to_state: Optional[set[str]] = None,
+) -> ChatBotResponse:
+    """Outbound counterpart to tool_executor._redact_internal_ids.
+
+    That function makes leaking operator_id/user_id/tenant_id/crm_id/
+    session_id "structurally impossible instead of just discouraged" on the
+    way IN to the model. Nothing plays the same role on the way OUT: the
+    system prompt (src/dialogue/prompts.py's "keep internals internal" /
+    DATA RULE / IDENTITY CONFIRMATION rules) tells the model never to state a
+    customer's contact details even when a tool genuinely returns one -- but
+    that is an LLM instruction, not a guarantee, exactly the gap
+    _redact_internal_ids's own docstring calls out for the inbound side.
+    This is that same guarantee applied outbound, for customer PII instead
+    of internal plumbing.
+
+    Detects (see the patterns above for the false-positive reasoning behind
+    each): Indian mobile numbers, email addresses, and anchor-gated bank
+    account numbers. Each match in response_text is redacted IN PLACE
+    (_PII_REDACTED_PLACEHOLDER) -- unlike apply_unverified_data_guard, a
+    leaked contact detail is a specific token in an otherwise
+    possibly-correct answer, not a signal the whole reply is untrustworthy,
+    so only the offending span is removed and the rest of the reply
+    survives. confidence is downgraded to "low" (a turn that needed this
+    guard is not one to trust blindly) and an ERROR is logged with the
+    matched TYPE(s) only (`pii_types`) -- deliberately NOT response_text or
+    the matched value itself, unlike the sibling guards in this module,
+    because logging the PII to defend against leaking it would be
+    self-defeating (matches tool_executor.py's own `param_keys`-only
+    logging precedent).
+
+    ``suggested_followups`` (review Fix 2) are scanned with the exact same
+    detection core, since they are customer-visible on every surface
+    response_text is: ``src/api/chat.py``'s REST ``_to_message_response``
+    (``suggested_followups=r.suggested_followups``) and its WebSocket
+    ``"suggestions"`` frame, and ``src/api/external_chat.py``'s
+    ``ExternalMessageResponse.suggestions``. Checked and confirmed NOT
+    customer-visible on any of those three surfaces: ``response.raw`` --
+    none of them read it, so it needs no scanning. A followup that leaks PII
+    is DROPPED from the list entirely, never redacted-in-place like
+    response_text is: a followup is a SUGGESTED REPLY the customer might
+    tap/say verbatim, and "Should I send the OTP to [redacted]?" is not a
+    coherent thing to hand a customer as a one-tap suggestion -- unlike a
+    redacted span sitting inside an otherwise-normal sentence, a redacted
+    span standing in for the entire payload of a short suggested question
+    reads as broken, not merely cautious. A dropped/redacted followup or
+    response_text span, in either case, downgrades confidence to "low" and
+    logs the same ERROR (pii_types covers hits from both response_text and
+    dropped followups; a `followups_dropped` count is included whenever at
+    least one followup was dropped).
+
+    No GuardConfig parameter -- unlike apply_hallucination_guard/
+    apply_unverified_data_guard, this guard has no fallback text to
+    template (it redacts a span, it doesn't replace the whole reply), so
+    there is nothing in GuardConfig for it to consume. Matches
+    apply_no_grounding_guard's precedent of the same shape for the same
+    reason.
+
+    Runs regardless of whether the customer supplied the value themselves
+    first (e.g. "is my number 98XXXXXXXX?" echoed back as "Yes, ...
+    9812345678 ...") -- the prompt's IDENTITY CONFIRMATION rule forbids
+    confirming it that way for exactly this reason, and this guard has no
+    way to know provenance even if it wanted to make that distinction.
+
+    safe_to_state is an optional allow-set of values the CALLER has already
+    verified are safe to state to the user this turn -- e.g. the operator's
+    own deposit account number, returned by a CRM tool call earlier in the
+    same turn, which is not customer PII at all and should not be redacted
+    out of a deposit-instructions reply. Matching is on NORMALIZED DIGITS
+    (see _normalize_digits), not raw text, so cosmetic formatting
+    differences (spaces/hyphens) between how a CRM payload spells the number
+    and how the model's reply spells it don't defeat the exemption. This
+    function has no concept of "turn" itself -- safe_to_state is trusted
+    as-is, whatever it contains; scoping it to the current turn (and to the
+    right tool's own output) is entirely the caller's responsibility.
+
+    PAN and Aadhaar were considered and deliberately excluded:
+    - PAN's shape (5 letters + 4 digits + 1 letter, e.g. "ABCDE1234F") is
+      distinctive versus this product's dates/amounts/bet-ids, but collides
+      with a plausible promo/bonus/referral code shape ("PROMO1234X") that
+      this product's replies could legitimately contain -- and unlike the
+      three patterns above, this wasn't verified against this product's
+      actual reply content, so the risk wasn't taken.
+    - Aadhaar's most distinctive form (12 digits spaced 4-4-4) was left out
+      for the same reason. A CONTIGUOUS 12-digit Aadhaar number is still
+      caught by the anchor-gated account-number pattern above if it happens
+      to sit near account-ish wording, but the spaced form, or one with no
+      nearby anchor at all, is a known gap.
+
+    Known limitations (documented, not fixed):
+    - This guard runs after the other reply guards (hallucination/
+      no-grounding/unverified-data) in the pipeline, by design, so their own
+      confidence gates and canned-fallback substitutions aren't disturbed by
+      this guard's confidence downgrade. FIXED (review Fix 1, was
+      previously documented here as an accepted gap covering only the
+      no-grounding WARNING path and not mentioning the ERROR path at all):
+      both ``apply_no_grounding_guard``'s WARNING log call and
+      ``apply_unverified_data_guard``'s ERROR log call now redact PII out of
+      the ``response_text`` slice they log (via ``_redact_pii_for_log``,
+      the same detection core this guard uses) before this guard ever runs
+      -- so a reply that trips one of those sibling guards while also
+      containing real PII no longer puts the raw value into an ERROR/WARNING
+      log line. The guard ORDER itself is unchanged and is not the fix: PII
+      guard still runs last, for the reason above.
+    - A bank account or mobile number rendered with spaces/hyphens IN THE
+      REPLY TEXT ITSELF is not detected at all (the account/mobile patterns
+      require a contiguous digit run to fire in the first place) --
+      ``safe_to_state``'s digit-normalization only ever helps match a
+      contiguous reply-side span against a differently-formatted CRM value;
+      it does not make a spaced/hyphenated reply-side number detectable when
+      it wasn't already.
+    - The ``safe_to_state`` exemption only ever applies on the tool-loop path
+      (``_handle_with_tools``), where a CRM tool call's own result is
+      available to build the allow-set from. On the single-shot/no-tool-loop
+      path, or if an operator's deposit account is ever sourced from a
+      knowledge-base chunk rather than a live ``get_payment_config`` call,
+      this guard has no way to know the value is safe and will redact it
+      like any other account-shaped number -- a caller who needs the
+      exemption in another code path must build and pass its own
+      ``safe_to_state`` set the same way.
+    - A bank account number stated with no account-ish word anywhere within
+      _PII_ACCOUNT_ANCHOR_WINDOW characters is not caught (see
+      _pii_account_matches).
+    - _pii_account_matches's anchor-vs-disqualifier tie-break is nearest-wins
+      (see there): on an exact distance tie the anchor wins (redacts), and a
+      disqualifier word landing strictly closer to the digit run than any
+      anchor word can still suppress a genuine leak in an unusual phrasing.
+      This is rare in practice -- real account-number sentences almost
+      always place the anchor word immediately adjacent to the number.
+    - NOT limited to ASCII-digit numerals as previously (incorrectly)
+      documented here: Python's regex ``\\d`` matches any Unicode decimal
+      digit, Devanagari included. The ACCOUNT path (_PII_DIGIT_RUN_PATTERN,
+      a bounded bare-digit-run regex) DOES match an anchor-adjacent
+      Devanagari-digit run (e.g. "बैंक account number है ९८७६५४३२१०१२") like
+      any other digit run. The MOBILE pattern is unaffected in practice: its
+      leading character class is the literal ASCII range ``[6-9]``, which
+      does not match Devanagari digit codepoints, so a fully-Devanagari
+      10-digit run is never recognized as a mobile number. Email is
+      unaffected (no digit matching involved in the local/domain shape
+      check beyond what `[A-Za-z0-9...]` already restricts to ASCII). None
+      of this was verified/tested before this pass, so treat the account-
+      path behavior as incidental rather than a designed guarantee -- chat
+      is text-in/text-out with no numeral-normalization pass, unlike voice,
+      so a model rendering digits in Devanagari at all is not expected in
+      practice, tested or not.
+    - A 10-digit run starting 6-9 immediately followed by a currency word
+      ("9500000000 rupees") is now classified as a mobile number rather than
+      an amount, even though it could in principle be a genuine (very large)
+      rupee amount -- see _find_pii_hits's own docstring (review Fix 4) for
+      the full reasoning; this is an accepted, deliberate tradeoff, not an
+      oversight.
+    - The guard cannot tell WHOSE account a digit run belongs to from the
+      text alone -- correctness of safe_to_state depends entirely on the
+      caller supplying the right allow-set for the right scope. A caller
+      that widened it to "any tool's output this turn" (instead of one
+      specific tool's own result) would wrongly exempt a customer's own
+      leaked bank account number just because some other tool happened to
+      return it in the same turn.
+    """
+    text = response.response_text or ""
+    safe_digits = {d for v in (safe_to_state or ()) if (d := _normalize_digits(v))}
+
+    # Exemption is restricted to account/mobile hits of a realistic minimum
+    # length (_PII_ACCOUNT_MIN_DIGITS, reused rather than a new magic
+    # number) -- never "email". _walk_digit_bearing_values (in chatbot.py)
+    # deliberately harvests EVERY digit-bearing leaf value from a CRM
+    # payload, by design, so safe_digits can contain a short, incidental
+    # value (a 3-digit SLA-hours field, a deposit limit) that is not itself
+    # an account/mobile number. Without the length floor, a short
+    # safe_digits entry could coincidentally match inside an EMAIL hit's
+    # local part (e.g. safe_to_state={"100"} exempting
+    # "support100@operator.com") purely by digit coincidence -- an email
+    # address should never be exempt via this mechanism at all. See
+    # _pii_hit_is_exempt, shared between response_text and followups below.
+    hits = _find_pii_hits(text) if text else []
+    redacted_text, body_types_found = (
+        _redact_pii_hits(text, hits, safe_digits) if hits else (text, set())
+    )
+
+    # Review Fix 2: suggested_followups get the exact same scan. A followup
+    # that leaks PII is DROPPED from the list entirely rather than redacted
+    # in place -- see this function's own docstring for why a placeholder
+    # inside a one-tap suggested reply is worse than just not offering it.
+    kept_followups: list[str] = []
+    followup_types_found: set[str] = set()
+    followups_dropped = 0
+    for followup in response.suggested_followups:
+        f_hits = _find_pii_hits(followup)
+        leaked_types = {
+            typ for start, end, typ in f_hits
+            if not _pii_hit_is_exempt(followup[start:end], typ, safe_digits)
+        }
+        if leaked_types:
+            followups_dropped += 1
+            followup_types_found |= leaked_types
+        else:
+            kept_followups.append(followup)
+
+    types_found = body_types_found | followup_types_found
+    if not types_found:
+        # Nothing survived to report: either there were no hits anywhere
+        # (response_text or followups), or every hit that did exist was
+        # exempted via safe_to_state. Return the original response
+        # untouched: no rebuild, no confidence downgrade, no error log,
+        # since nothing was actually redacted or dropped.
+        return response
+
+    log_extra: dict[str, object] = {"pii_types": sorted(types_found)}
+    if followups_dropped:
+        log_extra["followups_dropped"] = followups_dropped
+    log.error(
+        "pii guard: reply contained a customer PII pattern; span(s) redacted"
+        + (" and suggested_followups dropped" if followups_dropped else ""),
+        extra=log_extra,
+    )
+    return ChatBotResponse(
+        response_text=redacted_text,
+        language=response.language,
+        sources_used=list(response.sources_used),
+        confidence="low",
+        action=response.action,
+        suggested_followups=kept_followups,
         raw=dict(response.raw),
         parse_error=response.parse_error,
     )
