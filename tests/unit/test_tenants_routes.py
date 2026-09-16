@@ -738,6 +738,137 @@ async def test_crm_x_api_key_not_set_reports_empty_string(ctx) -> None:
     assert cfg["crm"]["x_api_key"] == ""
 
 
+async def _stored_secret(sm, tenant_id: str, name: str) -> str | None:
+    """Decrypt one tenant_secrets row, or None if the row does not exist —
+    the same select-then-crypto.decrypt shape used inline above, factored out
+    because the blank-credential tests below all need to prove what is
+    actually sitting in the column, not what an API response summarises."""
+    async with sm() as s:
+        rows = (await s.execute(
+            select(TenantSecret).where(TenantSecret.tenant_id == tenant_id)
+        )).scalars().all()
+    row = next((r for r in rows if r.name == name), None)
+    return None if row is None else crypto.decrypt(row.value_encrypted)
+
+
+@pytest.mark.parametrize("block,field", [
+    ("chatwoot", "api_url"),
+    ("chatwoot", "account_id"),
+    ("chatwoot", "api_token"),
+    ("chatwoot", "inbox_id"),
+    ("crm", "base_url"),
+    ("crm", "auth_type"),
+    ("crm", "api_token"),
+    ("crm", "x_api_key"),
+])
+async def test_patch_blank_credential_is_rejected(ctx, block, field) -> None:
+    """Every Chatwoot/CRM field that lands in tenant_secrets rejects "".
+
+    The handler gates each of these on `is not None`, which an empty string
+    passes — so before this constraint a blank field wrote an encrypted ""
+    over whatever was there. Rejecting at the model means the handler never
+    sees a value it would encrypt into a working credential's row.
+    """
+    client, _, _ = ctx
+    tid = (await client.post(
+        "/tenants", json=_body(slug="acme"), headers=ADMIN_HEADERS)).json()["tenant_id"]
+
+    resp = await client.patch(f"/tenants/{tid}", json={block: {field: ""}},
+                              headers=ADMIN_HEADERS)
+    assert resp.status_code == 422, f"{block}.{field} accepted an empty string"
+
+
+async def test_patch_blank_crm_x_api_key_does_not_erase_the_configured_one(ctx) -> None:
+    """x_api_key is the CRM's own auth header, independent of auth_type/api_token,
+    so a blank value silently replacing it breaks CRM auth on its own. It must
+    not reach the column — proven by decrypting the row, not by reading the
+    masked chat-config response, which shows "..." for both a real value and
+    an encrypted "".
+    """
+    client, _, sm = ctx
+    tid = (await client.post(
+        "/tenants", json=_body(slug="acme"), headers=ADMIN_HEADERS)).json()["tenant_id"]
+
+    assert (await client.patch(f"/tenants/{tid}", json={
+        "crm": {"base_url": "https://crm.example", "x_api_key": "live-x-api-key"},
+    }, headers=ADMIN_HEADERS)).status_code == 200
+    assert await _stored_secret(sm, tid, "crm:x_api_key") == "live-x-api-key"
+
+    resp = await client.patch(f"/tenants/{tid}", json={"crm": {"x_api_key": ""}},
+                              headers=ADMIN_HEADERS)
+    assert resp.status_code == 422
+    assert await _stored_secret(sm, tid, "crm:x_api_key") == "live-x-api-key", (
+        "a blank x_api_key overwrote the configured CRM credential"
+    )
+    assert await _stored_secret(sm, tid, "crm:base_url") == "https://crm.example"
+
+
+async def test_patch_blank_chatwoot_api_token_does_not_erase_the_configured_one(ctx) -> None:
+    """Same property on the Chatwoot side. The backoffice form always sends
+    inbox_id/account_id alongside the token, so the realistic shape of this
+    request carries a valid sibling field — the whole body must still be
+    rejected rather than committing the valid half."""
+    client, _, sm = ctx
+    tid = (await client.post(
+        "/tenants", json=_body(slug="acme"), headers=ADMIN_HEADERS)).json()["tenant_id"]
+
+    assert (await client.patch(f"/tenants/{tid}", json={
+        "chatwoot": {"inbox_id": "42", "api_token": "cw-live-token"},
+    }, headers=ADMIN_HEADERS)).status_code == 200
+    assert await _stored_secret(sm, tid, "chatwoot:api_token") == "cw-live-token"
+
+    resp = await client.patch(f"/tenants/{tid}", json={
+        "chatwoot": {"inbox_id": "42", "api_token": ""},
+    }, headers=ADMIN_HEADERS)
+    assert resp.status_code == 422
+    assert await _stored_secret(sm, tid, "chatwoot:api_token") == "cw-live-token", (
+        "a blank api_token overwrote the configured Chatwoot credential"
+    )
+
+
+async def test_patch_omitted_credential_field_is_left_untouched(ctx) -> None:
+    """The other half of the contract, and the reason the `is not None` gates
+    in the handler must survive this change: a field the caller did not send
+    keeps its stored value, while the fields it did send are written. Without
+    the gates a partial PATCH would blank every field it omits — a strictly
+    worse version of the bug the min_length constraint closes."""
+    client, _, sm = ctx
+    tid = (await client.post(
+        "/tenants", json=_body(slug="acme"), headers=ADMIN_HEADERS)).json()["tenant_id"]
+
+    assert (await client.patch(f"/tenants/{tid}", json={
+        "crm": {"base_url": "https://crm.example", "x_api_key": "live-x-api-key"},
+    }, headers=ADMIN_HEADERS)).status_code == 200
+
+    # x_api_key omitted entirely — only base_url is being changed.
+    assert (await client.patch(f"/tenants/{tid}", json={
+        "crm": {"base_url": "https://crm2.example"},
+    }, headers=ADMIN_HEADERS)).status_code == 200
+
+    assert await _stored_secret(sm, tid, "crm:x_api_key") == "live-x-api-key", (
+        "an omitted field was overwritten by a partial PATCH"
+    )
+    assert await _stored_secret(sm, tid, "crm:base_url") == "https://crm2.example"
+
+
+async def test_patch_explicit_null_credential_is_still_a_no_op(ctx) -> None:
+    """min_length=1 constrains the str arm of Optional[str] only — an explicit
+    JSON null must stay equivalent to omitting the field, not become a 422.
+    Nothing in the backoffice sends null today, but the PATCH contract has
+    always treated the two the same and a constraint should not quietly
+    redefine it."""
+    client, _, sm = ctx
+    tid = (await client.post(
+        "/tenants", json=_body(slug="acme"), headers=ADMIN_HEADERS)).json()["tenant_id"]
+    await client.patch(f"/tenants/{tid}", json={"crm": {"x_api_key": "live-x-api-key"}},
+                       headers=ADMIN_HEADERS)
+
+    resp = await client.patch(f"/tenants/{tid}", json={"crm": {"x_api_key": None}},
+                              headers=ADMIN_HEADERS)
+    assert resp.status_code == 200, resp.text
+    assert await _stored_secret(sm, tid, "crm:x_api_key") == "live-x-api-key"
+
+
 async def test_rotate_webhook_credentials_stringee_only(ctx) -> None:
     client, _, sm = ctx
     tid = (await client.post(
@@ -1110,20 +1241,33 @@ async def test_patch_deposit_verification_empty_secret_is_not_a_secret(ctx) -> N
 
     It must also not clobber an existing working secret: a blank field in the
     UI means "leave unchanged", not "erase".
+
+    This used to be enforced as a silent 200 no-op. It is a 422 now: the
+    backoffice form never sends a blank secret (it omits the field unless
+    typed), so the caller who can actually produce this request is a direct
+    API PATCH — and a silent 200 there gives no indication anything was
+    wrong. The property being guarded is unchanged — the previously
+    configured secret must still be there, byte for byte, after the
+    rejected call.
     """
-    client, _, _ = ctx
+    client, _, sm = ctx
     tid = (await client.post(
         "/tenants", json=_body(slug="acme"), headers=ADMIN_HEADERS)).json()["tenant_id"]
+    secret_name = "TENANT_ACME_DEPOSIT_VERIFICATION_WEBHOOK_SECRET"
 
-    resp = await client.patch(f"/tenants/{tid}", json={
+    # enabled + webhook_url, no secret yet — the inert-but-valid state.
+    assert (await client.patch(f"/tenants/{tid}", json={
         "deposit_verification": {
             "enabled": True,
             "webhook_url": "https://vendor.example/verify",
-            "webhook_secret": "",
         }
+    }, headers=ADMIN_HEADERS)).status_code == 200
+
+    resp = await client.patch(f"/tenants/{tid}", json={
+        "deposit_verification": {"webhook_secret": ""},
     }, headers=ADMIN_HEADERS)
-    assert resp.status_code == 200
-    assert resp.json()["deposit_verification_secret_set"] is False
+    assert resp.status_code == 422, "an empty webhook_secret was accepted"
+    assert await _stored_secret(sm, tid, secret_name) is None
 
     t = next(x for x in (await client.get("/tenants", headers=ADMIN_HEADERS))
              .json()["tenants"] if x["tenant_id"] == tid)
@@ -1132,18 +1276,21 @@ async def test_patch_deposit_verification_empty_secret_is_not_a_secret(ctx) -> N
         "enabled + webhook_url + an EMPTY secret must not read as active"
     )
 
-    # A real secret, then a blank one: the blank must leave the real one alone.
-    await client.patch(f"/tenants/{tid}", json={
+    # A real secret, then a blank one: the blank is rejected AND leaves the
+    # real one alone — the erase this whole constraint exists to prevent.
+    assert (await client.patch(f"/tenants/{tid}", json={
         "deposit_verification": {"webhook_secret": "shared-secret-value"},
-    }, headers=ADMIN_HEADERS)
-    await client.patch(f"/tenants/{tid}", json={
+    }, headers=ADMIN_HEADERS)).status_code == 200
+    assert (await client.patch(f"/tenants/{tid}", json={
         "deposit_verification": {"webhook_secret": ""},
-    }, headers=ADMIN_HEADERS)
-    t = next(x for x in (await client.get("/tenants", headers=ADMIN_HEADERS))
-             .json()["tenants"] if x["tenant_id"] == tid)
-    assert t["deposit_verification_secret_set"] is True, (
+    }, headers=ADMIN_HEADERS)).status_code == 422
+
+    assert await _stored_secret(sm, tid, secret_name) == "shared-secret-value", (
         "a blank secret erased a previously configured one"
     )
+    t = next(x for x in (await client.get("/tenants", headers=ADMIN_HEADERS))
+             .json()["tenants"] if x["tenant_id"] == tid)
+    assert t["deposit_verification_secret_set"] is True
     assert t["deposit_verification_active"] is True
 
 

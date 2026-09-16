@@ -303,30 +303,57 @@ class TelephonyUpdateIn(BaseModel):
 
 class ChatwootUpdateIn(BaseModel):
     """Chatwoot Agent Bot credentials — stored encrypted as TenantSecrets."""
-    api_url: Optional[str] = None          # defaults to https://app.chatwoot.com
-    account_id: Optional[str] = None
-    api_token: Optional[str] = None        # write-only; never returned
-    inbox_id: Optional[str] = None         # Chatwoot inbox ID for webhook tenant lookup (no bearer needed)
+    # min_length=1 on every field: each one is written straight into
+    # tenant_secrets, encrypted, gated only on `is not None` in update_tenant
+    # below. An empty string passes that gate, so a PATCH carrying "" replaces
+    # a working credential with an encrypted "" — nothing raises, nothing in
+    # the response shows it, and the tenant silently stops authenticating to
+    # Chatwoot until someone re-enters the value by hand. A blank field in the
+    # backoffice form means "leave unchanged"; rejecting "" here keeps that the
+    # only thing it can mean.
+    api_url: Optional[str] = Field(default=None, min_length=1)          # defaults to https://app.chatwoot.com
+    account_id: Optional[str] = Field(default=None, min_length=1)
+    api_token: Optional[str] = Field(default=None, min_length=1)        # write-only; never returned
+    inbox_id: Optional[str] = Field(default=None, min_length=1)         # Chatwoot inbox ID for webhook tenant lookup (no bearer needed)
 
 
 class CrmCredentialsIn(BaseModel):
     """Platform-catalog CRM credentials — stored as TenantSecrets / pipeline_config."""
-    base_url: Optional[str] = None       # per-tenant override; falls back to PLATFORM_CRM_BASE_URL env
-    auth_type: Optional[str] = None      # api_key | bearer  (default: api_key)
-    api_token: Optional[str] = None      # write-only; never returned
+    # min_length=1: same reasoning as ChatwootUpdateIn above — an "" would
+    # reach the `is not None` gate in update_tenant and overwrite a live
+    # credential with an encrypted empty string. The backoffice form already
+    # guards against sending blank fields (see saveCrmAuth in backoffice.html),
+    # but a direct API PATCH has no such guard — and a tenant's CRM auth
+    # failing silently with a 200 is worse than rejecting the request that
+    # would cause it.
+    # operator_id is deliberately NOT constrained — it goes to
+    # pipeline_config.crm.operator_id, not tenant_secrets, and has its own
+    # documented fallback in bootstrap.py.
+    base_url: Optional[str] = Field(default=None, min_length=1)       # per-tenant override; falls back to PLATFORM_CRM_BASE_URL env
+    auth_type: Optional[str] = Field(default=None, min_length=1)      # api_key | bearer  (default: api_key)
+    api_token: Optional[str] = Field(default=None, min_length=1)      # write-only; never returned
     operator_id: Optional[str] = None    # stored in pipeline_config.crm.operator_id
     # Independent, additive secret: the live CRM requires BOTH an
     # Authorization header (from auth_type/api_token above) AND a separate
     # X-API-Key header — this is that second header's value, sent
     # unconditionally alongside whatever auth_type/api_token already produce.
-    x_api_key: Optional[str] = None      # write-only; never returned
+    x_api_key: Optional[str] = Field(default=None, min_length=1)      # write-only; never returned
 
 
 class DepositVerificationUpdateIn(BaseModel):
     """Deposit dispute screenshot verification webhook config — partial update."""
     enabled: Optional[bool] = None
     webhook_url: Optional[str] = None
-    webhook_secret: Optional[str] = None   # write-only plaintext; never returned
+    # min_length=1: before the truthy guard below existed, an "" here wrote an
+    # encrypted empty-string secret row — the row existed, so
+    # deposit_verification_secret_set / _active both read True, while
+    # bootstrap.py's secret_optional(...) got back "" and never registered the
+    # tool. The `if dv.webhook_secret:` guard now catches that write as a 200
+    # no-op; a direct API caller sending "" still gets no indication anything
+    # was wrong. Rejecting it here with a 422 makes that visible. Both stay —
+    # the guard is the second line of defence if this constraint is ever
+    # relaxed.
+    webhook_secret: Optional[str] = Field(default=None, min_length=1)   # write-only plaintext; never returned
     # gt=0 duplicated from DepositVerificationConfig (src/config_tenant.py):
     # this PATCH field is unconstrained upstream of that model, so an
     # unconstrained int here would let e.g. timeout_minutes=0 commit to
