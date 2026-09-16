@@ -184,6 +184,85 @@ async def test_tenant_registered_tools_take_precedence_over_platform_fallback(mo
         await engine.dispose()
 
 
+async def test_tenant_registered_branch_warns_on_header_path_operator_id_mismatch(monkeypatch, caplog) -> None:
+    # A tenant registered via POST /chat/tools/from-catalog with a real
+    # operator_id (written into this tool's auth_config.extra_headers) but no
+    # tenant.settings.crm.operator_id: the header "operatorid" sent on every
+    # call and the path operator_id substituted into the same call
+    # (tenant.settings.crm.operator_id or tenant.id, i.e. "t1" here) diverge.
+    # Per the CRM's shipped contract this 403s before auth is even checked --
+    # must be logged so it's diagnosable instead of read as a bad credential.
+    import logging
+
+    _clean_platform_env(monkeypatch)
+
+    engine, sm = await _make_sessionmaker()
+    try:
+        async with sm() as s:
+            s.add(ChatTool(
+                tenant_id="t1", name="check_order_status", description="check order",
+                endpoint="https://crm/api/orders/{order_id}", method="GET", auth_type="bearer",
+                auth_config={"extra_headers": {"operatorid": "real-operator-uuid"}},
+                parameters={"order_id": {"type": "string", "source": "llm"}}))
+            await s.commit()
+
+        registry = _registry()
+        factory = make_chatbot_factory(registry, sm)
+        tenant = TenantContext(
+            settings=TenantSettings(id="t1", slug="t1", name="T1"),
+            secrets_resolved={},
+        )
+        with caplog.at_level(logging.WARNING, logger="src.bootstrap"):
+            await factory(tenant, "s1")
+
+        warnings = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and "operatorid" in r.getMessage()
+        ]
+        assert len(warnings) == 1
+        assert warnings[0].__dict__.get("tenant_id") == "t1"
+        assert "real-operator-uuid" in warnings[0].getMessage()
+        assert "t1" in warnings[0].getMessage()
+    finally:
+        await engine.dispose()
+
+
+async def test_tenant_registered_branch_no_warning_when_header_matches_path(monkeypatch, caplog) -> None:
+    # Negative case: header operatorid and path operator_id agree (both
+    # "t1", the tenant.id fallback since crm.operator_id isn't configured
+    # here either) -> no mismatch warning should fire.
+    import logging
+
+    _clean_platform_env(monkeypatch)
+
+    engine, sm = await _make_sessionmaker()
+    try:
+        async with sm() as s:
+            s.add(ChatTool(
+                tenant_id="t1", name="check_order_status", description="check order",
+                endpoint="https://crm/api/orders/{order_id}", method="GET", auth_type="bearer",
+                auth_config={"extra_headers": {"operatorid": "t1"}},
+                parameters={"order_id": {"type": "string", "source": "llm"}}))
+            await s.commit()
+
+        registry = _registry()
+        factory = make_chatbot_factory(registry, sm)
+        tenant = TenantContext(
+            settings=TenantSettings(id="t1", slug="t1", name="T1"),
+            secrets_resolved={},
+        )
+        with caplog.at_level(logging.WARNING, logger="src.bootstrap"):
+            await factory(tenant, "s1")
+
+        warnings = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and "operatorid" in r.getMessage()
+        ]
+        assert warnings == []
+    finally:
+        await engine.dispose()
+
+
 async def test_x_api_key_secret_populated_for_every_platform_catalog_tool(monkeypatch) -> None:
     # The new, independent crm:x_api_key secret is tenant-level (like
     # operator_id) and must be attached to every tool's exec spec in the
@@ -253,6 +332,68 @@ async def test_extra_headers_falls_back_to_tenant_id_when_no_operator_id_configu
         for name in ALL_TOOLS:
             exec_spec = registry.crm_tools._items["t1"][1][name]
             assert exec_spec["extra_headers"] == {"operatorid": "t1"}
+    finally:
+        await engine.dispose()
+
+
+async def test_operator_id_fallback_logs_a_warning_naming_the_consequence(monkeypatch, caplog) -> None:
+    # Against CRM PR #3963's shipped guard, a tenant on this fallback sends
+    # tenant.id (not a real registered operator uuid) as "operatorid" on
+    # every crm-catalog call, which the CRM 403s before even checking
+    # credentials -- indistinguishable from a bad/missing key unless this is
+    # logged. Behavior is unchanged (still tenant.id, per the test above);
+    # this only pins that the gap is now diagnosable from logs.
+    import logging
+
+    _clean_platform_env(monkeypatch)
+
+    engine, sm = await _make_sessionmaker_with_crm()
+    try:
+        registry = _registry()
+        factory = make_chatbot_factory(registry, sm)
+        tenant = TenantContext(
+            settings=TenantSettings(id="t1", slug="t1", name="T1", crm_id="betstudio"),
+            secrets_resolved={},
+        )
+        with caplog.at_level(logging.WARNING, logger="src.bootstrap"):
+            await factory(tenant, "s1")
+
+        warnings = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and "operatorid" in r.getMessage()
+        ]
+        assert len(warnings) == 1
+        assert warnings[0].__dict__.get("tenant_id") == "t1"
+    finally:
+        await engine.dispose()
+
+
+async def test_operator_id_configured_does_not_log_the_fallback_warning(monkeypatch, caplog) -> None:
+    # Negative case: when crm.operator_id IS configured, no warning should
+    # fire -- pins that the log is conditional on the fallback actually
+    # being taken, not unconditional noise on every crm-catalog resolution.
+    import logging
+
+    _clean_platform_env(monkeypatch)
+
+    engine, sm = await _make_sessionmaker_with_crm()
+    try:
+        registry = _registry()
+        factory = make_chatbot_factory(registry, sm)
+        tenant = TenantContext(
+            settings=TenantSettings(
+                id="t1", slug="t1", name="T1", crm_id="betstudio",
+                crm=TenantCRMConfig(operator_id="operator-uuid-123")),
+            secrets_resolved={},
+        )
+        with caplog.at_level(logging.WARNING, logger="src.bootstrap"):
+            await factory(tenant, "s1")
+
+        warnings = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and "operatorid" in r.getMessage()
+        ]
+        assert warnings == []
     finally:
         await engine.dispose()
 

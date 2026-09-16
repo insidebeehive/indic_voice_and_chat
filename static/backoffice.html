@@ -8,6 +8,13 @@
 <title>Vox Backoffice</title>
 <style>
   :root { color-scheme: dark; }
+  /* The UA stylesheet's [hidden]{display:none} loses to any author-origin
+     display rule (e.g. the `label { display:flex }` below), so an element
+     with `hidden` set can still render. Re-assert it here with !important so
+     `el.hidden = true`/the `hidden` attribute reliably hides ANY element in
+     this page, regardless of what other rules target it — this is what
+     silently broke the custom-voice-id <label> toggle. */
+  [hidden] { display: none !important; }
   body { font-family: system-ui, sans-serif; margin:0; background:#0a0a0a; color:#e2e8f0; }
   header { padding:.75rem 1rem; background:#3b0764; border-bottom:1px solid #1f2937; }
   header h1 { font-size:1.05rem; margin:0 0 .5rem; }
@@ -74,20 +81,24 @@
     <div id="rotateResult" style="margin:.5rem 0;"></div>
     <div class="tabs">
       <div class="tab active" id="tab_an" onclick="showTab('an')">Analytics</div>
+      <div class="tab" id="tab_pipe" onclick="showTab('pipe')">Pipeline</div>
       <div class="tab" id="tab_crm" onclick="showTab('crm')">CRM</div>
       <div class="tab" id="tab_camp" onclick="showTab('camp')">Campaign</div>
       <div class="tab" id="tab_chat" onclick="showTab('chat')">Chat</div>
       <div class="tab" id="tab_kb" onclick="showTab('kb')">Knowledge Base</div>
       <div class="tab" id="tab_bill" onclick="showTab('bill')">Billing</div>
       <div class="tab" id="tab_tel" onclick="showTab('tel')">Telephony</div>
+      <div class="tab" id="tab_dv" onclick="showTab('dv')">Deposit verification</div>
     </div>
     <div id="pane_an"></div>
+    <div id="pane_pipe" hidden></div>
     <div id="pane_crm" hidden></div>
     <div id="pane_camp" hidden></div>
     <div id="pane_chat" hidden></div>
     <div id="pane_kb" hidden></div>
     <div id="pane_bill" hidden></div>
     <div id="pane_tel" hidden></div>
+    <div id="pane_dv" hidden></div>
   </div>
 </div>
 
@@ -160,15 +171,17 @@ async function selectTenant(id, slug) {
   $("rotateResult").innerHTML = "";
   showTab("an");
   await loadAnalytics(id);
+  loadPipeline(id);
   loadBilling(id);
   loadTelephony(id);
   loadCRM(id, slug);
   loadCampaigns(id);
   loadChat(id, slug);
   loadKB(id, slug);
+  loadDepositVerification(id);
 }
 function showTab(which) {
-  for (const k of ["an", "crm", "camp", "chat", "kb", "bill", "tel"]) {
+  for (const k of ["an", "pipe", "crm", "camp", "chat", "kb", "bill", "tel", "dv"]) {
     const tabEl = $("tab_" + k);
     if (tabEl) tabEl.classList.toggle("active", which === k);
     $("pane_" + k).hidden = which !== k;
@@ -414,6 +427,400 @@ async function loadBilling(id) {
       <b>not</b> in the platform cost.</div>`;
 }
 
+// --- Pipeline editor ------------------------------------------------------
+// Lets an admin change a tenant's mode + STT/LLM/TTS/realtime/chat-voice
+// provider & model choices without touching the DB. PATCHes
+// /api/v1/tenants/{id} with a `pipeline` block (see PipelineUpdateIn).
+//
+// Every provider/model select defaults to a "leave unchanged" sentinel
+// (empty value) rather than being pre-selected to the current value: model
+// lists come from the live catalog (GET /api/v1/models) so a deprecated
+// model simply isn't offered, and the sentinel means "untouched" fields can
+// never be silently re-sent with a stale value — the field is only included
+// in the PATCH body when the admin actually picks something. The current
+// value is shown as a hint next to each field instead.
+let MODELS = {};
+let MODELS_LOADED = false;
+// Chat-voice current state (enabled / effective TTS provider) is NOT exposed
+// by any GET today — only a PATCH response echoes it back. This session-only
+// cache remembers the last value this page saw for a tenant so the hint text
+// can show it after a save; before any save this session it just says so.
+let CHAT_VOICE_CACHE = {};
+
+async function ensureModelsLoaded() {
+  if (MODELS_LOADED) return;
+  const r = await api("/api/v1/models");
+  if (r.ok) { MODELS = r.json.models || {}; MODELS_LOADED = true; }
+}
+
+function onPipeProviderChange(kind) {
+  const catKind = kind === "realtime" ? "s2s" : (kind === "cv_tts" ? "tts" : kind);
+  const prov = ($(`p_${kind}_provider`) || {}).value || "";
+  const models = prov ? ((MODELS[catKind] && MODELS[catKind][prov]) || []) : [];
+  const modelSel = $(`p_${kind}_model`);
+  if (modelSel) {
+    modelSel.innerHTML = `<option value="">— leave unchanged —</option>` +
+      models.map(m => `<option value="${escAttr(m)}">${escT(m)}</option>`).join("");
+  }
+  // The three voice-bearing layers also need their picker re-queried: a
+  // provider change usually means a different roster entirely (see
+  // resolveVoiceQuery/refreshVoiceOptions below).
+  if (kind === "tts" || kind === "cv_tts" || kind === "realtime") refreshVoiceOptions(kind);
+}
+
+// --- Voice picker (catalog-backed, GET /api/v1/voices) --------------------
+// Shared by the three free-text voice fields this replaces: call TTS
+// (p_tts_*), chat-voice TTS (p_cv_tts_*), and realtime/S2S (p_realtime_*).
+// Written once and parameterized by `kind` rather than three times, per the
+// task brief — the three pickers differ only in which language-input id
+// feeds them and which "current" value they fall back to.
+//
+// PIPE_CURRENT[kind] = {provider, language} seeds the query when the operator
+// hasn't touched the provider select or typed a language — see
+// resolveVoiceQuery(). Populated fresh by loadPipeline() on every tenant
+// selection/reload.
+let PIPE_CURRENT = {};
+
+// voice roster cache: "<provider>|<language>" -> voices array, so flipping
+// back and forth between two languages/providers for the same layer — or
+// across the three pickers sharing a provider — doesn't re-fetch the
+// identical roster. A failed fetch is deliberately NOT cached here (see
+// refreshVoiceOptions) so retrying (e.g. by re-picking the provider) can
+// recover from a transient error instead of being stuck on it.
+let VOICE_ROSTER_CACHE = {};
+
+function voicePickerFieldIds(kind) {
+  // Realtime stores its language under `language_code` (TenantRealtimeConfig)
+  // — a different input id than the `language` field tts/cv_tts use
+  // (TenantTTSConfig) — everything else follows the `p_${kind}_*` convention.
+  return {
+    provider: `p_${kind}_provider`,
+    language: kind === "realtime" ? "p_realtime_language_code" : `p_${kind}_language`,
+    select: `p_${kind}_voice_select`,
+    customWrap: `p_${kind}_voice_custom_wrap`,
+    custom: `p_${kind}_voice_custom`,
+    msg: `p_${kind}_voice_msg`,
+  };
+}
+
+function resolveVoiceQuery(kind) {
+  const ids = voicePickerFieldIds(kind);
+  const current = PIPE_CURRENT[kind] || {};
+  // Provider to query: the newly picked provider, or — the common case of an
+  // operator changing only the voice — the tenant's current stored provider.
+  // Keying off the dropdown alone would leave the list empty in exactly that
+  // case, since the dropdown sits at "— leave unchanged —".
+  const provider = (($(ids.provider) || {}).value || "") || current.provider || "";
+  // Language to query: the typed language field, else the layer's stored
+  // language, else hi-IN. Per-language rosters (sarvam/azure/google/indicf5)
+  // genuinely differ by language, so this must track the language input.
+  const typedLanguage = (($(ids.language) || {}).value || "").trim();
+  const language = typedLanguage || current.language || "hi-IN";
+  return { provider, language };
+}
+
+function onVoiceSelectChange(kind) {
+  const ids = voicePickerFieldIds(kind);
+  const wrap = $(ids.customWrap);
+  if (wrap) wrap.hidden = (($(ids.select) || {}).value !== "__custom__");
+}
+
+// The value savePipeline() should send for this layer's voice field, or ""
+// (meaning: leave unchanged) for both the sentinel and a blank custom entry.
+function voiceFieldValue(kind) {
+  const ids = voicePickerFieldIds(kind);
+  const sel = ($(ids.select) || {}).value || "";
+  if (sel === "__custom__") return (($(ids.custom) || {}).value || "").trim();
+  return sel;
+}
+
+function voicePickerHtml(kind, label, currentVoiceId) {
+  const hint = currentVoiceId
+    ? `current: ${escT(currentVoiceId)}`
+    : (kind === "cv_tts"
+        ? "current chat-voice TTS config isn't exposed by any GET until you save here"
+        : "current: —");
+  return `
+    <label>${label} voice <small class="hint">(${hint})</small>
+      <select id="p_${kind}_voice_select" onchange="onVoiceSelectChange('${kind}')">
+        <option value="">— leave unchanged —</option>
+        <option value="__custom__">custom / other…</option>
+      </select>
+    </label>
+    <label id="p_${kind}_voice_custom_wrap" hidden>${label} custom voice id
+      <input id="p_${kind}_voice_custom" placeholder="exact voice id (e.g. a cloned ElevenLabs voice)" />
+    </label>
+    <div id="p_${kind}_voice_msg" class="hint" style="flex-basis:100%;"></div>`;
+}
+
+async function refreshVoiceOptions(kind) {
+  const ids = voicePickerFieldIds(kind);
+  const select = $(ids.select);
+  const msg = $(ids.msg);
+  if (!select) return;   // picker not rendered for this tenant/tab right now
+  // Guards a stale response landing after the operator switches tenants
+  // mid-fetch: the picker element ids are identical across tenants, so
+  // without this a slow response for tenant A would overwrite the picker
+  // loadPipeline just built fresh for tenant B (same pattern loadPipeline
+  // itself uses around its own await, see the SELECTED check there).
+  const tenantAtStart = SELECTED;
+  const { provider, language } = resolveVoiceQuery(kind);
+  const keepValue = select.value;   // preserve the pick (incl. "__custom__") across a language-only edit
+  if (!provider) {
+    select.innerHTML = `<option value="">— leave unchanged —</option><option value="__custom__">custom / other…</option>`;
+    if (keepValue === "__custom__") select.value = "__custom__";
+    onVoiceSelectChange(kind);   // keep the custom-input wrapper's visibility in sync with the restored value
+    if (msg) msg.textContent = "pick a provider above (or leave the tenant's current one) to list voices";
+    return;
+  }
+  const cacheKey = `${provider}|${language}`;
+  let voices = VOICE_ROSTER_CACHE[cacheKey];
+  if (voices === undefined) {
+    const r = await api(`/api/v1/voices?provider=${encodeURIComponent(provider)}&language=${encodeURIComponent(language)}`);
+    if (tenantAtStart !== SELECTED) return;   // a different tenant's render now owns these element ids
+    if (!r.ok) {
+      // A failed catalog fetch must not block configuration — custom entry
+      // stays usable even when the picker itself couldn't populate. Not
+      // cached: a transient failure shouldn't stick once the fetch is retried
+      // (e.g. by switching providers and back).
+      if (msg) msg.textContent = `could not load voices for ${provider} (status ${r.status}) — use custom`;
+      voices = null;
+    } else {
+      voices = r.json.voices || [];
+      VOICE_ROSTER_CACHE[cacheKey] = voices;
+    }
+  }
+  const opts = [`<option value="">— leave unchanged —</option>`];
+  if (voices && voices.length) {
+    voices.forEach(v => {
+      // Gender in the label, not just the id: the voicebot prompt selects
+      // gendered Hindi/Marathi forms off the roster's gender field, so a
+      // gender flip from picking the wrong voice_id is a content bug.
+      const label = v.gender ? `${v.voice_id} (${v.gender})` : v.voice_id;
+      opts.push(`<option value="${escAttr(v.voice_id)}">${escT(label)}</option>`);
+    });
+  }
+  opts.push(`<option value="__custom__">custom / other…</option>`);
+  select.innerHTML = opts.join("");
+  const keepValueSelectable = keepValue === "__custom__" || (voices && voices.some(v => v.voice_id === keepValue));
+  if (keepValueSelectable) select.value = keepValue;
+  // A non-empty prior pick that the new roster no longer offers (a
+  // provider/language switch with no overlapping voice ids) MUST be called
+  // out here — silently reverting to the sentinel while saying nothing is
+  // exactly how a tenant ends up with a saved voice_id that doesn't match
+  // its saved language (see savePipeline: only the touched fields PATCH).
+  // This branch always wins over the generic empty/success messages below.
+  if (keepValue && keepValue !== "__custom__" && !keepValueSelectable && voices !== null) {
+    if (msg) msg.textContent = `previously selected voice "${keepValue}" isn't offered for ${provider}/${language} — selection cleared, pick a new voice or use custom`;
+  } else if (voices && voices.length) {
+    if (msg) msg.textContent = "";
+  } else if (voices !== null) {
+    // Empty roster is a real, reachable state (an unsupported language for a
+    // per-language provider — the catalog deliberately does not fall back to
+    // hi-IN here, see src/providers/voice_catalog.py) — not a fetch failure.
+    // An empty <select> alone can't be told apart from one, so say so.
+    if (msg) msg.textContent = `no voices published for ${provider}/${language} — use custom`;
+  }
+  onVoiceSelectChange(kind);   // re-sync the custom-input wrapper for whichever value ended up selected
+}
+
+function pipeLayerHtml(kind, label, current, extraHtml) {
+  const catKind = kind === "realtime" ? "s2s" : kind;
+  const providers = Object.keys(MODELS[catKind] || {});
+  return `
+    <div class="creds" style="gap:.6rem;flex-wrap:wrap;margin-bottom:.5rem;">
+      <label>${label} provider <small class="hint">(current: ${lay(current)})</small>
+        <select id="p_${kind}_provider" onchange="onPipeProviderChange('${kind}')">
+          <option value="">— leave unchanged —</option>
+          ${providers.map(p => `<option value="${escAttr(p)}">${escT(p)}</option>`).join("")}
+        </select>
+      </label>
+      <label>${label} model
+        <select id="p_${kind}_model">
+          <option value="">— leave unchanged —</option>
+        </select>
+      </label>
+      ${extraHtml || ""}
+    </div>`;
+}
+
+function chatVoiceHtml(id) {
+  const cache = CHAT_VOICE_CACHE[id];
+  const curLabel = cache
+    ? `current (as of last save this session): ${cache.enabled ? "enabled" : "disabled"}${cache.tts_provider ? " · effective tts=" + escT(cache.tts_provider) : ""}`
+    : "current on/off state isn't exposed by the API until you save here";
+  const providers = Object.keys(MODELS.tts || {});
+  return `
+    <h2 style="margin-top:1.2rem;">Chat voice replies</h2>
+    <div class="hint" style="margin-bottom:.5rem;">
+      Voice-note replies in the <b>chat</b> channel — a separate setting from the call TTS above.
+      A tenant can run S2S for calls and still need a TTS here for chat voice notes. If left unset,
+      chat voice falls back to the call TTS (pipeline.tts); if enabled with neither set, saving is
+      rejected. <br /><small class="hint">${curLabel}</small>
+    </div>
+    <div class="creds" style="gap:.6rem;flex-wrap:wrap;">
+      <label>Enabled
+        <select id="p_cv_enabled">
+          <option value="">— leave unchanged —</option>
+          <option value="true">enabled</option>
+          <option value="false">disabled</option>
+        </select>
+      </label>
+      <label>Chat TTS provider
+        <select id="p_cv_tts_provider" onchange="onPipeProviderChange('cv_tts')">
+          <option value="">— leave unchanged —</option>
+          ${providers.map(p => `<option value="${escAttr(p)}">${escT(p)}</option>`).join("")}
+        </select>
+      </label>
+      <label>Chat TTS model
+        <select id="p_cv_tts_model"><option value="">— leave unchanged —</option></select>
+      </label>
+      <label>Chat TTS language <input id="p_cv_tts_language" placeholder="blank = leave unchanged" onchange="refreshVoiceOptions('cv_tts')" /></label>
+      <label>Chat TTS speed <input id="p_cv_tts_speed" type="number" step="0.05" placeholder="blank = leave unchanged" /></label>
+      ${voicePickerHtml("cv_tts", "Chat TTS", null)}
+    </div>`;
+}
+
+async function loadPipeline(id) {
+  await ensureModelsLoaded();
+  if (SELECTED !== id) return;   // a different tenant may have been selected while this awaited
+  const t = (window.TENANTS || {})[id] || {};
+  const stt = t.stt || {}, llm = t.llm || {}, tts = t.tts || {}, realtime = t.realtime || {};
+  // Seeds for each voice picker's provider/language fallback (resolveVoiceQuery)
+  // when the operator hasn't touched those fields. `realtime` already carries
+  // `language`/`voice_id` — not `language_code`/`voice` — thanks to the
+  // _layer() mapping in src/api/tenants.py, so no per-kind translation is
+  // needed here. chat_voice's own tts config has no GET representation at all
+  // (see the CHAT_VOICE_CACHE comment above); the fallback consistent with
+  // its documented runtime behavior ("if left unset, chat voice falls back to
+  // the call TTS") is the call TTS layer itself.
+  const cvCache = CHAT_VOICE_CACHE[id];
+  PIPE_CURRENT = {
+    tts: { provider: tts.provider || "", language: tts.language || "" },
+    realtime: { provider: realtime.provider || "", language: realtime.language || "" },
+    cv_tts: { provider: (cvCache && cvCache.tts_provider) || tts.provider || "", language: tts.language || "" },
+  };
+  $("pane_pipe").innerHTML = `
+    <div class="hint" style="margin-bottom:.6rem;">
+      Change this tenant's mode and provider/model choices. PATCHes <code>/api/v1/tenants/${id}</code>
+      with a <code>pipeline</code> block — only fields you touch are sent; anything left at
+      "— leave unchanged —" keeps its current stored value untouched. Model lists come from the live
+      model catalog, so a deprecated model can't be picked by accident.
+    </div>
+    <h2>Mode</h2>
+    <div class="creds" style="gap:.6rem;margin-bottom:.5rem;">
+      <label>Mode <small class="hint">(current: ${escT(t.mode || "—")})</small>
+        <select id="p_mode">
+          <option value="">— leave unchanged —</option>
+          <option value="layered">layered</option>
+          <option value="s2s">s2s</option>
+        </select>
+      </label>
+    </div>
+    <h2>Call pipeline (layered mode)</h2>
+    ${pipeLayerHtml("stt", "STT", stt, `
+      <label>STT language <input id="p_stt_language" placeholder="blank = leave unchanged" /></label>`)}
+    ${pipeLayerHtml("llm", "LLM", llm)}
+    ${pipeLayerHtml("tts", "TTS (call)", tts, `
+      <label>TTS language <input id="p_tts_language" placeholder="blank = leave unchanged" onchange="refreshVoiceOptions('tts')" /></label>
+      <label>TTS speed <input id="p_tts_speed" type="number" step="0.05" placeholder="blank = leave unchanged" /></label>
+      ${voicePickerHtml("tts", "TTS", tts.voice_id)}`)}
+    <h2 style="margin-top:1rem;">Realtime (S2S mode)</h2>
+    ${pipeLayerHtml("realtime", "Realtime", realtime, `
+      <label>Realtime language_code <input id="p_realtime_language_code" placeholder="blank = leave unchanged" onchange="refreshVoiceOptions('realtime')" /></label>
+      ${voicePickerHtml("realtime", "Realtime", realtime.voice_id)}`)}
+    ${chatVoiceHtml(id)}
+    <div style="margin-top:1rem;">
+      <button id="p_save_btn" onclick="savePipeline('${id}')">Save pipeline</button>
+      <span id="p_result" class="hint" style="margin-left:.6rem;"></span>
+    </div>
+    <div id="p_error" style="margin-top:.6rem;"></div>`;
+  // Populate the three pickers now that their <select>s exist in the DOM.
+  // Fire-and-forget: each is an independent async fetch, and the pickers
+  // render their own "loading"/error state via refreshVoiceOptions' msg line.
+  refreshVoiceOptions("tts");
+  refreshVoiceOptions("realtime");
+  refreshVoiceOptions("cv_tts");
+}
+
+function formatApiError(json) {
+  const d = json && json.detail;
+  if (typeof d === "string") return d;
+  if (Array.isArray(d)) return d.map(e => (e && (e.msg || JSON.stringify(e))) || String(e)).join("\n");
+  if (d) return JSON.stringify(d, null, 2);
+  return (json && json.error) || "unknown error";
+}
+
+async function savePipeline(id) {
+  const v = (x) => { const el = $(x); return el ? (el.value || "").trim() : ""; };
+  const layer = (kind, fields) => {
+    const obj = {};
+    const provider = v(`p_${kind}_provider`);
+    const model = v(`p_${kind}_model`);
+    if (provider) obj.provider = provider;
+    if (model) obj.model = model;
+    for (const f of fields) {
+      const val = v(`p_${kind}_${f}`);
+      if (val) obj[f] = f === "speed" ? Number(val) : val;
+    }
+    return Object.keys(obj).length ? obj : null;
+  };
+
+  const pipeline = {};
+  const mode = v("p_mode");
+  if (mode) pipeline.mode = mode;
+
+  const stt = layer("stt", ["language"]);
+  if (stt) pipeline.stt = stt;
+  const llm = layer("llm", []);
+  if (llm) pipeline.llm = llm;
+
+  // voice_id/voice come from the catalog-backed picker (voiceFieldValue), not
+  // a plain input, so they're merged in separately from `layer()`'s `fields`
+  // list — but must still be checked, since a bare voice pick with provider
+  // and language both left unchanged should still produce a non-null layer.
+  const tts = layer("tts", ["language", "speed"]) || {};
+  const ttsVoice = voiceFieldValue("tts");
+  if (ttsVoice) tts.voice_id = ttsVoice;
+  if (Object.keys(tts).length) pipeline.tts = tts;
+
+  const realtime = layer("realtime", ["language_code"]) || {};
+  const realtimeVoice = voiceFieldValue("realtime");
+  if (realtimeVoice) realtime.voice = realtimeVoice;
+  if (Object.keys(realtime).length) pipeline.realtime = realtime;
+
+  const cvEnabled = v("p_cv_enabled");
+  const cvTts = layer("cv_tts", ["language", "speed"]) || {};
+  const cvVoice = voiceFieldValue("cv_tts");
+  if (cvVoice) cvTts.voice_id = cvVoice;
+  const chatVoice = {};
+  if (cvEnabled) chatVoice.enabled = cvEnabled === "true";
+  if (Object.keys(cvTts).length) chatVoice.tts = cvTts;
+  if (Object.keys(chatVoice).length) pipeline.chat_voice = chatVoice;
+
+  if (!Object.keys(pipeline).length) { $("p_result").textContent = "Nothing changed — pick a value to update first."; return; }
+
+  const btn = $("p_save_btn");
+  btn.disabled = true;
+  $("p_result").textContent = "saving…";
+  $("p_error").innerHTML = "";
+  const r = await apiSend("PATCH", `/api/v1/tenants/${id}`, { pipeline });
+  btn.disabled = false;
+  if (r.ok) {
+    CHAT_VOICE_CACHE[id] = { enabled: r.json.chat_voice_enabled, tts_provider: r.json.chat_voice_tts_provider };
+    $("p_result").textContent = "✓ saved";
+    await loadTenants();   // refresh table + window.TENANTS with the now-effective values
+    loadPipeline(id);      // re-render so hints reflect the new current values
+  } else {
+    $("p_result").textContent = `✗ save failed (${r.status})`;
+    $("p_error").innerHTML = `<div class="warnbox">
+      <div style="font-weight:700;color:#fca5a5;margin-bottom:.4rem;">Rejected — nothing was saved</div>
+      <pre style="white-space:pre-wrap;word-break:break-word;margin:0;">${escT(formatApiError(r.json))}</pre>
+    </div>`;
+    // Form is left exactly as entered so the admin can fix and retry.
+  }
+}
+
 // Credential fields per provider — [logical_name, label, isSecret]. Only the
 // fields a provider actually uses are shown when it's selected.
 const TEL_FIELDS = {
@@ -494,6 +901,135 @@ async function saveTelephony(id) {
     $("te_result").textContent = "✓ saved — resolver refreshed";
   } else {
     $("te_result").textContent = `✗ ${r.status}: ${r.json.detail || r.json.error || "error"}`;
+  }
+}
+
+// --- Deposit verification --------------------------------------------------
+// Registering the LLM tool for this requires ALL of: enabled, webhook_url,
+// AND a resolvable shared secret (see src/bootstrap.py:558-566) — a tenant
+// with `enabled: true` and nothing else PATCHed is fully valid and changes
+// NOTHING, because the tool still never registers. `deposit_verification_active`
+// (src/api/tenants.py) mirrors that gate; this pane exists specifically so an
+// operator can't mistake "I flipped enabled" for "it's working" — see
+// dvStateHtml's warning branch below.
+function dvStateHtml(t) {
+  if (!t.deposit_verification_enabled) {
+    return `<div class="hint">Deposit verification is <b>off</b> for this tenant. The LLM tool is not registered.</div>`;
+  }
+  if (t.deposit_verification_active) {
+    return `<div class="hint">Deposit verification is <b>on and active</b> — the LLM tool is registered.</div>`;
+  }
+  // enabled but NOT active — name exactly which of the two API-visible
+  // requirements is missing (bootstrap.py's third requirement, a running
+  // sessionmaker, isn't checkable from here — see TenantSummary's comment).
+  const missing = [];
+  if (!t.deposit_verification_webhook_url) missing.push("a webhook URL");
+  if (!t.deposit_verification_secret_set) missing.push("a resolvable webhook secret");
+  return `<div class="warnbox">
+    <div style="font-weight:700;color:#fca5a5;margin-bottom:.4rem;">Enabled but INERT — missing ${escT(missing.join(" and "))}</div>
+    <div>"Enabled" is set, but the tool is <b>not registered</b> and this feature does <b>nothing</b> right now —
+    the LLM will never offer deposit verification to a customer. Set ${escT(missing.join(" and "))} below and save
+    to actually turn it on.</div>
+  </div>`;
+}
+
+function loadDepositVerification(id) {
+  const t = (window.TENANTS || {})[id] || {};
+  $("pane_dv").innerHTML = `
+    <div class="hint" style="margin-bottom:.6rem;">
+      Deposit-dispute screenshot verification webhook (<code>deposit_verification</code>). PATCHes
+      <code>/api/v1/tenants/${id}</code> with a <code>deposit_verification</code> block; only fields you touch
+      below are sent.
+    </div>
+    <h2>Current state</h2>
+    <div class="kv" style="margin-bottom:.6rem;">
+      <div>Enabled: <b>${t.deposit_verification_enabled ? "yes" : "no"}</b></div>
+      <div>Active (tool actually registered): <b>${t.deposit_verification_active ? "yes" : "no"}</b></div>
+      <div>Webhook URL: ${t.deposit_verification_webhook_url ? escT(t.deposit_verification_webhook_url) : '<span class="hint">not set</span>'}</div>
+      <div>Contract: ${t.deposit_verification_contract ? escT(t.deposit_verification_contract) : '<span class="hint">—</span>'}</div>
+      <div>Timeout: ${t.deposit_verification_timeout_minutes != null ? t.deposit_verification_timeout_minutes + " min" : '<span class="hint">—</span>'}</div>
+      <div>Shared webhook secret: <b>${t.deposit_verification_secret_set ? "configured" : "not configured"}</b></div>
+    </div>
+    ${dvStateHtml(t)}
+    <h2 style="margin-top:1.1rem;">Edit</h2>
+    <div class="creds" style="gap:.6rem;flex-wrap:wrap;">
+      <label>Enabled <small class="hint">(current: ${t.deposit_verification_enabled ? "enabled" : "disabled"})</small>
+        <select id="dv_enabled">
+          <option value="">— leave unchanged —</option>
+          <option value="true">enabled</option>
+          <option value="false">disabled</option>
+        </select>
+      </label>
+      <label>Webhook URL <small class="hint">(current: ${t.deposit_verification_webhook_url ? escT(t.deposit_verification_webhook_url) : "not set"})</small>
+        <input id="dv_webhook_url" style="width:22rem" placeholder="blank = leave unchanged" /></label>
+      <label>Contract <small class="hint">(current: ${escT(t.deposit_verification_contract || "—")} · independent,
+        incompatible contracts — a mismatch is not caught when you save; it surfaces later as a rejected
+        inbound callback logged with reason="wrong_contract")</small>
+        <select id="dv_contract">
+          <option value="">— leave unchanged —</option>
+          <option value="multipart_verdict">multipart_verdict</option>
+          <option value="json_ticket_relay">json_ticket_relay</option>
+        </select>
+      </label>
+      <label>Timeout (minutes) <small class="hint">(current: ${t.deposit_verification_timeout_minutes ?? "—"}; must be &gt; 0)</small>
+        <input id="dv_timeout_minutes" type="number" min="1" step="1" placeholder="blank = leave unchanged" /></label>
+      <label>Screenshot URL TTL (seconds) <small class="hint">(must be &gt; 0)</small>
+        <input id="dv_ttl_seconds" type="number" min="1" step="1" placeholder="blank = leave unchanged" /></label>
+      <label>Mobile metadata keys <small class="hint">(comma-separated; <code>json_ticket_relay</code> only)</small>
+        <input id="dv_mobile_keys" style="width:16rem" placeholder="blank = leave unchanged" /></label>
+      <label>Webhook secret <small class="hint">(currently ${t.deposit_verification_secret_set ? "set" : "not set"}
+        · <b>shared</b> value — the vendor must hold the identical secret, or their verdict callback is
+        rejected as unsigned (401); write-only, never shown again after saving)</small>
+        <input id="dv_webhook_secret" type="password" style="width:18rem" placeholder="blank = leave unchanged" /></label>
+    </div>
+    <div style="margin-top:.9rem;">
+      <button id="dv_save_btn" onclick="saveDepositVerification('${id}')">Save deposit verification</button>
+      <span id="dv_result" class="hint" style="margin-left:.6rem;"></span>
+    </div>
+    <div id="dv_error" style="margin-top:.6rem;"></div>`;
+}
+
+async function saveDepositVerification(id) {
+  const v = (x) => { const el = $(x); return el ? (el.value || "").trim() : ""; };
+  const dv = {};
+  const enabled = v("dv_enabled");
+  if (enabled) dv.enabled = enabled === "true";
+  const webhookUrl = v("dv_webhook_url");
+  if (webhookUrl) dv.webhook_url = webhookUrl;
+  const contract = v("dv_contract");
+  if (contract) dv.contract = contract;
+  const timeoutMinutes = v("dv_timeout_minutes");
+  if (timeoutMinutes) dv.timeout_minutes = Number(timeoutMinutes);
+  const ttlSeconds = v("dv_ttl_seconds");
+  if (ttlSeconds) dv.screenshot_url_ttl_seconds = Number(ttlSeconds);
+  const mobileKeys = v("dv_mobile_keys");
+  if (mobileKeys) dv.mobile_metadata_keys = mobileKeys.split(",").map(s => s.trim()).filter(Boolean);
+  const webhookSecret = v("dv_webhook_secret");
+  if (webhookSecret) dv.webhook_secret = webhookSecret;
+
+  if (!Object.keys(dv).length) { $("dv_result").textContent = "Nothing changed — pick a value to update first."; return; }
+
+  const btn = $("dv_save_btn");
+  btn.disabled = true;
+  $("dv_result").textContent = "saving…";
+  $("dv_error").innerHTML = "";
+  const r = await apiSend("PATCH", `/api/v1/tenants/${id}`, { deposit_verification: dv });
+  btn.disabled = false;
+  if (r.ok) {
+    $("dv_result").textContent =
+      `✓ saved — enabled=${r.json.deposit_verification_enabled}, secret set=${r.json.deposit_verification_secret_set}`;
+    await loadTenants();          // refresh window.TENANTS with the now-effective values (incl. _active)
+    loadDepositVerification(id);  // re-render so the state panel reflects reality, not the stale form
+  } else {
+    // Includes the VOX_SECRET_KEY-unset 503 (src/api/tenants.py:674-676) — its
+    // detail string is specific enough to act on, so surface it verbatim via
+    // formatApiError rather than a bare "save failed".
+    $("dv_result").textContent = `✗ save failed (${r.status})`;
+    $("dv_error").innerHTML = `<div class="warnbox">
+      <div style="font-weight:700;color:#fca5a5;margin-bottom:.4rem;">Rejected — nothing was saved</div>
+      <pre style="white-space:pre-wrap;word-break:break-word;margin:0;">${escT(formatApiError(r.json))}</pre>
+    </div>`;
+    // Form is left exactly as entered so the admin can fix and retry.
   }
 }
 

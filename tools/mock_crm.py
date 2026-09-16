@@ -15,6 +15,7 @@ Seed tools via:
 from __future__ import annotations
 
 import argparse
+import datetime as _dt
 import uvicorn
 from fastapi import FastAPI, Header, HTTPException, Path, Query
 from typing import Optional
@@ -41,10 +42,13 @@ PLAYERS: dict[str, dict] = {
             {"id": "txn_004", "type": "withdrawal", "amount": 1000.00, "status": "processing", "timestamp": "2026-06-20T16:00:00Z", "method": "Bank Transfer"},
         ],
         "latest_deposit_order": {
-            "PgsOrderId": "PGS20260621143000123",
-            "datetime": "2026-06-21T14:30:00Z",
+            "order_id": "a1b2c3d4-e29b-41d4-a716-446655440000",
+            "external_transaction_id": None,
             "amount": 1500.00,
-            "status": "failed",
+            "currency": "INR",
+            "pgs_status": "PGS_FAILED",
+            "status_bucket": "failed",
+            "created_at": "2026-06-21T14:30:00+05:30",
         },
         "bets": [
             {"id": "bet_001", "sport": "Cricket", "match": "MI vs CSK", "selection": "MI Win",
@@ -177,6 +181,48 @@ OPERATORS: dict[str, dict] = {
             "brand": "Demo Platform",
             "operator_profile": "Licensed online gaming platform serving Indian players since 2022.",
         },
+        "bet_limits": [
+            {"game_name": "Teen Patti", "games_master_id": "gm-101", "min_stake": 10,
+             "max_stake": 50000, "max_profit": 200000, "resolved_from": "tier_override"},
+            {"game_name": "Andar Bahar", "games_master_id": "gm-102", "min_stake": 5,
+             "max_stake": 25000, "max_profit": 100000, "resolved_from": "default"},
+            # No limit configured at any tier for this game -- exists, but
+            # every limit field (and resolved_from) comes back null, per the
+            # shipped contract's "no limit configured" case.
+            {"game_name": "Roulette", "games_master_id": "gm-103", "min_stake": None,
+             "max_stake": None, "max_profit": None, "resolved_from": None},
+        ],
+        "matka_markets": {
+            # Keyed lowercase for partial-match lookup (see _match_matka_market).
+            "kalyan": {
+                "market_name": "Kalyan",
+                "closed_weekdays": {"Sunday"},
+                "upcoming_closures": [
+                    {"date": "2026-08-17", "weekday": "Sunday"},
+                    {"date": "2026-08-24", "weekday": "Sunday"},
+                ],
+            },
+            "milan day": {
+                "market_name": "Milan Day",
+                "closed_weekdays": {"Sunday"},
+                "upcoming_closures": [
+                    {"date": "2026-08-17", "weekday": "Sunday"},
+                    {"date": "2026-08-24", "weekday": "Sunday"},
+                ],
+            },
+        },
+    },
+    # Matka sold to selected operators only, so the holiday-schedule route
+    # 403s when it's disabled. Without an operator that actually has it off,
+    # that branch is unreachable here: _get_operator falls back to op_demo
+    # (matka enabled) for any unknown id, so the 403 the tool description
+    # tells the model how to handle could never be produced by this mock.
+    # Only the fields the Matka guard reads are set.
+    "op_matka_off": {
+        "games_config": {
+            "casino": {"enabled": True, "under_maintenance": False, "default_url": None},
+            "matka": {"enabled": False, "under_maintenance": False},
+        },
     },
 }
 
@@ -227,10 +273,21 @@ async def get_player_transactions(
 @app.get("/players/{user_id}/latest-deposit-order")
 async def get_player_latest_deposit_order(
     user_id: str = Path(...),
+    # The shipped contract sends operator_id as the "operatorid" HEADER (see
+    # docs/crm-api-contract.md's Auth section), not a query param -- this
+    # endpoint takes no query params at all.
+    operatorid: Optional[str] = Header(None),
     authorization: Optional[str] = Header(None),
 ):
     _check_auth(authorization)
-    return _get_player(user_id).get("latest_deposit_order")
+    order = _get_player(user_id).get("latest_deposit_order")
+    return {
+        "operator_id": operatorid or "op_demo",
+        "user_id": user_id,
+        "status": "found" if order else "no_recent_deposit",
+        "lookback_days": 7,
+        "order": order,
+    }
 
 
 @app.get("/players/{user_id}/bets")
@@ -322,6 +379,94 @@ async def get_operator_platform_config(
 ):
     _check_auth(authorization)
     return _get_operator(operator_id)["platform_config"]
+
+
+def _match_bet_limit_games(operator_id: str, name: str) -> list[dict]:
+    """Partial, case-insensitive match against the operator's casino games —
+    mirrors the shipped CRM's 'name' partial-match semantics, including that
+    it can legitimately match more than one game."""
+    name_lower = name.lower().strip()
+    return [
+        g for g in _get_operator(operator_id).get("bet_limits", [])
+        if name_lower in g["game_name"].lower()
+    ]
+
+
+@app.get("/operators/{operator_id}/players/{user_id}/bet-limit")
+async def get_bet_limit(
+    operator_id: str = Path(...),
+    user_id: str = Path(...),
+    name: str = Query(...),
+    authorization: Optional[str] = Header(None),
+):
+    _check_auth(authorization)
+    _get_player(user_id)  # 404s if the player itself doesn't exist
+    if not name.strip():
+        raise HTTPException(status_code=400, detail="'name' must not be blank")
+    matched = _match_bet_limit_games(operator_id, name)
+    if not matched:
+        # Per the shipped contract: no casino game matched -- including a
+        # Matka market name, since Matka isn't in this table at all.
+        raise HTTPException(status_code=404, detail=f"no casino game matched '{name}'")
+    return {"operator_id": operator_id, "user_id": user_id, "games": matched}
+
+
+def _match_matka_market(operator_id: str, market: str) -> Optional[dict]:
+    """Partial, case-insensitive match against the operator's Matka markets.
+    An ambiguous match (more than one hit) is treated the same as no match
+    at all -- per the shipped contract, an ambiguous market name returns
+    status: "not_found" rather than guessing between matches."""
+    market_lower = market.lower().strip()
+    matches = [
+        m for key, m in _get_operator(operator_id).get("matka_markets", {}).items()
+        if market_lower in key
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+@app.get("/operators/{operator_id}/matka/holiday-schedule")
+async def get_market_holiday_schedule(
+    operator_id: str = Path(...),
+    market: str = Query(...),
+    date: Optional[str] = Query(None),
+    authorization: Optional[str] = Header(None),
+):
+    _check_auth(authorization)
+    games_config = _get_operator(operator_id).get("games_config", {})
+    if not games_config.get("matka", {}).get("enabled", False):
+        raise HTTPException(status_code=403, detail="Matka is not enabled for this operator")
+
+    if date is None:
+        query_date = _dt.datetime.now(_dt.timezone.utc).date()
+    else:
+        try:
+            query_date = _dt.date.fromisoformat(date)
+        except ValueError:
+            raise HTTPException(
+                status_code=400,
+                detail=f"malformed date '{date}', expected YYYY-MM-DD") from None
+    date_str = query_date.isoformat()
+
+    matched = _match_matka_market(operator_id, market)
+    if matched is None:
+        return {
+            "operator_id": operator_id, "market_name": None, "status": "not_found",
+            "date": date_str, "is_closed": None, "closure_reason": None,
+            "upcoming_closures": [], "closure_source": None,
+        }
+
+    weekday = query_date.strftime("%A")
+    is_closed = weekday in matched["closed_weekdays"]
+    return {
+        "operator_id": operator_id,
+        "market_name": matched["market_name"],
+        "status": "found",
+        "date": date_str,
+        "is_closed": is_closed,
+        "closure_reason": f"Closed every {weekday}" if is_closed else None,
+        "upcoming_closures": matched["upcoming_closures"],
+        "closure_source": "weekly_schedule",
+    }
 
 
 # ---------------------------------------------------------------------------

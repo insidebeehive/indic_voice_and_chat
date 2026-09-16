@@ -449,21 +449,33 @@ GET /players/{user_id}/latest-deposit-order
 
 **When called:** Player disputes a deposit — says the money was deducted but not credited, or that a deposit shown as failed actually went through. Returns the payment-gateway order reference for the player's most recent deposit attempt, which the chatbot needs to raise a manual deposit-verification ticket with the operator's verification vendor.
 
-No query params — only the `user_id` is sent. The lookup window (the player's latest deposit attempt within the past 7 days) is your own business logic, not something we pass in.
+No query params — only the `user_id` is sent. The lookup window is your own business logic, not something we pass in — its length comes back in `lookback_days` (currently `7`, but treat it as server-side config, not a constant).
 
 **Expected response:**
 ```json
 {
-  "PgsOrderId": "PGS20260621143000123",
-  "datetime": "2026-06-21T14:30:00Z",
-  "amount": 1500.00,
-  "status": "failed"
+  "operator_id": "op-123",
+  "user_id": "user-456",
+  "status": "found",
+  "lookback_days": 7,
+  "order": {
+    "order_id": "a1b2c3d4-e29b-41d4-a716-446655440000",
+    "external_transaction_id": null,
+    "amount": 1500.00,
+    "currency": "INR",
+    "pgs_status": "PGS_FAILED",
+    "status_bucket": "failed",
+    "created_at": "2026-06-21T14:30:00+05:30"
+  }
 }
 ```
 
-`PgsOrderId` is the payment gateway's own order id — field name kept verbatim in the gateway's casing (`PgsOrderId`, not `pgs_order_id`), since it is forwarded to the verification vendor as-is.
-`status` — `success` | `failed` | `pending` (`pending` = still in flight at the gateway).
-Return the single most recent attempt only, not a list. Return `null` (or 404) if the player has made no deposit attempt in the last 7 days.
+`status` — `found` | `no_recent_deposit` | `lookup_unavailable`. `no_recent_deposit` means the lookup worked and there genuinely was no deposit attempt within `lookback_days`; `lookup_unavailable` means the lookup itself failed (distinct from `no_recent_deposit` — the chatbot must not treat it as "no deposit"). `order` is present (non-null) only when `status: "found"`.
+`order.order_id` is `PgsIntegration.id` — a UUID, always present when `order` is present — forwarded to the verification vendor as `order_id`.
+`order.external_transaction_id` is the payment gateway's own secondary reference; nullable, and specifically `null` on the `INITIATED`/`BS_PENDING` rows a deposit dispute is usually about.
+`order.pgs_status` is the raw gateway status — an open value set that can change without a deploy on your side, so the chatbot is told to key off `status_bucket` instead, not this field.
+`order.status_bucket` — `success` | `failed` | `pending`. `PGS_SUCCESS` and any unrecognised raw `pgs_status` both bucket as `pending`, never `failed` or `success` — this is deliberate: an unmapped status must never be presented to the customer as a definite outcome.
+Return the single most recent attempt only, not a list. 404 = unknown `user_id` or wrong `operator_id`.
 
 ---
 
@@ -721,26 +733,34 @@ GET /operators/{operator_id}/matka-results?market={market}&date={date}
 **Tool name:** `get_bet_limit`
 
 ```
-GET /casino/{operator_id}/players/{user_id}/games/{game_name}/bet-limit
+GET /operators/{operator_id}/players/{user_id}/bet-limit?name={game}
 ```
 
-**When called:** Player asks about bet limits for a named casino game (e.g. "what's the bet limit for Teen Patti?", "minimum bet on Andar Bahar?"). Requires `user_id` — this is a per-player effective limit (the CRM resolves tier-based rules or per-user overrides internally and returns the single applicable limit; the chatbot never guesses or reconciles limits itself). Does not cover Matka — Matka stake/bet-type limits come from **Matka Configuration** above.
+**When called:** Player asks about bet limits for a named casino game (e.g. "what's the bet limit for Teen Patti?", "minimum bet on Andar Bahar?"). Requires `user_id` — this is a per-player effective limit (the CRM resolves tier-based rules or per-user overrides internally and returns the single applicable limit per matching game; the chatbot never guesses or reconciles limits itself). Does not cover Matka — Matka stake/bet-type limits come from **Matka Configuration** above; a Matka name here 404s.
 
 **Query params set by AI:**
-- `game_name` — name of the casino game to check (e.g. `Teen Patti`, `Andar Bahar`)
+- `name` — **required**. Partial match against the casino game name (e.g. `Teen Patti`, `Andar Bahar`) — can legitimately match more than one game, hence `games` below is a list.
 
 **Expected response:**
 ```json
 {
-  "game": "Teen Patti",
-  "min_stake": 10,
-  "max_stake": 50000,
-  "max_profit": 200000,
-  "currency": "INR"
+  "operator_id": "op-123",
+  "user_id": "user-456",
+  "games": [
+    {
+      "game_name": "Teen Patti",
+      "games_master_id": "gm-789",
+      "min_stake": 10,
+      "max_stake": 50000,
+      "max_profit": 200000,
+      "resolved_from": "tier_override"
+    }
+  ]
 }
 ```
 
-`max_profit` is the upper limit on potential winnings for a single bet on this game, independent of `max_stake`.
+`max_profit` is the upper limit on potential winnings for a single bet on this game, independent of `max_stake`. `resolved_from` says which rule produced this limit (tier override, per-user override, blanket default, etc.); a game entry with `min_stake`/`max_stake`/`max_profit` all `null` and `resolved_from: null` means the game exists but has no limit configured at any tier — distinct from the game not existing at all.
+400 = blank `name`. 404 = no casino game matched `name` (including a Matka market name — Matka isn't in this table).
 
 ---
 
@@ -748,25 +768,34 @@ GET /casino/{operator_id}/players/{user_id}/games/{game_name}/bet-limit
 **Tool name:** `get_market_holiday_schedule`
 
 ```
-GET /matka/{operator_id}/markets/{market_name}/holiday-schedule
+GET /operators/{operator_id}/matka/holiday-schedule?market={name}&date={YYYY-MM-DD}
 ```
 
-**When called:** Player asks whether markets are open or closed on a specific date or holiday (e.g. "are markets closed on Independence Day?", "is Kalyan open tomorrow?").
+**When called:** Player asks whether a Matka market is open or closed on a specific date, or about its recurring weekly off-days (e.g. "is Kalyan open tomorrow?", "which days is Milan Day closed?").
 
 **Query params set by AI:**
-- `market_name` — name of the matka market to check (e.g. `Kalyan`, `Milan Day`)
+- `market` — **required**. Name of the matka market to check (e.g. `Kalyan`, `Milan Day`).
+- `date` — optional, `YYYY-MM-DD`. Defaults to today in the operator's timezone when omitted.
 
 **Expected response:**
 ```json
 {
-  "market": "Kalyan",
+  "operator_id": "op-123",
+  "market_name": "Kalyan",
+  "status": "found",
   "date": "2026-08-15",
-  "closed": true,
-  "reason": "Independence Day"
+  "is_closed": false,
+  "closure_reason": null,
+  "upcoming_closures": [
+    { "date": "2026-08-17", "weekday": "Sunday" }
+  ],
+  "closure_source": "weekly_schedule"
 }
 ```
 
-`closed: false` and `reason: null` for a normal trading day.
+`status` — `found` | `not_found`, returned with **HTTP 200** either way (`not_found` is not an error). An ambiguous market name also returns `status: "not_found"` rather than guessing between matches — `market_name` comes back `null` in that case.
+`upcoming_closures` is a projection of the market's **recurring weekly** closures only (e.g. "closed every Sunday") — it is not a one-off holiday calendar. One-off holidays are not represented **anywhere** in this schema yet, so a market reads as open on Diwali and similar even when it is actually closed. `closure_source` is on the wire so the answer can be phrased around the weekly pattern; it gains new values when the CRM's task 86eypx8zp lands, which is additive and not a breaking change.
+400 = malformed or impossible `date`. 403 = Matka is not enabled for this operator.
 
 ---
 

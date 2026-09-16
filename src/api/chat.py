@@ -21,13 +21,15 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import io
 import json
 import logging
 import time
 import uuid
+import wave
 from dataclasses import dataclass, field
 from types import SimpleNamespace
-from typing import Awaitable, Callable, NamedTuple, NoReturn, Optional
+from typing import Any, Awaitable, Callable, NamedTuple, NoReturn, Optional
 
 from fastapi import (
     APIRouter,
@@ -54,10 +56,13 @@ from src.interfaces.media_storage import IMediaStorage
 from src.api.deps import get_db_session
 from src.auth import TenantContext, current_tenant
 from src.auth.audit import log_denied, token_fingerprint
-from src.dialogue.language import normalize_lang
+from src.auth.registry import TenantProviders
+from src.dialogue.language import normalize_lang, to_bcp47
 from src.interfaces.llm import LLMMessage
+from src.interfaces.tts import TTSConfig
 from src.models.chat import ChatMessage, ChatSession
 from src.models.chat_turn_metrics import record_chat_turn_metric
+from src.pipeline.text_normalize import normalize_for_tts
 import src.utils.http_fetch as http_fetch
 from src.utils.http_fetch import MAX_FETCH_BYTES as _MAX_MEDIA_FETCH_BYTES
 from src.utils.http_fetch import fetch_capped as _fetch_capped
@@ -99,6 +104,19 @@ _async_push_queues: dict[str, asyncio.Queue] = {}
 
 _media_store: Optional[IMediaStorage] = None
 
+# Per-tenant TTS provider cache used ONLY to synthesize the audio half of a
+# voice-note reply (see `_synthesize_reply_audio` below). Optional by design:
+# a tenant that has not enabled `pipeline.chat_voice.enabled` (the default),
+# or has nothing resolvable via `resolve_chat_tts_config` (chat_voice.tts /
+# pipeline.tts both without a provider — e.g. a bare s2s tenant), or a process
+# that never called `set_tts_providers` at all (e.g. most unit tests), simply
+# never gets audio replies — the WS audio branch already tolerates that as
+# "TTS unavailable" and falls back to text-only, same as any other synthesis
+# failure. Chat TTS resolves independently of the voice-call cascade's
+# `pipeline.tts` now (see `TenantProviders.get_chat_tts`). Nothing about
+# inbound voice notes (transcription) depends on this.
+_tts_providers: Optional[TenantProviders] = None
+
 # Active voice-call WebSockets keyed by chat_session_id.
 # Populated by chat_voice_ws; cleared by _end_session so ending the chat
 # also terminates any live voice call for the same session.
@@ -118,6 +136,18 @@ def set_media_store(store: Optional[IMediaStorage]) -> None:
     _media_store = store
 
 
+def set_tts_providers(providers: Optional[TenantProviders]) -> None:
+    """Inject (or clear) the per-tenant TTS provider cache for voice-note replies.
+
+    Mirrors `set_media_store`/`set_chatbot_factory`: a plain module-level
+    setter so `src/main.py` can wire the same `TenantProviders` instance the
+    rest of the app already uses (`registry.providers`) without this module
+    importing `src.bootstrap` (which would be a real cycle — bootstrap wires
+    this module's factories)."""
+    global _tts_providers
+    _tts_providers = providers
+
+
 def _mime_ext(mime: str) -> str:
     mapping = {
         "audio/webm": "webm", "audio/ogg": "ogg",
@@ -133,6 +163,207 @@ def _mime_ext(mime: str) -> str:
 def _media_key(tenant_id: str, session_id: str, mime: str) -> str:
     ext = _mime_ext(mime)
     return f"chat/{tenant_id}/{session_id}/{uuid.uuid4().hex}.{ext}"
+
+
+# --- Outbound voice-note replies -----------------------------------------
+#
+# Mirrors the customer's own modality: a customer who sent a voice note gets
+# an audio reply back, not just text — but text is ALWAYS included too (see
+# `_send_reply`'s `audio_url`/`audio_mime` params), so a customer who can't
+# play audio right now, or a TTS failure, never loses the answer. Text-only
+# turns never synthesize anything; this whole path is only ever entered from
+# the `mtype == "audio"` branch of the WS loop.
+#
+# The synthesized clip is capped short deliberately: TTS is billed per
+# character/second by every provider wired here, and a long clip is also a
+# bad interaction — nobody wants to sit through 90 seconds of audio for a
+# multi-paragraph policy answer that's far faster to read. Indic TTS voices
+# produce roughly 12-15 characters of source text per second of audio, so
+# _TTS_MAX_REPLY_CHARS below bounds a synthesized reply to well under a
+# minute even at the slow end — long enough for a genuine spoken answer,
+# short enough to reject the "wall of text" replies (multi-item lists,
+# T&Cs) that are better read than listened to. Those still go out as text,
+# same as always; only the audio half is skipped.
+#
+# This cap is ALSO what keeps the uploaded/advertised WAV clip under the 1 MB
+# media size the CRM contract documents (docs/crm-chat-media-contract.md) —
+# every provider wired here is requested at 16 kHz mono PCM16 (see
+# `_synthesize_reply_audio_uncapped`'s `TTSConfig`, 32,000 bytes/sec), and the
+# chat layer wraps that raw PCM in a WAV container (see `_pcm16_to_wav`)
+# before upload, which is what actually gets served — never the mp3 the old
+# (wrong) mime claimed. Worst case, at the SLOW end of the 12-15 chars/sec
+# range (slow speech -> longest audio for a given character count):
+#   duration_s   = _TTS_MAX_REPLY_CHARS / 12
+#   worst_bytes  = duration_s * 32_000 + 44  (44-byte WAV header)
+# At the old 600-char cap that was 600/12*32_000+44 = 1_600_044 bytes (~1.53
+# MiB) — already over the 1 MB limit before this fix even wrapped the header
+# on. At 300 chars: 300/12*32_000+44 = 800_044 bytes (~781 KiB, ~76% of the
+# 1_048_576-byte limit) — comfortably under. Re-derive this if the cap, the
+# requested sample rate, or the cps estimate ever changes.
+_TTS_MAX_REPLY_CHARS = 300
+
+# Ceiling on the TTS synthesis call itself. This is deliberately its own
+# timeout, NOT covered by `_TURN_TIMEOUT_S` above: synthesis runs AFTER
+# `_run_turn` has already returned the text reply, as an additional step
+# before any customer-visible frame goes out, so an unbounded provider call
+# here would silently extend the turn past the budget the customer/CRM relay
+# were already told to expect (see `_TURN_TIMEOUT_S`'s own comment on why a
+# hang matters). Sized well above the ~300-char cap's expected synthesis time
+# for every provider wired here (typically 1-3s) while staying inside a
+# single `_INTERIM_INTERVAL_S` (15s) keepalive cycle — a slow provider costs
+# the customer at most one extra "still working on it" bubble, never several
+# back-to-back ones, and on timeout the turn falls back to text-only rather
+# than making the customer wait longer for audio nobody asked to wait for.
+_TTS_SYNTH_TIMEOUT_S = 10.0
+
+
+async def _synthesize_reply_audio(
+    tenant: TenantContext, text: str, language: str,
+) -> Optional[tuple[bytes, str]]:
+    """Synthesize a voice-note reply's audio. Returns (audio_bytes, mime) on
+    success, or ``None`` if synthesis should simply be skipped this turn.
+
+    ``None`` covers every non-fatal reason, all handled identically here
+    (log-and-skip) precisely because none of them should ever break the
+    turn — the text reply already went out (or is about to): empty/over-cap
+    text (see `_TTS_MAX_REPLY_CHARS`), no TTS provider registry wired at all
+    (`set_tts_providers` never called — fine, most deployments/tests don't
+    need chat audio replies), the tenant has not enabled
+    `pipeline.chat_voice.enabled`, neither `pipeline.chat_voice.tts` nor
+    `pipeline.tts` resolves a provider (`TenantProviders.get_chat_tts`
+    returns `None` — no warning logged, this is the expected shape for most
+    tenants), a synthesis timeout (`_TTS_SYNTH_TIMEOUT_S`), or any other
+    provider exception (bad credentials, provider outage, ...). Only a
+    genuine cancellation (shutdown, client disconnect racing this call)
+    propagates.
+
+    HINGLISH CAVEAT (unverified — needs a real TTS call to confirm before
+    this is trusted in production): on this product the reply TEXT is
+    frequently romanised Hindi ("Hinglish") in Latin script while
+    `result.response.language` still reports the base code "hi". Whether the
+    tenant's configured TTS voice for "hi" pronounces Latin-script Hinglish
+    acceptably, mangles it, or silently treats it as English is an empirical,
+    per-provider question this code cannot answer without making a live TTS
+    call, which is out of scope here. `normalize_for_tts` below only rewrites
+    currency amounts and known pronunciation overrides — it does NOT
+    transliterate Hinglish to Devanagari, so this risk is unmitigated as
+    shipped. Verify with a real call against each tenant's configured TTS
+    provider before relying on this for Hindi-configured tenants.
+    """
+    if not text or len(text) > _TTS_MAX_REPLY_CHARS:
+        return None
+    if _tts_providers is None:
+        return None
+    try:
+        # None = this tenant hasn't opted into chat voice replies, or has no
+        # resolvable chat TTS config. Not a failure: no provider was built, no
+        # cost incurred, and no warning is logged (it would fire on every voice
+        # note from every non-opted-in tenant). The text reply still goes out.
+        tts = _tts_providers.get_chat_tts(tenant)
+        if tts is None:
+            return None
+        return await asyncio.wait_for(
+            _synthesize_reply_audio_uncapped(tenant, text, language, tts),
+            timeout=_TTS_SYNTH_TIMEOUT_S,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001 — audio is a nicety, the text reply is not
+        log.warning("tts reply synthesis failed; sending text-only reply",
+                    extra={"tenant_id": tenant.id, "language": language}, exc_info=True)
+        return None
+
+
+def _pcm16_to_wav(pcm: bytes, sample_rate: int) -> bytes:
+    """Wrap headerless PCM16 mono samples in a RIFF/WAVE container.
+
+    Every TTS provider wired here (sarvam, google, azure, elevenlabs, gemini,
+    indicf5) returns raw PCM16 mono by design — their original/only consumer
+    was the telephony bridge, which wants headerless PCM, not a browser
+    `<audio>` element. `TTSConfig.output_format` is documented as accepting
+    "wav"/"mp3" but NO provider actually reads that field (verified: `grep
+    -rn "config.output_format" src/` has no hits) — every one of them ignores
+    it and returns PCM regardless. So the container has to be added here, in
+    the chat layer, using the bytes the provider actually produced, not
+    assumed.
+
+    PCM16 mono is a 2-byte (1 channel * 16-bit) frame size. A byte count that
+    doesn't divide evenly by 2 means a truncated last sample (never expected
+    from a well-behaved provider, but cheap to guard): drop the dangling byte
+    rather than handing `wave.writeframes` data whose length doesn't match
+    a whole number of frames, which would leave the RIFF/data chunk sizes
+    describing a fractional frame — a malformed header, not just an
+    imperceptibly short clip.
+    """
+    if len(pcm) % 2:
+        log.warning("tts reply audio has an odd byte count (%d); dropping the "
+                    "trailing incomplete PCM16 sample", len(pcm))
+        pcm = pcm[:-1]
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)  # PCM16
+        wav_file.setframerate(sample_rate)
+        wav_file.writeframes(pcm)
+    return buf.getvalue()
+
+
+async def _synthesize_reply_audio_uncapped(
+    tenant: TenantContext, text: str, language: str, tts: Any,
+) -> tuple[bytes, str]:
+    """The actual synthesis call, unwrapped — split out so the timeout/except
+    handling above has a single coroutine to bound. The TTS client is passed
+    in by the caller, which owns the opt-in/resolution gate (`get_chat_tts`);
+    this function no longer looks up a provider itself, which is also what
+    lets tests patch just that lookup without re-implementing the timeout
+    wrapper."""
+    overrides = getattr(tenant.settings, "pronunciation_overrides", None)
+    # Currency amounts and tenant/brand pronunciation overrides get rewritten
+    # to how they should be SPOKEN, not just displayed. This does NOT mirror
+    # a shared "voice path" call site in src/bootstrap.py — there isn't one.
+    # Normalization actually lives INSIDE two of the six wired providers:
+    # sarvam.py and indicf5.py each call `normalize_for_tts` themselves on
+    # whatever text they're handed; google/azure/elevenlabs/gemini call no
+    # such thing and would ship un-normalized currency/brand words verbatim.
+    # Doing it here too is what covers those four — but it means sarvam/
+    # indicf5 would see this already-normalized text a SECOND time if
+    # `extra_pronunciations` were also forwarded through `TTSConfig` below,
+    # since their own `normalize_for_tts` call would re-run against text that
+    # already contains the substitutions. Currency rewriting is idempotent
+    # (the ₹/Rs prefix is gone after the first pass, so the regex has nothing
+    # left to match), but pronunciation overrides are not in general: if one
+    # override's replacement text happens to contain another override's key
+    # as a literal substring, a second pass rewrites that occurrence too. So
+    # the overrides are burned into `normalized` exactly once, here, and
+    # deliberately NOT also threaded through `TTSConfig.extra_pronunciations`
+    # — see the comment on the config below. See the Hinglish caveat above
+    # for what this normalization does NOT cover.
+    normalized = normalize_for_tts(text, language, extra=overrides)
+    config = TTSConfig(
+        language=to_bcp47(language),
+        # Deliberately no `extra_pronunciations=overrides`: they're already
+        # applied to `normalized` above. Forwarding them here would make
+        # sarvam/indicf5 (the two providers that internally re-run
+        # `normalize_for_tts`) apply them a second time — see the comment
+        # above.
+        sample_rate=16000,  # pinned, not left to the TTSConfig default: the
+        # 1 MB worst-case-size math on `_TTS_MAX_REPLY_CHARS` assumes this
+        # exact rate. Re-derive that comment if this ever changes.
+        output_format="pcm",  # documents reality, not intent: every provider
+        # wired here ignores this field and returns raw PCM16 regardless of
+        # what's requested (see `_pcm16_to_wav`'s docstring) — this chat
+        # layer is what turns that into a playable file, below.
+    )
+    result = await tts.synthesize(normalized, config)
+    if not result.audio:
+        # A provider can return a 200 with an empty body (Azure does this on
+        # some failure modes) — treat that exactly like any other synthesis
+        # failure, not as a zero-byte clip with a play button. The caller
+        # (`_synthesize_reply_audio`) already catches/logs/degrades any
+        # exception from this function to a text-only reply.
+        raise ValueError("tts provider returned empty audio")
+    wav_bytes = _pcm16_to_wav(result.audio, result.sample_rate)
+    return wav_bytes, "audio/wav"
 
 
 # Ceiling on processing one chat turn (LLM + tools + RAG). Without it a hung
@@ -1877,6 +2108,33 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
                             # If transcription succeeded, get AI response; else inform customer
                             if transcript:
                                 result = await _run_turn(agent.handle_message(transcript))
+                                # Mirror the customer's modality: they sent a voice
+                                # note, so try to voice the reply back too — but
+                                # ONLY on this branch (inbound audio). A text turn
+                                # never reaches here, so it never gets synthesized
+                                # audio; see `_synthesize_reply_audio`'s docstring
+                                # for every way this degrades to text-only without
+                                # raising. Deliberately done BEFORE stopping the
+                                # keepalive below (not after): synthesis is more
+                                # post-turn processing time before any
+                                # customer-visible frame goes out, exactly like the
+                                # upload/transcribe step above — the customer stays
+                                # covered by "still working on it" bubbles instead
+                                # of sitting in silence for _TTS_SYNTH_TIMEOUT_S.
+                                reply_media_mime: Optional[str] = None
+                                reply_media_url: Optional[str] = None
+                                synthesized = await _synthesize_reply_audio(
+                                    tenant, result.response.response_text, result.response.language)
+                                if synthesized is not None and _media_store is not None:
+                                    reply_audio_bytes, reply_mime = synthesized
+                                    reply_object_key = _media_key(tenant.id, session_id, reply_mime)
+                                    try:
+                                        await _media_store.upload(reply_audio_bytes, reply_object_key, reply_mime)
+                                        reply_media_mime, reply_media_url = reply_mime, reply_object_key
+                                    except Exception:  # noqa: BLE001 — same rule as synthesis itself: never break the turn
+                                        log.warning("tts reply audio upload failed; sending text-only reply",
+                                                    extra={"ticket_id": ticket_id, "session_id": session_id},
+                                                    exc_info=True)
                                 # Stop the keepalive now, before ANY customer-visible
                                 # frame goes out (audio_ack / the real reply) and
                                 # before any human-handoff escalation:
@@ -1890,17 +2148,30 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
                                 # working on it" appear after it. Safe to call again
                                 # in the `finally` below (idempotent).
                                 await _stop_keepalive(_ka, _ka_stop)
-                                msg_id = await _persist_turn(
+                                persisted = await _persist_turn(
                                     session_id, transcript, result,
                                     user_type="audio", media_mime=mime, media_url=object_key,
                                     ticket_id=ticket_id,
+                                    reply_media_mime=reply_media_mime, reply_media_url=reply_media_url,
                                 )
-                                if msg_id is not None:
+                                if persisted.customer_message_id is not None:
                                     await websocket.send_text(json.dumps({
                                         "type": "audio_ack",
-                                        "media_url": f"/api/v1/chat/media/{msg_id}",
+                                        "media_url": f"/api/v1/chat/media/{persisted.customer_message_id}",
                                     }))
-                                await _send_reply(websocket, session_id, result, tenant.id)
+                                # Only reference the reply's media URL if persistence
+                                # actually recorded it (agent_message_id present) —
+                                # a persistence failure must not send a URL to a
+                                # message that was never written.
+                                await _send_reply(
+                                    websocket, session_id, result, tenant.id,
+                                    audio_url=(
+                                        f"/api/v1/chat/media/{persisted.agent_message_id}"
+                                        if reply_media_url and persisted.agent_message_id is not None
+                                        else None
+                                    ),
+                                    audio_mime=reply_media_mime if reply_media_url else None,
+                                )
                                 if result.escalation:
                                     if await _handle_escalation(websocket, session_id, tenant, row, result):
                                         if await _run_human_mode(websocket, session_id, tenant, ticket_id=ticket_id):
@@ -2120,17 +2391,38 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
 async def _send_reply(
     websocket: WebSocket, session_id: str, result: ChatTurnResult, tenant_id: str,
     *, call_url: Optional[str] = None,
+    audio_url: Optional[str] = None, audio_mime: Optional[str] = None,
 ) -> None:
     """Send the agent's reply frame, plus an escalation/call_offer frame if the
-    agent's tools fired one, and emit a signed chat.escalated tenant event."""
-    await websocket.send_text(json.dumps({
+    agent's tools fired one, and emit a signed chat.escalated tenant event.
+
+    ``audio_url``/``audio_mime`` are the ONLY change on the wire for voice-note
+    replies (see `_synthesize_reply_audio`) — deliberately added as optional
+    fields on the existing `message` frame rather than a new frame type.
+    `docs/crm-chat-media-contract.md` documents why: this codebase has no
+    versioning story for the CRM relays/widgets consuming these frames, and a
+    genuinely new frame type "would simply be dropped" by every integration
+    that doesn't already know to look for it (see `_interim_wait_keepalive`'s
+    docstring, which hit the identical problem for the keepalive message and
+    solved it the same way — reuse `message`, add a field). A JSON consumer
+    that doesn't know `audio_url` ignores it and renders the text exactly as
+    before; an updated client plays the clip. Both fields are omitted
+    entirely (not sent as null) when there is no audio, so existing payload
+    shape is byte-for-byte unchanged on every non-audio-reply turn — the
+    common case by far, since only an inbound `audio` turn ever populates
+    these (see the WS loop's audio branch)."""
+    frame = {
         "type": "message",
         "session_id": session_id,
         "text": result.response.response_text,
         "sources": result.response.sources_used,
         "suggestions": result.response.suggested_followups,
         "action": result.response.action,
-    }))
+    }
+    if audio_url:
+        frame["audio_url"] = audio_url
+        frame["audio_mime"] = audio_mime
+    await websocket.send_text(json.dumps(frame))
     if result.escalation:
         await websocket.send_text(json.dumps({
             "type": "escalation",
@@ -2164,27 +2456,58 @@ async def _emit_escalation(tenant_id: str, session_id: str, result: ChatTurnResu
     ))
 
 
+class PersistedTurnIds(NamedTuple):
+    """Return shape of `_persist_turn`: the customer and agent ``ChatMessage``
+    ids just written in the same DB transaction — either a caller that needs
+    to build a ``/chat/media/{id}`` URL for the CUSTOMER's attachment
+    (inbound audio_ack) or for the AGENT's synthesized voice-note reply
+    (outbound `audio_url`, see `_synthesize_reply_audio`) gets it without a
+    second query. Both fields are ``None`` together on error or missing
+    session — never a partial result, since both rows commit atomically."""
+    customer_message_id: Optional[int] = None
+    agent_message_id: Optional[int] = None
+
+
 async def _persist_turn(
     session_id: str, user_text: str, result: ChatTurnResult,
     *, user_type: str = "text", media_mime: Optional[str] = None,
     media_url: Optional[str] = None, ticket_id: Optional[str] = None,
-) -> Optional[int]:
+    reply_media_mime: Optional[str] = None, reply_media_url: Optional[str] = None,
+) -> PersistedTurnIds:
     """Append the customer + agent messages to chat_messages and bump the count.
-    Returns the customer ChatMessage.id on success, None on error or missing session."""
+
+    ``reply_media_mime``/``reply_media_url`` extend the AGENT's row with a
+    synthesized voice-note reply's audio — the same media columns the
+    customer's own inbound message already uses (just the other row), so the
+    transcript view and ``GET /chat/media/{message_id}`` serve an outbound
+    reply's audio the same way they already serve an inbound voice note,
+    with no parallel storage path. Both are ``None`` for every non-audio-reply
+    turn (the overwhelming majority), which is a no-op past ``ChatMessage``'s
+    own nullable columns.
+
+    Returns a ``PersistedTurnIds`` (both fields ``None`` on error or missing
+    session)."""
     try:
         async with _sm()() as db:
             row = await db.get(ChatSession, session_id)
             if row is None:
-                return None
+                return PersistedTurnIds()
             customer_msg = ChatMessage(
                 session_id=session_id, role="customer", type=user_type,
                 content=user_text, media_mime=media_mime, media_url=media_url,
             )
             db.add(customer_msg)
             agent_msg = ChatMessage(
-                session_id=session_id, role="agent", type="text",
+                # "audio" (not "text") when a voice-note reply was
+                # synthesized, mirroring the inbound side's own
+                # type="audio" convention for a message carrying playable
+                # media — consuming UIs branch on `type`/`media_url`
+                # together already for the customer's messages.
+                session_id=session_id, role="agent",
+                type=("audio" if reply_media_url else "text"),
                 content=result.response.response_text,
                 sources=result.response.sources_used or None,
+                media_mime=reply_media_mime, media_url=reply_media_url,
                 # Phase 1 of the turn-metrics plan: retires the previously
                 # dead latency_ms column using data the agent already
                 # computed this turn. getattr-defensive (matching
@@ -2229,13 +2552,14 @@ async def _persist_turn(
                     log.exception("chat turn cost computation failed", extra={
                         "ticket_id": ticket_id, "session_id": session_id})
             await db.flush()
-            msg_id = customer_msg.id
+            customer_msg_id = customer_msg.id
+            agent_msg_id = agent_msg.id
             await db.commit()
-            return msg_id
+            return PersistedTurnIds(customer_msg_id, agent_msg_id)
     except Exception:
         log.exception("chat message persistence failed", extra={
             "ticket_id": ticket_id, "session_id": session_id})
-        return None
+        return PersistedTurnIds()
 
 
 async def push_async_message(

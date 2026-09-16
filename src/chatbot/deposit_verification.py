@@ -97,9 +97,9 @@ async def submit_deposit_verification(
             "status": "missing_order_id",
             "message": (
                 "No order id was provided. Call get_player_latest_deposit_order first "
-                "and pass its PgsOrderId value back here as order_id. If no deposit "
-                "order can be found for this customer, do not invent or substitute an "
-                "order id — escalate to a human agent instead."
+                "and pass its order_id value back here as order_id. If no deposit "
+                "order can be found for this customer, do not invent or substitute "
+                "an order id — escalate to a human agent instead."
             ),
         }
 

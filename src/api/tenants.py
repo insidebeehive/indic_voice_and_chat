@@ -20,7 +20,7 @@ from types import SimpleNamespace
 from typing import Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy import case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -31,13 +31,18 @@ from src.auth.audit import log_denied
 from src.auth.context import hash_api_token
 from src.auth.middleware import require_admin
 from src.config_tenant import (
+    DepositVerificationConfig,
     TelephonyCreds,
+    TenantConfigError,
     TenantPipelineConfig,
     TenantRealtimeConfig,
+    TenantSettings,
     TenantSTTConfig,
     TenantTelephonyConfig,
     TenantTTSConfig,
     platform_webhook_base_url,
+    resolve_chat_tts_config,
+    validate_credentials,
 )
 from src.config_tenant import TenantLLMConfig as _LLM
 from src.dialogue.campaign_loader import parse_campaign_yaml
@@ -322,15 +327,77 @@ class DepositVerificationUpdateIn(BaseModel):
     enabled: Optional[bool] = None
     webhook_url: Optional[str] = None
     webhook_secret: Optional[str] = None   # write-only plaintext; never returned
-    timeout_minutes: Optional[int] = None
+    # gt=0 duplicated from DepositVerificationConfig (src/config_tenant.py):
+    # this PATCH field is unconstrained upstream of that model, so an
+    # unconstrained int here would let e.g. timeout_minutes=0 commit to
+    # pipeline_config successfully while DepositVerificationConfig(**cfg)
+    # rejects it with a ValidationError on every subsequent read — including
+    # DbTenantResolver.reload(), which builds this same model for every
+    # tenant in one pass and only swaps in its caches after the whole loop
+    # succeeds. One bad row here therefore leaves ALL tenants unresolvable
+    # on the next resolver reload, not just this one. Rejecting it here with
+    # a 422 keeps the write and the read in agreement.
+    timeout_minutes: Optional[int] = Field(default=None, gt=0)
     # Vendor API contract this tenant's webhook speaks — see
     # DepositVerificationConfig.contract in src/config_tenant.py.
     contract: Optional[Literal["multipart_verdict", "json_ticket_relay"]] = None
-    screenshot_url_ttl_seconds: Optional[int] = None
+    # gt=0: see timeout_minutes above — same duplicated constraint, same
+    # write/read split if omitted here.
+    screenshot_url_ttl_seconds: Optional[int] = Field(default=None, gt=0)
     # ``json_ticket_relay``-only: ordered ``ChatSession.extra_data`` keys to
     # try when resolving the optional outbound ``mobile`` field — see
     # DepositVerificationConfig.mobile_metadata_keys in src/config_tenant.py.
     mobile_metadata_keys: Optional[list[str]] = None
+
+
+class LayerUpdateIn(BaseModel):
+    """Partial provider-layer update, shared shape for stt/llm/tts and
+    chat_voice.tts. Every field is optional — an admin can flip just
+    ``provider`` (e.g. swap TTS vendor) without re-stating ``model``, or
+    just ``model`` without re-stating ``provider``. ``voice_id``/``speed``
+    are TTS-only; harmless no-ops when applied to stt/llm (see
+    _merge_layer_fields, which restricts which of these actually get
+    written per layer so an stt/llm config never picks up TTS-only keys)."""
+    provider: Optional[str] = None
+    model: Optional[str] = None
+    language: Optional[str] = None
+    voice_id: Optional[str] = None  # tts only
+    speed: Optional[float] = None   # tts only
+
+
+class RealtimeUpdateIn(BaseModel):
+    """Partial update for pipeline.realtime (the S2S provider block) — same
+    fields as register-time's RealtimeChoice, but every field optional here
+    since PATCH is partial-override, not replace-wholesale."""
+    provider: Optional[str] = None
+    model: Optional[str] = None
+    voice: Optional[str] = None
+    language_code: Optional[str] = None
+
+
+class ChatVoiceUpdateIn(BaseModel):
+    """Partial update for pipeline.chat_voice — CHAT voice-note replies,
+    independent of the voice-call cascade's pipeline.tts (added in 0c011a6;
+    see ChatVoiceConfig in src/config_tenant.py). ``tts`` here is the
+    chat-specific override; leaving it unset and enabling chat_voice relies
+    on the documented pipeline.tts fallback (resolve_chat_tts_config)."""
+    enabled: Optional[bool] = None
+    tts: Optional[LayerUpdateIn] = None
+
+
+class PipelineUpdateIn(BaseModel):
+    """Partial pipeline update — mode + provider/model choices, write-once at
+    registration until now. Every field optional; update_tenant merges each
+    provided sub-block field-by-field into the stored pipeline_config (same
+    partial-override semantics as TelephonyUpdateIn) and then validates the
+    RESULT with validate_credentials before persisting — see update_tenant's
+    docstring for why."""
+    mode: Optional[Literal["layered", "s2s"]] = None
+    stt: Optional[LayerUpdateIn] = None
+    llm: Optional[LayerUpdateIn] = None
+    tts: Optional[LayerUpdateIn] = None
+    realtime: Optional[RealtimeUpdateIn] = None
+    chat_voice: Optional[ChatVoiceUpdateIn] = None
 
 
 class UpdateTenantRequest(BaseModel):
@@ -343,6 +410,11 @@ class UpdateTenantRequest(BaseModel):
     # "" clears the link (FK is nullable); omitted/None leaves it untouched.
     crm_id: Optional[str] = None
     deposit_verification: Optional[DepositVerificationUpdateIn] = None
+    # Mode + STT/LLM/TTS/realtime/chat_voice provider choices — previously
+    # write-once at registration (POST /tenants). See PipelineUpdateIn and
+    # update_tenant's docstring for the partial-override + validate-the-
+    # result semantics.
+    pipeline: Optional[PipelineUpdateIn] = None
 
 
 class UpdateTenantResponse(BaseModel):
@@ -358,6 +430,48 @@ class UpdateTenantResponse(BaseModel):
     crm_id: Optional[str] = None
     deposit_verification_enabled: Optional[bool] = None
     deposit_verification_secret_set: Optional[bool] = None
+    # Effective pipeline state after this PATCH, so the caller can confirm
+    # what's now in force without a separate GET. Provider/model NAMES only —
+    # never API keys (STT/LLM/TTS/realtime always resolve keys from the
+    # platform master env, never per-tenant, so there is nothing secret here
+    # to withhold in the first place; unlike telephony_creds_configured this
+    # doesn't need to be a names-only list because there ARE no per-tenant
+    # secrets on these layers).
+    pipeline_mode: Optional[str] = None
+    stt_provider: Optional[str] = None
+    stt_model: Optional[str] = None
+    llm_provider: Optional[str] = None
+    llm_model: Optional[str] = None
+    tts_provider: Optional[str] = None
+    tts_model: Optional[str] = None
+    realtime_provider: Optional[str] = None
+    realtime_model: Optional[str] = None
+    chat_voice_enabled: bool = False
+    chat_voice_tts_provider: Optional[str] = None
+
+
+# Which of LayerUpdateIn's fields actually apply to each pipeline layer.
+# stt/llm never had voice_id/speed to begin with (TenantSTTConfig/
+# TenantLLMConfig don't declare them) so restricting here keeps the stored
+# JSON clean, even though pydantic would silently drop the extra keys anyway
+# when TenantPipelineConfig(**pc) reconstructs each sub-config.
+_STT_UPDATE_FIELDS = ("provider", "model", "language")
+_LLM_UPDATE_FIELDS = ("provider", "model")
+_TTS_UPDATE_FIELDS = ("provider", "model", "language", "voice_id", "speed")
+
+
+def _merge_layer_fields(cfg: dict, upd: "LayerUpdateIn", fields: tuple[str, ...]) -> dict:
+    """Partial-override merge for one pipeline layer (stt/llm/tts/chat_voice.tts):
+    only the fields the admin actually set overwrite the stored value, so an
+    admin changing just ``tts.provider`` does not wipe ``tts.voice_id`` —
+    same shape as the telephony block's merge below, just for a single dict
+    instead of TelephonyUpdateIn's flatter set of fields."""
+    out = dict(cfg)
+    for f in fields:
+        v = getattr(upd, f)
+        if v is not None:
+            out[f] = v
+    return out
 
 
 async def _refresh_resolver(request: Request, tenant_id: str) -> None:
@@ -380,13 +494,51 @@ async def update_tenant(
     session: AsyncSession = Depends(get_db_session),
     _: None = Depends(require_admin),
 ) -> UpdateTenantResponse:
-    """Update an existing tenant's telephony credentials/config or status (admin).
+    """Update an existing tenant's telephony credentials/config, pipeline
+    mode/providers, or status (admin).
 
     Telephony ``keys`` are encrypted and **merged** into the tenant's secrets
     (existing names are overwritten, new ones added), and the matching ``*_env``
     references are written into ``pipeline_config.telephony``. The live resolver
     is refreshed so the change takes effect immediately — e.g. fixing a wrong
     Stringee API Key SID without re-registering the tenant.
+
+    ``pipeline`` (mode + stt/llm/tts/realtime/chat_voice) was write-once at
+    registration until now — this was the only way to flip a tenant between
+    ``layered``/``s2s`` or swap a provider, short of hand-editing
+    ``pipeline_config`` JSON in Postgres. Same partial-override semantics as
+    ``telephony``: every field is optional, an omitted field leaves the
+    stored value untouched, and the merge happens onto ``pc`` (never a
+    wholesale replace) — see ``_merge_layer_fields``.
+
+    Unlike every other block here, the pipeline merge's RESULT is validated
+    before it's persisted: we build the prospective ``pipeline_config``,
+    reconstruct the ``TenantSettings`` it would produce, and run the same
+    ``validate_credentials`` gate ``load_tenant()`` runs for YAML tenants
+    (src/config_tenant.py). A gap — e.g. switching to ``s2s`` with no
+    ``pipeline.realtime.provider``, or enabling ``chat_voice`` with no TTS
+    resolvable anywhere — is rejected with a 422 naming what's missing,
+    instead of being accepted and discovered when a call or chat reply
+    actually fails. This only runs when ``req.pipeline`` is provided — a
+    telephony-only or status-only PATCH keeps its pre-existing (unvalidated)
+    behavior, unchanged by this endpoint's original scope.
+
+    NOTE (deliberately not handled here): switching ``s2s -> layered`` on a
+    tenant whose ``pipeline.tts`` was never set (an s2s tenant legitimately
+    has none) leaves voice calls with no TTS. ``validate_credentials`` has no
+    rule for this — it only requires ``pipeline.tts`` indirectly via
+    ``chat_voice.enabled`` — so this combination is NOT caught here. Fixing
+    it would mean changing ``validate_credentials``'s rules, which is out of
+    scope for this endpoint (see its own docstring for why: STT/LLM/TTS keys
+    are platform-level, not per-tenant, so the function has historically only
+    policed telephony/realtime/chat_voice gaps that would silently bill or
+    break the platform).
+
+    The live resolver + cached provider clients (``TenantProviders.evict``,
+    via ``_refresh_resolver``) are refreshed for every successful PATCH
+    regardless of which block changed, so a provider/model swap takes effect
+    immediately — no restart, and no stale cached client (e.g. a cached TTS
+    adapter for the old provider) survives the edit.
     """
     t = await _require_tenant(session, tenant_id)
 
@@ -529,7 +681,14 @@ async def update_tenant(
             dv_cfg["screenshot_url_ttl_seconds"] = dv.screenshot_url_ttl_seconds
         if dv.mobile_metadata_keys is not None:
             dv_cfg["mobile_metadata_keys"] = dv.mobile_metadata_keys
-        if dv.webhook_secret is not None:
+        # Truthy, not `is not None`: {"webhook_secret": ""} must be a no-op.
+        # An empty string would still pass `is not None`, write an encrypted
+        # empty-string row, and make deposit_verification_secret_set /
+        # deposit_verification_active both read True downstream (a row
+        # exists) — while bootstrap.py's secret_optional(...) gets back ""
+        # and treats it as falsy, so the tool never actually registers. That
+        # mismatch is exactly the false "active" this field exists to catch.
+        if dv.webhook_secret:
             if not crypto.has_key():
                 raise HTTPException(
                     status_code=503,
@@ -548,9 +707,57 @@ async def update_tenant(
             dv_cfg["webhook_secret_env"] = name
         pc["deposit_verification"] = dv_cfg
 
+    if req.pipeline is not None:
+        pl = req.pipeline
+        if pl.mode is not None:
+            pc["mode"] = pl.mode
+        if pl.stt is not None:
+            pc["stt"] = _merge_layer_fields(pc.get("stt") or {}, pl.stt, _STT_UPDATE_FIELDS)
+        if pl.llm is not None:
+            pc["llm"] = _merge_layer_fields(pc.get("llm") or {}, pl.llm, _LLM_UPDATE_FIELDS)
+        if pl.tts is not None:
+            pc["tts"] = _merge_layer_fields(pc.get("tts") or {}, pl.tts, _TTS_UPDATE_FIELDS)
+        if pl.realtime is not None:
+            realtime_cfg = dict(pc.get("realtime") or {})
+            for f in ("provider", "model", "voice", "language_code"):
+                v = getattr(pl.realtime, f)
+                if v is not None:
+                    realtime_cfg[f] = v
+            pc["realtime"] = realtime_cfg
+        if pl.chat_voice is not None:
+            cv_cfg = dict(pc.get("chat_voice") or {})
+            if pl.chat_voice.enabled is not None:
+                cv_cfg["enabled"] = pl.chat_voice.enabled
+            if pl.chat_voice.tts is not None:
+                cv_cfg["tts"] = _merge_layer_fields(
+                    cv_cfg.get("tts") or {}, pl.chat_voice.tts, _TTS_UPDATE_FIELDS)
+            pc["chat_voice"] = cv_cfg
+
+        # Validate the RESULT, not the request: build the TenantSettings this
+        # merged pipeline_config would produce and run it through the same
+        # validate_credentials gate load_tenant() runs for YAML tenants — a
+        # mode switch or provider change that leaves the tenant unable to
+        # place calls / send chat voice replies must be rejected here, not
+        # discovered at the next call. Only id/slug/name/pipeline are set:
+        # validate_credentials reads only settings.pipeline (+ settings.slug
+        # for its own error message) — see its docstring — so nothing else
+        # this endpoint can touch (crm/deposit_verification/telephony
+        # secrets) needs to round-trip through here.
+        try:
+            prospective_pipeline = TenantPipelineConfig(**pc)
+        except ValidationError as e:
+            raise HTTPException(status_code=422, detail=f"invalid pipeline config: {e}")
+        prospective_settings = TenantSettings(id=t.id, slug=t.slug, name=t.name,
+                                               pipeline=prospective_pipeline)
+        try:
+            validate_credentials(prospective_settings, source=f"tenant:{t.slug}")
+        except TenantConfigError as e:
+            raise HTTPException(status_code=422, detail=str(e))
+
     if req.status is not None or req.events_webhook_url is not None \
             or req.telephony is not None or req.chatwoot is not None \
-            or req.crm is not None or req.deposit_verification is not None:
+            or req.crm is not None or req.deposit_verification is not None \
+            or req.pipeline is not None:
         t.pipeline_config = pc  # reassign (new object) so the JSON column is marked dirty
 
     await session.commit()
@@ -560,6 +767,21 @@ async def update_tenant(
     pc = t.pipeline_config or {}
     tel_cfg = pc.get("telephony") or {}
     dv_cfg = pc.get("deposit_verification") or {}
+    stt_cfg = pc.get("stt") or {}
+    llm_cfg = pc.get("llm") or {}
+    tts_cfg = pc.get("tts") or {}
+    realtime_cfg = pc.get("realtime") or {}
+    chat_voice_cfg = pc.get("chat_voice") or {}
+    # The EFFECTIVE chat-voice TTS provider, including the documented
+    # pipeline.tts fallback (resolve_chat_tts_config) — not just whatever
+    # chat_voice.tts itself declares. A tenant that enables chat_voice while
+    # relying on the fallback should see that fallback reflected here, not a
+    # blank field that makes it look unresolved.
+    chat_voice_tts_provider = None
+    effective_pipeline = TenantPipelineConfig(**pc)
+    chat_tts_cfg = resolve_chat_tts_config(effective_pipeline)
+    if chat_tts_cfg is not None:
+        chat_voice_tts_provider = chat_tts_cfg.provider
     return UpdateTenantResponse(
         tenant_id=t.id, slug=t.slug, status=t.status,
         telephony_provider=tel_cfg.get("provider"),
@@ -569,6 +791,17 @@ async def update_tenant(
         crm_id=t.crm_id,
         deposit_verification_enabled=dv_cfg.get("enabled"),
         deposit_verification_secret_set=bool(dv_cfg.get("webhook_secret_env")),
+        pipeline_mode=pc.get("mode", "layered"),
+        stt_provider=stt_cfg.get("provider"),
+        stt_model=stt_cfg.get("model"),
+        llm_provider=llm_cfg.get("provider"),
+        llm_model=llm_cfg.get("model"),
+        tts_provider=tts_cfg.get("provider"),
+        tts_model=tts_cfg.get("model"),
+        realtime_provider=realtime_cfg.get("provider"),
+        realtime_model=realtime_cfg.get("model"),
+        chat_voice_enabled=bool(chat_voice_cfg.get("enabled")),
+        chat_voice_tts_provider=chat_voice_tts_provider,
     )
 
 
@@ -824,6 +1057,13 @@ async def rotate_webhook_credentials(
 class LayerInfo(BaseModel):
     provider: Optional[str] = None
     model: Optional[str] = None
+    # Additive (Task: backoffice voice pickers). Lets the backoffice show the
+    # currently-configured voice/language without a separate call, and gives
+    # it a language to query GET /api/v1/voices with when the operator hasn't
+    # typed one. See ``_layer()`` for where each field is actually read from —
+    # the realtime layer stores these under different config keys.
+    language: Optional[str] = None
+    voice_id: Optional[str] = None
 
 
 class TenantSummary(BaseModel):
@@ -859,6 +1099,29 @@ class TenantSummary(BaseModel):
     stringee_webhook_auth_configured: bool = False
     exotel_basic_auth_configured: bool = False
     chatwoot_webhook_id_configured: bool = False
+    # Deposit-verification screenshot-dispute webhook (DepositVerificationConfig,
+    # src/config_tenant.py). Non-secret fields only — webhook_secret itself is
+    # write-only (see DepositVerificationUpdateIn) and never round-trips here.
+    deposit_verification_enabled: bool = False
+    deposit_verification_webhook_url: Optional[str] = None
+    # Whether a TenantSecret row exists under this tenant's stored
+    # webhook_secret_env name (see update_tenant's PATCH handler, :677) —
+    # never the value itself, matching events_webhook_secret_set/
+    # telephony_creds_configured's names/booleans-only convention.
+    deposit_verification_secret_set: bool = False
+    deposit_verification_contract: Optional[str] = None
+    deposit_verification_timeout_minutes: Optional[int] = None
+    # THE field this endpoint exists to add: whether the tool will actually be
+    # registered, not just whether `enabled` is set. Mirrors bootstrap.py's
+    # registration gate (~:558-566) exactly — enabled + webhook_url + a
+    # resolvable secret — MINUS the `sessionmaker is not None` leg, which is a
+    # runtime/process-wiring concern this API has no way to inspect. An
+    # `enabled: true` PATCH with no webhook_url or no resolvable secret is a
+    # deliberately-refused half-configuration (bootstrap.py:548-556): the tool
+    # never registers, so the LLM never offers a verification whose verdict
+    # could never come back. `_enabled` alone reads as "on"; `_active` is what
+    # actually predicts whether the feature does anything.
+    deposit_verification_active: bool = False
 
 
 class TenantListResponse(BaseModel):
@@ -868,7 +1131,25 @@ class TenantListResponse(BaseModel):
 
 def _layer(pc: dict, key: str) -> LayerInfo:
     d = pc.get(key) or {}
-    return LayerInfo(provider=d.get("provider"), model=d.get("model"))
+    if key == "realtime":
+        # TenantRealtimeConfig (src/config_tenant.py) names these fields
+        # `voice` and `language_code`, not `voice_id`/`language` like
+        # TenantSTTConfig/TenantTTSConfig. Mapped onto the SAME LayerInfo
+        # fields (rather than adding realtime-only field names) so the
+        # backoffice's voice picker can read one shared shape for every
+        # layer kind instead of special-casing s2s — without this mapping
+        # the realtime layer's current voice/language would silently come
+        # back null even though they're stored.
+        return LayerInfo(
+            provider=d.get("provider"), model=d.get("model"),
+            language=d.get("language_code"), voice_id=d.get("voice"),
+        )
+    # stt/tts read straight off TenantSTTConfig/TenantTTSConfig's own
+    # `language`/`voice_id` field names; llm has neither and both stay None.
+    return LayerInfo(
+        provider=d.get("provider"), model=d.get("model"),
+        language=d.get("language"), voice_id=d.get("voice_id"),
+    )
 
 
 _CRED_ENV_FIELDS = (
@@ -908,11 +1189,50 @@ async def list_tenants(
     for secret_tenant_id, name in webhook_secret_rows:
         webhook_secret_names.setdefault(secret_tenant_id, set()).add(name)
 
+    # Deposit-verification webhook secret is named PER TENANT (TENANT_{SLUG}_
+    # DEPOSIT_VERIFICATION_WEBHOOK_SECRET, minted by update_tenant's PATCH
+    # handler at :677) rather than one of the fixed names above, so it can't
+    # join the IN(...) query above. Collect each tenant's configured env name
+    # first, then resolve all of them in ONE extra query — an N+1 (a secret
+    # lookup per tenant) here would run on every backoffice page load.
+    dv_env_by_tenant: dict[str, str] = {}
+    for t in rows:
+        env_name = ((t.pipeline_config or {}).get("deposit_verification") or {}).get(
+            "webhook_secret_env")
+        if env_name:
+            dv_env_by_tenant[t.id] = env_name
+    dv_secret_rows = []
+    if dv_env_by_tenant:
+        dv_secret_rows = (await session.execute(
+            select(TenantSecret.tenant_id, TenantSecret.name).where(
+                TenantSecret.name.in_(set(dv_env_by_tenant.values()))
+            )
+        )).all()
+    dv_secret_pairs = {(secret_tenant_id, name) for secret_tenant_id, name in dv_secret_rows}
+
     items = []
     for t in rows:
         pc = t.pipeline_config or {}
         tel = pc.get("telephony") or {}
         names = webhook_secret_names.get(t.id, set())
+        try:
+            dv = DepositVerificationConfig(**(pc.get("deposit_verification") or {}))
+        except ValidationError as e:
+            # Corrupt/legacy stored config (e.g. a timeout_minutes that no
+            # longer satisfies gt=0) — fall back to the disabled default
+            # rather than 500ing the whole tenant list over one bad row.
+            # This is NOT a benign "off" state: db_resolver.py builds this
+            # same DepositVerificationConfig with no guard, so a row that
+            # lands here is one that makes DbTenantResolver.reload() raise
+            # and leaves every tenant unresolvable. Log it so it's greppable
+            # instead of silently showing "off" while the resolver is down.
+            log.warning(
+                "invalid deposit_verification config for tenant %s (%s); "
+                "showing disabled default — this also breaks DbTenantResolver.reload()",
+                t.id, t.slug, exc_info=e)
+            dv = DepositVerificationConfig()
+        dv_env = dv_env_by_tenant.get(t.id)
+        dv_secret_set = dv_env is not None and (t.id, dv_env) in dv_secret_pairs
         items.append(TenantSummary(
             tenant_id=t.id, slug=t.slug, name=t.name, status=t.status,
             mode=t.mode, max_concurrent_calls=t.max_concurrent_calls,
@@ -939,6 +1259,16 @@ async def list_tenants(
                 {"webhook:exotel_basic_user", "webhook:exotel_basic_password"} <= names
             ),
             chatwoot_webhook_id_configured="chatwoot:webhook_id" in names,
+            deposit_verification_enabled=dv.enabled,
+            deposit_verification_webhook_url=dv.webhook_url,
+            deposit_verification_secret_set=dv_secret_set,
+            deposit_verification_contract=dv.contract,
+            deposit_verification_timeout_minutes=dv.timeout_minutes,
+            # Mirrors bootstrap.py's registration gate (~:558-566) exactly,
+            # minus the `sessionmaker is not None` leg (a runtime/process
+            # concern this API has no way to inspect) — see TenantSummary's
+            # deposit_verification_active docstring for what that means.
+            deposit_verification_active=bool(dv.enabled and dv.webhook_url and dv_secret_set),
         ))
     return TenantListResponse(tenants=items, total=len(items))
 

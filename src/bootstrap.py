@@ -258,9 +258,13 @@ def build_runtime_registry(providers: TenantProviders, base_session_store: Sessi
 
 
 def _crm_params_to_schema(params: dict) -> dict:
-    """Turn a PRD-style ``{name: {type, description, source}}`` map into the
-    JSON-Schema the LLM tool declaration needs. LLM-sourced params are required;
-    session-sourced ones are filled from session context, so not required."""
+    """Turn a PRD-style ``{name: {type, description, source, required}}`` map
+    into the JSON-Schema the LLM tool declaration needs. LLM-sourced params
+    are required by default; session-sourced ones are filled from session
+    context, so never required. A catalog param can override the default by
+    setting ``"required": False`` explicitly (e.g. a query param the upstream
+    CRM defaults server-side when omitted, like get_market_holiday_schedule's
+    "date") — every param without that override keeps today's behavior."""
     props: dict = {}
     required: list[str] = []
     for name, spec in (params or {}).items():
@@ -269,7 +273,7 @@ def _crm_params_to_schema(params: dict) -> dict:
         if spec.get("description"):
             prop["description"] = spec["description"]
         props[name] = prop
-        if spec.get("source", "llm") == "llm":
+        if spec.get("source", "llm") == "llm" and spec.get("required", True):
             required.append(name)
     schema: dict = {"type": "object", "properties": props}
     if required:
@@ -354,6 +358,37 @@ async def resolve_crm_tools(
                     "extra_headers": (r.auth_config or {}).get("extra_headers")}
 
     if specs:
+        # The "operatorid" HEADER for these tools comes from each row's
+        # auth_config.extra_headers, written by POST /chat/tools/from-catalog
+        # from req.operator_id (src/api/chat_tools.py:285-286). The PATH
+        # operator_id substituted into these same tools' endpoints at call
+        # time comes from a different knob entirely: tenant.settings.crm
+        # .operator_id, falling back to tenant.id — see make_chatbot_factory's
+        # factory() closure below (_operator_id / _crm_context). A tenant can
+        # set one of these without the other, and per the CRM's shipped
+        # contract the guard 403s BEFORE auth whenever the path operator_id
+        # doesn't match the "operatorid" header — so a disagreement here means
+        # every operator-scoped tool call for this tenant fails that way,
+        # indistinguishable from a bad/missing credential unless it's logged.
+        path_operator_id = getattr(tenant.settings.crm, "operator_id", None) or tenant.id
+        mismatched_headers = sorted({
+            header_operator_id
+            for r in rows
+            if (header_operator_id := ((r.auth_config or {}).get("extra_headers") or {}).get("operatorid")) is not None
+            and header_operator_id != path_operator_id
+        })
+        if mismatched_headers:
+            log.warning(
+                "crm tool resolution: tenant-registered tool(s) carry an "
+                "'operatorid' header (%s, from auth_config.extra_headers) that "
+                "disagrees with the path operator_id (%s, from "
+                "tenant.settings.crm.operator_id or tenant.id) substituted into "
+                "the same tools' endpoints at call time — per the CRM's shipped "
+                "contract this 403s every operator-scoped tool call for this "
+                "tenant before auth is even checked",
+                mismatched_headers, path_operator_id,
+                extra={"tenant_id": tenant.id},
+            )
         return specs, execs, "tenant"  # tenant-specific tools take precedence
 
     # ── CRM catalog (tenant linked to a Crm entity) ─────────────────────
@@ -381,7 +416,25 @@ async def resolve_crm_tools(
     # must carry this as the "operatorid" header — previously hardcoded
     # to None here, so the old platform-fallback path never sent it at all
     # (only the tenant-registered chat_tools branch did, via auth_config).
-    operator_id = getattr(tenant.settings.crm, "operator_id", None) or tenant.id
+    configured_operator_id = getattr(tenant.settings.crm, "operator_id", None)
+    operator_id = configured_operator_id or tenant.id
+    if not configured_operator_id:
+        # Per CRM PR #3963's shipped contract, the CRM guard 403s a request
+        # whenever the path's operator_id doesn't match this "operatorid"
+        # header — before auth is even checked. tenant.id is an internal
+        # platform id, not the CRM's registered operator uuid, so a tenant
+        # left on this fallback will have every crm-catalog call rejected as
+        # a 403, which reads exactly like a bad/missing credential and is
+        # not: it's this tenant.settings.crm.operator_id gap. Logged here
+        # (once per tool resolution) so that's diagnosable from logs instead
+        # of guessed at from a bare 403.
+        log.warning(
+            "crm tool resolution: no crm.operator_id configured for tenant, "
+            "falling back to tenant.id as the 'operatorid' header/path value — "
+            "this will 403 against a CRM that validates operatorid against a "
+            "real registered operator uuid",
+            extra={"tenant_id": tenant.id},
+        )
     extra_headers = {"operatorid": operator_id}
 
     for row in crm_tool_rows:

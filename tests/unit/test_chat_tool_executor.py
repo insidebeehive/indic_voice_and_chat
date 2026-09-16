@@ -443,6 +443,156 @@ def test_pgs_order_id_non_string_value_is_not_blindly_passed_through() -> None:
     }
 
 
+# --- CRM PR #3963: get_player_latest_deposit_order ships "order_id" /
+# "external_transaction_id", not "PgsOrderId" -- the blocker this brief
+# fixes. Without extending _ORDER_ID_EXEMPT_KEYS_NORMALIZED, a UUID-shaped
+# order_id hits the UUID scrub below and comes back as REDACTED_PLACEHOLDER,
+# which deposit_verification.py's missing_order_id guard treats as "no
+# order id was provided" -- dead-ending every deposit dispute with no
+# fallback, since external_transaction_id is null on exactly the
+# INITIATED/BS_PENDING rows a dispute is about. -------------------------
+
+
+def test_order_id_is_exempt_from_redaction() -> None:
+    """order_id (PgsIntegration.id, always present per the shipped contract)
+    must reach the LLM unmodified, including when UUID-shaped."""
+    out = tool_executor._redact_internal_ids({
+        "order_id": "a1b2c3d4-e29b-41d4-a716-446655440000",
+        "status_bucket": "pending",
+    })
+    assert out == {
+        "order_id": "a1b2c3d4-e29b-41d4-a716-446655440000",
+        "status_bucket": "pending",
+    }
+
+
+def test_external_transaction_id_is_exempt_from_redaction() -> None:
+    """external_transaction_id is the gateway's own secondary reference in
+    the same shipped response -- the fallback submit_deposit_verification
+    uses only if order_id is rejected -- so it must also survive the scrub.
+
+    Uses a UUID-SHAPED value deliberately (a real external_transaction_id is
+    usually a short gateway ref like "gw-abc-123", but that shape would pass
+    through the generic UUID-value scrub unchanged regardless of whether the
+    key-based exemption exists at all -- proving nothing about it). A
+    UUID-shaped value is the only shape that actually exercises the
+    exemption path rather than accidentally surviving some other way."""
+    out = tool_executor._redact_internal_ids({
+        "external_transaction_id": "550e8400-e29b-41d4-a716-446655440000",
+        "amount": 500,
+    })
+    assert out == {
+        "external_transaction_id": "550e8400-e29b-41d4-a716-446655440000",
+        "amount": 500,
+    }
+
+
+def test_shipped_deposit_order_response_shape_survives_redaction_end_to_end() -> None:
+    """Pins the actual blocker end-to-end against a realistic
+    get_player_latest_deposit_order response body (per CRM PR #3963): both
+    payment-gateway references forward unmodified while operator_id/user_id
+    -- real internal platform ids -- are still stripped in the same payload.
+
+    operator_id/user_id are deliberately NON-UUID ("op-7"/"user-42") here:
+    a UUID-shaped value would be caught by the value-level UUID scrub even
+    with key-based redaction removed entirely, proving nothing about the
+    key-based path this test means to pin. external_transaction_id is
+    deliberately UUID-shaped, for the mirror reason
+    test_external_transaction_id_is_exempt_from_redaction gives -- a
+    realistic non-UUID gateway ref like "gw-abc-123" would survive the scrub
+    whether or not the key is in the exemption set, proving nothing about
+    the exemption this test means to pin."""
+    out = tool_executor._redact_internal_ids({
+        "operator_id": "op-7",
+        "user_id": "user-42",
+        "order": {
+            "order_id": "a1b2c3d4-e29b-41d4-a716-446655440000",
+            "external_transaction_id": "550e8400-e29b-41d4-a716-446655440000",
+            "amount": 500,
+            "status_bucket": "pending",
+        },
+    })
+    assert out["operator_id"] == tool_executor.REDACTED_PLACEHOLDER
+    assert out["user_id"] == tool_executor.REDACTED_PLACEHOLDER
+    assert out["order"]["order_id"] == "a1b2c3d4-e29b-41d4-a716-446655440000"
+    assert out["order"]["external_transaction_id"] == "550e8400-e29b-41d4-a716-446655440000"
+    assert out["order"]["amount"] == 500
+    assert out["order"]["status_bucket"] == "pending"
+
+
+def test_order_id_exemption_is_exact_match_not_substring() -> None:
+    """Same exact-match discipline as the PgsOrderId exemption above, applied
+    to the new "order_id" key: a key that merely CONTAINS the normalized
+    substring "orderid" without normalizing to exactly "orderid" must still
+    be redacted -- proves the set membership check wasn't loosened into a
+    substring/pattern match when it was extended."""
+    out = tool_executor._redact_internal_ids({
+        "customerOrderIdReference": "a1b2c3d4-e29b-41d4-a716-446655440000",
+    })
+    assert out == {
+        "customerOrderIdReference": tool_executor.REDACTED_PLACEHOLDER,
+    }
+
+
+def test_external_transaction_id_exemption_is_exact_match_not_substring() -> None:
+    out = tool_executor._redact_internal_ids({
+        "internalExternalTransactionIdLookup": "a1b2c3d4-e29b-41d4-a716-446655440000",
+    })
+    assert out == {
+        "internalExternalTransactionIdLookup": tool_executor.REDACTED_PLACEHOLDER,
+    }
+
+
+def test_order_id_exemption_does_not_bypass_uuid_scrub_for_free_text_value() -> None:
+    """A CRM putting a free-text diagnostic sentence under "order_id" instead
+    of a bare id (e.g. a "no order found" message that happens to embed a
+    player UUID) must not get a free pass just because the key is exempt --
+    an unconditional key-based exemption here would leak the embedded
+    internal-id UUID straight through. The value must still fall through to
+    the normal UUID scrub since it doesn't look like a bare identifier
+    (it contains whitespace)."""
+    out = tool_executor._redact_internal_ids({
+        "order_id": "no order for player 6c1a77a6-1234-4abc-8def-8add58aba9ef",
+    })
+    assert out == {
+        "order_id": f"no order for player {tool_executor.REDACTED_PLACEHOLDER}",
+    }
+
+
+def test_order_id_exemption_does_not_bypass_uuid_scrub_for_embedded_uuid() -> None:
+    """The whitespace check alone is a not-prose test, not an is-an-identifier
+    test: a hyphen-joined token embedding a player UUID has no whitespace at
+    all, so a "bare id" rule based only on \\S would forward it verbatim and
+    leak the UUID. A value under an exempt key is preserved only when it IS a
+    UUID outright, or contains none -- one that merely embeds one is scrubbed.
+
+    The two real shapes that must NOT regress are covered by
+    test_order_id_is_exempt_from_redaction (a bare UUID order_id -- the
+    deposit-dispute blocker) and the gateway-reference case below; without
+    both, tightening this rule could silently re-close the tool."""
+    uuid = "6c1a77a6-1234-4abc-8def-8add58aba9ef"
+    out = tool_executor._redact_internal_ids({
+        "order_id": f"no-order-for-{uuid}",
+        "external_transaction_id": f"{uuid}|user:{uuid}",
+    })
+    assert out == {
+        "order_id": f"no-order-for-{tool_executor.REDACTED_PLACEHOLDER}",
+        "external_transaction_id": (
+            f"{tool_executor.REDACTED_PLACEHOLDER}|user:"
+            f"{tool_executor.REDACTED_PLACEHOLDER}"
+        ),
+    }
+
+    # Real gateway references carry hyphens, slashes and digits but no UUID,
+    # and must still reach the LLM untouched -- scrubbing these would break
+    # deposit verification just as surely as redacting the order_id did.
+    kept = tool_executor._redact_internal_ids({
+        "order_id": uuid,
+        "external_transaction_id": "UPI/2026/06/21/abc",
+    })
+    assert kept == {"order_id": uuid, "external_transaction_id": "UPI/2026/06/21/abc"}
+
+
 # --- Step 1 (ticket #1762 fix): failure legibility ------------------------
 
 
@@ -872,3 +1022,97 @@ async def test_rejection_log_does_not_contain_the_param_value(caplog) -> None:
     assert record.__dict__.get("param_name") == "market_name"
     assert secret_value not in repr(record.__dict__)
     assert secret_value not in record.getMessage()
+
+
+# --- CRM PR #3963: get_bet_limit / get_market_holiday_schedule's renamed
+# params ("name", "market", "date") must land as query params, not path
+# segments -- catalog.py's default_path for both no longer contains a
+# placeholder for them, and tool_executor.py only path-substitutes
+# placeholders actually present in the endpoint (the `if placeholder in url`
+# check above `path_used.add(k)`); anything left over becomes `rest`, sent
+# as query params on GET. This exercises the real catalog entries end-to-end
+# through the executor rather than a hand-built endpoint string, so a future
+# edit that puts "name"/"market"/"date" back into the path template (or
+# forgets to declare them at all) would break these.
+
+
+@pytest.mark.asyncio
+async def test_catalog_get_bet_limit_name_param_lands_as_query_not_path() -> None:
+    from src.chatbot.catalog import OPERATOR_TOOLS
+
+    entry = OPERATOR_TOOLS["get_bet_limit"]
+    client = _FakeClient({"games": []})
+    out = await execute_crm_tool(
+        endpoint="https://crm.example.com" + entry["default_path"],
+        method=entry["method"],
+        parameters=entry["parameters"],
+        auth_type=None, token=None,
+        args={"name": "Teen Patti"},
+        context={"operator_id": "op1", "user_id": "u1"},
+        http_client=client,
+    )
+    assert "error" not in out
+    method, url, params, headers = client.calls[0]
+    assert url == "https://crm.example.com/operators/op1/players/u1/bet-limit"
+    assert params == {"name": "Teen Patti"}
+
+
+@pytest.mark.asyncio
+async def test_catalog_get_market_holiday_schedule_market_and_date_land_as_query_not_path() -> None:
+    from src.chatbot.catalog import OPERATOR_TOOLS
+
+    entry = OPERATOR_TOOLS["get_market_holiday_schedule"]
+    client = _FakeClient({"status": "found"})
+    out = await execute_crm_tool(
+        endpoint="https://crm.example.com" + entry["default_path"],
+        method=entry["method"],
+        parameters=entry["parameters"],
+        auth_type=None, token=None,
+        args={"market": "Kalyan", "date": "2026-09-20"},
+        context={"operator_id": "op1"},
+        http_client=client,
+    )
+    assert "error" not in out
+    method, url, params, headers = client.calls[0]
+    assert url == "https://crm.example.com/operators/op1/matka/holiday-schedule"
+    assert params == {"market": "Kalyan", "date": "2026-09-20"}
+
+
+@pytest.mark.asyncio
+async def test_catalog_get_market_holiday_schedule_date_is_optional() -> None:
+    """'date' is optional (defaults to today in the operator's timezone
+    upstream when omitted) -- omitting it from args must not be treated as
+    an error or block the call.
+
+    Also asserts the property this test's name actually claims: the
+    JSON-Schema the LLM receives (via bootstrap._crm_params_to_schema, not
+    just this executor-level call) must not list "date" as required either.
+    The executor-level check alone gives false assurance here -- the LLM
+    never sees the executor, only the schema -- so without catalog.py's
+    "date" param declaring "required": False and bootstrap.py's
+    _crm_params_to_schema honoring it, the model would always be told to
+    send a date, defeating the operator-timezone default upstream provides.
+    """
+    from src.bootstrap import _crm_params_to_schema
+    from src.chatbot.catalog import OPERATOR_TOOLS
+
+    entry = OPERATOR_TOOLS["get_market_holiday_schedule"]
+
+    schema = _crm_params_to_schema(entry["parameters"])
+    assert "date" not in schema.get("required", [])
+    assert "market" in schema.get("required", [])
+
+    client = _FakeClient({"status": "found"})
+    out = await execute_crm_tool(
+        endpoint="https://crm.example.com" + entry["default_path"],
+        method=entry["method"],
+        parameters=entry["parameters"],
+        auth_type=None, token=None,
+        args={"market": "Kalyan"},
+        context={"operator_id": "op1"},
+        http_client=client,
+    )
+    assert "error" not in out
+    method, url, params, headers = client.calls[0]
+    assert url == "https://crm.example.com/operators/op1/matka/holiday-schedule"
+    assert params == {"market": "Kalyan"}

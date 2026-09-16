@@ -131,7 +131,7 @@ Accepted content types per frame type:
 | Frame | Shape | Meaning |
 |---|---|---|
 | `typing` | `{"type":"typing"}` | turn accepted, reply coming — sent once when a turn starts (treat as idempotent; any other frame clears it) |
-| `message` | `{"type":"message","session_id":...,"text":...,"sources":[...],"suggestions":[...],"action":...}` | the AI reply. May instead be an *interim* wait message — see below |
+| `message` | `{"type":"message","session_id":...,"text":...,"sources":[...],"suggestions":[...],"action":...}` | the AI reply. May instead be an *interim* wait message — see below. May carry `audio_url`/`audio_mime` — see "Voice-note replies" below |
 | `audio_ack` | `{"type":"audio_ack","media_url":"/api/v1/chat/media/<id>"}` | voice note stored; URL serves the recording for transcript UIs |
 | `escalation` | `{"type":"escalation","reason":...,"context_summary":...}` | conversation escalated to a human |
 | `call_offer` | `{"type":"call_offer","reason":...,"call_url":...}` | AI offered a voice call; `call_url` is the WS the browser dials |
@@ -154,6 +154,55 @@ needed. They are never persisted in the transcript and are always followed
 by the real reply, an `error` frame, or `ended`. Relays that key off "bot
 sent a message" for ticket/session state tracking should check the `interim`
 flag to distinguish these from the real reply.
+
+### Voice-note replies
+
+When the customer's turn was itself a voice note (`type:"audio"`), the AI's
+reply `message` frame MAY carry two additional optional fields:
+
+```json
+{
+  "type": "message",
+  "session_id": "...",
+  "text": "the AI's reply, as always",
+  "sources": [],
+  "suggestions": [],
+  "action": "none",
+  "audio_url": "/api/v1/chat/media/<id>",
+  "audio_mime": "audio/wav"
+}
+```
+
+- **`text` is always present and always the full answer**, exactly as on any
+  other turn. `audio_url`/`audio_mime` are additive fields on the existing
+  `message` frame, not a new frame type: a relay/widget that doesn't
+  recognize them ignores them (unknown JSON fields are safe to ignore) and
+  renders the text bubble exactly as before; an updated client also plays
+  the clip. A genuinely new frame type would need every existing
+  integration to add a case for it before it did anything at all — adding
+  fields to a frame type they already handle needs no such rollout.
+- **Only inbound `audio` turns can produce these fields.** A `type:"message"`
+  (text) turn never gets a synthesized reply — the AI mirrors whatever
+  modality the customer used.
+- **Never guaranteed even on an audio turn.** The dominant reason is opt-in:
+  `pipeline.chat_voice.enabled` defaults to **false** per tenant, so most
+  tenants never synthesize a reply at all regardless of what the customer
+  sends — this is deliberate (TTS is billed per reply) and not a bug to
+  chase. When a tenant has opted in, synthesis is also skipped server-side
+  for an empty or unusually long reply, and best-effort everywhere else — no
+  resolvable chat TTS provider for the tenant (neither a chat-specific
+  override nor its call-cascade TTS), a synthesis timeout, or any provider
+  error all silently fall back to text-only. Treat `audio_url` as "sometimes
+  there," never as something to wait for.
+- `audio_url` is a `GET /api/v1/chat/media/{message_id}` link — same
+  endpoint and auth rules `audio_ack` already uses (302 to a short-lived
+  signed URL).
+- **`audio_mime` is always `audio/wav`** — the platform's TTS providers only
+  ever produce raw PCM16 mono, which the platform wraps in a WAV container
+  before upload so any standard `<audio>` element can play it directly (no
+  client-side transcode). The synthesized reply text is capped short enough
+  server-side that the resulting WAV file stays comfortably under the 1 MB
+  limit described above.
 
 An `error` frame never closes the socket. Treat it as per-message failure,
 not a connection failure. `reason` is machine-readable, for relays that want

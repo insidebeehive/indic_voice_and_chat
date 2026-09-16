@@ -17,10 +17,21 @@ pipeline:
     # no api_key_env needed — STT/LLM/TTS/realtime always use the platform master key
   tts:
     provider: sarvam
-    model: bulbul:v2
+    model: bulbul:v3
     language: hi-IN
-    voice_id: anushka
+    voice_id: priya  # bulbul:v2 + anushka were deprecated 2026-09; priya is v3's female equivalent
     # no api_key_env needed — STT/LLM/TTS/realtime always use the platform master key
+  # Chat voice-note replies — opt-in, off by default (TTS bills per reply).
+  # Uncomment to enable. With `tts:` omitted, chat reuses pipeline.tts above;
+  # spell out a `tts:` block to give chat its own voice. A tenant with neither
+  # simply gets text-only chat replies.
+  # chat_voice:
+  #   enabled: true
+  #   tts:
+  #     provider: sarvam
+  #     model: bulbul:v3
+  #     language: hi-IN
+  #     voice_id: priya
   telephony:
     provider: twilio
     from_number: "+918888888888"

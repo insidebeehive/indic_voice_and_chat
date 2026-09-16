@@ -558,6 +558,14 @@ async def test_list_tenants_shows_mode_and_models(ctx) -> None:
     assert acme["llm"]["provider"] == "gemini"
     assert acme["llm"]["model"] == "gemini-2.5-flash-lite"
     assert acme["tts"]["model"] == "bulbul:v3"
+    # LayerInfo.language/voice_id (additive) — the tenant list's only visible
+    # copy of the currently-configured voice, previously invisible until a
+    # deprecated speaker (e.g. Sarvam's dropped bulbul:v2 "anushka") broke in
+    # production. llm carries neither field; both stay None for it.
+    assert acme["tts"]["voice_id"] == "anushka"
+    assert acme["tts"]["language"] == "hi-IN"
+    assert acme["llm"]["voice_id"] is None
+    assert acme["llm"]["language"] is None
     assert acme["telephony_provider"] == "twilio"
     # Non-secret telephony config surfaces so the backoffice can prefill it, and
     # the names (NOT values) of configured creds show what's set.
@@ -568,6 +576,26 @@ async def test_list_tenants_shows_mode_and_models(ctx) -> None:
     # tenant's Stringee project so calls attribute to the right tenant.
     assert acme["stringee_softphone_answer_url"].endswith("/stringee/softphone-answer/acme")
     assert acme["stringee_answer_url"].endswith("/stringee/answer/acme")
+
+
+async def test_list_tenants_maps_realtime_voice_and_language(ctx) -> None:
+    """TenantRealtimeConfig stores its current voice/language under `voice`/
+    `language_code`, not `voice_id`/`language` like STT/TTS — _layer() must
+    map them onto the same LayerInfo fields, or the realtime layer's current
+    voice/language would silently come back null in the tenant list."""
+    client, _, _ = ctx
+    body = _body(
+        slug="acme-s2s", mode="s2s",
+        realtime={"provider": "gemini_live", "model": "gemini-3.1-flash-live-preview",
+                  "voice": "Aoede", "language_code": "hi-IN"},
+    )
+    await client.post("/tenants", json=body, headers=ADMIN_HEADERS)
+    resp = await client.get("/tenants", headers=ADMIN_HEADERS)
+    assert resp.status_code == 200
+    acme = next(t for t in resp.json()["tenants"] if t["slug"] == "acme-s2s")
+    assert acme["realtime"]["provider"] == "gemini_live"
+    assert acme["realtime"]["voice_id"] == "Aoede"
+    assert acme["realtime"]["language"] == "hi-IN"
 
 
 async def test_list_tenants_requires_admin(ctx) -> None:
@@ -948,6 +976,260 @@ async def test_list_tenants_webhook_auth_booleans_flip_after_rotation(ctx) -> No
     assert after["chatwoot_webhook_id_configured"] is True
 
 
+async def test_list_tenants_deposit_verification_defaults_are_inert(ctx) -> None:
+    """A freshly registered tenant has no deposit_verification config at all —
+    every new field must default to the safe/off reading, not None-as-truthy
+    or some other accidental "looks configured" state."""
+    client, _, _ = ctx
+    tid = (await client.post(
+        "/tenants", json=_body(slug="acme"), headers=ADMIN_HEADERS)).json()["tenant_id"]
+    t = next(x for x in (await client.get("/tenants", headers=ADMIN_HEADERS))
+             .json()["tenants"] if x["tenant_id"] == tid)
+    assert t["deposit_verification_enabled"] is False
+    assert t["deposit_verification_webhook_url"] is None
+    assert t["deposit_verification_secret_set"] is False
+    assert t["deposit_verification_contract"] == "multipart_verdict"
+    assert t["deposit_verification_timeout_minutes"] == 5
+    assert t["deposit_verification_active"] is False
+
+
+async def test_list_tenants_deposit_verification_enabled_without_secret_is_not_active(ctx) -> None:
+    """This is the trap the feature exists to surface: `enabled: true` +
+    webhook_url with NO resolvable secret must NOT read as active. Mirrors
+    bootstrap.py's registration gate (~:558-566) — without a resolvable
+    secret the tool never registers, no matter what `enabled` says."""
+    client, _, _ = ctx
+    tid = (await client.post(
+        "/tenants", json=_body(slug="acme"), headers=ADMIN_HEADERS)).json()["tenant_id"]
+    patch = await client.patch(f"/tenants/{tid}", json={
+        "deposit_verification": {
+            "enabled": True,
+            "webhook_url": "https://vendor.example/verify",
+        }
+    }, headers=ADMIN_HEADERS)
+    assert patch.status_code == 200
+
+    t = next(x for x in (await client.get("/tenants", headers=ADMIN_HEADERS))
+             .json()["tenants"] if x["tenant_id"] == tid)
+    assert t["deposit_verification_enabled"] is True
+    assert t["deposit_verification_webhook_url"] == "https://vendor.example/verify"
+    assert t["deposit_verification_secret_set"] is False
+    assert t["deposit_verification_active"] is False
+
+
+async def test_list_tenants_deposit_verification_enabled_without_webhook_url_is_not_active(ctx) -> None:
+    """The other half of the same gate: enabled + a resolvable secret but no
+    webhook_url must also read as inactive."""
+    client, _, _ = ctx
+    tid = (await client.post(
+        "/tenants", json=_body(slug="acme"), headers=ADMIN_HEADERS)).json()["tenant_id"]
+    patch = await client.patch(f"/tenants/{tid}", json={
+        "deposit_verification": {"enabled": True, "webhook_secret": "shared-secret-value"}
+    }, headers=ADMIN_HEADERS)
+    assert patch.status_code == 200
+
+    t = next(x for x in (await client.get("/tenants", headers=ADMIN_HEADERS))
+             .json()["tenants"] if x["tenant_id"] == tid)
+    assert t["deposit_verification_enabled"] is True
+    assert t["deposit_verification_webhook_url"] is None
+    assert t["deposit_verification_secret_set"] is True
+    assert t["deposit_verification_active"] is False
+
+
+async def test_list_tenants_deposit_verification_active_when_fully_configured(ctx) -> None:
+    """Only once ALL three requirements this API can see hold — enabled,
+    webhook_url, and a resolvable secret — does `_active` flip True."""
+    client, _, _ = ctx
+    tid = (await client.post(
+        "/tenants", json=_body(slug="acme"), headers=ADMIN_HEADERS)).json()["tenant_id"]
+    patch = await client.patch(f"/tenants/{tid}", json={
+        "deposit_verification": {
+            "enabled": True,
+            "webhook_url": "https://vendor.example/verify",
+            "webhook_secret": "shared-secret-value",
+            "contract": "json_ticket_relay",
+            "timeout_minutes": 10,
+        }
+    }, headers=ADMIN_HEADERS)
+    assert patch.status_code == 200
+    assert patch.json()["deposit_verification_enabled"] is True
+    assert patch.json()["deposit_verification_secret_set"] is True
+
+    t = next(x for x in (await client.get("/tenants", headers=ADMIN_HEADERS))
+             .json()["tenants"] if x["tenant_id"] == tid)
+    assert t["deposit_verification_enabled"] is True
+    assert t["deposit_verification_webhook_url"] == "https://vendor.example/verify"
+    assert t["deposit_verification_secret_set"] is True
+    assert t["deposit_verification_contract"] == "json_ticket_relay"
+    assert t["deposit_verification_timeout_minutes"] == 10
+    assert t["deposit_verification_active"] is True
+
+    # The webhook secret itself must never round-trip anywhere in the list response.
+    assert "shared-secret-value" not in (await client.get(
+        "/tenants", headers=ADMIN_HEADERS)).text
+
+
+async def test_patch_deposit_verification_rejects_non_positive_durations(ctx) -> None:
+    """timeout_minutes/screenshot_url_ttl_seconds must be rejected at the PATCH
+    (422) rather than committed and then blowing up on every read.
+
+    DepositVerificationConfig enforces gt=0 on both, but this PATCH model sits
+    upstream of it: an unconstrained int here commits to pipeline_config
+    successfully and only fails when something CONSTRUCTS the config. That
+    something includes DbTenantResolver.reload(), which builds the model for
+    every tenant in one pass and swaps in its caches only if the whole loop
+    succeeds — so a single 0 stored here leaves EVERY tenant unresolvable on
+    the next reload, not just this one. The write and the read must agree.
+    """
+    client, _, _ = ctx
+    tid = (await client.post(
+        "/tenants", json=_body(slug="acme"), headers=ADMIN_HEADERS)).json()["tenant_id"]
+
+    for field in ("timeout_minutes", "screenshot_url_ttl_seconds"):
+        for bad in (0, -1):
+            resp = await client.patch(f"/tenants/{tid}", json={
+                "deposit_verification": {field: bad},
+            }, headers=ADMIN_HEADERS)
+            assert resp.status_code == 422, f"{field}={bad} was accepted"
+
+    # And nothing was persisted by the rejected calls — the stored config must
+    # still construct cleanly, which is the property the resolver depends on.
+    t = next(x for x in (await client.get("/tenants", headers=ADMIN_HEADERS))
+             .json()["tenants"] if x["tenant_id"] == tid)
+    assert t["deposit_verification_timeout_minutes"] == 5   # untouched default
+
+
+async def test_patch_deposit_verification_empty_secret_is_not_a_secret(ctx) -> None:
+    """An empty-string webhook_secret must NOT register as a configured secret.
+
+    bootstrap.py gates registration on secret_optional(...) being truthy, so a
+    stored "" means the tool never registers. If the PATCH accepted "" as a
+    secret, `_secret_set` and `_active` would both read True for a feature that
+    does nothing — the exact false-positive `_active` exists to prevent, and
+    the one an operator would most reasonably trust.
+
+    It must also not clobber an existing working secret: a blank field in the
+    UI means "leave unchanged", not "erase".
+    """
+    client, _, _ = ctx
+    tid = (await client.post(
+        "/tenants", json=_body(slug="acme"), headers=ADMIN_HEADERS)).json()["tenant_id"]
+
+    resp = await client.patch(f"/tenants/{tid}", json={
+        "deposit_verification": {
+            "enabled": True,
+            "webhook_url": "https://vendor.example/verify",
+            "webhook_secret": "",
+        }
+    }, headers=ADMIN_HEADERS)
+    assert resp.status_code == 200
+    assert resp.json()["deposit_verification_secret_set"] is False
+
+    t = next(x for x in (await client.get("/tenants", headers=ADMIN_HEADERS))
+             .json()["tenants"] if x["tenant_id"] == tid)
+    assert t["deposit_verification_secret_set"] is False
+    assert t["deposit_verification_active"] is False, (
+        "enabled + webhook_url + an EMPTY secret must not read as active"
+    )
+
+    # A real secret, then a blank one: the blank must leave the real one alone.
+    await client.patch(f"/tenants/{tid}", json={
+        "deposit_verification": {"webhook_secret": "shared-secret-value"},
+    }, headers=ADMIN_HEADERS)
+    await client.patch(f"/tenants/{tid}", json={
+        "deposit_verification": {"webhook_secret": ""},
+    }, headers=ADMIN_HEADERS)
+    t = next(x for x in (await client.get("/tenants", headers=ADMIN_HEADERS))
+             .json()["tenants"] if x["tenant_id"] == tid)
+    assert t["deposit_verification_secret_set"] is True, (
+        "a blank secret erased a previously configured one"
+    )
+    assert t["deposit_verification_active"] is True
+
+
+async def test_list_tenants_deposit_verification_disabling_deactivates(ctx) -> None:
+    """A fully-configured tenant that later flips `enabled: false` must go
+    inactive immediately — a stale `_active: true` would be worse than the
+    original invisible bug, since it actively lies about the tool state."""
+    client, _, _ = ctx
+    tid = (await client.post(
+        "/tenants", json=_body(slug="acme"), headers=ADMIN_HEADERS)).json()["tenant_id"]
+    await client.patch(f"/tenants/{tid}", json={
+        "deposit_verification": {
+            "enabled": True,
+            "webhook_url": "https://vendor.example/verify",
+            "webhook_secret": "shared-secret-value",
+        }
+    }, headers=ADMIN_HEADERS)
+    await client.patch(f"/tenants/{tid}", json={
+        "deposit_verification": {"enabled": False}
+    }, headers=ADMIN_HEADERS)
+
+    t = next(x for x in (await client.get("/tenants", headers=ADMIN_HEADERS))
+             .json()["tenants"] if x["tenant_id"] == tid)
+    assert t["deposit_verification_enabled"] is False
+    # The secret and webhook_url are untouched by this PATCH (partial-override
+    # semantics) — only `enabled` should have moved.
+    assert t["deposit_verification_secret_set"] is True
+    assert t["deposit_verification_webhook_url"] == "https://vendor.example/verify"
+    assert t["deposit_verification_active"] is False
+
+
+async def test_list_tenants_deposit_verification_secret_lookup_is_one_query_not_n_plus_one(ctx) -> None:
+    """The per-tenant deposit_verification secret name (TENANT_{SLUG}_..., set
+    at :676) can't join the fixed-name webhook-creds IN(...) query above, so
+    it needs its OWN query — but still exactly ONE for the whole list, not one
+    per tenant. Proven here by counting actual SQL against tenant_secrets
+    while listing 3 tenants, each with its own distinct deposit_verification
+    secret: an N+1 would show up as 4 SELECTs (1 fixed-name + 3 per-tenant)
+    instead of 2 (1 fixed-name + 1 batched dv lookup)."""
+    from sqlalchemy import event
+    from sqlalchemy.engine import Engine
+
+    client, _, _ = ctx
+    tids = []
+    for i, slug in enumerate(("acme", "beta", "gamma")):
+        # Each registration needs its own phone number — tenant_phone_numbers
+        # has a UNIQUE constraint on phone_number, unrelated to what this test
+        # is checking.
+        number = f"+1570525567{i}"
+        body = _body(slug=slug)
+        body["telephony"]["from_number"] = number
+        body["telephony"]["phone_numbers"] = [number]
+        tid = (await client.post(
+            "/tenants", json=body, headers=ADMIN_HEADERS)).json()["tenant_id"]
+        patch = await client.patch(f"/tenants/{tid}", json={
+            "deposit_verification": {
+                "enabled": True,
+                "webhook_url": "https://vendor.example/verify",
+                "webhook_secret": f"secret-for-{slug}",
+            }
+        }, headers=ADMIN_HEADERS)
+        assert patch.status_code == 200
+        tids.append(tid)
+
+    secret_selects: list[str] = []
+
+    def _count(conn, cursor, statement, parameters, context, executemany):
+        s = statement.strip().lower()
+        if "tenant_secrets" in s and s.startswith("select"):
+            secret_selects.append(statement)
+
+    event.listen(Engine, "before_cursor_execute", _count)
+    try:
+        resp = await client.get("/tenants", headers=ADMIN_HEADERS)
+    finally:
+        event.remove(Engine, "before_cursor_execute", _count)
+
+    assert resp.status_code == 200
+    assert len(secret_selects) == 2, secret_selects
+    body = resp.json()
+    for slug, tid in zip(("acme", "beta", "gamma"), tids):
+        t = next(x for x in body["tenants"] if x["tenant_id"] == tid)
+        assert t["deposit_verification_secret_set"] is True, slug
+        assert t["deposit_verification_active"] is True, slug
+
+
 @pytest.fixture
 def json_log_stream():
     """Install the REAL production logging config, redirected to a buffer —
@@ -1023,6 +1305,223 @@ async def test_admin_label_does_not_leak_across_requests(ctx, json_log_stream) -
 
     anon_rec = next(r for r in records if r.get("message") == "admin auth rejected")
     assert "admin_label" not in anon_rec
+
+
+@pytest_asyncio.fixture
+async def ctx_with_providers(monkeypatch):
+    """Same as ``ctx`` but with a real ``TenantProviders`` cache attached to
+    ``app.state.providers`` (like production's ``src/main.py``), so tests can
+    assert cached clients are actually evicted by PATCH /tenants/{id} — not
+    just that the field exists."""
+    from src.auth.registry import TenantProviders
+
+    monkeypatch.setenv("VOX_SECRET_KEY", crypto.generate_key())
+    crypto.reset_cache_for_tests()
+
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:", future=True)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    sm = async_sessionmaker(engine, expire_on_commit=False)
+
+    async def _session_override():
+        async with sm() as session:
+            yield session
+
+    resolver = DbTenantResolver(sm)
+    await resolver.reload()
+    set_tenant_resolver(resolver)
+    set_admin_tokens(["admin-token"])
+
+    providers = TenantProviders(
+        global_defaults={}, stt_factory=lambda c: object(), llm_factory=lambda c: object(),
+        tts_factory=lambda c: object(), telephony_factory=lambda c: object(),
+        vector_store_factory=lambda c: object())
+
+    app = FastAPI()
+    app.state.tenant_resolver = resolver
+    app.state.tenants = resolver.loaded_settings()
+    app.state.providers = providers
+    app.include_router(tenants.router)
+    app.dependency_overrides[get_db_session] = _session_override
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as c:
+        yield c, resolver, sm, providers
+    set_tenant_resolver(None)
+    set_admin_tokens([])
+    crypto.reset_cache_for_tests()
+    await engine.dispose()
+
+
+async def test_pipeline_update_tts_provider_partial_override_pins_rest(ctx) -> None:
+    """Changing pipeline.tts.provider alone must leave mode and every other
+    layer (stt/llm/tts's own model+voice_id/telephony) untouched — the same
+    partial-override guarantee TelephonyUpdateIn already gives, extended to
+    the pipeline block."""
+    client, resolver, _ = ctx
+    tid = (await client.post(
+        "/tenants", json=_body(slug="acme", mode="layered"), headers=ADMIN_HEADERS)).json()["tenant_id"]
+
+    resp = await client.patch(
+        f"/tenants/{tid}",
+        json={"pipeline": {"tts": {"provider": "elevenlabs"}}},
+        headers=ADMIN_HEADERS)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["pipeline_mode"] == "layered"
+    assert body["tts_provider"] == "elevenlabs"
+    assert body["tts_model"] == "bulbul:v3"          # untouched
+    assert body["llm_provider"] == "gemini"          # untouched
+    assert body["stt_provider"] == "groq"            # untouched
+    assert body["telephony_provider"] == "twilio"    # untouched
+
+    ctx2 = await resolver.resolve_by_slug("acme")
+    p = ctx2.settings.pipeline
+    assert p.mode == "layered"
+    assert p.tts.provider == "elevenlabs"
+    assert p.tts.model == "bulbul:v3"
+    assert p.tts.voice_id == "anushka"
+    assert p.tts.language == "hi-IN"
+    assert p.llm.provider == "gemini" and p.llm.model == "gemini-2.5-flash-lite"
+    assert p.stt.provider == "groq" and p.stt.model == "whisper-large-v3"
+    assert p.telephony.provider == "twilio"
+
+
+async def test_pipeline_switch_to_s2s_without_realtime_rejected(ctx) -> None:
+    client, resolver, _ = ctx
+    tid = (await client.post(
+        "/tenants", json=_body(slug="acme", mode="layered"), headers=ADMIN_HEADERS)).json()["tenant_id"]
+
+    resp = await client.patch(
+        f"/tenants/{tid}",
+        json={"pipeline": {"mode": "s2s"}},
+        headers=ADMIN_HEADERS)
+    assert resp.status_code == 422, resp.text
+    assert "pipeline.realtime" in resp.json()["detail"]
+
+    # rejected -> nothing persisted, mode stays layered
+    ctx2 = await resolver.resolve_by_slug("acme")
+    assert ctx2.settings.pipeline.mode == "layered"
+
+
+async def test_pipeline_switch_to_s2s_with_realtime_succeeds(ctx) -> None:
+    client, resolver, _ = ctx
+    tid = (await client.post(
+        "/tenants", json=_body(slug="acme", mode="layered"), headers=ADMIN_HEADERS)).json()["tenant_id"]
+
+    resp = await client.patch(
+        f"/tenants/{tid}",
+        json={"pipeline": {
+            "mode": "s2s",
+            "realtime": {"provider": "gemini_live", "model": "gemini-3.1-flash-live-preview",
+                         "voice": "Aoede", "language_code": "hi-IN"},
+        }},
+        headers=ADMIN_HEADERS)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["pipeline_mode"] == "s2s"
+    assert body["realtime_provider"] == "gemini_live"
+    assert body["realtime_model"] == "gemini-3.1-flash-live-preview"
+
+    ctx2 = await resolver.resolve_by_slug("acme")
+    p = ctx2.settings.pipeline
+    assert p.mode == "s2s"
+    assert p.realtime.provider == "gemini_live"
+    assert p.realtime.voice == "Aoede"
+
+
+async def test_pipeline_enable_chat_voice_with_no_tts_anywhere_rejected(ctx) -> None:
+    client, resolver, _ = ctx
+    body = _body(slug="acme", mode="layered")
+    body["tts"] = None   # no pipeline.tts at all -> nothing for chat_voice to fall back to
+    tid = (await client.post(
+        "/tenants", json=body, headers=ADMIN_HEADERS)).json()["tenant_id"]
+    ctx0 = await resolver.resolve_by_slug("acme")
+    assert ctx0.settings.pipeline.tts.provider is None
+
+    resp = await client.patch(
+        f"/tenants/{tid}",
+        json={"pipeline": {"chat_voice": {"enabled": True}}},
+        headers=ADMIN_HEADERS)
+    assert resp.status_code == 422, resp.text
+    assert "pipeline.chat_voice.tts" in resp.json()["detail"]
+
+    ctx1 = await resolver.resolve_by_slug("acme")
+    assert ctx1.settings.pipeline.chat_voice.enabled is False   # rejected -> untouched
+
+
+async def test_pipeline_enable_chat_voice_falls_back_to_pipeline_tts(ctx) -> None:
+    """Enabling chat_voice on a tenant whose pipeline.tts is already set
+    succeeds via the documented fallback (resolve_chat_tts_config) — no
+    chat_voice.tts override required."""
+    client, resolver, _ = ctx
+    tid = (await client.post(
+        "/tenants", json=_body(slug="acme", mode="layered"), headers=ADMIN_HEADERS)).json()["tenant_id"]
+
+    resp = await client.patch(
+        f"/tenants/{tid}",
+        json={"pipeline": {"chat_voice": {"enabled": True}}},
+        headers=ADMIN_HEADERS)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["chat_voice_enabled"] is True
+    assert body["chat_voice_tts_provider"] == "sarvam"   # fell back to pipeline.tts's provider
+
+    ctx2 = await resolver.resolve_by_slug("acme")
+    assert ctx2.settings.pipeline.chat_voice.enabled is True
+    assert ctx2.settings.pipeline.chat_voice.tts.provider is None   # no override was written
+    assert ctx2.settings.pipeline.tts.provider == "sarvam"          # untouched, still the fallback source
+
+
+async def test_pipeline_update_evicts_cached_provider_clients(ctx_with_providers) -> None:
+    """A client built before the edit (e.g. the old TTS provider's adapter)
+    must not be reused after a pipeline PATCH — TenantProviders.evict(tenant_id)
+    must run, same as it already does for telephony edits."""
+    client, resolver, _, providers = ctx_with_providers
+    tid = (await client.post(
+        "/tenants", json=_body(slug="acme", mode="layered"), headers=ADMIN_HEADERS)).json()["tenant_id"]
+
+    tctx = await resolver.resolve_by_slug("acme")
+    old_tts_client = providers.get_tts(tctx)
+    assert providers.get_tts(tctx) is old_tts_client   # cached: same object on a second call
+
+    resp = await client.patch(
+        f"/tenants/{tid}",
+        json={"pipeline": {"tts": {"provider": "elevenlabs"}}},
+        headers=ADMIN_HEADERS)
+    assert resp.status_code == 200, resp.text
+
+    tctx2 = await resolver.resolve_by_slug("acme")
+    new_tts_client = providers.get_tts(tctx2)
+    assert new_tts_client is not old_tts_client   # cache was evicted, not reused
+
+
+async def test_unrelated_status_patch_does_not_disturb_pipeline_config(ctx) -> None:
+    client, resolver, _ = ctx
+    tid = (await client.post(
+        "/tenants", json=_body(slug="acme", mode="layered"), headers=ADMIN_HEADERS)).json()["tenant_id"]
+
+    before = await resolver.resolve_by_slug("acme")
+    before_pipeline = before.settings.pipeline.model_dump()
+
+    resp = await client.patch(
+        f"/tenants/{tid}", json={"status": "suspended"}, headers=ADMIN_HEADERS)
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "suspended"
+    # the pipeline block in the response still reports the untouched values
+    assert resp.json()["pipeline_mode"] == "layered"
+    assert resp.json()["tts_provider"] == "sarvam"
+
+    after = await resolver.resolve_by_slug("acme")
+    assert after.settings.pipeline.model_dump() == before_pipeline
+
+
+async def test_pipeline_update_requires_admin(ctx) -> None:
+    client, _, _ = ctx
+    tid = (await client.post(
+        "/tenants", json=_body(slug="acme", mode="layered"), headers=ADMIN_HEADERS)).json()["tenant_id"]
+    resp = await client.patch(
+        f"/tenants/{tid}", json={"pipeline": {"tts": {"provider": "elevenlabs"}}})
+    assert resp.status_code == 401
 
 
 async def test_register_s2s_mode(ctx) -> None:

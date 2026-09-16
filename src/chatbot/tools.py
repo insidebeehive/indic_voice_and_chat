@@ -68,17 +68,27 @@ BUILTIN_TOOLS: list[ToolSpec] = [
 # Not in BUILTIN_TOOLS: only registered per-tenant, when the tenant has
 # deposit_verification enabled and a webhook_url configured (see
 # src/bootstrap.py's make_chatbot_factory).
+#
+# order_id vs. external_transaction_id: nothing at runtime signals back "the
+# vendor rejected order_id" (the webhook ack is fire-and-forget — see
+# src/chatbot/deposit_verification.py's module docstring), so the
+# external_transaction_id fallback described in
+# the order_id parameter below can't actually be triggered by observed
+# behavior today. The CRM team explicitly asked us to try order_id first and
+# report back which one their verification service accepts — that's an open
+# question owed back to them on their ticket 86eywvpbt, not yet resolved.
 SUBMIT_DEPOSIT_VERIFICATION_TOOL_SPEC = ToolSpec(
     name=SUBMIT_DEPOSIT_VERIFICATION,
     description=(
         "Submit the customer's deposit for manual verification against their proof "
         "screenshot, when the deposit-status check shows the deposit failed but the "
         "customer insists it succeeded. Call get_player_latest_deposit_order first "
-        "and pass its PgsOrderId as order_id — never invent one. Requires a screenshot "
-        "to already be uploaded in this conversation — do not call this before the "
-        "customer has sent one, ask them to upload it first. This takes a few minutes; "
-        "the result will be delivered later in this same chat, not immediately — do "
-        "not call this tool again while a submission is already pending."
+        "and pass its order_id as order_id — never invent one. Requires a "
+        "screenshot to already be uploaded in this conversation — do not call this "
+        "before the customer has sent one, ask them to upload it first. This takes "
+        "a few minutes; the result will be delivered later in this same chat, not "
+        "immediately — do not call this tool again while a submission is already "
+        "pending."
     ),
     parameters={
         "type": "object",
@@ -86,7 +96,10 @@ SUBMIT_DEPOSIT_VERIFICATION_TOOL_SPEC = ToolSpec(
             "order_id": {
                 "type": "string",
                 "description": (
-                    "The PgsOrderId from get_player_latest_deposit_order's response."
+                    "The order_id from get_player_latest_deposit_order's response "
+                    "(always present). Fall back to that response's "
+                    "external_transaction_id only if order_id is rejected — it is "
+                    "null on exactly the pending/failed deposits a dispute is about."
                 ),
             },
         },

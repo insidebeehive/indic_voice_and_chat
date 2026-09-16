@@ -115,6 +115,19 @@ class IndicF5TTSAdapter(ITTSProvider):
                     log.warning("indicf5 tts stream %s (attempt %d/%d); retrying",
                                 e.response.status_code, attempt + 1, _TTS_ATTEMPTS)
                     continue
+                if e.response.status_code < 500:
+                    # A 4xx means WE sent something wrong (bad lang code,
+                    # malformed request) — log the body before raising, or
+                    # only httpx's uninformative status line reaches the log.
+                    # aread() can itself raise if the server already closed
+                    # the connection with an empty body (StreamClosed) — that
+                    # must not mask the real HTTPStatusError. Never log the
+                    # request body (customer text).
+                    try:
+                        err_body = (await e.response.aread())[:500].decode(errors="replace")
+                    except Exception:
+                        err_body = "<body unavailable>"
+                    log.error("indicf5 tts stream %s: %s", e.response.status_code, err_body)
                 raise
         if chunks is None:
             raise last_exc  # type: ignore[misc]  # set whenever the loop didn't break

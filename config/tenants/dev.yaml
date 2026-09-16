@@ -99,11 +99,31 @@ pipeline:
 
   tts:
     provider: sarvam
-    model: bulbul:v2
+    model: bulbul:v3
     language: hi-IN
-    voice_id: anushka
+    voice_id: priya  # bulbul:v2 + anushka were deprecated 2026-09; priya is v3's female equivalent
     speed: 1.0
     # no api_key_env needed — STT/LLM/TTS/realtime always use the platform master key
+
+  # Chat voice-note replies (NOT calls). Opt-in and off by default everywhere
+  # else: TTS bills per reply, so a tenant that never asked for spoken chat
+  # replies must not pay for one just because a customer sent a voice note.
+  chat_voice:
+    enabled: true
+    # This block is the chat-only override (precedence step 1). Omit `tts:`
+    # entirely and chat falls back to this tenant's pipeline.tts above
+    # (step 2) — which is what a layered tenant reusing its cascade voice
+    # should do. A tenant with neither (e.g. a pure s2s tenant) gets NO chat
+    # audio at all — text-only, never the platform default.
+    tts:
+      provider: sarvam
+      # Spelled out rather than inherited: the platform default layer used for
+      # unset fields is still pipeline.tts in config/default.yaml, so a bare
+      # `provider:` override would inherit THAT provider's model/voice names.
+      model: bulbul:v3
+      language: hi-IN
+      voice_id: priya
+      speed: 1.0
 
   telephony:
     provider: stringee

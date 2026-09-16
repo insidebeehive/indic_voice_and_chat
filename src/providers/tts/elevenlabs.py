@@ -116,6 +116,13 @@ class ElevenLabsTTSAdapter(ITTSProvider):
                     log.warning("elevenlabs tts %s (attempt %d/%d); retrying",
                                 e.response.status_code, attempt + 1, _TTS_ATTEMPTS)
                     continue
+                if e.response.status_code < 500:
+                    # A 4xx means WE sent something wrong (bad voice/model id,
+                    # quota, etc.) and the body says what — log it before
+                    # raising. Never log headers/request body — they carry
+                    # the API key and the customer's text.
+                    log.error("elevenlabs tts %s: %s", e.response.status_code,
+                              e.response.text[:500])
                 raise
 
         if audio is None:
@@ -149,7 +156,22 @@ class ElevenLabsTTSAdapter(ITTSProvider):
             try:
                 async with httpx.AsyncClient(timeout=timeout) as client:
                     async with client.stream("POST", url, headers=self._headers(), json=body) as resp:
-                        resp.raise_for_status()
+                        try:
+                            resp.raise_for_status()
+                        except httpx.HTTPStatusError as e:
+                            if e.response.status_code < 500:
+                                # A 4xx means WE sent something wrong; the body
+                                # says what. aread() can itself raise if the
+                                # server already closed the connection with an
+                                # empty body (StreamClosed) — that must not
+                                # mask the real HTTPStatusError.
+                                try:
+                                    err_body = (await e.response.aread())[:500].decode(errors="replace")
+                                except Exception:
+                                    err_body = "<body unavailable>"
+                                log.error("elevenlabs tts stream %s: %s",
+                                          e.response.status_code, err_body)
+                            raise
                         async for chunk in resp.aiter_bytes(chunk_size=4096):
                             if chunk:
                                 yield chunk
@@ -180,6 +202,13 @@ class ElevenLabsTTSAdapter(ITTSProvider):
                 }
                 for v in voices
             ]
+        except _httpx.HTTPStatusError as e:
+            # A 4xx here (bad/expired key) means the account lookup itself is
+            # wrong — log the body so that's diagnosable, then degrade to the
+            # preset list same as any other failure.
+            log.warning("elevenlabs: failed to fetch voices (%s: %s), falling back to preset list",
+                        e.response.status_code, e.response.text[:500])
+            return list(_PRESET_VOICES)
         except Exception:
             log.warning("elevenlabs: failed to fetch voices, falling back to preset list")
             return list(_PRESET_VOICES)

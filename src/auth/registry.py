@@ -2,7 +2,10 @@
 
 The framework holds these singletons per tenant for the life of the process:
 
-- ``TenantProviders``  cached STT/LLM/TTS/telephony/vector-store client per tenant
+- ``TenantProviders``  cached STT/LLM/TTS/telephony/vector-store client per
+  tenant, plus a separate chat-voice-note TTS cache entry (``get_chat_tts``) —
+  chat's effective TTS config resolves independently of the voice-call
+  cascade's ``pipeline.tts`` (see ``resolve_chat_tts_config``)
 - ``RetrieverRegistry``  one HybridRetriever per tenant (FAISS dir + BM25 index)
 - ``DNDRegistry``  one DND filter + calling-hours policy per tenant
 - ``WebhookRegistry``  one WebhookManager per tenant
@@ -23,7 +26,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
 
 from src.auth.context import TenantContext
-from src.config_tenant import merge_provider_config
+from src.config_tenant import merge_provider_config, resolve_chat_tts_config
 
 
 # --- Provider clients ---------------------------------------------------
@@ -91,6 +94,41 @@ class TenantProviders:
 
     def get_tts(self, tenant: TenantContext) -> Any:
         return self._get_or_build(tenant, "tts", self.tts_factory)
+
+    def get_chat_tts(self, tenant: TenantContext) -> Optional[Any]:
+        """TTS client for CHAT voice-note replies, or None when the tenant
+        hasn't opted in / has nothing resolvable.
+
+        Deliberately NOT ``_get_or_build(tenant, "tts", ...)``: that keys both
+        the tenant sub-config (``getattr(pipeline, layer)``) and the global
+        default off the same ``layer`` string, and chat's effective config is
+        ``chat_voice.tts`` XOR ``pipeline.tts`` (see
+        ``resolve_chat_tts_config``) — there is no ``pipeline.chat_tts``
+        attribute and no ``global_defaults["chat_tts"]``.
+
+        Returns None BEFORE touching the cache or calling the factory: an
+        opted-out or unconfigured tenant must cost nothing — no client
+        constructed, no platform credential ever picked up. Falling through to
+        ``global_defaults["tts"]`` with no tenant provider at all is precisely
+        the silent-platform-billing bug this exists to prevent.
+        """
+        pipeline = tenant.settings.pipeline
+        if not pipeline.chat_voice.enabled:
+            return None
+        tenant_tts = resolve_chat_tts_config(pipeline)
+        if tenant_tts is None:
+            return None
+        key = (tenant.id, "chat_tts")
+        if key in self._cache:
+            return self._cache[key]
+        # Same platform-key rule as get_tts: no per-tenant api_key is resolved
+        # here; the adapter reads its own platform env var. The global default
+        # LAYER is still "tts" — there is no separate platform chat-TTS default
+        # (and adding one would re-create the silent fallback).
+        merged = merge_provider_config(tenant_tts, self.global_defaults.get("tts", {}))
+        client = self.tts_factory(merged)
+        self._cache[key] = client
+        return client
 
     def get_telephony(self, tenant: TenantContext) -> Any:
         return self._get_or_build(tenant, "telephony", self.telephony_factory)

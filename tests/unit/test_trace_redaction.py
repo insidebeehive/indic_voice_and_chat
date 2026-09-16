@@ -740,10 +740,11 @@ class TestCredentialAndSecretTerms:
 class TestPgsOrderIdDivergesFromToolExecutor:
     def test_pgs_order_id_value_is_redacted_here(self):
         """src/chatbot/tool_executor.py::_redact_internal_ids() has a named,
-        deliberate EXEMPTION for "PgsOrderId" (see
-        _PGS_ORDER_ID_KEY_NORMALIZED there): that function forwards the
-        payment-gateway order id to the LLM unmodified because the LLM
-        needs it to raise a deposit-verification ticket with the vendor.
+        deliberate EXEMPTION for the payment-gateway order references --
+        "PgsOrderId", "order_id" and "external_transaction_id" (see
+        _ORDER_ID_EXEMPT_KEYS_NORMALIZED there): that function forwards them
+        to the LLM unmodified because the LLM needs them to raise a
+        deposit-verification ticket with the vendor.
 
         This module must NOT carry that exemption over. A trace redactor's
         job is the opposite of tool_executor's: maximum redaction of
