@@ -23,7 +23,7 @@ from src.auth import TenantContext, register_tenant_for_test
 from src.auth import secrets as crypto
 from src.auth.middleware import set_tenant_resolver
 from src.bootstrap import resolve_crm_tools
-from src.chatbot.catalog import ALL_TOOLS, PLAYER_TOOLS
+from src.chatbot.catalog import ALL_TOOLS, OPERATOR_TOOLS, PLAYER_TOOLS
 from src.config_tenant import TenantSettings
 from src.models.chat import ChatTool
 from src.models.database import Base
@@ -261,3 +261,39 @@ def test_get_player_latest_deposit_order_is_registered_in_catalog() -> None:
     assert entry["method"] == "GET"
     assert set(entry["parameters"]) == {"user_id"}
     assert entry["parameters"]["user_id"]["source"] == "session"
+
+
+def test_get_bet_limit_matches_crm_pr_3963_shipped_path() -> None:
+    """CRM PR #3963 shipped get_bet_limit at
+    GET /operators/{operator_id}/players/{user_id}/bet-limit?name=<partial>
+    -- our catalog previously registered /casino/{operator_id}/players/
+    {user_id}/games/{game_name}/bet-limit, a path the CRM never exposes.
+    'name' is player-scoped (user_id in the path) and a required query
+    param, not a path segment -- see the query-landing test in
+    test_chat_tool_executor.py for proof it doesn't get path-substituted."""
+    entry = OPERATOR_TOOLS["get_bet_limit"]
+    assert entry["default_path"] == "/operators/{operator_id}/players/{user_id}/bet-limit"
+    assert entry["method"] == "GET"
+    assert set(entry["parameters"]) == {"operator_id", "user_id", "name"}
+    assert entry["parameters"]["name"]["source"] == "llm"
+    # default_path has no {name} placeholder -- pins the mechanism this
+    # relies on (tool_executor.py only path-substitutes placeholders present
+    # in the endpoint; anything else becomes a query param).
+    assert "{name}" not in entry["default_path"]
+
+
+def test_get_market_holiday_schedule_matches_crm_pr_3963_shipped_path() -> None:
+    """CRM PR #3963 shipped get_market_holiday_schedule at
+    GET /operators/{operator_id}/matka/holiday-schedule?market=<name>&date=<YYYY-MM-DD>
+    -- our catalog previously registered /matka/{operator_id}/markets/
+    {market_name}/holiday-schedule, a path the CRM never exposes. 'market'
+    (renamed from market_name) and the new optional 'date' are both query
+    params, not path segments."""
+    entry = OPERATOR_TOOLS["get_market_holiday_schedule"]
+    assert entry["default_path"] == "/operators/{operator_id}/matka/holiday-schedule"
+    assert entry["method"] == "GET"
+    assert set(entry["parameters"]) == {"operator_id", "market", "date"}
+    assert entry["parameters"]["market"]["source"] == "llm"
+    assert entry["parameters"]["date"]["source"] == "llm"
+    assert "{market}" not in entry["default_path"]
+    assert "{date}" not in entry["default_path"]

@@ -37,14 +37,20 @@ _PATH_VALUE_DANGEROUS_RE = re.compile(r"[/\\?#]|\.\.")
 # "...", ...), also reshapes the path even though a single "." doesn't match
 # the two-dot traversal pattern above and quote() leaves a lone "." alone
 # (it's in urllib's always-safe set). httpx normalises a "/./" path segment
-# away client-side before the request is sent, so
-# ".../markets/{market_name}/holiday-schedule" with market_name="." is
-# rewritten to ".../markets/holiday-schedule" — a different, real endpoint
-# the template never described, reachable from a model-supplied argument
-# alone. An empty value collapses to "//", which some upstream routers
-# normalise the same way. This is a check on the value AS A WHOLE (`^\.*$`),
-# not on the dot character appearing anywhere in it — a legitimate value like
-# "teen-patti.v2" contains a dot and must still be accepted.
+# away client-side before the request is sent, so a tenant-registered
+# template like ".../orders/{order_id}" with an LLM-sourced order_id="." is
+# rewritten to ".../orders" — a different, real endpoint the template never
+# described, reachable from a model-supplied argument alone. As of the
+# current built-in catalog (src/chatbot/catalog.py), every default_path
+# placeholder is {user_id} or {operator_id}, and both are source="session"
+# on every catalog tool — never filled from an LLM-supplied argument — so
+# this guard's only LIVE exposure today is a tenant-registered chat_tools
+# row with an arbitrary endpoint template and an LLM-sourced path param, not
+# the built-in catalog. An empty value collapses to "//", which some
+# upstream routers normalise the same way. This is a check on the value AS A
+# WHOLE (`^\.*$`), not on the dot character appearing anywhere in it — a
+# legitimate value like "teen-patti.v2" contains a dot and must still be
+# accepted.
 _PATH_VALUE_EMPTY_OR_ALL_DOTS_RE = re.compile(r"^\.*$")
 
 # Placeholder substituted for any internal-id-shaped value this module
@@ -76,14 +82,25 @@ _REDACTED_RESPONSE_KEYS = {
 _REDACTED_KEYS_NORMALIZED = {k.replace("_", "") for k in _REDACTED_RESPONSE_KEYS}
 
 # Narrow, EXACT-match exemption from the UUID value-scrub below — not a
-# general allowlist. "PgsOrderId" is the payment gateway's own order
-# reference (see get_player_latest_deposit_order), which the platform must
-# forward on to the deposit-verification vendor unmodified. It is not one of
-# the internal platform ids this scrub was hardened against, so even a
-# UUID-shaped value under this exact (normalized) key must reach the LLM
-# as-is instead of being redacted. Normalized the same way as
-# _REDACTED_KEYS_NORMALIZED above (lowercased, underscores stripped).
-_PGS_ORDER_ID_KEY_NORMALIZED = "pgsorderid"
+# general allowlist. These are payment-gateway order references that the
+# platform must forward on to the deposit-verification vendor unmodified:
+# "PgsOrderId" was the field name assumed before CRM PR #3963 shipped;
+# get_player_latest_deposit_order's actual response (per that PR) carries
+# the same reference as "order_id" (PgsIntegration.id, always present) with
+# "external_transaction_id" as the gateway's own secondary reference (null
+# on the INITIATED/BS_PENDING rows a deposit dispute is usually about). Both
+# are UUID-shaped in practice, so without this exemption they would hit the
+# UUID scrub below and come back as REDACTED_PLACEHOLDER, which is exactly
+# what deposit_verification.py's missing_order_id guard treats as "no order
+# id" — silently dead-ending every deposit dispute. "order_id" and
+# "external_transaction_id" are the same class of customer-facing payment
+# reference as the already-exempt bet_id/event_id/transaction_id class (see
+# _REDACTED_RESPONSE_KEYS's comment above) — not internal platform ids this
+# scrub was hardened against — so even a UUID-shaped value under one of
+# these exact (normalized) keys must reach the LLM as-is instead of being
+# redacted. Normalized the same way as _REDACTED_KEYS_NORMALIZED above
+# (lowercased, underscores stripped).
+_ORDER_ID_EXEMPT_KEYS_NORMALIZED = {"pgsorderid", "orderid", "externaltransactionid"}
 
 # Belt-and-suspenders value-level scrub: a UUID can leak through a key name
 # that isn't in _REDACTED_RESPONSE_KEYS (e.g. "player_id", "customer_id", a
@@ -94,6 +111,29 @@ _PGS_ORDER_ID_KEY_NORMALIZED = "pgsorderid"
 _UUID_RE = re.compile(
     r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b"
 )
+
+# _ORDER_ID_EXEMPT_KEYS_NORMALIZED above exists to preserve a bare id value
+# unmodified. But nothing stops a CRM from putting a free-text diagnostic
+# under one of these same keys instead of a bare id (e.g.
+# {"order_id": "no order for player 6c1a77a6-...-8add58aba9ef"}) — an
+# unconditional exemption would let an embedded internal-id UUID inside that
+# sentence leak straight through, defeating the UUID scrub above for exactly
+# the keys this module cares most about. So the exemption only applies when
+# the value actually LOOKS like a bare identifier — no whitespace, and a
+# plausible id length — not merely because the key matches; anything else
+# (free text, whitespace, absurdly long) falls through to the normal scrub,
+# which still strips an embedded UUID via _UUID_RE.
+#
+# "No whitespace" alone is a not-prose test, not an is-an-identifier test: a
+# hyphen- or colon-joined token like "no-order-for-6c1a77a6-...-8add58aba9ef"
+# carries an embedded UUID and contains no whitespace, so it would still be
+# forwarded verbatim. Hence the second condition at the call site: the value
+# may be a UUID outright (the common case — order_id IS a UUID), or contain
+# no UUID at all (gw-abc-123, PGS20260621143000123, UPI/2026/06/21/abc), but
+# a value that merely *embeds* one is not a bare id and gets scrubbed. No
+# charset allowlist, since hyphens/slashes/colons are all legal in real
+# gateway references.
+_BARE_ID_RE = re.compile(r"^\S{1,100}$")
 
 
 def _redact_internal_ids(value: object) -> object:
@@ -109,10 +149,17 @@ def _redact_internal_ids(value: object) -> object:
             normalized_k = k.lower().replace("_", "")
             if normalized_k in _REDACTED_KEYS_NORMALIZED:
                 result[k] = REDACTED_PLACEHOLDER
-            elif normalized_k == _PGS_ORDER_ID_KEY_NORMALIZED and isinstance(v, str):
-                # EXACT-match exemption — see _PGS_ORDER_ID_KEY_NORMALIZED
-                # above. Preserve the payment-gateway order id unmodified,
-                # even if it happens to be UUID-shaped.
+            elif (
+                normalized_k in _ORDER_ID_EXEMPT_KEYS_NORMALIZED
+                and isinstance(v, str)
+                and _BARE_ID_RE.match(v)
+                and (_UUID_RE.fullmatch(v) or not _UUID_RE.search(v))
+            ):
+                # EXACT-match exemption — see _ORDER_ID_EXEMPT_KEYS_NORMALIZED
+                # and _BARE_ID_RE above. Preserve the payment-gateway order
+                # reference unmodified, even if it happens to be UUID-shaped
+                # — but only when it actually looks like a bare id; free text
+                # under the same key still falls through to the scrub below.
                 result[k] = v
             else:
                 result[k] = _redact_internal_ids(v)

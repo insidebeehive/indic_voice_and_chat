@@ -32,8 +32,9 @@ PLAYER_TOOLS: dict[str, dict] = {
             "credits/debits, sports credits/debits. Supports filtering by type and "
             "date range via query params. Use to answer questions like 'did my "
             "deposit go through?' or 'show my recent withdrawals'. "
-            "NOTE: this does NOT return the PgsOrderId needed to raise a deposit "
-            "verification — call get_player_latest_deposit_order for that."
+            "NOTE: for a deposit DISPUTE, prefer get_player_latest_deposit_order "
+            "instead: it targets the specific recent attempt in one call and "
+            "exposes the pending/failed status detail a dispute needs."
         ),
         "parameters": {
             "user_id": {"type": "string", "source": "session",
@@ -48,17 +49,31 @@ PLAYER_TOOLS: dict[str, dict] = {
     },
     "get_player_latest_deposit_order": {
         "description": (
-            "Get the payment-gateway order details for the player's most recent "
-            "deposit attempt in the last 7 days: PgsOrderId (the payment gateway's "
-            "own order id), datetime, amount, and status (success | failed | pending). "
-            "Call this whenever the customer disputes a deposit — money deducted but "
-            "balance not credited, or a deposit shown as failed that they insist went "
-            "through (e.g. 'paise kat gaye par balance nahi aaya', 'deposit failed "
-            "dikha raha hai par payment ho gaya', 'my deposit did go through, check "
+            "Get the player's most recent deposit attempt within a recent lookback "
+            "window, at ANY status — including pending and failed, which is "
+            "deliberate: those are exactly the attempts a deposit dispute is about. "
+            "The window length is server-side config, not fixed — the response's "
+            "lookback_days field states exactly how many days it covers; use that "
+            "value if you need to state the window to the customer, never assume a "
+            "specific number of days. Call this whenever "
+            "the customer disputes a deposit — money deducted but balance not "
+            "credited, or a deposit shown as failed that they insist went through "
+            "(e.g. 'paise kat gaye par balance nahi aaya', 'deposit failed dikha "
+            "raha hai par payment ho gaya', 'my deposit did go through, check "
             "again'). "
-            "This is the ONLY source of the PgsOrderId that submit_deposit_verification "
-            "needs as its order_id — get_player_transactions does NOT return it. "
-            "Returns nothing if the player has made no deposit attempt in the last 7 days."
+            "The response's top-level status is found | no_recent_deposit | "
+            "lookup_unavailable — these are three different answers, not "
+            "interchangeable: no_recent_deposit means the lookup worked and there "
+            "genuinely was no deposit in that lookback window, safe to tell the "
+            "customer; "
+            "lookup_unavailable means the lookup itself failed and you do NOT know "
+            "whether a deposit happened — never say 'no deposit' in that case, "
+            "escalate to a human instead. "
+            "When status is found, describe the outcome using the order's "
+            "status_bucket (success | failed | pending) — never the raw pgs_status, "
+            "which is an open value set that can change without a deploy; a pending "
+            "bucket (this includes a raw status of PGS_SUCCESS) means the wallet may "
+            "not yet be credited, so never call it a success."
         ),
         "parameters": {
             "user_id": {"type": "string", "source": "session",
@@ -392,41 +407,69 @@ OPERATOR_TOOLS: dict[str, dict] = {
         "description": (
             "Get the applicable bet limit (minimum and maximum stake) and "
             "maximum profit (the upper limit on potential winnings) for a "
-            "specific player on a specific CASINO game. Does not cover Matka — "
-            "Matka stake/bet-type limits come from get_matka_config instead. "
-            "The CRM resolves any user-specific overrides, tier-based rules, or "
-            "blanket per-user limits internally and returns the single "
-            "effective limit — never guess or reconcile limits from other "
-            "tools yourself. Call this whenever a player asks about bet limits "
-            "for a named casino game (e.g. 'what's the bet limit for Teen "
-            "Patti?', 'minimum bet on Andar Bahar?')."
+            "specific player on a CASINO game matching the given name. Does not "
+            "cover Matka — Matka markets are a different table and 404 here by "
+            "design; use get_matka_config instead. The CRM resolves any "
+            "user-specific overrides, tier-based rules, or blanket per-user "
+            "limits internally and returns the single effective limit per "
+            "matching game — never guess or reconcile limits from other tools "
+            "yourself. "
+            "'name' is a partial match, so it can legitimately match more than "
+            "one game — the response's games is a LIST; if it has more than "
+            "one entry, ask the player which game they mean instead of picking "
+            "one for them. If a game's min_stake/max_stake/max_profit are all "
+            "null (resolved_from also null), that game exists but has no limit "
+            "configured at any tier — say 'no limit configured', do NOT say "
+            "the game doesn't exist. A 404 response is the different case: no "
+            "casino game matched 'name' at all — check spelling with the player "
+            "rather than assuming limits aren't configured. Call this whenever "
+            "a player asks about bet limits for a named casino game (e.g. "
+            "'what's the bet limit for Teen Patti?', 'minimum bet on Andar "
+            "Bahar?')."
         ),
         "parameters": {
             "operator_id": {"type": "string", "source": "session",
                             "description": "Operator identifier"},
             "user_id": {"type": "string", "source": "session",
                         "description": "Player identifier"},
-            "game_name": {"type": "string", "source": "llm",
-                          "description": "Name of the casino game to check (e.g. 'Teen Patti', 'Andar Bahar')"},
+            "name": {"type": "string", "source": "llm",
+                     "description": "Partial casino game name to check (e.g. 'Teen Patti', 'Andar Bahar') — a partial match can return more than one game"},
         },
-        "default_path": "/casino/{operator_id}/players/{user_id}/games/{game_name}/bet-limit",
+        "default_path": "/operators/{operator_id}/players/{user_id}/bet-limit",
         "method": "GET",
     },
     "get_market_holiday_schedule": {
         "description": (
-            "Get whether a specific market/game is closed on a given date (e.g. "
-            "a national holiday or a scheduled closure). Call this when a "
-            "player asks whether markets are open or closed on a specific date "
-            "or holiday (e.g. 'are markets closed on Independence Day?', "
-            "'is Kalyan open tomorrow?')."
+            "Get whether a specific Matka market is closed on a given date, "
+            "and its upcoming recurring weekly off-days. 'date' defaults to "
+            "today in the operator's timezone if omitted. The response's "
+            "status is found | not_found — not_found also covers an "
+            "ambiguous market name (it is never guessed at; market_name comes "
+            "back null in that case). "
+            "upcoming_closures is a projection of the market's RECURRING "
+            "weekly closures (e.g. 'closed every Sunday') — it is NOT a "
+            "holiday list. One-off holidays (Diwali etc.) aren't tracked "
+            "anywhere in this data, so the market will read as open on one "
+            "even if it's actually closed — phrase your answer around the "
+            "weekly pattern, don't imply this covers one-off holidays. A 403 "
+            "response means Matka isn't enabled for this operator at all — tell "
+            "the player Matka isn't available rather than that the market "
+            "doesn't exist. A 400 response means the date was malformed or "
+            "impossible (not YYYY-MM-DD, or a calendar date that doesn't exist) "
+            "— confirm the date with the player rather than retrying blindly. "
+            "Call this when a player asks whether a market is open or closed on "
+            "a date (e.g. 'is Kalyan open tomorrow?', 'which days is Milan Day "
+            "closed?')."
         ),
         "parameters": {
             "operator_id": {"type": "string", "source": "session",
                             "description": "Operator identifier"},
-            "market_name": {"type": "string", "source": "llm",
-                            "description": "Name of the matka market to check (e.g. 'Kalyan', 'Milan Day')"},
+            "market": {"type": "string", "source": "llm",
+                       "description": "Name of the matka market to check (e.g. 'Kalyan', 'Milan Day')"},
+            "date": {"type": "string", "source": "llm", "required": False,
+                     "description": "Optional: date to check (YYYY-MM-DD). Defaults to today in the operator's timezone if omitted."},
         },
-        "default_path": "/matka/{operator_id}/markets/{market_name}/holiday-schedule",
+        "default_path": "/operators/{operator_id}/matka/holiday-schedule",
         "method": "GET",
     },
 }

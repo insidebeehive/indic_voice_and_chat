@@ -46,11 +46,14 @@ and never fold backend-specific logic in here.
   deliberately NOT copied.** That function is a system-routing redactor: it
   strips internal plumbing keys (``operator_id``, ``user_id``, ...) from CRM
   responses before they reach the LLM, but it *deliberately preserves*
-  ``bet_id``/``transaction_id`` and has an explicit, narrow exemption that
-  lets ``PgsOrderId`` (the payment-gateway order reference) through even
-  though it is UUID-shaped — because the LLM needs those specific values to
-  do its job (place a bet reference in a reply, forward an order id to a
-  verification vendor, etc).
+  ``bet_id``/``transaction_id`` and has an explicit, narrow exemption
+  (``_ORDER_ID_EXEMPT_KEYS_NORMALIZED``) that lets the payment-gateway order
+  references — ``PgsOrderId``, ``order_id`` and ``external_transaction_id``
+  — through even when UUID-shaped, because the LLM needs those specific
+  values to do its job (place a bet reference in a reply, forward an order id
+  to a verification vendor, etc). ``order_id``/``external_transaction_id``
+  are the field names the CRM actually ships; ``PgsOrderId`` was the name in
+  the original ticket and is kept for any endpoint still using it.
 
   **This module has the opposite goal.** It sits on the *trace* path, not
   the LLM path — nothing that passes through here is going back to a model

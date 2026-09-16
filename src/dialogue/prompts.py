@@ -784,10 +784,15 @@ def build_chatbot_system_prompt(
             "- Already pending: if the tool's result says a verification is already pending for "
             "this conversation, don't call it again — just remind the customer it's still being "
             "checked.\n"
-            "- Order id source: the order id must come from get_player_latest_deposit_order's "
-            "PgsOrderId field — never from get_player_transactions (which doesn't return it), "
-            "and never invented; if no deposit order can be found, escalate to a human instead "
-            "of guessing."
+            "- Order id source: use get_player_latest_deposit_order's order_id field, "
+            "and never invent one; if no deposit order can be found, escalate to a "
+            "human instead of guessing.\n"
+            "- Status handling: get_player_latest_deposit_order's status can be "
+            "lookup_unavailable — that means the lookup failed, not that there's no "
+            "deposit; never tell the customer 'no deposit found' in that case, escalate "
+            "to a human instead. On a pending status_bucket (including a raw status of "
+            "PGS_SUCCESS) never say the deposit succeeded — it's an intermediate state "
+            "where the wallet may not yet be credited."
         )
 
     # ── Depth matching ───────────────────────────────────────────────────────
