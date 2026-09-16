@@ -20,7 +20,7 @@ from types import SimpleNamespace
 from typing import Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy import case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -32,12 +32,16 @@ from src.auth.context import hash_api_token
 from src.auth.middleware import require_admin
 from src.config_tenant import (
     TelephonyCreds,
+    TenantConfigError,
     TenantPipelineConfig,
     TenantRealtimeConfig,
+    TenantSettings,
     TenantSTTConfig,
     TenantTelephonyConfig,
     TenantTTSConfig,
     platform_webhook_base_url,
+    resolve_chat_tts_config,
+    validate_credentials,
 )
 from src.config_tenant import TenantLLMConfig as _LLM
 from src.dialogue.campaign_loader import parse_campaign_yaml
@@ -333,6 +337,56 @@ class DepositVerificationUpdateIn(BaseModel):
     mobile_metadata_keys: Optional[list[str]] = None
 
 
+class LayerUpdateIn(BaseModel):
+    """Partial provider-layer update, shared shape for stt/llm/tts and
+    chat_voice.tts. Every field is optional — an admin can flip just
+    ``provider`` (e.g. swap TTS vendor) without re-stating ``model``, or
+    just ``model`` without re-stating ``provider``. ``voice_id``/``speed``
+    are TTS-only; harmless no-ops when applied to stt/llm (see
+    _merge_layer_fields, which restricts which of these actually get
+    written per layer so an stt/llm config never picks up TTS-only keys)."""
+    provider: Optional[str] = None
+    model: Optional[str] = None
+    language: Optional[str] = None
+    voice_id: Optional[str] = None  # tts only
+    speed: Optional[float] = None   # tts only
+
+
+class RealtimeUpdateIn(BaseModel):
+    """Partial update for pipeline.realtime (the S2S provider block) — same
+    fields as register-time's RealtimeChoice, but every field optional here
+    since PATCH is partial-override, not replace-wholesale."""
+    provider: Optional[str] = None
+    model: Optional[str] = None
+    voice: Optional[str] = None
+    language_code: Optional[str] = None
+
+
+class ChatVoiceUpdateIn(BaseModel):
+    """Partial update for pipeline.chat_voice — CHAT voice-note replies,
+    independent of the voice-call cascade's pipeline.tts (added in 0c011a6;
+    see ChatVoiceConfig in src/config_tenant.py). ``tts`` here is the
+    chat-specific override; leaving it unset and enabling chat_voice relies
+    on the documented pipeline.tts fallback (resolve_chat_tts_config)."""
+    enabled: Optional[bool] = None
+    tts: Optional[LayerUpdateIn] = None
+
+
+class PipelineUpdateIn(BaseModel):
+    """Partial pipeline update — mode + provider/model choices, write-once at
+    registration until now. Every field optional; update_tenant merges each
+    provided sub-block field-by-field into the stored pipeline_config (same
+    partial-override semantics as TelephonyUpdateIn) and then validates the
+    RESULT with validate_credentials before persisting — see update_tenant's
+    docstring for why."""
+    mode: Optional[Literal["layered", "s2s"]] = None
+    stt: Optional[LayerUpdateIn] = None
+    llm: Optional[LayerUpdateIn] = None
+    tts: Optional[LayerUpdateIn] = None
+    realtime: Optional[RealtimeUpdateIn] = None
+    chat_voice: Optional[ChatVoiceUpdateIn] = None
+
+
 class UpdateTenantRequest(BaseModel):
     status: Optional[str] = Field(default=None, pattern="^(active|suspended)$")
     events_webhook_url: Optional[str] = None
@@ -343,6 +397,11 @@ class UpdateTenantRequest(BaseModel):
     # "" clears the link (FK is nullable); omitted/None leaves it untouched.
     crm_id: Optional[str] = None
     deposit_verification: Optional[DepositVerificationUpdateIn] = None
+    # Mode + STT/LLM/TTS/realtime/chat_voice provider choices — previously
+    # write-once at registration (POST /tenants). See PipelineUpdateIn and
+    # update_tenant's docstring for the partial-override + validate-the-
+    # result semantics.
+    pipeline: Optional[PipelineUpdateIn] = None
 
 
 class UpdateTenantResponse(BaseModel):
@@ -358,6 +417,48 @@ class UpdateTenantResponse(BaseModel):
     crm_id: Optional[str] = None
     deposit_verification_enabled: Optional[bool] = None
     deposit_verification_secret_set: Optional[bool] = None
+    # Effective pipeline state after this PATCH, so the caller can confirm
+    # what's now in force without a separate GET. Provider/model NAMES only —
+    # never API keys (STT/LLM/TTS/realtime always resolve keys from the
+    # platform master env, never per-tenant, so there is nothing secret here
+    # to withhold in the first place; unlike telephony_creds_configured this
+    # doesn't need to be a names-only list because there ARE no per-tenant
+    # secrets on these layers).
+    pipeline_mode: Optional[str] = None
+    stt_provider: Optional[str] = None
+    stt_model: Optional[str] = None
+    llm_provider: Optional[str] = None
+    llm_model: Optional[str] = None
+    tts_provider: Optional[str] = None
+    tts_model: Optional[str] = None
+    realtime_provider: Optional[str] = None
+    realtime_model: Optional[str] = None
+    chat_voice_enabled: bool = False
+    chat_voice_tts_provider: Optional[str] = None
+
+
+# Which of LayerUpdateIn's fields actually apply to each pipeline layer.
+# stt/llm never had voice_id/speed to begin with (TenantSTTConfig/
+# TenantLLMConfig don't declare them) so restricting here keeps the stored
+# JSON clean, even though pydantic would silently drop the extra keys anyway
+# when TenantPipelineConfig(**pc) reconstructs each sub-config.
+_STT_UPDATE_FIELDS = ("provider", "model", "language")
+_LLM_UPDATE_FIELDS = ("provider", "model")
+_TTS_UPDATE_FIELDS = ("provider", "model", "language", "voice_id", "speed")
+
+
+def _merge_layer_fields(cfg: dict, upd: "LayerUpdateIn", fields: tuple[str, ...]) -> dict:
+    """Partial-override merge for one pipeline layer (stt/llm/tts/chat_voice.tts):
+    only the fields the admin actually set overwrite the stored value, so an
+    admin changing just ``tts.provider`` does not wipe ``tts.voice_id`` —
+    same shape as the telephony block's merge below, just for a single dict
+    instead of TelephonyUpdateIn's flatter set of fields."""
+    out = dict(cfg)
+    for f in fields:
+        v = getattr(upd, f)
+        if v is not None:
+            out[f] = v
+    return out
 
 
 async def _refresh_resolver(request: Request, tenant_id: str) -> None:
@@ -380,13 +481,51 @@ async def update_tenant(
     session: AsyncSession = Depends(get_db_session),
     _: None = Depends(require_admin),
 ) -> UpdateTenantResponse:
-    """Update an existing tenant's telephony credentials/config or status (admin).
+    """Update an existing tenant's telephony credentials/config, pipeline
+    mode/providers, or status (admin).
 
     Telephony ``keys`` are encrypted and **merged** into the tenant's secrets
     (existing names are overwritten, new ones added), and the matching ``*_env``
     references are written into ``pipeline_config.telephony``. The live resolver
     is refreshed so the change takes effect immediately — e.g. fixing a wrong
     Stringee API Key SID without re-registering the tenant.
+
+    ``pipeline`` (mode + stt/llm/tts/realtime/chat_voice) was write-once at
+    registration until now — this was the only way to flip a tenant between
+    ``layered``/``s2s`` or swap a provider, short of hand-editing
+    ``pipeline_config`` JSON in Postgres. Same partial-override semantics as
+    ``telephony``: every field is optional, an omitted field leaves the
+    stored value untouched, and the merge happens onto ``pc`` (never a
+    wholesale replace) — see ``_merge_layer_fields``.
+
+    Unlike every other block here, the pipeline merge's RESULT is validated
+    before it's persisted: we build the prospective ``pipeline_config``,
+    reconstruct the ``TenantSettings`` it would produce, and run the same
+    ``validate_credentials`` gate ``load_tenant()`` runs for YAML tenants
+    (src/config_tenant.py). A gap — e.g. switching to ``s2s`` with no
+    ``pipeline.realtime.provider``, or enabling ``chat_voice`` with no TTS
+    resolvable anywhere — is rejected with a 422 naming what's missing,
+    instead of being accepted and discovered when a call or chat reply
+    actually fails. This only runs when ``req.pipeline`` is provided — a
+    telephony-only or status-only PATCH keeps its pre-existing (unvalidated)
+    behavior, unchanged by this endpoint's original scope.
+
+    NOTE (deliberately not handled here): switching ``s2s -> layered`` on a
+    tenant whose ``pipeline.tts`` was never set (an s2s tenant legitimately
+    has none) leaves voice calls with no TTS. ``validate_credentials`` has no
+    rule for this — it only requires ``pipeline.tts`` indirectly via
+    ``chat_voice.enabled`` — so this combination is NOT caught here. Fixing
+    it would mean changing ``validate_credentials``'s rules, which is out of
+    scope for this endpoint (see its own docstring for why: STT/LLM/TTS keys
+    are platform-level, not per-tenant, so the function has historically only
+    policed telephony/realtime/chat_voice gaps that would silently bill or
+    break the platform).
+
+    The live resolver + cached provider clients (``TenantProviders.evict``,
+    via ``_refresh_resolver``) are refreshed for every successful PATCH
+    regardless of which block changed, so a provider/model swap takes effect
+    immediately — no restart, and no stale cached client (e.g. a cached TTS
+    adapter for the old provider) survives the edit.
     """
     t = await _require_tenant(session, tenant_id)
 
@@ -548,9 +687,57 @@ async def update_tenant(
             dv_cfg["webhook_secret_env"] = name
         pc["deposit_verification"] = dv_cfg
 
+    if req.pipeline is not None:
+        pl = req.pipeline
+        if pl.mode is not None:
+            pc["mode"] = pl.mode
+        if pl.stt is not None:
+            pc["stt"] = _merge_layer_fields(pc.get("stt") or {}, pl.stt, _STT_UPDATE_FIELDS)
+        if pl.llm is not None:
+            pc["llm"] = _merge_layer_fields(pc.get("llm") or {}, pl.llm, _LLM_UPDATE_FIELDS)
+        if pl.tts is not None:
+            pc["tts"] = _merge_layer_fields(pc.get("tts") or {}, pl.tts, _TTS_UPDATE_FIELDS)
+        if pl.realtime is not None:
+            realtime_cfg = dict(pc.get("realtime") or {})
+            for f in ("provider", "model", "voice", "language_code"):
+                v = getattr(pl.realtime, f)
+                if v is not None:
+                    realtime_cfg[f] = v
+            pc["realtime"] = realtime_cfg
+        if pl.chat_voice is not None:
+            cv_cfg = dict(pc.get("chat_voice") or {})
+            if pl.chat_voice.enabled is not None:
+                cv_cfg["enabled"] = pl.chat_voice.enabled
+            if pl.chat_voice.tts is not None:
+                cv_cfg["tts"] = _merge_layer_fields(
+                    cv_cfg.get("tts") or {}, pl.chat_voice.tts, _TTS_UPDATE_FIELDS)
+            pc["chat_voice"] = cv_cfg
+
+        # Validate the RESULT, not the request: build the TenantSettings this
+        # merged pipeline_config would produce and run it through the same
+        # validate_credentials gate load_tenant() runs for YAML tenants — a
+        # mode switch or provider change that leaves the tenant unable to
+        # place calls / send chat voice replies must be rejected here, not
+        # discovered at the next call. Only id/slug/name/pipeline are set:
+        # validate_credentials reads only settings.pipeline (+ settings.slug
+        # for its own error message) — see its docstring — so nothing else
+        # this endpoint can touch (crm/deposit_verification/telephony
+        # secrets) needs to round-trip through here.
+        try:
+            prospective_pipeline = TenantPipelineConfig(**pc)
+        except ValidationError as e:
+            raise HTTPException(status_code=422, detail=f"invalid pipeline config: {e}")
+        prospective_settings = TenantSettings(id=t.id, slug=t.slug, name=t.name,
+                                               pipeline=prospective_pipeline)
+        try:
+            validate_credentials(prospective_settings, source=f"tenant:{t.slug}")
+        except TenantConfigError as e:
+            raise HTTPException(status_code=422, detail=str(e))
+
     if req.status is not None or req.events_webhook_url is not None \
             or req.telephony is not None or req.chatwoot is not None \
-            or req.crm is not None or req.deposit_verification is not None:
+            or req.crm is not None or req.deposit_verification is not None \
+            or req.pipeline is not None:
         t.pipeline_config = pc  # reassign (new object) so the JSON column is marked dirty
 
     await session.commit()
@@ -560,6 +747,21 @@ async def update_tenant(
     pc = t.pipeline_config or {}
     tel_cfg = pc.get("telephony") or {}
     dv_cfg = pc.get("deposit_verification") or {}
+    stt_cfg = pc.get("stt") or {}
+    llm_cfg = pc.get("llm") or {}
+    tts_cfg = pc.get("tts") or {}
+    realtime_cfg = pc.get("realtime") or {}
+    chat_voice_cfg = pc.get("chat_voice") or {}
+    # The EFFECTIVE chat-voice TTS provider, including the documented
+    # pipeline.tts fallback (resolve_chat_tts_config) — not just whatever
+    # chat_voice.tts itself declares. A tenant that enables chat_voice while
+    # relying on the fallback should see that fallback reflected here, not a
+    # blank field that makes it look unresolved.
+    chat_voice_tts_provider = None
+    effective_pipeline = TenantPipelineConfig(**pc)
+    chat_tts_cfg = resolve_chat_tts_config(effective_pipeline)
+    if chat_tts_cfg is not None:
+        chat_voice_tts_provider = chat_tts_cfg.provider
     return UpdateTenantResponse(
         tenant_id=t.id, slug=t.slug, status=t.status,
         telephony_provider=tel_cfg.get("provider"),
@@ -569,6 +771,17 @@ async def update_tenant(
         crm_id=t.crm_id,
         deposit_verification_enabled=dv_cfg.get("enabled"),
         deposit_verification_secret_set=bool(dv_cfg.get("webhook_secret_env")),
+        pipeline_mode=pc.get("mode", "layered"),
+        stt_provider=stt_cfg.get("provider"),
+        stt_model=stt_cfg.get("model"),
+        llm_provider=llm_cfg.get("provider"),
+        llm_model=llm_cfg.get("model"),
+        tts_provider=tts_cfg.get("provider"),
+        tts_model=tts_cfg.get("model"),
+        realtime_provider=realtime_cfg.get("provider"),
+        realtime_model=realtime_cfg.get("model"),
+        chat_voice_enabled=bool(chat_voice_cfg.get("enabled")),
+        chat_voice_tts_provider=chat_voice_tts_provider,
     )
 
 

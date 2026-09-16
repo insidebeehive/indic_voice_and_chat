@@ -74,6 +74,7 @@
     <div id="rotateResult" style="margin:.5rem 0;"></div>
     <div class="tabs">
       <div class="tab active" id="tab_an" onclick="showTab('an')">Analytics</div>
+      <div class="tab" id="tab_pipe" onclick="showTab('pipe')">Pipeline</div>
       <div class="tab" id="tab_crm" onclick="showTab('crm')">CRM</div>
       <div class="tab" id="tab_camp" onclick="showTab('camp')">Campaign</div>
       <div class="tab" id="tab_chat" onclick="showTab('chat')">Chat</div>
@@ -82,6 +83,7 @@
       <div class="tab" id="tab_tel" onclick="showTab('tel')">Telephony</div>
     </div>
     <div id="pane_an"></div>
+    <div id="pane_pipe" hidden></div>
     <div id="pane_crm" hidden></div>
     <div id="pane_camp" hidden></div>
     <div id="pane_chat" hidden></div>
@@ -160,6 +162,7 @@ async function selectTenant(id, slug) {
   $("rotateResult").innerHTML = "";
   showTab("an");
   await loadAnalytics(id);
+  loadPipeline(id);
   loadBilling(id);
   loadTelephony(id);
   loadCRM(id, slug);
@@ -168,7 +171,7 @@ async function selectTenant(id, slug) {
   loadKB(id, slug);
 }
 function showTab(which) {
-  for (const k of ["an", "crm", "camp", "chat", "kb", "bill", "tel"]) {
+  for (const k of ["an", "pipe", "crm", "camp", "chat", "kb", "bill", "tel"]) {
     const tabEl = $("tab_" + k);
     if (tabEl) tabEl.classList.toggle("active", which === k);
     $("pane_" + k).hidden = which !== k;
@@ -412,6 +415,207 @@ async function loadBilling(id) {
     <div class="hint" style="margin-top:.6rem;">Platform cost = voice (STT/LLM/TTS or S2S) + chat (LLM tokens) combined —
       what we bill. Telephony runs on the tenant's own provider key, so it's shown as a tentative figure and is
       <b>not</b> in the platform cost.</div>`;
+}
+
+// --- Pipeline editor ------------------------------------------------------
+// Lets an admin change a tenant's mode + STT/LLM/TTS/realtime/chat-voice
+// provider & model choices without touching the DB. PATCHes
+// /api/v1/tenants/{id} with a `pipeline` block (see PipelineUpdateIn).
+//
+// Every provider/model select defaults to a "leave unchanged" sentinel
+// (empty value) rather than being pre-selected to the current value: model
+// lists come from the live catalog (GET /api/v1/models) so a deprecated
+// model simply isn't offered, and the sentinel means "untouched" fields can
+// never be silently re-sent with a stale value — the field is only included
+// in the PATCH body when the admin actually picks something. The current
+// value is shown as a hint next to each field instead.
+let MODELS = {};
+let MODELS_LOADED = false;
+// Chat-voice current state (enabled / effective TTS provider) is NOT exposed
+// by any GET today — only a PATCH response echoes it back. This session-only
+// cache remembers the last value this page saw for a tenant so the hint text
+// can show it after a save; before any save this session it just says so.
+let CHAT_VOICE_CACHE = {};
+
+async function ensureModelsLoaded() {
+  if (MODELS_LOADED) return;
+  const r = await api("/api/v1/models");
+  if (r.ok) { MODELS = r.json.models || {}; MODELS_LOADED = true; }
+}
+
+function onPipeProviderChange(kind) {
+  const catKind = kind === "realtime" ? "s2s" : (kind === "cv_tts" ? "tts" : kind);
+  const prov = ($(`p_${kind}_provider`) || {}).value || "";
+  const models = prov ? ((MODELS[catKind] && MODELS[catKind][prov]) || []) : [];
+  const modelSel = $(`p_${kind}_model`);
+  if (!modelSel) return;
+  modelSel.innerHTML = `<option value="">— leave unchanged —</option>` +
+    models.map(m => `<option value="${escAttr(m)}">${escT(m)}</option>`).join("");
+}
+
+function pipeLayerHtml(kind, label, current, extraHtml) {
+  const catKind = kind === "realtime" ? "s2s" : kind;
+  const providers = Object.keys(MODELS[catKind] || {});
+  return `
+    <div class="creds" style="gap:.6rem;flex-wrap:wrap;margin-bottom:.5rem;">
+      <label>${label} provider <small class="hint">(current: ${lay(current)})</small>
+        <select id="p_${kind}_provider" onchange="onPipeProviderChange('${kind}')">
+          <option value="">— leave unchanged —</option>
+          ${providers.map(p => `<option value="${escAttr(p)}">${escT(p)}</option>`).join("")}
+        </select>
+      </label>
+      <label>${label} model
+        <select id="p_${kind}_model">
+          <option value="">— leave unchanged —</option>
+        </select>
+      </label>
+      ${extraHtml || ""}
+    </div>`;
+}
+
+function chatVoiceHtml(id) {
+  const cache = CHAT_VOICE_CACHE[id];
+  const curLabel = cache
+    ? `current (as of last save this session): ${cache.enabled ? "enabled" : "disabled"}${cache.tts_provider ? " · effective tts=" + escT(cache.tts_provider) : ""}`
+    : "current on/off state isn't exposed by the API until you save here";
+  const providers = Object.keys(MODELS.tts || {});
+  return `
+    <h2 style="margin-top:1.2rem;">Chat voice replies</h2>
+    <div class="hint" style="margin-bottom:.5rem;">
+      Voice-note replies in the <b>chat</b> channel — a separate setting from the call TTS above.
+      A tenant can run S2S for calls and still need a TTS here for chat voice notes. If left unset,
+      chat voice falls back to the call TTS (pipeline.tts); if enabled with neither set, saving is
+      rejected. <br /><small class="hint">${curLabel}</small>
+    </div>
+    <div class="creds" style="gap:.6rem;flex-wrap:wrap;">
+      <label>Enabled
+        <select id="p_cv_enabled">
+          <option value="">— leave unchanged —</option>
+          <option value="true">enabled</option>
+          <option value="false">disabled</option>
+        </select>
+      </label>
+      <label>Chat TTS provider
+        <select id="p_cv_tts_provider" onchange="onPipeProviderChange('cv_tts')">
+          <option value="">— leave unchanged —</option>
+          ${providers.map(p => `<option value="${escAttr(p)}">${escT(p)}</option>`).join("")}
+        </select>
+      </label>
+      <label>Chat TTS model
+        <select id="p_cv_tts_model"><option value="">— leave unchanged —</option></select>
+      </label>
+      <label>Chat TTS voice_id <input id="p_cv_tts_voice_id" placeholder="blank = leave unchanged" /></label>
+      <label>Chat TTS language <input id="p_cv_tts_language" placeholder="blank = leave unchanged" /></label>
+      <label>Chat TTS speed <input id="p_cv_tts_speed" type="number" step="0.05" placeholder="blank = leave unchanged" /></label>
+    </div>`;
+}
+
+async function loadPipeline(id) {
+  await ensureModelsLoaded();
+  if (SELECTED !== id) return;   // a different tenant may have been selected while this awaited
+  const t = (window.TENANTS || {})[id] || {};
+  const stt = t.stt || {}, llm = t.llm || {}, tts = t.tts || {}, realtime = t.realtime || {};
+  $("pane_pipe").innerHTML = `
+    <div class="hint" style="margin-bottom:.6rem;">
+      Change this tenant's mode and provider/model choices. PATCHes <code>/api/v1/tenants/${id}</code>
+      with a <code>pipeline</code> block — only fields you touch are sent; anything left at
+      "— leave unchanged —" keeps its current stored value untouched. Model lists come from the live
+      model catalog, so a deprecated model can't be picked by accident.
+    </div>
+    <h2>Mode</h2>
+    <div class="creds" style="gap:.6rem;margin-bottom:.5rem;">
+      <label>Mode <small class="hint">(current: ${escT(t.mode || "—")})</small>
+        <select id="p_mode">
+          <option value="">— leave unchanged —</option>
+          <option value="layered">layered</option>
+          <option value="s2s">s2s</option>
+        </select>
+      </label>
+    </div>
+    <h2>Call pipeline (layered mode)</h2>
+    ${pipeLayerHtml("stt", "STT", stt, `
+      <label>STT language <input id="p_stt_language" placeholder="blank = leave unchanged" /></label>`)}
+    ${pipeLayerHtml("llm", "LLM", llm)}
+    ${pipeLayerHtml("tts", "TTS (call)", tts, `
+      <label>TTS language <input id="p_tts_language" placeholder="blank = leave unchanged" /></label>
+      <label>TTS voice_id <input id="p_tts_voice_id" placeholder="blank = leave unchanged" /></label>
+      <label>TTS speed <input id="p_tts_speed" type="number" step="0.05" placeholder="blank = leave unchanged" /></label>`)}
+    <h2 style="margin-top:1rem;">Realtime (S2S mode)</h2>
+    ${pipeLayerHtml("realtime", "Realtime", realtime, `
+      <label>Realtime voice <input id="p_realtime_voice" placeholder="blank = leave unchanged" /></label>
+      <label>Realtime language_code <input id="p_realtime_language_code" placeholder="blank = leave unchanged" /></label>`)}
+    ${chatVoiceHtml(id)}
+    <div style="margin-top:1rem;">
+      <button id="p_save_btn" onclick="savePipeline('${id}')">Save pipeline</button>
+      <span id="p_result" class="hint" style="margin-left:.6rem;"></span>
+    </div>
+    <div id="p_error" style="margin-top:.6rem;"></div>`;
+}
+
+function formatApiError(json) {
+  const d = json && json.detail;
+  if (typeof d === "string") return d;
+  if (Array.isArray(d)) return d.map(e => (e && (e.msg || JSON.stringify(e))) || String(e)).join("\n");
+  if (d) return JSON.stringify(d, null, 2);
+  return (json && json.error) || "unknown error";
+}
+
+async function savePipeline(id) {
+  const v = (x) => { const el = $(x); return el ? (el.value || "").trim() : ""; };
+  const layer = (kind, fields) => {
+    const obj = {};
+    const provider = v(`p_${kind}_provider`);
+    const model = v(`p_${kind}_model`);
+    if (provider) obj.provider = provider;
+    if (model) obj.model = model;
+    for (const f of fields) {
+      const val = v(`p_${kind}_${f}`);
+      if (val) obj[f] = f === "speed" ? Number(val) : val;
+    }
+    return Object.keys(obj).length ? obj : null;
+  };
+
+  const pipeline = {};
+  const mode = v("p_mode");
+  if (mode) pipeline.mode = mode;
+
+  const stt = layer("stt", ["language"]);
+  if (stt) pipeline.stt = stt;
+  const llm = layer("llm", []);
+  if (llm) pipeline.llm = llm;
+  const tts = layer("tts", ["language", "voice_id", "speed"]);
+  if (tts) pipeline.tts = tts;
+  const realtime = layer("realtime", ["voice", "language_code"]);
+  if (realtime) pipeline.realtime = realtime;
+
+  const cvEnabled = v("p_cv_enabled");
+  const cvTts = layer("cv_tts", ["voice_id", "language", "speed"]);
+  const chatVoice = {};
+  if (cvEnabled) chatVoice.enabled = cvEnabled === "true";
+  if (cvTts) chatVoice.tts = cvTts;
+  if (Object.keys(chatVoice).length) pipeline.chat_voice = chatVoice;
+
+  if (!Object.keys(pipeline).length) { $("p_result").textContent = "Nothing changed — pick a value to update first."; return; }
+
+  const btn = $("p_save_btn");
+  btn.disabled = true;
+  $("p_result").textContent = "saving…";
+  $("p_error").innerHTML = "";
+  const r = await apiSend("PATCH", `/api/v1/tenants/${id}`, { pipeline });
+  btn.disabled = false;
+  if (r.ok) {
+    CHAT_VOICE_CACHE[id] = { enabled: r.json.chat_voice_enabled, tts_provider: r.json.chat_voice_tts_provider };
+    $("p_result").textContent = "✓ saved";
+    await loadTenants();   // refresh table + window.TENANTS with the now-effective values
+    loadPipeline(id);      // re-render so hints reflect the new current values
+  } else {
+    $("p_result").textContent = `✗ save failed (${r.status})`;
+    $("p_error").innerHTML = `<div class="warnbox">
+      <div style="font-weight:700;color:#fca5a5;margin-bottom:.4rem;">Rejected — nothing was saved</div>
+      <pre style="white-space:pre-wrap;word-break:break-word;margin:0;">${escT(formatApiError(r.json))}</pre>
+    </div>`;
+    // Form is left exactly as entered so the admin can fix and retry.
+  }
 }
 
 // Credential fields per provider — [logical_name, label, isSecret]. Only the
