@@ -31,6 +31,7 @@ from src.auth.audit import log_denied
 from src.auth.context import hash_api_token
 from src.auth.middleware import require_admin
 from src.config_tenant import (
+    DepositVerificationConfig,
     TelephonyCreds,
     TenantConfigError,
     TenantPipelineConfig,
@@ -326,11 +327,23 @@ class DepositVerificationUpdateIn(BaseModel):
     enabled: Optional[bool] = None
     webhook_url: Optional[str] = None
     webhook_secret: Optional[str] = None   # write-only plaintext; never returned
-    timeout_minutes: Optional[int] = None
+    # gt=0 duplicated from DepositVerificationConfig (src/config_tenant.py):
+    # this PATCH field is unconstrained upstream of that model, so an
+    # unconstrained int here would let e.g. timeout_minutes=0 commit to
+    # pipeline_config successfully while DepositVerificationConfig(**cfg)
+    # rejects it with a ValidationError on every subsequent read — including
+    # DbTenantResolver.reload(), which builds this same model for every
+    # tenant in one pass and only swaps in its caches after the whole loop
+    # succeeds. One bad row here therefore leaves ALL tenants unresolvable
+    # on the next resolver reload, not just this one. Rejecting it here with
+    # a 422 keeps the write and the read in agreement.
+    timeout_minutes: Optional[int] = Field(default=None, gt=0)
     # Vendor API contract this tenant's webhook speaks — see
     # DepositVerificationConfig.contract in src/config_tenant.py.
     contract: Optional[Literal["multipart_verdict", "json_ticket_relay"]] = None
-    screenshot_url_ttl_seconds: Optional[int] = None
+    # gt=0: see timeout_minutes above — same duplicated constraint, same
+    # write/read split if omitted here.
+    screenshot_url_ttl_seconds: Optional[int] = Field(default=None, gt=0)
     # ``json_ticket_relay``-only: ordered ``ChatSession.extra_data`` keys to
     # try when resolving the optional outbound ``mobile`` field — see
     # DepositVerificationConfig.mobile_metadata_keys in src/config_tenant.py.
@@ -668,7 +681,14 @@ async def update_tenant(
             dv_cfg["screenshot_url_ttl_seconds"] = dv.screenshot_url_ttl_seconds
         if dv.mobile_metadata_keys is not None:
             dv_cfg["mobile_metadata_keys"] = dv.mobile_metadata_keys
-        if dv.webhook_secret is not None:
+        # Truthy, not `is not None`: {"webhook_secret": ""} must be a no-op.
+        # An empty string would still pass `is not None`, write an encrypted
+        # empty-string row, and make deposit_verification_secret_set /
+        # deposit_verification_active both read True downstream (a row
+        # exists) — while bootstrap.py's secret_optional(...) gets back ""
+        # and treats it as falsy, so the tool never actually registers. That
+        # mismatch is exactly the false "active" this field exists to catch.
+        if dv.webhook_secret:
             if not crypto.has_key():
                 raise HTTPException(
                     status_code=503,
@@ -1079,6 +1099,29 @@ class TenantSummary(BaseModel):
     stringee_webhook_auth_configured: bool = False
     exotel_basic_auth_configured: bool = False
     chatwoot_webhook_id_configured: bool = False
+    # Deposit-verification screenshot-dispute webhook (DepositVerificationConfig,
+    # src/config_tenant.py). Non-secret fields only — webhook_secret itself is
+    # write-only (see DepositVerificationUpdateIn) and never round-trips here.
+    deposit_verification_enabled: bool = False
+    deposit_verification_webhook_url: Optional[str] = None
+    # Whether a TenantSecret row exists under this tenant's stored
+    # webhook_secret_env name (see update_tenant's PATCH handler, :677) —
+    # never the value itself, matching events_webhook_secret_set/
+    # telephony_creds_configured's names/booleans-only convention.
+    deposit_verification_secret_set: bool = False
+    deposit_verification_contract: Optional[str] = None
+    deposit_verification_timeout_minutes: Optional[int] = None
+    # THE field this endpoint exists to add: whether the tool will actually be
+    # registered, not just whether `enabled` is set. Mirrors bootstrap.py's
+    # registration gate (~:558-566) exactly — enabled + webhook_url + a
+    # resolvable secret — MINUS the `sessionmaker is not None` leg, which is a
+    # runtime/process-wiring concern this API has no way to inspect. An
+    # `enabled: true` PATCH with no webhook_url or no resolvable secret is a
+    # deliberately-refused half-configuration (bootstrap.py:548-556): the tool
+    # never registers, so the LLM never offers a verification whose verdict
+    # could never come back. `_enabled` alone reads as "on"; `_active` is what
+    # actually predicts whether the feature does anything.
+    deposit_verification_active: bool = False
 
 
 class TenantListResponse(BaseModel):
@@ -1146,11 +1189,50 @@ async def list_tenants(
     for secret_tenant_id, name in webhook_secret_rows:
         webhook_secret_names.setdefault(secret_tenant_id, set()).add(name)
 
+    # Deposit-verification webhook secret is named PER TENANT (TENANT_{SLUG}_
+    # DEPOSIT_VERIFICATION_WEBHOOK_SECRET, minted by update_tenant's PATCH
+    # handler at :677) rather than one of the fixed names above, so it can't
+    # join the IN(...) query above. Collect each tenant's configured env name
+    # first, then resolve all of them in ONE extra query — an N+1 (a secret
+    # lookup per tenant) here would run on every backoffice page load.
+    dv_env_by_tenant: dict[str, str] = {}
+    for t in rows:
+        env_name = ((t.pipeline_config or {}).get("deposit_verification") or {}).get(
+            "webhook_secret_env")
+        if env_name:
+            dv_env_by_tenant[t.id] = env_name
+    dv_secret_rows = []
+    if dv_env_by_tenant:
+        dv_secret_rows = (await session.execute(
+            select(TenantSecret.tenant_id, TenantSecret.name).where(
+                TenantSecret.name.in_(set(dv_env_by_tenant.values()))
+            )
+        )).all()
+    dv_secret_pairs = {(secret_tenant_id, name) for secret_tenant_id, name in dv_secret_rows}
+
     items = []
     for t in rows:
         pc = t.pipeline_config or {}
         tel = pc.get("telephony") or {}
         names = webhook_secret_names.get(t.id, set())
+        try:
+            dv = DepositVerificationConfig(**(pc.get("deposit_verification") or {}))
+        except ValidationError as e:
+            # Corrupt/legacy stored config (e.g. a timeout_minutes that no
+            # longer satisfies gt=0) — fall back to the disabled default
+            # rather than 500ing the whole tenant list over one bad row.
+            # This is NOT a benign "off" state: db_resolver.py builds this
+            # same DepositVerificationConfig with no guard, so a row that
+            # lands here is one that makes DbTenantResolver.reload() raise
+            # and leaves every tenant unresolvable. Log it so it's greppable
+            # instead of silently showing "off" while the resolver is down.
+            log.warning(
+                "invalid deposit_verification config for tenant %s (%s); "
+                "showing disabled default — this also breaks DbTenantResolver.reload()",
+                t.id, t.slug, exc_info=e)
+            dv = DepositVerificationConfig()
+        dv_env = dv_env_by_tenant.get(t.id)
+        dv_secret_set = dv_env is not None and (t.id, dv_env) in dv_secret_pairs
         items.append(TenantSummary(
             tenant_id=t.id, slug=t.slug, name=t.name, status=t.status,
             mode=t.mode, max_concurrent_calls=t.max_concurrent_calls,
@@ -1177,6 +1259,16 @@ async def list_tenants(
                 {"webhook:exotel_basic_user", "webhook:exotel_basic_password"} <= names
             ),
             chatwoot_webhook_id_configured="chatwoot:webhook_id" in names,
+            deposit_verification_enabled=dv.enabled,
+            deposit_verification_webhook_url=dv.webhook_url,
+            deposit_verification_secret_set=dv_secret_set,
+            deposit_verification_contract=dv.contract,
+            deposit_verification_timeout_minutes=dv.timeout_minutes,
+            # Mirrors bootstrap.py's registration gate (~:558-566) exactly,
+            # minus the `sessionmaker is not None` leg (a runtime/process
+            # concern this API has no way to inspect) — see TenantSummary's
+            # deposit_verification_active docstring for what that means.
+            deposit_verification_active=bool(dv.enabled and dv.webhook_url and dv_secret_set),
         ))
     return TenantListResponse(tenants=items, total=len(items))
 

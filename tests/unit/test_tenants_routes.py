@@ -976,6 +976,260 @@ async def test_list_tenants_webhook_auth_booleans_flip_after_rotation(ctx) -> No
     assert after["chatwoot_webhook_id_configured"] is True
 
 
+async def test_list_tenants_deposit_verification_defaults_are_inert(ctx) -> None:
+    """A freshly registered tenant has no deposit_verification config at all —
+    every new field must default to the safe/off reading, not None-as-truthy
+    or some other accidental "looks configured" state."""
+    client, _, _ = ctx
+    tid = (await client.post(
+        "/tenants", json=_body(slug="acme"), headers=ADMIN_HEADERS)).json()["tenant_id"]
+    t = next(x for x in (await client.get("/tenants", headers=ADMIN_HEADERS))
+             .json()["tenants"] if x["tenant_id"] == tid)
+    assert t["deposit_verification_enabled"] is False
+    assert t["deposit_verification_webhook_url"] is None
+    assert t["deposit_verification_secret_set"] is False
+    assert t["deposit_verification_contract"] == "multipart_verdict"
+    assert t["deposit_verification_timeout_minutes"] == 5
+    assert t["deposit_verification_active"] is False
+
+
+async def test_list_tenants_deposit_verification_enabled_without_secret_is_not_active(ctx) -> None:
+    """This is the trap the feature exists to surface: `enabled: true` +
+    webhook_url with NO resolvable secret must NOT read as active. Mirrors
+    bootstrap.py's registration gate (~:558-566) — without a resolvable
+    secret the tool never registers, no matter what `enabled` says."""
+    client, _, _ = ctx
+    tid = (await client.post(
+        "/tenants", json=_body(slug="acme"), headers=ADMIN_HEADERS)).json()["tenant_id"]
+    patch = await client.patch(f"/tenants/{tid}", json={
+        "deposit_verification": {
+            "enabled": True,
+            "webhook_url": "https://vendor.example/verify",
+        }
+    }, headers=ADMIN_HEADERS)
+    assert patch.status_code == 200
+
+    t = next(x for x in (await client.get("/tenants", headers=ADMIN_HEADERS))
+             .json()["tenants"] if x["tenant_id"] == tid)
+    assert t["deposit_verification_enabled"] is True
+    assert t["deposit_verification_webhook_url"] == "https://vendor.example/verify"
+    assert t["deposit_verification_secret_set"] is False
+    assert t["deposit_verification_active"] is False
+
+
+async def test_list_tenants_deposit_verification_enabled_without_webhook_url_is_not_active(ctx) -> None:
+    """The other half of the same gate: enabled + a resolvable secret but no
+    webhook_url must also read as inactive."""
+    client, _, _ = ctx
+    tid = (await client.post(
+        "/tenants", json=_body(slug="acme"), headers=ADMIN_HEADERS)).json()["tenant_id"]
+    patch = await client.patch(f"/tenants/{tid}", json={
+        "deposit_verification": {"enabled": True, "webhook_secret": "shared-secret-value"}
+    }, headers=ADMIN_HEADERS)
+    assert patch.status_code == 200
+
+    t = next(x for x in (await client.get("/tenants", headers=ADMIN_HEADERS))
+             .json()["tenants"] if x["tenant_id"] == tid)
+    assert t["deposit_verification_enabled"] is True
+    assert t["deposit_verification_webhook_url"] is None
+    assert t["deposit_verification_secret_set"] is True
+    assert t["deposit_verification_active"] is False
+
+
+async def test_list_tenants_deposit_verification_active_when_fully_configured(ctx) -> None:
+    """Only once ALL three requirements this API can see hold — enabled,
+    webhook_url, and a resolvable secret — does `_active` flip True."""
+    client, _, _ = ctx
+    tid = (await client.post(
+        "/tenants", json=_body(slug="acme"), headers=ADMIN_HEADERS)).json()["tenant_id"]
+    patch = await client.patch(f"/tenants/{tid}", json={
+        "deposit_verification": {
+            "enabled": True,
+            "webhook_url": "https://vendor.example/verify",
+            "webhook_secret": "shared-secret-value",
+            "contract": "json_ticket_relay",
+            "timeout_minutes": 10,
+        }
+    }, headers=ADMIN_HEADERS)
+    assert patch.status_code == 200
+    assert patch.json()["deposit_verification_enabled"] is True
+    assert patch.json()["deposit_verification_secret_set"] is True
+
+    t = next(x for x in (await client.get("/tenants", headers=ADMIN_HEADERS))
+             .json()["tenants"] if x["tenant_id"] == tid)
+    assert t["deposit_verification_enabled"] is True
+    assert t["deposit_verification_webhook_url"] == "https://vendor.example/verify"
+    assert t["deposit_verification_secret_set"] is True
+    assert t["deposit_verification_contract"] == "json_ticket_relay"
+    assert t["deposit_verification_timeout_minutes"] == 10
+    assert t["deposit_verification_active"] is True
+
+    # The webhook secret itself must never round-trip anywhere in the list response.
+    assert "shared-secret-value" not in (await client.get(
+        "/tenants", headers=ADMIN_HEADERS)).text
+
+
+async def test_patch_deposit_verification_rejects_non_positive_durations(ctx) -> None:
+    """timeout_minutes/screenshot_url_ttl_seconds must be rejected at the PATCH
+    (422) rather than committed and then blowing up on every read.
+
+    DepositVerificationConfig enforces gt=0 on both, but this PATCH model sits
+    upstream of it: an unconstrained int here commits to pipeline_config
+    successfully and only fails when something CONSTRUCTS the config. That
+    something includes DbTenantResolver.reload(), which builds the model for
+    every tenant in one pass and swaps in its caches only if the whole loop
+    succeeds — so a single 0 stored here leaves EVERY tenant unresolvable on
+    the next reload, not just this one. The write and the read must agree.
+    """
+    client, _, _ = ctx
+    tid = (await client.post(
+        "/tenants", json=_body(slug="acme"), headers=ADMIN_HEADERS)).json()["tenant_id"]
+
+    for field in ("timeout_minutes", "screenshot_url_ttl_seconds"):
+        for bad in (0, -1):
+            resp = await client.patch(f"/tenants/{tid}", json={
+                "deposit_verification": {field: bad},
+            }, headers=ADMIN_HEADERS)
+            assert resp.status_code == 422, f"{field}={bad} was accepted"
+
+    # And nothing was persisted by the rejected calls — the stored config must
+    # still construct cleanly, which is the property the resolver depends on.
+    t = next(x for x in (await client.get("/tenants", headers=ADMIN_HEADERS))
+             .json()["tenants"] if x["tenant_id"] == tid)
+    assert t["deposit_verification_timeout_minutes"] == 5   # untouched default
+
+
+async def test_patch_deposit_verification_empty_secret_is_not_a_secret(ctx) -> None:
+    """An empty-string webhook_secret must NOT register as a configured secret.
+
+    bootstrap.py gates registration on secret_optional(...) being truthy, so a
+    stored "" means the tool never registers. If the PATCH accepted "" as a
+    secret, `_secret_set` and `_active` would both read True for a feature that
+    does nothing — the exact false-positive `_active` exists to prevent, and
+    the one an operator would most reasonably trust.
+
+    It must also not clobber an existing working secret: a blank field in the
+    UI means "leave unchanged", not "erase".
+    """
+    client, _, _ = ctx
+    tid = (await client.post(
+        "/tenants", json=_body(slug="acme"), headers=ADMIN_HEADERS)).json()["tenant_id"]
+
+    resp = await client.patch(f"/tenants/{tid}", json={
+        "deposit_verification": {
+            "enabled": True,
+            "webhook_url": "https://vendor.example/verify",
+            "webhook_secret": "",
+        }
+    }, headers=ADMIN_HEADERS)
+    assert resp.status_code == 200
+    assert resp.json()["deposit_verification_secret_set"] is False
+
+    t = next(x for x in (await client.get("/tenants", headers=ADMIN_HEADERS))
+             .json()["tenants"] if x["tenant_id"] == tid)
+    assert t["deposit_verification_secret_set"] is False
+    assert t["deposit_verification_active"] is False, (
+        "enabled + webhook_url + an EMPTY secret must not read as active"
+    )
+
+    # A real secret, then a blank one: the blank must leave the real one alone.
+    await client.patch(f"/tenants/{tid}", json={
+        "deposit_verification": {"webhook_secret": "shared-secret-value"},
+    }, headers=ADMIN_HEADERS)
+    await client.patch(f"/tenants/{tid}", json={
+        "deposit_verification": {"webhook_secret": ""},
+    }, headers=ADMIN_HEADERS)
+    t = next(x for x in (await client.get("/tenants", headers=ADMIN_HEADERS))
+             .json()["tenants"] if x["tenant_id"] == tid)
+    assert t["deposit_verification_secret_set"] is True, (
+        "a blank secret erased a previously configured one"
+    )
+    assert t["deposit_verification_active"] is True
+
+
+async def test_list_tenants_deposit_verification_disabling_deactivates(ctx) -> None:
+    """A fully-configured tenant that later flips `enabled: false` must go
+    inactive immediately — a stale `_active: true` would be worse than the
+    original invisible bug, since it actively lies about the tool state."""
+    client, _, _ = ctx
+    tid = (await client.post(
+        "/tenants", json=_body(slug="acme"), headers=ADMIN_HEADERS)).json()["tenant_id"]
+    await client.patch(f"/tenants/{tid}", json={
+        "deposit_verification": {
+            "enabled": True,
+            "webhook_url": "https://vendor.example/verify",
+            "webhook_secret": "shared-secret-value",
+        }
+    }, headers=ADMIN_HEADERS)
+    await client.patch(f"/tenants/{tid}", json={
+        "deposit_verification": {"enabled": False}
+    }, headers=ADMIN_HEADERS)
+
+    t = next(x for x in (await client.get("/tenants", headers=ADMIN_HEADERS))
+             .json()["tenants"] if x["tenant_id"] == tid)
+    assert t["deposit_verification_enabled"] is False
+    # The secret and webhook_url are untouched by this PATCH (partial-override
+    # semantics) — only `enabled` should have moved.
+    assert t["deposit_verification_secret_set"] is True
+    assert t["deposit_verification_webhook_url"] == "https://vendor.example/verify"
+    assert t["deposit_verification_active"] is False
+
+
+async def test_list_tenants_deposit_verification_secret_lookup_is_one_query_not_n_plus_one(ctx) -> None:
+    """The per-tenant deposit_verification secret name (TENANT_{SLUG}_..., set
+    at :676) can't join the fixed-name webhook-creds IN(...) query above, so
+    it needs its OWN query — but still exactly ONE for the whole list, not one
+    per tenant. Proven here by counting actual SQL against tenant_secrets
+    while listing 3 tenants, each with its own distinct deposit_verification
+    secret: an N+1 would show up as 4 SELECTs (1 fixed-name + 3 per-tenant)
+    instead of 2 (1 fixed-name + 1 batched dv lookup)."""
+    from sqlalchemy import event
+    from sqlalchemy.engine import Engine
+
+    client, _, _ = ctx
+    tids = []
+    for i, slug in enumerate(("acme", "beta", "gamma")):
+        # Each registration needs its own phone number — tenant_phone_numbers
+        # has a UNIQUE constraint on phone_number, unrelated to what this test
+        # is checking.
+        number = f"+1570525567{i}"
+        body = _body(slug=slug)
+        body["telephony"]["from_number"] = number
+        body["telephony"]["phone_numbers"] = [number]
+        tid = (await client.post(
+            "/tenants", json=body, headers=ADMIN_HEADERS)).json()["tenant_id"]
+        patch = await client.patch(f"/tenants/{tid}", json={
+            "deposit_verification": {
+                "enabled": True,
+                "webhook_url": "https://vendor.example/verify",
+                "webhook_secret": f"secret-for-{slug}",
+            }
+        }, headers=ADMIN_HEADERS)
+        assert patch.status_code == 200
+        tids.append(tid)
+
+    secret_selects: list[str] = []
+
+    def _count(conn, cursor, statement, parameters, context, executemany):
+        s = statement.strip().lower()
+        if "tenant_secrets" in s and s.startswith("select"):
+            secret_selects.append(statement)
+
+    event.listen(Engine, "before_cursor_execute", _count)
+    try:
+        resp = await client.get("/tenants", headers=ADMIN_HEADERS)
+    finally:
+        event.remove(Engine, "before_cursor_execute", _count)
+
+    assert resp.status_code == 200
+    assert len(secret_selects) == 2, secret_selects
+    body = resp.json()
+    for slug, tid in zip(("acme", "beta", "gamma"), tids):
+        t = next(x for x in body["tenants"] if x["tenant_id"] == tid)
+        assert t["deposit_verification_secret_set"] is True, slug
+        assert t["deposit_verification_active"] is True, slug
+
+
 @pytest.fixture
 def json_log_stream():
     """Install the REAL production logging config, redirected to a buffer —

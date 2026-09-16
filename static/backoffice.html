@@ -88,6 +88,7 @@
       <div class="tab" id="tab_kb" onclick="showTab('kb')">Knowledge Base</div>
       <div class="tab" id="tab_bill" onclick="showTab('bill')">Billing</div>
       <div class="tab" id="tab_tel" onclick="showTab('tel')">Telephony</div>
+      <div class="tab" id="tab_dv" onclick="showTab('dv')">Deposit verification</div>
     </div>
     <div id="pane_an"></div>
     <div id="pane_pipe" hidden></div>
@@ -97,6 +98,7 @@
     <div id="pane_kb" hidden></div>
     <div id="pane_bill" hidden></div>
     <div id="pane_tel" hidden></div>
+    <div id="pane_dv" hidden></div>
   </div>
 </div>
 
@@ -176,9 +178,10 @@ async function selectTenant(id, slug) {
   loadCampaigns(id);
   loadChat(id, slug);
   loadKB(id, slug);
+  loadDepositVerification(id);
 }
 function showTab(which) {
-  for (const k of ["an", "pipe", "crm", "camp", "chat", "kb", "bill", "tel"]) {
+  for (const k of ["an", "pipe", "crm", "camp", "chat", "kb", "bill", "tel", "dv"]) {
     const tabEl = $("tab_" + k);
     if (tabEl) tabEl.classList.toggle("active", which === k);
     $("pane_" + k).hidden = which !== k;
@@ -898,6 +901,135 @@ async function saveTelephony(id) {
     $("te_result").textContent = "✓ saved — resolver refreshed";
   } else {
     $("te_result").textContent = `✗ ${r.status}: ${r.json.detail || r.json.error || "error"}`;
+  }
+}
+
+// --- Deposit verification --------------------------------------------------
+// Registering the LLM tool for this requires ALL of: enabled, webhook_url,
+// AND a resolvable shared secret (see src/bootstrap.py:558-566) — a tenant
+// with `enabled: true` and nothing else PATCHed is fully valid and changes
+// NOTHING, because the tool still never registers. `deposit_verification_active`
+// (src/api/tenants.py) mirrors that gate; this pane exists specifically so an
+// operator can't mistake "I flipped enabled" for "it's working" — see
+// dvStateHtml's warning branch below.
+function dvStateHtml(t) {
+  if (!t.deposit_verification_enabled) {
+    return `<div class="hint">Deposit verification is <b>off</b> for this tenant. The LLM tool is not registered.</div>`;
+  }
+  if (t.deposit_verification_active) {
+    return `<div class="hint">Deposit verification is <b>on and active</b> — the LLM tool is registered.</div>`;
+  }
+  // enabled but NOT active — name exactly which of the two API-visible
+  // requirements is missing (bootstrap.py's third requirement, a running
+  // sessionmaker, isn't checkable from here — see TenantSummary's comment).
+  const missing = [];
+  if (!t.deposit_verification_webhook_url) missing.push("a webhook URL");
+  if (!t.deposit_verification_secret_set) missing.push("a resolvable webhook secret");
+  return `<div class="warnbox">
+    <div style="font-weight:700;color:#fca5a5;margin-bottom:.4rem;">Enabled but INERT — missing ${escT(missing.join(" and "))}</div>
+    <div>"Enabled" is set, but the tool is <b>not registered</b> and this feature does <b>nothing</b> right now —
+    the LLM will never offer deposit verification to a customer. Set ${escT(missing.join(" and "))} below and save
+    to actually turn it on.</div>
+  </div>`;
+}
+
+function loadDepositVerification(id) {
+  const t = (window.TENANTS || {})[id] || {};
+  $("pane_dv").innerHTML = `
+    <div class="hint" style="margin-bottom:.6rem;">
+      Deposit-dispute screenshot verification webhook (<code>deposit_verification</code>). PATCHes
+      <code>/api/v1/tenants/${id}</code> with a <code>deposit_verification</code> block; only fields you touch
+      below are sent.
+    </div>
+    <h2>Current state</h2>
+    <div class="kv" style="margin-bottom:.6rem;">
+      <div>Enabled: <b>${t.deposit_verification_enabled ? "yes" : "no"}</b></div>
+      <div>Active (tool actually registered): <b>${t.deposit_verification_active ? "yes" : "no"}</b></div>
+      <div>Webhook URL: ${t.deposit_verification_webhook_url ? escT(t.deposit_verification_webhook_url) : '<span class="hint">not set</span>'}</div>
+      <div>Contract: ${t.deposit_verification_contract ? escT(t.deposit_verification_contract) : '<span class="hint">—</span>'}</div>
+      <div>Timeout: ${t.deposit_verification_timeout_minutes != null ? t.deposit_verification_timeout_minutes + " min" : '<span class="hint">—</span>'}</div>
+      <div>Shared webhook secret: <b>${t.deposit_verification_secret_set ? "configured" : "not configured"}</b></div>
+    </div>
+    ${dvStateHtml(t)}
+    <h2 style="margin-top:1.1rem;">Edit</h2>
+    <div class="creds" style="gap:.6rem;flex-wrap:wrap;">
+      <label>Enabled <small class="hint">(current: ${t.deposit_verification_enabled ? "enabled" : "disabled"})</small>
+        <select id="dv_enabled">
+          <option value="">— leave unchanged —</option>
+          <option value="true">enabled</option>
+          <option value="false">disabled</option>
+        </select>
+      </label>
+      <label>Webhook URL <small class="hint">(current: ${t.deposit_verification_webhook_url ? escT(t.deposit_verification_webhook_url) : "not set"})</small>
+        <input id="dv_webhook_url" style="width:22rem" placeholder="blank = leave unchanged" /></label>
+      <label>Contract <small class="hint">(current: ${escT(t.deposit_verification_contract || "—")} · independent,
+        incompatible contracts — a mismatch is not caught when you save; it surfaces later as a rejected
+        inbound callback logged with reason="wrong_contract")</small>
+        <select id="dv_contract">
+          <option value="">— leave unchanged —</option>
+          <option value="multipart_verdict">multipart_verdict</option>
+          <option value="json_ticket_relay">json_ticket_relay</option>
+        </select>
+      </label>
+      <label>Timeout (minutes) <small class="hint">(current: ${t.deposit_verification_timeout_minutes ?? "—"}; must be &gt; 0)</small>
+        <input id="dv_timeout_minutes" type="number" min="1" step="1" placeholder="blank = leave unchanged" /></label>
+      <label>Screenshot URL TTL (seconds) <small class="hint">(must be &gt; 0)</small>
+        <input id="dv_ttl_seconds" type="number" min="1" step="1" placeholder="blank = leave unchanged" /></label>
+      <label>Mobile metadata keys <small class="hint">(comma-separated; <code>json_ticket_relay</code> only)</small>
+        <input id="dv_mobile_keys" style="width:16rem" placeholder="blank = leave unchanged" /></label>
+      <label>Webhook secret <small class="hint">(currently ${t.deposit_verification_secret_set ? "set" : "not set"}
+        · <b>shared</b> value — the vendor must hold the identical secret, or their verdict callback is
+        rejected as unsigned (401); write-only, never shown again after saving)</small>
+        <input id="dv_webhook_secret" type="password" style="width:18rem" placeholder="blank = leave unchanged" /></label>
+    </div>
+    <div style="margin-top:.9rem;">
+      <button id="dv_save_btn" onclick="saveDepositVerification('${id}')">Save deposit verification</button>
+      <span id="dv_result" class="hint" style="margin-left:.6rem;"></span>
+    </div>
+    <div id="dv_error" style="margin-top:.6rem;"></div>`;
+}
+
+async function saveDepositVerification(id) {
+  const v = (x) => { const el = $(x); return el ? (el.value || "").trim() : ""; };
+  const dv = {};
+  const enabled = v("dv_enabled");
+  if (enabled) dv.enabled = enabled === "true";
+  const webhookUrl = v("dv_webhook_url");
+  if (webhookUrl) dv.webhook_url = webhookUrl;
+  const contract = v("dv_contract");
+  if (contract) dv.contract = contract;
+  const timeoutMinutes = v("dv_timeout_minutes");
+  if (timeoutMinutes) dv.timeout_minutes = Number(timeoutMinutes);
+  const ttlSeconds = v("dv_ttl_seconds");
+  if (ttlSeconds) dv.screenshot_url_ttl_seconds = Number(ttlSeconds);
+  const mobileKeys = v("dv_mobile_keys");
+  if (mobileKeys) dv.mobile_metadata_keys = mobileKeys.split(",").map(s => s.trim()).filter(Boolean);
+  const webhookSecret = v("dv_webhook_secret");
+  if (webhookSecret) dv.webhook_secret = webhookSecret;
+
+  if (!Object.keys(dv).length) { $("dv_result").textContent = "Nothing changed — pick a value to update first."; return; }
+
+  const btn = $("dv_save_btn");
+  btn.disabled = true;
+  $("dv_result").textContent = "saving…";
+  $("dv_error").innerHTML = "";
+  const r = await apiSend("PATCH", `/api/v1/tenants/${id}`, { deposit_verification: dv });
+  btn.disabled = false;
+  if (r.ok) {
+    $("dv_result").textContent =
+      `✓ saved — enabled=${r.json.deposit_verification_enabled}, secret set=${r.json.deposit_verification_secret_set}`;
+    await loadTenants();          // refresh window.TENANTS with the now-effective values (incl. _active)
+    loadDepositVerification(id);  // re-render so the state panel reflects reality, not the stale form
+  } else {
+    // Includes the VOX_SECRET_KEY-unset 503 (src/api/tenants.py:674-676) — its
+    // detail string is specific enough to act on, so surface it verbatim via
+    // formatApiError rather than a bare "save failed".
+    $("dv_result").textContent = `✗ save failed (${r.status})`;
+    $("dv_error").innerHTML = `<div class="warnbox">
+      <div style="font-weight:700;color:#fca5a5;margin-bottom:.4rem;">Rejected — nothing was saved</div>
+      <pre style="white-space:pre-wrap;word-break:break-word;margin:0;">${escT(formatApiError(r.json))}</pre>
+    </div>`;
+    // Form is left exactly as entered so the admin can fix and retry.
   }
 }
 
