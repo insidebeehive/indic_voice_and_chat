@@ -39,7 +39,12 @@ MODELS: dict[str, dict[str, list[str]]] = {
         ],
     },
     "tts": {
-        "sarvam": ["bulbul:v2", "bulbul:v3", "bulbul:v3-beta"],
+        # "bulbul:v2" was deprecated by Sarvam in 2026-09 (the API 400s on it
+        # now — "has been deprecated. Please use 'bulbul:v3' instead.") and is
+        # dropped here so the registration UI stops offering a model the API
+        # rejects. "bulbul:v3" is the recommended default (see
+        # src.providers.tts.sarvam.DEFAULT_MODEL).
+        "sarvam": ["bulbul:v3", "bulbul:v3-beta"],
         # Self-hosted fine-tuned IndicF5 voice server (one model = one voice).
         "indicf5": ["indicf5-finetuned"],
     },

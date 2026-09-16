@@ -34,34 +34,86 @@ _TTS_ATTEMPTS = 2  # initial try + 1 retry
 
 
 SARVAM_BASE_URL = "https://api.sarvam.ai"
-DEFAULT_MODEL = "bulbul:v2"
-DEFAULT_SPEAKER = "anushka"
+DEFAULT_MODEL = "bulbul:v3"
+# Female default: campaigns configured for a female agent (see
+# ``build_voicebot_system_prompt``'s gender directive, which is driven by
+# ``agent.gender`` and picks gendered Hindi/Marathi grammatical forms) rely on
+# the speaker's gender matching. ``priya`` is a verified-working (16 kHz,
+# hand-tested against the live API 2026-09) unambiguous female v3 speaker —
+# same choice Sarvam's own docs call out as a top pick for Indian-language
+# coverage.
+DEFAULT_SPEAKER = "priya"
 
-# Per Sarvam's current ``bulbul:v2`` speaker roster. ``bulbul:v1`` was
-# retired in 2025 (the API now only accepts ``bulbul:v2``, ``bulbul:v3``,
-# or ``bulbul:v3-beta``). ``meera`` / ``arjun`` no longer exist as speakers.
+# bulbul:v2 was deprecated by Sarvam in 2026-09 (the API now rejects it with
+# "Model 'bulbul:v2' has been deprecated. Please use 'bulbul:v3' instead.");
+# bulbul:v1 was retired earlier, in 2025. As of 2026-09 the API accepts
+# ``bulbul:v3`` and ``bulbul:v3-beta`` only. ``anushka``/``meera``/``arjun``
+# (the old v1/v2 speakers) do not exist on v3 — attempting them 400s with
+# "Speaker '<x>' is not compatible with model bulbul:v3."
 #
-# In bulbul:v2 the speaker set is the SAME across every supported target
+# In bulbul:v3 the speaker set is the SAME across every supported target
 # language (the model is multilingual — a speaker renders any of the languages
 # below), so we apply one canonical roster to all of them.
-_BULBUL_V2_SPEAKERS: list[dict] = [
-    {"voice_id": "anushka", "gender": "female"},
-    {"voice_id": "manisha", "gender": "female"},
-    {"voice_id": "vidya", "gender": "female"},
-    {"voice_id": "arya", "gender": "female"},
-    {"voice_id": "abhilash", "gender": "male"},
-    {"voice_id": "karun", "gender": "male"},
-    {"voice_id": "hitesh", "gender": "male"},
+#
+# Roster + genders below are cross-checked against Sarvam's public docs
+# (docs.sarvam.ai "change the speaker voice" how-to, 2026-09) rather than the
+# API itself (which doesn't publish gender). Two names carry real everyday
+# ambiguity in India regardless of what the docs list them as — "mani" (also
+# used as a short form of female names like Manisha/Manjula, though the docs
+# list it male) and "sunny" (used by both e.g. actor Sunny Deol (m) and
+# performer Sunny Leone (f), though the docs list it male) — flagged here
+# rather than silently trusted; verify before relying on either for a
+# gender-sensitive campaign.
+_BULBUL_V3_SPEAKERS: list[dict] = [
+    {"voice_id": "aditya", "gender": "male"},
+    {"voice_id": "ritu", "gender": "female"},
+    {"voice_id": "ashutosh", "gender": "male"},
+    {"voice_id": "priya", "gender": "female"},
+    {"voice_id": "neha", "gender": "female"},
+    {"voice_id": "rahul", "gender": "male"},
+    {"voice_id": "pooja", "gender": "female"},
+    {"voice_id": "rohan", "gender": "male"},
+    {"voice_id": "simran", "gender": "female"},
+    {"voice_id": "kavya", "gender": "female"},
+    {"voice_id": "amit", "gender": "male"},
+    {"voice_id": "dev", "gender": "male"},
+    {"voice_id": "ishita", "gender": "female"},
+    {"voice_id": "shreya", "gender": "female"},
+    {"voice_id": "ratan", "gender": "male"},
+    {"voice_id": "varun", "gender": "male"},
+    {"voice_id": "manan", "gender": "male"},
+    {"voice_id": "sumit", "gender": "male"},
+    {"voice_id": "roopa", "gender": "female"},
+    {"voice_id": "kabir", "gender": "male"},
+    {"voice_id": "aayan", "gender": "male"},
+    {"voice_id": "shubh", "gender": "male"},
+    {"voice_id": "advait", "gender": "male"},
+    {"voice_id": "anand", "gender": "male"},
+    {"voice_id": "tanya", "gender": "female"},
+    {"voice_id": "tarun", "gender": "male"},
+    {"voice_id": "sunny", "gender": "male"},   # unconfirmed — see note above
+    {"voice_id": "mani", "gender": "male"},    # unconfirmed — see note above
+    {"voice_id": "gokul", "gender": "male"},
+    {"voice_id": "vijay", "gender": "male"},
+    {"voice_id": "shruti", "gender": "female"},
+    {"voice_id": "suhani", "gender": "female"},
+    {"voice_id": "mohit", "gender": "male"},
+    {"voice_id": "kavitha", "gender": "female"},
+    {"voice_id": "rehan", "gender": "male"},
+    {"voice_id": "soham", "gender": "male"},
+    {"voice_id": "rupali", "gender": "female"},
 ]
 
-# Target languages bulbul:v2 supports (BCP-47 codes the API accepts).
-_BULBUL_V2_LANGUAGES = [
+# Target languages bulbul:v3 supports (BCP-47 codes the API accepts). Same 11
+# as bulbul:v2 — cross-checked against Sarvam's public model docs (2026-09),
+# not independently confirmed against the live API by this change.
+_BULBUL_V3_LANGUAGES = [
     "hi-IN", "en-IN", "bn-IN", "gu-IN", "kn-IN", "ml-IN",
     "mr-IN", "od-IN", "pa-IN", "ta-IN", "te-IN",
 ]
 
 LANGUAGE_VOICES: dict[str, list[dict]] = {
-    lang: [dict(s) for s in _BULBUL_V2_SPEAKERS] for lang in _BULBUL_V2_LANGUAGES
+    lang: [dict(s) for s in _BULBUL_V3_SPEAKERS] for lang in _BULBUL_V3_LANGUAGES
 }
 
 
@@ -123,6 +175,17 @@ class SarvamTTSAdapter(ITTSProvider):
                     log.warning("sarvam tts %s (attempt %d/%d); retrying",
                                 e.response.status_code, attempt + 1, _TTS_ATTEMPTS)
                     continue
+                if e.response.status_code < 500:
+                    # A 4xx means WE sent something wrong (bad model/speaker/
+                    # param) and Sarvam's response body says exactly what —
+                    # e.g. "Model 'bulbul:v2' has been deprecated." Log it
+                    # before raising, or the only thing that reaches the log
+                    # is httpx's uninformative "Client error '400 ...'" status
+                    # line and diagnosing requires reproducing the call by
+                    # hand. Never log the request body/headers here — they
+                    # carry the API key and the customer's text.
+                    log.error("sarvam tts %s: %s", e.response.status_code,
+                              e.response.text[:500])
                 raise
         if payload is None:
             raise last_exc  # type: ignore[misc]  # set whenever the loop didn't break

@@ -185,7 +185,7 @@ async def test_get_voices_sarvam(client: AsyncClient) -> None:
     assert resp.status_code == 200
     voices = resp.json()["voices"]
     voice_ids = {v["voice_id"] for v in voices}
-    assert {"anushka", "abhilash"} <= voice_ids
+    assert {"priya", "aditya"} <= voice_ids  # bulbul:v3 roster (v2's anushka/abhilash are gone)
     assert all(v["gender"] in ("male", "female") for v in voices)
 
 

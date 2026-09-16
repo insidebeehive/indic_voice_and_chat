@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import base64
 import io
+import logging
 import os
 import wave
 from typing import Any, AsyncIterator
@@ -19,6 +20,8 @@ from typing import Any, AsyncIterator
 import httpx
 
 from src.interfaces.stt import ISTTProvider, STTConfig, STTResult
+
+log = logging.getLogger(__name__)
 
 _BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"
 _DEFAULT_MODEL = "gemini-3.5-flash"  # 2.5-flash 404s on new Gemini projects
@@ -82,7 +85,17 @@ class GeminiSTTAdapter(ISTTProvider):
         url = f"{_BASE_URL}/{self._model}:generateContent?key={self._api_key}"
         async with httpx.AsyncClient(timeout=self._timeout) as client:
             resp = await client.post(url, json=body)
-            resp.raise_for_status()
+            try:
+                resp.raise_for_status()
+            except httpx.HTTPStatusError as e:
+                # A 4xx means WE sent something wrong (bad model id, payload
+                # shape, etc.) — Gemini's body says what. Log it before
+                # raising, or only httpx's status line reaches the log. Never
+                # log the request body — it carries the caller's audio.
+                if e.response.status_code < 500:
+                    log.error("gemini stt %s: %s", e.response.status_code,
+                              e.response.text[:500])
+                raise
             payload = resp.json()
 
         text = ""

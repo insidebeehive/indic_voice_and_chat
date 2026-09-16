@@ -79,6 +79,52 @@ async def test_synthesize_does_not_retry_4xx(adapter: SarvamTTSAdapter) -> None:
 
 @pytest.mark.asyncio
 @respx.mock
+async def test_synthesize_logs_4xx_body_before_raising(
+    adapter: SarvamTTSAdapter, caplog,
+) -> None:
+    # The whole point of this fix: a 4xx means WE sent something wrong, and
+    # Sarvam's response body says exactly what (e.g. "Model 'bulbul:v2' has
+    # been deprecated."). Previously only httpx's uninformative status line
+    # reached the log; the body was discarded.
+    respx.post(f"{SARVAM_BASE_URL}/text-to-speech").mock(
+        return_value=Response(
+            400,
+            json={"error": {"message": "Model 'bulbul:v2' has been deprecated.",
+                             "code": "invalid_request_error"}},
+        )
+    )
+    with caplog.at_level("ERROR", logger="src.providers.tts.sarvam"):
+        with pytest.raises(httpx.HTTPStatusError):
+            await adapter.synthesize("Namaste", TTSConfig(voice_id="priya"))
+
+    logged = "\n".join(r.getMessage() for r in caplog.records)
+    assert "bulbul:v2" in logged and "deprecated" in logged
+    # Never log the API key or the request payload (customer text/speaker) —
+    # only the provider's error response body.
+    assert "test-key" not in logged
+    assert "Namaste" not in logged
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_synthesize_5xx_still_retries_after_body_logging_change(
+    adapter: SarvamTTSAdapter,
+) -> None:
+    # The 4xx body-logging fix must not disturb the existing 5xx retry path.
+    pcm = b"\x01\x02" * 8
+    route = respx.post(f"{SARVAM_BASE_URL}/text-to-speech").mock(
+        side_effect=[
+            Response(503, text="upstream overloaded"),
+            Response(200, json={"audios": [base64.b64encode(pcm).decode()]}),
+        ]
+    )
+    result = await adapter.synthesize("Namaste", TTSConfig(language="hi-IN"))
+    assert route.call_count == 2
+    assert result.audio == pcm
+
+
+@pytest.mark.asyncio
+@respx.mock
 async def test_synthesize_raises_when_no_audio(adapter: SarvamTTSAdapter) -> None:
     respx.post(f"{SARVAM_BASE_URL}/text-to-speech").mock(
         return_value=Response(200, json={"audios": []})
@@ -116,8 +162,35 @@ async def test_synthesize_stream_yields_per_segment(adapter: SarvamTTSAdapter) -
 
 def test_get_available_voices(adapter: SarvamTTSAdapter) -> None:
     hi = adapter.get_available_voices("hi-IN")
-    assert any(v["voice_id"] == "anushka" for v in hi)
+    assert any(v["voice_id"] == "priya" for v in hi)
     assert adapter.get_available_voices("xx-XX") == []
+
+
+def test_get_available_voices_only_v3_speakers(adapter: SarvamTTSAdapter) -> None:
+    # bulbul:v2 speakers (anushka, manisha, vidya, arya, abhilash, karun,
+    # hitesh) don't exist on bulbul:v3 — a stale roster here means the
+    # operator-facing voice dropdown offers speakers the API 400s on.
+    from src.providers.tts.sarvam import _BULBUL_V3_SPEAKERS
+
+    roster_ids = {v["voice_id"] for v in _BULBUL_V3_SPEAKERS}
+    hi = adapter.get_available_voices("hi-IN")
+    assert hi  # non-empty
+    assert {v["voice_id"] for v in hi} == roster_ids
+    assert "anushka" not in roster_ids
+
+
+def test_default_model_and_speaker_are_v3_valid() -> None:
+    # Regression guard: a future edit that reintroduces a non-roster default
+    # (e.g. reverting to bulbul:v2/anushka) must fail loudly here rather than
+    # only failing in production against the live API.
+    from src.providers.tts.sarvam import (
+        _BULBUL_V3_SPEAKERS,
+        DEFAULT_MODEL,
+        DEFAULT_SPEAKER,
+    )
+
+    assert DEFAULT_MODEL == "bulbul:v3"
+    assert DEFAULT_SPEAKER in {v["voice_id"] for v in _BULBUL_V3_SPEAKERS}
 
 
 @pytest.mark.asyncio

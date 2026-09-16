@@ -156,7 +156,7 @@ async def test_sarvam_tts_smoke(dev_tenant_ctx: TenantContext, capsys) -> None:
         "Namaste, yeh ek test message hai.",
         TTSConfig(
             language="hi-IN",
-            voice_id=dev_tenant_ctx.settings.pipeline.tts.voice_id or "anushka",
+            voice_id=dev_tenant_ctx.settings.pipeline.tts.voice_id or "priya",
             sample_rate=16000,
         ),
     )

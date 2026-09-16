@@ -99,9 +99,9 @@ pipeline:
 
   tts:
     provider: sarvam
-    model: bulbul:v2
+    model: bulbul:v3
     language: hi-IN
-    voice_id: anushka
+    voice_id: priya  # bulbul:v2 + anushka were deprecated 2026-09; priya is v3's female equivalent
     speed: 1.0
     # no api_key_env needed — STT/LLM/TTS/realtime always use the platform master key
 

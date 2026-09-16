@@ -33,6 +33,11 @@ pipeline:
 
   tts:
     provider: sarvam
+    # Pinned explicitly (bulbul:v2 was deprecated by Sarvam 2026-09; the
+    # adapter's own DEFAULT_MODEL falls back to this too, but spelling it out
+    # here means a future adapter-default change can't silently retarget
+    # every tenant that inherits this config).
+    model: bulbul:v3
     language: hi-IN
     voice_id: null
     speed: 1.0

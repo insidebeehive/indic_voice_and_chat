@@ -10,12 +10,15 @@ Env vars:
 
 from __future__ import annotations
 
+import logging
 import os
 from typing import Any, AsyncIterator
 
 import httpx
 
 from src.interfaces.tts import ITTSProvider, TTSConfig, TTSResult
+
+log = logging.getLogger(__name__)
 
 _TIMEOUT = 12.0
 
@@ -118,7 +121,18 @@ class AzureTTSAdapter(ITTSProvider):
         }
         async with httpx.AsyncClient(timeout=self._timeout) as client:
             resp = await client.post(self._tts_url, headers=headers, content=ssml.encode())
-            resp.raise_for_status()
+            try:
+                resp.raise_for_status()
+            except httpx.HTTPStatusError as e:
+                # A 4xx means WE sent something wrong (bad voice name, format,
+                # etc.) and Azure's body says what — log it before raising, or
+                # only httpx's uninformative status line reaches the log.
+                # Never log headers/SSML — they carry the subscription key
+                # and the customer's text.
+                if e.response.status_code < 500:
+                    log.error("azure tts %s: %s", e.response.status_code,
+                              e.response.text[:500])
+                raise
         pcm = resp.content
         return TTSResult(
             audio=pcm,

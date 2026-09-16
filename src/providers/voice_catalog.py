@@ -54,7 +54,7 @@ _GEMINI_LIVE_VOICES = [
 def list_voices(provider: str, language: str = "hi-IN") -> list[dict]:
     """Return ``[{voice_id, gender}, ...]`` for a provider (+ language for TTS).
 
-    Empty list for an unknown provider/language. Sarvam ``bulbul:v2`` roster comes
+    Empty list for an unknown provider/language. Sarvam ``bulbul:v3`` roster comes
     straight from the adapter's ``LANGUAGE_VOICES`` (no key needed).
     """
     p = (provider or "").lower()
