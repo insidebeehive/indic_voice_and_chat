@@ -26,6 +26,11 @@ Schema (all sections optional — global defaults fill the gaps):
         provider: sarvam
         voice_id: meera
         # same as above: TTS always uses the platform master key.
+      chat_voice:                     # CHAT voice-note replies only (not calls)
+        enabled: false                # opt-in; TTS is billed per reply
+        tts:                          # optional — falls back to pipeline.tts
+          provider: sarvam
+          voice_id: priya
       telephony:
         provider: twilio
         from_number: "+918888888888"
@@ -130,6 +135,33 @@ class TenantTTSConfig(BaseModel):
     voice_id: Optional[str] = None
     speed: Optional[float] = None
     api_key_env: Optional[str] = None
+
+
+class ChatVoiceConfig(BaseModel):
+    """Voice-note replies in CHAT — deliberately separate from the voice-call
+    cascade's ``pipeline.tts``.
+
+    ``enabled`` is opt-in and defaults to False on purpose: TTS is billed per
+    character/second by every provider wired here, on every synthesized reply.
+    A tenant that never asked for spoken chat replies must not start incurring
+    that cost merely because one of its customers sent a voice note. Off means
+    the customer still gets the full TEXT answer — nothing is lost but the
+    audio half (see ``_synthesize_reply_audio`` in src/api/chat.py).
+
+    ``tts`` is the chat-specific TTS block. It exists because an s2s tenant
+    (pipeline.mode == "s2s", calls handled end-to-end by pipeline.realtime)
+    legitimately has NO ``pipeline.tts`` at all — validate_credentials has
+    never required one. Resolving chat replies through ``pipeline.tts`` for
+    such a tenant fell all the way through to the PLATFORM default in
+    config/default.yaml (sarvam) and the platform's own SARVAM_API_KEY,
+    silently billing the platform for that tenant's chat audio. Leave this
+    empty and the tenant's own ``pipeline.tts`` is reused instead (the sane
+    default for a layered tenant that already pays for a cascade voice); leave
+    both empty and there is no chat TTS at all — see
+    ``resolve_chat_tts_config``.
+    """
+    enabled: bool = False
+    tts: TenantTTSConfig = Field(default_factory=TenantTTSConfig)
 
 
 class TelephonyCreds(BaseModel):
@@ -314,6 +346,35 @@ class TenantPipelineConfig(BaseModel):
     tts: TenantTTSConfig = Field(default_factory=TenantTTSConfig)
     telephony: TenantTelephonyConfig = Field(default_factory=TenantTelephonyConfig)
     vector_store: TenantVectorStoreConfig = Field(default_factory=TenantVectorStoreConfig)
+    chat_voice: ChatVoiceConfig = Field(default_factory=ChatVoiceConfig)
+
+
+def resolve_chat_tts_config(pipeline: TenantPipelineConfig) -> Optional[TenantTTSConfig]:
+    """The EFFECTIVE TTS config for chat voice-note replies, or None.
+
+    Precedence:
+      1. ``pipeline.chat_voice.tts`` when it declares a provider — the chat
+         override.
+      2. else ``pipeline.tts`` when IT declares a provider — a layered tenant
+         reusing the cascade voice it already configured and pays for.
+      3. else None — nothing resolvable. Callers MUST NOT fall through to the
+         platform default here: that is the silent-platform-billing bug this
+         function exists to prevent (an s2s tenant has no pipeline.tts at all).
+
+    ``provider`` is the discriminator, not "any field set": a block with only
+    e.g. ``voice_id`` and no provider cannot build a client, so it falls
+    through rather than half-resolving.
+
+    Deliberately ignores ``chat_voice.enabled`` — this answers "what WOULD be
+    used", which is what both callers need: the registry checks ``enabled``
+    separately, and ``validate_credentials`` must flag the enabled-but-
+    unresolvable combination.
+    """
+    if pipeline.chat_voice.tts.provider:
+        return pipeline.chat_voice.tts
+    if pipeline.tts.provider:
+        return pipeline.tts
+    return None
 
 
 class TenantCompliance(BaseModel):
@@ -486,7 +547,9 @@ def validate_credentials(settings: TenantSettings, *, source: str = "") -> None:
     *always* resolve their API key from the platform-level master env var
     (e.g. ``GEMINI_API_KEY``), never from a per-tenant ``api_key_env``. So
     ``api_key_env`` on those layers is optional and purely informational —
-    it is not consulted at runtime and is not required here.
+    it is not consulted at runtime and is not required here. ``pipeline.chat_voice``
+    is validated for a resolvable **provider** (not a key) only when ``enabled``
+    is true, for the same platform-billing reason telephony is validated.
 
     Raises ``TenantConfigError`` listing all gaps so admins fix them in one
     round-trip rather than chasing missing fields one at a time.
@@ -505,6 +568,13 @@ def validate_credentials(settings: TenantSettings, *, source: str = "") -> None:
             )
     if p.mode == "s2s" and not (p.realtime and p.realtime.provider):
         gaps.append("pipeline.realtime (provider) — required when pipeline.mode == 's2s'")
+
+    if p.chat_voice.enabled and resolve_chat_tts_config(p) is None:
+        gaps.append(
+            "pipeline.chat_voice.tts (provider) — required when "
+            "pipeline.chat_voice.enabled is true and pipeline.tts declares no "
+            "provider to fall back to"
+        )
 
     if gaps:
         prefix = f"{source}: " if source else ""

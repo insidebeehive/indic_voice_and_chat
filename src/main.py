@@ -704,9 +704,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                              crm_retrievers=crm_retrievers))
     chat_api.set_chat_sessionmaker(sessionmaker)
     chat_api.set_chat_handoff_store(base_session_store)
-    # Voice-note replies: reuses the SAME per-tenant TTS client cache the
-    # voice/telephony paths already build (`providers.get_tts`), so a
-    # tenant's pipeline_config.tts is the single source of truth for both.
+    # Voice-note replies: injects the SAME TenantProviders instance the
+    # voice/telephony paths use, but chat resolves its TTS client through
+    # `get_chat_tts` (pipeline.chat_voice, falling back to pipeline.tts) under
+    # its own cache key — no longer the same source of truth as the
+    # voice-call cascade's `get_tts` (see src/auth/registry.py).
     chat_api.set_tts_providers(providers)
     ext_chat_api.set_ext_redis(redis_client)
     if settings.media_storage is not None:

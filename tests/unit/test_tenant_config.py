@@ -347,3 +347,154 @@ def test_validate_credentials_passes_s2s_with_realtime() -> None:
                            mode="s2s",
                            realtime=TenantRealtimeConfig(provider="gemini_live", api_key_env="GK")))
     validate_credentials(t)
+
+
+# --- Chat voice replies --------------------------------------------------
+
+
+def test_chat_voice_replies_disabled_by_default() -> None:
+    t = TenantSettings(id="t1", slug="t1", name="T1")
+    assert t.pipeline.chat_voice.enabled is False
+    assert t.pipeline.chat_voice.tts.provider is None
+
+
+def test_resolve_chat_tts_prefers_chat_voice_block() -> None:
+    from src.config_tenant import ChatVoiceConfig, TenantPipelineConfig, TenantTTSConfig, resolve_chat_tts_config
+    pipeline = TenantPipelineConfig(
+        tts=TenantTTSConfig(provider="sarvam"),
+        chat_voice=ChatVoiceConfig(enabled=True, tts=TenantTTSConfig(provider="google")),
+    )
+    result = resolve_chat_tts_config(pipeline)
+    assert result is pipeline.chat_voice.tts
+    assert result.provider == "google"
+
+
+def test_resolve_chat_tts_falls_back_to_pipeline_tts() -> None:
+    from src.config_tenant import ChatVoiceConfig, TenantPipelineConfig, TenantTTSConfig, resolve_chat_tts_config
+    pipeline = TenantPipelineConfig(
+        tts=TenantTTSConfig(provider="sarvam"),
+        chat_voice=ChatVoiceConfig(enabled=True),  # no chat-specific tts
+    )
+    result = resolve_chat_tts_config(pipeline)
+    assert result is pipeline.tts
+
+
+def test_resolve_chat_tts_ignores_chat_block_without_provider() -> None:
+    from src.config_tenant import ChatVoiceConfig, TenantPipelineConfig, TenantTTSConfig, resolve_chat_tts_config
+    pipeline = TenantPipelineConfig(
+        tts=TenantTTSConfig(provider="sarvam"),
+        chat_voice=ChatVoiceConfig(enabled=True, tts=TenantTTSConfig(voice_id="anushka")),
+    )
+    result = resolve_chat_tts_config(pipeline)
+    assert result is pipeline.tts
+
+
+def test_resolve_chat_tts_returns_none_when_neither_has_a_provider() -> None:
+    """The motivating case: a pure s2s tenant (calls handled entirely by
+    pipeline.realtime) has no pipeline.tts at all, and no chat-specific
+    override either — there is nothing to resolve chat audio from."""
+    from src.config_tenant import TenantPipelineConfig, TenantRealtimeConfig, resolve_chat_tts_config
+    pipeline = TenantPipelineConfig(
+        mode="s2s", realtime=TenantRealtimeConfig(provider="gemini_live"),
+    )
+    assert resolve_chat_tts_config(pipeline) is None
+
+
+def test_resolve_chat_tts_is_independent_of_enabled() -> None:
+    """resolve_chat_tts_config deliberately ignores `enabled` — that gate is
+    checked separately by the registry (`get_chat_tts`) and the validator
+    (`validate_credentials`)."""
+    from src.config_tenant import ChatVoiceConfig, TenantPipelineConfig, TenantTTSConfig, resolve_chat_tts_config
+    pipeline = TenantPipelineConfig(
+        chat_voice=ChatVoiceConfig(enabled=False, tts=TenantTTSConfig(provider="google")),
+    )
+    result = resolve_chat_tts_config(pipeline)
+    assert result is pipeline.chat_voice.tts
+
+
+def test_validate_credentials_raises_when_chat_voice_enabled_without_any_tts() -> None:
+    from src.config_tenant import ChatVoiceConfig, TenantPipelineConfig, TenantRealtimeConfig
+    t = TenantSettings(
+        id="t1", slug="t1", name="T1",
+        pipeline=TenantPipelineConfig(
+            mode="s2s", realtime=TenantRealtimeConfig(provider="gemini_live"),
+            chat_voice=ChatVoiceConfig(enabled=True),
+        ),
+    )
+    with pytest.raises(TenantConfigError, match="chat_voice") as ei:
+        validate_credentials(t)
+    assert "pipeline.chat_voice.tts" in str(ei.value)
+
+
+def test_validate_credentials_passes_when_chat_voice_enabled_with_pipeline_tts_only() -> None:
+    from src.config_tenant import ChatVoiceConfig, TenantPipelineConfig, TenantTTSConfig
+    t = TenantSettings(
+        id="t1", slug="t1", name="T1",
+        pipeline=TenantPipelineConfig(
+            tts=TenantTTSConfig(provider="sarvam"),
+            chat_voice=ChatVoiceConfig(enabled=True),
+        ),
+    )
+    validate_credentials(t)
+
+
+def test_validate_credentials_passes_when_chat_voice_disabled_and_no_tts_anywhere() -> None:
+    from src.config_tenant import ChatVoiceConfig, TenantPipelineConfig, TenantRealtimeConfig
+    t = TenantSettings(
+        id="t1", slug="t1", name="T1",
+        pipeline=TenantPipelineConfig(
+            mode="s2s", realtime=TenantRealtimeConfig(provider="gemini_live"),
+            chat_voice=ChatVoiceConfig(enabled=False),
+        ),
+    )
+    validate_credentials(t)
+
+
+def test_validate_credentials_collects_chat_voice_gap_alongside_telephony_gaps() -> None:
+    from src.config_tenant import ChatVoiceConfig, TenantPipelineConfig, TenantTelephonyConfig
+    t = TenantSettings(
+        id="t1", slug="t1", name="T1",
+        pipeline=TenantPipelineConfig(
+            telephony=TenantTelephonyConfig(provider="twilio"),  # missing sid + token
+            chat_voice=ChatVoiceConfig(enabled=True),  # nothing resolvable
+        ),
+    )
+    with pytest.raises(TenantConfigError) as ei:
+        validate_credentials(t)
+    msg = str(ei.value)
+    assert "account_sid_env" in msg
+    assert "auth_token_env" in msg
+    assert "chat_voice" in msg
+
+
+def test_load_tenant_accepts_chat_voice_block(tenant_dir: Path) -> None:
+    _write(tenant_dir / "chatvoice.yaml", """
+id: t_chatvoice
+slug: chatvoice
+name: Chat Voice Tenant
+pipeline:
+  chat_voice:
+    enabled: true
+    tts: {provider: sarvam, voice_id: priya}
+""")
+    t = load_tenant("chatvoice", tenant_dir)
+    assert t.pipeline.chat_voice.enabled is True
+    assert t.pipeline.chat_voice.tts.voice_id == "priya"
+
+
+def test_chat_voice_survives_pipeline_config_round_trip() -> None:
+    """This is the exact mechanism src/auth/seed.py -> src/auth/db_resolver.py
+    use to round-trip tenant config through the DB's JSON column, which is
+    why chat_voice lives under `pipeline` rather than somewhere that isn't
+    part of that round-trip."""
+    from src.config_tenant import ChatVoiceConfig, TenantPipelineConfig, TenantTTSConfig
+    t = TenantSettings(
+        id="t1", slug="t1", name="T1",
+        pipeline=TenantPipelineConfig(
+            chat_voice=ChatVoiceConfig(enabled=True, tts=TenantTTSConfig(provider="google")),
+        ),
+    )
+    pc = t.pipeline.model_dump()
+    rebuilt = TenantPipelineConfig(**pc)
+    assert rebuilt.chat_voice.enabled is True
+    assert rebuilt.chat_voice.tts.provider == "google"

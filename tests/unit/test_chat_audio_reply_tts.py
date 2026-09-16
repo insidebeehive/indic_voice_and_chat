@@ -127,18 +127,27 @@ class _FakeTTSProvider:
 
 
 class _FakeTTSProviders:
-    """Stands in for `TenantProviders` — only the `get_tts` method the new
-    code calls."""
+    """Stands in for `TenantProviders` — now implements only the
+    `get_chat_tts` method the new code calls. `raise_on_get` models a factory
+    that raises inside the accessor (bad provider name, adapter import
+    failure); `return_none` models the normal opted-out/unresolvable path
+    (the registry's own short-circuit, not a failure)."""
 
-    def __init__(self, provider: _FakeTTSProvider | None = None, *, raise_on_get: bool = False):
+    def __init__(
+        self, provider: _FakeTTSProvider | None = None, *,
+        raise_on_get: bool = False, return_none: bool = False,
+    ):
         self.provider = provider
         self.raise_on_get = raise_on_get
-        self.get_tts_calls: list = []
+        self.return_none = return_none
+        self.get_chat_tts_calls: list = []
 
-    def get_tts(self, tenant):
-        self.get_tts_calls.append(tenant)
+    def get_chat_tts(self, tenant):
+        self.get_chat_tts_calls.append(tenant)
         if self.raise_on_get:
             raise RuntimeError("no TTS provider configured for this tenant")
+        if self.return_none:
+            return None
         return self.provider
 
 
@@ -353,6 +362,32 @@ async def test_tenant_with_no_tts_provider_configured_falls_back_to_text_only(ws
     assert reply["text"] == "answer"
     assert "audio_url" not in reply
     assert "audio_mime" not in reply
+
+
+@pytest.mark.asyncio
+async def test_chat_tts_unavailable_returns_none_falls_back_to_text_only(ws_ctx):
+    """The normal opted-out/unconfigured path: TenantProviders.get_chat_tts
+    returning None (not raising) must degrade to text-only exactly like every
+    other reason in `_synthesize_reply_audio`'s docstring — no synthesis is
+    attempted at all."""
+    sm, media_store, fake_agent = ws_ctx
+    fake_agent.handle_message = AsyncMock(
+        return_value=_FakeTurnResult(response=_FakeResp(response_text="answer", language="hi")))
+
+    provider = _FakeTTSProvider()
+    fake_providers = _FakeTTSProviders(provider, return_none=True)
+    chat_api.set_tts_providers(fake_providers)
+
+    fake_tenant = _make_fake_tenant()
+    frames = _send_audio_and_collect(fake_tenant)
+    reply = frames[2]
+    assert reply["type"] == "message"
+    assert reply["text"] == "answer"
+    assert "audio_url" not in reply
+    assert "audio_mime" not in reply
+    assert not provider.calls, "synthesis must not be attempted when get_chat_tts returns None"
+    assert len(media_store.uploaded) == 1  # inbound recording only
+    assert len(fake_providers.get_chat_tts_calls) == 1
 
 
 @pytest.mark.asyncio

@@ -14,8 +14,10 @@ from src.auth.registry import (
     make_per_tenant_registry,
 )
 from src.config_tenant import (
+    ChatVoiceConfig,
     TenantLLMConfig,
     TenantPipelineConfig,
+    TenantRealtimeConfig,
     TenantSTTConfig,
     TenantSettings,
     TenantTTSConfig,
@@ -36,6 +38,23 @@ def _tenant(slug: str, *, stt_key_env: str = "K1", llm_key_env: str = "K2",
                 account_sid_env=twilio_sid,
                 auth_token_env=twilio_tok,
             ),
+        ),
+    )
+    return TenantContext(settings=s)
+
+
+def _chat_tenant(
+    *, enabled: bool, chat_tts: TenantTTSConfig | None = None,
+    pipeline_tts: TenantTTSConfig | None = None, mode: str = "layered",
+    realtime: TenantRealtimeConfig | None = None,
+) -> TenantContext:
+    s = TenantSettings(
+        id="t_chat", slug="chat", name="Chat",
+        pipeline=TenantPipelineConfig(
+            mode=mode,
+            realtime=realtime,
+            tts=pipeline_tts or TenantTTSConfig(),
+            chat_voice=ChatVoiceConfig(enabled=enabled, tts=chat_tts or TenantTTSConfig()),
         ),
     )
     return TenantContext(settings=s)
@@ -216,3 +235,104 @@ def test_runtime_registry_evict_clears_everywhere(tmp_path, env) -> None:
     runtime.retrievers.get(acme)
     runtime.evict_tenant("t_acme")
     assert not runtime.retrievers.has("t_acme")
+
+
+# --- chat TTS ------------------------------------------------------------
+
+
+def test_get_chat_tts_returns_none_when_voice_replies_disabled(tmp_path, env) -> None:
+    providers, calls = _providers(tmp_path)
+    t = _chat_tenant(enabled=False, pipeline_tts=TenantTTSConfig(provider="sarvam", voice_id="meera"))
+    assert providers.get_chat_tts(t) is None
+    assert calls["tts"] == []
+    assert (t.id, "chat_tts") not in providers._cache
+
+
+def test_get_chat_tts_uses_chat_voice_tts_over_pipeline_tts(tmp_path, env) -> None:
+    providers, calls = _providers(tmp_path)
+    t = _chat_tenant(
+        enabled=True,
+        chat_tts=TenantTTSConfig(provider="google", voice_id="en-IN-Wavenet-D"),
+        pipeline_tts=TenantTTSConfig(provider="sarvam", voice_id="meera"),
+    )
+    result = providers.get_chat_tts(t)
+    assert result is not None
+    assert calls["tts"][0]["provider"] == "google"
+    assert calls["tts"][0]["voice_id"] == "en-IN-Wavenet-D"
+    assert calls["tts"][0]["language"] == "hi-IN"  # global default survived
+    assert "api_key" not in calls["tts"][0]
+
+
+def test_get_chat_tts_falls_back_to_pipeline_tts_when_chat_block_empty(tmp_path, env) -> None:
+    providers, calls = _providers(tmp_path)
+    t = _chat_tenant(
+        enabled=True, chat_tts=None,
+        pipeline_tts=TenantTTSConfig(provider="sarvam", voice_id="meera"),
+    )
+    providers.get_chat_tts(t)
+    assert calls["tts"][0]["provider"] == "sarvam"
+    assert calls["tts"][0]["voice_id"] == "meera"
+    assert len(calls["tts"]) == 1
+
+
+def test_get_chat_tts_ignores_chat_block_without_provider(tmp_path, env) -> None:
+    providers, calls = _providers(tmp_path)
+    t = _chat_tenant(
+        enabled=True,
+        chat_tts=TenantTTSConfig(voice_id="anushka"),  # no provider — doesn't count
+        pipeline_tts=TenantTTSConfig(provider="sarvam", voice_id="meera"),
+    )
+    providers.get_chat_tts(t)
+    assert calls["tts"][0]["provider"] == "sarvam"
+    assert calls["tts"][0]["voice_id"] == "meera"  # not "anushka"
+
+
+def test_s2s_tenant_with_no_chat_tts_never_hits_platform_default(tmp_path, env) -> None:
+    """Regression guard: an s2s tenant with no TTS config of its own must NOT
+    silently fall through to `global_defaults["tts"]` and get billed for chat
+    voice replies on the platform's own provider/key. The factory must never
+    even be invoked."""
+    providers, calls = _providers(tmp_path)
+    t = _chat_tenant(
+        enabled=True, mode="s2s", realtime=TenantRealtimeConfig(provider="gemini_live"),
+        pipeline_tts=TenantTTSConfig(),  # all unset
+    )
+    assert providers.get_chat_tts(t) is None
+    assert calls["tts"] == []
+    assert providers._cache == {}
+
+
+def test_s2s_tenant_with_chat_tts_gets_its_own_provider(tmp_path, env) -> None:
+    providers, calls = _providers(tmp_path)
+    t = _chat_tenant(
+        enabled=True, mode="s2s", realtime=TenantRealtimeConfig(provider="gemini_live"),
+        chat_tts=TenantTTSConfig(provider="elevenlabs", voice_id="rachel"),
+        pipeline_tts=TenantTTSConfig(),
+    )
+    result = providers.get_chat_tts(t)
+    assert result is not None
+    assert calls["tts"][0]["provider"] == "elevenlabs"
+
+
+def test_chat_tts_cached_under_a_key_distinct_from_call_tts(tmp_path, env) -> None:
+    providers, calls = _providers(tmp_path)
+    t = _chat_tenant(enabled=True, pipeline_tts=TenantTTSConfig(provider="sarvam", voice_id="meera"))
+    call_client_1 = providers.get_tts(t)
+    chat_client_1 = providers.get_chat_tts(t)
+    call_client_2 = providers.get_tts(t)
+    chat_client_2 = providers.get_chat_tts(t)
+    assert len(calls["tts"]) == 2  # two builds total, caching works both ways
+    assert call_client_1 is call_client_2
+    assert chat_client_1 is chat_client_2
+    assert call_client_1 is not chat_client_1
+    assert (t.id, "tts") in providers._cache
+    assert (t.id, "chat_tts") in providers._cache
+
+
+def test_evict_drops_chat_tts_cache(tmp_path, env) -> None:
+    providers, calls = _providers(tmp_path)
+    t = _chat_tenant(enabled=True, pipeline_tts=TenantTTSConfig(provider="sarvam", voice_id="meera"))
+    providers.get_chat_tts(t)
+    providers.evict(t.id)
+    providers.get_chat_tts(t)
+    assert len(calls["tts"]) == 2

@@ -184,12 +184,16 @@ reply `message` frame MAY carry two additional optional fields:
 - **Only inbound `audio` turns can produce these fields.** A `type:"message"`
   (text) turn never gets a synthesized reply — the AI mirrors whatever
   modality the customer used.
-- **Never guaranteed even on an audio turn.** Synthesis is skipped
-  server-side for an empty or unusually long reply, and best-effort
-  everywhere else — a missing/misconfigured TTS provider for the tenant, a
-  synthesis timeout, or any provider error all silently fall back to
-  text-only. Treat `audio_url` as "sometimes there," never as something to
-  wait for.
+- **Never guaranteed even on an audio turn.** The dominant reason is opt-in:
+  `pipeline.chat_voice.enabled` defaults to **false** per tenant, so most
+  tenants never synthesize a reply at all regardless of what the customer
+  sends — this is deliberate (TTS is billed per reply) and not a bug to
+  chase. When a tenant has opted in, synthesis is also skipped server-side
+  for an empty or unusually long reply, and best-effort everywhere else — no
+  resolvable chat TTS provider for the tenant (neither a chat-specific
+  override nor its call-cascade TTS), a synthesis timeout, or any provider
+  error all silently fall back to text-only. Treat `audio_url` as "sometimes
+  there," never as something to wait for.
 - `audio_url` is a `GET /api/v1/chat/media/{message_id}` link — same
   endpoint and auth rules `audio_ack` already uses (302 to a short-lived
   signed URL).

@@ -29,7 +29,7 @@ import uuid
 import wave
 from dataclasses import dataclass, field
 from types import SimpleNamespace
-from typing import Awaitable, Callable, NamedTuple, NoReturn, Optional
+from typing import Any, Awaitable, Callable, NamedTuple, NoReturn, Optional
 
 from fastapi import (
     APIRouter,
@@ -106,11 +106,15 @@ _media_store: Optional[IMediaStorage] = None
 
 # Per-tenant TTS provider cache used ONLY to synthesize the audio half of a
 # voice-note reply (see `_synthesize_reply_audio` below). Optional by design:
-# a tenant that never configured pipeline_config.tts, or a process that never
-# called `set_tts_providers` at all (e.g. most unit tests), simply never gets
-# audio replies — the WS audio branch already tolerates that as "TTS
-# unavailable" and falls back to text-only, same as any other synthesis
-# failure. Nothing about inbound voice notes (transcription) depends on this.
+# a tenant that has not enabled `pipeline.chat_voice.enabled` (the default),
+# or has nothing resolvable via `resolve_chat_tts_config` (chat_voice.tts /
+# pipeline.tts both without a provider — e.g. a bare s2s tenant), or a process
+# that never called `set_tts_providers` at all (e.g. most unit tests), simply
+# never gets audio replies — the WS audio branch already tolerates that as
+# "TTS unavailable" and falls back to text-only, same as any other synthesis
+# failure. Chat TTS resolves independently of the voice-call cascade's
+# `pipeline.tts` now (see `TenantProviders.get_chat_tts`). Nothing about
+# inbound voice notes (transcription) depends on this.
 _tts_providers: Optional[TenantProviders] = None
 
 # Active voice-call WebSockets keyed by chat_session_id.
@@ -224,11 +228,14 @@ async def _synthesize_reply_audio(
     turn — the text reply already went out (or is about to): empty/over-cap
     text (see `_TTS_MAX_REPLY_CHARS`), no TTS provider registry wired at all
     (`set_tts_providers` never called — fine, most deployments/tests don't
-    need chat audio replies), a tenant with no/misconfigured
-    `pipeline_config.tts` (`TenantProviders.get_tts` raises), a synthesis
-    timeout (`_TTS_SYNTH_TIMEOUT_S`), or any other provider exception (bad
-    credentials, provider outage, ...). Only a genuine cancellation
-    (shutdown, client disconnect racing this call) propagates.
+    need chat audio replies), the tenant has not enabled
+    `pipeline.chat_voice.enabled`, neither `pipeline.chat_voice.tts` nor
+    `pipeline.tts` resolves a provider (`TenantProviders.get_chat_tts`
+    returns `None` — no warning logged, this is the expected shape for most
+    tenants), a synthesis timeout (`_TTS_SYNTH_TIMEOUT_S`), or any other
+    provider exception (bad credentials, provider outage, ...). Only a
+    genuine cancellation (shutdown, client disconnect racing this call)
+    propagates.
 
     HINGLISH CAVEAT (unverified — needs a real TTS call to confirm before
     this is trusted in production): on this product the reply TEXT is
@@ -248,8 +255,15 @@ async def _synthesize_reply_audio(
     if _tts_providers is None:
         return None
     try:
+        # None = this tenant hasn't opted into chat voice replies, or has no
+        # resolvable chat TTS config. Not a failure: no provider was built, no
+        # cost incurred, and no warning is logged (it would fire on every voice
+        # note from every non-opted-in tenant). The text reply still goes out.
+        tts = _tts_providers.get_chat_tts(tenant)
+        if tts is None:
+            return None
         return await asyncio.wait_for(
-            _synthesize_reply_audio_uncapped(tenant, text, language),
+            _synthesize_reply_audio_uncapped(tenant, text, language, tts),
             timeout=_TTS_SYNTH_TIMEOUT_S,
         )
     except asyncio.CancelledError:
@@ -295,12 +309,14 @@ def _pcm16_to_wav(pcm: bytes, sample_rate: int) -> bytes:
 
 
 async def _synthesize_reply_audio_uncapped(
-    tenant: TenantContext, text: str, language: str,
+    tenant: TenantContext, text: str, language: str, tts: Any,
 ) -> tuple[bytes, str]:
     """The actual synthesis call, unwrapped — split out so the timeout/except
-    handling above has a single coroutine to bound, and so tests can patch
-    just the provider lookup without re-implementing the timeout wrapper."""
-    tts = _tts_providers.get_tts(tenant)  # raises if unconfigured — caller wraps
+    handling above has a single coroutine to bound. The TTS client is passed
+    in by the caller, which owns the opt-in/resolution gate (`get_chat_tts`);
+    this function no longer looks up a provider itself, which is also what
+    lets tests patch just that lookup without re-implementing the timeout
+    wrapper."""
     overrides = getattr(tenant.settings, "pronunciation_overrides", None)
     # Currency amounts and tenant/brand pronunciation overrides get rewritten
     # to how they should be SPOKEN, not just displayed. This does NOT mirror

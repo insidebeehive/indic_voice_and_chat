@@ -42,6 +42,15 @@ pipeline:
     voice_id: null
     speed: 1.0
 
+  # NOTE: there is deliberately NO platform-level chat_voice/chat-TTS default
+  # here. Chat voice-note replies resolve per tenant only
+  # (pipeline.chat_voice.enabled + pipeline.chat_voice.tts, falling back to the
+  # tenant's own pipeline.tts — see resolve_chat_tts_config in
+  # src/config_tenant.py). A default at this level would put a tenant with no
+  # TTS config of its own (e.g. an s2s tenant) straight onto the platform's own
+  # provider + SARVAM_API_KEY, silently billing the platform for that tenant's
+  # chat replies. Off/unresolvable means text-only replies, which is correct.
+
   telephony:
     provider: twilio
     from_number: "+91XXXXXXXXXX"
