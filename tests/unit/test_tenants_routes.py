@@ -558,6 +558,14 @@ async def test_list_tenants_shows_mode_and_models(ctx) -> None:
     assert acme["llm"]["provider"] == "gemini"
     assert acme["llm"]["model"] == "gemini-2.5-flash-lite"
     assert acme["tts"]["model"] == "bulbul:v3"
+    # LayerInfo.language/voice_id (additive) — the tenant list's only visible
+    # copy of the currently-configured voice, previously invisible until a
+    # deprecated speaker (e.g. Sarvam's dropped bulbul:v2 "anushka") broke in
+    # production. llm carries neither field; both stay None for it.
+    assert acme["tts"]["voice_id"] == "anushka"
+    assert acme["tts"]["language"] == "hi-IN"
+    assert acme["llm"]["voice_id"] is None
+    assert acme["llm"]["language"] is None
     assert acme["telephony_provider"] == "twilio"
     # Non-secret telephony config surfaces so the backoffice can prefill it, and
     # the names (NOT values) of configured creds show what's set.
@@ -568,6 +576,26 @@ async def test_list_tenants_shows_mode_and_models(ctx) -> None:
     # tenant's Stringee project so calls attribute to the right tenant.
     assert acme["stringee_softphone_answer_url"].endswith("/stringee/softphone-answer/acme")
     assert acme["stringee_answer_url"].endswith("/stringee/answer/acme")
+
+
+async def test_list_tenants_maps_realtime_voice_and_language(ctx) -> None:
+    """TenantRealtimeConfig stores its current voice/language under `voice`/
+    `language_code`, not `voice_id`/`language` like STT/TTS — _layer() must
+    map them onto the same LayerInfo fields, or the realtime layer's current
+    voice/language would silently come back null in the tenant list."""
+    client, _, _ = ctx
+    body = _body(
+        slug="acme-s2s", mode="s2s",
+        realtime={"provider": "gemini_live", "model": "gemini-3.1-flash-live-preview",
+                  "voice": "Aoede", "language_code": "hi-IN"},
+    )
+    await client.post("/tenants", json=body, headers=ADMIN_HEADERS)
+    resp = await client.get("/tenants", headers=ADMIN_HEADERS)
+    assert resp.status_code == 200
+    acme = next(t for t in resp.json()["tenants"] if t["slug"] == "acme-s2s")
+    assert acme["realtime"]["provider"] == "gemini_live"
+    assert acme["realtime"]["voice_id"] == "Aoede"
+    assert acme["realtime"]["language"] == "hi-IN"
 
 
 async def test_list_tenants_requires_admin(ctx) -> None:

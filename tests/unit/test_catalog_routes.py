@@ -197,6 +197,35 @@ async def test_get_voices_gemini_live(client: AsyncClient) -> None:
     assert "Aoede" in {v["voice_id"] for v in resp.json()["voices"]}
 
 
+async def test_get_voices_elevenlabs_flat_roster_ignores_language(client: AsyncClient) -> None:
+    # ElevenLabs' catalog roster is its static preset list, language-independent
+    # — a different `language` must return the identical roster, not an empty
+    # one (only its live-fetched cloned/custom voices are language-scoped, and
+    # those aren't in this catalog at all — see src/providers/voice_catalog.py).
+    resp_a = await client.get(
+        "/voices", params={"provider": "elevenlabs", "language": "hi-IN"}, headers=TENANT_HEADERS
+    )
+    resp_b = await client.get(
+        "/voices", params={"provider": "elevenlabs", "language": "mr-IN"}, headers=TENANT_HEADERS
+    )
+    assert resp_a.status_code == 200 and resp_b.status_code == 200
+    voices_a, voices_b = resp_a.json()["voices"], resp_b.json()["voices"]
+    assert voices_a and voices_a == voices_b
+    assert all(v["gender"] in ("male", "female") for v in voices_a)
+
+
+async def test_get_voices_unsupported_language_empty(client: AsyncClient) -> None:
+    # Per-language providers (sarvam/azure/google/indicf5) return [] for a
+    # language they don't publish a roster for — deliberately NOT falling
+    # back to hi-IN, since this is reference data for a UI dropdown, not a
+    # synthesis call (see the module docstring on src/providers/voice_catalog.py).
+    resp = await client.get(
+        "/voices", params={"provider": "sarvam", "language": "xx-XX"}, headers=TENANT_HEADERS
+    )
+    assert resp.status_code == 200
+    assert resp.json()["voices"] == []
+
+
 async def test_get_voices_unknown_provider_empty(client: AsyncClient) -> None:
     resp = await client.get("/voices", params={"provider": "nope"}, headers=TENANT_HEADERS)
     assert resp.status_code == 200

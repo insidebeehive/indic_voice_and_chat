@@ -1037,6 +1037,13 @@ async def rotate_webhook_credentials(
 class LayerInfo(BaseModel):
     provider: Optional[str] = None
     model: Optional[str] = None
+    # Additive (Task: backoffice voice pickers). Lets the backoffice show the
+    # currently-configured voice/language without a separate call, and gives
+    # it a language to query GET /api/v1/voices with when the operator hasn't
+    # typed one. See ``_layer()`` for where each field is actually read from —
+    # the realtime layer stores these under different config keys.
+    language: Optional[str] = None
+    voice_id: Optional[str] = None
 
 
 class TenantSummary(BaseModel):
@@ -1081,7 +1088,25 @@ class TenantListResponse(BaseModel):
 
 def _layer(pc: dict, key: str) -> LayerInfo:
     d = pc.get(key) or {}
-    return LayerInfo(provider=d.get("provider"), model=d.get("model"))
+    if key == "realtime":
+        # TenantRealtimeConfig (src/config_tenant.py) names these fields
+        # `voice` and `language_code`, not `voice_id`/`language` like
+        # TenantSTTConfig/TenantTTSConfig. Mapped onto the SAME LayerInfo
+        # fields (rather than adding realtime-only field names) so the
+        # backoffice's voice picker can read one shared shape for every
+        # layer kind instead of special-casing s2s — without this mapping
+        # the realtime layer's current voice/language would silently come
+        # back null even though they're stored.
+        return LayerInfo(
+            provider=d.get("provider"), model=d.get("model"),
+            language=d.get("language_code"), voice_id=d.get("voice"),
+        )
+    # stt/tts read straight off TenantSTTConfig/TenantTTSConfig's own
+    # `language`/`voice_id` field names; llm has neither and both stay None.
+    return LayerInfo(
+        provider=d.get("provider"), model=d.get("model"),
+        language=d.get("language"), voice_id=d.get("voice_id"),
+    )
 
 
 _CRED_ENV_FIELDS = (

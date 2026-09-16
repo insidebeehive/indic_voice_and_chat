@@ -2,7 +2,8 @@
 
 - ``GET  /api/v1/providers``                  — list every provider + cost/min
 - ``PUT  /api/v1/providers/{kind}/{provider}`` — admin: maintain a rate
-- ``GET  /api/v1/voices?provider=&language=``  — static voice roster (tenant-authed)
+- ``GET  /api/v1/voices?provider=&language=``  — static voice roster (public
+  reference data, same class as ``/models`` — no auth dependency)
 
 The cost catalog is the single source of truth read by ``GET /providers`` and the
 per-call cost calculation; ``PUT`` upserts so rates can be kept current as vendor
@@ -149,7 +150,13 @@ async def get_models() -> ModelsResponse:
 
 @router.get("/voices", response_model=VoicesResponse)
 async def get_voices(
-    provider: str = Query(..., description="sarvam | gemini_live"),
+    provider: str = Query(
+        ...,
+        description=(
+            "TTS provider (sarvam, gemini, google, azure, elevenlabs, indicf5) "
+            "or gemini_live (S2S realtime voices)"
+        ),
+    ),
     language: str = Query("hi-IN", description="BCP-47 language tag (TTS only)"),
 ) -> VoicesResponse:
     """Return the available voices for a provider (+ language for TTS)."""

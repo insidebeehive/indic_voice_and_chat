@@ -8,6 +8,13 @@
 <title>Vox Backoffice</title>
 <style>
   :root { color-scheme: dark; }
+  /* The UA stylesheet's [hidden]{display:none} loses to any author-origin
+     display rule (e.g. the `label { display:flex }` below), so an element
+     with `hidden` set can still render. Re-assert it here with !important so
+     `el.hidden = true`/the `hidden` attribute reliably hides ANY element in
+     this page, regardless of what other rules target it — this is what
+     silently broke the custom-voice-id <label> toggle. */
+  [hidden] { display: none !important; }
   body { font-family: system-ui, sans-serif; margin:0; background:#0a0a0a; color:#e2e8f0; }
   header { padding:.75rem 1rem; background:#3b0764; border-bottom:1px solid #1f2937; }
   header h1 { font-size:1.05rem; margin:0 0 .5rem; }
@@ -448,9 +455,170 @@ function onPipeProviderChange(kind) {
   const prov = ($(`p_${kind}_provider`) || {}).value || "";
   const models = prov ? ((MODELS[catKind] && MODELS[catKind][prov]) || []) : [];
   const modelSel = $(`p_${kind}_model`);
-  if (!modelSel) return;
-  modelSel.innerHTML = `<option value="">— leave unchanged —</option>` +
-    models.map(m => `<option value="${escAttr(m)}">${escT(m)}</option>`).join("");
+  if (modelSel) {
+    modelSel.innerHTML = `<option value="">— leave unchanged —</option>` +
+      models.map(m => `<option value="${escAttr(m)}">${escT(m)}</option>`).join("");
+  }
+  // The three voice-bearing layers also need their picker re-queried: a
+  // provider change usually means a different roster entirely (see
+  // resolveVoiceQuery/refreshVoiceOptions below).
+  if (kind === "tts" || kind === "cv_tts" || kind === "realtime") refreshVoiceOptions(kind);
+}
+
+// --- Voice picker (catalog-backed, GET /api/v1/voices) --------------------
+// Shared by the three free-text voice fields this replaces: call TTS
+// (p_tts_*), chat-voice TTS (p_cv_tts_*), and realtime/S2S (p_realtime_*).
+// Written once and parameterized by `kind` rather than three times, per the
+// task brief — the three pickers differ only in which language-input id
+// feeds them and which "current" value they fall back to.
+//
+// PIPE_CURRENT[kind] = {provider, language} seeds the query when the operator
+// hasn't touched the provider select or typed a language — see
+// resolveVoiceQuery(). Populated fresh by loadPipeline() on every tenant
+// selection/reload.
+let PIPE_CURRENT = {};
+
+// voice roster cache: "<provider>|<language>" -> voices array, so flipping
+// back and forth between two languages/providers for the same layer — or
+// across the three pickers sharing a provider — doesn't re-fetch the
+// identical roster. A failed fetch is deliberately NOT cached here (see
+// refreshVoiceOptions) so retrying (e.g. by re-picking the provider) can
+// recover from a transient error instead of being stuck on it.
+let VOICE_ROSTER_CACHE = {};
+
+function voicePickerFieldIds(kind) {
+  // Realtime stores its language under `language_code` (TenantRealtimeConfig)
+  // — a different input id than the `language` field tts/cv_tts use
+  // (TenantTTSConfig) — everything else follows the `p_${kind}_*` convention.
+  return {
+    provider: `p_${kind}_provider`,
+    language: kind === "realtime" ? "p_realtime_language_code" : `p_${kind}_language`,
+    select: `p_${kind}_voice_select`,
+    customWrap: `p_${kind}_voice_custom_wrap`,
+    custom: `p_${kind}_voice_custom`,
+    msg: `p_${kind}_voice_msg`,
+  };
+}
+
+function resolveVoiceQuery(kind) {
+  const ids = voicePickerFieldIds(kind);
+  const current = PIPE_CURRENT[kind] || {};
+  // Provider to query: the newly picked provider, or — the common case of an
+  // operator changing only the voice — the tenant's current stored provider.
+  // Keying off the dropdown alone would leave the list empty in exactly that
+  // case, since the dropdown sits at "— leave unchanged —".
+  const provider = (($(ids.provider) || {}).value || "") || current.provider || "";
+  // Language to query: the typed language field, else the layer's stored
+  // language, else hi-IN. Per-language rosters (sarvam/azure/google/indicf5)
+  // genuinely differ by language, so this must track the language input.
+  const typedLanguage = (($(ids.language) || {}).value || "").trim();
+  const language = typedLanguage || current.language || "hi-IN";
+  return { provider, language };
+}
+
+function onVoiceSelectChange(kind) {
+  const ids = voicePickerFieldIds(kind);
+  const wrap = $(ids.customWrap);
+  if (wrap) wrap.hidden = (($(ids.select) || {}).value !== "__custom__");
+}
+
+// The value savePipeline() should send for this layer's voice field, or ""
+// (meaning: leave unchanged) for both the sentinel and a blank custom entry.
+function voiceFieldValue(kind) {
+  const ids = voicePickerFieldIds(kind);
+  const sel = ($(ids.select) || {}).value || "";
+  if (sel === "__custom__") return (($(ids.custom) || {}).value || "").trim();
+  return sel;
+}
+
+function voicePickerHtml(kind, label, currentVoiceId) {
+  const hint = currentVoiceId
+    ? `current: ${escT(currentVoiceId)}`
+    : (kind === "cv_tts"
+        ? "current chat-voice TTS config isn't exposed by any GET until you save here"
+        : "current: —");
+  return `
+    <label>${label} voice <small class="hint">(${hint})</small>
+      <select id="p_${kind}_voice_select" onchange="onVoiceSelectChange('${kind}')">
+        <option value="">— leave unchanged —</option>
+        <option value="__custom__">custom / other…</option>
+      </select>
+    </label>
+    <label id="p_${kind}_voice_custom_wrap" hidden>${label} custom voice id
+      <input id="p_${kind}_voice_custom" placeholder="exact voice id (e.g. a cloned ElevenLabs voice)" />
+    </label>
+    <div id="p_${kind}_voice_msg" class="hint" style="flex-basis:100%;"></div>`;
+}
+
+async function refreshVoiceOptions(kind) {
+  const ids = voicePickerFieldIds(kind);
+  const select = $(ids.select);
+  const msg = $(ids.msg);
+  if (!select) return;   // picker not rendered for this tenant/tab right now
+  // Guards a stale response landing after the operator switches tenants
+  // mid-fetch: the picker element ids are identical across tenants, so
+  // without this a slow response for tenant A would overwrite the picker
+  // loadPipeline just built fresh for tenant B (same pattern loadPipeline
+  // itself uses around its own await, see the SELECTED check there).
+  const tenantAtStart = SELECTED;
+  const { provider, language } = resolveVoiceQuery(kind);
+  const keepValue = select.value;   // preserve the pick (incl. "__custom__") across a language-only edit
+  if (!provider) {
+    select.innerHTML = `<option value="">— leave unchanged —</option><option value="__custom__">custom / other…</option>`;
+    if (keepValue === "__custom__") select.value = "__custom__";
+    onVoiceSelectChange(kind);   // keep the custom-input wrapper's visibility in sync with the restored value
+    if (msg) msg.textContent = "pick a provider above (or leave the tenant's current one) to list voices";
+    return;
+  }
+  const cacheKey = `${provider}|${language}`;
+  let voices = VOICE_ROSTER_CACHE[cacheKey];
+  if (voices === undefined) {
+    const r = await api(`/api/v1/voices?provider=${encodeURIComponent(provider)}&language=${encodeURIComponent(language)}`);
+    if (tenantAtStart !== SELECTED) return;   // a different tenant's render now owns these element ids
+    if (!r.ok) {
+      // A failed catalog fetch must not block configuration — custom entry
+      // stays usable even when the picker itself couldn't populate. Not
+      // cached: a transient failure shouldn't stick once the fetch is retried
+      // (e.g. by switching providers and back).
+      if (msg) msg.textContent = `could not load voices for ${provider} (status ${r.status}) — use custom`;
+      voices = null;
+    } else {
+      voices = r.json.voices || [];
+      VOICE_ROSTER_CACHE[cacheKey] = voices;
+    }
+  }
+  const opts = [`<option value="">— leave unchanged —</option>`];
+  if (voices && voices.length) {
+    voices.forEach(v => {
+      // Gender in the label, not just the id: the voicebot prompt selects
+      // gendered Hindi/Marathi forms off the roster's gender field, so a
+      // gender flip from picking the wrong voice_id is a content bug.
+      const label = v.gender ? `${v.voice_id} (${v.gender})` : v.voice_id;
+      opts.push(`<option value="${escAttr(v.voice_id)}">${escT(label)}</option>`);
+    });
+  }
+  opts.push(`<option value="__custom__">custom / other…</option>`);
+  select.innerHTML = opts.join("");
+  const keepValueSelectable = keepValue === "__custom__" || (voices && voices.some(v => v.voice_id === keepValue));
+  if (keepValueSelectable) select.value = keepValue;
+  // A non-empty prior pick that the new roster no longer offers (a
+  // provider/language switch with no overlapping voice ids) MUST be called
+  // out here — silently reverting to the sentinel while saying nothing is
+  // exactly how a tenant ends up with a saved voice_id that doesn't match
+  // its saved language (see savePipeline: only the touched fields PATCH).
+  // This branch always wins over the generic empty/success messages below.
+  if (keepValue && keepValue !== "__custom__" && !keepValueSelectable && voices !== null) {
+    if (msg) msg.textContent = `previously selected voice "${keepValue}" isn't offered for ${provider}/${language} — selection cleared, pick a new voice or use custom`;
+  } else if (voices && voices.length) {
+    if (msg) msg.textContent = "";
+  } else if (voices !== null) {
+    // Empty roster is a real, reachable state (an unsupported language for a
+    // per-language provider — the catalog deliberately does not fall back to
+    // hi-IN here, see src/providers/voice_catalog.py) — not a fetch failure.
+    // An empty <select> alone can't be told apart from one, so say so.
+    if (msg) msg.textContent = `no voices published for ${provider}/${language} — use custom`;
+  }
+  onVoiceSelectChange(kind);   // re-sync the custom-input wrapper for whichever value ended up selected
 }
 
 function pipeLayerHtml(kind, label, current, extraHtml) {
@@ -504,9 +672,9 @@ function chatVoiceHtml(id) {
       <label>Chat TTS model
         <select id="p_cv_tts_model"><option value="">— leave unchanged —</option></select>
       </label>
-      <label>Chat TTS voice_id <input id="p_cv_tts_voice_id" placeholder="blank = leave unchanged" /></label>
-      <label>Chat TTS language <input id="p_cv_tts_language" placeholder="blank = leave unchanged" /></label>
+      <label>Chat TTS language <input id="p_cv_tts_language" placeholder="blank = leave unchanged" onchange="refreshVoiceOptions('cv_tts')" /></label>
       <label>Chat TTS speed <input id="p_cv_tts_speed" type="number" step="0.05" placeholder="blank = leave unchanged" /></label>
+      ${voicePickerHtml("cv_tts", "Chat TTS", null)}
     </div>`;
 }
 
@@ -515,6 +683,20 @@ async function loadPipeline(id) {
   if (SELECTED !== id) return;   // a different tenant may have been selected while this awaited
   const t = (window.TENANTS || {})[id] || {};
   const stt = t.stt || {}, llm = t.llm || {}, tts = t.tts || {}, realtime = t.realtime || {};
+  // Seeds for each voice picker's provider/language fallback (resolveVoiceQuery)
+  // when the operator hasn't touched those fields. `realtime` already carries
+  // `language`/`voice_id` — not `language_code`/`voice` — thanks to the
+  // _layer() mapping in src/api/tenants.py, so no per-kind translation is
+  // needed here. chat_voice's own tts config has no GET representation at all
+  // (see the CHAT_VOICE_CACHE comment above); the fallback consistent with
+  // its documented runtime behavior ("if left unset, chat voice falls back to
+  // the call TTS") is the call TTS layer itself.
+  const cvCache = CHAT_VOICE_CACHE[id];
+  PIPE_CURRENT = {
+    tts: { provider: tts.provider || "", language: tts.language || "" },
+    realtime: { provider: realtime.provider || "", language: realtime.language || "" },
+    cv_tts: { provider: (cvCache && cvCache.tts_provider) || tts.provider || "", language: tts.language || "" },
+  };
   $("pane_pipe").innerHTML = `
     <div class="hint" style="margin-bottom:.6rem;">
       Change this tenant's mode and provider/model choices. PATCHes <code>/api/v1/tenants/${id}</code>
@@ -537,19 +719,25 @@ async function loadPipeline(id) {
       <label>STT language <input id="p_stt_language" placeholder="blank = leave unchanged" /></label>`)}
     ${pipeLayerHtml("llm", "LLM", llm)}
     ${pipeLayerHtml("tts", "TTS (call)", tts, `
-      <label>TTS language <input id="p_tts_language" placeholder="blank = leave unchanged" /></label>
-      <label>TTS voice_id <input id="p_tts_voice_id" placeholder="blank = leave unchanged" /></label>
-      <label>TTS speed <input id="p_tts_speed" type="number" step="0.05" placeholder="blank = leave unchanged" /></label>`)}
+      <label>TTS language <input id="p_tts_language" placeholder="blank = leave unchanged" onchange="refreshVoiceOptions('tts')" /></label>
+      <label>TTS speed <input id="p_tts_speed" type="number" step="0.05" placeholder="blank = leave unchanged" /></label>
+      ${voicePickerHtml("tts", "TTS", tts.voice_id)}`)}
     <h2 style="margin-top:1rem;">Realtime (S2S mode)</h2>
     ${pipeLayerHtml("realtime", "Realtime", realtime, `
-      <label>Realtime voice <input id="p_realtime_voice" placeholder="blank = leave unchanged" /></label>
-      <label>Realtime language_code <input id="p_realtime_language_code" placeholder="blank = leave unchanged" /></label>`)}
+      <label>Realtime language_code <input id="p_realtime_language_code" placeholder="blank = leave unchanged" onchange="refreshVoiceOptions('realtime')" /></label>
+      ${voicePickerHtml("realtime", "Realtime", realtime.voice_id)}`)}
     ${chatVoiceHtml(id)}
     <div style="margin-top:1rem;">
       <button id="p_save_btn" onclick="savePipeline('${id}')">Save pipeline</button>
       <span id="p_result" class="hint" style="margin-left:.6rem;"></span>
     </div>
     <div id="p_error" style="margin-top:.6rem;"></div>`;
+  // Populate the three pickers now that their <select>s exist in the DOM.
+  // Fire-and-forget: each is an independent async fetch, and the pickers
+  // render their own "loading"/error state via refreshVoiceOptions' msg line.
+  refreshVoiceOptions("tts");
+  refreshVoiceOptions("realtime");
+  refreshVoiceOptions("cv_tts");
 }
 
 function formatApiError(json) {
@@ -583,16 +771,28 @@ async function savePipeline(id) {
   if (stt) pipeline.stt = stt;
   const llm = layer("llm", []);
   if (llm) pipeline.llm = llm;
-  const tts = layer("tts", ["language", "voice_id", "speed"]);
-  if (tts) pipeline.tts = tts;
-  const realtime = layer("realtime", ["voice", "language_code"]);
-  if (realtime) pipeline.realtime = realtime;
+
+  // voice_id/voice come from the catalog-backed picker (voiceFieldValue), not
+  // a plain input, so they're merged in separately from `layer()`'s `fields`
+  // list — but must still be checked, since a bare voice pick with provider
+  // and language both left unchanged should still produce a non-null layer.
+  const tts = layer("tts", ["language", "speed"]) || {};
+  const ttsVoice = voiceFieldValue("tts");
+  if (ttsVoice) tts.voice_id = ttsVoice;
+  if (Object.keys(tts).length) pipeline.tts = tts;
+
+  const realtime = layer("realtime", ["language_code"]) || {};
+  const realtimeVoice = voiceFieldValue("realtime");
+  if (realtimeVoice) realtime.voice = realtimeVoice;
+  if (Object.keys(realtime).length) pipeline.realtime = realtime;
 
   const cvEnabled = v("p_cv_enabled");
-  const cvTts = layer("cv_tts", ["voice_id", "language", "speed"]);
+  const cvTts = layer("cv_tts", ["language", "speed"]) || {};
+  const cvVoice = voiceFieldValue("cv_tts");
+  if (cvVoice) cvTts.voice_id = cvVoice;
   const chatVoice = {};
   if (cvEnabled) chatVoice.enabled = cvEnabled === "true";
-  if (cvTts) chatVoice.tts = cvTts;
+  if (Object.keys(cvTts).length) chatVoice.tts = cvTts;
   if (Object.keys(chatVoice).length) pipeline.chat_voice = chatVoice;
 
   if (!Object.keys(pipeline).length) { $("p_result").textContent = "Nothing changed — pick a value to update first."; return; }
