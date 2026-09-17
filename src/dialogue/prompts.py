@@ -621,6 +621,77 @@ def build_s2s_system_instruction(
     return "\n\n".join(parts)
 
 
+def _variable_tail_parts(
+    rag_context: Optional[str],
+    extra_directives: Optional[list[str]],
+    tenant_timezone: str,
+) -> list[str]:
+    """The per-turn variable tail of the chatbot system prompt: retrieved
+    sources, current date/local-time (%H:%M granularity), and the per-turn
+    language directive, in that order — shared by build_chatbot_system_prompt
+    (appended in place, default behavior) and build_chatbot_variable_tail
+    (built standalone, e.g. for a caller that wants to send the STATIC body of
+    the prompt separately, such as a provider-side context cache — the tail's
+    per-minute content would invalidate such a cache every minute; see
+    docs/llm-prompt-caching.md).
+    """
+    tail: list[str] = []
+
+    # Retrieved sources go here, after every static rule block above, not where SCOPE
+    # used to embed them: those rules are identical on every call for a given tenant
+    # config, so keeping them first — with the per-turn RAG block appended after —
+    # makes the whole static body a stable, cacheable prefix instead of only the
+    # portion before the old mid-prompt insertion point. Sources are DATA and belong
+    # after the rules that govern how to use them (DATA RULE, TOOL FAILURE, etc.), so
+    # this is also the more correct place semantically, not just the more cacheable
+    # one. extra_directives (the per-turn language directive) stays LAST — it's an
+    # instruction, not data, and must never end up buried under a large sources block
+    # (see the language-handling bug history in chatbot.py).
+    if rag_context:
+        tail.append(_sources_block("Reference sources", "", rag_context))
+
+    # Current date/time MUST be built here, not at the top of this function: it
+    # changes every minute (%H:%M), so anywhere upstream of it stops being a
+    # stable prefix — everything before this point is what a caching provider
+    # can actually reuse (review Fix 1; a prior version at the top of the
+    # function made that prefix 0.4% of the prompt). It also has to sit AFTER
+    # rag_context here, not just after the static rule blocks: caching is
+    # prefix-based with no explicit breakpoint marker in this codebase, so ANY
+    # earlier-occurring byte that differs between two calls truncates the
+    # reusable prefix for everything that follows it, even content that is
+    # itself byte-identical. Splitting the block — leaving the date upstream
+    # in the "stable" region and moving only the time down here — would not
+    # help and can only hurt: within a day the date bytes are identical either
+    # way, so the measured common prefix is the same; but across a day
+    # boundary, a date placed upstream "poisons" every static rule block after
+    # it (the common-prefix comparison stops dead at the first differing byte,
+    # even though the following bytes are still equal), which is strictly
+    # worse than keeping date+time together at the very end where only the
+    # rag_context/extra_directives tail — already per-turn variable — sits
+    # after it. So: keep them adjacent, both here.
+    from datetime import UTC, datetime
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+    now_utc = datetime.now(UTC)
+    try:
+        now_local = now_utc.astimezone(ZoneInfo(tenant_timezone))
+        tz_label = tenant_timezone
+    except (ZoneInfoNotFoundError, ValueError):
+        log.warning("unknown tenant timezone %r; defaulting to UTC", tenant_timezone)
+        now_local = now_utc
+        tz_label = "UTC"
+    tail.append(
+        f"Current date (UTC): {now_utc.strftime('%Y-%m-%d')}. "
+        f"Current local time ({tz_label}): {now_local.strftime('%H:%M')} "
+        f"on {now_local.strftime('%Y-%m-%d')}. If asked what time or date it is, "
+        f"use this local value directly — do not guess or use a different timezone."
+    )
+
+    if extra_directives:
+        tail.append("Additional directives:\n" + "\n".join(f"- {d}" for d in extra_directives))
+
+    return tail
+
+
 def build_chatbot_system_prompt(
     company_name: str,
     language_default: str = "en",
@@ -631,8 +702,24 @@ def build_chatbot_system_prompt(
     has_deposit_verification_tool: bool = False,
     tenant_timezone: str = "Asia/Kolkata",
     prompt_pack: str = "generic",
+    include_variable_tail: bool = True,
 ) -> str:
-    """System prompt for the RAG-powered ChatBot agent (Phase 4)."""
+    """System prompt for the RAG-powered ChatBot agent (Phase 4).
+
+    ``include_variable_tail`` controls whether the per-turn variable tail
+    (retrieved sources, current date/local-time, the per-turn language
+    directive — see _variable_tail_parts) is appended. Defaults to True, so
+    every existing call site is unaffected. It exists so a caller can obtain
+    just the STATIC body of the prompt — see docs/llm-prompt-caching.md, whose
+    measurements this rests on: Gemini's implicit cache covers only the
+    contiguous system_instruction text and is stable at ~4,024-4,028 tokens
+    for this prompt regardless of what else is sent. The variable tail
+    contains %H:%M-granular content that changes every minute, so a caller
+    that wants to address the static body separately from that tail (for
+    example to send it through some provider-side caching mechanism) needs a
+    way to build the prompt without the tail, and to build that tail on its
+    own — build_chatbot_variable_tail does the latter.
+    """
     pack = PACKS.get(prompt_pack, _generic_pack)
     parts: list[str] = []
 
@@ -925,56 +1012,21 @@ def build_chatbot_system_prompt(
         + json.dumps(CHATBOT_RESPONSE_SCHEMA, indent=2)
     )
 
-    # Retrieved sources go here, after every static rule block above, not where SCOPE
-    # used to embed them: those rules are identical on every call for a given tenant
-    # config, so keeping them first — with the per-turn RAG block appended after —
-    # makes the whole static body a stable, cacheable prefix instead of only the
-    # portion before the old mid-prompt insertion point. Sources are DATA and belong
-    # after the rules that govern how to use them (DATA RULE, TOOL FAILURE, etc.), so
-    # this is also the more correct place semantically, not just the more cacheable
-    # one. extra_directives (the per-turn language directive) stays LAST — it's an
-    # instruction, not data, and must never end up buried under a large sources block
-    # (see the language-handling bug history in chatbot.py).
-    if rag_context:
-        parts.append(_sources_block("Reference sources", "", rag_context))
-
-    # Current date/time MUST be built here, not at the top of this function: it
-    # changes every minute (%H:%M), so anywhere upstream of it stops being a
-    # stable prefix — everything before this point is what a caching provider
-    # can actually reuse (review Fix 1; a prior version at the top of the
-    # function made that prefix 0.4% of the prompt). It also has to sit AFTER
-    # rag_context here, not just after the static rule blocks: caching is
-    # prefix-based with no explicit breakpoint marker in this codebase, so ANY
-    # earlier-occurring byte that differs between two calls truncates the
-    # reusable prefix for everything that follows it, even content that is
-    # itself byte-identical. Splitting the block — leaving the date upstream
-    # in the "stable" region and moving only the time down here — would not
-    # help and can only hurt: within a day the date bytes are identical either
-    # way, so the measured common prefix is the same; but across a day
-    # boundary, a date placed upstream "poisons" every static rule block after
-    # it (the common-prefix comparison stops dead at the first differing byte,
-    # even though the following bytes are still equal), which is strictly
-    # worse than keeping date+time together at the very end where only the
-    # rag_context/extra_directives tail — already per-turn variable — sits
-    # after it. So: keep them adjacent, both here.
-    from datetime import UTC, datetime
-    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
-    now_utc = datetime.now(UTC)
-    try:
-        now_local = now_utc.astimezone(ZoneInfo(tenant_timezone))
-        tz_label = tenant_timezone
-    except (ZoneInfoNotFoundError, ValueError):
-        log.warning("unknown tenant timezone %r; defaulting to UTC", tenant_timezone)
-        now_local = now_utc
-        tz_label = "UTC"
-    parts.append(
-        f"Current date (UTC): {now_utc.strftime('%Y-%m-%d')}. "
-        f"Current local time ({tz_label}): {now_local.strftime('%H:%M')} "
-        f"on {now_local.strftime('%Y-%m-%d')}. If asked what time or date it is, "
-        f"use this local value directly — do not guess or use a different timezone."
-    )
-
-    if extra_directives:
-        parts.append("Additional directives:\n" + "\n".join(f"- {d}" for d in extra_directives))
+    if include_variable_tail:
+        parts.extend(_variable_tail_parts(rag_context, extra_directives, tenant_timezone))
 
     return "\n\n".join(parts)
+
+
+def build_chatbot_variable_tail(
+    rag_context: Optional[str] = None,
+    extra_directives: Optional[list[str]] = None,
+    tenant_timezone: str = "Asia/Kolkata",
+) -> str:
+    """The per-turn variable tail of the chatbot system prompt, standalone —
+    see build_chatbot_system_prompt(include_variable_tail=...) and
+    _variable_tail_parts for what this contains and why it's separable.
+    Defaults mirror build_chatbot_system_prompt's so the two never disagree
+    on e.g. the default timezone.
+    """
+    return "\n\n".join(_variable_tail_parts(rag_context, extra_directives, tenant_timezone))

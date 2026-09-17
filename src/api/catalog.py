@@ -48,6 +48,12 @@ class ProviderCostItem(BaseModel):
     # Chat (text) token rates — meaningful for kind="llm" only; 0 elsewhere.
     cost_per_1k_input_tokens: float = 0.0
     cost_per_1k_output_tokens: float = 0.0
+    # None = no cached-input rate configured for this row (chat cost falls
+    # back to cost_per_1k_input_tokens — see src/api/chat_cost.py); this is
+    # deliberately not defaulted to 0.0 like the two rates above, since 0.0
+    # is itself a legitimate configured ("this provider doesn't charge for
+    # cache hits") value and must stay distinguishable from "unset".
+    cost_per_1k_cached_tokens: float | None = None
 
 
 class ProvidersResponse(BaseModel):
@@ -62,6 +68,15 @@ class UpdateProviderCostRequest(BaseModel):
     # stored token rates on every plain per-minute rate edit.
     cost_per_1k_input_tokens: float | None = Field(default=None, ge=0)
     cost_per_1k_output_tokens: float | None = Field(default=None, ge=0)
+    # Same partial-update rule as the two rates above: omitted means "leave
+    # unchanged" (the column itself defaults to unset/NULL for a brand-new
+    # row rather than 0.0 — see ProviderCost.cost_per_1k_cached_tokens). An
+    # explicit 0.0 IS a real, distinct update ("this provider doesn't charge
+    # for cache hits"), so this cannot reuse the `or 0.0` idiom the two rates
+    # above use on insert — that would turn an explicit 0.0 and "omitted"
+    # into the same thing again, exactly the ambiguity this column exists to
+    # avoid.
+    cost_per_1k_cached_tokens: float | None = Field(default=None, ge=0)
 
 
 class VoiceItem(BaseModel):
@@ -92,7 +107,8 @@ async def list_providers(
         ProviderCostItem(kind=r.kind, provider=r.provider, model=r.model,
                          cost_per_min=r.cost_per_min,
                          cost_per_1k_input_tokens=r.cost_per_1k_input_tokens,
-                         cost_per_1k_output_tokens=r.cost_per_1k_output_tokens)
+                         cost_per_1k_output_tokens=r.cost_per_1k_output_tokens,
+                         cost_per_1k_cached_tokens=r.cost_per_1k_cached_tokens)
         for r in rows
     ])
 
@@ -115,7 +131,16 @@ async def update_provider_cost(
         row = ProviderCost(kind=kind, provider=provider, model=req.model,
                            cost_per_min=req.cost_per_min,
                            cost_per_1k_input_tokens=req.cost_per_1k_input_tokens or 0.0,
-                           cost_per_1k_output_tokens=req.cost_per_1k_output_tokens or 0.0)
+                           cost_per_1k_output_tokens=req.cost_per_1k_output_tokens or 0.0,
+                           # No `or 0.0` here, unlike the two rates above:
+                           # those columns are NOT NULL/default-0.0, so a
+                           # missing request value and a real 0.0 rate are
+                           # already the same thing for them. This column is
+                           # nullable specifically so a brand-new row created
+                           # from a cost_per_min-only PUT (the live UI's only
+                           # call shape) starts "unconfigured", not "free" —
+                           # see ProviderCost.cost_per_1k_cached_tokens.
+                           cost_per_1k_cached_tokens=req.cost_per_1k_cached_tokens)
         session.add(row)
     else:
         row.cost_per_min = req.cost_per_min
@@ -126,11 +151,20 @@ async def update_provider_cost(
             row.cost_per_1k_input_tokens = req.cost_per_1k_input_tokens
         if req.cost_per_1k_output_tokens is not None:
             row.cost_per_1k_output_tokens = req.cost_per_1k_output_tokens
+        # Same partial-update rule for the cached rate. This can only ever
+        # move an existing row from "unconfigured" to "configured (incl.
+        # 0.0)" or from one configured value to another — there is no
+        # request shape that puts it back to NULL, the same limitation the
+        # two rates above already have (no "unset" wire value distinct from
+        # "omitted").
+        if req.cost_per_1k_cached_tokens is not None:
+            row.cost_per_1k_cached_tokens = req.cost_per_1k_cached_tokens
     await session.commit()
     return ProviderCostItem(kind=kind, provider=provider, model=req.model,
                             cost_per_min=row.cost_per_min,
                             cost_per_1k_input_tokens=row.cost_per_1k_input_tokens,
-                            cost_per_1k_output_tokens=row.cost_per_1k_output_tokens)
+                            cost_per_1k_output_tokens=row.cost_per_1k_output_tokens,
+                            cost_per_1k_cached_tokens=row.cost_per_1k_cached_tokens)
 
 
 class ModelsResponse(BaseModel):

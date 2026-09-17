@@ -140,6 +140,52 @@ async def test_update_provider_cost_partial_update_preserves_token_rates(client:
     assert row["cost_per_1k_output_tokens"] == pytest.approx(0.0025)
 
 
+async def test_update_provider_cost_cached_rate_partial_update(client: AsyncClient) -> None:
+    """Same partial-update contract as cost_per_1k_input_tokens/output_tokens
+    above, extended to cost_per_1k_cached_tokens: (1) a brand-new row created
+    from a cost_per_min-only PUT must come back with cached rate `None`
+    (unconfigured), never 0.0 -- 0.0 is a distinct, real "this provider is
+    free to cache" value, so defaulting a never-sent field to it would be a
+    silent lie about what was configured. (2) once a cached rate IS set, a
+    later PUT that omits the field must not reset it to null/0."""
+    # New row, cost_per_min + model only -- cached rate never mentioned.
+    created = await client.put(
+        "/providers/llm/gemini",
+        json={"cost_per_min": 0.002, "model": "gemini-9-ultra"},
+        headers=ADMIN_HEADERS,
+    )
+    assert created.status_code == 200
+    assert created.json()["cost_per_1k_cached_tokens"] is None
+
+    # Explicitly set the cached rate.
+    set_resp = await client.put(
+        "/providers/llm/gemini",
+        json={
+            "cost_per_min": 0.002, "model": "gemini-9-ultra",
+            "cost_per_1k_cached_tokens": 0.00015,
+        },
+        headers=ADMIN_HEADERS,
+    )
+    assert set_resp.status_code == 200
+    assert set_resp.json()["cost_per_1k_cached_tokens"] == pytest.approx(0.00015)
+
+    # A later per-minute-only edit (the live UI's actual call shape) must
+    # leave the cached rate exactly as it was, not reset it to null/0.
+    later = await client.put(
+        "/providers/llm/gemini",
+        json={"cost_per_min": 0.0021, "model": "gemini-9-ultra"},
+        headers=ADMIN_HEADERS,
+    )
+    assert later.status_code == 200
+    assert later.json()["cost_per_min"] == pytest.approx(0.0021)
+    assert later.json()["cost_per_1k_cached_tokens"] == pytest.approx(0.00015)
+
+    listed = (await client.get("/providers", headers=TENANT_HEADERS)).json()["providers"]
+    row = [r for r in listed if r["kind"] == "llm" and r["provider"] == "gemini"
+           and r["model"] == "gemini-9-ultra"][0]
+    assert row["cost_per_1k_cached_tokens"] == pytest.approx(0.00015)
+
+
 async def test_update_provider_cost_can_explicitly_zero_token_rate(client: AsyncClient) -> None:
     """An explicit 0.0 must be distinguished from an omitted field: sending
     cost_per_1k_input_tokens=0.0 must actually set it to zero, not be treated

@@ -87,3 +87,25 @@ class ILLMProvider(ABC):
         config: LLMConfig,
     ) -> AsyncIterator[str]:
         """Stream response tokens."""
+
+
+def is_llm_spending_cap_error(exc: Exception) -> bool:
+    """True if ``exc`` is a 429 caused by a monthly *spending cap*, as opposed
+    to an ordinary rate/quota-exhaustion 429.
+
+    Google's Gemini error body has no machine-checkable field for this case —
+    it's prose that includes the literal phrase "spending cap" (observed live:
+    "429 RESOURCE_EXHAUSTED. Your project has exceeded its monthly spending
+    cap. See https://ai.studio/spend for details."). Ordinary quota 429s
+    (per-minute/per-day RESOURCE_EXHAUSTED, FreeTier, RetryInfo.retryDelay)
+    don't use this wording, so the match stays narrow: it flags a billing
+    ceiling a human must raise, never a transient quota window that clears on
+    its own.
+
+    Provider-agnostic by design (matches on message text, not a Gemini-typed
+    exception) so both the provider layer (fail fast instead of retrying) and
+    the chat layer (surface a distinct ``llm_billing`` reason) can share this
+    one definition instead of each hand-rolling the same substring check and
+    silently drifting apart.
+    """
+    return "spending cap" in str(exc).lower()

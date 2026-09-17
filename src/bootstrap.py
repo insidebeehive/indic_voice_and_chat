@@ -451,6 +451,20 @@ async def resolve_crm_tools(
     return specs, execs, "crm_catalog"
 
 
+def _prompt_cache_split_enabled(llm: object) -> bool:
+    """True when the chat prompt should be split into a cacheable static body
+    plus a per-turn tail folded into the user turn (see ChatBotAgent's
+    cache_split_prompt and _compose). Gated on BOTH the platform LLM actually
+    being the Gemini adapter AND GEMINI_EXPLICIT_CACHE being set: splitting
+    the prompt only pays for itself against an adapter that will actually
+    create and reuse an explicit cache from the static body it's handed --
+    doing this for any other provider would just move the per-turn language
+    directive and current time out of system_instruction for no benefit.
+    """
+    from src.providers.llm.gemini import GeminiLLMAdapter, explicit_cache_enabled
+    return isinstance(llm, GeminiLLMAdapter) and explicit_cache_enabled()
+
+
 def make_chatbot_factory(registry, sessionmaker=None, crm_retrievers: "PerCrmRetrieverRegistry | None" = None):
     """Per-(tenant, session) ChatBotAgent factory for ``chat.set_chatbot_factory``.
 
@@ -607,15 +621,22 @@ def make_chatbot_factory(registry, sessionmaker=None, crm_retrievers: "PerCrmRet
         # getattr-defensive: some tests stub registry.providers as a bare
         # SimpleNamespace(get_platform_llm=...) without global_defaults.
         _llm_defaults = getattr(registry.providers, "global_defaults", {}).get("llm", {})
+        platform_llm = registry.providers.get_platform_llm()
         return ChatBotAgent(
             session=AgentSession(session_id=session_id),
-            llm=registry.providers.get_platform_llm(),
+            llm=platform_llm,
             retriever=registry.retrievers.get(tenant),
             crm_retriever=_crm_retriever_for(tenant, crm_retrievers),
             company_name=tenant.name,
             language_default=getattr(tenant.settings, "default_language", None) or "en",
             tenant_timezone=getattr(tenant.settings, "timezone", "Asia/Kolkata"),
             prompt_pack=getattr(tenant.settings, "prompt_pack", None) or "generic",
+            # Ships dark: only True when the platform LLM is actually the
+            # Gemini adapter AND GEMINI_EXPLICIT_CACHE is set (see
+            # _prompt_cache_split_enabled above) -- every other tenant/env
+            # keeps composing the prompt exactly as before this parameter
+            # existed.
+            cache_split_prompt=_prompt_cache_split_enabled(platform_llm),
             store=registry.session_stores.get(tenant),
             enable_tools=True,
             crm_tools=tool_specs,

@@ -6,6 +6,7 @@ import asyncio
 import io
 import json
 import logging
+from datetime import datetime
 
 import pytest
 import pytest_asyncio
@@ -698,6 +699,165 @@ async def test_tenant_billing_combines_voice_and_chat_cost(ctx) -> None:
     assert bill["avg_cost_per_call"] == pytest.approx(0.10)
 
 
+async def test_chat_analytics_token_cost_breakdown_tolerates_null_provider(ctx) -> None:
+    """GET .../chat-analytics token/cost reporting (added so an operator can
+    see LLM spend without going to the DB — see ChatAnalytics' own comment
+    for why this exists). Covers: per-model aggregation across multiple
+    messages for the same (provider, model), a None/None legacy row bucketed
+    as "unknown"/"unknown" rather than dropped or raising, non-agent messages
+    excluded from totals, message-count coverage reporting, and — the one
+    that would actually catch a missing tenant filter on the chat_messages
+    query — a second tenant's tokens/cost never leaking into the first's
+    totals."""
+    client, _, sm = ctx
+    tid = (await client.post("/tenants", json=_body(slug="acme"), headers=ADMIN_HEADERS)).json()["tenant_id"]
+    other_body = _body(slug="other")
+    other_body["telephony"]["from_number"] = "+15705255680"
+    other_body["telephony"]["phone_numbers"] = ["+15705255680"]
+    other_tid = (await client.post("/tenants", json=other_body, headers=ADMIN_HEADERS)).json()["tenant_id"]
+
+    from src.models.chat import ChatMessage, ChatSession
+
+    async with sm() as s:
+        s.add(ChatSession(id="s1", tenant_id=tid, status="ended", message_count=4))
+        s.add(ChatMessage(session_id="s1", role="customer", content="hi"))  # no tokens
+        s.add(ChatMessage(
+            session_id="s1", role="agent", content="hello", input_tokens=1000,
+            output_tokens=200, cost=0.01, llm_provider="gemini", llm_model="gemini-3.5-flash"))
+        s.add(ChatMessage(
+            session_id="s1", role="agent", content="more", input_tokens=500,
+            output_tokens=100, cost=0.02, llm_provider="gemini", llm_model="gemini-3.5-flash"))
+        # Legacy row written before llm_provider/llm_model were populated.
+        s.add(ChatMessage(
+            session_id="s1", role="agent", content="legacy", input_tokens=300,
+            output_tokens=50, cost=0.005, llm_provider=None, llm_model=None))
+        # A different tenant's session/messages -- must not leak into tid's totals.
+        s.add(ChatSession(id="s2", tenant_id=other_tid, status="ended", message_count=1))
+        s.add(ChatMessage(
+            session_id="s2", role="agent", content="other tenant", input_tokens=99_999,
+            output_tokens=99_999, cost=123.45, llm_provider="gemini", llm_model="gemini-3.5-flash"))
+        await s.commit()
+
+    ca = (await client.get(f"/tenants/{tid}/chat-analytics", headers=ADMIN_HEADERS)).json()
+    assert ca["total_input_tokens"] == 1800   # 1000 + 500 + 300, other tenant's 99999 excluded
+    assert ca["total_output_tokens"] == 350   # 200 + 100 + 50
+    assert ca["total_cost"] == pytest.approx(0.035)
+    assert ca["total_messages"] == 4          # from ChatSession.message_count, all roles
+    assert ca["total_token_messages"] == 3    # the customer message is excluded
+    assert ca["token_data_since"] is not None
+
+    by_model = {(m["llm_provider"], m["llm_model"]): m for m in ca["by_model"]}
+    assert set(by_model) == {("gemini", "gemini-3.5-flash"), ("unknown", "unknown")}
+    gem = by_model[("gemini", "gemini-3.5-flash")]
+    assert gem["input_tokens"] == 1500 and gem["output_tokens"] == 300
+    assert gem["cost"] == pytest.approx(0.03)
+    assert gem["message_count"] == 2
+    legacy = by_model[("unknown", "unknown")]
+    assert legacy["input_tokens"] == 300 and legacy["cost"] == pytest.approx(0.005)
+    assert legacy["message_count"] == 1
+
+
+async def test_chat_analytics_cache_hit_rate_is_ratio_of_sums(ctx) -> None:
+    """cache_hit_rate_pct MUST be sum(cached_tokens)/sum(input_tokens) across
+    chat_turn_metrics rows, not an average of each row's own ratio -- an
+    average over-weights a low-token turn's incidental 100%/0% hit the same
+    as a high-token turn's real rate (see ChatTurnMetricsTurns.cache_hit_rate_pct
+    for the same reasoning applied to the sibling endpoint).
+
+    The two seeded rows are chosen so the two denominators disagree sharply:
+    ratio-of-sums = (50+0)/(100+900) = 5.0%; average-of-per-row-ratios =
+    (50%+0%)/2 = 25.0%. A wrong-denominator implementation fails this
+    assertion outright rather than by rounding noise."""
+    client, _, sm = ctx
+    tid = (await client.post("/tenants", json=_body(slug="acme"), headers=ADMIN_HEADERS)).json()["tenant_id"]
+
+    from src.models.chat_turn_metrics import ChatTurnMetric
+
+    async with sm() as s:
+        s.add(ChatTurnMetric(
+            tenant_id=tid, session_id="cs1", path="tools", llm_provider="gemini",
+            llm_model="gemini-3.5-flash", action="continue",
+            input_tokens=100, cached_tokens=50,
+            created_at=datetime(2026, 9, 15, 10, 0, 0),
+        ))
+        s.add(ChatTurnMetric(
+            tenant_id=tid, session_id="cs2", path="tools", llm_provider="gemini",
+            llm_model="gemini-3.5-flash", action="continue",
+            input_tokens=900, cached_tokens=0,
+            created_at=datetime(2026, 9, 16, 10, 0, 0),
+        ))
+        await s.commit()
+
+    ca = (await client.get(f"/tenants/{tid}/chat-analytics", headers=ADMIN_HEADERS)).json()
+    assert ca["cached_tokens"] == 50
+    assert ca["cache_hit_rate_pct"] == pytest.approx(5.0)
+    assert ca["cache_metrics_turns"] == 2
+    assert ca["cache_metrics_since"].startswith("2026-09-15")
+
+
+async def test_chat_analytics_zero_coverage_reports_no_data_not_bare_zero(ctx) -> None:
+    """With no chat_turn_metrics rows at all for the tenant, the response must
+    say so explicitly (cache_metrics_turns == 0, cache_metrics_since is None)
+    rather than silently returning cache_hit_rate_pct == 0.0 with nothing to
+    distinguish "measured zero" from "never measured". The frontend's "no
+    cache data yet" branch (static/backoffice.html) is gated on
+    cache_metrics_turns, so a regression that always returns turns > 0 (or
+    always 0 regardless of data) would misrender in exactly the incident
+    scenario this endpoint exists to prevent. Same shape checked for the
+    chat_messages side via total_token_messages/token_data_since."""
+    client, _, sm = ctx
+    tid = (await client.post("/tenants", json=_body(slug="acme"), headers=ADMIN_HEADERS)).json()["tenant_id"]
+
+    from src.models.chat import ChatSession
+
+    async with sm() as s:
+        s.add(ChatSession(id="s1", tenant_id=tid, status="ended", message_count=1))
+        await s.commit()
+
+    ca = (await client.get(f"/tenants/{tid}/chat-analytics", headers=ADMIN_HEADERS)).json()
+    assert ca["cache_metrics_turns"] == 0
+    assert ca["cache_metrics_since"] is None
+    assert ca["cache_hit_rate_pct"] == 0.0
+    assert ca["cached_tokens"] == 0
+    assert ca["total_token_messages"] == 0
+    assert ca["token_data_since"] is None
+    assert ca["total_input_tokens"] == 0
+    assert ca["by_model"] == []
+
+
+async def test_chat_analytics_pre_migration_turn_rows_dont_count_as_cache_coverage(ctx) -> None:
+    """The realistic zero-coverage case: chat_turn_metrics ROWS EXIST for the
+    tenant (unlike the no-rows-at-all case above) but predate migration
+    0021_chat_turn_metrics_tokens, so their token columns are the NOT NULL
+    server_default '0' backfill, not NULL. A query that used
+    `ChatTurnMetric.input_tokens.isnot(None)` (the right filter for
+    chat_messages, which IS nullable) would count every one of these as a
+    "covered" turn and report a confident "0.0% (based on N turns)" for a
+    tenant that in fact has zero real cache-hit data -- exactly the failure
+    cache_metrics_turns/cache_metrics_since exist to prevent. This must come
+    back looking identical to the true no-rows case."""
+    client, _, sm = ctx
+    tid = (await client.post("/tenants", json=_body(slug="acme"), headers=ADMIN_HEADERS)).json()["tenant_id"]
+
+    from src.models.chat_turn_metrics import ChatTurnMetric
+
+    async with sm() as s:
+        for i in range(3):
+            # input_tokens/output_tokens/cached_tokens omitted -- ORM applies
+            # the column default (0), matching a real pre-migration row.
+            s.add(ChatTurnMetric(
+                tenant_id=tid, session_id=f"cs{i}", path="tools",
+                llm_provider="gemini", llm_model="gemini-3.5-flash", action="continue",
+            ))
+        await s.commit()
+
+    ca = (await client.get(f"/tenants/{tid}/chat-analytics", headers=ADMIN_HEADERS)).json()
+    assert ca["cache_metrics_turns"] == 0
+    assert ca["cache_metrics_since"] is None
+    assert ca["cache_hit_rate_pct"] == 0.0
+    assert ca["cached_tokens"] == 0
+
+
 async def test_tenant_analytics_unknown_404(ctx) -> None:
     client, _, _ = ctx
     assert (await client.get("/tenants/nope/analytics", headers=ADMIN_HEADERS)).status_code == 404
@@ -736,6 +896,137 @@ async def test_crm_x_api_key_not_set_reports_empty_string(ctx) -> None:
         "/tenants", json=_body(slug="acme"), headers=ADMIN_HEADERS)).json()["tenant_id"]
     cfg = (await client.get(f"/tenants/{tid}/chat-config", headers=ADMIN_HEADERS)).json()
     assert cfg["crm"]["x_api_key"] == ""
+
+
+async def _stored_secret(sm, tenant_id: str, name: str) -> str | None:
+    """Decrypt one tenant_secrets row, or None if the row does not exist —
+    the same select-then-crypto.decrypt shape used inline above, factored out
+    because the blank-credential tests below all need to prove what is
+    actually sitting in the column, not what an API response summarises."""
+    async with sm() as s:
+        rows = (await s.execute(
+            select(TenantSecret).where(TenantSecret.tenant_id == tenant_id)
+        )).scalars().all()
+    row = next((r for r in rows if r.name == name), None)
+    return None if row is None else crypto.decrypt(row.value_encrypted)
+
+
+@pytest.mark.parametrize("block,field", [
+    ("chatwoot", "api_url"),
+    ("chatwoot", "account_id"),
+    ("chatwoot", "api_token"),
+    ("chatwoot", "inbox_id"),
+    ("crm", "base_url"),
+    ("crm", "auth_type"),
+    ("crm", "api_token"),
+    ("crm", "x_api_key"),
+])
+async def test_patch_blank_credential_is_rejected(ctx, block, field) -> None:
+    """Every Chatwoot/CRM field that lands in tenant_secrets rejects "".
+
+    The handler gates each of these on `is not None`, which an empty string
+    passes — so before this constraint a blank field wrote an encrypted ""
+    over whatever was there. Rejecting at the model means the handler never
+    sees a value it would encrypt into a working credential's row.
+    """
+    client, _, _ = ctx
+    tid = (await client.post(
+        "/tenants", json=_body(slug="acme"), headers=ADMIN_HEADERS)).json()["tenant_id"]
+
+    resp = await client.patch(f"/tenants/{tid}", json={block: {field: ""}},
+                              headers=ADMIN_HEADERS)
+    assert resp.status_code == 422, f"{block}.{field} accepted an empty string"
+
+
+async def test_patch_blank_crm_x_api_key_does_not_erase_the_configured_one(ctx) -> None:
+    """x_api_key is the CRM's own auth header, independent of auth_type/api_token,
+    so a blank value silently replacing it breaks CRM auth on its own. It must
+    not reach the column — proven by decrypting the row, not by reading the
+    masked chat-config response, which shows "..." for both a real value and
+    an encrypted "".
+    """
+    client, _, sm = ctx
+    tid = (await client.post(
+        "/tenants", json=_body(slug="acme"), headers=ADMIN_HEADERS)).json()["tenant_id"]
+
+    assert (await client.patch(f"/tenants/{tid}", json={
+        "crm": {"base_url": "https://crm.example", "x_api_key": "live-x-api-key"},
+    }, headers=ADMIN_HEADERS)).status_code == 200
+    assert await _stored_secret(sm, tid, "crm:x_api_key") == "live-x-api-key"
+
+    resp = await client.patch(f"/tenants/{tid}", json={"crm": {"x_api_key": ""}},
+                              headers=ADMIN_HEADERS)
+    assert resp.status_code == 422
+    assert await _stored_secret(sm, tid, "crm:x_api_key") == "live-x-api-key", (
+        "a blank x_api_key overwrote the configured CRM credential"
+    )
+    assert await _stored_secret(sm, tid, "crm:base_url") == "https://crm.example"
+
+
+async def test_patch_blank_chatwoot_api_token_does_not_erase_the_configured_one(ctx) -> None:
+    """Same property on the Chatwoot side. The backoffice form always sends
+    inbox_id/account_id alongside the token, so the realistic shape of this
+    request carries a valid sibling field — the whole body must still be
+    rejected rather than committing the valid half."""
+    client, _, sm = ctx
+    tid = (await client.post(
+        "/tenants", json=_body(slug="acme"), headers=ADMIN_HEADERS)).json()["tenant_id"]
+
+    assert (await client.patch(f"/tenants/{tid}", json={
+        "chatwoot": {"inbox_id": "42", "api_token": "cw-live-token"},
+    }, headers=ADMIN_HEADERS)).status_code == 200
+    assert await _stored_secret(sm, tid, "chatwoot:api_token") == "cw-live-token"
+
+    resp = await client.patch(f"/tenants/{tid}", json={
+        "chatwoot": {"inbox_id": "42", "api_token": ""},
+    }, headers=ADMIN_HEADERS)
+    assert resp.status_code == 422
+    assert await _stored_secret(sm, tid, "chatwoot:api_token") == "cw-live-token", (
+        "a blank api_token overwrote the configured Chatwoot credential"
+    )
+
+
+async def test_patch_omitted_credential_field_is_left_untouched(ctx) -> None:
+    """The other half of the contract, and the reason the `is not None` gates
+    in the handler must survive this change: a field the caller did not send
+    keeps its stored value, while the fields it did send are written. Without
+    the gates a partial PATCH would blank every field it omits — a strictly
+    worse version of the bug the min_length constraint closes."""
+    client, _, sm = ctx
+    tid = (await client.post(
+        "/tenants", json=_body(slug="acme"), headers=ADMIN_HEADERS)).json()["tenant_id"]
+
+    assert (await client.patch(f"/tenants/{tid}", json={
+        "crm": {"base_url": "https://crm.example", "x_api_key": "live-x-api-key"},
+    }, headers=ADMIN_HEADERS)).status_code == 200
+
+    # x_api_key omitted entirely — only base_url is being changed.
+    assert (await client.patch(f"/tenants/{tid}", json={
+        "crm": {"base_url": "https://crm2.example"},
+    }, headers=ADMIN_HEADERS)).status_code == 200
+
+    assert await _stored_secret(sm, tid, "crm:x_api_key") == "live-x-api-key", (
+        "an omitted field was overwritten by a partial PATCH"
+    )
+    assert await _stored_secret(sm, tid, "crm:base_url") == "https://crm2.example"
+
+
+async def test_patch_explicit_null_credential_is_still_a_no_op(ctx) -> None:
+    """min_length=1 constrains the str arm of Optional[str] only — an explicit
+    JSON null must stay equivalent to omitting the field, not become a 422.
+    Nothing in the backoffice sends null today, but the PATCH contract has
+    always treated the two the same and a constraint should not quietly
+    redefine it."""
+    client, _, sm = ctx
+    tid = (await client.post(
+        "/tenants", json=_body(slug="acme"), headers=ADMIN_HEADERS)).json()["tenant_id"]
+    await client.patch(f"/tenants/{tid}", json={"crm": {"x_api_key": "live-x-api-key"}},
+                       headers=ADMIN_HEADERS)
+
+    resp = await client.patch(f"/tenants/{tid}", json={"crm": {"x_api_key": None}},
+                              headers=ADMIN_HEADERS)
+    assert resp.status_code == 200, resp.text
+    assert await _stored_secret(sm, tid, "crm:x_api_key") == "live-x-api-key"
 
 
 async def test_rotate_webhook_credentials_stringee_only(ctx) -> None:
@@ -1110,20 +1401,33 @@ async def test_patch_deposit_verification_empty_secret_is_not_a_secret(ctx) -> N
 
     It must also not clobber an existing working secret: a blank field in the
     UI means "leave unchanged", not "erase".
+
+    This used to be enforced as a silent 200 no-op. It is a 422 now: the
+    backoffice form never sends a blank secret (it omits the field unless
+    typed), so the caller who can actually produce this request is a direct
+    API PATCH — and a silent 200 there gives no indication anything was
+    wrong. The property being guarded is unchanged — the previously
+    configured secret must still be there, byte for byte, after the
+    rejected call.
     """
-    client, _, _ = ctx
+    client, _, sm = ctx
     tid = (await client.post(
         "/tenants", json=_body(slug="acme"), headers=ADMIN_HEADERS)).json()["tenant_id"]
+    secret_name = "TENANT_ACME_DEPOSIT_VERIFICATION_WEBHOOK_SECRET"
 
-    resp = await client.patch(f"/tenants/{tid}", json={
+    # enabled + webhook_url, no secret yet — the inert-but-valid state.
+    assert (await client.patch(f"/tenants/{tid}", json={
         "deposit_verification": {
             "enabled": True,
             "webhook_url": "https://vendor.example/verify",
-            "webhook_secret": "",
         }
+    }, headers=ADMIN_HEADERS)).status_code == 200
+
+    resp = await client.patch(f"/tenants/{tid}", json={
+        "deposit_verification": {"webhook_secret": ""},
     }, headers=ADMIN_HEADERS)
-    assert resp.status_code == 200
-    assert resp.json()["deposit_verification_secret_set"] is False
+    assert resp.status_code == 422, "an empty webhook_secret was accepted"
+    assert await _stored_secret(sm, tid, secret_name) is None
 
     t = next(x for x in (await client.get("/tenants", headers=ADMIN_HEADERS))
              .json()["tenants"] if x["tenant_id"] == tid)
@@ -1132,18 +1436,21 @@ async def test_patch_deposit_verification_empty_secret_is_not_a_secret(ctx) -> N
         "enabled + webhook_url + an EMPTY secret must not read as active"
     )
 
-    # A real secret, then a blank one: the blank must leave the real one alone.
-    await client.patch(f"/tenants/{tid}", json={
+    # A real secret, then a blank one: the blank is rejected AND leaves the
+    # real one alone — the erase this whole constraint exists to prevent.
+    assert (await client.patch(f"/tenants/{tid}", json={
         "deposit_verification": {"webhook_secret": "shared-secret-value"},
-    }, headers=ADMIN_HEADERS)
-    await client.patch(f"/tenants/{tid}", json={
+    }, headers=ADMIN_HEADERS)).status_code == 200
+    assert (await client.patch(f"/tenants/{tid}", json={
         "deposit_verification": {"webhook_secret": ""},
-    }, headers=ADMIN_HEADERS)
-    t = next(x for x in (await client.get("/tenants", headers=ADMIN_HEADERS))
-             .json()["tenants"] if x["tenant_id"] == tid)
-    assert t["deposit_verification_secret_set"] is True, (
+    }, headers=ADMIN_HEADERS)).status_code == 422
+
+    assert await _stored_secret(sm, tid, secret_name) == "shared-secret-value", (
         "a blank secret erased a previously configured one"
     )
+    t = next(x for x in (await client.get("/tenants", headers=ADMIN_HEADERS))
+             .json()["tenants"] if x["tenant_id"] == tid)
+    assert t["deposit_verification_secret_set"] is True
     assert t["deposit_verification_active"] is True
 
 

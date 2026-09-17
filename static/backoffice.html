@@ -250,6 +250,45 @@ async function loadAnalytics(id) {
   const ct = tmr.ok ? tmr.json : null;
   const bm = bmr.ok ? bmr.json : null;
 
+  // Cache-hit rate is only meaningful alongside its own coverage — see
+  // ChatAnalytics.cache_metrics_turns/cache_metrics_since in src/api/tenants.py.
+  // A tenant with zero chat_turn_metrics rows (e.g. everything predates
+  // migration 0021_chat_turn_metrics_tokens) gets an explicit "no cache data
+  // yet" message instead of a misleading "0%".
+  const cacheHtml = ca && ca.cache_metrics_turns > 0
+    ? `${pct1(ca.cache_hit_rate_pct)} <span class="hint">(based on ${ca.cache_metrics_turns} turn${ca.cache_metrics_turns === 1 ? "" : "s"}` +
+      (ca.cache_metrics_since ? ` since ${escT(String(ca.cache_metrics_since).slice(0, 10))}` : "") + `)</span>`
+    : `<span class="hint">no cache data yet</span>`;
+
+  const modelRows = ca && ca.by_model && ca.by_model.length
+    ? `<div class="metrics-wrap"><table class="metrics">
+        <thead><tr><th>Provider</th><th>Model</th><th class="n">Messages</th><th class="n">Input tokens</th>
+          <th class="n">Output tokens</th><th class="n">Cost (est.)</th></tr></thead>
+        <tbody>${ca.by_model.slice().sort((x, y) => (Number(y.cost) || 0) - (Number(x.cost) || 0)).map(m => `<tr>
+          <td>${escT(m.llm_provider)}</td>
+          <td>${escT(m.llm_model)}</td>
+          <td class="n">${m.message_count}</td>
+          <td class="n">${m.input_tokens}</td>
+          <td class="n">${m.output_tokens}</td>
+          <td class="n">${fmt(m.cost)}</td>
+        </tr>`).join("")}</tbody>
+      </table></div>`
+    : `<span class="hint">No token usage recorded yet.</span>`;
+
+  // total_token_messages/token_data_since tell us roughly what fraction of
+  // this tenant's chat history the token/cost totals above actually cover —
+  // token data was only ever written for messages once cost tracking
+  // existed on that write path, so this is a floor on real spend, not a
+  // total, for any tenant with messages older than that. total_messages is
+  // ChatSession.message_count, a separately-maintained running counter, not
+  // a live count of chat_messages rows, so this is worded as "~out of" —
+  // an approximate coverage indicator, not an exact fraction — rather than
+  // implying the two counts are drawn from the same query.
+  const coverageHtml = ca && ca.total_token_messages > 0
+    ? `<span class="hint">${ca.total_token_messages} messages carry token data (~out of ${ca.total_messages} total)` +
+      (ca.token_data_since ? ` since ${escT(String(ca.token_data_since).slice(0, 10))}` : "") + `</span>`
+    : `<span class="hint">no token data recorded yet</span>`;
+
   const chatHtml = ca ? `
     <h2 style="margin:1.4rem 0 .6rem;">Chat sessions</h2>
     <div class="stats">
@@ -262,7 +301,22 @@ async function loadAnalytics(id) {
       <div><h2>By status</h2><div class="kv">${rows(ca.by_status)}</div></div>
       <div><h2>By mode</h2><div class="kv">${rows(ca.by_mode)}</div></div>
       <div><h2>By source</h2><div class="kv">${rows(ca.by_source)}</div></div>
-    </div>` : "";
+    </div>
+    <h2 style="margin:1.4rem 0 .6rem;">Chat tokens &amp; cost</h2>
+    <div class="stats">
+      ${statBox("Total input tokens", ca.total_input_tokens)}
+      ${statBox("Total output tokens", ca.total_output_tokens)}
+      ${statBox("Total cost (est.)", fmt(ca.total_cost))}
+      ${statBox("Cache-hit rate", cacheHtml)}
+    </div>
+    <div style="margin:.4rem 0 .2rem;">${coverageHtml}</div>
+    <div class="hint" style="margin:.3rem 0 .5rem;">Cost is our own estimate from the local <code>provider_costs</code>
+      rate table, not the provider's billing figure — it (and the token totals above) only reflect messages that
+      carried token data (see coverage note above), so totals below full coverage are a floor, not the complete
+      spend. Cache-hit rate is computed from a separate table (chat turn metrics) with its own, different coverage —
+      shown in its own stat above — which is not available for older history.</div>
+    <h3 style="margin:1rem 0 .5rem;font-size:.85rem;color:#cbd5e1;">By model</h3>
+    ${modelRows}` : "";
 
   const winLabel = CHAT_WINDOW_H === 168 ? "7d" : CHAT_WINDOW_H + "h";
 
