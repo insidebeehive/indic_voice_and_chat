@@ -103,6 +103,86 @@ direction, and the size of the error is whatever discount the provider applies
 to cached input. Modelling that rate is a precondition for any credible
 projection of what caching work would save.
 
+## Explicit caching as implemented
+
+Built behind `GEMINI_EXPLICIT_CACHE` (unset/falsy = disabled, the shipped
+default) plus `GEMINI_CACHE_TTL_S` (default 1800s = 30 minutes). The registry
+lives entirely inside `GeminiLLMAdapter` (`src/providers/llm/gemini.py`) —
+`src/interfaces/llm.py` carries no new fields, so the adapter derives
+everything (system text, tool declarations) from what `generate()` is already
+handed. TTL of 30 minutes was picked against two numbers in this doc: a
+30-minute window is long enough that an active tenant's turns — which arrive
+far more often than every 30 minutes — keep reusing one cache instead of
+re-paying the 1.77s-plus-a-full-token-write creation cost every restart of
+the window, and short enough to bound idle storage billing (explicit caches
+bill storage per token-hour) to at most half an hour after a tenant goes
+quiet.
+
+`build_chatbot_system_prompt` gained `include_variable_tail: bool = True`
+(default preserves today's output byte-for-byte) plus a standalone
+`build_chatbot_variable_tail()`, so the static body (cacheable) and the
+per-turn tail (sources / current time / language directive — minute-granular,
+would invalidate a cache every minute if left in `system_instruction`) can be
+built separately. `ChatBotAgent` only uses the split when `cache_split_prompt`
+is on (wired in `src/bootstrap.py`, gated on both the platform LLM being the
+Gemini adapter and the env flag) — when it's on, `_compose` folds the tail
+into the user turn's `contents` message instead, framed so the model reads it
+as platform-supplied context rather than something the customer said.
+
+A cache is not created on the first sighting of a `(model, system, tools)`
+key — only from the second sighting, so a one-shot or minute-varying system
+prompt (voice, analysis) never burns a real `caches.create` call. Chat's
+static body is stable across a turn's ~2.47 LLM calls, so it typically gets
+created within the first one or two turns of traffic for a given tenant
+config. Any prompt/tenant/tool-catalog/model change produces a different
+sha256 key, so a stale cache is never reused for changed content — it just
+ages out.
+
+### Live verification, 2026-09-17
+
+Verified against the live Developer API with a production-shaped prompt: the
+real `build_chatbot_system_prompt` static body (betting pack, all tool flags
+on, `include_variable_tail=False`, 20,138 chars) plus the FULL production tool
+set a fully-configured tenant would actually send — 3 builtins +
+`submit_deposit_verification` + the entire 22-tool CRM catalog
+(`src/chatbot/catalog.py`'s `ALL_TOOLS`) — 26 tools total — plus ~10 turns of
+realistic Hinglish chat history.
+
+- **Generate-side contract, confirmed live**: a `generate_content` call
+  combining `cached_content` with either `system_instruction` or `tools` is
+  rejected — `400 INVALID_ARGUMENT`, verbatim: *"CachedContent can not be used
+  with GenerateContent request setting system_instruction, tools or
+  tool_config. Proposed fix: move those values to CachedContent from
+  GenerateContent request."* The implementation matches this: on a hit it
+  sends neither.
+- **Tool-declaration token count (the size of the prize)**: caching the
+  static system body alone costs **4,574 tokens**; adding the full 26-tool
+  declaration set to the same cache costs **9,468 tokens** — the 26 tools
+  alone are **4,894 tokens**, i.e. tool declarations are *larger* than the
+  static system prompt they ride alongside. This is materially bigger than
+  the ~4,024-4,028-token implicit-cache ceiling measured above — the implicit
+  cache structurally cannot see this content at all (`config.tools` never
+  contributed to the cached count, confirmed above), so this is real,
+  previously-unreachable coverage, not a duplicate of the existing implicit
+  hit.
+- **Before/after `cached_content_token_count`, via the real adapter**: a cold
+  uncached call against this prompt (9,683 total prompt tokens, tools
+  included) reported **0 cached** (the implicit cache did not warm on a
+  single one-off call in this run — consistent with it being best-effort, not
+  guaranteed, and unrelated to the explicit-cache path). Once the adapter's
+  own second-sighting rule created the cache and a third call hit it, the
+  same 9,683-token prompt reported **9,468 cached (97.8%)** — matching the
+  99.7% figure from the original explicit-cache experiment above, on a larger
+  and fully tool-bearing prompt this time.
+- **Tool-calling still works on a cache hit**: a follow-up cached call that
+  should trigger `search_knowledge_base` did — `tool_calls=['get_player_wallet',
+  'get_player_bonuses', 'search_knowledge_base']` — confirming caching the
+  tool declarations does not silently disable function-calling.
+- All caches created during this verification (2 in the tool-declaration
+  measurement, 1 in the contract probe, 1 created by the adapter itself) were
+  deleted immediately after use. Total spend: a handful of small
+  `generate_content` calls plus four short-lived caches, well under a cent.
+
 ## Measurement notes
 
 Production figures come from operator-run queries against the production

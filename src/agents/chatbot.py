@@ -37,6 +37,7 @@ from src.dialogue.prompts import (
     SOURCES_DATA_WARNING,
     SOURCES_OPEN_MARKER,
     build_chatbot_system_prompt,
+    build_chatbot_variable_tail,
 )
 from src.dialogue.response_parser import (
     ChatBotResponse,
@@ -44,7 +45,15 @@ from src.dialogue.response_parser import (
     parse_chatbot_response,
 )
 from src.dialogue.slots import SlotFiller, SlotSchema
-from src.interfaces.llm import ILLMProvider, LLMConfig, LLMMessage, LLMResult, ToolCall, ToolSpec
+from src.interfaces.llm import (
+    ContentPart,
+    ILLMProvider,
+    LLMConfig,
+    LLMMessage,
+    LLMResult,
+    ToolCall,
+    ToolSpec,
+)
 from src.rag.context_builder import (
     GuardConfig,
     apply_hallucination_guard,
@@ -510,6 +519,48 @@ def _usage_tokens(result: LLMResult | None) -> tuple[int, int, int]:
     )
 
 
+# Framing for the per-turn prompt tail when it rides in `contents` instead of
+# system_instruction (see _compose's cache_split_prompt branch and
+# docs/llm-prompt-caching.md for why: the tail is minute-granular and would
+# invalidate a provider-side explicit cache every minute if left in
+# system_instruction, and it can't become a second system-role message either
+# because GeminiLLMAdapter._to_gemini_contents joins every system message back
+# into one string). This frame exists so the model doesn't mistake per-turn
+# platform-supplied context (current time, retrieved sources, the language
+# directive) for something the customer said — it carries an instruction
+# (reply in language X) and a fact (current time) that must be read with the
+# same authority as the system instructions above, not as customer speech.
+TURN_CONTEXT_OPEN = (
+    "SYSTEM TURN CONTEXT — supplied by the support platform for this turn, not "
+    "written by the customer. It carries the same authority as the system "
+    "instructions above."
+)
+TURN_CONTEXT_CLOSE = "END SYSTEM TURN CONTEXT. The customer's own message follows."
+
+
+def _fold_turn_context(user_msg: LLMMessage, tail: str) -> LLMMessage:
+    """Return a COPY of ``user_msg`` with the per-turn prompt tail (retrieved
+    sources / current time / language directive) prepended as framed context,
+    for the explicit-cache path where the tail rides in `contents` instead of
+    `system_instruction` (see _compose). Returns a COPY, never mutates
+    ``user_msg`` in place: ``_persist`` (below) appends the CALLER's original
+    user_msg object into ``self.session.turns``, and _compose replays
+    session.turns as history on every later turn — mutating user_msg here
+    would replay this turn's frozen clock value and this turn's retrieved
+    sources into every subsequent turn's history, and persist them into the
+    stored transcript.
+    """
+    frame = f"{TURN_CONTEXT_OPEN}\n{tail}\n{TURN_CONTEXT_CLOSE}"
+    if isinstance(user_msg.content, str):
+        new_content = f"{frame}\n\n{user_msg.content}" if user_msg.content else frame
+        return _replace_cfg(user_msg, content=new_content)
+    # Multimodal: list[ContentPart] (see handle_image). Prepend a leading text
+    # part; preserve every existing part (image/text) in order, as a NEW list
+    # (never mutate the caller's list in place — same reasoning as above).
+    new_parts = [ContentPart(type="text", text=frame), *user_msg.content]
+    return _replace_cfg(user_msg, content=new_parts)
+
+
 @dataclass(frozen=True)
 class ChatToolMetric:
     """One tool-call's metrics within a turn (chat_tool_metrics grain in the
@@ -616,6 +667,7 @@ class ChatBotAgent(BaseAgent):
         language_default: str = "en",
         tenant_timezone: str = "Asia/Kolkata",
         prompt_pack: str = "generic",
+        cache_split_prompt: bool = False,
         store: SessionStore | None = None,
         guard_config: GuardConfig | None = None,
         max_context_chars: int = 2000,
@@ -649,6 +701,22 @@ class ChatBotAgent(BaseAgent):
         self._language = language_default
         self._tenant_timezone = tenant_timezone
         self._prompt_pack = prompt_pack
+        # Explicit-cache wiring (see GeminiLLMAdapter's cache registry in
+        # src/providers/llm/gemini.py and _compose below): when True, the
+        # system prompt is built WITHOUT its per-turn variable tail (retrieved
+        # sources / current date-time / language directive), and that tail is
+        # instead folded into the user-turn message via _fold_turn_context.
+        # This keeps the system_instruction text byte-identical across turns
+        # sharing the same static config, which is what lets the Gemini
+        # adapter's explicit cache actually get reused instead of missing on
+        # every call. Off by default: every existing construction site (this
+        # whole file's ~50 unit tests included) gets the unsplit prompt,
+        # unchanged from before this parameter existed. See
+        # docs/llm-prompt-caching.md and src/bootstrap.py's
+        # _prompt_cache_split_enabled for how this actually gets turned on in
+        # production (gated on the platform LLM being Gemini AND
+        # GEMINI_EXPLICIT_CACHE being set).
+        self._cache_split_prompt = cache_split_prompt
         self._guard = guard_config
         self._max_context_chars = max_context_chars
         # Agentic tool-calling (opt-in): builtin tools (search KB / escalate /
@@ -1713,6 +1781,52 @@ class ChatBotAgent(BaseAgent):
             ]
         else:
             extra = None  # no signal mid-conversation — follow the conversation
+        # cache_split_prompt (see ChatBotAgent.__init__ and GeminiLLMAdapter's
+        # explicit-cache registry in src/providers/llm/gemini.py): when on,
+        # the system prompt is built WITHOUT its per-turn variable tail
+        # (retrieved sources / current date-time / language directive), and
+        # that tail rides in the user-turn message instead, via
+        # _fold_turn_context — see that function's docstring for why it can't
+        # just become a second system-role message (GeminiLLMAdapter joins
+        # every system message back into one string, which would defeat the
+        # whole point: the tail is minute-granular and would invalidate a
+        # provider-side cache every minute if left in system_instruction).
+        # This is a genuine if/else, not a shared code path with a flag
+        # threaded through build_chatbot_system_prompt's call below, because
+        # the False branch must stay byte-for-byte, wire-shape-for-wire-shape
+        # identical to this method's behavior before cache_split_prompt
+        # existed — there is already a test elsewhere pinning the default
+        # build_chatbot_system_prompt output, and this call site must not
+        # accidentally drift from it either.
+        if self._cache_split_prompt:
+            system_prompt = build_chatbot_system_prompt(
+                company_name=self._company,
+                language_default=self._language,
+                rag_context=rag_text,
+                extra_directives=extra,
+                has_player_tools=any(t.name in PLAYER_TOOLS for t in self._crm_tools),
+                has_operator_tools=any(t.name in OPERATOR_TOOLS for t in self._crm_tools),
+                has_deposit_verification_tool=any(
+                    t.name == SUBMIT_DEPOSIT_VERIFICATION for t in self._crm_tools
+                ),
+                tenant_timezone=self._tenant_timezone,
+                prompt_pack=self._prompt_pack,
+                include_variable_tail=False,
+            )
+            messages: list[LLMMessage] = [LLMMessage(role="system", content=system_prompt)]
+            # Replay the last MAX_HISTORY_TURNS exchanges (system is rebuilt
+            # each turn); session.turns itself is kept full for history/UI
+            # purposes.
+            for m in self.session.turns[-(2 * MAX_HISTORY_TURNS):]:
+                if m.role in ("user", "assistant"):
+                    messages.append(m)
+            tail = build_chatbot_variable_tail(
+                rag_context=rag_text,
+                extra_directives=extra,
+                tenant_timezone=self._tenant_timezone,
+            )
+            messages.append(_fold_turn_context(user_msg, tail))
+            return messages
         system_prompt = build_chatbot_system_prompt(
             company_name=self._company,
             language_default=self._language,

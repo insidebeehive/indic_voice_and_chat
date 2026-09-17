@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
 
+import src.providers.llm.gemini as gemini_module
 from src.interfaces.llm import LLMConfig, LLMMessage
 from src.providers.llm.gemini import GeminiLLMAdapter
 
@@ -36,7 +38,8 @@ def _response(text: str, finish_reason: str = "STOP",
 
 
 def _make_client(*, generate_return: Any = None,
-                 stream_chunks: list[Any] | None = None) -> SimpleNamespace:
+                 stream_chunks: list[Any] | None = None,
+                 cache_create: Any = None) -> SimpleNamespace:
     generate = AsyncMock(return_value=generate_return) if generate_return else AsyncMock()
 
     if stream_chunks is not None:
@@ -55,7 +58,30 @@ def _make_client(*, generate_return: Any = None,
         generate_content=generate,
         generate_content_stream=stream,
     )
-    return SimpleNamespace(aio=SimpleNamespace(models=models))
+    # ``caches`` is unused by every pre-existing test (caching is opt-in and
+    # off by default), so a plain default here is harmless noise for them —
+    # the cache-registry tests below override it via ``cache_create`` to
+    # observe/control ``caches.create`` (name returned, blocking, failure).
+    caches = cache_create if cache_create is not None else SimpleNamespace(
+        create=AsyncMock(return_value=SimpleNamespace(name="cachedContents/fake123")),
+        delete=AsyncMock(),
+    )
+    return SimpleNamespace(aio=SimpleNamespace(models=models, caches=caches))
+
+
+# A system string comfortably over the 5,000-char explicit-cache floor
+# (~1,250-token proxy — see _CACHE_MIN_SYSTEM_CHARS) so cache-registry tests
+# can actually exercise the caching logic. A short one for the floor test.
+_BIG_SYSTEM = ("This is a long, stable, cacheable system prompt sentence. ") * 110
+_SHORT_SYSTEM = "Be terse and helpful."
+assert len(_BIG_SYSTEM) >= 5000 and len(_SHORT_SYSTEM) < 5000
+
+
+def _msgs(system_text: str) -> list[LLMMessage]:
+    return [
+        LLMMessage(role="system", content=system_text),
+        LLMMessage(role="user", content="hi"),
+    ]
 
 
 # --- generate() ---------------------------------------------------------
@@ -237,6 +263,21 @@ def _no_backoff_sleep(monkeypatch):
     """Keep retry tests fast — skip the real backoff delay."""
     import src.providers.llm.gemini as gemini_mod
     monkeypatch.setattr(gemini_mod.asyncio, "sleep", AsyncMock())
+
+
+@pytest.fixture(autouse=True)
+def _clear_inflight_cache_tasks():
+    """``_inflight_cache_tasks`` is a MODULE-GLOBAL set (see gemini.py's
+    comment on it) that outlives any one test. pytest-asyncio gives each test
+    its own fresh event loop, so a task that leaked across a test boundary
+    would be bound to an already-closed loop — a later test's
+    ``asyncio.gather(*gemini_module._inflight_cache_tasks)`` would then raise
+    or hang on someone else's leftover task instead of its own. Clearing
+    before AND after each test keeps this file's tests isolated from each
+    other regardless of load order."""
+    gemini_module._inflight_cache_tasks.clear()
+    yield
+    gemini_module._inflight_cache_tasks.clear()
 
 
 @pytest.mark.asyncio
@@ -747,3 +788,346 @@ async def test_generate_no_tools_is_unchanged_regression() -> None:
     kwargs = client.aio.models.generate_content.await_args.kwargs
     assert kwargs["contents"] == [{"role": "user", "parts": [{"text": "hi"}]}]
     assert "tools" not in kwargs["config"]
+
+
+# --- Explicit context-cache registry ------------------------------------
+
+
+class _FakeCacheNotFoundError(Exception):
+    """Mimics google.genai's error when a referenced CachedContent is gone
+    (expired server-side, deleted out of band, etc.)."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "404 NOT_FOUND. CachedContent not found: cachedContents/fake123"
+        )
+        self.code = 404
+
+
+@pytest.mark.asyncio
+async def test_cache_disabled_by_default_leaves_requests_unchanged(monkeypatch) -> None:
+    monkeypatch.delenv("GEMINI_EXPLICIT_CACHE", raising=False)
+    client = _make_client(generate_return=_response("ok"))
+    adapter = GeminiLLMAdapter({"client": client})
+
+    await adapter.generate(_msgs(_BIG_SYSTEM), LLMConfig())
+    await adapter.generate(_msgs(_BIG_SYSTEM), LLMConfig())
+
+    assert client.aio.caches.create.await_count == 0
+    for call in client.aio.models.generate_content.await_args_list:
+        cfg = call.kwargs["config"]
+        assert cfg["system_instruction"] == _BIG_SYSTEM
+        assert "cached_content" not in cfg
+
+
+@pytest.mark.asyncio
+async def test_first_sighting_is_uncached_and_creates_nothing(monkeypatch) -> None:
+    monkeypatch.setenv("GEMINI_EXPLICIT_CACHE", "1")
+    client = _make_client(generate_return=_response("ok"))
+    adapter = GeminiLLMAdapter({"client": client})
+
+    await adapter.generate(_msgs(_BIG_SYSTEM), LLMConfig())
+
+    # `create.await_count == 0` alone is vacuous here: the uncontended
+    # semaphore fast-path means generate() never yields control back to the
+    # loop in a way that would let a create_task-scheduled coroutine actually
+    # run, so this would pass identically even if the second-sighting rule
+    # had an off-by-one bug that scheduled creation on the FIRST sighting (a
+    # scheduled-but-not-yet-run task also shows await_count == 0 right here).
+    # Asserting the module-level in-flight set is empty proves creation was
+    # never even ATTEMPTED, not just that it hasn't finished yet.
+    assert gemini_module._inflight_cache_tasks == set()
+    assert client.aio.caches.create.await_count == 0
+    cfg = client.aio.models.generate_content.await_args.kwargs["config"]
+    assert cfg["system_instruction"] == _BIG_SYSTEM
+    assert "cached_content" not in cfg
+
+
+@pytest.mark.asyncio
+async def test_second_sighting_schedules_creation_without_blocking_the_turn(monkeypatch) -> None:
+    import src.providers.llm.gemini as gemini_module
+    monkeypatch.setenv("GEMINI_EXPLICIT_CACHE", "1")
+
+    release = asyncio.Event()
+
+    async def _blocking_create(**kwargs):
+        await release.wait()
+        return SimpleNamespace(name="cachedContents/fake123")
+
+    create_mock = AsyncMock(side_effect=_blocking_create)
+    client = _make_client(
+        generate_return=_response("ok"),
+        cache_create=SimpleNamespace(create=create_mock, delete=AsyncMock()),
+    )
+    adapter = GeminiLLMAdapter({"client": client})
+
+    await adapter.generate(_msgs(_BIG_SYSTEM), LLMConfig())  # 1st sighting: nothing scheduled
+
+    # 2nd sighting schedules a background creation that is currently blocked
+    # on `release` — the turn must not wait for it.
+    result2 = await asyncio.wait_for(
+        adapter.generate(_msgs(_BIG_SYSTEM), LLMConfig()), timeout=1.0,
+    )
+    assert result2.text == "ok"
+
+    release.set()
+    await asyncio.gather(*gemini_module._inflight_cache_tasks)
+
+    assert create_mock.await_count == 1
+    create_kwargs = create_mock.await_args.kwargs
+    assert create_kwargs["config"]["system_instruction"] == _BIG_SYSTEM
+    assert create_kwargs["config"]["ttl"] == "1800s"
+
+
+@pytest.mark.asyncio
+async def test_hit_passes_cached_content_and_omits_system_and_tools(monkeypatch) -> None:
+    # Config carries real tools: production chat ALWAYS sends tools
+    # (BUILTIN_TOOLS + CRM tools), and combining `cached_content` with
+    # `tools` was confirmed live this session to 400 INVALID_ARGUMENT. A
+    # config with no tools at all would make `"tools" not in cfg` pass
+    # trivially (_build_config never adds the key when config.tools is
+    # falsy) regardless of whether the hit-path omission logic works.
+    from src.interfaces.llm import ToolSpec
+    monkeypatch.setenv("GEMINI_EXPLICIT_CACHE", "1")
+    client = _make_client(generate_return=_response("ok"))
+    adapter = GeminiLLMAdapter({"client": client})
+    tools = [ToolSpec(name="search_kb", description="search the KB",
+                       parameters={"type": "object", "properties": {}})]
+    config = LLMConfig(tools=tools)
+
+    await adapter.generate(_msgs(_BIG_SYSTEM), config)  # sighting 1
+    await adapter.generate(_msgs(_BIG_SYSTEM), config)  # sighting 2 -> schedules creation
+    await asyncio.gather(*gemini_module._inflight_cache_tasks)
+
+    await adapter.generate(_msgs(_BIG_SYSTEM), config)  # sighting 3 -> hit
+
+    cfg = client.aio.models.generate_content.await_args.kwargs["config"]
+    assert cfg.get("cached_content") == "cachedContents/fake123"
+    assert "system_instruction" not in cfg
+    assert "tools" not in cfg
+
+
+@pytest.mark.asyncio
+async def test_stale_cache_error_falls_back_inside_the_same_call(monkeypatch) -> None:
+    import src.providers.llm.gemini as gemini_module
+    monkeypatch.setenv("GEMINI_EXPLICIT_CACHE", "1")
+
+    client = _make_client()
+    client.aio.models.generate_content = AsyncMock(side_effect=[
+        _response("ok"),                # sighting 1 (uncached, arming)
+        _response("ok"),                # sighting 2 (uncached, schedules creation)
+        _FakeCacheNotFoundError(),       # sighting 3 (cache hit) -> stale
+        _response("ok"),                # same generate() call's fallback retry
+    ])
+    adapter = GeminiLLMAdapter({"client": client})
+
+    await adapter.generate(_msgs(_BIG_SYSTEM), LLMConfig())
+    await adapter.generate(_msgs(_BIG_SYSTEM), LLMConfig())
+    await asyncio.gather(*gemini_module._inflight_cache_tasks)
+
+    result = await adapter.generate(_msgs(_BIG_SYSTEM), LLMConfig())
+    assert result.text == "ok"  # the stale cache never surfaces to the caller
+
+    fallback_cfg = client.aio.models.generate_content.await_args.kwargs["config"]
+    assert "cached_content" not in fallback_cfg
+    assert fallback_cfg["system_instruction"] == _BIG_SYSTEM
+
+    # The registry entry's cache name is cleared so it re-arms rather than
+    # keeps referencing a name the server just rejected.
+    key = GeminiLLMAdapter._cache_key(adapter._default_model, _BIG_SYSTEM, None)
+    assert adapter._cache_entries[key].name is None
+
+
+@pytest.mark.asyncio
+async def test_creation_failure_is_invisible_and_backs_off(monkeypatch) -> None:
+    monkeypatch.setenv("GEMINI_EXPLICIT_CACHE", "1")
+
+    create_mock = AsyncMock(side_effect=Exception("boom"))
+    client = _make_client(
+        generate_return=_response("ok"),
+        cache_create=SimpleNamespace(create=create_mock, delete=AsyncMock()),
+    )
+    adapter = GeminiLLMAdapter({"client": client})
+    key = GeminiLLMAdapter._cache_key(adapter._default_model, _BIG_SYSTEM, None)
+
+    for _ in range(2):  # sighting 1 (nothing), sighting 2 (schedules the failing creation)
+        result = await adapter.generate(_msgs(_BIG_SYSTEM), LLMConfig())
+        assert result.text == "ok"
+    await asyncio.gather(*gemini_module._inflight_cache_tasks, return_exceptions=True)
+    assert create_mock.await_count == 1
+
+    # `await_count == 1` alone can't tell correct cooldown behavior apart
+    # from a bug where `creating` never gets reset after a failure (wedging
+    # the key so it never re-arms again for the rest of the process's
+    # lifetime) -- both look identical by that assertion alone. Assert the
+    # `finally` block in `_create_cache` actually ran (creating reset to
+    # False, not permanently wedged) and that a real cooldown window was set
+    # (proving a cooldown was actually armed, not that it merely hasn't
+    # happened to retry yet).
+    entry = adapter._cache_entries[key]
+    assert entry.creating is False
+    assert entry.cooldown_until > gemini_module.monotonic()
+
+    # Further calls land inside the 5-minute cooldown -> no repeat attempts,
+    # and every call still succeeds uncached.
+    for _ in range(3):
+        result = await adapter.generate(_msgs(_BIG_SYSTEM), LLMConfig())
+        assert result.text == "ok"
+        cfg = client.aio.models.generate_content.await_args.kwargs["config"]
+        assert "cached_content" not in cfg
+    assert create_mock.await_count == 1
+
+    # The cooldown-EXPIRY path was previously untested (only "still within
+    # cooldown" was covered above). Jump the clock past the cooldown window
+    # and confirm the key re-arms -- a SECOND creation attempt must fire on
+    # the very next sighting.
+    future = gemini_module.monotonic() + gemini_module._CACHE_CREATE_COOLDOWN_S + 1
+    monkeypatch.setattr(gemini_module, "monotonic", lambda: future)
+    result = await adapter.generate(_msgs(_BIG_SYSTEM), LLMConfig())
+    assert result.text == "ok"
+    await asyncio.gather(*gemini_module._inflight_cache_tasks, return_exceptions=True)
+    assert create_mock.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_cache_key_changes_with_tools_and_system_and_model(monkeypatch) -> None:
+    from src.interfaces.llm import ToolSpec
+    import src.providers.llm.gemini as gemini_module
+    monkeypatch.setenv("GEMINI_EXPLICIT_CACHE", "1")
+
+    create_mock = AsyncMock(side_effect=[
+        SimpleNamespace(name="cachedContents/fakeA"),
+        SimpleNamespace(name="cachedContents/fakeB"),
+        SimpleNamespace(name="cachedContents/fakeModel"),
+    ])
+    client = _make_client(
+        generate_return=_response("ok"),
+        cache_create=SimpleNamespace(create=create_mock, delete=AsyncMock()),
+    )
+    adapter = GeminiLLMAdapter({"client": client})
+
+    tools_a = [ToolSpec(name="a", description="d", parameters={"type": "object"})]
+    tools_b = [ToolSpec(name="b", description="d", parameters={"type": "object"})]
+
+    await adapter.generate(_msgs(_BIG_SYSTEM), LLMConfig(tools=tools_a))
+    await adapter.generate(_msgs(_BIG_SYSTEM), LLMConfig(tools=tools_a))
+    await asyncio.gather(*gemini_module._inflight_cache_tasks)
+
+    await adapter.generate(_msgs(_BIG_SYSTEM), LLMConfig(tools=tools_b))
+    await adapter.generate(_msgs(_BIG_SYSTEM), LLMConfig(tools=tools_b))
+    await asyncio.gather(*gemini_module._inflight_cache_tasks)
+
+    assert create_mock.await_count == 2
+
+    await adapter.generate(_msgs(_BIG_SYSTEM), LLMConfig(tools=tools_a))  # hit -> A
+    cfg_a = client.aio.models.generate_content.await_args.kwargs["config"]
+    assert cfg_a["cached_content"] == "cachedContents/fakeA"
+
+    await adapter.generate(_msgs(_BIG_SYSTEM), LLMConfig(tools=tools_b))  # hit -> B
+    cfg_b = client.aio.models.generate_content.await_args.kwargs["config"]
+    assert cfg_b["cached_content"] == "cachedContents/fakeB"
+    assert cfg_b["cached_content"] != cfg_a["cached_content"]
+
+    # Same system + tools, different model -> a third, distinct key/creation.
+    await adapter.generate(_msgs(_BIG_SYSTEM), LLMConfig(model="gemini-other-model", tools=tools_a))
+    await adapter.generate(_msgs(_BIG_SYSTEM), LLMConfig(model="gemini-other-model", tools=tools_a))
+    await asyncio.gather(*gemini_module._inflight_cache_tasks)
+    assert create_mock.await_count == 3
+
+
+@pytest.mark.asyncio
+async def test_concurrent_sightings_create_only_one_cache(monkeypatch) -> None:
+    import src.providers.llm.gemini as gemini_module
+    monkeypatch.setenv("GEMINI_EXPLICIT_CACHE", "1")
+
+    release = asyncio.Event()
+
+    async def _blocking_create(**kwargs):
+        await release.wait()
+        return SimpleNamespace(name="cachedContents/fakeConc")
+
+    create_mock = AsyncMock(side_effect=_blocking_create)
+    client = _make_client(
+        generate_return=_response("ok"),
+        cache_create=SimpleNamespace(create=create_mock, delete=AsyncMock()),
+    )
+    adapter = GeminiLLMAdapter({"client": client})
+
+    await adapter.generate(_msgs(_BIG_SYSTEM), LLMConfig())  # sighting 1
+
+    results = await asyncio.gather(*[
+        adapter.generate(_msgs(_BIG_SYSTEM), LLMConfig()) for _ in range(5)
+    ])
+    assert all(r.text == "ok" for r in results)
+
+    release.set()
+    await asyncio.gather(*gemini_module._inflight_cache_tasks)
+    assert create_mock.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_streaming_never_uses_or_creates_a_cache(monkeypatch) -> None:
+    monkeypatch.setenv("GEMINI_EXPLICIT_CACHE", "1")
+    client = _make_client(
+        stream_chunks=[_response("chunk")],
+        cache_create=SimpleNamespace(
+            create=AsyncMock(return_value=SimpleNamespace(name="cachedContents/fakeStream")),
+            delete=AsyncMock(),
+        ),
+    )
+    adapter = GeminiLLMAdapter({"client": client})
+
+    for _ in range(3):
+        tokens = [t async for t in adapter.generate_stream(_msgs(_BIG_SYSTEM), LLMConfig())]
+        assert tokens == ["chunk"]
+
+    assert client.aio.caches.create.await_count == 0
+    for call in client.aio.models.generate_content_stream.await_args_list:
+        assert "cached_content" not in call.kwargs["config"]
+
+
+@pytest.mark.asyncio
+async def test_short_system_prompt_is_never_cached(monkeypatch) -> None:
+    monkeypatch.setenv("GEMINI_EXPLICIT_CACHE", "1")
+    client = _make_client(generate_return=_response("ok"))
+    adapter = GeminiLLMAdapter({"client": client})
+
+    for _ in range(5):
+        await adapter.generate(_msgs(_SHORT_SYSTEM), LLMConfig())
+
+    assert client.aio.caches.create.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_expired_entry_stops_being_used_and_recreates(monkeypatch) -> None:
+    import src.providers.llm.gemini as gemini_module
+    monkeypatch.setenv("GEMINI_EXPLICIT_CACHE", "1")
+
+    create_mock = AsyncMock(return_value=SimpleNamespace(name="cachedContents/fake123"))
+    client = _make_client(
+        generate_return=_response("ok"),
+        cache_create=SimpleNamespace(create=create_mock, delete=AsyncMock()),
+    )
+    adapter = GeminiLLMAdapter({"client": client})
+
+    await adapter.generate(_msgs(_BIG_SYSTEM), LLMConfig())  # sighting 1
+    await adapter.generate(_msgs(_BIG_SYSTEM), LLMConfig())  # sighting 2 -> schedules creation
+    await asyncio.gather(*gemini_module._inflight_cache_tasks)
+
+    await adapter.generate(_msgs(_BIG_SYSTEM), LLMConfig())  # sighting 3 -> hit
+    cfg_hit = client.aio.models.generate_content.await_args.kwargs["config"]
+    assert cfg_hit["cached_content"] == "cachedContents/fake123"
+
+    # Jump the clock past ttl (1800s) minus the 30s safety margin.
+    future = gemini_module.monotonic() + 10_000
+    monkeypatch.setattr(gemini_module, "monotonic", lambda: future)
+
+    result = await adapter.generate(_msgs(_BIG_SYSTEM), LLMConfig())  # expired -> falls back
+    assert result.text == "ok"
+    cfg_expired = client.aio.models.generate_content.await_args.kwargs["config"]
+    assert "cached_content" not in cfg_expired
+    assert cfg_expired["system_instruction"] == _BIG_SYSTEM
+
+    # And a new creation is scheduled (this was another sighting of the key).
+    await asyncio.gather(*gemini_module._inflight_cache_tasks)
+    assert create_mock.await_count == 2

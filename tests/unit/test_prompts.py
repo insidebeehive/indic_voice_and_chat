@@ -11,6 +11,7 @@ from src.dialogue.prompts import (
     VOICEBOT_RESPONSE_SCHEMA,
     VoiceBotScript,
     build_chatbot_system_prompt,
+    build_chatbot_variable_tail,
     build_voicebot_system_prompt,
 )
 from src.dialogue.slots import SlotSchema
@@ -634,3 +635,107 @@ def test_s2s_instruction_delimits_kb_context_as_untrusted_data() -> None:
     close_idx = instr.index("<<<END SOURCES>>>")
     sentinel_idx = instr.index("SENTINEL_KB_TEXT")
     assert warn_idx < open_idx < sentinel_idx < close_idx
+
+
+# ── Explicit-cache split: static body vs. per-turn variable tail ────────────
+#
+# Gemini's context caching (both the implicit cache and an explicit cache
+# being built elsewhere — see docs/llm-prompt-caching.md) matches on the
+# system_instruction text, so any minute-granular content inside it
+# invalidates the cache every minute. build_chatbot_system_prompt's variable
+# tail (retrieved sources, current date/local-time, the per-turn language
+# directive) is exactly that minute-granular content, so it must be
+# separable from the static body without changing the default (tail
+# included) output at all. These tests pin the algebraic invariant between
+# build_chatbot_system_prompt(include_variable_tail=False),
+# build_chatbot_variable_tail, and the default build_chatbot_system_prompt
+# output, plus the two structural properties that make the split useful: the
+# static body carries none of the per-turn content, and it is genuinely
+# invariant across a clock tick and a rag_context/extra_directives change.
+
+
+def test_chatbot_variable_tail_split_reconstructs_default_byte_for_byte(monkeypatch) -> None:
+    import datetime as _dt
+
+    _freeze_clock(monkeypatch, _dt.datetime(2026, 1, 15, 10, 30, tzinfo=_dt.UTC))
+
+    for rag_context in (None, "Doc 1: alpha"):
+        for extra_directives in (None, ["Reply in Hindi."]):
+            full = build_chatbot_system_prompt(
+                company_name="Acme",
+                language_default="en",
+                rag_context=rag_context,
+                extra_directives=extra_directives,
+                prompt_pack="betting",
+                tenant_timezone="Asia/Kolkata",
+            )
+            static = build_chatbot_system_prompt(
+                company_name="Acme",
+                language_default="en",
+                rag_context=rag_context,
+                extra_directives=extra_directives,
+                prompt_pack="betting",
+                tenant_timezone="Asia/Kolkata",
+                include_variable_tail=False,
+            )
+            tail = build_chatbot_variable_tail(
+                rag_context=rag_context,
+                extra_directives=extra_directives,
+                tenant_timezone="Asia/Kolkata",
+            )
+            assert full == static + "\n\n" + tail, (
+                f"split did not reconstruct the default output for "
+                f"rag_context={rag_context!r}, extra_directives={extra_directives!r}"
+            )
+
+
+def test_chatbot_static_body_contains_no_per_turn_content() -> None:
+    full = build_chatbot_system_prompt(
+        company_name="Acme",
+        rag_context="Doc 1: alpha content only.",
+        extra_directives=["Reply in Hindi."],
+    )
+    static = build_chatbot_system_prompt(
+        company_name="Acme",
+        rag_context="Doc 1: alpha content only.",
+        extra_directives=["Reply in Hindi."],
+        include_variable_tail=False,
+    )
+    assert "Current date (UTC)" not in static
+    assert "Reference sources —" not in static
+    assert "Additional directives:" not in static
+    assert full.startswith(static)
+
+
+def test_chatbot_static_body_is_identical_across_a_clock_tick_and_rag_change(monkeypatch) -> None:
+    import datetime as _dt
+
+    _freeze_clock(monkeypatch, _dt.datetime(2026, 1, 15, 10, 30, tzinfo=_dt.UTC))
+    static_a = build_chatbot_system_prompt(
+        company_name="Acme",
+        rag_context="Doc 1: alpha content only.",
+        extra_directives=["Reply in Hindi."],
+        include_variable_tail=False,
+    )
+
+    _freeze_clock(monkeypatch, _dt.datetime(2026, 1, 15, 10, 31, tzinfo=_dt.UTC))
+    static_b = build_chatbot_system_prompt(
+        company_name="Acme",
+        rag_context="Doc 2: totally different beta content.",
+        extra_directives=["Reply in Tamil, this turn only."],
+        include_variable_tail=False,
+    )
+
+    # A different minute, a different calendar day is not exercised by this
+    # pair (both instants are 2026-01-15) — cover that separately below so a
+    # day-boundary regression in the static body is caught too.
+    assert static_a == static_b
+
+    _freeze_clock(monkeypatch, _dt.datetime(2026, 3, 2, 23, 59, tzinfo=_dt.UTC))
+    static_c = build_chatbot_system_prompt(
+        company_name="Acme",
+        rag_context=None,
+        extra_directives=None,
+        include_variable_tail=False,
+    )
+    assert static_a == static_c
