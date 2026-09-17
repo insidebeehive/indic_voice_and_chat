@@ -1405,6 +1405,20 @@ async def tenant_analytics(
     )
 
 
+class ChatModelCost(BaseModel):
+    """One (provider, model) bucket of the token/cost breakdown. Both key
+    fields fall back to "unknown" rather than emitting a null key — a chat
+    message written before ``llm_provider``/``llm_model`` were populated on
+    every write path leaves both NULL, and a dict keyed by null would either
+    collide across tenants or force the frontend to special-case it."""
+    llm_provider: str
+    llm_model: str
+    input_tokens: int
+    output_tokens: int
+    cost: float
+    message_count: int
+
+
 class ChatAnalytics(BaseModel):
     tenant_id: str
     total_sessions: int
@@ -1414,6 +1428,45 @@ class ChatAnalytics(BaseModel):
     by_status: dict[str, int]         # active / ended
     by_mode: dict[str, int]           # ai / awaiting_human / human / closed
     by_source: dict[str, int]         # widget / external / chatwoot / unknown
+    # --- token/cost reporting -------------------------------------------
+    # Added because there was no in-product way to see LLM token spend at
+    # all — an operator had to go straight to the DB (this gap is what let a
+    # Gemini monthly spending cap get hit in production on 2026-09-17 with no
+    # visibility into which tenant/model was driving it). Sourced from
+    # chat_messages (input_tokens/output_tokens/cost/llm_provider/llm_model):
+    # only a message with token data set (role="agent" turns, and only from
+    # whenever cost tracking started being written) is counted here, via the
+    # input_tokens IS NOT NULL filter below — everything else is excluded,
+    # not double-counted as a zero. total_token_messages/token_data_since
+    # exist precisely so the caller can tell how much coverage these totals
+    # actually have — a coverage gap here works the same way as the
+    # chat_turn_metrics one below, just on a different table and column set.
+    # total_token_messages is a real COUNT() of chat_messages rows, whereas
+    # total_messages above is ChatSession.message_count — a manually
+    # incremented running counter (see the `+= 1`/`+= 2` sites in
+    # src/api/chat.py), not a live count of this session's ChatMessage rows.
+    # The two can drift, so treat "total_token_messages of total_messages" as
+    # an approximate coverage indicator, not an exact fraction.
+    total_input_tokens: int
+    total_output_tokens: int
+    total_cost: float                 # our own provider_costs-rate estimate, not provider billing
+    total_token_messages: int         # real chat_messages row count with token data (see note above)
+    token_data_since: Optional[datetime]  # earliest message with token data; None if none yet
+    by_model: list[ChatModelCost]
+    # --- cache-hit rate ---------------------------------------------------
+    # Deliberately sourced from chat_turn_metrics, NOT chat_messages above —
+    # cached_tokens only exists on chat_turn_metrics, and that table's token
+    # columns only arrived in migration 0021_chat_turn_metrics_tokens, so its
+    # coverage is a strict subset of chat_messages' (far fewer rows, and only
+    # from the migration date forward). cache_metrics_turns/
+    # cache_metrics_since exist so the caller can tell "cache_hit_rate_pct is
+    # 0%" apart from "there is no cache data for this range" — reporting a
+    # bare percentage against the full tenant history would otherwise read as
+    # "0% cached" for every turn before that migration, which is false.
+    cached_tokens: int
+    cache_hit_rate_pct: float
+    cache_metrics_turns: int
+    cache_metrics_since: Optional[datetime]
 
 
 @router.get("/{tenant_id}/chat-analytics", response_model=ChatAnalytics)
@@ -1424,6 +1477,7 @@ async def tenant_chat_analytics(
 ) -> ChatAnalytics:
     """Chat session analytics for one tenant."""
     from src.models.chat import ChatMessage, ChatSession
+    from src.models.chat_turn_metrics import ChatTurnMetric
     await _require_tenant(session, tenant_id)
 
     rows = (await session.execute(
@@ -1453,6 +1507,84 @@ async def tenant_chat_analytics(
             escalated += 1
 
     n = len(rows)
+
+    # One GROUP BY query for the whole per-model breakdown (+ its totals via
+    # Python sum over the small number of groups) rather than a per-message
+    # fetch — this endpoint runs on every backoffice analytics page load, and
+    # a tenant with tens of thousands of chat_messages rows must not turn
+    # into a row-by-row scan. Joins to chat_sessions for tenant scoping since
+    # chat_messages itself has no tenant_id column. Only rows with
+    # input_tokens set are assistant turns with token data (see
+    # ChatMessage.input_tokens' comment) — everything else is filtered out in
+    # SQL, not counted as a zero-cost bucket. func.min(created_at) is pulled
+    # per-group (cheap — same GROUP BY, no extra query) so the overall
+    # earliest token-bearing message is just the min of a handful of group
+    # mins in Python, rather than a second query against this table.
+    model_rows = (await session.execute(
+        select(
+            ChatMessage.llm_provider, ChatMessage.llm_model,
+            func.sum(ChatMessage.input_tokens), func.sum(ChatMessage.output_tokens),
+            func.sum(ChatMessage.cost), func.count(), func.min(ChatMessage.created_at),
+        )
+        .join(ChatSession, ChatMessage.session_id == ChatSession.id)
+        .where(ChatSession.tenant_id == tenant_id, ChatMessage.input_tokens.isnot(None))
+        .group_by(ChatMessage.llm_provider, ChatMessage.llm_model)
+    )).all()
+
+    by_model: list[ChatModelCost] = []
+    total_input_tokens = 0
+    total_output_tokens = 0
+    total_cost = 0.0
+    total_token_messages = 0
+    token_data_since: Optional[datetime] = None
+    for provider, model, in_tok, out_tok, cost, msg_ct, since in model_rows:
+        in_tok = int(in_tok or 0)
+        out_tok = int(out_tok or 0)
+        cost = float(cost or 0.0)
+        msg_ct = int(msg_ct or 0)
+        by_model.append(ChatModelCost(
+            llm_provider=provider or "unknown", llm_model=model or "unknown",
+            input_tokens=in_tok, output_tokens=out_tok, cost=round(cost, 6),
+            message_count=msg_ct,
+        ))
+        total_input_tokens += in_tok
+        total_output_tokens += out_tok
+        total_cost += cost
+        total_token_messages += msg_ct
+        if since is not None and (token_data_since is None or since < token_data_since):
+            token_data_since = since
+
+    # Single aggregate query over chat_turn_metrics — no GROUP BY needed
+    # since only the tenant-wide sums/count/earliest-row matter here, so this
+    # is one row back regardless of how many turns the tenant has.
+    #
+    # input_tokens > 0, NOT "IS NOT NULL": unlike chat_messages.input_tokens
+    # (genuinely nullable), ChatTurnMetric.input_tokens is NOT NULL with
+    # server_default '0' (see migration 0021_chat_turn_metrics_tokens) --
+    # every row written before that migration backfilled to 0, not NULL, and
+    # so does every WS-layer failure placeholder row (chat.py's
+    # _record_ws_turn_failure_metric). An IS NOT NULL filter would count all
+    # of those as "covered" turns, which is exactly the zero-coverage-read-
+    # as-a-confident-0% failure cache_metrics_turns/cache_metrics_since exist
+    # to prevent. A turn making a real LLM call always has some nonzero
+    # input_tokens, so ">  0" is a reliable proxy for "this row actually has
+    # token data" without needing to special-case either exclusion by name.
+    turn_count, turn_input_sum, turn_cached_sum, turn_since = (await session.execute(
+        select(
+            func.count(), func.sum(ChatTurnMetric.input_tokens),
+            func.sum(ChatTurnMetric.cached_tokens), func.min(ChatTurnMetric.created_at),
+        ).where(ChatTurnMetric.tenant_id == tenant_id, ChatTurnMetric.input_tokens > 0)
+    )).one()
+    turn_count = int(turn_count or 0)
+    turn_input_sum = int(turn_input_sum or 0)
+    turn_cached_sum = int(turn_cached_sum or 0)
+    # Ratio of SUMS, not an average of per-turn ratios — same reasoning as
+    # ChatTurnMetricsTurns.cache_hit_rate_pct below: averaging per-turn rates
+    # over-weights low-token turns.
+    cache_hit_rate_pct = (
+        round(turn_cached_sum * 100 / turn_input_sum, 1) if turn_input_sum else 0.0
+    )
+
     return ChatAnalytics(
         tenant_id=tenant_id,
         total_sessions=n,
@@ -1462,6 +1594,16 @@ async def tenant_chat_analytics(
         by_status=by_status,
         by_mode=by_mode,
         by_source=by_source,
+        total_input_tokens=total_input_tokens,
+        total_output_tokens=total_output_tokens,
+        total_cost=round(total_cost, 6),
+        total_token_messages=total_token_messages,
+        token_data_since=token_data_since,
+        by_model=by_model,
+        cached_tokens=turn_cached_sum,
+        cache_hit_rate_pct=cache_hit_rate_pct,
+        cache_metrics_turns=turn_count,
+        cache_metrics_since=turn_since,
     )
 
 

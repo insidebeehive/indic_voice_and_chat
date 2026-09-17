@@ -69,6 +69,46 @@ async def test_backoffice_served() -> None:
 
 
 @pytest.mark.asyncio
+async def test_backoffice_chat_analytics_shows_tokens_cost_and_cache_coverage() -> None:
+    """Token/cost reporting (loadAnalytics' chatHtml block) must be present
+    and must never let the cache-hit rate render as a bare percentage.
+
+    NOTE: this is a served-HTML string match, not a browser — it cannot
+    execute the JS or fetch /chat-analytics, so it cannot confirm that a real
+    zero-coverage tenant actually renders "no cache data yet" at runtime.
+    What it CAN and does confirm is that the *source* still contains the
+    zero-coverage branch, in the right shape, so a code change that deletes
+    or short-circuits that branch is caught here even though no test in this
+    suite drives a browser against the page."""
+    transport = ASGITransport(app=_app())
+    async with AsyncClient(transport=transport, base_url="http://test") as c:
+        resp = await c.get("/admin/tenants")
+    body = resp.text
+
+    # Totals + per-model breakdown are wired up.
+    assert "ca.total_input_tokens" in body
+    assert "ca.total_output_tokens" in body
+    assert "ca.total_cost" in body
+    assert "ca.by_model" in body
+    assert "escT(m.llm_provider)" in body and "escT(m.llm_model)" in body
+
+    # Cost is explicitly labeled as a local estimate, not provider billing.
+    assert "provider_costs" in body and "not the provider" in body.lower()
+
+    # The cache-hit rate must be a ternary gated on cache_metrics_turns > 0,
+    # with pct1(...) only in the true branch and an explicit "no data"
+    # fallback in the false branch -- a bare `pct1(ca.cache_hit_rate_pct)`
+    # rendered unconditionally would fail this regex (it requires the
+    # `> 0 ? ... pct1 ... : ... no cache data yet` shape).
+    import re
+    assert re.search(
+        r"ca\.cache_metrics_turns\s*>\s*0\s*\?\s*`\$\{pct1\(ca\.cache_hit_rate_pct\)\}.*?"
+        r":\s*`<span[^`]*no cache data yet</span>`",
+        body, re.S,
+    ), "cache-hit rate must be gated on cache_metrics_turns, with an explicit no-data fallback"
+
+
+@pytest.mark.asyncio
 async def test_backoffice_voice_pickers_replace_free_text() -> None:
     """The three voice fields (chat TTS, call TTS, realtime) must be
     catalog-backed <select> pickers, not free-text inputs an operator has to

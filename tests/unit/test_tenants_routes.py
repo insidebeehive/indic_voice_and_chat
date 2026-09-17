@@ -6,6 +6,7 @@ import asyncio
 import io
 import json
 import logging
+from datetime import datetime
 
 import pytest
 import pytest_asyncio
@@ -696,6 +697,165 @@ async def test_tenant_billing_combines_voice_and_chat_cost(ctx) -> None:
     assert bill["platform_cost"] == pytest.approx(0.17)
     # avg_cost_per_call stays voice-only (calls, not chat sessions).
     assert bill["avg_cost_per_call"] == pytest.approx(0.10)
+
+
+async def test_chat_analytics_token_cost_breakdown_tolerates_null_provider(ctx) -> None:
+    """GET .../chat-analytics token/cost reporting (added so an operator can
+    see LLM spend without going to the DB — see ChatAnalytics' own comment
+    for why this exists). Covers: per-model aggregation across multiple
+    messages for the same (provider, model), a None/None legacy row bucketed
+    as "unknown"/"unknown" rather than dropped or raising, non-agent messages
+    excluded from totals, message-count coverage reporting, and — the one
+    that would actually catch a missing tenant filter on the chat_messages
+    query — a second tenant's tokens/cost never leaking into the first's
+    totals."""
+    client, _, sm = ctx
+    tid = (await client.post("/tenants", json=_body(slug="acme"), headers=ADMIN_HEADERS)).json()["tenant_id"]
+    other_body = _body(slug="other")
+    other_body["telephony"]["from_number"] = "+15705255680"
+    other_body["telephony"]["phone_numbers"] = ["+15705255680"]
+    other_tid = (await client.post("/tenants", json=other_body, headers=ADMIN_HEADERS)).json()["tenant_id"]
+
+    from src.models.chat import ChatMessage, ChatSession
+
+    async with sm() as s:
+        s.add(ChatSession(id="s1", tenant_id=tid, status="ended", message_count=4))
+        s.add(ChatMessage(session_id="s1", role="customer", content="hi"))  # no tokens
+        s.add(ChatMessage(
+            session_id="s1", role="agent", content="hello", input_tokens=1000,
+            output_tokens=200, cost=0.01, llm_provider="gemini", llm_model="gemini-3.5-flash"))
+        s.add(ChatMessage(
+            session_id="s1", role="agent", content="more", input_tokens=500,
+            output_tokens=100, cost=0.02, llm_provider="gemini", llm_model="gemini-3.5-flash"))
+        # Legacy row written before llm_provider/llm_model were populated.
+        s.add(ChatMessage(
+            session_id="s1", role="agent", content="legacy", input_tokens=300,
+            output_tokens=50, cost=0.005, llm_provider=None, llm_model=None))
+        # A different tenant's session/messages -- must not leak into tid's totals.
+        s.add(ChatSession(id="s2", tenant_id=other_tid, status="ended", message_count=1))
+        s.add(ChatMessage(
+            session_id="s2", role="agent", content="other tenant", input_tokens=99_999,
+            output_tokens=99_999, cost=123.45, llm_provider="gemini", llm_model="gemini-3.5-flash"))
+        await s.commit()
+
+    ca = (await client.get(f"/tenants/{tid}/chat-analytics", headers=ADMIN_HEADERS)).json()
+    assert ca["total_input_tokens"] == 1800   # 1000 + 500 + 300, other tenant's 99999 excluded
+    assert ca["total_output_tokens"] == 350   # 200 + 100 + 50
+    assert ca["total_cost"] == pytest.approx(0.035)
+    assert ca["total_messages"] == 4          # from ChatSession.message_count, all roles
+    assert ca["total_token_messages"] == 3    # the customer message is excluded
+    assert ca["token_data_since"] is not None
+
+    by_model = {(m["llm_provider"], m["llm_model"]): m for m in ca["by_model"]}
+    assert set(by_model) == {("gemini", "gemini-3.5-flash"), ("unknown", "unknown")}
+    gem = by_model[("gemini", "gemini-3.5-flash")]
+    assert gem["input_tokens"] == 1500 and gem["output_tokens"] == 300
+    assert gem["cost"] == pytest.approx(0.03)
+    assert gem["message_count"] == 2
+    legacy = by_model[("unknown", "unknown")]
+    assert legacy["input_tokens"] == 300 and legacy["cost"] == pytest.approx(0.005)
+    assert legacy["message_count"] == 1
+
+
+async def test_chat_analytics_cache_hit_rate_is_ratio_of_sums(ctx) -> None:
+    """cache_hit_rate_pct MUST be sum(cached_tokens)/sum(input_tokens) across
+    chat_turn_metrics rows, not an average of each row's own ratio -- an
+    average over-weights a low-token turn's incidental 100%/0% hit the same
+    as a high-token turn's real rate (see ChatTurnMetricsTurns.cache_hit_rate_pct
+    for the same reasoning applied to the sibling endpoint).
+
+    The two seeded rows are chosen so the two denominators disagree sharply:
+    ratio-of-sums = (50+0)/(100+900) = 5.0%; average-of-per-row-ratios =
+    (50%+0%)/2 = 25.0%. A wrong-denominator implementation fails this
+    assertion outright rather than by rounding noise."""
+    client, _, sm = ctx
+    tid = (await client.post("/tenants", json=_body(slug="acme"), headers=ADMIN_HEADERS)).json()["tenant_id"]
+
+    from src.models.chat_turn_metrics import ChatTurnMetric
+
+    async with sm() as s:
+        s.add(ChatTurnMetric(
+            tenant_id=tid, session_id="cs1", path="tools", llm_provider="gemini",
+            llm_model="gemini-3.5-flash", action="continue",
+            input_tokens=100, cached_tokens=50,
+            created_at=datetime(2026, 9, 15, 10, 0, 0),
+        ))
+        s.add(ChatTurnMetric(
+            tenant_id=tid, session_id="cs2", path="tools", llm_provider="gemini",
+            llm_model="gemini-3.5-flash", action="continue",
+            input_tokens=900, cached_tokens=0,
+            created_at=datetime(2026, 9, 16, 10, 0, 0),
+        ))
+        await s.commit()
+
+    ca = (await client.get(f"/tenants/{tid}/chat-analytics", headers=ADMIN_HEADERS)).json()
+    assert ca["cached_tokens"] == 50
+    assert ca["cache_hit_rate_pct"] == pytest.approx(5.0)
+    assert ca["cache_metrics_turns"] == 2
+    assert ca["cache_metrics_since"].startswith("2026-09-15")
+
+
+async def test_chat_analytics_zero_coverage_reports_no_data_not_bare_zero(ctx) -> None:
+    """With no chat_turn_metrics rows at all for the tenant, the response must
+    say so explicitly (cache_metrics_turns == 0, cache_metrics_since is None)
+    rather than silently returning cache_hit_rate_pct == 0.0 with nothing to
+    distinguish "measured zero" from "never measured". The frontend's "no
+    cache data yet" branch (static/backoffice.html) is gated on
+    cache_metrics_turns, so a regression that always returns turns > 0 (or
+    always 0 regardless of data) would misrender in exactly the incident
+    scenario this endpoint exists to prevent. Same shape checked for the
+    chat_messages side via total_token_messages/token_data_since."""
+    client, _, sm = ctx
+    tid = (await client.post("/tenants", json=_body(slug="acme"), headers=ADMIN_HEADERS)).json()["tenant_id"]
+
+    from src.models.chat import ChatSession
+
+    async with sm() as s:
+        s.add(ChatSession(id="s1", tenant_id=tid, status="ended", message_count=1))
+        await s.commit()
+
+    ca = (await client.get(f"/tenants/{tid}/chat-analytics", headers=ADMIN_HEADERS)).json()
+    assert ca["cache_metrics_turns"] == 0
+    assert ca["cache_metrics_since"] is None
+    assert ca["cache_hit_rate_pct"] == 0.0
+    assert ca["cached_tokens"] == 0
+    assert ca["total_token_messages"] == 0
+    assert ca["token_data_since"] is None
+    assert ca["total_input_tokens"] == 0
+    assert ca["by_model"] == []
+
+
+async def test_chat_analytics_pre_migration_turn_rows_dont_count_as_cache_coverage(ctx) -> None:
+    """The realistic zero-coverage case: chat_turn_metrics ROWS EXIST for the
+    tenant (unlike the no-rows-at-all case above) but predate migration
+    0021_chat_turn_metrics_tokens, so their token columns are the NOT NULL
+    server_default '0' backfill, not NULL. A query that used
+    `ChatTurnMetric.input_tokens.isnot(None)` (the right filter for
+    chat_messages, which IS nullable) would count every one of these as a
+    "covered" turn and report a confident "0.0% (based on N turns)" for a
+    tenant that in fact has zero real cache-hit data -- exactly the failure
+    cache_metrics_turns/cache_metrics_since exist to prevent. This must come
+    back looking identical to the true no-rows case."""
+    client, _, sm = ctx
+    tid = (await client.post("/tenants", json=_body(slug="acme"), headers=ADMIN_HEADERS)).json()["tenant_id"]
+
+    from src.models.chat_turn_metrics import ChatTurnMetric
+
+    async with sm() as s:
+        for i in range(3):
+            # input_tokens/output_tokens/cached_tokens omitted -- ORM applies
+            # the column default (0), matching a real pre-migration row.
+            s.add(ChatTurnMetric(
+                tenant_id=tid, session_id=f"cs{i}", path="tools",
+                llm_provider="gemini", llm_model="gemini-3.5-flash", action="continue",
+            ))
+        await s.commit()
+
+    ca = (await client.get(f"/tenants/{tid}/chat-analytics", headers=ADMIN_HEADERS)).json()
+    assert ca["cache_metrics_turns"] == 0
+    assert ca["cache_metrics_since"] is None
+    assert ca["cache_hit_rate_pct"] == 0.0
+    assert ca["cached_tokens"] == 0
 
 
 async def test_tenant_analytics_unknown_404(ctx) -> None:
