@@ -387,6 +387,96 @@ async def test_429_free_tier_quota_fails_fast_without_retry() -> None:
     assert calls["n"] == 1
 
 
+class _FakeSpendingCapError(Exception):
+    """Mimics the real google.genai 429 body for a monthly spending cap —
+    prose, no RetryInfo, no FreeTier quotaId. Seen live 2026-09-17."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "429 RESOURCE_EXHAUSTED. Your project has exceeded its monthly "
+            "spending cap. See https://ai.studio/spend for details."
+        )
+        self.code = 429
+
+
+@pytest.mark.asyncio
+async def test_429_spending_cap_fails_fast_with_zero_retries_and_zero_sleeps(monkeypatch) -> None:
+    # A spend cap doesn't clear in ~29s of escalating backoff the way a
+    # per-minute quota does — retrying is pure wasted latency against an API
+    # that is refusing us outright. Must raise on the FIRST attempt, with no
+    # sleep at all (not even the short first-tier delay).
+    import src.providers.llm.gemini as gemini_mod
+    sleep_mock = AsyncMock()
+    monkeypatch.setattr(gemini_mod.asyncio, "sleep", sleep_mock)
+    calls = {"n": 0}
+
+    async def _always_spend_cap(**kwargs):
+        calls["n"] += 1
+        raise _FakeSpendingCapError()
+
+    models = SimpleNamespace(
+        generate_content=AsyncMock(side_effect=_always_spend_cap),
+        generate_content_stream=AsyncMock(),
+    )
+    adapter = GeminiLLMAdapter({"client": SimpleNamespace(aio=SimpleNamespace(models=models))})
+    with pytest.raises(_FakeSpendingCapError):
+        await adapter.generate([LLMMessage(role="user", content="hi")], LLMConfig())
+    assert calls["n"] == 1  # zero retries
+    sleep_mock.assert_not_awaited()  # zero sleeps — not even the first backoff tier
+
+
+@pytest.mark.asyncio
+async def test_429_ordinary_quota_still_retries_as_before(monkeypatch) -> None:
+    # Guards against the spending-cap check being too broad: a plain
+    # RESOURCE_EXHAUSTED 429 (no "spending cap" wording) must still go
+    # through the normal escalating-retry path, unaffected by the new branch.
+    import src.providers.llm.gemini as gemini_mod
+    sleep_mock = AsyncMock()
+    monkeypatch.setattr(gemini_mod.asyncio, "sleep", sleep_mock)
+    calls = {"n": 0}
+
+    async def _quota_once(**kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise _FakeAPIError(429)  # "429 transient" — no spend-cap wording
+        return _response("ok")
+
+    models = SimpleNamespace(
+        generate_content=AsyncMock(side_effect=_quota_once),
+        generate_content_stream=AsyncMock(),
+    )
+    adapter = GeminiLLMAdapter({"client": SimpleNamespace(aio=SimpleNamespace(models=models))})
+    result = await adapter.generate([LLMMessage(role="user", content="hi")], LLMConfig())
+    assert result.text == "ok"
+    assert calls["n"] == 2  # one failure + one retry, as before
+    sleep_mock.assert_awaited_once()  # the escalating backoff still ran
+
+
+@pytest.mark.asyncio
+async def test_transcribe_audio_spending_cap_fails_fast_without_retry(monkeypatch) -> None:
+    # The retry wrapper is shared across `what=` call sites (generate,
+    # transcribe, ...) — production logs show "429 on transcribe" too, so
+    # this must fail fast the same way `generate` does, not just for chat.
+    import src.providers.llm.gemini as gemini_mod
+    sleep_mock = AsyncMock()
+    monkeypatch.setattr(gemini_mod.asyncio, "sleep", sleep_mock)
+    client = _make_client()
+    calls = {"n": 0}
+
+    async def _always_spend_cap(**kwargs):
+        calls["n"] += 1
+        raise _FakeSpendingCapError()
+
+    client.aio.models.generate_content = AsyncMock(side_effect=_always_spend_cap)
+    adapter = GeminiLLMAdapter({"client": client})
+    # transcribe_audio swallows all exceptions (never crashes finalize) —
+    # the observable proof here is the call/sleep count, not a raise.
+    out = await adapter.transcribe_audio(b"x", "audio/mpeg")
+    assert out == ""
+    assert calls["n"] == 1  # zero retries
+    sleep_mock.assert_not_awaited()  # zero sleeps
+
+
 @pytest.mark.asyncio
 async def test_429_with_short_retry_delay_still_retries() -> None:
     # The per-MINUTE quota suggests ~1s — the escalating schedule handles it.

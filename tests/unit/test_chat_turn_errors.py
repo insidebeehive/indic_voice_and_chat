@@ -61,6 +61,23 @@ def test_classify_billing_cap_case_insensitive():
     assert reason == "llm_billing"
 
 
+def test_spending_cap_predicate_shared_with_gemini_provider():
+    """The spend-cap classification lives in exactly one place
+    (src.interfaces.llm.is_llm_spending_cap_error) and both
+    ``chat._classify_turn_error`` and the gemini provider's retry wrapper
+    import that same function object rather than each hand-rolling their own
+    "spending cap" substring check. If a future edit re-derives the check in
+    only one of the two modules instead of importing the shared helper, this
+    identity assertion fails immediately — catching the drift before the two
+    classifications silently diverge.
+    """
+    import src.providers.llm.gemini as gemini_mod
+    from src.interfaces.llm import is_llm_spending_cap_error
+
+    assert chat_api.is_llm_spending_cap_error is is_llm_spending_cap_error
+    assert gemini_mod.is_llm_spending_cap_error is is_llm_spending_cap_error
+
+
 def test_classify_plain_quota_429():
     exc = _FakeProviderError(429, "Resource exhausted, retry after backoff")
     reason, message = chat_api._classify_turn_error(exc)

@@ -58,7 +58,7 @@ from src.auth import TenantContext, current_tenant
 from src.auth.audit import log_denied, token_fingerprint
 from src.auth.registry import TenantProviders
 from src.dialogue.language import normalize_lang, to_bcp47
-from src.interfaces.llm import LLMMessage
+from src.interfaces.llm import LLMMessage, is_llm_spending_cap_error
 from src.interfaces.tts import TTSConfig
 from src.models.chat import ChatMessage, ChatSession
 from src.models.chat_turn_metrics import record_chat_turn_metric
@@ -699,7 +699,7 @@ def _classify_turn_error(exc: Exception) -> tuple[str, str]:
     line at the call site).
     """
     if getattr(exc, "code", None) == 429:
-        if "spending cap" in str(exc).lower():
+        if is_llm_spending_cap_error(exc):
             return "llm_billing", (
                 "The AI assistant is temporarily unavailable due to a "
                 "service limit on our side. Our team has been notified — "

@@ -28,6 +28,7 @@ from src.interfaces.llm import (
     LLMMessage,
     LLMResult,
     ToolCall,
+    is_llm_spending_cap_error,
 )
 
 
@@ -219,6 +220,28 @@ class GeminiLLMAdapter(ILLMProvider):
             except Exception as exc:  # noqa: BLE001 - re-raised unless retriable
                 code = getattr(exc, "code", None)
                 if code == 429 and rate_limit_attempt < _RATE_LIMIT_MAX_RETRIES:
+                    if is_llm_spending_cap_error(exc):
+                        # A monthly SPENDING CAP is a billing ceiling, not a
+                        # quota window — unlike the per-minute/per-day quotas
+                        # below, it does not clear on a ~minute cadence, so
+                        # the escalating schedule just delays the customer's
+                        # error while adding pointless load against an API
+                        # that is refusing us outright (not throttling us).
+                        # Seen live 2026-09-17: 3 full retries (2.0s/7.7s/
+                        # 18.2s) then failure, ~29s per turn, against
+                        # ~1,200-2,100 chat turns/day — every turn during the
+                        # cap paid that ~29s before the customer saw an
+                        # error, and logs showed customers disconnecting
+                        # before it arrived. Same predicate as
+                        # src.api.chat._classify_turn_error's "llm_billing"
+                        # branch (imported, not re-derived) so the two
+                        # classifications can't drift apart.
+                        log.error(
+                            "gemini monthly spending cap exceeded on %s — raise it "
+                            "at https://ai.studio/spend to restore service; not retrying",
+                            what,
+                        )
+                        raise
                     if "FreeTier" in str(exc) or "free_tier" in str(exc):
                         # Not load — a misconfigured project. A key swapped to a
                         # Gemini project WITHOUT billing runs on the free tier
