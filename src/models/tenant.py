@@ -154,6 +154,20 @@ class ProviderCost(Base):
     # Chat (text) is billed per-token, not per-minute — used only for kind="llm".
     cost_per_1k_input_tokens: Mapped[float] = mapped_column(Float, default=0.0)
     cost_per_1k_output_tokens: Mapped[float] = mapped_column(Float, default=0.0)
+    # Rate for input tokens the provider reports as served from its prompt
+    # cache (see docs/llm-prompt-caching.md — Gemini's explicit caching
+    # measured 97.8% of a production-shaped prompt as cached, so this is not
+    # a theoretical rate). NULLABLE, unlike the two columns above, and that is
+    # load-bearing: NULL means "no cached rate configured for this
+    # (provider, model)" and must fall back to cost_per_1k_input_tokens (see
+    # src/api/chat_cost.py's compute_chat_turn_cost) — a missing rate row
+    # silently billing cached tokens at 0.0 would look like a spectacular
+    # saving and be a reporting bug, not a real one. 0.0 stays a legitimate,
+    # distinct value for a provider that genuinely doesn't charge for cache
+    # hits. If this column had the same NOT NULL / default=0.0 shape as its
+    # neighbours, "unconfigured" and "configured free" would be the same bit
+    # pattern and that fallback could never be implemented correctly.
+    cost_per_1k_cached_tokens: Mapped[Optional[float]] = mapped_column(Float, nullable=True, default=None)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=False), server_default=func.now(), onupdate=func.now()
     )

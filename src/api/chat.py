@@ -2535,10 +2535,25 @@ async def _persist_turn(
             # it in its own session/connection avoids that entirely.
             if result.llm_provider and (result.input_tokens or result.output_tokens):
                 try:
+                    # ChatTurnResult itself carries no cached-token count (only
+                    # its optional `.metrics`, same getattr-defensive pattern
+                    # as latency_ms above) -- several unit tests pass a
+                    # minimal duck-typed result with no `metrics` attribute at
+                    # all, and metrics assembly can itself fail independently
+                    # of the turn (see ChatTurnResult.metrics's own docstring).
+                    # 0 here means "no cached figure available", which
+                    # compute_chat_turn_cost treats identically to a provider
+                    # that never reports caching -- today's behaviour.
+                    turn_cached_tokens = (
+                        turn_metrics.cached_tokens
+                        if (turn_metrics := getattr(result, "metrics", None)) is not None
+                        else 0
+                    )
                     async with _sm()() as cost_db:
                         turn_cost = await compute_chat_turn_cost(
                             cost_db, provider=result.llm_provider, model=result.llm_model,
                             input_tokens=result.input_tokens, output_tokens=result.output_tokens,
+                            cached_tokens=turn_cached_tokens,
                         )
                     agent_msg.input_tokens = result.input_tokens
                     agent_msg.output_tokens = result.output_tokens

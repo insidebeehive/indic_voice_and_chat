@@ -144,6 +144,49 @@ async def test_seed_provider_costs_upserts_llm_token_rates(sm, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_seed_provider_costs_cached_per_1k_is_optional_and_preserved(sm, tmp_path):
+    """cached_per_1k is optional on an llm_token_rates entry, unlike
+    input_per_1k/output_per_1k which the YAML always fully owns (reset on
+    every re-seed, per the test above). A model with no cached_per_1k key
+    must come back with cost_per_1k_cached_tokens=None (unconfigured), not
+    0.0 -- and re-seeding must never wipe out a cached rate that was set
+    live (e.g. via PUT) just because a given YAML revision doesn't mention
+    it for that model."""
+    costs_yaml = tmp_path / "costs.yaml"
+    costs_yaml.write_text(textwrap.dedent("""
+        llm_token_rates:
+          gemini:
+            gemini-3.5-flash: {input_per_1k: 0.0003, output_per_1k: 0.0025, cached_per_1k: 0.00015}
+            gemini-2.5-flash: {input_per_1k: 0.0003, output_per_1k: 0.0025}
+    """))
+
+    await seed_provider_costs(sm, costs_yaml)
+    async with sm() as s:
+        flash35 = await s.get(ProviderCost, ("llm", "gemini", "gemini-3.5-flash"))
+        assert flash35.cost_per_1k_cached_tokens == pytest.approx(0.00015)
+
+        # No cached_per_1k key in the YAML for this model -- must be None,
+        # not 0.0 (0.0 is a real "this is free" claim the YAML never made).
+        flash25 = await s.get(ProviderCost, ("llm", "gemini", "gemini-2.5-flash"))
+        assert flash25.cost_per_1k_cached_tokens is None
+
+    # Simulate a live PUT setting flash25's cached rate after seeding.
+    async with sm() as s:
+        row = await s.get(ProviderCost, ("llm", "gemini", "gemini-2.5-flash"))
+        row.cost_per_1k_cached_tokens = 0.00005
+        await s.commit()
+
+    # Re-seed from the SAME YAML (still no cached_per_1k for gemini-2.5-flash).
+    # The live-set rate must survive -- input/output still reset from YAML
+    # (existing behaviour), but cached is untouched because the key is absent.
+    await seed_provider_costs(sm, costs_yaml)
+    async with sm() as s:
+        flash25 = await s.get(ProviderCost, ("llm", "gemini", "gemini-2.5-flash"))
+        assert flash25.cost_per_1k_cached_tokens == pytest.approx(0.00005)
+        assert flash25.cost_per_1k_input_tokens == pytest.approx(0.0003)  # unaffected
+
+
+@pytest.mark.asyncio
 async def test_seed_provider_costs_real_yaml_seeds_llm_token_fallback_row(sm):
     """The real config/provider_costs.yaml must seed a provider-level ("")
     fallback row for llm_token_rates/gemini, not just the exact-model row —

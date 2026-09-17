@@ -72,13 +72,44 @@ telephony:
 # APPROXIMATE market estimates (early 2026); replace with contracted rates.
 llm_token_rates:
   gemini:
-    gemini-3.5-flash: {input_per_1k: 0.0003, output_per_1k: 0.0025}
+    # cached_per_1k: $0.15 / 1M tokens, confirmed 2026-09-17 against Google's
+    # own published pricing (ai.google.dev/gemini-api/docs/pricing, Gemini
+    # 3.5 Flash row, "Context caching price", paid tier) — not an estimate,
+    # unlike input_per_1k/output_per_1k above (see this file's own "seeded at
+    # the 2.5-flash rate" TODO). Cached rates are NOT uniform across Gemini
+    # model generations (the same pricing page lists 2.5 Flash's context
+    # caching price as $0.03/1M, less than a fifth of this), so this is
+    # intentionally set only on the exact gemini-3.5-flash row, not mirrored
+    # onto the "" fallback below the way input/output are — mirroring it
+    # would silently apply the wrong model's cache discount to whatever other
+    # gemini variant falls back to this row.
+    # input/output confirmed 2026-09-17 against the same published pricing as
+    # cached_per_1k above ($1.50 and $9.00 per 1M). They previously carried the
+    # 2.5-flash estimates ($0.30/$2.50 per 1M) left behind by the model swap,
+    # which under-reported chat cost by roughly 4x. Corroborated independently
+    # of the pricing page: September's reported spend under the old rates was
+    # ~$78, while the account's actual $300 monthly cap was reached and blocked
+    # over the same period — so real spend was at least ~4x what this file
+    # was reporting. $300 is a floor, not the uncapped total.
+    gemini-3.5-flash: {input_per_1k: 0.0015, output_per_1k: 0.009, cached_per_1k: 0.00015}
     # Provider-level fallback (model="") used by token_rates() in
     # src/api/chat_cost.py when pipeline.llm.model is swapped to a gemini
     # model with no dedicated row above — keeps chat cost tracking from
-    # silently going to $0.00 after a model change. Mirrors gemini-3.5-flash
-    # until per-model rates are added for the other gemini variants.
-    "": {input_per_1k: 0.0003, output_per_1k: 0.0025}
+    # silently going to $0.00 after a model change. Mirrors gemini-3.5-flash's
+    # input/output rates until per-model rates are added for the other gemini
+    # variants; deliberately carries no cached_per_1k of its own (see above) —
+    # a variant that lands here bills cached tokens at this in_rate instead,
+    # via compute_chat_turn_cost's unconfigured-rate fallback.
+    #
+    # Now that gemini-3.5-flash carries its real (5x higher) rates, mirroring
+    # them here means an OLDER, cheaper variant landing on this row is
+    # over-reported rather than under-reported — 2.5-flash is genuinely
+    # $0.30/1M input, a fifth of this. That direction is deliberate: a cost
+    # figure that reads high prompts someone to add a dedicated row, whereas
+    # one that reads low is what let a spending cap be sized at roughly a
+    # third of one month's real traffic. The fix for any specific variant is
+    # its own row above, not lowering this.
+    "": {input_per_1k: 0.0015, output_per_1k: 0.009}
   groq:
     # No per-model rows yet (only per-minute rates exist for groq above).
     # Provider-level fallback so switching the platform LLM provider to groq

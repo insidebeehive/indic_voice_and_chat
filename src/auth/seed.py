@@ -200,16 +200,37 @@ async def seed_provider_costs(sessionmaker, path: Path = _PROVIDER_COSTS_YAML) -
             for model, rates in (models or {}).items():
                 in_rate = float((rates or {}).get("input_per_1k", 0.0))
                 out_rate = float((rates or {}).get("output_per_1k", 0.0))
+                # Unlike input_per_1k/output_per_1k above, cached_per_1k is
+                # OPTIONAL and left as `None` (not 0.0) when absent from the
+                # YAML entry -- most providers/models have no established
+                # cached rate yet, and defaulting the missing case to 0.0
+                # here would write "this provider charges nothing for cache
+                # hits" into the DB, which is a real claim, not an absence of
+                # one. `None` preserves "not configured" so
+                # compute_chat_turn_cost's input-rate fallback (see
+                # src/api/chat_cost.py) actually applies.
+                cached_raw = (rates or {}).get("cached_per_1k")
+                cached_rate = float(cached_raw) if cached_raw is not None else None
                 row = await session.get(ProviderCost, ("llm", provider, model))
                 if row is None:
                     session.add(ProviderCost(
                         kind="llm", provider=provider, model=model,
                         cost_per_1k_input_tokens=in_rate,
-                        cost_per_1k_output_tokens=out_rate))
+                        cost_per_1k_output_tokens=out_rate,
+                        cost_per_1k_cached_tokens=cached_rate))
                     inserted += 1
                 else:
                     row.cost_per_1k_input_tokens = in_rate
                     row.cost_per_1k_output_tokens = out_rate
+                    # Only overwrite an existing row's cached rate when the
+                    # YAML actually specifies one for this (provider, model)
+                    # -- unlike in_rate/out_rate above, which the YAML always
+                    # fully owns. Without this guard, re-seeding a row whose
+                    # cached rate was set live via PUT (or by a YAML entry
+                    # for a different revision) would silently wipe it back
+                    # to "unconfigured" every restart.
+                    if cached_rate is not None:
+                        row.cost_per_1k_cached_tokens = cached_rate
 
         await session.commit()
     if inserted:
