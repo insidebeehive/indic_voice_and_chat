@@ -107,7 +107,7 @@ Replaced YAML-on-boot + in-memory state with real DB tables and a clean API surf
 **Voice core**
 - **STT:** Deepgram streaming (`nova-2 hi`, active dev-console path) + Groq Whisper batch fallback. Tuned and validated.
 - **LLM:** Gemini 2.5-flash (active, with transient-error retry hardening) + Anthropic Claude (Haiku 4.5) as a tested one-line swap-in.
-- **TTS:** Sarvam (`bulbul:v2`, voice `anushka`) — the only voice; batch + sentence-overlapped streaming.
+- **TTS:** Sarvam (`bulbul:v3`, voice `priya`) — Sarvam deprecated `bulbul:v2` and rejects it and its old speakers (e.g. `anushka`) outright on v3; batch + sentence-overlapped streaming.
 
 **Dev console (browser) — the primary working surface**
 - Full streaming pipeline (live Deepgram endpointing → Gemini token stream → overlapped Sarvam TTS).

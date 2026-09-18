@@ -38,8 +38,9 @@ flowchart TB
     VAD["VAD / endpointing<br/>SileroVAD · EnergyVAD"]:::impl
     STT["STT · ISTTProvider<br/>Deepgram (stream) · Sarvam · Groq"]:::impl
     LLMC["LLM · ILLMProvider<br/>Gemini · Groq · Anthropic<br/>JSON envelope: text + slots + action"]:::impl
+    GUARD["Per-sentence guard<br/>engine.py sentence_guard ·<br/>voicebot.py _voice_sentence_guard"]:::impl
     TTS["TTS · ITTSProvider<br/>Sarvam bulbul"]:::impl
-    VAD --> STT --> LLMC --> TTS
+    VAD --> STT --> LLMC --> GUARD --> TTS
   end
 
   subgraph S2S["② Speech-to-speech"]
@@ -79,7 +80,10 @@ flowchart TB
    **bridge** (`_BaseLiveBridge` family) normalizes/resamples it (`audio_utils`).
 2. **Understand** —
    - **Cascade:** VAD/endpointing detects end-of-utterance → **STT** → **LLM** (returns a JSON
-     envelope: `response_text` + `updated_slots` + `action`) → **TTS** synthesizes the reply.
+     envelope: `response_text` + `updated_slots` + `action`) → a **per-sentence guard** checks
+     each completed sentence, pre-synthesis, for an ungrounded currency figure and swaps it for a
+     safe fallback if one fires (`src/pipeline/engine.py`'s `sentence_guard` callback, backed by
+     `src/agents/voicebot.py`'s `_voice_sentence_guard`) → **TTS** synthesizes the reply.
    - **S2S:** audio streams straight into **GeminiLiveSession**, which speaks the reply directly and
      emits a `record_turn_signal` tool call carrying `action` + `updated_slots`.
 3. **Decide** — either path feeds **`VoiceBotAgent.apply_signal()`**, which advances the

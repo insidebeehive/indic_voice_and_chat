@@ -6,11 +6,16 @@ SDK's ``RequestValidator``), Stringee (HMAC-SHA1, base64), Exotel (HTTP Basic
 auth), and Chatwoot (HMAC-SHA256 with a timestamp window against replay).
 
 Each ``verify_*`` function raises :class:`WebhookAuthError` on failure and
-returns ``None`` on success. None of these functions are wired into a live
-route yet — that happens in a later PR; this module is isolated infra.
+returns ``None`` on success.
 
-See :func:`signature_mode` for the enforce-vs-log-only toggle a caller can
-use once these are wired in.
+``verify_chatwoot`` and :func:`signature_mode` are wired into the live
+Chatwoot webhook route (``src/api/external_chat.py``). ``verify_twilio``,
+``verify_stringee`` and ``verify_exotel_basic`` are not called from any route
+— check that with ``grep`` rather than trusting this line, since a docstring
+claiming something is unwired is exactly what outlives the wiring and sends
+someone to build what already exists.
+
+See :func:`signature_mode` for the enforce-vs-log-only toggle.
 """
 
 from __future__ import annotations

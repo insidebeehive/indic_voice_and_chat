@@ -101,7 +101,7 @@ flowchart TB
     CHATAGENT["ChatBotAgent<br/>agentic tool loop: search_knowledge_base ·<br/>CRM tools · escalate_to_human · offer_voice_call"]
     KB["RAG / Knowledge base<br/>tenant KB + CRM-shared KB, merged (not tenant-wins)<br/>+ opt-in bundled pack / product-module KB"]
     TOOLRES["CRM tool resolution<br/>tenant's own chat_tools wins → else linked Crm's catalog"]
-    GUARD["Grounding guards<br/>hallucination · no-grounding · unverified-data (TOOL FAILURE)"]:::note
+    GUARD["Reply guards<br/>hallucination · no-grounding · unverified-data (TOOL FAILURE)<br/>+ outbound PII redaction, runs last, every reply"]:::note
   end
 
   DATA2[("Same Postgres/Redis as the VoiceBot side<br/>chat_sessions · chat_messages · chat_tools<br/>crms/crm_tools · kb_documents · crm_kb_documents")]:::store
@@ -132,7 +132,11 @@ flowchart TB
    search happened, and the unverified-data guard whenever a CRM tool was involved (called,
    or attempted and failed) — a number the reply states must trace back to something the model
    actually saw this turn, or the reply is replaced with a safe fallback, independent of what
-   the model itself claims to have checked.
+   the model itself claims to have checked. A PII guard (`apply_pii_guard`) then runs last, on
+   every reply and every suggested followup regardless of whether a KB search or tool call
+   happened this turn: it redacts any Indian mobile number, email address, or anchor-gated bank
+   account number the reply states, dropping a suggested followup outright rather than
+   redacting it in place, and downgrades confidence to `"low"` whenever it fires.
 4. **Escalate or hand off** — the agent can offer a human (`escalate_to_human`, a signed
    webhook to the tenant's events endpoint) or a live voice call (`offer_voice_call` /
    `POST /chat/{id}/call`, which stashes the chat's context under a short-lived Redis token and
@@ -220,7 +224,7 @@ where noted.
 | STT (batch) | Sarvam · Groq (Whisper) · Gemini | |
 | STT (streaming) | Deepgram | the only streaming STT provider; batch providers above are the fallback |
 | LLM | Gemini (also the S2S/Live provider) · Groq · Anthropic Claude · self-hosted vLLM (OpenAI-compatible, e.g. an IndicF5 RunPod pod) | Gemini is the active default for both VoiceBot and ChatBot |
-| TTS | Sarvam · Gemini · Google · Azure · ElevenLabs · self-hosted IndicF5 | Sarvam (`bulbul:v2`) is the active default |
+| TTS | Sarvam · Gemini · Google · Azure · ElevenLabs · self-hosted IndicF5 | Sarvam (`bulbul:v3`, speaker `priya`) is the active default — Sarvam deprecated `bulbul:v2` and rejects `bulbul:v2`/its old speakers (e.g. `anushka`) outright on v3 |
 | Telephony (dial-out) | Twilio · Exotel · Stringee | behind the common `ITelephonyProvider` interface |
 | Telephony (room-join) | LiveKit — CRM-hosted SIP, CRM-level credentials | separate integration, not behind `ITelephonyProvider` (no dial-out leg on this side) |
 | Telephony (in progress) | SIP trunk / DiDLogic (pyVoIP, in-app RTP) | built on a branch, not merged |
