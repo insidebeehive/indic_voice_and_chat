@@ -32,7 +32,6 @@ Withdrawal processing involves two stages:
 
 The following must be met before a withdrawal can be processed:
 
-- **KYC verification**: Your identity must be verified. Unverified accounts cannot withdraw.
 - **Bank account details**: You must have saved valid bank account or UPI details in your profile.
 - **Wagering completion**: Any active bonus wagering requirements must be met before those funds can be withdrawn. Real-money funds that are not subject to a bonus rollover can usually be withdrawn independently.
 - **Minimum balance**: You must have at least the minimum withdrawal amount available in your main (real money) balance.
@@ -50,8 +49,7 @@ You can track the status of your withdrawal from the transaction history section
 
 A withdrawal may be rejected if:
 
-- KYC is not completed
-- Bank details are incorrect or do not match verified identity
+- Bank details are incorrect or do not match the account holder
 - The account has an active bonus with unmet wagering requirements
 - The requested amount exceeds available real-money balance
 

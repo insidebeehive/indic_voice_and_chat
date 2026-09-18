@@ -983,10 +983,19 @@ def build_chatbot_system_prompt(
         "or ask a specific clarifying question; a bare acknowledgement ('Okay', 'Theek hai', "
         "'Samajh gaya') or an apology without action is never enough. If you made an error "
         "(incomplete list, wrong count), fix it in the same message: acknowledge once briefly, "
-        "then show the correct data. Be concise by default — a couple of sentences for simple "
-        "answers — but take the space a complete answer genuinely needs (tool results, "
-        "step-by-step instructions, multi-part questions). A complete helpful answer beats a "
-        "short evasive one. If a tool call failed and didn't return usable data, TOOL FAILURE "
+        "then show the correct data. LENGTH: two or three short sentences is the DEFAULT, not "
+        "a target to exceed. Go longer only when the customer asked for detail, or the answer "
+        "genuinely needs it (a tool result with several fields, step-by-step instructions, a "
+        "multi-part question) — 'complete' does not mean 'exhaustive', and length is not "
+        "helpfulness. Concretely, in a reply that already answers the question: do NOT open "
+        "with a sympathy preamble or restate their complaint back to them (lead with the "
+        "answer; empathy is one short clause at most, if any); give the ONE timeline that "
+        "applies rather than every timeline that might; do not stack a second topic the "
+        "customer did not raise; and do not append an offer to connect them to a human — "
+        "ESCALATION below says when that offer belongs, and tacking it onto an answered "
+        "question reads as a brush-off. A complete answer beats an evasive one, but a long "
+        "answer does not beat a short complete one. If a tool call failed and didn't return "
+        "usable data, TOOL FAILURE "
         "below overrides this section's 'always give substance' instruction for that specific "
         "case."
     )
@@ -1005,6 +1014,31 @@ def build_chatbot_system_prompt(
         "tool failure with a fabricated specific — this rule wins that conflict every time, "
         "with no exception for how many times you've already tried or how insistent the "
         "customer is."
+    )
+
+    # ── Account state ────────────────────────────────────────────────────────
+    # TOOL FAILURE above covers a tool that ran and broke. This covers the case
+    # that actually shipped a wrong answer: NO tool ran at all, and the model
+    # turned a knowledge-base policy line into a claim about this customer
+    # ("unverified accounts cannot withdraw" -> "aapka KYC status pending hai",
+    # on a turn recorded with tool_calls=0 and 05-withdrawals.md as its only
+    # source). apply_unverified_data_guard cannot catch that class: it verifies
+    # currency figures against grounded text, and a fabricated STATUS carries
+    # no number for it to check.
+    parts.append(
+        "ACCOUNT STATE:\n"
+        "Never state this customer's account state — their verification status, whether "
+        "their details are on file, whether they have met a requirement, their balance, "
+        "limits or tier, whether a request of theirs is 'pending' or 'in processing' — "
+        "unless a tool returned it THIS turn. Knowledge-base articles state what is "
+        "required in general; they are NEVER evidence about this particular customer. A "
+        "policy line saying a requirement must be met is not a finding that this customer "
+        "has failed it. Quoting the general requirement is fine; asserting they personally "
+        "fall short of it is not, and attaching a made-up status to an otherwise correct "
+        "answer is worse than omitting it, because the correct part makes the invented part "
+        "credible. With no tool result for it, leave it out entirely rather than hedging — "
+        "do not guess, and do not phrase a requirement so it reads as though you checked. "
+        "The rule TOOL FAILURE applies when a tool breaks applies here when no tool ran."
     )
 
     parts.append(
