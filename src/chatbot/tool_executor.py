@@ -9,6 +9,7 @@ token the caller resolves (decrypted from tenant_secrets) — never logged.
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 from typing import Optional
@@ -302,12 +303,32 @@ async def execute_crm_tool(
     own = client is None
     if own:
         client = httpx.AsyncClient(timeout=httpx.Timeout(timeout_s, connect=5.0))
+    # Values for NUMERIC params only, alongside the keys-only list below.
+    # A type check, not an allowlist of names: a new count-shaped filter
+    # (page_size, offset, top_k) is captured the day it is added, where a
+    # name allowlist would silently miss it. Strings are excluded BY
+    # CONSTRUCTION, which is the whole point -- a resolved param value can be
+    # a mobile, an email, or a player id, and this module already logs
+    # param_keys rather than param values for exactly that reason (see the
+    # comment on param_keys below). Do not "improve" this into logging
+    # values generally.
+    #
+    # bools are excluded deliberately: isinstance(True, int) is True in
+    # Python, so a flag would ride in unnoticed rather than by decision, and
+    # a flag is not a size driver -- what this captures is how many records
+    # were asked for, to be read against result_chars on the response line
+    # below.
+    numeric_params = {
+        k: v for k, v in sorted(rest.items())
+        if isinstance(v, (int, float)) and not isinstance(v, bool)
+    }
     log.info("crm tool call", extra={
         "ticket_id": ticket_id, "session_id": session_id,
         "url": _redact_url(url), "method": method,
         # keys only — resolved param VALUES can be customer PII (mobile,
         # email) or a player id; same rule as header_keys below.
         "param_keys": sorted(rest.keys()),
+        "numeric_params": numeric_params,
         "header_keys": list(headers.keys()),  # keys only — never log token values
     })
     try:
@@ -319,14 +340,10 @@ async def execute_crm_tool(
             body = resp.json()
         except Exception:  # noqa: BLE001 — non-JSON response
             body = {"text": resp.text}
-        log.info("crm tool response", extra={
-            "ticket_id": ticket_id, "session_id": session_id,
-            "url": _redact_url(url), "status_code": resp.status_code,
-        })
         # The response body is never logged, at any level: CRM bodies carry
         # real customer PII (get_player_profile returns mobile, email,
         # kyc_documents, bank_saved). Only url (UUID-scrubbed) + status_code
-        # go to the log, above. Redact internal ids before the body reaches
+        # go to the log, below. Redact internal ids before the body reaches
         # the LLM's context — see _REDACTED_RESPONSE_KEYS.
         result: dict = {"status_code": resp.status_code, "data": _redact_internal_ids(body)}
         if resp.status_code >= 400:
@@ -335,6 +352,17 @@ async def execute_crm_tool(
             # at all and was invisible to any failure check downstream.
             result["failure"] = "http_error"
             result["error"] = f"The upstream service returned an error (HTTP {resp.status_code})."
+        log.info("crm tool response", extra={
+            "ticket_id": ticket_id, "session_id": session_id,
+            "url": _redact_url(url), "status_code": resp.status_code,
+            # Measures the same dict that becomes the tool message content
+            # sent to the model (src/agents/chatbot.py's out_json), i.e.
+            # this result AFTER _redact_internal_ids and the failure-key
+            # additions above -- not the raw wire body -- so it's directly
+            # comparable to chat_tool_metrics.result_chars. The body itself
+            # is still never logged, only its length.
+            "result_chars": len(json.dumps(result)),
+        })
         return result
     except Exception as e:  # noqa: BLE001 — a failing CRM call must not kill the turn
         log.exception("crm tool http call failed", extra={

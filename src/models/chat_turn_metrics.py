@@ -207,6 +207,19 @@ class ChatToolMetricRow(Base):
     outcome: Mapped[str] = mapped_column(String(30), nullable=False)
     budget_slice_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     round_index: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # Characters of this tool result's JSON as sent to the model (see
+    # src/agents/chatbot.py's ChatToolMetric.result_chars). A LENGTH, never
+    # content -- there is still nothing here to redact.
+    #
+    # NULLABLE, unlike every other integer column on these tables. Deliberate:
+    # NULL means "this row predates the measurement", and rows written before
+    # this migration would otherwise backfill to a literal 0 that AVG/
+    # percentile would average in as a real observation -- biasing downward
+    # exactly the statistic this column exists to produce. 0 is never a
+    # legitimate value either: json.dumps of a result dict is at least "{}"
+    # (2 chars). AVG and percentile_cont both skip NULLs, so no COALESCE is
+    # needed for this one.
+    result_chars: Mapped[Optional[int]] = mapped_column(Integer)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=False), server_default=func.now(),
     )
@@ -237,8 +250,8 @@ async def record_chat_turn_metric(
     partial dict never raises a KeyError, same convention as
     ``record_turn_metric``). ``tools`` holds zero or more per-tool-call dicts
     (``tool_name``/``kind``/``latency_ms``/``outcome``/``budget_slice_ms``/
-    ``round_index``), inserted as ``chat_tool_metrics`` rows once the parent's
-    id is known.
+    ``round_index``/``result_chars``), inserted as ``chat_tool_metrics`` rows
+    once the parent's id is known.
     """
     try:
         sessionmaker = get_sessionmaker()
@@ -294,6 +307,11 @@ async def record_chat_turn_metric(
                     outcome=t["outcome"],
                     budget_slice_ms=t.get("budget_slice_ms", 0),
                     round_index=t.get("round_index", 0),
+                    # .get with no default -> None (not 0) when the payload
+                    # predates this field, e.g. an older agent process during
+                    # a rolling deploy. Same reason the column is nullable:
+                    # a missing measurement must not look like a 0-char result.
+                    result_chars=t.get("result_chars"),
                 )
                 for t in tools
             ]

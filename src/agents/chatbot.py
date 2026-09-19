@@ -586,6 +586,14 @@ class ChatToolMetric:
     outcome: str          # "ok" | "timeout" | "transport_error" | "error" | "skipped_budget"
     budget_slice_ms: int
     round_index: int
+    # Length in characters of this tool result's JSON as actually sent to the
+    # model (the role="tool" message in _handle_with_tools). Tool results ride
+    # in `contents`, which never caches and is re-sent on every subsequent
+    # round of the turn, so this is the full-rate component of the turn's
+    # input bill. Recorded to tell "the data really is this large" apart from
+    # "the model asked for 20 records when 3 would do" -- those have opposite
+    # fixes, and neither is safe to guess at before trimming.
+    result_chars: int
 
 
 @dataclass(frozen=True)
@@ -849,7 +857,7 @@ class ChatBotAgent(BaseAgent):
                     {
                         "tool_name": t.tool_name, "kind": t.kind, "latency_ms": t.latency_ms,
                         "outcome": t.outcome, "budget_slice_ms": t.budget_slice_ms,
-                        "round_index": t.round_index,
+                        "round_index": t.round_index, "result_chars": t.result_chars,
                     }
                     for t in metrics.tools
                 ],
@@ -1175,6 +1183,17 @@ class ChatBotAgent(BaseAgent):
                     slice_s = min(_TOOL_CALL_CEILING_S, remaining / calls_left) if calls_left > 0 else 0.0
                     out, chunks, esc, off = await self._exec_tool(tc, slice_s)
                 elapsed = time.perf_counter() - tool_start
+                # Serialise ONCE per tool result. This exact string is what
+                # goes to the model as the role="tool" message below, and
+                # (for a successful CRM/deposit-verification call) what the
+                # Step 5 guard treats as grounded text -- so its length is
+                # the real, full-rate payload this result costs on every
+                # later round of the turn. Measured by reusing the string
+                # rather than re-serialising: a second dumps of a large
+                # result would both cost a needless pass and let the
+                # measured size drift from the sent size. Computed AFTER
+                # `elapsed` above so serialisation never inflates latency_ms.
+                out_json = json.dumps(out)
                 if tc.name not in (SEARCH_KB, ESCALATE, OFFER_CALL):
                     tool_elapsed_s += elapsed
                     # Ticket #1762 fix, Steps 2/5: classify this CRM/deposit-
@@ -1187,7 +1206,7 @@ class ChatBotAgent(BaseAgent):
                         round_failed_names.add(tc.name)
                     else:
                         round_succeeded_names.add(tc.name)
-                        grounded_tool_texts.append(json.dumps(out))
+                        grounded_tool_texts.append(out_json)
                         if tc.name == _PAYMENT_CONFIG_TOOL_NAME:
                             try:
                                 payment_config_safe_values.update(
@@ -1242,7 +1261,7 @@ class ChatBotAgent(BaseAgent):
                     tool_metrics.append(ChatToolMetric(
                         tool_name=tc.name, kind=kind, latency_ms=round(elapsed * 1000),
                         outcome=outcome, budget_slice_ms=budget_slice_ms,
-                        round_index=rounds - 1,
+                        round_index=rounds - 1, result_chars=len(out_json),
                     ))
                 except Exception:  # noqa: BLE001 - per-tool metrics must never break a live turn
                     log.warning(
@@ -1257,7 +1276,7 @@ class ChatBotAgent(BaseAgent):
                 escalation = esc or escalation
                 call_offer = off or call_offer
                 messages.append(LLMMessage(
-                    role="tool", name=tc.name, tool_call_id=tc.id, content=json.dumps(out)))
+                    role="tool", name=tc.name, tool_call_id=tc.id, content=out_json))
             # A category that recovers this round must be cleared, not flagged
             # (success always wins within the round it happens in).
             failed_category_names -= round_succeeded_names
@@ -1528,7 +1547,7 @@ class ChatBotAgent(BaseAgent):
                     {
                         "name": tm.tool_name, "kind": tm.kind, "ms": tm.latency_ms,
                         "outcome": tm.outcome, "slice_ms": tm.budget_slice_ms,
-                        "round": tm.round_index,
+                        "round": tm.round_index, "result_chars": tm.result_chars,
                     }
                     for tm in tool_metrics
                 ],

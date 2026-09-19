@@ -135,6 +135,7 @@ async def test_two_round_tool_turn_emits_correct_parent_and_child_payload(retrie
     for t in tools:
         assert set(t.keys()) == {
             "tool_name", "kind", "latency_ms", "outcome", "budget_slice_ms", "round_index",
+            "result_chars",
         }
 
 
@@ -435,3 +436,48 @@ async def test_real_agent_turn_persists_via_record_chat_turn_metric(
     assert by_name["get_player_wallet"].kind == "crm"
     assert all(t.turn_id == row.id for t in tools)
     assert all(t.tenant_id == "dev" for t in tools)  # denormalized correctly
+
+
+async def test_result_chars_survives_to_the_chat_tool_metrics_row(
+    retriever, chat_metrics_db, monkeypatch,
+) -> None:
+    """Same shape as test_real_agent_turn_persists_via_record_chat_turn_metric
+    above -- a real two-round KB + CRM turn through the ACTUAL
+    record_chat_turn_metric write path -- but asserting on result_chars
+    specifically: the persisted row's value must match what the in-process
+    ChatTurnMetrics reported, for both the KB and the CRM tool."""
+    monkeypatch.setattr(
+        "src.models.chat_turn_metrics.get_sessionmaker", lambda: chat_metrics_db,
+    )
+
+    async def crm_exec(tc: ToolCall, *, timeout_s: float = 0.0) -> dict:
+        return {"balance": 500}
+
+    crm_tools = [ToolSpec(name="get_player_wallet", description="wallet",
+                          parameters={"type": "object", "properties": {}})]
+    llm = ScriptedLLM([
+        LLMResult(text="", finish_reason="tool_calls", tool_calls=[
+            ToolCall(id="t1", name="search_knowledge_base", arguments={"query": "plans"}),
+            ToolCall(id="t2", name="get_player_wallet", arguments={}),
+        ]),
+        LLMResult(text="Your balance is ₹500.", finish_reason="stop"),
+    ])
+    agent = _agent(
+        llm, retriever, crm_tools=crm_tools, crm_executor=crm_exec,
+        session_id="sess-result-chars", llm_provider="GeminiLLMAdapter",
+        llm_model="gemini-2.0-flash",
+        record_metric=lambda payload: record_chat_turn_metric(
+            tenant_id="dev", crm_id="betstudio", **payload),
+    )
+    result = await agent.handle_message("what's my balance and tell me about Plan B?")
+
+    assert result.metrics is not None
+    in_process_by_name = {t.tool_name: t.result_chars for t in result.metrics.tools}
+
+    async with chat_metrics_db() as db:
+        tools = (await db.execute(select(ChatToolMetricRow))).scalars().all()
+
+    assert len(tools) == 2
+    for row in tools:
+        assert row.result_chars == in_process_by_name[row.tool_name]
+        assert row.result_chars is not None and row.result_chars > 0

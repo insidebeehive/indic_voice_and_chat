@@ -556,6 +556,71 @@ async def test_unusable_after_retry_escalates_instead_of_asking_to_rephrase(retr
     assert "agent" in result.response.response_text.lower()
 
 
+# --- result_chars: measures the exact tool-result JSON sent to the model ---
+
+
+async def test_result_chars_equals_the_tool_message_actually_sent_to_the_model(
+    retriever,
+) -> None:
+    async def crm_exec(tc: ToolCall, *, timeout_s: float = 0.0) -> dict:
+        return {"balance": 500}
+
+    crm_tools = [ToolSpec(name="get_player_wallet", description="wallet",
+                          parameters={"type": "object", "properties": {}})]
+    llm = ScriptedLLM([
+        LLMResult(text="", finish_reason="tool_calls", tool_calls=[
+            ToolCall(id="t1", name="search_knowledge_base", arguments={"query": "plans"}),
+            ToolCall(id="t2", name="get_player_wallet", arguments={}),
+        ]),
+        LLMResult(text="Your balance is ₹500.", finish_reason="stop"),
+    ])
+    agent = _agent(llm, retriever, crm_tools=crm_tools, crm_executor=crm_exec)
+    result = await agent.handle_message("what's my balance and tell me about Plan B?")
+
+    m = result.metrics
+    assert m is not None
+    # The second LLM call's messages include round 1's tool results as
+    # role="tool" messages -- pull those to compare against what was
+    # actually sent, keyed by tool_call_id so this doesn't depend on order.
+    second_call_messages = llm.calls[1][0]
+    tool_messages_by_id = {
+        msg.tool_call_id: msg for msg in second_call_messages if msg.role == "tool"
+    }
+    kb_metric = next(t for t in m.tools if t.tool_name == "search_knowledge_base")
+    crm_metric = next(t for t in m.tools if t.tool_name == "get_player_wallet")
+    assert kb_metric.result_chars == len(tool_messages_by_id["t1"].content)
+    assert crm_metric.result_chars == len(tool_messages_by_id["t2"].content)
+    # KB carries the full chunk content (wrapped in source markers); the CRM
+    # result is just {"balance": 500}. KB's result_chars must be strictly
+    # bigger -- proving KB isn't somehow excluded/zeroed from this field.
+    assert kb_metric.result_chars > crm_metric.result_chars
+
+
+async def test_failed_tool_still_records_result_chars(retriever) -> None:
+    async def crm_exec(tc: ToolCall, *, timeout_s: float = 0.0) -> dict:
+        raise RuntimeError("crm executor exploded")
+
+    crm_tools = [ToolSpec(name="get_player_wallet", description="wallet",
+                          parameters={"type": "object", "properties": {}})]
+    llm = ScriptedLLM([
+        LLMResult(text="", finish_reason="tool_calls", tool_calls=[
+            ToolCall(id="t1", name="get_player_wallet", arguments={})]),
+        LLMResult(text="I can't check that right now.", finish_reason="stop"),
+    ])
+    agent = _agent(llm, retriever, crm_tools=crm_tools, crm_executor=crm_exec)
+    result = await agent.handle_message("what's my balance?")
+
+    m = result.metrics
+    assert m is not None
+    entry = next(t for t in m.tools if t.tool_name == "get_player_wallet")
+    assert entry.outcome != "ok"
+    second_call_messages = llm.calls[1][0]
+    tool_message = next(
+        msg for msg in second_call_messages if msg.role == "tool" and msg.tool_call_id == "t1")
+    assert entry.result_chars == len(tool_message.content)
+    assert entry.result_chars > 0
+
+
 async def test_usable_response_is_not_escalated(retriever) -> None:
     """The escalation must fire only on the unusable path. A normal answer
     keeps its own text and action -- otherwise this change would route every
