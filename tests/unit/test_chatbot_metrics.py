@@ -528,3 +528,45 @@ async def test_unusable_response_warning_carries_redacted_raw_output(retriever, 
     assert "response_text" in msg, f"raw model output missing from: {msg}"
     # ...and the mobile number in it is not.
     assert "9876543210" not in msg, f"unredacted PII in log: {msg}"
+
+
+async def test_unusable_after_retry_escalates_instead_of_asking_to_rephrase(retriever) -> None:
+    """Two generations in a row with nothing usable means the customer cannot
+    fix this by rewording -- the retry already tried again. The parser's canned
+    lines invite exactly that ("could you ask that again?"), which in
+    production ticket 7525 went out six turns running before the customer left.
+
+    Asserting on all three: the canned line is gone, the action routes to a
+    human, and the reply says so. A test that only checked `action` would pass
+    while the customer still read "could you rephrase?".
+    """
+    from src.dialogue.response_parser import is_unusable_response
+
+    llm = ScriptedLLM([
+        LLMResult(text="", finish_reason="stop"),   # forced answer: empty
+        LLMResult(text="", finish_reason="stop"),   # retry: empty too
+    ])
+    agent = _agent(llm, retriever)
+    result = await agent.handle_message("win paisa abhi tak nahi chadha hai")
+
+    assert result.response.action == "escalate"
+    assert not is_unusable_response(result.response.response_text), (
+        f"customer still got a canned retry-me line: {result.response.response_text!r}"
+    )
+    assert "agent" in result.response.response_text.lower()
+
+
+async def test_usable_response_is_not_escalated(retriever) -> None:
+    """The escalation must fire only on the unusable path. A normal answer
+    keeps its own text and action -- otherwise this change would route every
+    turn to a human.
+    """
+    # No currency figure: apply_unverified_data_guard would replace an
+    # ungrounded one and this test would pass for the wrong reason.
+    llm = ScriptedLLM([LLMResult(text="Plan B includes unlimited data.",
+                                 finish_reason="stop")])
+    agent = _agent(llm, retriever)
+    result = await agent.handle_message("tell me about Plan B")
+
+    assert result.response.action != "escalate"
+    assert "unlimited data" in result.response.response_text

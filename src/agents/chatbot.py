@@ -90,6 +90,19 @@ MAX_HISTORY_TURNS = 10
 # chat turn rather than a spoken one.
 _CHAT_RETRY_TIMEOUT_S = 12.0
 
+# Shown, with action="escalate", when the model produced nothing usable even
+# after its one retry. The parser's canned lines ("could you rephrase?", "could
+# you ask that again?") invite the customer to try again, which is the wrong
+# advice here: the retry already tried again and the customer cannot change the
+# outcome by rewording. Production ticket 7525 is the case this exists for --
+# six consecutive turns, every one answered with the same canned line, then the
+# customer left. Handing off is the only honest move once the model has failed
+# twice on the same turn.
+_UNUSABLE_ESCALATION_TEXT = (
+    "Sorry — I'm not able to answer that right now. Let me connect you to a "
+    "support agent who can help."
+)
+
 # Cap on the bumped max_tokens used for a retry attempted after a finish_reason
 # of "length" (truncation) — see _retry_if_unusable. Keeps a runaway retry from
 # ballooning cost/latency even for a tenant configured with an already-large
@@ -923,6 +936,9 @@ class ChatBotAgent(BaseAgent):
                 # this parses to the same canned fallback as before — no worse
                 # off than not retrying at all.
                 response = parse_chatbot_response(retried_result.text)
+        # Two generations in a row with nothing usable: hand off rather than
+        # telling the customer to rephrase, which cannot help them.
+        response, _escalated_unusable = self._escalate_if_still_unusable(response)
         # 5. Guard. apply_hallucination_guard runs first so its own
         # confidence == "high" gate sees the model's ORIGINAL confidence, not
         # one already downgraded by apply_pii_guard -- apply_pii_guard runs
@@ -1351,6 +1367,10 @@ class ChatBotAgent(BaseAgent):
         if not response.language:
             response.language = self._language
         response.sources_used = list(dict.fromkeys([*sources, *(response.sources_used or [])]))
+        # Before the escalation check below, so a turn the model itself asked to
+        # escalate keeps its own wording rather than being overwritten by the
+        # generic handoff line.
+        response, escalated_unusable = self._escalate_if_still_unusable(response)
         if escalation:
             response.action = "escalate"
         # Only guard fully when the agent actually retrieved (search_knowledge_base
@@ -1694,6 +1714,32 @@ class ChatBotAgent(BaseAgent):
         }, [], None, None
 
     # --- Shared helpers -------------------------------------------------
+
+    def _escalate_if_still_unusable(self, response: ChatBotResponse) -> tuple[ChatBotResponse, bool]:
+        """Hand off to a human when the model produced nothing usable even
+        after its retry. Returns ``(response, escalated_here)``.
+
+        Call this only AFTER the retry has been adopted. Reaching it means two
+        generations in a row yielded nothing the parser could use, so the
+        customer is not going to get an answer from another attempt — and the
+        parser's canned lines tell them to rephrase, which is advice that
+        cannot work. In production ticket 7525 the same canned line went out
+        six turns running before the customer gave up.
+
+        Deliberately does NOT clear an action the model already set: a turn
+        that had asked to escalate anyway stays escalated, and this only
+        upgrades the no-action case.
+        """
+        if not is_unusable_response(response.response_text):
+            return response, False
+        log.warning(
+            "chatbot escalating: no usable response after retry",
+            extra={"ticket_id": self._ticket_id, "session_id": self._session_id},
+        )
+        response.response_text = _UNUSABLE_ESCALATION_TEXT
+        response.action = "escalate"
+        response.confidence = "low"
+        return response, True
 
     async def _retry_if_unusable(
         self,
