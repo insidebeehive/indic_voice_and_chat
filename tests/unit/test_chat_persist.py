@@ -88,3 +88,32 @@ async def test_persist_turn_with_reply_media_extends_agent_row(db_session):
     assert agent_row.type == "audio"
     # The customer's own row is untouched by the reply's media fields.
     assert customer_row.media_url is None
+
+
+@pytest.mark.asyncio
+async def test_persist_turn_with_source_media_url_sets_customer_row_only(db_session):
+    """`source_media_url` (the client's own original URL, e.g. the CRM's
+    inbound `media_url`) belongs on the CUSTOMER's row only — the agent's
+    reply row has no client-supplied URL of its own and must stay NULL."""
+    persisted = await chat_api._persist_turn(
+        "s1", "[image]", _FakeResult(),
+        user_type="image", media_mime="image/png", media_url="chat/t1/s1/shot.png",
+        source_media_url="https://crm.example.com/uploads/shot.png",
+    )
+    async with db_session() as db:
+        customer_row = await db.get(ChatMessage, persisted.customer_message_id)
+        agent_row = await db.get(ChatMessage, persisted.agent_message_id)
+    assert customer_row.source_media_url == "https://crm.example.com/uploads/shot.png"
+    # The object-key media_url keeps being stored exactly as before, alongside it.
+    assert customer_row.media_url == "chat/t1/s1/shot.png"
+    assert agent_row.source_media_url is None
+
+
+@pytest.mark.asyncio
+async def test_persist_turn_source_media_url_defaults_to_none(db_session):
+    """No `source_media_url` argument (the overwhelming majority of calls,
+    e.g. plain text turns) must leave the column NULL, not an empty string."""
+    persisted = await chat_api._persist_turn("s1", "hello", _FakeResult())
+    async with db_session() as db:
+        customer_row = await db.get(ChatMessage, persisted.customer_message_id)
+    assert customer_row.source_media_url is None

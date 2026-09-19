@@ -98,10 +98,13 @@ async def sm():
     await engine.dispose()
 
 
-async def _add_image_message(sessionmaker, session_id: str, media_url: str = "media/key-1") -> int:
+async def _add_image_message(
+    sessionmaker, session_id: str, media_url: str = "media/key-1",
+    *, source_media_url: str | None = None,
+) -> int:
     async with sessionmaker() as db:
         msg = ChatMessage(session_id=session_id, role="customer", type="image",
-                           content="", media_url=media_url)
+                           content="", media_url=media_url, source_media_url=source_media_url)
         db.add(msg)
         await db.commit()
         await db.refresh(msg)
@@ -556,4 +559,218 @@ async def test_default_contract_unset_still_uses_old_multipart_path(sm, monkeypa
     assert request.headers["content-type"].startswith("multipart/form-data")
     assert b"screenshot-bytes" in request.content
     # signed_url must never be called for the multipart_verdict contract.
+    assert store.signed_url_calls == []
+
+
+# --- source_media_url passthrough (json_ticket_relay only) -----------------
+
+
+@respx.mock
+async def test_source_media_url_is_forwarded_and_media_store_is_untouched(sm, monkeypatch) -> None:
+    """The whole point of `source_media_url`: when the CRM's own inbound URL
+    was persisted on the screenshot row, `json_ticket_relay` forwards it
+    directly and never touches the media store — this is what keeps the
+    contract working even when our object storage is down (the stage bug
+    this change fixes)."""
+    monkeypatch.setattr(chat_api, "schedule_verification_timeout", lambda *a: None)
+    session_id = "s-source-url"
+    crm_url = "https://crm.example.com/uploads/shot-1.jpg?sig=abc"
+    await _add_image_message(sm, session_id, media_url="media/key-src-1", source_media_url=crm_url)
+    store = _FakeMediaStore()
+    route = respx.post(WEBHOOK_URL).mock(return_value=httpx.Response(200))
+
+    out = await submit_deposit_verification(
+        tenant=_tenant(), session_id=session_id, order_id="ORD-src-1",
+        sessionmaker=sm, media_store=store, timeout_s=10.0)
+    assert out["status"] == "submitted"
+
+    body = json.loads(route.calls.last.request.content)
+    assert body["screenshot_url"] == crm_url
+
+    # Neither the existence-probe download nor signed_url minting happens on
+    # this path — the CRM's URL is used as-is.
+    assert store.downloads == []
+    assert store.signed_url_calls == []
+
+    rows = await _rows(sm)
+    assert len(rows) == 1
+    assert rows[0].status == "pending"
+
+
+@respx.mock
+async def test_http_source_media_url_is_refused_before_any_vendor_call(sm) -> None:
+    """A non-https CRM URL must be refused by the same scheme gate that
+    guards a bad signed URL — the gate runs against whichever URL ends up
+    selected, source or signed."""
+    session_id = "s-source-url-http"
+    crm_url = "http://crm.example.com/uploads/shot-2.jpg"
+    await _add_image_message(sm, session_id, media_url="media/key-src-2", source_media_url=crm_url)
+    store = _FakeMediaStore()
+    route = respx.post(WEBHOOK_URL).mock(return_value=httpx.Response(200))
+
+    out = await submit_deposit_verification(
+        tenant=_tenant(), session_id=session_id, order_id="ORD-src-2",
+        sessionmaker=sm, media_store=store, timeout_s=10.0)
+    assert out["status"] == "error"
+    assert route.call_count == 0
+    assert store.downloads == []
+    assert store.signed_url_calls == []
+
+    rows = await _rows(sm)
+    assert len(rows) == 1
+    assert rows[0].status == "error"
+
+
+@respx.mock
+async def test_null_source_media_url_keeps_using_signed_url_path(sm, monkeypatch) -> None:
+    """No `source_media_url` on the row (old rows, or a base64 upload) must
+    fall back to exactly today's behaviour: download as the existence probe,
+    then mint a signed URL from the media store."""
+    monkeypatch.setattr(chat_api, "schedule_verification_timeout", lambda *a: None)
+    session_id = "s-source-url-null"
+    await _add_image_message(sm, session_id, media_url="media/key-src-3", source_media_url=None)
+    store = _FakeMediaStore(signed_url_value="https://cdn.example.com/shots/src-3?sig=xyz")
+    route = respx.post(WEBHOOK_URL).mock(return_value=httpx.Response(200))
+
+    out = await submit_deposit_verification(
+        tenant=_tenant(), session_id=session_id, order_id="ORD-src-3",
+        sessionmaker=sm, media_store=store, timeout_s=10.0)
+    assert out["status"] == "submitted"
+
+    body = json.loads(route.calls.last.request.content)
+    assert body["screenshot_url"] == "https://cdn.example.com/shots/src-3?sig=xyz"
+    assert store.downloads == ["media/key-src-3"]
+    assert store.signed_url_calls == [("media/key-src-3", 3600)]
+
+
+@respx.mock
+async def test_multipart_contract_ignores_source_media_url_and_still_downloads(sm, monkeypatch) -> None:
+    """`source_media_url` is a `json_ticket_relay`-only optimization —
+    `multipart_verdict` must keep downloading bytes from the media store and
+    posting them multipart, completely ignoring the column, even when it's
+    populated on the row."""
+    monkeypatch.setattr(chat_api, "schedule_verification_timeout", lambda *a: None)
+    session_id = "s-source-url-multipart"
+    crm_url = "https://crm.example.com/uploads/shot-4.jpg"
+    await _add_image_message(sm, session_id, media_url="media/key-src-4", source_media_url=crm_url)
+    store = _FakeMediaStore(data=b"screenshot-bytes-4", mime="image/png")
+    route = respx.post(WEBHOOK_URL).mock(return_value=httpx.Response(200))
+
+    out = await submit_deposit_verification(
+        tenant=_tenant(_dv_config(contract="multipart_verdict")), session_id=session_id,
+        order_id="ORD-src-4", sessionmaker=sm, media_store=store, timeout_s=10.0)
+    assert out["status"] == "submitted"
+
+    request = route.calls.last.request
+    assert request.headers["content-type"].startswith("multipart/form-data")
+    assert b"screenshot-bytes-4" in request.content
+    assert crm_url.encode() not in request.content
+    assert store.downloads == ["media/key-src-4"]
+    assert store.signed_url_calls == []
+
+
+# --- Row selection when media_url is NULL (object-storage-outage regression) -
+
+
+@respx.mock
+async def test_null_media_url_with_source_url_is_still_selected_and_forwarded(sm, monkeypatch) -> None:
+    """Regression test for the bug this whole change exists to fix: a row
+    persisted with `media_url=NULL` (object storage was unavailable at upload
+    time — see src/api/chat.py) but a usable `source_media_url` must still be
+    picked up by the screenshot lookup for `json_ticket_relay`, and that URL
+    forwarded without ever touching the media store. Before the fix, the
+    `media_url.isnot(None)` predicate filtered this row out entirely and the
+    tool returned `no_screenshot`."""
+    monkeypatch.setattr(chat_api, "schedule_verification_timeout", lambda *a: None)
+    session_id = "s-null-media-url"
+    crm_url = "https://crm.example.com/uploads/shot-5.jpg?sig=abc"
+    await _add_image_message(sm, session_id, media_url=None, source_media_url=crm_url)
+    store = _FakeMediaStore()
+    route = respx.post(WEBHOOK_URL).mock(return_value=httpx.Response(200))
+
+    out = await submit_deposit_verification(
+        tenant=_tenant(), session_id=session_id, order_id="ORD-src-5",
+        sessionmaker=sm, media_store=store, timeout_s=10.0)
+    assert out["status"] != "no_screenshot"
+    assert out["status"] == "submitted"
+
+    body = json.loads(route.calls.last.request.content)
+    assert body["screenshot_url"] == crm_url
+    assert store.downloads == []
+    assert store.signed_url_calls == []
+
+    rows = await _rows(sm)
+    assert len(rows) == 1
+    assert rows[0].status == "pending"
+
+
+@respx.mock
+async def test_multipart_contract_ignores_source_only_row_and_reports_no_screenshot(sm) -> None:
+    """`multipart_verdict` needs the bytes in our own store — a row with
+    `media_url=None` and only a `source_media_url` must NOT be picked up by
+    that contract's screenshot lookup, even though `json_ticket_relay` would
+    happily use it."""
+    session_id = "s-null-media-url-multipart"
+    crm_url = "https://crm.example.com/uploads/shot-6.jpg"
+    await _add_image_message(sm, session_id, media_url=None, source_media_url=crm_url)
+    store = _FakeMediaStore()
+    route = respx.post(WEBHOOK_URL).mock(return_value=httpx.Response(200))
+
+    out = await submit_deposit_verification(
+        tenant=_tenant(_dv_config(contract="multipart_verdict")), session_id=session_id,
+        order_id="ORD-src-6", sessionmaker=sm, media_store=store, timeout_s=10.0)
+    assert out["status"] == "no_screenshot"
+    assert route.call_count == 0
+    assert await _rows(sm) == []
+
+
+@respx.mock
+async def test_empty_string_source_media_url_falls_back_to_signed_url_path(sm, monkeypatch) -> None:
+    """An empty-string `source_media_url` (e.g. from a future call site
+    missing the `or None` idiom, or a backfill) must not be treated as a
+    usable source URL — it must fall back to the signed-URL path, not be
+    forwarded as-is (which would fail the https scheme gate) and not cause
+    the row to be excluded from selection either, since `media_url` here is
+    still valid."""
+    monkeypatch.setattr(chat_api, "schedule_verification_timeout", lambda *a: None)
+    session_id = "s-empty-source-url"
+    await _add_image_message(
+        sm, session_id, media_url="media/key-src-7", source_media_url="")
+    store = _FakeMediaStore(signed_url_value="https://cdn.example.com/shots/src-7?sig=xyz")
+    route = respx.post(WEBHOOK_URL).mock(return_value=httpx.Response(200))
+
+    out = await submit_deposit_verification(
+        tenant=_tenant(), session_id=session_id, order_id="ORD-src-7",
+        sessionmaker=sm, media_store=store, timeout_s=10.0)
+    assert out["status"] == "submitted"
+
+    body = json.loads(route.calls.last.request.content)
+    assert body["screenshot_url"] == "https://cdn.example.com/shots/src-7?sig=xyz"
+    assert store.downloads == ["media/key-src-7"]
+    assert store.signed_url_calls == [("media/key-src-7", 3600)]
+
+
+@respx.mock
+async def test_newer_source_only_row_wins_over_older_media_url_row(sm, monkeypatch) -> None:
+    """Ordering: with two image rows in the session for `json_ticket_relay`
+    — an older one with `media_url` set and a newer one with only
+    `source_media_url` — the newest qualifying row must win (order_by(id
+    desc()).limit(1)), even though it's the source-only row."""
+    monkeypatch.setattr(chat_api, "schedule_verification_timeout", lambda *a: None)
+    session_id = "s-ordering"
+    await _add_image_message(sm, session_id, media_url="media/key-old")
+    newer_crm_url = "https://crm.example.com/uploads/shot-newer.jpg"
+    await _add_image_message(
+        sm, session_id, media_url=None, source_media_url=newer_crm_url)
+    store = _FakeMediaStore()
+    route = respx.post(WEBHOOK_URL).mock(return_value=httpx.Response(200))
+
+    out = await submit_deposit_verification(
+        tenant=_tenant(), session_id=session_id, order_id="ORD-ordering",
+        sessionmaker=sm, media_store=store, timeout_s=10.0)
+    assert out["status"] == "submitted"
+
+    body = json.loads(route.calls.last.request.content)
+    assert body["screenshot_url"] == newer_crm_url
+    assert store.downloads == []
     assert store.signed_url_calls == []

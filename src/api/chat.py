@@ -2151,6 +2151,7 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
                                 persisted = await _persist_turn(
                                     session_id, transcript, result,
                                     user_type="audio", media_mime=mime, media_url=object_key,
+                                    source_media_url=(audio_media_url or None),
                                     ticket_id=ticket_id,
                                     reply_media_mime=reply_media_mime, reply_media_url=reply_media_url,
                                 )
@@ -2276,6 +2277,7 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
                             await _stop_keepalive(_ka, _ka_stop)
                             await _persist_turn(session_id, caption or f"[{mtype}]", result,
                                                 user_type=mtype, media_mime=mime, media_url=object_key,
+                                                source_media_url=(media_url or None),
                                                 ticket_id=ticket_id)
                             await _send_reply(websocket, session_id, result, tenant.id)
                             if result.escalation:
@@ -2471,7 +2473,8 @@ class PersistedTurnIds(NamedTuple):
 async def _persist_turn(
     session_id: str, user_text: str, result: ChatTurnResult,
     *, user_type: str = "text", media_mime: Optional[str] = None,
-    media_url: Optional[str] = None, ticket_id: Optional[str] = None,
+    media_url: Optional[str] = None, source_media_url: Optional[str] = None,
+    ticket_id: Optional[str] = None,
     reply_media_mime: Optional[str] = None, reply_media_url: Optional[str] = None,
 ) -> PersistedTurnIds:
     """Append the customer + agent messages to chat_messages and bump the count.
@@ -2485,6 +2488,11 @@ async def _persist_turn(
     turn (the overwhelming majority), which is a no-op past ``ChatMessage``'s
     own nullable columns.
 
+    ``source_media_url`` is the CUSTOMER's own original URL (e.g. the CRM's
+    ``media_url``), when the inbound message carried one instead of raw
+    base64 bytes — set on the customer row only, never the agent's; see
+    ``ChatMessage.source_media_url``.
+
     Returns a ``PersistedTurnIds`` (both fields ``None`` on error or missing
     session)."""
     try:
@@ -2495,6 +2503,7 @@ async def _persist_turn(
             customer_msg = ChatMessage(
                 session_id=session_id, role="customer", type=user_type,
                 content=user_text, media_mime=media_mime, media_url=media_url,
+                source_media_url=source_media_url,
             )
             db.add(customer_msg)
             agent_msg = ChatMessage(
