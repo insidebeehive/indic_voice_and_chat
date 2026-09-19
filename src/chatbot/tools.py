@@ -81,8 +81,12 @@ SUBMIT_DEPOSIT_VERIFICATION_TOOL_SPEC = ToolSpec(
     name=SUBMIT_DEPOSIT_VERIFICATION,
     description=(
         "Submit the customer's deposit for manual verification against their proof "
-        "screenshot, when the deposit-status check shows the deposit failed but the "
-        "customer insists it succeeded. Call get_player_latest_deposit_order first "
+        "screenshot. Call it for any disputed deposit that is NOT already confirmed "
+        "successful: a failed one the customer insists went through, and equally a "
+        "PENDING one — a deposit can be charged and left uncredited while its status "
+        "still reads pending, so there is no need to wait for it to turn failed. A "
+        "deposit already showing as successful is the only case this does not cover. "
+        "Call get_player_latest_deposit_order first "
         "and pass its order_id as order_id — never invent one. Requires a "
         "screenshot to already be uploaded in this conversation — do not call this "
         "before the customer has sent one, ask them to upload it first. This takes "
