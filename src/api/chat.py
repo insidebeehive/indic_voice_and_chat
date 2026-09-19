@@ -1362,6 +1362,15 @@ async def upload_media(
     ticket_id = _ticket_id_from_row(row)
     agent = await _factory(tenant, _scoped_session(tenant, session_id), ticket_id=ticket_id)
     await _hydrate_agent_history(agent, session_id, tenant.id)
+    # Same mid-turn-invisibility trap as the WS image/video branch (see
+    # _persist_inbound_media_message's docstring): this persists the
+    # customer row only AFTER handle_image returns, so a submit_deposit_
+    # verification call mid-turn cannot see it yet. Moot today only because
+    # this call passes no media_url/source_media_url below, so the row it
+    # eventually writes can never satisfy screenshot_predicate's type="image"
+    # + media/source_media query anyway. If this endpoint starts storing
+    # media (media_url/source_media_url), move it to the same
+    # pre-persist-then-pass-through ordering the WS branch uses first.
     try:
         result = await agent.handle_image(data, mime, text)
     except HTTPException:
@@ -2261,6 +2270,23 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
                                         "ticket_id": ticket_id, "session_id": session_id})
                                     object_key = None
 
+                            # Persist the customer's inbound row BEFORE running the
+                            # turn (not after, as the reply is below) and commit it
+                            # now. The LLM routinely calls submit_deposit_verification
+                            # during this same turn, and that tool looks the
+                            # screenshot up by querying chat_messages for the newest
+                            # type='image' row in the session (see
+                            # src/chatbot/deposit_verification.py's screenshot_predicate)
+                            # — through a completely separate DB session, so a row
+                            # only staged on `db` (uncommitted) would be invisible to
+                            # it. Persisting after the turn, like every other branch
+                            # does, meant the tool ran before the row existed and told
+                            # the customer to upload a screenshot they'd just sent.
+                            customer_message_id = await _persist_inbound_media_message(
+                                session_id, caption or f"[{mtype}]", user_type=mtype,
+                                media_mime=mime, media_url=object_key,
+                                source_media_url=(media_url or None), ticket_id=ticket_id,
+                            )
                             result = await _run_turn(
                                 agent.handle_image(fetched_bytes if fetched_bytes is not None else data, mime, caption))
                             # Stop the keepalive now, before ANY customer-visible
@@ -2275,10 +2301,22 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
                             # THEN see "still working on it" appear after it. Safe
                             # to call again in the `finally` below (idempotent).
                             await _stop_keepalive(_ka, _ka_stop)
+                            # user_type/media_mime/media_url/source_media_url ARE
+                            # still passed here even though customer_message_id is
+                            # set too — _persist_turn ignores them on the success
+                            # path (customer row already written and committed
+                            # above), but if _persist_inbound_media_message
+                            # returned None (transient DB error) customer_message_id
+                            # is None and _persist_turn falls back to writing the
+                            # customer row itself from these kwargs, instead of a
+                            # corrupt type="text"/no-media row that can never
+                            # satisfy submit_deposit_verification's screenshot query.
                             await _persist_turn(session_id, caption or f"[{mtype}]", result,
-                                                user_type=mtype, media_mime=mime, media_url=object_key,
+                                                user_type=mtype, media_mime=mime,
+                                                media_url=object_key,
                                                 source_media_url=(media_url or None),
-                                                ticket_id=ticket_id)
+                                                ticket_id=ticket_id,
+                                                customer_message_id=customer_message_id)
                             await _send_reply(websocket, session_id, result, tenant.id)
                             if result.escalation:
                                 if await _handle_escalation(websocket, session_id, tenant, row, result):
@@ -2460,14 +2498,119 @@ async def _emit_escalation(tenant_id: str, session_id: str, result: ChatTurnResu
 
 class PersistedTurnIds(NamedTuple):
     """Return shape of `_persist_turn`: the customer and agent ``ChatMessage``
-    ids just written in the same DB transaction — either a caller that needs
-    to build a ``/chat/media/{id}`` URL for the CUSTOMER's attachment
-    (inbound audio_ack) or for the AGENT's synthesized voice-note reply
-    (outbound `audio_url`, see `_synthesize_reply_audio`) gets it without a
-    second query. Both fields are ``None`` together on error or missing
-    session — never a partial result, since both rows commit atomically."""
+    ids just written — either a caller that needs to build a
+    ``/chat/media/{id}`` URL for the CUSTOMER's attachment (inbound
+    audio_ack) or for the AGENT's synthesized voice-note reply (outbound
+    `audio_url`, see `_synthesize_reply_audio`) gets it without a second
+    query.
+
+    When `_persist_turn` writes both rows itself (no `customer_message_id`
+    passed in), they DO commit atomically in one transaction, and both
+    fields are ``None`` together on error or missing session.
+
+    But when a caller passes `customer_message_id` (the image/video WS
+    branch, via `_persist_inbound_media_message`), that id is only echoed
+    back here, not verified — the customer row was already committed by the
+    earlier, separate call, independently of this one's outcome. This call
+    can then still return an all-``None`` `PersistedTurnIds()` (missing
+    session, or an exception below) even though the customer row exists on
+    disk. So `customer_message_id` on the result is NOT proof that the pair
+    committed atomically — callers that key off it (e.g. the audio branch's
+    `audio_ack` frame, once it migrates to this same pre-persist pattern)
+    must handle the passed-through id on its own terms rather than assuming
+    both-or-neither."""
     customer_message_id: Optional[int] = None
     agent_message_id: Optional[int] = None
+
+
+async def _persist_inbound_media_message(
+    session_id: str, content: str, *, user_type: str,
+    media_mime: Optional[str] = None, media_url: Optional[str] = None,
+    source_media_url: Optional[str] = None, ticket_id: Optional[str] = None,
+) -> Optional[int]:
+    """Write ONLY the customer's inbound-media ``ChatMessage`` row, committed,
+    and hand back its id.
+
+    Exists so a tool call made mid-turn (``submit_deposit_verification``,
+    ``src/chatbot/deposit_verification.py``) can find the customer's just-sent
+    screenshot by querying ``chat_messages`` for it — that tool reads through
+    its own, completely separate DB session (``sessionmaker()`` in
+    ``src/bootstrap.py``, not the one this coroutine uses), so an uncommitted
+    row on `db` here would simply not exist as far as that query is concerned.
+    Hence the explicit commit before returning, rather than leaving it to
+    whichever ``_persist_turn`` call happens to land after the turn.
+
+    Callers that pre-persist with this helper must pass the returned id
+    through to ``_persist_turn`` as ``customer_message_id=`` so the customer
+    row is not written a second time.
+
+    Only the image/video WS branch calls this today. Inbound audio still
+    persists its customer row after the turn (see the audio branch's own
+    ``_persist_turn`` call) — nothing there currently reads the customer's
+    voice note mid-turn, but the same trap would apply the moment something
+    does: move that branch to this same pre-persist-then-pass-through shape
+    first.
+
+    This row's commit is independent of the turn's outcome: the caller runs
+    the turn (``_run_turn``, under ``asyncio.wait_for``) AFTER this helper
+    returns, and that call can still raise (timeout, provider error). When it
+    does, the per-turn guard around it logs, sends an ``error`` frame, and
+    continues the session loop — leaving this customer row committed with no
+    matching agent row and ``message_count`` odd for that turn. This is
+    intentional, not a bug: the customer really did send the image, so the
+    row should exist regardless of whether the agent managed to reply, and a
+    later turn's ``submit_deposit_verification`` call will still find it.
+    Every current consumer already tolerates the resulting odd count/trailing
+    unanswered row: ``_hydrate_agent_history`` drops a trailing unanswered
+    customer row when rebuilding agent history, the history endpoint reads
+    in-memory session state (not this count), and backoffice analytics only
+    sum message counts.
+
+    Returns ``None`` on error or a missing session, matching ``_persist_turn``'s
+    own defensive style."""
+    customer_msg_id: Optional[int] = None
+    try:
+        db = _sm()()
+    except Exception:
+        log.exception("inbound media message persistence failed", extra={
+            "ticket_id": ticket_id, "session_id": session_id})
+        return None
+    # Session opened and closed manually (not via `async with`) so teardown
+    # lives in its own `finally`, outside the `except` below. If `__aexit__`
+    # (session close / pool reset-on-return) raised while still inside that
+    # `except`'s `try`, it would be swallowed and reported as `None` — AFTER
+    # the row was already committed — sending `_persist_turn` down its
+    # fallback path and writing a second customer row for the same image.
+    # With teardown split out, only a failure in `get`/`add`/`flush`/`commit`
+    # itself can produce `None`; a close failure after a successful commit is
+    # logged but does not change the (already-decided) return value.
+    try:
+        row = await db.get(ChatSession, session_id)
+        if row is None:
+            return None
+        customer_msg = ChatMessage(
+            session_id=session_id, role="customer", type=user_type,
+            content=content, media_mime=media_mime, media_url=media_url,
+            source_media_url=source_media_url,
+        )
+        db.add(customer_msg)
+        row.message_count = (row.message_count or 0) + 1
+        await db.flush()
+        customer_msg_id = customer_msg.id
+        await db.commit()
+    except Exception:
+        log.exception("inbound media message persistence failed", extra={
+            "ticket_id": ticket_id, "session_id": session_id})
+        return None
+    finally:
+        try:
+            await db.close()
+        except Exception:
+            log.exception(
+                "closing inbound media message session failed "
+                "(commit may have already succeeded)",
+                extra={"ticket_id": ticket_id, "session_id": session_id})
+    return customer_msg_id
 
 
 async def _persist_turn(
@@ -2476,6 +2619,7 @@ async def _persist_turn(
     media_url: Optional[str] = None, source_media_url: Optional[str] = None,
     ticket_id: Optional[str] = None,
     reply_media_mime: Optional[str] = None, reply_media_url: Optional[str] = None,
+    customer_message_id: Optional[int] = None,
 ) -> PersistedTurnIds:
     """Append the customer + agent messages to chat_messages and bump the count.
 
@@ -2493,6 +2637,17 @@ async def _persist_turn(
     base64 bytes — set on the customer row only, never the agent's; see
     ``ChatMessage.source_media_url``.
 
+    ``customer_message_id``, when given, means the customer's row was already
+    written and committed by ``_persist_inbound_media_message`` before the
+    turn ran (so a mid-turn tool call could see it — see that helper's
+    docstring). In that case this call writes ONLY the agent row, bumps
+    ``message_count`` by 1 instead of 2, and echoes the passed-in id back in
+    the returned ``PersistedTurnIds`` so callers that key off
+    ``persisted.customer_message_id`` (e.g. an ``audio_ack`` frame) keep
+    working unchanged whether the customer row was written here or earlier.
+    ``user_text``/``user_type``/``media_mime``/``media_url``/``source_media_url``
+    are then ignored — they describe a customer row this call does not create.
+
     Returns a ``PersistedTurnIds`` (both fields ``None`` on error or missing
     session)."""
     try:
@@ -2500,12 +2655,13 @@ async def _persist_turn(
             row = await db.get(ChatSession, session_id)
             if row is None:
                 return PersistedTurnIds()
-            customer_msg = ChatMessage(
-                session_id=session_id, role="customer", type=user_type,
-                content=user_text, media_mime=media_mime, media_url=media_url,
-                source_media_url=source_media_url,
-            )
-            db.add(customer_msg)
+            if customer_message_id is None:
+                customer_msg = ChatMessage(
+                    session_id=session_id, role="customer", type=user_type,
+                    content=user_text, media_mime=media_mime, media_url=media_url,
+                    source_media_url=source_media_url,
+                )
+                db.add(customer_msg)
             agent_msg = ChatMessage(
                 # "audio" (not "text") when a voice-note reply was
                 # synthesized, mirroring the inbound side's own
@@ -2532,7 +2688,10 @@ async def _persist_turn(
                 ),
             )
             db.add(agent_msg)
-            row.message_count = (row.message_count or 0) + 2
+            # +1 (agent row only) when the customer row was already committed
+            # by _persist_inbound_media_message and bumped the count itself;
+            # +2 (both rows, this call's usual job) otherwise.
+            row.message_count = (row.message_count or 0) + (1 if customer_message_id is not None else 2)
             # Chat cost tracking (Pass 1). The ProviderCost rate lookup runs on
             # its own independent DB session (not `db`) so that a failure there
             # (e.g. a pre-migration deploy where the new columns don't exist
@@ -2576,7 +2735,9 @@ async def _persist_turn(
                     log.exception("chat turn cost computation failed", extra={
                         "ticket_id": ticket_id, "session_id": session_id})
             await db.flush()
-            customer_msg_id = customer_msg.id
+            # Already known (and already committed by the caller) when
+            # pre-persisted; only a fresh customer_msg has an id to read here.
+            customer_msg_id = customer_message_id if customer_message_id is not None else customer_msg.id
             agent_msg_id = agent_msg.id
             await db.commit()
             return PersistedTurnIds(customer_msg_id, agent_msg_id)
