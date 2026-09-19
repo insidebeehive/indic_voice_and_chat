@@ -56,6 +56,7 @@ from src.interfaces.llm import (
 )
 from src.rag.context_builder import (
     GuardConfig,
+    _redact_pii_for_log,
     apply_hallucination_guard,
     apply_no_grounding_guard,
     apply_pii_guard,
@@ -907,6 +908,7 @@ class ChatBotAgent(BaseAgent):
             retry_fired = True
             retried_result, retry_ms = await self._retry_if_unusable(
                 result.finish_reason, messages, self._llm_config,
+                raw_text=result.text,
             )
             llm_ms_list.append(retry_ms)
             retry_in, retry_out, retry_cached = _usage_tokens(retried_result)
@@ -1325,6 +1327,7 @@ class ChatBotAgent(BaseAgent):
             retry_fired = True
             retried, retry_ms = await self._retry_if_unusable(
                 result.finish_reason, messages, retry_cfg,
+                raw_text=text,
             )
             llm_ms_list.append(retry_ms)
             _retry_in, _retry_out, _retry_cached = _usage_tokens(retried)
@@ -1697,6 +1700,7 @@ class ChatBotAgent(BaseAgent):
         finish_reason: str,
         messages: list[LLMMessage],
         config: LLMConfig,
+        raw_text: str = "",
     ) -> tuple[LLMResult | None, float]:
         """Retry a generate() call once, bounded by ``_CHAT_RETRY_TIMEOUT_S``.
 
@@ -1717,8 +1721,20 @@ class ChatBotAgent(BaseAgent):
         ``(None, elapsed_ms)`` and the caller falls back to the original
         (pre-retry) response, no worse off than not retrying at all.
         """
+        # The raw model output is logged, redacted and truncated, because
+        # without it this warning is undiagnosable: "no usable response" covers
+        # three different failures the parser collapses into the same canned
+        # fallback — the model returned nothing, returned something
+        # JSON-shaped it could not parse, or returned a valid envelope with no
+        # response_text — and they have different causes and different fixes.
+        # Same treatment apply_no_grounding_guard and apply_unverified_data_guard
+        # already give their own diagnostic slices, via the same redactor:
+        # this text is a reply about the customer's own account and can carry
+        # their mobile, email or account number, and apply_pii_guard has not
+        # run on it at this point.
         log.warning(
-            "chatbot retrying turn: no usable response (finish_reason=%s)", finish_reason,
+            "chatbot retrying turn: no usable response (finish_reason=%s) raw=%r",
+            finish_reason, _redact_pii_for_log(raw_text or "")[:300],
             extra={"ticket_id": self._ticket_id, "session_id": self._session_id},
         )
         retry_start = time.perf_counter()

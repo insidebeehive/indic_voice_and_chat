@@ -497,3 +497,34 @@ async def test_per_tool_metric_failure_does_not_break_the_reply(retriever, monke
     # it being short) must still succeed.
     assert result.metrics is not None
     assert result.metrics.tools == ()
+
+
+async def test_unusable_response_warning_carries_redacted_raw_output(retriever, caplog) -> None:
+    """The "no usable response" warning must carry what the model actually
+    returned. Without it the warning is undiagnosable: the parser collapses
+    three different failures into one canned fallback -- nothing returned,
+    JSON-shaped but unparseable, and a valid envelope with no response_text --
+    and they need different fixes.
+
+    The output is a reply about the customer's own account and apply_pii_guard
+    has not run on it yet, so it must go through the same redactor the other
+    diagnostic log slices use.
+    """
+    import logging
+
+    leaky = '{"response_text": "call me on 9876543210", '  # unparseable: truncated
+    llm = ScriptedLLM([
+        LLMResult(text=leaky, finish_reason="stop"),
+        LLMResult(text="Sure, I can help with that.", finish_reason="stop"),
+    ])
+    agent = _agent(llm, retriever)
+    with caplog.at_level(logging.WARNING, logger="src.agents.chatbot"):
+        await agent.handle_message("hi")
+
+    warnings = [r for r in caplog.records if "no usable response" in r.getMessage()]
+    assert warnings, "the unusable-response path logged no warning"
+    msg = warnings[0].getMessage()
+    # The raw output is present -- this is the whole point of the log line.
+    assert "response_text" in msg, f"raw model output missing from: {msg}"
+    # ...and the mobile number in it is not.
+    assert "9876543210" not in msg, f"unredacted PII in log: {msg}"
