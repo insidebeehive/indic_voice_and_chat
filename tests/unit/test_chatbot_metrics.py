@@ -269,11 +269,16 @@ async def test_rounds_exhausted_true_on_forced_final_answer(retriever) -> None:
             ToolCall(id="t1", name="get_player_transactions", arguments={})]),
         LLMResult(text="", finish_reason="tool_calls", tool_calls=[
             ToolCall(id="t2", name="get_player_transactions", arguments={})]),
-        # max_tool_rounds default is 2 -- the loop's `else` branch fires here.
+        # With max_tool_rounds pinned to 2 below, the loop's `else` branch
+        # fires here and this is the forced plain answer.
         LLMResult(text="I can't verify this right now, let me connect you to a human.",
                   finish_reason="stop"),
     ])
-    agent = _agent(llm, retriever, crm_tools=crm_tools, crm_executor=crm_exec)
+    # Pinned explicitly rather than riding the default: this test is about what
+    # happens WHEN rounds run out, not about how many there are, so it must not
+    # break the next time the budget is retuned.
+    agent = _agent(llm, retriever, crm_tools=crm_tools, crm_executor=crm_exec,
+                   max_tool_rounds=2)
     result = await agent.handle_message("where is my ₹19,600 withdrawal?")
 
     assert result.metrics is not None

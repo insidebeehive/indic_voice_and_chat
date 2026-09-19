@@ -184,15 +184,18 @@ async def test_cached_tokens_accumulate_through_rounds_exhausted_forced_final_an
         LLMResult(text="", finish_reason="tool_calls", tool_calls=[
             ToolCall(id="t2", name="get_player_transactions", arguments={})],
             usage={"prompt_tokens": 20, "completion_tokens": 2, "cached_tokens": 7}),
-        # max_tool_rounds default is 2 -- the loop's `else` branch (forced
-        # final answer) fires for this third call.
+        # With max_tool_rounds pinned to 2 below, the loop's `else` branch
+        # (forced final answer) fires for this third call.
         LLMResult(text="I can't verify this right now, let me connect you to a human.",
                   finish_reason="stop",
                   usage={"prompt_tokens": 30, "completion_tokens": 12, "cached_tokens": 3}),
     ])
     recorder = RecordingMetric()
+    # Pinned explicitly rather than riding the default: this test is about
+    # token accumulation ACROSS the forced final answer, not about how many
+    # rounds precede it, so it must not break when the budget is retuned.
     agent = _agent(llm, retriever, crm_tools=crm_tools, crm_executor=crm_exec,
-                   record_metric=recorder)
+                   record_metric=recorder, max_tool_rounds=2)
     await asyncio.wait_for(agent.handle_message("where is my ₹19,600 withdrawal?"), timeout=5.0)
 
     assert len(recorder.calls) == 1

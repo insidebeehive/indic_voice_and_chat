@@ -250,7 +250,14 @@ PLAYER_TOOLS: dict[str, dict] = {
             "status": {"type": "string", "source": "llm",
                        "description": "Filter: open | settled | cancelled | all (default: all)"},
             "market": {"type": "string", "source": "llm",
-                       "description": "Optional: filter to a specific market name (e.g. 'Kalyan', 'Milan Day', 'Starline')"},
+                       "description": (
+                           "Optional: filter to a specific market name, with no "
+                           "session word — 'Kalyan', 'Milan Day', 'Milan Morning', "
+                           "'Starline'. Strip a trailing 'Open'/'Close' before "
+                           "passing it ('Milan Morning Close' is market='Milan "
+                           "Morning'); the session is a property of each bid in the "
+                           "response, not part of the market name."
+                       )},
             "limit": {"type": "integer", "source": "llm",
                       "description": "Max records to return (default: 20)"},
         },
@@ -342,7 +349,16 @@ OPERATOR_TOOLS: dict[str, dict] = {
             "operator_id": {"type": "string", "source": "session",
                             "description": "Operator identifier"},
             "market_name": {"type": "string", "source": "llm",
-                            "description": "Optional: filter to a specific market (e.g. 'Kalyan', 'Milan Day', 'Starline'). Omit to get full Matka config."},
+                            "description": (
+                                "Optional: filter to a specific market, with no "
+                                "session word — 'Kalyan', 'Milan Day', 'Milan "
+                                "Morning', 'Starline'. Strip a trailing "
+                                "'Open'/'Close' before passing it ('Milan Morning "
+                                "Close' is market_name='Milan Morning'); this "
+                                "endpoint returns that market's open-bid, close-bid, "
+                                "open-result and close-result timings together. "
+                                "Omit to get full Matka config."
+                            )},
         },
         "default_path": "/operators/{operator_id}/matka-config",
         "method": "GET",
@@ -357,6 +373,12 @@ OPERATOR_TOOLS: dict[str, dict] = {
             "(e.g. 'Rajdhani Day ka result kya aya hai', 'Kalyan ka aaj ka number "
             "kya hai', 'is market ka result declare hua kya', 'Milan Day open "
             "result kya tha'). "
+            "SESSIONS: most markets run two sessions a day, Open and Close, and a "
+            "customer names the one they want ('Milan Morning Close', 'Kalyan open "
+            "ka result'). The session is NOT part of the market name — pass the "
+            "market alone and read the session you need out of the response, which "
+            "returns a `sessions` array with one entry per session (two for an "
+            "Open/Close market, one for a single-session market like Starline). "
             "NOTE: this does NOT know which bets a player placed or whether they "
             "won/lost — for the customer's OWN bid outcome, settlement status, or "
             "payout, call get_matka_bids instead."
@@ -365,7 +387,14 @@ OPERATOR_TOOLS: dict[str, dict] = {
             "operator_id": {"type": "string", "source": "session",
                             "description": "Operator identifier"},
             "market": {"type": "string", "source": "llm",
-                       "description": "Market name (e.g. 'Kalyan', 'Milan Day', 'Rajdhani Day', 'Starline')"},
+                       "description": (
+                           "Market name ONLY, with no session word — 'Kalyan', "
+                           "'Milan Day', 'Milan Morning', 'Rajdhani Day', 'Starline'. "
+                           "Strip a trailing 'Open'/'Close' before passing it: "
+                           "'Milan Morning Close' is market='Milan Morning', and the "
+                           "Close figure comes from the response's sessions array. "
+                           "Passing the session in this field matches no market."
+                       )},
             "date": {"type": "string", "source": "llm",
                      "description": "Optional: date to fetch the result for (YYYY-MM-DD). Omit for today's/latest declared result."},
         },

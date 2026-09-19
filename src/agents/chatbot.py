@@ -675,7 +675,16 @@ class ChatBotAgent(BaseAgent):
         crm_tools: list[ToolSpec] | None = None,
         crm_executor: CrmExecutor | None = None,
         deposit_verification_executor: Callable | None = None,
-        max_tool_rounds: int = 2,
+        # 3, not 2: at 2 the model gets one lookup and one correction, so a
+        # first call that returns nothing useful (a market name it guessed
+        # wrong, a filter that matched no rows) leaves it out of rounds before
+        # it can act on what it learned. The forced plain-answer call that
+        # follows has tool results it could not use and routinely produces
+        # nothing, which surfaces as "no usable response (finish_reason=stop)"
+        # and a dead turn. The third round is the recovery budget. Each round
+        # re-sends the whole prompt, so this costs tokens — see
+        # docs/llm-prompt-caching.md, and note the static body is cacheable.
+        max_tool_rounds: int = 3,
         llm_provider: str = "",
         llm_model: str = "",
         session_id: str | None = None,
