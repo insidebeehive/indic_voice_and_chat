@@ -50,7 +50,12 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.agents.chatbot import ChatBotAgent, ChatTurnResult, MAX_HISTORY_TURNS
+from src.agents.chatbot import (
+    ChatBotAgent,
+    ChatTurnResult,
+    MAX_HISTORY_TURNS,
+    truncate_previous_conversation,
+)
 from src.api.chat_cost import compute_chat_turn_cost
 from src.interfaces.media_storage import IMediaStorage
 from src.api.deps import get_db_session
@@ -890,6 +895,72 @@ def _ticket_id_from_row(row: ChatSession | None) -> Optional[str]:
     return (row.extra_data or {}).get("crm_ticket_id") if row else None
 
 
+def _stored_previous_conversation(row: ChatSession | None) -> Optional[str]:
+    """Previously-captured `previous_conversation` summary for a session, if
+    any was captured off an earlier connection's first frame (see
+    _capture_previous_conversation). Defensive isinstance/blank check for the
+    same reason _ticket_id_from_row's callers treat a malformed value as
+    absent rather than erroring — nothing else validates ChatSession.extra_data
+    on the read path."""
+    if row is None:
+        return None
+    val = (row.extra_data or {}).get("previous_conversation")
+    return val if isinstance(val, str) and val.strip() else None
+
+
+def _warn_late_previous_conversation(msg: dict, session_id: str) -> None:
+    """`previous_conversation` is contractually first-frame-only (see
+    _capture_previous_conversation's docstring). A value arriving on any
+    later frame is dropped, never merged or used to overwrite the one
+    already captured — accepting it would let a client rewrite the model's
+    background context mid-conversation at will. Just a log line: this must
+    never fail or slow down the actual turn."""
+    val = msg.get("previous_conversation")
+    if isinstance(val, str) and val.strip():
+        log.warning("previous_conversation received on a non-first frame; "
+                    "ignoring it and keeping the one already captured",
+                    extra={"session_id": session_id})
+
+
+async def _capture_previous_conversation(agent: ChatBotAgent, session_id: str, msg: dict) -> None:
+    """Capture a CRM-relayed `previous_conversation` summary — a prose
+    summary of the customer's earlier, SEPARATE session — from a session's
+    first inbound WS frame (the caller, chat_websocket, only calls this while
+    ``session_first_frame_pending`` is still True) and make it available to
+    every turn of this session, not just this one.
+
+    Persisted onto ChatSession.extra_data so a reconnect's freshly-built
+    ChatBotAgent picks it back up (see the ``agent._previous_conversation =
+    _stored_previous_conversation(row)`` line at both ``_factory`` call
+    sites), and set directly on the already-built ``agent`` here too so the
+    rest of THIS connection's turns benefit immediately without waiting for
+    a reconnect.
+
+    Empty, missing, whitespace-only, or non-string values are silent no-ops —
+    the CRM simply had nothing to relay for this session, not an error.
+    """
+    raw_summary = msg.get("previous_conversation")
+    if not isinstance(raw_summary, str):
+        return
+    summary = raw_summary.strip()
+    if not summary:
+        return
+    capped = truncate_previous_conversation(summary)
+    agent._previous_conversation = capped
+    try:
+        async with _sm()() as db:
+            db_row = await db.get(ChatSession, session_id)
+            if db_row is None:
+                return
+            extra = dict(db_row.extra_data or {})
+            extra["previous_conversation"] = capped
+            db_row.extra_data = extra
+            await db.commit()
+    except Exception:  # noqa: BLE001 — best-effort persistence; a live turn must never fail on it
+        log.exception("failed to persist previous_conversation",
+                      extra={"session_id": session_id})
+
+
 # Roles in chat_messages that carry conversational content worth replaying.
 # "system" is included so async-pushed messages (push_async_message persists
 # them with role="system" — e.g. deposit-verdict and verification-timeout
@@ -1361,6 +1432,15 @@ async def upload_media(
     mime = file.content_type or "application/octet-stream"
     ticket_id = _ticket_id_from_row(row)
     agent = await _factory(tenant, _scoped_session(tenant, session_id), ticket_id=ticket_id)
+    # Set directly on the built agent rather than threading a new kwarg
+    # through the `_factory` callable's signature (bootstrap.py's factory
+    # AND every test double that stands in for it across the suite would
+    # otherwise need updating just to keep accepting the call) — a plain
+    # attribute assignment on whatever `_factory` handed back, real
+    # ChatBotAgent or a test's stand-in, needs no signature change anywhere.
+    # From the row already fetched above — same "reuse what's in hand"
+    # convention as ticket_id just above.
+    agent._previous_conversation = _stored_previous_conversation(row)
     await _hydrate_agent_history(agent, session_id, tenant.id)
     # Same mid-turn-invisibility trap as the WS image/video branch (see
     # _persist_inbound_media_message's docstring): this persists the
@@ -1864,6 +1944,16 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
         await websocket.close(code=1011, reason="chatbot unavailable — please retry")
         return
 
+    # Set directly on the built agent rather than threading a new kwarg
+    # through the `_factory` callable's signature — see the identical
+    # comment at upload_media's own _factory call site. A reconnect to a
+    # session whose first-ever connection already captured a
+    # previous_conversation (see _capture_previous_conversation) needs it
+    # here, since THIS connection's loop below will never see that session's
+    # first frame again to re-capture it; `_stored_previous_conversation`
+    # reads it off the same row already fetched above for tenant/ticket_id.
+    agent._previous_conversation = _stored_previous_conversation(row)
+
     await _hydrate_agent_history(agent, session_id, tenant.id)
 
     # Declared here (not inside the try below) so the `finally` at the bottom
@@ -1893,6 +1983,17 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
         # queue. An unconditional fresh queue keeps identity meaningful.
         async_q = asyncio.Queue()
         _async_push_queues[session_id] = async_q
+
+        # `previous_conversation` rides on the session's first inbound frame
+        # only (CRM contract). `row.message_count == 0` here means no frame
+        # has ever been processed for this session yet — once the loop below
+        # consumes its first frame (whatever it turns out to contain), this
+        # flips False for the rest of THIS connection and is never re-armed;
+        # a later reconnect fetches a fresh `row` at the top of this function
+        # with message_count > 0 (that first frame's turn having persisted),
+        # so it never re-arms there either. That's what makes "first frame"
+        # mean session-wide, not per-connection.
+        session_first_frame_pending = row.message_count == 0
 
         while True:
             ws_task = asyncio.ensure_future(websocket.receive_text())
@@ -1995,6 +2096,18 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
             except json.JSONDecodeError:
                 await websocket.send_text(json.dumps({"type": "error", "message": "invalid json"}))
                 continue
+
+            # See session_first_frame_pending's comment above where it's set:
+            # this is the session's first successfully-parsed frame (of any
+            # type — message/image/audio/end) if and only if that flag is
+            # still True. Consumed unconditionally right here, before the
+            # mtype dispatch below, so it applies to every frame shape
+            # uniformly and can never be re-armed later in this connection.
+            if session_first_frame_pending:
+                await _capture_previous_conversation(agent, session_id, msg)
+                session_first_frame_pending = False
+            else:
+                _warn_late_previous_conversation(msg, session_id)
 
             mtype = msg.get("type", "message")
             if mtype == "end":
