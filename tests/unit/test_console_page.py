@@ -189,6 +189,59 @@ async def test_backoffice_hidden_attribute_is_defended_at_stylesheet_level() -> 
 
 
 @pytest.mark.asyncio
+async def test_backoffice_pipeline_hint_shows_effective_value_and_source() -> None:
+    """The Pipeline tab's "(current: ...)" hint (pipeLayerHtml) must render
+    the EFFECTIVE provider/model (LayerInfo.effective_provider/effective_model
+    from src/api/tenants.py) and label whether each field is inherited from
+    the platform default or set on this tenant — not the raw stored override,
+    which is None (and rendered as a bare "—") for any tenant running the
+    platform default untouched. This is the exact bug the PR fixes: 3 of 6
+    live tenants stored no stt/llm/tts override and showed three dashes each.
+
+    NOTE: this is a served-HTML string match, not a browser — it cannot
+    execute the JS, so it cannot confirm that a real inherited-vs-overridden
+    tenant actually renders the two different strings at runtime, only that
+    the source still contains the branching logic that would produce them.
+    """
+    transport = ASGITransport(app=_app())
+    async with AsyncClient(transport=transport, base_url="http://test") as c:
+        resp = await c.get("/admin/tenants")
+    body = resp.text
+
+    # pipeLayerHtml's hint must call the source-aware renderer, not the bare
+    # provider/model formatter used elsewhere.
+    assert '(current: ${layHint(current)})' in body
+
+    # layHint must exist and read the additive LayerInfo fields (a regression
+    # back to a plain `l.provider`/`l.model` formatter — the original bug —
+    # would still satisfy the line above if left in place unedited, but not
+    # this: it pins the function to the effective_* / *_source fields).
+    assert "function layHint(l)" in body
+    import re
+    layhint_body = re.search(r"function layHint\(l\)\s*\{(.*?)\n\}", body, re.S)
+    assert layhint_body, "layHint function body not found"
+    lh = layhint_body.group(1)
+    assert "l.effective_provider" in lh and "l.effective_model" in lh
+    assert "l.provider_source" in lh and "l.model_source" in lh
+    assert "platform default" in lh and "set on this tenant" in lh
+
+    # The compact list-table renderer (`lay`, used for the LLM/STT/TTS/
+    # Realtime columns on the main tenant list) must ALSO have moved onto the
+    # effective fields — the same three-dashes bug is equally visible there.
+    lay_body = re.search(r"function lay\(l\)\s*\{(.*?)\n\}", body, re.S)
+    assert lay_body, "lay function body not found"
+    assert "l.effective_provider" in lay_body.group(1)
+
+    # Editing semantics untouched: every pipeline control still defaults to
+    # the "leave unchanged" sentinel and PATCH only sends touched fields —
+    # this change is about the hint text, not the control. (Already covered
+    # more thoroughly elsewhere in this file/test_tenants_routes.py; this is
+    # a cheap guard that the hint rewrite didn't collaterally touch it.)
+    assert 'onchange="onPipeProviderChange(\'${kind}\')"' in body
+    assert "— leave unchanged —" in body
+
+
+@pytest.mark.asyncio
 async def test_backoffice_dropped_selection_warning_is_present_in_source() -> None:
     """refreshVoiceOptions must not silently revert a non-empty prior voice
     pick to the sentinel when the new provider/language roster doesn't

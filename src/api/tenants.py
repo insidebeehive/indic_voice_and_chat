@@ -40,6 +40,7 @@ from src.config_tenant import (
     TenantSTTConfig,
     TenantTelephonyConfig,
     TenantTTSConfig,
+    merge_provider_config,
     platform_webhook_base_url,
     resolve_chat_tts_config,
     validate_credentials,
@@ -1091,6 +1092,26 @@ class LayerInfo(BaseModel):
     # the realtime layer stores these under different config keys.
     language: Optional[str] = None
     voice_id: Optional[str] = None
+    # Additive (Task: backoffice "(current: —)" fix). `provider`/`model` above
+    # are the RAW stored override — None on a tenant that never set this
+    # layer, which is exactly the "—" that made 3 of 6 live tenants look
+    # unconfigured on stt/llm/tts while actually running the platform default
+    # from config/default.yaml. These two fields are the EFFECTIVE value
+    # (tenant override merged over the platform default, via the same
+    # merge_provider_config() TenantProviders._config_for runs at request
+    # time — see _layer()), plus a per-field source so the backoffice can
+    # tell "inherits sarvam" apart from "pinned to sarvam" instead of
+    # rendering both identically.
+    effective_provider: Optional[str] = None
+    effective_model: Optional[str] = None
+    # "tenant": this tenant's pipeline_config sets the field.
+    # "platform_default": the tenant has no override; the value shown is
+    #   config/default.yaml's.
+    # "unset": neither has a value — only reachable for `realtime`, which has
+    #   no platform-level default (config.py's PipelineConfig declares
+    #   stt/llm/tts but not realtime; s2s is a tenant-only concept).
+    provider_source: Literal["tenant", "platform_default", "unset"] = "unset"
+    model_source: Literal["tenant", "platform_default", "unset"] = "unset"
 
 
 class TenantSummary(BaseModel):
@@ -1156,7 +1177,32 @@ class TenantListResponse(BaseModel):
     total: int
 
 
-def _layer(pc: dict, key: str) -> LayerInfo:
+# {layer: TenantXConfig class} — the model _layer() reconstructs the stored
+# dict into before handing it to merge_provider_config, so a field this
+# tenant genuinely didn't set reads as None (not an empty string or missing
+# key) when deciding provider_source/model_source below. "llm" is aliased as
+# _LLM at import time (name collision with the stdlib-adjacent `llm` var used
+# elsewhere in this module).
+_LAYER_MODEL_CLS = {"stt": TenantSTTConfig, "llm": _LLM, "tts": TenantTTSConfig}
+
+
+def _layer(pc: dict, key: str, global_defaults: dict[str, dict]) -> LayerInfo:
+    """Build the display LayerInfo for one pipeline layer.
+
+    ``provider``/``model`` stay the RAW stored override (None when this
+    tenant never set the layer) — unchanged from before, since the
+    backoffice's editing pickers (PIPE_CURRENT in static/backoffice.html)
+    seed their voice-catalog fallback query off exactly that raw value and
+    must keep doing so; this function only ADDS the effective/source fields
+    the "(current: —)" fix needs.
+
+    ``effective_provider``/``effective_model`` resolve the tenant override
+    over the platform default via ``merge_provider_config`` — the same
+    tenant-over-global merge ``TenantProviders._config_for`` (src/auth/
+    registry.py) runs at request time — so this display can't disagree with
+    what actually executes. ``global_defaults`` must be built ONCE by the
+    caller (a single ``get_settings()`` call), not per tenant.
+    """
     d = pc.get(key) or {}
     if key == "realtime":
         # TenantRealtimeConfig (src/config_tenant.py) names these fields
@@ -1167,15 +1213,29 @@ def _layer(pc: dict, key: str) -> LayerInfo:
         # layer kind instead of special-casing s2s — without this mapping
         # the realtime layer's current voice/language would silently come
         # back null even though they're stored.
-        return LayerInfo(
-            provider=d.get("provider"), model=d.get("model"),
-            language=d.get("language_code"), voice_id=d.get("voice"),
-        )
-    # stt/tts read straight off TenantSTTConfig/TenantTTSConfig's own
-    # `language`/`voice_id` field names; llm has neither and both stay None.
+        language, voice_id = d.get("language_code"), d.get("voice")
+        tenant_model = TenantRealtimeConfig(**d)
+        # No platform-level default for realtime to merge against: config.py's
+        # PipelineConfig declares stt/llm/tts only — s2s/realtime is a
+        # tenant-only concept, so config/default.yaml has nothing to inherit.
+        merged = merge_provider_config(tenant_model, {})
+    else:
+        # stt/tts read straight off TenantSTTConfig/TenantTTSConfig's own
+        # `language`/`voice_id` field names; llm has neither and both stay None.
+        language, voice_id = d.get("language"), d.get("voice_id")
+        tenant_model = _LAYER_MODEL_CLS[key](**d)
+        merged = merge_provider_config(tenant_model, global_defaults.get(key, {}))
+
+    def _source(field: str) -> Literal["tenant", "platform_default", "unset"]:
+        if getattr(tenant_model, field, None) is not None:
+            return "tenant"
+        return "platform_default" if merged.get(field) is not None else "unset"
+
     return LayerInfo(
         provider=d.get("provider"), model=d.get("model"),
-        language=d.get("language"), voice_id=d.get("voice_id"),
+        language=language, voice_id=voice_id,
+        effective_provider=merged.get("provider"), effective_model=merged.get("model"),
+        provider_source=_source("provider"), model_source=_source("model"),
     )
 
 
@@ -1199,6 +1259,19 @@ async def list_tenants(
     """List every tenant with its mode + selected providers/models (admin)."""
     rows = (await session.execute(select(Tenant).order_by(Tenant.created_at))).scalars().all()
     base = (platform_webhook_base_url() or "").rstrip("/")
+
+    # Platform pipeline defaults, resolved ONCE for the whole list — not per
+    # tenant in the loop below. get_settings() is an lru_cache singleton so a
+    # second call here would be cheap too, but a call per tenant still means
+    # every backoffice list-tenants page load re-derives the same dict N
+    # times for no reason.
+    from src.config import get_settings
+    platform_pipeline = get_settings().pipeline
+    global_defaults = {
+        "stt": platform_pipeline.stt.model_dump(),
+        "llm": platform_pipeline.llm.model_dump(),
+        "tts": platform_pipeline.tts.model_dump(),
+    }
 
     # Webhook-credential secret names, per tenant — a dedicated query instead
     # of lazy-loading Tenant.secrets (the query above doesn't eager-load that
@@ -1263,8 +1336,9 @@ async def list_tenants(
         items.append(TenantSummary(
             tenant_id=t.id, slug=t.slug, name=t.name, status=t.status,
             mode=t.mode, max_concurrent_calls=t.max_concurrent_calls,
-            stt=_layer(pc, "stt"), llm=_layer(pc, "llm"), tts=_layer(pc, "tts"),
-            realtime=_layer(pc, "realtime"),
+            stt=_layer(pc, "stt", global_defaults), llm=_layer(pc, "llm", global_defaults),
+            tts=_layer(pc, "tts", global_defaults),
+            realtime=_layer(pc, "realtime", global_defaults),
             telephony_provider=tel.get("provider"),
             telephony_from_number=tel.get("from_number"),
             telephony_stringee_base_url=tel.get("stringee_base_url"),

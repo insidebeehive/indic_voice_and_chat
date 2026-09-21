@@ -140,7 +140,37 @@ async function apiSend(method, path, body) {
   } catch (e) { return { ok: false, status: 0, json: { error: String(e) } }; }
 }
 
-const lay = (l) => l && l.provider ? `${l.provider}${l.model ? " · " + l.model : ""}` : "—";
+// Effective provider/model for one pipeline layer (LayerInfo.effective_provider
+// / effective_model in src/api/tenants.py — the tenant's stored override
+// merged over config/default.yaml, same merge TenantProviders._config_for
+// runs at request time), marking any field this tenant did NOT set itself.
+// Before this, a tenant with no stt/llm/tts override at all (running the
+// platform default) rendered as a bare "—" here, identical to a genuinely
+// unconfigured pipeline — see pipeLayerHtml's docstring-equivalent comment
+// below for the fuller per-field version used in the editor hint.
+function lay(l) {
+  if (!l) return "—";
+  const p = l.effective_provider, m = l.effective_model;
+  if (!p && !m) return "—";
+  const tag = (src) => src === "platform_default" ? " (default)" : "";
+  return `${p ? p + tag(l.provider_source) : "—"}${m ? " · " + m + tag(l.model_source) : ""}`;
+}
+
+// Verbose per-field breakdown for the pipeline editor's "(current: ...)" hint
+// (pipeLayerHtml) — distinguishes "inherits the platform default" from "set
+// on this tenant" PER FIELD, since a tenant can pin `provider` while
+// inheriting `model` (merge_provider_config merges field-by-field, not
+// layer-by-layer) — a single whole-layer suffix would misreport that case as
+// fully one or the other.
+function layHint(l) {
+  if (!l) return "—";
+  const p = l.effective_provider, m = l.effective_model;
+  if (!p && !m) return "—";
+  const label = (src) => src === "tenant" ? "set on this tenant" : "platform default";
+  if (!m) return `${p} — ${label(l.provider_source)}`;
+  if (l.provider_source === l.model_source) return `${p} · ${m} — ${label(l.provider_source)}`;
+  return `${p} (${label(l.provider_source)}) · ${m} (${label(l.model_source)})`;
+}
 let SELECTED = null;
 let CHAT_WINDOW_H = 24;
 
@@ -683,7 +713,7 @@ function pipeLayerHtml(kind, label, current, extraHtml) {
   const providers = Object.keys(MODELS[catKind] || {});
   return `
     <div class="creds" style="gap:.6rem;flex-wrap:wrap;margin-bottom:.5rem;">
-      <label>${label} provider <small class="hint">(current: ${lay(current)})</small>
+      <label>${label} provider <small class="hint">(current: ${layHint(current)})</small>
         <select id="p_${kind}_provider" onchange="onPipeProviderChange('${kind}')">
           <option value="">— leave unchanged —</option>
           ${providers.map(p => `<option value="${escAttr(p)}">${escT(p)}</option>`).join("")}
