@@ -398,3 +398,15 @@ async def test_row_is_committed_before_the_async_push(dv_app, monkeypatch):
     assert observed["status"] == "verified"
     assert observed["resolved_at"] is not None
     assert observed["call"] == ("sess-1", dv._VERDICT_MESSAGES["verified"], "system")
+
+
+def test_tenant_order_index_covers_the_ticket_reply_lookup():
+    """The json_ticket_relay ticket-reply callback (deposit_ticket_reply in
+    src/api/deposit_verification.py; its route tests live in
+    test_deposit_ticket_reply_route.py) has no request_id and looks a row up
+    by tenant_id + order_id alone. idx_deposit_verification_requests_tenant_order
+    must exist with that exact leading-column order for the lookup to be
+    index-covered rather than a table scan."""
+    indexes = {idx.name: idx for idx in DepositVerificationRequest.__table__.indexes}
+    idx = indexes["idx_deposit_verification_requests_tenant_order"]
+    assert [c.name for c in idx.columns] == ["tenant_id", "order_id"]

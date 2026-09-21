@@ -27,6 +27,15 @@ class DepositVerificationRequest(Base):
             "idx_deposit_verification_requests_tenant_status_timeout",
             "tenant_id", "status", "timeout_at",
         ),
+        # Serves the json_ticket_relay vendor reply lookup in
+        # src/api/deposit_verification.py (POST /deposit-verification/reply/{token}),
+        # which has no request_id to key off and so filters on tenant_id +
+        # order_id alone -- not covered by the index above, since it doesn't
+        # filter on status and order_id isn't a leading column there.
+        Index(
+            "idx_deposit_verification_requests_tenant_order",
+            "tenant_id", "order_id",
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(50), primary_key=True)
