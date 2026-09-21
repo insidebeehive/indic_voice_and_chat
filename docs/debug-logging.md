@@ -161,6 +161,40 @@ no log and no metric. Three conditions in that one function return `None` with
 no trace, and from outside they are indistinguishable from the feature being
 broken. Diagnosing it needed a database query and a code read.
 
+## On a hot path, log transitions — not frames
+
+`src/pipeline` runs 50 audio frames a second per open call, and parts of
+`engine.py` run per LLM token. A line per frame there is not "verbose": one
+call under investigation fills `LokiPushHandler`'s queue (bounded at 10,000,
+`except queue.Full: pass`) and silently evicts the lines the operator turned
+DEBUG on to read. The instrumentation destroys the evidence it was added for.
+
+The answer is not to skip these paths — they are where voice problems live —
+but to log the **edges**, carrying the accumulated state:
+
+```python
+def detect(self, pcm16: bytes) -> VADFrame:
+    energy = rms_energy_pcm16(pcm16)
+    is_speech = energy >= self._threshold
+    if is_speech != self._last_is_speech:     # the flip, not the frame
+        debug_event(log, "vad energy_threshold transition",
+                    is_speech=is_speech, energy=energy, threshold=self._threshold)
+        self._last_is_speech = is_speech
+```
+
+Two or three lines per utterance instead of fifty a second, and they answer
+more: `energy` beside `threshold` at the moment of the flip is what
+`BARGE_RMS` was tuned by hand against, with temporary diagnostics that were
+then deleted. The same move works per token — `SentenceDetector` logs each
+sentence EMITTED rather than each `feed()`, and `_SpokenTextExtractor` exposes
+what it accumulated for one read at end of turn.
+
+**Watch for level-triggered returns.** `EndpointDetector.feed` returns True on
+every silent frame once the threshold is crossed, not just the first, so
+logging on the return value floods the moment a caller is slow to `reset()`.
+Both it and `turn_capture.accumulate_and_detect` latch instead. Ask of any
+hot-path event: does the condition GO true here, or is it merely true here?
+
 ## An event that misleads is worse than no event
 
 The `rag` pass added `rag context chunk_dropped_for_budget` to
@@ -207,7 +241,7 @@ control flow, or named as already covered by an existing log or a
 | `auth` — the rest | 8 | — | not started |
 | `providers` | 33 | 5,045 | **done** (23 instrumented; 10 without — 8 empty `__init__`, plus `model_catalog.py` and `voice_catalog.py`, which are static tables. See 4a3be36) |
 | `rag` | 5 | 2,586 | **done** (4 files instrumented, `__init__` empty) |
-| `pipeline` | 8 | 1,379 | not started |
+| `pipeline` | 8 | 1,379 | **done** (7 files instrumented, `__init__` empty) |
 | `dialogue` | 11 | 2,017 | not started |
 | `campaign` | 5 | 863 | not started |
 | `models` | 11 | 1,297 | not started |

@@ -14,6 +14,8 @@ from __future__ import annotations
 import logging
 import re
 
+from src.utils.logging import debug_event
+
 log = logging.getLogger(__name__)
 
 # English / brand term -> Devanagari phonetic spelling. Matched whole-word and
@@ -79,7 +81,33 @@ def apply_pronunciations(text: str, extra: dict[str, str] | None = None) -> str:
     pattern = re.compile(
         r"\b(" + "|".join(re.escape(k) for k in keys) + r")\b", re.IGNORECASE
     )
-    return pattern.sub(lambda m: lower[m.group(0).lower()], text)
+    # This runs on every sentence handed to TTS (every turn, often several
+    # times), so the substitution expression below is written once and used
+    # at both levels; only the tracking around it (the `substitutions` list
+    # and the debug_event call) is built when DEBUG is actually on --
+    # unguarded it would pay for a list nobody is reading on every live
+    # call, forever (see docs/debug-logging.md "Cost when DEBUG is off").
+    # A wrong substitution changes what the customer HEARS, so the thing
+    # worth logging is the specific term matched and what it became. Keeping
+    # one copy of the expression also means a future fix to it can't
+    # diverge silently by log level -- the two branches used to each hold
+    # their own copy of `lower[m.group(0).lower()]`.
+    track = log.isEnabledFor(logging.DEBUG)
+    substitutions: list[tuple[str, str]] = []
+
+    def _sub(m: re.Match) -> str:
+        replacement = lower[m.group(0).lower()]
+        if track:
+            substitutions.append((m.group(0), replacement))
+        return replacement
+
+    result = pattern.sub(_sub, text)
+    if track and substitutions:
+        debug_event(
+            log, "tts_normalize pronunciation substituted",
+            substitutions=substitutions, before=text, after=result,
+        )
+    return result
 
 
 # Currency: Sarvam TTS doesn't vocalize the ₹ symbol or a bare "Rs", so amounts
@@ -92,7 +120,30 @@ def normalize_currency(text: str) -> str:
     amount is actually spoken. Spelled-out forms (``100 रुपये``) are untouched."""
     if not text:
         return text
-    return _CURRENCY_RE.sub(lambda m: f"{m.group(1).replace(',', '')} रुपये", text)
+    # Same reasoning as apply_pronunciations above: this runs on every
+    # sentence bound for TTS, so the substitution expression is written once
+    # and used at both levels; only the match-list tracking is built when
+    # DEBUG is actually on. Known pre-existing bug in the expression below,
+    # not fixed here: a decimal amount like "Rs 99.50" becomes
+    # "99 रुपये.50" -- the regex only captures the integer part before the
+    # decimal point. Leaving it as-is; this fix is about not duplicating it,
+    # not correcting it.
+    track = log.isEnabledFor(logging.DEBUG)
+    matches: list[str] = []
+
+    def _sub(m: re.Match) -> str:
+        replacement = f"{m.group(1).replace(',', '')} रुपये"
+        if track:
+            matches.append(m.group(0))
+        return replacement
+
+    result = _CURRENCY_RE.sub(_sub, text)
+    if track and matches:
+        debug_event(
+            log, "tts_normalize currency rewritten",
+            matches=matches, before=text, after=result,
+        )
+    return result
 
 
 # Indian languages written in Devanagari. The pronunciation + currency rewrites

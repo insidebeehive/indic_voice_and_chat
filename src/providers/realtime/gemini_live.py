@@ -199,7 +199,11 @@ class GeminiLiveSession(IRealtimeSession):
                                         tool_args=dict(fc.args or {}), tool_id=fc.id or "")
 
     async def send_tool_response(self, *, tool_id: str, name: str, response: dict[str, Any]) -> None:
-        debug_event(log, "gemini live send_tool_response", tool_id=tool_id, name=name,
+        # tool_name=, not name=: `name` is a LogRecord attribute, so it lands
+        # under `name_` while `name` holds the logger's own name -- an operator
+        # filtering on the tool would match nothing. Matches the sibling
+        # "gemini live tool_call" event above.
+        debug_event(log, "gemini live send_tool_response", tool_id=tool_id, tool_name=name,
                     response=response)
         from google.genai import types
         await self._session.send_tool_response(function_responses=[

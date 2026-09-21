@@ -43,6 +43,7 @@ from src.interfaces.llm import ILLMProvider, LLMConfig, LLMMessage
 from src.interfaces.stt import ISTTProvider, STTConfig
 from src.interfaces.tts import ITTSProvider, TTSConfig
 from src.pipeline.sentence_detector import SentenceDetector
+from src.utils.logging import debug_event
 
 
 AudioSink = Callable[[bytes], Awaitable[None]]
@@ -95,18 +96,48 @@ def _speakable_from_json(raw: str) -> str:
         if s[:4].lower() == "json":
             s = s[4:].strip()
     obj = None
+    used_fallback = False
     try:
         obj = json.loads(s)
     except Exception:  # noqa: BLE001 - tolerant: fall back to a {...} search
+        used_fallback = True
         match = re.search(r"\{.*\}", s, re.DOTALL)
         if match:
             try:
                 obj = json.loads(match.group(0))
             except Exception:  # noqa: BLE001
                 obj = None
-    if isinstance(obj, dict):
-        return str(obj.get("response_text") or "")
-    return ""
+    recovered = str(obj.get("response_text") or "") if isinstance(obj, dict) else ""
+    if used_fallback:
+        # Only on the non-happy path: a clean direct `json.loads` logs
+        # nothing here (see the `elif` below for the one thing it can still
+        # be worth logging). Otherwise this is the one place that answers
+        # "what did the customer actually hear" when the envelope came back
+        # malformed -- the raw text plus whatever (if anything) the regex
+        # fallback salvaged from it. Gated on `used_fallback` alone, not on
+        # `recovered` being empty: `used_fallback and recovered` is a
+        # malformed envelope the regex still rescued a value from, and
+        # `used_fallback and not recovered` is a genuine parse failure --
+        # both are real non-happy-path outcomes. What must NOT land here is
+        # a clean parse with an empty/absent response_text: nothing failed
+        # to parse there, the model just chose to say nothing (e.g. a
+        # hangup action), which is a legitimate outcome, not a parse bug --
+        # see docs/debug-logging.md "An event that misleads is worse than no
+        # event". That case is reported separately below.
+        debug_event(
+            log,
+            "pipeline envelope_parse recovered" if recovered else "pipeline envelope_parse failed",
+            raw=raw, recovered=recovered, used_regex_fallback=used_fallback,
+        )
+    elif not recovered:
+        # Direct json.loads succeeded but response_text was empty or absent.
+        # Not a parse failure -- the envelope was well-formed and the model
+        # deliberately returned no spoken text. Worth its own event: an
+        # operator investigating "the call went silent" should be able to
+        # tell this apart from a genuine envelope_parse failure without
+        # reading the raw text by eye.
+        debug_event(log, "pipeline envelope_parse empty", raw=raw)
+    return recovered
 
 
 class _SpokenTextExtractor:
@@ -136,6 +167,22 @@ class _SpokenTextExtractor:
             if self._value_start < 0:
                 return ""
         return self._emit_new()
+
+    @property
+    def closed(self) -> bool:
+        """True once ``response_text``'s closing quote has actually been seen.
+
+        Read once at end-of-turn (see run_turn_text) to tell a normally
+        finished extraction from one truncated mid-value -- ``feed`` itself
+        is never logged (per-token), so this is the only place that
+        distinction is visible without re-reading the raw envelope.
+        """
+        return self._closed
+
+    @property
+    def consumed(self) -> int:
+        """Chars of ``response_text`` decoded and handed out via ``feed`` so far."""
+        return self._consumed
 
     def _locate_value_start(self) -> None:
         s = self._joined
@@ -395,8 +442,17 @@ class PipelineEngine:
                 return
             try:
                 replacement = sentence_guard(sentence)
-            except Exception:  # noqa: BLE001 - fail OPEN: a guard bug must never break a live call
+            except Exception as exc:  # noqa: BLE001 - fail OPEN: a guard bug must never break a live call
                 log.exception("sentence_guard raised; speaking sentence unchanged")
+                # log.exception above carries no structured fields and no
+                # session context. Without this, a guard bug and a guard
+                # saying "fine" are indistinguishable from outside -- the
+                # sentence goes out unchecked either way, which is exactly
+                # the case the guard exists to prevent.
+                debug_event(
+                    log, "pipeline sentence_guard raised",
+                    sentence=sentence, error=f"{type(exc).__name__}: {exc}",
+                )
                 replacement = None
             if replacement is None:
                 await sentence_queue.put(sentence)
@@ -424,6 +480,14 @@ class PipelineEngine:
                         "TTS synthesize timed out after %.0fs: %r",
                         TTS_SENTENCE_TIMEOUT_S, sentence[:60],
                     )
+                    # ERROR above truncates to 60 chars and carries no
+                    # extra= fields -- this is the "what did the customer NOT
+                    # hear" companion: the full sentence that got dropped.
+                    debug_event(
+                        log, "pipeline tts_synthesize timed_out",
+                        sentence=sentence, timeout_s=TTS_SENTENCE_TIMEOUT_S,
+                        consecutive_failures=consecutive_failures + 1,
+                    )
                     metrics.tts_segments_dropped += 1
                     consecutive_failures += 1
                     if consecutive_failures >= MAX_CONSECUTIVE_TTS_FAILURES:
@@ -431,16 +495,33 @@ class PipelineEngine:
                             "aborting turn: %d consecutive TTS failures",
                             consecutive_failures,
                         )
+                        debug_event(
+                            log, "pipeline turn aborted",
+                            reason="consecutive_tts_failures",
+                            consecutive_failures=consecutive_failures,
+                            sentences_spoken=len(sentences_spoken),
+                        )
                         cancel_event.set()
                     continue
                 except Exception as _tts_err:  # noqa: BLE001
                     log.error("TTS synthesize failed: %s", _tts_err)
+                    debug_event(
+                        log, "pipeline tts_synthesize failed",
+                        sentence=sentence, error=f"{type(_tts_err).__name__}: {_tts_err}",
+                        consecutive_failures=consecutive_failures + 1,
+                    )
                     metrics.tts_segments_dropped += 1
                     consecutive_failures += 1
                     if consecutive_failures >= MAX_CONSECUTIVE_TTS_FAILURES:
                         log.error(
                             "aborting turn: %d consecutive TTS failures",
                             consecutive_failures,
+                        )
+                        debug_event(
+                            log, "pipeline turn aborted",
+                            reason="consecutive_tts_failures",
+                            consecutive_failures=consecutive_failures,
+                            sentences_spoken=len(sentences_spoken),
                         )
                         cancel_event.set()
                     continue
@@ -480,6 +561,10 @@ class PipelineEngine:
                         "LLM produced no first token within %.0fs; ending turn early",
                         LLM_FIRST_TOKEN_TIMEOUT_S,
                     )
+                    debug_event(
+                        log, "pipeline llm_generate no_first_token",
+                        timeout_s=LLM_FIRST_TOKEN_TIMEOUT_S,
+                    )
                     cancel_event.set()
                     break
                 token_index += 1
@@ -489,6 +574,30 @@ class PipelineEngine:
                     log.error(
                         "LLM generation exceeded %.0fs budget; ending turn early",
                         LLM_TURN_TIMEOUT_S,
+                    )
+                    # gemini.py's own "generate_stream response" DEBUG line
+                    # only fires once the async generator is exhausted
+                    # naturally -- breaking out of consumption here means it
+                    # never fires for this turn, so the partial text collected
+                    # before the budget hit would otherwise be lost entirely.
+                    #
+                    # `partial_raw_output` is the RAW LLM output collected so
+                    # far, not the spoken text: in JSON mode (the voice
+                    # default) that's the raw envelope, the same value
+                    # TurnResult.agent_text carries. `tokens_received` is
+                    # `token_index - 1`, not `token_index`: token_index was
+                    # already incremented above by the time this check runs,
+                    # but the token that triggered the budget check is
+                    # dropped by the `break` below (it never reaches
+                    # full_text_parts / partial_raw_output), so counting it
+                    # here would make tokens_received one higher than the
+                    # number of tokens actually present in partial_raw_output.
+                    # That one extra token was received from the stream but
+                    # is not reflected in either field.
+                    debug_event(
+                        log, "pipeline llm_generate budget_exceeded",
+                        timeout_s=LLM_TURN_TIMEOUT_S, tokens_received=token_index - 1,
+                        partial_raw_output="".join(full_text_parts),
                     )
                     cancel_event.set()
                     break
@@ -520,6 +629,45 @@ class PipelineEngine:
             metrics.llm_total_ms = int((time.perf_counter() - t_llm_start) * 1000)
             await sentence_queue.put(None)
             await tts_task
+
+        if extractor is not None:
+            # The DECISION, not a second copy of the text: whether the
+            # streamed response_text value ever closed. When the stream
+            # finishes normally gemini.py's own "generate_stream response"
+            # DEBUG line already has the full raw envelope; when it doesn't
+            # (aborted above, or cancelled below), that line never fires at
+            # all, and `closed=False` here is often the only trace that the
+            # envelope was left mid-value.
+            debug_event(
+                log, "pipeline spoken_text_extraction summary",
+                extracted_chars=extractor.consumed, closed=extractor.closed,
+                spoke_anything=spoke_anything, cancelled=cancel_event.is_set(),
+            )
+
+        if cancel_event.is_set() and detector.pending:
+            # Barge-in, or an internal abort (LLM budget / consecutive TTS
+            # failures above), discards whatever SentenceDetector is still
+            # holding once cancellation is observed -- deliberately not
+            # calling detector.flush() first, so a cut-off fragment isn't
+            # spoken after the fact. Gated on detector.pending (not just
+            # cancel_event) because cancel_event can be set with nothing
+            # buffered: a barge-in landing exactly on a sentence boundary, or
+            # the MAX_CONSECUTIVE_TTS_FAILURES abort path above, where every
+            # sentence had already been emitted before the abort. Firing this
+            # event with pending_text='' in those cases reads as "buffered
+            # speech was dropped" when nothing was -- see docs/debug-logging.md
+            # "An event that misleads is worse than no event". Note this path
+            # can still race detector.flush(): cancel_event is set from
+            # inside tts_worker and may arrive after the
+            # `if not cancel_event.is_set():` above has already run flush(),
+            # in which case detector.pending is '' here too and this simply
+            # doesn't fire -- it does not mean flush() is never reached on a
+            # cancelled turn, only that this event and flush() are mutually
+            # exclusive on any given turn.
+            debug_event(
+                log, "pipeline turn pending_discarded",
+                pending_text=detector.pending, sentences_spoken=len(sentences_spoken),
+            )
 
         if first_token_at is not None:
             metrics.llm_ttft_ms = int((first_token_at - t_llm_start) * 1000)

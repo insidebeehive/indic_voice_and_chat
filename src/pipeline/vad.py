@@ -16,10 +16,15 @@ and to drive the interruption handler (barge-in).
 
 from __future__ import annotations
 
+import logging
+import time
 from dataclasses import dataclass
 from typing import Iterable, Protocol
 
 from src.pipeline.audio_utils import rms_energy_pcm16
+from src.utils.logging import debug_event
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -53,6 +58,10 @@ class EnergyVAD:
         self.sample_rate = sample_rate
         self.frame_ms = frame_ms
         self._threshold = rms_threshold
+        # Tracks only the previous frame's verdict, so `detect` (per-frame,
+        # ~50/s) can tell a flip from a repeat without any per-frame log —
+        # see the transition check below.
+        self._last_is_speech: bool | None = None
 
     @property
     def frame_bytes(self) -> int:
@@ -61,10 +70,21 @@ class EnergyVAD:
 
     def detect(self, pcm16: bytes) -> VADFrame:
         energy = rms_energy_pcm16(pcm16)
-        return VADFrame(is_speech=energy >= self._threshold, energy=energy)
+        is_speech = energy >= self._threshold
+        # Per-frame function (~50 calls/s while a call is open). Only the
+        # flip fires a log line -- a handful of times per utterance, not
+        # per frame -- and the comparison itself is a cheap float/bool
+        # check paid whether or not DEBUG is on.
+        if is_speech != self._last_is_speech:
+            debug_event(
+                log, "vad energy_threshold transition",
+                is_speech=is_speech, energy=energy, threshold=self._threshold,
+            )
+            self._last_is_speech = is_speech
+        return VADFrame(is_speech=is_speech, energy=energy)
 
     def reset(self) -> None:
-        pass
+        self._last_is_speech = None
 
 
 # --- SileroVAD ----------------------------------------------------------
@@ -134,8 +154,17 @@ class SileroVAD:
     def _ensure_model(self) -> None:
         if self._session is not None:
             return
+        # Boundary, and a slow one -- loads/caches the ONNX session on first
+        # use of this VAD instance. Not per-frame: guarded by the None check
+        # above, so this body runs once per SileroVAD instance.
+        started = time.monotonic()
         self._session = _silero_session()
         self.reset()
+        debug_event(
+            log, "vad silero_model load",
+            sample_rate=self.sample_rate, frame_ms=self.frame_ms,
+            threshold=self._threshold, load_ms=round((time.monotonic() - started) * 1000, 1),
+        )
 
     @property
     def frame_bytes(self) -> int:
@@ -171,6 +200,15 @@ class SileroVAD:
     def reset(self) -> None:
         import numpy as np
 
+        # Not per-frame -- called once per turn/call by owners of this VAD.
+        # Clears the LSTM state carried between `detect` calls; a stale
+        # state here is the same bug class as the stale Deepgram
+        # `_endpointed` flag (docs/SESSION-HANDOFF-barge-in.md), so log
+        # whether there was anything to clear.
+        debug_event(
+            log, "vad silero_state reset",
+            had_state=self._state is not None,
+        )
         self._state = np.zeros((2, 1, 128), dtype=np.float32)
         self._context = np.zeros((1, self._context_size), dtype=np.float32)
 
@@ -198,18 +236,73 @@ class EndpointDetector:
         self._speech_ms = 0
         self._trailing_silence_ms = 0
         self._saw_enough_speech = False
+        # Logging-only bookkeeping (does not affect feed()'s return value):
+        # _in_speech lets a per-frame call detect a flip without remembering
+        # the previous frame's is_speech anywhere else; _fired_logged stops
+        # the "fired" event from repeating on every subsequent silent frame
+        # if a caller is slow to (or never does) call reset() after a
+        # completed utterance -- exactly the stale-flag shape this package
+        # is watching for, applied to our own log line so a forgotten
+        # reset() degrades to a missing log rather than a flood.
+        self._in_speech = False
+        self._fired_logged = False
+
+    @property
+    def utterance_reported(self) -> bool:
+        """Whether this utterance's completion has already been logged.
+
+        Public because ``turn_capture.accumulate_and_detect`` needs the same
+        dedup latch for its own event: ``feed`` returns True on EVERY silent
+        frame once the threshold is crossed, not just the first, so a caller
+        logging on the return value alone floods at frame rate if ``reset()``
+        is ever late. Exposed as a property rather than read off the private
+        attribute, because that read sits in a 50/s loop -- renaming the field
+        would turn a logging detail into an AttributeError raised 50 times a
+        second on live audio.
+        """
+        return self._fired_logged
 
     def feed(self, frame: VADFrame) -> bool:
+        # Called once per audio frame (~50/s per open call) by every
+        # transport bridge. No log fires on a steady-state frame -- only on
+        # the state flips below, which happen a handful of times per
+        # utterance.
         if frame.is_speech:
+            if not self._in_speech:
+                debug_event(
+                    log, "endpoint speech_run started",
+                    energy=frame.energy, probability=frame.probability,
+                )
+                self._in_speech = True
             self._speech_ms += self._frame_ms
             self._trailing_silence_ms = 0
-            if self._speech_ms >= self._cfg.min_speech_ms:
+            if not self._saw_enough_speech and self._speech_ms >= self._cfg.min_speech_ms:
                 self._saw_enough_speech = True
+                debug_event(
+                    log, "endpoint min_speech reached",
+                    speech_ms=self._speech_ms, min_speech_ms=self._cfg.min_speech_ms,
+                )
             return False
-        if self._saw_enough_speech:
-            self._trailing_silence_ms += self._frame_ms
-            return self._trailing_silence_ms >= self._cfg.min_silence_ms
-        return False
+        if self._in_speech:
+            debug_event(
+                log, "endpoint speech_run ended",
+                speech_ms=self._speech_ms, saw_enough_speech=self._saw_enough_speech,
+            )
+            self._in_speech = False
+        if not self._saw_enough_speech:
+            return False
+        self._trailing_silence_ms += self._frame_ms
+        complete = self._trailing_silence_ms >= self._cfg.min_silence_ms
+        if complete and not self._fired_logged:
+            debug_event(
+                log, "endpoint utterance_complete fired",
+                speech_ms=self._speech_ms,
+                trailing_silence_ms=self._trailing_silence_ms,
+                min_silence_ms=self._cfg.min_silence_ms,
+                min_speech_ms=self._cfg.min_speech_ms,
+            )
+            self._fired_logged = True
+        return complete
 
     def feed_many(self, frames: Iterable[VADFrame]) -> bool:
         complete = False
@@ -220,6 +313,24 @@ class EndpointDetector:
         return complete
 
     def reset(self) -> None:
+        # Not per-frame -- called once per turn by every caller of this
+        # detector: browser_bridge.py and telephony_twilio.py via
+        # accumulate_and_detect (turn_capture.py), and telephony_exotel.py
+        # directly -- it does not go through accumulate_and_detect, it
+        # inlines the same capture/detect/feed loop and calls
+        # `_endpoint.reset()` itself (src/api/telephony_exotel.py). Logged
+        # unconditionally
+        # (with the state being cleared) so a reset that runs with nothing
+        # accumulated -- or, via its absence in the logs, a reset that never
+        # runs between turns -- is visible without a code read.
+        debug_event(
+            log, "endpoint state reset",
+            prior_speech_ms=self._speech_ms,
+            prior_trailing_silence_ms=self._trailing_silence_ms,
+            prior_saw_enough_speech=self._saw_enough_speech,
+        )
         self._speech_ms = 0
         self._trailing_silence_ms = 0
         self._saw_enough_speech = False
+        self._in_speech = False
+        self._fired_logged = False
