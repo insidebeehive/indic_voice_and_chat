@@ -16,6 +16,7 @@ import httpx
 from pythonjsonlogger import jsonlogger
 
 from src.auth.audit import current_admin_label
+from src.utils.chat_context import current_chat_session_id, current_chat_ticket_id
 from src.utils.client_ip import current_client_ip
 from src.utils.redact import redact_url
 from src.utils.trace_id import current_trace_id
@@ -126,6 +127,38 @@ class _TraceIdLogFilter(logging.Filter):
             trace_id = current_trace_id()
             if trace_id is not None:
                 record.trace_id = trace_id
+        return True
+
+
+class _ChatContextLogFilter(logging.Filter):
+    """Stamp records emitted while handling a chat connection with that
+    connection's session and ticket ids (see src/utils/chat_context.py).
+
+    Threading these through `extra={}` only works where the caller happens to
+    hold them. `_synthesize_reply_audio` (src/api/chat.py) takes a tenant and
+    some text and has neither, and every adapter under src/providers/ gets a
+    config dict with no session context — which is precisely where a debug
+    session needs to follow a conversation across layers.
+
+    Stamps ONLY when a value is actually set, matching _TraceIdLogFilter: most
+    records are emitted outside any chat scope, and adding `session_id: null`
+    to every line in the system would change the shape of all of them for no
+    signal. An explicit value passed via extra={} still wins, so a call site
+    with better information keeps it.
+
+    Dependency direction is one-way: this module imports
+    src.utils.chat_context; that module must never import this one.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if not hasattr(record, "session_id"):
+            session_id = current_chat_session_id()
+            if session_id is not None:
+                record.session_id = session_id
+        if not hasattr(record, "ticket_id"):
+            ticket_id = current_chat_ticket_id()
+            if ticket_id is not None:
+                record.ticket_id = ticket_id
         return True
 
 
@@ -443,6 +476,7 @@ def configure_logging(
     handler.addFilter(_ClientIPLogFilter())
     handler.addFilter(_AdminLabelLogFilter())
     handler.addFilter(_TraceIdLogFilter())
+    handler.addFilter(_ChatContextLogFilter())
     root.addHandler(handler)
 
     if loki_url:
@@ -452,6 +486,7 @@ def configure_logging(
         loki_handler.addFilter(_ClientIPLogFilter())
         loki_handler.addFilter(_AdminLabelLogFilter())
         loki_handler.addFilter(_TraceIdLogFilter())
+        loki_handler.addFilter(_ChatContextLogFilter())
         root.addHandler(loki_handler)
 
     # Quiet down noisy libraries.

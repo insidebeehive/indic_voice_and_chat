@@ -73,6 +73,8 @@ from src.pipeline.text_normalize import normalize_for_tts
 import src.utils.http_fetch as http_fetch
 from src.utils.http_fetch import MAX_FETCH_BYTES as _MAX_MEDIA_FETCH_BYTES
 from src.utils.http_fetch import fetch_capped as _fetch_capped
+from src.utils.chat_context import set_chat_context
+from src.utils.logging import debug_event
 from src.utils.trace_id import new_trace_id, trace_id_scope
 
 log = logging.getLogger(__name__)
@@ -323,10 +325,22 @@ async def _synthesize_reply_audio(
         tts = _tts_providers.get_chat_tts(tenant)
         if tts is None:
             return None
-        return await asyncio.wait_for(
+        result = await asyncio.wait_for(
             _synthesize_reply_audio_uncapped(tenant, text, language, tts),
             timeout=_TTS_SYNTH_TIMEOUT_S,
         )
+        # Success is logged too, not only the skips. Without this the ONLY
+        # signal that audio was produced is the absence of a skip line, so
+        # "we never synthesized" and "we synthesized, attached the url, and
+        # the widget did not play it" are indistinguishable from here -- and
+        # the second is live, since playing audio_url is a CRM-side change.
+        # A successful call nobody can see is as hard to debug as a failed one.
+        debug_event(log, "tts_reply_synthesized",
+                    tenant_id=tenant.id, language=language,
+                    reply_chars=len(text), max_chars=max_chars,
+                    audio_bytes=len(result[0]) if result else 0,
+                    audio_mime=result[1] if result else None)
+        return result
     except asyncio.CancelledError:
         raise
     except Exception:  # noqa: BLE001 — audio is a nicety, the text reply is not
@@ -1998,6 +2012,19 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
     # below) — a session's crm_ticket_id doesn't change mid-conversation, and
     # this is used purely for log correlation with the external CRM ticket.
     ticket_id = _ticket_id_from_row(row)
+    # Publish both ids for the rest of this connection so EVERY record emitted
+    # while handling it carries them -- including from layers holding no
+    # session object at all (_synthesize_reply_audio takes a tenant and some
+    # text; every src/providers/ adapter gets a config dict). Threading them
+    # through extra={} only reaches call sites that happen to have them, which
+    # is how the voice-reply skip came to log a tenant_id and nothing tying it
+    # to a conversation. See src/utils/chat_context.py.
+    #
+    # Set, not scoped: ContextVars are per-asyncio-Task and this handler owns
+    # the task for the connection's lifetime, so the values die with it. A
+    # `with` block here would mean re-indenting several hundred lines, and the
+    # reset it buys is one the task boundary already provides.
+    set_chat_context(session_id, ticket_id)
     tenant = await tenant_from_id(row.tenant_id)
     if tenant is None:
         await websocket.close(code=1011, reason="tenant unavailable")
@@ -2236,6 +2263,20 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
             # close together in time is the grep signature of the
             # double-reply bug this whole mechanism exists to catch.
             turn_trace_id = new_trace_id()
+            # What the customer actually sent. Nothing recorded the inbound
+            # frame type, so "no voice reply came back" could not be told
+            # apart from "the customer sent text" without asking them --
+            # every downstream line describes the TURN, and by then the
+            # modality that decided whether audio was even attempted is gone.
+            # Sizes rather than payloads: `data` is base64 audio and can be
+            # megabytes, and a log line is not the place for it.
+            debug_event(log, "chat_frame_received",
+                        session_id=session_id, message_type=mtype,
+                        has_data=bool(msg.get("data")),
+                        has_media_url=bool(msg.get("media_url")),
+                        mime=msg.get("mime"),
+                        text_chars=len(msg.get("text") or msg.get("message") or ""),
+                        trace_id=turn_trace_id)
             fingerprint = _turn_fingerprint(msg)
             guard_token = _try_begin_turn(session_id, fingerprint)
             if guard_token is None:
@@ -2682,6 +2723,15 @@ async def _send_reply(
     if audio_url:
         frame["audio_url"] = audio_url
         frame["audio_mime"] = audio_mime
+    # What actually went out on the wire, audio or not. This is the line that
+    # separates "we sent no audio" from "we sent audio and the customer did
+    # not hear it" -- the split the reply-frame layer is the only place that
+    # can answer, since synthesis succeeding does not prove the url shipped.
+    debug_event(log, "chat_reply_frame_sent",
+                session_id=session_id, has_audio=bool(audio_url),
+                audio_url=audio_url, audio_mime=audio_mime,
+                action=result.response.action,
+                text_chars=len(result.response.response_text or ""))
     await websocket.send_text(json.dumps(frame))
     if result.escalation:
         await websocket.send_text(json.dumps({
