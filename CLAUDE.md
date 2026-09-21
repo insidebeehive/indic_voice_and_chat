@@ -51,6 +51,19 @@ boundary, and treating it as permanently-failing kept that coverage dark. Before
 adding anything to this list, record why it fails — an entry with no diagnosis
 stops being read.
 
+## Deployment
+
+Alembic migrations apply themselves on deploy — the `Dockerfile` CMD runs
+`timeout 60 alembic upgrade head` before exec'ing uvicorn. There is no manual
+upgrade step after shipping a migration, so don't tell anyone to run one.
+
+That command is `;`-chained, not `&&`: uvicorn starts even if alembic times out
+or fails, leaving the app serving on the old schema with only container logs as
+evidence. The Dockerfile comment justifies the non-blocking choice with "we have
+no new migrations in this deploy", which stops holding the moment one ships — so
+when a deploy carries a migration, check the container logs to confirm it
+actually reached head.
+
 ## Existing standing preferences
 
 - Never use "thesis"/academic framing in commit messages, PRs, or committed docs.
