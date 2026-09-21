@@ -1114,6 +1114,54 @@ class LayerInfo(BaseModel):
     model_source: Literal["tenant", "platform_default", "unset"] = "unset"
 
 
+class ChatVoiceInfo(BaseModel):
+    """Effective state of pipeline.chat_voice — CHAT voice-note TTS replies,
+    not the call cascade (ChatVoiceConfig, src/config_tenant.py).
+
+    Deliberately not a LayerInfo: stt/llm/tts merge tenant fields over a
+    platform default field-by-field (merge_provider_config); chat voice has
+    no platform-level default to merge against at all (there is no
+    ``global_defaults["chat_tts"]`` — see get_chat_tts's docstring,
+    src/auth/registry.py). It is a discrete choice between two whole TTS
+    blocks, made by resolve_chat_tts_config: chat_voice.tts if it names a
+    provider, else pipeline.tts, else nothing resolves. ``source`` records
+    which of those three actually won, because the middle case (silently
+    borrowing the call cascade's TTS) and the last (nothing at all, which for
+    an s2s tenant means falling through to the platform's own account — see
+    0c011a6) look identical to an operator unless the source is named.
+    """
+    # pipeline.chat_voice.enabled, read directly rather than derived from
+    # `source` — resolve_chat_tts_config deliberately ignores `enabled` (it
+    # answers "what WOULD be used"), so a disabled tenant with a fully
+    # resolvable TTS block and an enabled tenant with nothing resolvable can
+    # both reach here; only `enabled` distinguishes "voice replies are off"
+    # from "voice replies are on but broken" — the tenant reported in the
+    # task brief (lotterystage) needed exactly this distinction and the tab
+    # could not make it before this field existed.
+    enabled: bool = False
+    effective_provider: Optional[str] = None
+    effective_model: Optional[str] = None
+    # Same resolved TenantTTSConfig's language/voice_id — lets the
+    # backoffice's shared voice picker (voicePickerHtml("cv_tts", ...),
+    # static/backoffice.html) show a real "(current: ...)" instead of the
+    # "isn't exposed by any GET" placeholder it used to fall back to for this
+    # one picker only.
+    effective_language: Optional[str] = None
+    effective_voice_id: Optional[str] = None
+    # "own": pipeline.chat_voice.tts declares a provider — this tenant
+    #   configured chat voice-note replies separately from its call cascade.
+    # "cascade": chat_voice.tts is empty; resolve_chat_tts_config fell back to
+    #   pipeline.tts. Not a problem for a layered tenant reusing voice it
+    #   already pays for, but the trap for an s2s tenant, which may have no
+    #   pipeline.tts to borrow — that case shows as "none", not "cascade".
+    # "none": neither block declares a provider; resolve_chat_tts_config
+    #   returned None. Combined with `enabled: true` this is the
+    #   enabled-but-nothing-resolvable gap validate_credentials rejects at
+    #   config-write time (0c011a6) — reachable here for a stored config that
+    #   predates that check or was edited around it.
+    source: Literal["own", "cascade", "none"] = "none"
+
+
 class TenantSummary(BaseModel):
     tenant_id: str
     slug: str
@@ -1125,6 +1173,7 @@ class TenantSummary(BaseModel):
     llm: LayerInfo
     tts: LayerInfo
     realtime: LayerInfo
+    chat_voice: ChatVoiceInfo
     telephony_provider: Optional[str] = None
     # Non-secret telephony config (so the backoffice can prefill it) + the NAMES
     # (never values) of the creds configured for the active provider.
@@ -1239,6 +1288,37 @@ def _layer(pc: dict, key: str, global_defaults: dict[str, dict]) -> LayerInfo:
     )
 
 
+def _chat_voice_info(pc: dict) -> ChatVoiceInfo:
+    """Build the display ChatVoiceInfo for pipeline.chat_voice.
+
+    Resolved through resolve_chat_tts_config (src/config_tenant.py) — the
+    same function TenantProviders.get_chat_tts (src/auth/registry.py) calls
+    to decide which TTS an actual chat voice-note reply uses — instead of a
+    second merge written for display, so this tab cannot disagree with what
+    runs. ``TenantPipelineConfig(**pc)`` mirrors the same reconstruction
+    update_tenant's PATCH response already does for this purpose; pydantic
+    ignores the pc keys (deposit_verification, events_webhook_url, ...) that
+    aren't TenantPipelineConfig fields.
+    """
+    pipeline_model = TenantPipelineConfig(**pc)
+    cv = pipeline_model.chat_voice
+    resolved = resolve_chat_tts_config(pipeline_model)
+    if resolved is None:
+        source: Literal["own", "cascade", "none"] = "none"
+    elif cv.tts.provider:
+        source = "own"
+    else:
+        source = "cascade"
+    return ChatVoiceInfo(
+        enabled=cv.enabled,
+        effective_provider=resolved.provider if resolved else None,
+        effective_model=resolved.model if resolved else None,
+        effective_language=resolved.language if resolved else None,
+        effective_voice_id=resolved.voice_id if resolved else None,
+        source=source,
+    )
+
+
 _CRED_ENV_FIELDS = (
     "account_sid_env", "auth_token_env", "api_key_sid_env",
     "api_key_secret_env", "twiml_app_sid_env", "user_id_env",
@@ -1339,6 +1419,7 @@ async def list_tenants(
             stt=_layer(pc, "stt", global_defaults), llm=_layer(pc, "llm", global_defaults),
             tts=_layer(pc, "tts", global_defaults),
             realtime=_layer(pc, "realtime", global_defaults),
+            chat_voice=_chat_voice_info(pc),
             telephony_provider=tel.get("provider"),
             telephony_from_number=tel.get("from_number"),
             telephony_stringee_base_url=tel.get("stringee_base_url"),

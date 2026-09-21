@@ -725,6 +725,139 @@ async def test_list_tenants_realtime_unset_for_layered_tenant_is_not_platform_de
     assert t["realtime"]["model_source"] == "unset"
 
 
+async def test_list_tenants_chat_voice_not_enabled(ctx) -> None:
+    """A freshly registered tenant never touches pipeline.chat_voice at all —
+    `enabled` must read False even though pipeline.tts IS configured and
+    resolve_chat_tts_config (which deliberately ignores `enabled`) would
+    still resolve it. This is the fourth state the task exists to separate
+    from "enabled but nothing resolvable": both have real chat TTS costs
+    riding on `enabled` alone, and collapsing them is what left the
+    lotterystage on/off question unanswerable from this tab.
+
+    Mutation check: hardcoding ChatVoiceInfo.enabled=True in
+    _chat_voice_info (instead of cv.enabled) makes this assert False is True
+    and fails; the source/effective_provider fields alone would not catch
+    that mutation since they're unaffected by it.
+    """
+    client, _, _ = ctx
+    body = _body(slug="acme", mode="layered")   # default tts = sarvam/bulbul:v3
+    await client.post("/tenants", json=body, headers=ADMIN_HEADERS)
+    resp = await client.get("/tenants", headers=ADMIN_HEADERS)
+    t = next(x for x in resp.json()["tenants"] if x["slug"] == "acme")
+
+    assert t["chat_voice"]["enabled"] is False
+    # Still reports what WOULD run if enabled (matches resolve_chat_tts_config's
+    # documented "ignores enabled" contract) rather than blanking these out —
+    # an operator flipping `enabled` on needs to see this ahead of time.
+    assert t["chat_voice"]["effective_provider"] == "sarvam"
+    assert t["chat_voice"]["source"] == "cascade"
+
+
+async def test_list_tenants_chat_voice_enabled_with_own_tts(ctx) -> None:
+    """The lotterystage shape from the task brief: chat_voice.enabled=true
+    with its own tts block (elevenlabs/eleven_multilingual_v2/a voice id) —
+    must report source="own", not "cascade", and must surface the resolved
+    voice_id so the backoffice's chat-TTS voice picker gets a real
+    "(current: ...)" instead of the old "isn't exposed by any GET" hint.
+
+    Mutation check: changing `elif cv.tts.provider: source = "own"` to
+    `source = "cascade"` unconditionally leaves effective_provider/model
+    unchanged (resolve_chat_tts_config still returns chat_voice.tts first)
+    but flips this test's source assertion from "own" to "cascade" — proving
+    the source label, not just the resolved value, is under test.
+    """
+    client, _, _ = ctx
+    body = _body(slug="lotterystage", mode="layered")   # pipeline.tts = sarvam
+    tid = (await client.post("/tenants", json=body, headers=ADMIN_HEADERS)).json()["tenant_id"]
+
+    patch = await client.patch(
+        f"/tenants/{tid}",
+        json={"pipeline": {"chat_voice": {
+            "enabled": True,
+            "tts": {"provider": "elevenlabs", "model": "eleven_multilingual_v2",
+                     "voice_id": "21m00Tcm4TlvDq8ikWAM"},
+        }}},
+        headers=ADMIN_HEADERS)
+    assert patch.status_code == 200, patch.text
+
+    t = next(x for x in (await client.get("/tenants", headers=ADMIN_HEADERS))
+             .json()["tenants"] if x["tenant_id"] == tid)
+    assert t["chat_voice"]["enabled"] is True
+    assert t["chat_voice"]["effective_provider"] == "elevenlabs"
+    assert t["chat_voice"]["effective_model"] == "eleven_multilingual_v2"
+    assert t["chat_voice"]["effective_voice_id"] == "21m00Tcm4TlvDq8ikWAM"
+    assert t["chat_voice"]["source"] == "own"
+    # Not accidentally reporting the call cascade's TTS instead.
+    assert t["chat_voice"]["effective_provider"] != "sarvam"
+
+
+async def test_list_tenants_chat_voice_enabled_falls_back_to_pipeline_tts(ctx) -> None:
+    """chat_voice.enabled=true with NO chat_voice.tts override: the documented
+    fallback (resolve_chat_tts_config) reuses pipeline.tts, and this tab must
+    label that "cascade" — the middle of the three states, and the one an
+    operator can mistake for "own" if the label is missing (a tenant that
+    looks fully configured is actually silently reusing the call TTS, which
+    breaks the moment that tenant switches to s2s and pipeline.tts goes away).
+
+    Mutation check: swapping resolve_chat_tts_config for a stub that only
+    ever reads chat_voice.tts (never falls back to pipeline.tts) makes
+    effective_provider come back None instead of "sarvam" here — this test
+    catches losing the fallback, not just mislabeling it.
+    """
+    client, _, _ = ctx
+    body = _body(slug="acme", mode="layered")   # pipeline.tts = sarvam/bulbul:v3
+    tid = (await client.post("/tenants", json=body, headers=ADMIN_HEADERS)).json()["tenant_id"]
+
+    patch = await client.patch(
+        f"/tenants/{tid}",
+        json={"pipeline": {"chat_voice": {"enabled": True}}},
+        headers=ADMIN_HEADERS)
+    assert patch.status_code == 200, patch.text
+
+    t = next(x for x in (await client.get("/tenants", headers=ADMIN_HEADERS))
+             .json()["tenants"] if x["tenant_id"] == tid)
+    assert t["chat_voice"]["enabled"] is True
+    assert t["chat_voice"]["effective_provider"] == "sarvam"
+    assert t["chat_voice"]["effective_model"] == "bulbul:v3"
+    assert t["chat_voice"]["source"] == "cascade"
+
+
+async def test_list_tenants_chat_voice_enabled_but_nothing_resolvable(ctx) -> None:
+    """The gap validate_credentials rejects at PATCH time (0c011a6) — see
+    test_pipeline_enable_chat_voice_with_no_tts_anywhere_rejected, which
+    proves the PATCH path can't write this combination. It is still a real
+    state the list endpoint must be able to report: a row written before
+    that validator existed, or edited directly against the database, can
+    carry `chat_voice.enabled: true` with no TTS resolvable anywhere — the
+    exact "voice replies not working" shape with no trace anywhere the task
+    brief describes. Written directly via the DB session (not PATCH) because
+    the API correctly refuses to create it.
+
+    Mutation check: having _chat_voice_info treat a None `resolved` as
+    source="cascade" (instead of "none") would still pass an effective_
+    provider-is-None check but fail this test's explicit source assertion.
+    """
+    client, resolver, sm = ctx
+    body = _body(slug="acme", mode="layered")
+    body["tts"] = None   # no pipeline.tts at all -> nothing to fall back to
+    tid = (await client.post("/tenants", json=body, headers=ADMIN_HEADERS)).json()["tenant_id"]
+
+    async with sm() as session:
+        t = await session.get(Tenant, tid)
+        pc = dict(t.pipeline_config or {})
+        pc["chat_voice"] = {"enabled": True}   # no tts block either
+        t.pipeline_config = pc
+        session.add(t)
+        await session.commit()
+
+    resp = await client.get("/tenants", headers=ADMIN_HEADERS)
+    t = next(x for x in resp.json()["tenants"] if x["tenant_id"] == tid)
+    assert t["chat_voice"]["enabled"] is True
+    assert t["chat_voice"]["effective_provider"] is None
+    assert t["chat_voice"]["effective_model"] is None
+    assert t["chat_voice"]["source"] == "none"
+
+
 async def test_list_tenants_requires_admin(ctx) -> None:
     client, _, _ = ctx
     assert (await client.get("/tenants")).status_code == 401
