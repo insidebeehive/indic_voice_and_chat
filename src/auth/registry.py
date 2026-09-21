@@ -21,12 +21,15 @@ goes elsewhere.
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
 
 from src.auth.context import TenantContext
 from src.config_tenant import merge_provider_config, resolve_chat_tts_config
+
+log = logging.getLogger(__name__)
 
 
 # --- Provider clients ---------------------------------------------------
@@ -114,9 +117,24 @@ class TenantProviders:
         """
         pipeline = tenant.settings.pipeline
         if not pipeline.chat_voice.enabled:
+            # Routine: most tenants never opt into chat voice-note replies at
+            # all (this is the common case, not a problem) -- DEBUG only, no
+            # promotion, so it stays silent unless someone turns DEBUG on to
+            # investigate a specific tenant/session.
+            log.debug("chat tts skipped: chat_voice.enabled is false",
+                      extra={"tenant_id": tenant.id})
             return None
         tenant_tts = resolve_chat_tts_config(pipeline)
         if tenant_tts is None:
+            # Distinguishes "opted in but nothing resolvable" from the
+            # not-enabled case above -- this is the shape that produced a
+            # tenant-reported "voice replies aren't working" ticket with no
+            # trace anywhere (see src/api/chat.py's _synthesize_reply_audio
+            # module comment): chat_voice.enabled=true but neither
+            # chat_voice.tts nor pipeline.tts declares a provider.
+            log.debug("chat tts skipped: chat_voice.enabled is true but no "
+                      "chat_voice.tts or pipeline.tts provider resolves",
+                      extra={"tenant_id": tenant.id})
             return None
         key = (tenant.id, "chat_tts")
         if key in self._cache:

@@ -1832,6 +1832,14 @@ class ChatBotAgent(BaseAgent):
             return {"status": "offered", **off}, [], None, off
         if tc.name == SUBMIT_DEPOSIT_VERIFICATION:
             if self._deposit_verification_executor is None:
+                # Should be unreachable in practice -- src/bootstrap.py only
+                # registers this tool spec when it also builds an executor
+                # for it (see make_chatbot_factory) -- but the model was
+                # still handed this tool and got a plain "not available" with
+                # nothing here recording why, if the two ever drift apart.
+                log.debug("deposit verification tool called but no executor "
+                          "is wired for this agent",
+                          extra={"ticket_id": self._ticket_id, "session_id": self._session_id})
                 return {"error": "verification is not available"}, [], None, None
             try:
                 out = await self._deposit_verification_executor(tc, timeout_s=max(0.5, timeout_s - 1.0))
@@ -1875,6 +1883,13 @@ class ChatBotAgent(BaseAgent):
                         "satisfies the response-quality bar for this turn."
                     ),
                 }, [], None, None
+        # No crm_executor was ever wired for this agent (self._crm_executor is
+        # None), yet the model was handed a CRM tool spec to call -- a real
+        # config/registration gap, not a per-call transient failure like the
+        # except block just above.
+        log.debug("crm tool called but no crm_executor is wired for this agent",
+                  extra={"ticket_id": self._ticket_id, "session_id": self._session_id,
+                         "tool": tc.name})
         return {
             "status": "error",
             "error": "no CRM integration is connected for this tool",

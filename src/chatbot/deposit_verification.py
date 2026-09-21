@@ -84,6 +84,19 @@ async def submit_deposit_verification(
         # the inbound verdict callback (src/api/deposit_verification.py)
         # 401s anything it can't HMAC-verify — submitting without one would
         # create a request whose verdict can never be accepted.
+        #
+        # This should be unreachable (make_chatbot_factory only registers the
+        # tool when all four hold), so hitting it at all means the
+        # registration-time check and this one have drifted apart -- the
+        # discriminating value is WHICH condition failed, not just that one did.
+        log.debug(
+            "deposit verification submit rejected by the defensive gate",
+            extra={
+                "ticket_id": ticket_id, "session_id": session_id,
+                "dv_enabled": dv_config.enabled, "has_webhook_url": bool(dv_config.webhook_url),
+                "has_media_store": media_store is not None, "has_secret": bool(secret),
+            },
+        )
         return {"status": "error", "message": "Verification is not available for this account."}
 
     order_id = (order_id or "").strip()

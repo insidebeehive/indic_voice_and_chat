@@ -448,27 +448,45 @@ async def test_mark_error_leaves_a_non_pending_row_alone(sm) -> None:
     ["disabled", "no_webhook_url", "no_media_store", "enabled_url_no_secret", "no_secret_env_name"],
 )
 @respx.mock
-async def test_executor_refuses_when_not_available(sm, monkeypatch, case) -> None:
+async def test_executor_refuses_when_not_available(sm, monkeypatch, case, caplog) -> None:
+    """This defensive gate should be unreachable in production (bootstrap.py
+    only registers the tool when all four conditions hold) -- so hitting it
+    at all is exactly the situation this repo's audit exists to make
+    diagnosable rather than silent. Asserts the DEBUG line fires AND that its
+    four boolean fields (the discriminating values, not just "not available")
+    actually reflect which condition(s) failed for each case."""
     monkeypatch.delenv(WEBHOOK_SECRET_ENV, raising=False)
     store: _FakeMediaStore | None = _FakeMediaStore()
 
     if case == "disabled":
         tenant = _tenant(_dv_config(enabled=False))
+        expect = {"dv_enabled": False, "has_webhook_url": True, "has_media_store": True, "has_secret": True}
     elif case == "no_webhook_url":
         tenant = _tenant(_dv_config(webhook_url=None))
+        expect = {"dv_enabled": True, "has_webhook_url": False, "has_media_store": True, "has_secret": True}
     elif case == "no_media_store":
         tenant = _tenant()
         store = None
+        expect = {"dv_enabled": True, "has_webhook_url": True, "has_media_store": False, "has_secret": True}
     elif case == "enabled_url_no_secret":
         tenant = _tenant(secret=None)
+        expect = {"dv_enabled": True, "has_webhook_url": True, "has_media_store": True, "has_secret": False}
     else:  # no_secret_env_name
         tenant = _tenant(_dv_config(webhook_secret_env=None))
+        expect = {"dv_enabled": True, "has_webhook_url": True, "has_media_store": True, "has_secret": False}
 
-    out = await submit_deposit_verification(
-        tenant=tenant, session_id="s1", order_id="ORD-1",
-        sessionmaker=sm, media_store=store, timeout_s=10.0)
+    with caplog.at_level(logging.DEBUG, logger="src.chatbot.deposit_verification"):
+        out = await submit_deposit_verification(
+            tenant=tenant, session_id="s1", order_id="ORD-1",
+            sessionmaker=sm, media_store=store, timeout_s=10.0)
     assert out == {"status": "error", "message": "Verification is not available for this account."}
     assert await _rows(sm) == []
+
+    gate_logs = [r for r in caplog.records if "defensive gate" in r.message]
+    assert len(gate_logs) == 1
+    assert gate_logs[0].levelname == "DEBUG"
+    for field, value in expect.items():
+        assert getattr(gate_logs[0], field) == value, f"{case}: {field}"
 
 
 # --- Timeout clamping --------------------------------------------------------

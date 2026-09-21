@@ -391,7 +391,7 @@ async def test_chat_tts_unavailable_returns_none_falls_back_to_text_only(ws_ctx)
 
 
 @pytest.mark.asyncio
-async def test_no_tts_providers_wired_at_all_falls_back_to_text_only(ws_ctx):
+async def test_no_tts_providers_wired_at_all_falls_back_to_text_only(ws_ctx, caplog):
     """The common case for most deployments/tests: `set_tts_providers` was
     never called at all (module default `None`)."""
     sm, media_store, fake_agent = ws_ctx
@@ -400,11 +400,19 @@ async def test_no_tts_providers_wired_at_all_falls_back_to_text_only(ws_ctx):
     # Deliberately do NOT call chat_api.set_tts_providers — module default.
 
     fake_tenant = _make_fake_tenant()
-    frames = _send_audio_and_collect(fake_tenant)
+    with caplog.at_level("DEBUG", logger="src.api.chat"):
+        frames = _send_audio_and_collect(fake_tenant)
     reply = frames[2]
     assert reply["type"] == "message"
     assert "audio_url" not in reply
     assert "audio_mime" not in reply
+    wired_logs = [r for r in caplog.records if "no TTS provider registry wired" in r.message]
+    assert len(wired_logs) == 1
+    assert wired_logs[0].levelname == "DEBUG"
+    # Mutation proof this is the process-wiring reason, not the length cap:
+    # the reply text here ("answer") is well under the cap, so that other
+    # DEBUG line must not also fire.
+    assert not any("reply exceeds max length" in r.message for r in caplog.records)
 
 
 @pytest.mark.asyncio
@@ -425,9 +433,16 @@ async def test_empty_reply_text_skips_synthesis(ws_ctx):
 
 
 @pytest.mark.asyncio
-async def test_over_cap_reply_text_skips_synthesis(ws_ctx):
+async def test_over_cap_reply_text_skips_synthesis(ws_ctx, caplog):
+    """This is the exact shape of the tenant-reported "voice replies aren't
+    working" ticket: config was correct, the key was present, and the only
+    thing wrong was a reply over the synthesis cap (`_tts_max_reply_chars`) -- diagnosing it took
+    a DB query and a code read because the skip logged nothing. Proves (by
+    mutation, via the at-cap test right below) that the DEBUG line only fires
+    when the length actually exceeds the cap, and carries the real length and
+    the cap as the discriminating values -- not just "skipped"."""
     sm, media_store, fake_agent = ws_ctx
-    long_text = "x" * (chat_api._TTS_MAX_REPLY_CHARS + 1)
+    long_text = "x" * (chat_api._tts_max_reply_chars() + 1)
     fake_agent.handle_message = AsyncMock(
         return_value=_FakeTurnResult(response=_FakeResp(response_text=long_text, language="hi")))
 
@@ -435,19 +450,28 @@ async def test_over_cap_reply_text_skips_synthesis(ws_ctx):
     chat_api.set_tts_providers(_FakeTTSProviders(provider))
 
     fake_tenant = _make_fake_tenant()
-    frames = _send_audio_and_collect(fake_tenant)
+    with caplog.at_level("DEBUG", logger="src.api.chat"):
+        frames = _send_audio_and_collect(fake_tenant)
     reply = frames[2]
     assert reply["type"] == "message"
     assert "audio_url" not in reply
     assert not provider.calls, "synthesis must not be attempted over the character cap"
 
+    over_cap_logs = [r for r in caplog.records if "reply exceeds max length" in r.message]
+    assert len(over_cap_logs) == 1
+    assert over_cap_logs[0].levelname == "DEBUG"
+    assert over_cap_logs[0].reply_chars == chat_api._tts_max_reply_chars() + 1
+    assert over_cap_logs[0].max_chars == chat_api._tts_max_reply_chars()
+
 
 @pytest.mark.asyncio
-async def test_at_cap_reply_text_still_synthesizes(ws_ctx):
+async def test_at_cap_reply_text_still_synthesizes(ws_ctx, caplog):
     """Boundary check: exactly at the cap still synthesizes (only STRICTLY
-    over the cap is skipped)."""
+    over the cap is skipped). Mutation proof for the over-cap DEBUG log
+    above: a reply AT the cap must not log "reply exceeds max length" at
+    all -- the discriminating length check, not just "some skip happened"."""
     sm, media_store, fake_agent = ws_ctx
-    exact_text = "x" * chat_api._TTS_MAX_REPLY_CHARS
+    exact_text = "x" * chat_api._tts_max_reply_chars()
     fake_agent.handle_message = AsyncMock(
         return_value=_FakeTurnResult(response=_FakeResp(response_text=exact_text, language="hi")))
 
@@ -455,11 +479,13 @@ async def test_at_cap_reply_text_still_synthesizes(ws_ctx):
     chat_api.set_tts_providers(_FakeTTSProviders(provider))
 
     fake_tenant = _make_fake_tenant()
-    frames = _send_audio_and_collect(fake_tenant)
+    with caplog.at_level("DEBUG", logger="src.api.chat"):
+        frames = _send_audio_and_collect(fake_tenant)
     reply = frames[2]
     assert reply["type"] == "message"
     assert reply["audio_url"].startswith("/api/v1/chat/media/")
     assert provider.calls
+    assert not any("reply exceeds max length" in r.message for r in caplog.records)
 
 
 @pytest.mark.asyncio
