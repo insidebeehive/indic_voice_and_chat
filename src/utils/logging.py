@@ -21,6 +21,47 @@ from src.utils.redact import redact_url
 from src.utils.trace_id import current_trace_id
 
 
+# LogRecord's own attribute names. Passing any of these through `extra=`
+# makes logging raise "Attempt to overwrite %r in LogRecord" — and the raise
+# happens inside the handler, so it takes out the caller rather than just
+# losing the line. That is not hypothetical here: a resolver reload once
+# logged a secret's `name` through `extra` and the KeyError aborted the reload
+# for every tenant, not only the one with the bad secret. debug_event renames
+# a colliding key rather than letting a diagnostic line break the thing it is
+# diagnosing — `name` becomes `name_`, and the value still reaches the log.
+_LOG_RECORD_ATTRS = frozenset(
+    logging.LogRecord("", 0, "", 0, "", None, None).__dict__
+) | {"message", "asctime", "taskName"}
+
+
+def debug_event(logger: logging.Logger, event: str, **values: object) -> None:
+    """Emit one structured DEBUG event: ``event`` names it, ``values`` carry it.
+
+    DEBUG is off in normal running and switched on to investigate something
+    (``VOX_LOG_LEVEL=DEBUG``), so these lines carry FULL values — customer
+    text, identifiers, media URLs, prompts, request and response bodies. They
+    are deliberately not routed through ``_redact_pii_for_log`` or the
+    keys-only conventions that govern INFO and above: a redacted debug line
+    cannot answer the question it was turned on to answer. See
+    docs/debug-logging.md for the operator decision behind that, and for the
+    one exception — credentials appear at no level.
+
+    Values land as structured fields (jsonlogger promotes ``extra`` into the
+    JSON object), so they are queryable in Loki rather than grep-able text.
+    That is the whole reason this exists instead of a f-string ``log.debug``.
+
+    Returns immediately when DEBUG is disabled, so the cost of an uncalled
+    event is one level check. Build nothing expensive for the arguments — pass
+    what you already hold; an f-string or a serialisation in the call site is
+    paid on every turn whether or not anyone is listening.
+    """
+    if not logger.isEnabledFor(logging.DEBUG):
+        return
+    safe = {(f"{k}_" if k in _LOG_RECORD_ATTRS else k): v for k, v in values.items()}
+    safe["event"] = event
+    logger.debug(event, extra=safe)
+
+
 class _ClientIPLogFilter(logging.Filter):
     """Stamp every record with the ambient client IP from ``ClientIPMiddleware``.
 
