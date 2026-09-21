@@ -34,8 +34,19 @@ _LOG_RECORD_ATTRS = frozenset(
     logging.LogRecord("", 0, "", 0, "", None, None).__dict__
 ) | {"message", "asctime", "taskName"}
 
+# `event` is reserved twice over: it is the name debug_event gives the line
+# itself (set below, after the rename), and it is the helper's own second
+# parameter. The parameter is positional-only (`/`) so that passing `event=...`
+# can never raise "got multiple values for argument 'event'" — two separate
+# agents instrumenting `state_machine.py` and `voicebot.py` wrote exactly that
+# and took out every state transition with a TypeError from inside a log line,
+# which is the one thing a diagnostic helper must never do. With the marker in
+# place the keyword lands in `values` and is renamed to `event_` here, the same
+# way a LogRecord collision is handled.
+_RESERVED_EVENT_KEYS = _LOG_RECORD_ATTRS | {"event"}
 
-def debug_event(logger: logging.Logger, event: str, **values: object) -> None:
+
+def debug_event(logger: logging.Logger, event: str, /, **values: object) -> None:
     """Emit one structured DEBUG event: ``event`` names it, ``values`` carry it.
 
     DEBUG is off in normal running and switched on to investigate something
@@ -58,7 +69,7 @@ def debug_event(logger: logging.Logger, event: str, **values: object) -> None:
     """
     if not logger.isEnabledFor(logging.DEBUG):
         return
-    safe = {(f"{k}_" if k in _LOG_RECORD_ATTRS else k): v for k, v in values.items()}
+    safe = {(f"{k}_" if k in _RESERVED_EVENT_KEYS else k): v for k, v in values.items()}
     safe["event"] = event
     logger.debug(event, extra=safe)
 
@@ -489,7 +500,14 @@ def configure_logging(
         loki_handler.addFilter(_ChatContextLogFilter())
         root.addHandler(loki_handler)
 
-    # Quiet down noisy libraries.
+    # Quiet down noisy libraries. This is not only about noise: httpx logs
+    # "HTTP Request: GET <full url>" at INFO, and a CRM url carries the player
+    # id in its path -- the very thing tool_executor.py redacts before logging
+    # the same call itself. Without this line that redaction is decorative,
+    # because httpx has already shipped the unredacted url to stdout and Loki
+    # from one frame away. Pinned to WARNING rather than left to inherit the
+    # root level, so turning DEBUG on for an investigation cannot switch it
+    # back on. See tests/unit/test_noisy_library_loggers_are_pinned.py.
     for noisy in ("uvicorn.access", "httpx", "httpcore"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 

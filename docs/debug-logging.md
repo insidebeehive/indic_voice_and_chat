@@ -112,6 +112,20 @@ That keeps the process up but the value lands somewhere nobody will look:
 a licence — qualify the key yourself (`document_filename`, `source_module`)
 whenever the natural name is one of `logging`'s.
 
+`event` is reserved one level up as well: it names the line itself, and it is
+`debug_event`'s own second parameter. It is positional-only for that reason, so
+`event="answered"` lands in the values and is renamed rather than raising
+`TypeError: got multiple values for argument 'event'` — which is what it did
+when the state-machine and voicebot instrumentation both reached for it, taking
+out every state transition from inside a log line. Prefer a qualified name
+(`sm_event`, `trigger`) over relying on the rename.
+
+**Run the suite at `--log-level=DEBUG` as well as normally.** At the default
+level `debug_event` returns before touching its arguments, so an ordinary run
+exercises none of the code a pass adds — every collision above, and any
+exception building a value, is invisible until the level is raised. That is
+also precisely when it would first fire in production: during an incident.
+
 ## What to instrument
 
 **Boundaries.** Every outbound HTTP call and its response, every database
@@ -184,8 +198,8 @@ control flow, or named as already covered by an existing log or a
 |---|---|---|---|
 | `api` — chat request path (`chat.py`) | 1 | — | **done** |
 | `api` — the other 40 files | 40 | — | not started |
-| `agents` — `chatbot.py` | 1 | — | **partial** — skips classified and instrumented (3 sites, 1d97f8b); the turn body is not. See below. |
-| `agents` — `voicebot.py` and the rest | 4 | — | not started |
+| `agents` — `chatbot.py` | 1 | 2,212 | **done** |
+| `agents` — `voicebot.py`, `state_machine.py`, `base.py` | 3 | 1,337 | **done** |
 | `chatbot` — `tool_executor.py` | 1 | — | **done** (needed nothing; every path already logs with a discriminator) |
 | `chatbot` — `deposit_verification.py` | 1 | — | **done** |
 | `chatbot` — the rest | 5 | — | not started |
@@ -210,16 +224,21 @@ than finishing any single directory, and recording it as "api: done" would
 claim 40 untouched files.
 
 `agents/chatbot.py` is the case that shows why "done" needs the definition
-above. The first pass instrumented its silent skips and the file was marked
-done on that basis, but it holds 3 `log.debug` calls and no `debug_event` at
-all across 2,212 lines — the turn body, tool dispatch and KB tool-result
-assembly are not classified. Much of what it would carry is covered at the
-provider boundary: `src/providers/llm/gemini.py` logs `contents` in full on
-every request, and the `role="tool"` KB payload the production path feeds the
-model rides in there. That makes the gap narrower than it looks, and it is
-exactly the kind of claim the status column has to name rather than imply,
-since "done" against a file with one-and-a-half log lines is how coverage goes
-dark while reading as finished.
+above. The first pass instrumented its silent skips and marked the file done on
+that basis, while 2,212 lines of turn body, tool dispatch and KB tool-result
+assembly stayed unclassified behind 3 `log.debug` calls. The `agents` pass
+finished it. The lesson is in the status column, not the code: a file can be
+genuinely improved by a pass and still be nowhere near done, and recording it
+as done is how coverage goes dark while the checklist reads as finished.
+
+What kept that gap narrow while it lasted is worth knowing, because it decides
+what this package should NOT carry: `src/providers/llm/gemini.py` logs
+`contents` in full on every request, and the `role="tool"` KB payload the
+production path feeds the model rides in there. "What did the model see" and
+"what did it say" are answered at the provider boundary. So the events added
+here are the decisions BETWEEN those boundaries — which tool was selected and
+with what arguments, why a requested tool was not dispatched, why the round
+loop stopped — and not a second copy of the prompt.
 
 The first pass (commit 1d97f8b) classified ~90 sites and instrumented ~20. It
 also found a class the original framing missed: sites where the customer is

@@ -726,8 +726,8 @@ async def test_deposit_verification_tool_without_executor_returns_error(retrieve
     other failure shape. Mutation proof against
     test_deposit_verification_executor_exception_is_swallowed just above: an
     executor exception logs at ERROR ("deposit verification submission
-    failed"); this not-wired path must log its OWN, distinct DEBUG line
-    instead, not that one."""
+    failed"); this not-wired path must log its OWN, distinct DEBUG
+    `debug_event` instead, not that one."""
     agent = _agent(ScriptedLLM([]), retriever)
     tc = ToolCall(id="t1", name="submit_deposit_verification", arguments={"order_id": "ORD-1"})
     with caplog.at_level(logging.DEBUG, logger="src.agents.chatbot"):
@@ -736,9 +736,11 @@ async def test_deposit_verification_tool_without_executor_returns_error(retrieve
     assert chunks == []
     assert escalation is None
     assert call_offer is None
-    not_wired = [r for r in caplog.records if "no executor is wired" in r.message]
+    not_wired = [r for r in caplog.records
+                 if r.message == "chatbot tool_dispatch deposit_verification_no_executor"]
     assert len(not_wired) == 1
     assert not_wired[0].levelname == "DEBUG"
+    assert not_wired[0].tool_name == "submit_deposit_verification"
     assert not any("submission failed" in r.message for r in caplog.records)
 
 
@@ -949,8 +951,8 @@ async def test_crm_executor_exception_fallback_forbids_pending_framing(retriever
 async def test_no_executor_fallback_forbids_pending_framing(retriever, caplog) -> None:
     """Regression for the no-crm-executor-configured payload. Also proves (by
     mutation against test_crm_executor_exception_fallback_forbids_pending_framing
-    above) that this config-gap path logs its own distinct DEBUG line naming
-    the tool, rather than reusing the exception handler's ERROR-level
+    above) that this config-gap path logs its own distinct DEBUG `debug_event`
+    naming the tool, rather than reusing the exception handler's ERROR-level
     "crm tool failed" message -- the two are different failure classes."""
     crm_tools = [ToolSpec(name="get_player_wallet", description="wallet",
                           parameters={"type": "object", "properties": {}})]
@@ -970,10 +972,10 @@ async def test_no_executor_fallback_forbids_pending_framing(retriever, caplog) -
     directive_msgs = [m for m in llm.calls[1][0]
                        if m.role == "user" and "SYSTEM NOTE" in (m.content or "")]
     assert directive_msgs
-    not_wired = [r for r in caplog.records if "no crm_executor is wired" in r.message]
+    not_wired = [r for r in caplog.records if r.message == "chatbot tool_dispatch crm_no_executor"]
     assert len(not_wired) == 1
     assert not_wired[0].levelname == "DEBUG"
-    assert not_wired[0].tool == "get_player_wallet"
+    assert not_wired[0].tool_name == "get_player_wallet"
     assert not any("crm tool failed" in r.message for r in caplog.records)
 
 
