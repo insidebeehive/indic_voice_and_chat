@@ -93,13 +93,18 @@ control flow, or named as already covered by an existing log or a
 
 | package | files | lines | status |
 |---|---|---|---|
-| `api` (chat path first) | 41 | 16,394 | in progress |
-| `agents` | 5 | 3,523 | not started |
-| `chatbot` | 7 | 1,729 | not started |
-| `providers` | 33 | 5,045 | not started |
+| `api` — chat request path (`chat.py`) | 1 | — | **done** |
+| `api` — the other 40 files | 40 | — | not started |
+| `agents` — `chatbot.py` | 1 | — | **done** |
+| `agents` — `voicebot.py` and the rest | 4 | — | not started |
+| `chatbot` — `tool_executor.py` | 1 | — | **done** (needed nothing; every path already logs with a discriminator) |
+| `chatbot` — `deposit_verification.py` | 1 | — | **done** |
+| `chatbot` — the rest | 5 | — | not started |
+| `auth` — `registry.py` (`get_chat_tts`) | 1 | — | **done** |
+| `auth` — the rest | 8 | — | not started |
+| `providers` | 33 | 5,045 | in progress |
 | `rag` | 5 | 2,586 | not started |
 | `pipeline` | 8 | 1,379 | not started |
-| `auth` | 9 | 1,755 | not started |
 | `dialogue` | 11 | 2,017 | not started |
 | `campaign` | 5 | 863 | not started |
 | `models` | 11 | 1,297 | not started |
@@ -109,6 +114,20 @@ control flow, or named as already covered by an existing log or a
 | `utils` | 7 | 912 | not started |
 | `interfaces` | 8 | 449 | not started |
 | `benchmarks` | 11 | 2,472 | not started |
+
+Tracked per file rather than per package where a pass covered only part of
+one: the first pass followed the chat request path across four packages rather
+than finishing any single directory, and recording it as "api: done" would
+claim 40 untouched files.
+
+The first pass (commit 1d97f8b) classified ~90 sites and instrumented ~20. It
+also found a class the original framing missed: sites where the customer is
+told something happened and the database never recorded it — a turn persisted
+against a missing session row, a human agent's reply forwarded but never
+written to the transcript, a mode change confirmed to the customer while the
+row still said otherwise. Those were silent `if row is None: return` and
+`if r:` with no else. Worth looking for specifically in later passes; they are
+harder to spot than an early return because the code reads as a success path.
 
 Each pass produces a classification table in its commit message: every site
 examined, its category, and what covers it where it was left alone. That table
