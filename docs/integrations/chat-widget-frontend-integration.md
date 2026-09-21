@@ -186,12 +186,48 @@ Show a typing indicator. Remove it when the next `message` arrives.
 }
 ```
 
+A reply to a voice note carries two extra fields:
+
+```json
+{
+  "type": "message",
+  "text": "आपका बैलेंस ₹1,200 है।",
+  "audio_url": "https://css.example.com/proxy/media/104",
+  "audio_mime": "audio/wav",
+  "sources": [],
+  "suggestions": [],
+  "action": "none"
+}
+```
+
 | Field | What to do |
 |---|---|
 | `text` | Render as chat bubble |
+| `audio_url` | **Present only on replies to a voice note.** Render an `<audio controls>` alongside the text bubble, `src` set to this value exactly (CSS/CS has already proxied it). Both fields are omitted — not sent as `null` — on every other turn, so test with `if (msg.audio_url)`. |
+| `audio_mime` | Content type of that clip, e.g. `audio/wav`. |
 | `suggestions` | Show as quick-reply chips below the bubble |
 | `sources` | RAG references — omit from UI if unused |
 | `action` | Behaviour hint from the AI. `"none"` = no special UI change. Other values are reserved for future use — safe to ignore unknown values. |
+
+```js
+function renderAgentMessage(msg) {
+  addBubble("agent", msg.text);
+  if (msg.audio_url) {
+    const audio = document.createElement("audio");
+    audio.controls = true;
+    audio.src = msg.audio_url;   // already proxied — use as-is
+    chatLog.appendChild(audio);
+  }
+  renderChips(msg.suggestions);
+}
+```
+
+The text is always sent, and is the full reply — the clip is a spoken rendering
+of the same words, not a substitute for them. A client that ignores
+`audio_url` therefore stays correct and simply renders a text-only reply, which
+is why the fields ride on `message` rather than arriving as a new frame type.
+The cost of that choice is that dropping them fails silently: the customer hears
+nothing and no error is raised anywhere.
 
 ### `audio_ack`
 ```json
@@ -453,6 +489,7 @@ Form fields: `file` (image/* or video/*), `text` (optional caption). CSS proxies
 - [ ] Image/video attach → base64 WS frame or multipart POST to CSS's `/api/chat/upload` endpoint
 - [ ] Mic button → record → `audio` frame → show local blob `<audio>` immediately
 - [ ] `audio_ack` → swap the pending `<audio>` element's `src` with `msg.media_url` (already proxied — use as-is)
+- [ ] `message` with `audio_url` → render an `<audio controls>` next to the text bubble (reply to a voice note; field absent on every other turn)
 - [ ] Media URLs: use exactly as provided by CSS/CS — never construct platform paths or append `?session_id=`
 - [ ] `escalation` → show "Connecting to agent…"
 - [ ] `mode_change` mode=`awaiting_human` → "Waiting for an agent…"; mode=`human` → show agent name; mode=`bot` → re-enable composer and resume bot UX (CRM declined); mode=`voice_pending` → "Calling your number…"
