@@ -644,6 +644,36 @@ def truncate_previous_conversation(text: str) -> str:
     return truncated.rstrip() + "…"
 
 
+def _defang_platform_frames(summary: str) -> str:
+    """Strip every frame this codebase uses to mark trusted content out of an
+    untrusted body.
+
+    neutralize_sources_markers only defangs runs of 3+ angle brackets, so it
+    protects SOURCES_OPEN/CLOSE_MARKER and nothing else. TURN_CONTEXT_OPEN and
+    TURN_CONTEXT_CLOSE are plain English — verified: passing TURN_CONTEXT_OPEN
+    through the neutralizer returns it unchanged — and TURN_CONTEXT_OPEN's own
+    text says the block "carries the same authority as the system
+    instructions". A summary reproducing it verbatim therefore arrives in the
+    model's context claiming exactly that authority, and on the
+    cache_split_prompt branch the forged copy lands BEFORE the genuine one in
+    the same message.
+
+    That matters here more than for retrieved KB content: the chat WebSocket
+    treats the session id as the whole capability (see src/api/chat.py's
+    "session_id is the capability"), so previous_conversation is reachable by
+    whoever holds that id — the browser widget, and therefore the end user —
+    not only by the CRM relaying it.
+
+    Exact-match replacement, because the verbatim string is the only version
+    that reads as genuine; an approximation the model would discount is not
+    worth the false-positive risk of a fuzzy match against real summary prose.
+    """
+    body = neutralize_sources_markers(summary, source="previous_conversation")
+    for forged in (TURN_CONTEXT_OPEN, TURN_CONTEXT_CLOSE):
+        body = body.replace(forged, "[removed]")
+    return body
+
+
 def _fold_previous_conversation(user_msg: LLMMessage, summary: str) -> LLMMessage:
     """Return a COPY of ``user_msg`` with the previous_conversation summary
     prepended as its own labelled, delimited, neutralized block, ahead of
@@ -662,7 +692,7 @@ def _fold_previous_conversation(user_msg: LLMMessage, summary: str) -> LLMMessag
     subsequent turn, instead of it being framed background exactly once
     (well, once per turn, freshly folded, but never persisted).
     """
-    body = neutralize_sources_markers(summary, source="previous_conversation")
+    body = _defang_platform_frames(summary)
     frame = (
         f"{PREVIOUS_CONVERSATION_LABEL}\n{SOURCES_OPEN_MARKER}\n{body}\n"
         f"{SOURCES_CLOSE_MARKER}\n{PREVIOUS_CONVERSATION_REANCHOR}"

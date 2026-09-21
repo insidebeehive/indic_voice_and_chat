@@ -953,6 +953,22 @@ async def _capture_previous_conversation(agent: ChatBotAgent, session_id: str, m
             if db_row is None:
                 return
             extra = dict(db_row.extra_data or {})
+            # The stored value is the latch, not the caller's first-frame flag.
+            # That flag is derived from message_count == 0, which re-arms on
+            # every reconnect until a turn actually persists — and a frame that
+            # errors out before persisting (an audio frame that fails to
+            # transcribe, say) leaves the count at 0. A client could therefore
+            # connect, seed a summary, reconnect, and replace it. Keeping the
+            # first stored value makes "first one wins" true of the session
+            # rather than of a single connection.
+            if isinstance(extra.get("previous_conversation"), str):
+                log.warning(
+                    "previous_conversation already stored for this session; "
+                    "keeping the first value and ignoring the new one",
+                    extra={"session_id": session_id},
+                )
+                agent._previous_conversation = extra["previous_conversation"]
+                return
             extra["previous_conversation"] = capped
             db_row.extra_data = extra
             await db.commit()
