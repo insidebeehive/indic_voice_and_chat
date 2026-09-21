@@ -27,6 +27,7 @@ from src.dialogue.prompts import SOURCES_CLOSE_MARKER, SOURCES_OPEN_MARKER
 from src.dialogue.response_parser import ChatBotResponse
 from src.interfaces.vector_store import Document
 from src.rag.retriever import RetrievedChunk
+from src.utils.logging import debug_event
 
 if TYPE_CHECKING:
     from src.rag.retriever import HybridRetriever
@@ -74,9 +75,18 @@ def neutralize_sources_markers(text: str, *, source: str = "") -> str:
         "retrieved content contained a sources-boundary marker string; neutralising",
         extra={"source": source},
     )
-    return _SOURCES_MARKER_PATTERN.sub(
+    neutralized = _SOURCES_MARKER_PATTERN.sub(
         lambda m: m.group(0).replace("<", "‹").replace(">", "›"), text
     )
+    # Full before/after text, unredacted -- an operator investigating a
+    # suspected injection needs to see what the source actually contained
+    # and exactly what this defence did to it, not just that it fired
+    # (which is all the WARNING above carries).
+    debug_event(
+        log, "rag sources_marker neutralized", source=source,
+        before=text, after=neutralized,
+    )
+    return neutralized
 
 
 # --- Trusted-frame defanging ---------------------------------------------
@@ -250,7 +260,9 @@ def defang_trusted_frames(text: str, *, source: str = "") -> str:
     if not text:
         return text
     detection_view = unicodedata.normalize("NFKC", _INVISIBLE_FORMAT_RE.sub("", text))
-    if not _has_forged_frame_or_marker(text) and not _has_forged_frame_or_marker(detection_view):
+    found_in_raw = _has_forged_frame_or_marker(text)
+    found_in_detection_view = _has_forged_frame_or_marker(detection_view)
+    if not found_in_raw and not found_in_detection_view:
         return text
     cleaned = neutralize_sources_markers(detection_view, source=source)
     for pattern in (_TURN_CONTEXT_OPEN_RE, _TURN_CONTEXT_CLOSE_RE):
@@ -259,8 +271,20 @@ def defang_trusted_frames(text: str, *, source: str = "") -> str:
     # is the only place that can happen on this path, so truncating here is
     # sufficient to guarantee the whole function never returns something
     # longer than its input.
-    if len(cleaned) > len(text):
+    truncated = len(cleaned) > len(text)
+    if truncated:
         cleaned = cleaned[: len(text)]
+    # This is the module's other indirect-prompt-injection defence, and the
+    # aggressive rewrite path (this branch) only ever runs on text that
+    # tripped detection -- log the original, the normalized view detection
+    # actually matched against, and the final defanged result so an operator
+    # can see exactly what was found and what survived.
+    debug_event(
+        log, "rag trusted_frame defanged", source=source,
+        before=text, detection_view=detection_view, after=cleaned,
+        found_in_raw_text=found_in_raw, found_in_detection_view=found_in_detection_view,
+        nfkc_expansion_truncated=truncated,
+    )
     return cleaned
 
 
@@ -274,14 +298,36 @@ class RAGContext:
 def build_rag_context(
     chunks: list[RetrievedChunk],
     max_chars: int = 4000,
+    *,
+    purpose: str = "prompt",
 ) -> RAGContext:
     """Format retrieved chunks into a numbered context block.
 
     Truncates at ``max_chars`` so we don't blow past the LLM's input window
     on long retrievals. Truncation is on chunk boundaries — we never split
     mid-chunk, so the cited source is always either fully present or absent.
+
+    ``purpose`` says what the caller does with the returned ``.text`` and is
+    logged verbatim on the two DEBUG events below, nothing else — it changes
+    no behaviour here. It exists because this function has two call sites
+    with fundamentally different fates for ``.text``: ``ChatBot._single_shot``
+    composes it directly into the system prompt (the default, ``"prompt"``),
+    while ``ChatBot._handle_with_tools`` (the production tools-enabled path)
+    only uses the returned ``.source_tags``/``.chunk_count`` for
+    ``apply_hallucination_guard`` — ``.text`` itself is discarded there, and
+    the model instead receives the KB content, untruncated, via a
+    ``role="tool"`` message (see the call site's own comment). Without this,
+    an operator who greps ``rag context chunk_dropped_for_budget`` on the
+    tools path and sees a chunk named there wrongly concludes the model never
+    saw it — it did, via the tool JSON, just not via this budget-limited
+    text. Log the value; do not use it to change what this function does.
     """
     if not chunks:
+        # Empty retrieval feeding an otherwise-normal turn is exactly the
+        # shape behind the KYC-status incident: nothing here says so unless
+        # this fires, since downstream (apply_hallucination_guard) is the
+        # only other place chunk_count==0 is visible at all.
+        debug_event(log, "rag context empty", max_chars=max_chars, purpose=purpose)
         return RAGContext(text="(no relevant sources found)", source_tags=[], chunk_count=0)
 
     parts: list[str] = []
@@ -292,13 +338,40 @@ def build_rag_context(
         body = neutralize_sources_markers(c.document.content.strip(), source=tag)
         block = f"[{i}] {tag}\n{body}"
         if used_chars + len(block) > max_chars and parts:
+            # Everything from here on is silently dropped for the rest of
+            # this call -- a chunk that would have answered the question
+            # never reaches the model, and nothing downstream can tell the
+            # difference between "not retrieved" and "retrieved, then cut
+            # for budget". Name exactly what got cut and why, and (at DEBUG)
+            # what was actually in it -- an operator's real question is
+            # "did the dropped chunk contain the answer", which the filename
+            # alone can't answer.
+            dropped_chunks = chunks[i - 1:]
+            dropped_tags = [_source_tag(cc) for cc in dropped_chunks]
+            dropped_texts = (
+                [cc.document.content for cc in dropped_chunks]
+                if log.isEnabledFor(logging.DEBUG) else []
+            )
+            debug_event(
+                log, "rag context chunk_dropped_for_budget",
+                dropped_tags=dropped_tags, dropped_count=len(dropped_tags),
+                dropped_texts=dropped_texts,
+                included_count=len(parts), used_chars=used_chars, max_chars=max_chars,
+                block_chars=len(block), purpose=purpose,
+            )
             break
         parts.append(block)
         tags.append(tag)
         used_chars += len(block) + 2  # +2 for separator
 
+    text = "\n\n".join(parts)
+    debug_event(
+        log, "rag context built", source_tags=tags, chunk_count=len(parts),
+        retrieved_count=len(chunks), budget_used=used_chars, max_chars=max_chars,
+        text=text, purpose=purpose,
+    )
     return RAGContext(
-        text="\n\n".join(parts),
+        text=text,
         source_tags=tags,
         chunk_count=len(parts),
     )
@@ -326,6 +399,10 @@ async def search_combined(
 ) -> list[RetrievedChunk]:
     """Query multiple retrievers in parallel and merge results by score."""
     if not retrievers:
+        # Silent empty context downstream is indistinguishable from "nothing
+        # relevant exists" -- this is "misconfigured, no retrievers wired up
+        # for this call" instead, and it's worth telling those apart.
+        debug_event(log, "rag search_combined no_retrievers", query=query)
         return []
     results_per = await asyncio.gather(
         *[r.search(query, top_k=top_k, filters=filters) for r in retrievers]
@@ -339,7 +416,33 @@ async def search_combined(
         if chunk.document.id not in seen:
             seen.add(chunk.document.id)
             merged.append(chunk)
-    return merged[:top_k]
+    final = merged[:top_k]
+    # Both events below run on EVERY chat turn (_single_shot and the tool
+    # dispatch both land here), so everything they need is built inside the
+    # level check -- including raw_total, which exists only to report how many
+    # duplicates were collapsed.
+    if log.isEnabledFor(logging.DEBUG):
+        raw_total = sum(len(batch) for batch in results_per)
+        if len(merged) > top_k:
+            # These scored lower than top_k and are dropped here, permanently
+            # -- this is the only place that decision is made. The cut is BY
+            # SCORE (the sort key above), so the scores themselves are the
+            # whole answer to "why didn't chunk X make top_k" -- log them
+            # alongside the tags.
+            dropped = merged[top_k:]
+            debug_event(
+                log, "rag search_combined topk_dropped",
+                dropped_tags=[_source_tag(c) for c in dropped],
+                dropped_scores=[c.score for c in dropped],
+                dropped_count=len(dropped), kept_count=len(final), top_k=top_k,
+            )
+        debug_event(
+            log, "rag search_combined result", query=query, retriever_count=len(retrievers),
+            raw_total=raw_total, duplicates_dropped=raw_total - len(merged),
+            final_count=len(final), source_tags=[_source_tag(c) for c in final],
+            source_scores=[c.score for c in final],
+        )
+    return final
 
 
 # Priority order for the voicebot's one-shot KB dump (src/agents/voicebot.py has
@@ -397,6 +500,7 @@ async def build_voicebot_kb_context(
                 seen.add(doc.id)
                 all_docs.append(doc)
     if not all_docs:
+        debug_event(log, "voicebot_kb context empty", retriever_count=len(retrievers))
         return ""
 
     def _filename(doc: Document) -> str:
@@ -408,6 +512,14 @@ async def build_voicebot_kb_context(
         except (TypeError, ValueError):
             return 0
 
+    # Built only at DEBUG: this calls _filename(d) twice per doc over the WHOLE
+    # KB list and exists solely to feed one field on the event below. Computed
+    # here rather than after the filter on the next line, so it can still see
+    # the docs that filter removes.
+    excluded_filenames = (
+        sorted({_filename(d) for d in all_docs if _filename(d) in _VOICE_KB_EXCLUDED})
+        if log.isEnabledFor(logging.DEBUG) else []
+    )
     all_docs = [d for d in all_docs if _filename(d) not in _VOICE_KB_EXCLUDED]
     # Stable base sort on (filename, section) so pgvector's unordered rows
     # don't scramble intra-document chunk order. Must run BEFORE the priority
@@ -425,10 +537,34 @@ async def build_voicebot_kb_context(
         fn = _filename(doc)
         entry = f"[{fn}]\n{neutralize_sources_markers(doc.content.strip(), source=fn)}"
         if total + len(entry) + 2 > max_chars:
+            # This one is built once at call start for the whole call (see
+            # docstring) -- a doc dropped here is invisible to the agent for
+            # the entire conversation, not just one turn. Log what was
+            # dropped (name + text, at DEBUG) and the length that decided it.
+            dropped_docs = all_docs[len(parts):]
+            dropped_filenames = [_filename(d) for d in dropped_docs]
+            dropped_texts = (
+                [d.content for d in dropped_docs] if log.isEnabledFor(logging.DEBUG) else []
+            )
+            debug_event(
+                log, "voicebot_kb context doc_dropped_for_budget",
+                dropped_filenames=dropped_filenames, dropped_count=len(dropped_filenames),
+                dropped_texts=dropped_texts,
+                included_count=len(parts), total_chars=total, max_chars=max_chars,
+                entry_chars=len(entry),
+            )
             break
         parts.append(entry)
         total += len(entry) + 2
-    return "\n\n".join(parts)
+    text = "\n\n".join(parts)
+    if log.isEnabledFor(logging.DEBUG):
+        debug_event(
+            log, "voicebot_kb context built",
+            included_filenames=[_filename(d) for d in all_docs[: len(parts)]],
+            excluded_filenames=excluded_filenames, doc_count=len(all_docs),
+            included_count=len(parts), budget_used=total, max_chars=max_chars, text=text,
+        )
+    return text
 
 
 # --- Hallucination guard -------------------------------------------------
@@ -501,15 +637,34 @@ def apply_hallucination_guard(
     if available and new.sources_used:
         valid = [s for s in new.sources_used if s in available]
         if len(valid) != len(new.sources_used):
+            debug_event(
+                log, "guard hallucination bogus_citation_dropped",
+                cited=list(new.sources_used), available=sorted(available), kept=valid,
+                dropped=[s for s in new.sources_used if s not in available],
+            )
             new.sources_used = valid
             new.confidence = "low"
 
     # No retrieval results -> reject and return the language-appropriate fallback.
     if rag_context.chunk_count == 0:
         if new.response_text:
+            debug_event(
+                log, "guard hallucination no_retrieval_override",
+                original_response_text=new.response_text,
+                original_confidence=response.confidence, language=new.language,
+            )
             new.response_text = (
                 cfg.fallback_text_hi if (new.language or "").startswith("hi")
                 else cfg.fallback_text_en
+            )
+        else:
+            # Fix 8: the mutation below (confidence forced to "low",
+            # sources_used cleared) fired with no DEBUG trace at all when
+            # response_text was already falsy -- the only guard mutation in
+            # this file that left no record of having happened.
+            debug_event(
+                log, "guard hallucination no_retrieval_forced_low",
+                original_confidence=response.confidence, language=new.language,
             )
         new.confidence = "low"
         new.sources_used = []
@@ -523,6 +678,11 @@ def apply_hallucination_guard(
         and new.confidence == "high"
         and new.response_text
     ):
+        debug_event(
+            log, "guard hallucination uncited_high_confidence_override",
+            original_response_text=new.response_text,
+            available_sources=sorted(available), language=new.language,
+        )
         new.response_text = (
             cfg.fallback_text_hi if (new.language or "").startswith("hi")
             else cfg.fallback_text_en
@@ -564,7 +724,14 @@ def apply_no_grounding_guard(
     if response.confidence != "high" or not response.response_text:
         return response
     text = response.response_text
-    if not (_TIME_OF_DAY_PATTERN.search(text) or _CURRENCY_FIGURE_PATTERN.search(text)):
+    # Fix 6: capture which pattern(s) fired here, once, and reuse below --
+    # the `or` short-circuits so re-searching at the debug_event call site
+    # loses which pattern actually matched, and re-running both patterns
+    # unconditionally on every ungrounded high-confidence reply is pure waste
+    # when only one is needed to decide the branch.
+    matched_time_pattern = bool(_TIME_OF_DAY_PATTERN.search(text))
+    matched_currency_pattern = bool(_CURRENCY_FIGURE_PATTERN.search(text))
+    if not (matched_time_pattern or matched_currency_pattern):
         return response
     new = ChatBotResponse(
         response_text=response.response_text,
@@ -586,6 +753,14 @@ def apply_no_grounding_guard(
         # account number sitting in an otherwise-risk-flagged reply landed
         # in this WARNING log completely unredacted.
         extra={"response_text": _redact_pii_for_log(text)[:200]},
+    )
+    # Full, unredacted text alongside the redacted/truncated WARNING slice
+    # above -- at DEBUG the operator investigating this is allowed to see
+    # exactly what tripped the pattern, not just the first 200 chars.
+    debug_event(
+        log, "guard no_grounding triggered", response_text=text,
+        matched_time_pattern=matched_time_pattern,
+        matched_currency_pattern=matched_currency_pattern,
     )
     return new
 
@@ -734,6 +909,18 @@ def apply_unverified_data_guard(
         text_out = template.format(figure=disputed.group())
     else:
         text_out = cfg.unverified_data_fallback_hi if is_hindi else cfg.unverified_data_fallback_en
+    # Full, unredacted values alongside the ERROR above (which carries only
+    # a 200-char redacted slice and the bare figures) -- grounded_text and
+    # customer_text aren't logged at any level today, and this is the only
+    # place that shows what the guard actually checked the figures against
+    # and what it swapped the reply for.
+    debug_event(
+        log, "guard unverified_data triggered",
+        original_response_text=response.response_text, grounded_text=grounded_text,
+        customer_text=customer_text, matched_figures=matches, unverified_figures=unverified,
+        disputed_figure=(disputed.group() if disputed else None), replacement_text=text_out,
+        original_confidence=response.confidence,
+    )
     return ChatBotResponse(
         response_text=text_out,
         language=response.language,
@@ -1373,8 +1560,8 @@ def apply_pii_guard(
     # in place -- see this function's own docstring for why a placeholder
     # inside a one-tap suggested reply is worse than just not offering it.
     kept_followups: list[str] = []
+    dropped_followups: list[str] = []
     followup_types_found: set[str] = set()
-    followups_dropped = 0
     for followup in response.suggested_followups:
         f_hits = _find_pii_hits(followup)
         leaked_types = {
@@ -1382,10 +1569,11 @@ def apply_pii_guard(
             if not _pii_hit_is_exempt(followup[start:end], typ, safe_digits)
         }
         if leaked_types:
-            followups_dropped += 1
+            dropped_followups.append(followup)
             followup_types_found |= leaked_types
         else:
             kept_followups.append(followup)
+    followups_dropped = len(dropped_followups)
 
     types_found = body_types_found | followup_types_found
     if not types_found:
@@ -1403,6 +1591,21 @@ def apply_pii_guard(
         "pii guard: reply contained a customer PII pattern; span(s) redacted"
         + (" and suggested_followups dropped" if followups_dropped else ""),
         extra=log_extra,
+    )
+    # The ERROR above deliberately carries types only, never values -- PII in
+    # an ERROR log is the exact leak this guard exists to prevent. DEBUG is
+    # the recorded exception to that: full unredacted before/after text, so
+    # an operator can confirm the guard redacted the right span and nothing
+    # else, without that confirmation itself requiring a database query.
+    # Fix 6: dropped_followups is now collected in the loop above (it already
+    # tracks the per-followup decision) instead of an unconditional O(n*m)
+    # re-scan of response.suggested_followups against kept_followups here.
+    debug_event(
+        log, "guard pii triggered", pii_types=sorted(types_found),
+        original_response_text=text, redacted_response_text=redacted_text,
+        original_followups=list(response.suggested_followups),
+        kept_followups=kept_followups, dropped_followups=dropped_followups,
+        safe_digits_count=len(safe_digits),
     )
     return ChatBotResponse(
         response_text=redacted_text,

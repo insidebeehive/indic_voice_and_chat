@@ -1487,7 +1487,19 @@ class ChatBotAgent(BaseAgent):
                 extra={"ticket_id": self._ticket_id, "session_id": self._session_id},
             )
 
-        rag = build_rag_context(retrieved_all, max_chars=self._max_context_chars)
+        # purpose="citation_scope_only": on this path (tools enabled -- the
+        # production chat path, see bootstrap.py) rag.text is NEVER composed
+        # into the prompt -- KB content instead reaches the model as a
+        # role="tool" message (see _dispatch_tool's own comment below). This
+        # call exists only to get source_tags/chunk_count for
+        # apply_hallucination_guard's citation check; say so on the DEBUG
+        # events build_rag_context logs, so an operator investigating a
+        # hallucination via those events doesn't conclude a chunk named in a
+        # "dropped for budget" event never reached the model -- it did, via
+        # the (untruncated) tool JSON, just not via this text.
+        rag = build_rag_context(
+            retrieved_all, max_chars=self._max_context_chars, purpose="citation_scope_only",
+        )
         # Dedupe tool-retrieved sources, preserving order.
         sources = list(dict.fromkeys(_chunk_source(c) for c in retrieved_all))
         # The model usually emits the structured JSON envelope (per the system

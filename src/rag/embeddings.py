@@ -13,8 +13,13 @@ Three implementations:
 from __future__ import annotations
 
 import hashlib
+import logging
 import math
 from typing import Optional, Protocol
+
+from src.utils.logging import debug_event
+
+log = logging.getLogger(__name__)
 
 
 # --- Embedders ----------------------------------------------------------
@@ -92,9 +97,18 @@ class LocalEmbedder:
         self._ensure_model()
         if not texts:
             return []
+        debug_event(log, "local_embedder embed request", model=self.model_name,
+                    count=len(texts), texts=texts)
         # normalize_embeddings=True so cosine == inner product (matches our FAISS index).
         vecs = self._model.encode(texts, normalize_embeddings=True, convert_to_numpy=True)
-        return [v.tolist() for v in vecs]
+        out = [v.tolist() for v in vecs]
+        # Vectors themselves never get logged (see docs/debug-logging.md) --
+        # only their dimensions, so a mismatch against the FAISS index dim is
+        # diagnosable without ever printing a raw float array.
+        if log.isEnabledFor(logging.DEBUG):
+            debug_event(log, "local_embedder embed response", model=self.model_name,
+                        count=len(out), dims=[len(v) for v in out])
+        return out
 
     def embed_query(self, text: str) -> list[float]:
         return self.embed_documents([text])[0]
@@ -168,15 +182,27 @@ class GeminiEmbedder:
         # shape identical to before this feature existed.
         if task_type:
             config["task_type"] = task_type
-        resp = client.models.embed_content(
-            model=self.model_name,
-            contents=texts,
-            config=config,
-        )
+        debug_event(log, "gemini_embedder embed request", model=self.model_name,
+                    task_type=task_type, count=len(texts), texts=texts,
+                    output_dimensionality=self.dim)
+        try:
+            resp = client.models.embed_content(
+                model=self.model_name,
+                contents=texts,
+                config=config,
+            )
+        except Exception as exc:  # noqa: BLE001 - re-raised unchanged; no retry in this adapter
+            debug_event(log, "gemini_embedder embed failed", model=self.model_name,
+                        task_type=task_type, count=len(texts), error=str(exc))
+            raise
         out: list[list[float]] = []
         for emb in (getattr(resp, "embeddings", None) or []):
             values = getattr(emb, "values", None)
             out.append(_l2_normalize(list(values if values is not None else emb)))
+        # Dimensions/lengths only -- never the raw vectors (docs/debug-logging.md).
+        if log.isEnabledFor(logging.DEBUG):
+            debug_event(log, "gemini_embedder embed response", model=self.model_name,
+                        task_type=task_type, count=len(out), dims=[len(v) for v in out])
         return out
 
     def embed_documents(self, texts: list[str]) -> list[list[float]]:

@@ -40,14 +40,77 @@ f-string, so values land as structured fields a Loki query can filter on
 instead of text a human has to grep:
 
 ```python
-debug_event(log, "tts_reply_skipped", reason="reply_too_long",
-            length=len(text), cap=_TTS_MAX_REPLY_CHARS, tenant_id=tenant.id)
+debug_event(log, "gemini generate request", model=model, system=system,
+            contents=contents, config=gen, cache_name=cache_name)
 ```
 
-The event name is a stable identifier — snake_case, specific enough to query on
-its own. Values are keyword arguments. It is a no-op when DEBUG is off, so
-building the values must itself be cheap; pass what you already have rather
-than computing something for the log.
+Values are keyword arguments.
+
+## Naming an event
+
+`<component> <operation> <phase>` — space-separated, with the operation itself
+snake_case where it needs more than one word:
+
+```
+gemini generate request          retriever dense_search response
+elevenlabs tts response          ingestion pdf_page_extract_failed
+```
+
+The component prefix is the point: `event=~"retriever .*"` scopes a query to
+one subsystem, which a flat name cannot do. Phase is `request`/`response` for a
+boundary; for a decision or a skip, name the outcome (`..._dropped`,
+`..._failed`, `..._triggered`).
+
+A name is a query key. Once an event has shipped, treat it as an interface and
+do not rename it — a rename silently splits any query spanning it inside Loki's
+retention window, and breaks saved queries with no error.
+
+Three shipped events in `src/api/chat.py` predate this convention and use flat
+snake_case (`chat_frame_received`, `chat_reply_frame_sent`,
+`tts_reply_synthesized`). They stay as they are, under the rule above. Match
+the convention in new code rather than these three.
+
+## Cost when DEBUG is off
+
+`debug_event` is a no-op at INFO and above — but **its arguments are evaluated
+before it is called**, so anything built to feed it is paid for in normal
+running, forever:
+
+```python
+# Wrong: builds the list on every search, DEBUG off or not.
+debug_event(log, "retriever search response", hits=[c.id for c in results])
+
+# Right.
+if log.isEnabledFor(logging.DEBUG):
+    debug_event(log, "retriever search response", hits=[c.id for c in results])
+```
+
+Pass what you already hold. The guard is for work on a path that actually runs
+— per request, per turn, per chunk, per document — where an unguarded
+comprehension is paid by every request forever to build a line nobody is
+reading. `search_combined` is the shape to watch: it runs on every chat turn,
+so its events build `raw_total`, the tags and the scores inside the level
+check, not outside it.
+
+It is not an absolute rule, and applying it as one buries the code in guards.
+A rare error path over a handful of items does not need one — the bogus-citation
+event in `context_builder.py` fires only when the model invents a citation, and
+guarding a few strings on a path that mostly never executes costs more
+readability than it saves. Judge by how often the path runs and how big the
+collection is, not by whether a comprehension is present.
+
+## Key names collide with LogRecord
+
+`logging` owns `name`, `module`, `filename`, `args`, `msg`, `levelname` and
+friends on every record. Passing one as a keyword raises inside the handler and
+takes out the caller — which is why `debug_event` renames collisions by
+appending an underscore rather than letting them through.
+
+That keeps the process up but the value lands somewhere nobody will look:
+`filename="kb-manual.pdf"` is emitted as `filename_="kb-manual.pdf"`, while
+`filename` still appears holding `logging.py`. So the rename is a backstop, not
+a licence — qualify the key yourself (`document_filename`, `source_module`)
+whenever the natural name is one of `logging`'s.
 
 ## What to instrument
 
@@ -84,6 +147,32 @@ no log and no metric. Three conditions in that one function return `None` with
 no trace, and from outside they are indistinguishable from the feature being
 broken. Diagnosing it needed a database query and a code read.
 
+## An event that misleads is worse than no event
+
+The `rag` pass added `rag context chunk_dropped_for_budget` to
+`build_rag_context`, naming every chunk cut to fit `max_context_chars`. It is
+the right instrument for the incident that motivated this doc. It was also,
+on production, wrong.
+
+`build_rag_context` has two callers. `_single_shot` composes its `text` into
+the system prompt. `_handle_with_tools` — the production chat path, per
+`bootstrap.py` — does not: there `rag.text` is discarded and KB content reaches
+the model as a `role="tool"` message instead, untruncated. The built context
+survives only to give `apply_hallucination_guard` its citation scope.
+
+So on production the event fired for a truncation that did not affect what the
+model saw. An operator investigating a hallucination would read
+`dropped_tags=["kyc.md#4"]`, conclude the model never received that chunk, and
+spend the afternoon raising a budget that changes nothing. A missing log costs
+an investigation; a confidently wrong one costs the investigation and sends the
+next one the same way.
+
+The fix is the `purpose` argument that call site now passes. The general rule:
+when a value is computed in one place and consumed differently depending on the
+caller, the event has to record which consumer it was built for. "What
+happened" is not enough — an event must not be readable as a claim about
+something it does not govern.
+
 ## Coverage
 
 One pass per package, in the order an operator would need them. A package is
@@ -95,15 +184,15 @@ control flow, or named as already covered by an existing log or a
 |---|---|---|---|
 | `api` — chat request path (`chat.py`) | 1 | — | **done** |
 | `api` — the other 40 files | 40 | — | not started |
-| `agents` — `chatbot.py` | 1 | — | **done** |
+| `agents` — `chatbot.py` | 1 | — | **partial** — skips classified and instrumented (3 sites, 1d97f8b); the turn body is not. See below. |
 | `agents` — `voicebot.py` and the rest | 4 | — | not started |
 | `chatbot` — `tool_executor.py` | 1 | — | **done** (needed nothing; every path already logs with a discriminator) |
 | `chatbot` — `deposit_verification.py` | 1 | — | **done** |
 | `chatbot` — the rest | 5 | — | not started |
 | `auth` — `registry.py` (`get_chat_tts`) | 1 | — | **done** |
 | `auth` — the rest | 8 | — | not started |
-| `providers` | 33 | 5,045 | in progress |
-| `rag` | 5 | 2,586 | not started |
+| `providers` | 33 | 5,045 | **done** (23 instrumented; 10 without — 8 empty `__init__`, plus `model_catalog.py` and `voice_catalog.py`, which are static tables. See 4a3be36) |
+| `rag` | 5 | 2,586 | **done** (4 files instrumented, `__init__` empty) |
 | `pipeline` | 8 | 1,379 | not started |
 | `dialogue` | 11 | 2,017 | not started |
 | `campaign` | 5 | 863 | not started |
@@ -119,6 +208,18 @@ Tracked per file rather than per package where a pass covered only part of
 one: the first pass followed the chat request path across four packages rather
 than finishing any single directory, and recording it as "api: done" would
 claim 40 untouched files.
+
+`agents/chatbot.py` is the case that shows why "done" needs the definition
+above. The first pass instrumented its silent skips and the file was marked
+done on that basis, but it holds 3 `log.debug` calls and no `debug_event` at
+all across 2,212 lines — the turn body, tool dispatch and KB tool-result
+assembly are not classified. Much of what it would carry is covered at the
+provider boundary: `src/providers/llm/gemini.py` logs `contents` in full on
+every request, and the `role="tool"` KB payload the production path feeds the
+model rides in there. That makes the gap narrower than it looks, and it is
+exactly the kind of claim the status column has to name rather than imply,
+since "done" against a file with one-and-a-half log lines is how coverage goes
+dark while reading as finished.
 
 The first pass (commit 1d97f8b) classified ~90 sites and instrumented ~20. It
 also found a class the original framing missed: sites where the customer is
