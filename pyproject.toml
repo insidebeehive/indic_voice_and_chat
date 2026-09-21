@@ -63,6 +63,11 @@ dev = [
     "fakeredis>=2.21",
     "aiosqlite>=0.20",
     "ruff>=0.4",
+    # Mutation testing — see scripts/mutation_test.sh for why it is scoped to
+    # six modules rather than run over src/. Pinned below 3.0 deliberately: 3.x
+    # replaced parso with libcst, which has no prebuilt wheel for this
+    # interpreter here and fails to build from source.
+    "mutmut>=2.4,<3",
 ]
 
 [tool.setuptools.packages.find]
