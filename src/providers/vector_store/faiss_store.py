@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from pathlib import Path
 from typing import Any, Optional
 
@@ -24,6 +25,9 @@ from src.interfaces.vector_store import (
     IVectorStore,
     SearchResult,
 )
+from src.utils.logging import debug_event
+
+log = logging.getLogger(__name__)
 
 
 class FAISSAdapter(IVectorStore):
@@ -59,6 +63,8 @@ class FAISSAdapter(IVectorStore):
             )
             for doc_id, d in meta.get("docs", {}).items()
         }
+        debug_event(log, "faiss index loaded", index_path=str(self._index_path),
+                    docs=len(self._docs), vectors=self._index.ntotal)
 
     def _persist(self) -> None:
         self._index_path.parent.mkdir(parents=True, exist_ok=True)
@@ -114,6 +120,8 @@ class FAISSAdapter(IVectorStore):
                     embedding=None,
                 )
             self._persist()
+        debug_event(log, "faiss index", count=len(documents), total=self._index.ntotal,
+                    index_path=str(self._index_path))
         return len(documents)
 
     async def search(
@@ -152,12 +160,18 @@ class FAISSAdapter(IVectorStore):
             results.append(SearchResult(document=doc, score=float(score)))
             if len(results) >= top_k:
                 break
+        debug_event(log, "faiss search", top_k=top_k, filters=filters,
+                    candidates=k, returned=len(results),
+                    result_ids=[r.document.id for r in results],
+                    scores=[r.score for r in results])
         return results
 
     async def delete(self, doc_ids: list[str]) -> int:
         async with self._lock:
             count = await self._delete_unlocked(doc_ids)
             self._persist()
+        debug_event(log, "faiss delete", requested=len(doc_ids), removed=count,
+                    doc_ids=doc_ids)
         return count
 
     async def _delete_unlocked(self, doc_ids: list[str]) -> int:

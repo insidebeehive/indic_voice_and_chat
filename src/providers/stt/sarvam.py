@@ -20,6 +20,7 @@ from typing import Any, AsyncIterator, Optional
 import httpx
 
 from src.interfaces.stt import ISTTProvider, STTConfig, STTResult
+from src.utils.logging import debug_event
 
 log = logging.getLogger(__name__)
 
@@ -71,6 +72,10 @@ class SarvamSTTAdapter(ISTTProvider):
         if config.enable_timestamps:
             data["with_timestamps"] = "true"
 
+        # `data` is the full textual request (model/language/timestamp flag);
+        # the audio itself is never logged, matching the other STT adapters.
+        debug_event(log, "sarvam stt request", url=f"{self._base_url}/speech-to-text",
+                    form=data, audio_bytes=len(wav))
         async with httpx.AsyncClient(timeout=self._timeout) as client:
             resp = await client.post(
                 f"{self._base_url}/speech-to-text",
@@ -92,7 +97,10 @@ class SarvamSTTAdapter(ISTTProvider):
                 raise
             payload = resp.json()
 
-        return _parse_response(payload)
+        result = _parse_response(payload)
+        debug_event(log, "sarvam stt response", text=result.text,
+                    confidence=result.confidence, raw_response=payload)
+        return result
 
     async def transcribe_stream(
         self,

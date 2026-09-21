@@ -28,6 +28,7 @@ import numpy as np
 
 from src.config import strip_libpq_only_query_params
 from src.interfaces.vector_store import Document, IVectorStore, SearchResult
+from src.utils.logging import debug_event
 
 log = logging.getLogger(__name__)
 
@@ -261,6 +262,9 @@ class PGVectorAdapter(IVectorStore):
                 """,
                 [(r[0], r[1], _json.dumps(r[2]), r[3], r[4], r[5]) for r in rows],
             )
+        debug_event(log, "pgvector index", count=len(documents),
+                    tenant_id=self._tenant_id, crm_id=self._crm_id,
+                    doc_ids=[d.id for d in documents])
         return len(documents)
 
     async def search(
@@ -302,6 +306,10 @@ class PGVectorAdapter(IVectorStore):
             meta = json.loads(raw) if isinstance(raw, str) else (dict(raw) if raw else {})
             doc = Document(id=r["id"], content=r["content"], metadata=meta)
             results.append(SearchResult(document=doc, score=float(r["score"])))
+        debug_event(log, "pgvector search", top_k=top_k, filters=filters,
+                    tenant_id=self._tenant_id, crm_id=self._crm_id,
+                    returned=len(results), result_ids=[r.document.id for r in results],
+                    scores=[r.score for r in results])
         return results
 
     async def delete(self, doc_ids: list[str]) -> int:
@@ -313,9 +321,12 @@ class PGVectorAdapter(IVectorStore):
         async with pool.acquire() as conn:
             result = await conn.execute(sql, doc_ids, *scope_params)
         try:
-            return int(result.split()[-1])
+            removed = int(result.split()[-1])
         except (ValueError, IndexError):
-            return 0
+            removed = 0
+        debug_event(log, "pgvector delete", requested=len(doc_ids), removed=removed,
+                    tenant_id=self._tenant_id, crm_id=self._crm_id, doc_ids=doc_ids)
+        return removed
 
     async def count(self) -> int:
         pool = await self._pool()

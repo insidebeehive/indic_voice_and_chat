@@ -20,6 +20,7 @@ import httpx
 log = logging.getLogger(__name__)
 
 from src.interfaces.tts import ITTSProvider, TTSConfig, TTSResult
+from src.utils.logging import debug_event
 
 _TTS_URL = "https://texttospeech.googleapis.com/v1/text:synthesize"
 _TIMEOUT = 10.0
@@ -69,6 +70,10 @@ class GoogleTTSAdapter(ITTSProvider):
                 "sampleRateHertz": config.sample_rate,
             },
         }
+        # `body` is the full textual request (customer text + voice/format
+        # config); the API key travels as a `?key=` query param on the URL,
+        # so the URL itself is never logged, only the fixed endpoint constant.
+        debug_event(log, "google tts request", url=_TTS_URL, body=body)
         async with httpx.AsyncClient(timeout=self._timeout) as client:
             resp = await client.post(_TTS_URL, params={"key": self._api_key}, json=body)
             if not resp.is_success:
@@ -80,9 +85,12 @@ class GoogleTTSAdapter(ITTSProvider):
             resp.raise_for_status()
         raw = base64.b64decode(resp.json()["audioContent"])
         pcm, rate = _extract_pcm(raw, fallback_rate=config.sample_rate)
+        duration_ms = (len(pcm) / max(rate * 2, 1)) * 1000.0
+        debug_event(log, "google tts response", audio_bytes=len(pcm),
+                    duration_ms=duration_ms, sample_rate=rate)
         return TTSResult(
             audio=pcm,
-            duration_ms=(len(pcm) / max(rate * 2, 1)) * 1000.0,
+            duration_ms=duration_ms,
             sample_rate=rate,
         )
 

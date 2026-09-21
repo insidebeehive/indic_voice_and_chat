@@ -19,6 +19,7 @@ import httpx
 
 from src.interfaces.tts import ITTSProvider, TTSConfig, TTSResult
 from src.pipeline.text_normalize import normalize_for_tts
+from src.utils.logging import debug_event
 
 
 log = logging.getLogger(__name__)
@@ -153,6 +154,10 @@ class SarvamTTSAdapter(ITTSProvider):
         timeout = httpx.Timeout(self._timeout, connect=min(self._timeout, 5.0))
         payload = None
         last_exc: Exception | None = None
+        # `body` includes the (normalized) customer text — never the API key,
+        # which lives only in the header built by `_headers()`.
+        debug_event(log, "sarvam tts request",
+                    url=f"{self._base_url}/text-to-speech", body=body)
         for attempt in range(_TTS_ATTEMPTS):
             try:
                 async with httpx.AsyncClient(timeout=timeout) as client:
@@ -202,6 +207,8 @@ class SarvamTTSAdapter(ITTSProvider):
         raw = base64.b64decode(audios[0])
         audio_bytes, sample_rate = _extract_pcm(raw, fallback_rate=config.sample_rate)
         duration_ms = (len(audio_bytes) / max(sample_rate * 2, 1)) * 1000.0
+        debug_event(log, "sarvam tts response", audio_bytes=len(audio_bytes),
+                    duration_ms=duration_ms, sample_rate=sample_rate)
         return TTSResult(
             audio=audio_bytes,
             duration_ms=duration_ms,

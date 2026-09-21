@@ -20,6 +20,7 @@ from src.interfaces.realtime import (
     RealtimeEvent,
     RealtimeTool,
 )
+from src.utils.logging import debug_event
 
 log = logging.getLogger(__name__)
 
@@ -117,11 +118,21 @@ class GeminiLiveSession(IRealtimeSession):
                 turn_coverage=types.TurnCoverage.TURN_INCLUDES_ONLY_ACTIVITY,
             ),
         )
+        # The request boundary for this session: model + the full realtime
+        # config, including the system prompt actually sent to Live. The
+        # connect failures below already log a warning per attempt; this is
+        # the one place that shows what was asked for, success or not.
+        debug_event(log, "gemini live connect request", model=config.model,
+                    system_instruction=config.system_instruction,
+                    language_code=config.language_code, voice=config.voice,
+                    tools=[t.name for t in config.tools])
         last_err: Exception | None = None
         for attempt in range(_OPEN_RETRIES):
             cm = client.aio.live.connect(model=config.model, config=live_config)
             try:
                 session = await cm.__aenter__()
+                debug_event(log, "gemini live connect response", model=config.model,
+                            attempt=attempt + 1)
                 return cls(cm, session)
             except Exception as e:  # noqa: BLE001 - transient open failures retry
                 last_err = e
@@ -138,6 +149,7 @@ class GeminiLiveSession(IRealtimeSession):
         # Turn-based content (NOT realtime input): mixing send_realtime_input(text)
         # with the audio stream disrupts automatic VAD so subsequent caller audio
         # never endpoints. send_client_content keeps the realtime audio path clean.
+        debug_event(log, "gemini live send_text", text=text)
         from google.genai import types
         await self._session.send_client_content(
             turns=types.Content(role="user", parts=[types.Part(text=text)]),
@@ -178,10 +190,17 @@ class GeminiLiveSession(IRealtimeSession):
             tc = getattr(msg, "tool_call", None)
             if tc is not None:
                 for fc in tc.function_calls or []:
+                    # The realtime equivalent of a tool-call boundary in the
+                    # batch adapters -- arguments are exactly what decides
+                    # what the agent does next on a live call.
+                    debug_event(log, "gemini live tool_call", tool_name=fc.name,
+                                tool_args=dict(fc.args or {}), tool_id=fc.id or "")
                     yield RealtimeEvent(type="tool_call", tool_name=fc.name,
                                         tool_args=dict(fc.args or {}), tool_id=fc.id or "")
 
     async def send_tool_response(self, *, tool_id: str, name: str, response: dict[str, Any]) -> None:
+        debug_event(log, "gemini live send_tool_response", tool_id=tool_id, name=name,
+                    response=response)
         from google.genai import types
         await self._session.send_tool_response(function_responses=[
             types.FunctionResponse(id=tool_id, name=name, response=response)])

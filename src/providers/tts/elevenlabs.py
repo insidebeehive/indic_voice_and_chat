@@ -25,6 +25,7 @@ from typing import Any, AsyncIterator
 import httpx
 
 from src.interfaces.tts import ITTSProvider, TTSConfig, TTSResult
+from src.utils.logging import debug_event
 
 
 log = logging.getLogger(__name__)
@@ -99,6 +100,10 @@ class ElevenLabsTTSAdapter(ITTSProvider):
         audio: bytes | None = None
         last_exc: Exception | None = None
 
+        # `url` has no secret in it (the key rides in the xi-api-key header,
+        # never logged); `body` includes the customer's text, which DEBUG is
+        # allowed (and meant) to carry in full — see docs/debug-logging.md.
+        debug_event(log, "elevenlabs tts request", url=url, body=body)
         for attempt in range(_TTS_ATTEMPTS):
             try:
                 async with httpx.AsyncClient(timeout=timeout) as client:
@@ -130,6 +135,10 @@ class ElevenLabsTTSAdapter(ITTSProvider):
 
         sample_rate = config.sample_rate
         duration_ms = (len(audio) / max(sample_rate * 2, 1)) * 1000.0
+        # The audio itself is never logged (binary); its size/duration is
+        # the diagnostic value, same convention as the STT adapters.
+        debug_event(log, "elevenlabs tts response", audio_bytes=len(audio),
+                    duration_ms=duration_ms, sample_rate=sample_rate)
         return TTSResult(audio=audio, duration_ms=duration_ms, sample_rate=sample_rate)
 
     async def synthesize_stream(
@@ -153,6 +162,8 @@ class ElevenLabsTTSAdapter(ITTSProvider):
                 "model_id": self._model,
                 "voice_settings": {"stability": 0.5, "similarity_boost": 0.75},
             }
+            debug_event(log, "elevenlabs tts stream request", url=url, body=body)
+            total_bytes = 0
             try:
                 async with httpx.AsyncClient(timeout=timeout) as client:
                     async with client.stream("POST", url, headers=self._headers(), json=body) as resp:
@@ -174,10 +185,12 @@ class ElevenLabsTTSAdapter(ITTSProvider):
                             raise
                         async for chunk in resp.aiter_bytes(chunk_size=4096):
                             if chunk:
+                                total_bytes += len(chunk)
                                 yield chunk
             except Exception:
                 log.exception("elevenlabs stream error for segment %r", segment[:40])
                 raise
+            debug_event(log, "elevenlabs tts stream response", audio_bytes=total_bytes)
 
     def get_available_voices(self, language: str) -> list[dict]:
         # If a key is configured, fetch the account's actual voices (includes
@@ -193,7 +206,7 @@ class ElevenLabsTTSAdapter(ITTSProvider):
             )
             resp.raise_for_status()
             voices = resp.json().get("voices", [])
-            return [
+            out = [
                 {
                     "voice_id": v["voice_id"],
                     "name": v.get("name", v["voice_id"]),
@@ -202,6 +215,8 @@ class ElevenLabsTTSAdapter(ITTSProvider):
                 }
                 for v in voices
             ]
+            debug_event(log, "elevenlabs voices fetched", count=len(out))
+            return out
         except _httpx.HTTPStatusError as e:
             # A 4xx here (bad/expired key) means the account lookup itself is
             # wrong — log the body so that's diagnosable, then degrade to the

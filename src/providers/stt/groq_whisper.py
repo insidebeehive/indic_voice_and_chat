@@ -23,6 +23,7 @@ from typing import Any, AsyncIterator, Optional
 import httpx
 
 from src.interfaces.stt import ISTTProvider, STTConfig, STTResult
+from src.utils.logging import debug_event
 
 log = logging.getLogger(__name__)
 
@@ -70,6 +71,11 @@ class GroqSTTAdapter(ISTTProvider):
         if config.enable_timestamps:
             data["timestamp_granularities[]"] = "word"
 
+        # `data` (form fields) is the whole textual request; `files` carries
+        # the audio, which — like every other STT adapter here — is never
+        # logged (binary, and its size is what's diagnostically useful).
+        debug_event(log, "groq stt request", url=f"{self._base_url}/audio/transcriptions",
+                    form=data, audio_bytes=len(wav))
         async with httpx.AsyncClient(timeout=self._timeout) as client:
             resp = await client.post(
                 f"{self._base_url}/audio/transcriptions",
@@ -91,7 +97,10 @@ class GroqSTTAdapter(ISTTProvider):
                 ) from e
             payload = resp.json()
 
-        return _parse_response(payload)
+        result = _parse_response(payload)
+        debug_event(log, "groq stt response", text=result.text,
+                    confidence=result.confidence, raw_response=payload)
+        return result
 
     async def transcribe_stream(
         self,

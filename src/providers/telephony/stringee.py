@@ -39,6 +39,7 @@ from src.interfaces.telephony import (
     CallSession,
     ITelephonyProvider,
 )
+from src.utils.logging import debug_event
 
 log = logging.getLogger(__name__)
 
@@ -226,11 +227,19 @@ class StringeeAdapter(ITelephonyProvider):
         )
 
     async def hangup(self, session_id: str) -> None:
+        # `initiate_call` above logs its request/response at INFO already
+        # (pre-existing); hangup had no logging at any level, so a hangup
+        # that silently failed (wrong id, already ended) was indistinguishable
+        # from one that worked. Body only, never `_headers()` -- the bearer
+        # JWT lives there.
+        debug_event(log, "stringee hangup request", session_id=session_id)
         async with httpx.AsyncClient(timeout=self._timeout) as client:
             resp = await client.post(
                 f"{self._base_url}/v1/call2/{session_id}/hangup",
                 headers=self._headers(),
             )
+            debug_event(log, "stringee hangup response", session_id=session_id,
+                        status=resp.status_code, body=resp.text)
             if resp.status_code >= 500:
                 resp.raise_for_status()
 

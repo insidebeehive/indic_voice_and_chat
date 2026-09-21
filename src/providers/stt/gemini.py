@@ -20,6 +20,7 @@ from typing import Any, AsyncIterator
 import httpx
 
 from src.interfaces.stt import ISTTProvider, STTConfig, STTResult
+from src.utils.logging import debug_event
 
 log = logging.getLogger(__name__)
 
@@ -73,15 +74,26 @@ class GeminiSTTAdapter(ISTTProvider):
         if config.language:
             lang_hint = f" The audio is in {config.language}."
 
+        prompt_text = (
+            "Transcribe this audio exactly as spoken, preserving the original "
+            f"language and script. Return only the transcript text with no "
+            f"commentary or formatting.{lang_hint}"
+        )
         body = {
             "contents": [{
                 "parts": [
-                    {"text": f"Transcribe this audio exactly as spoken, preserving the original language and script. Return only the transcript text with no commentary or formatting.{lang_hint}"},
+                    {"text": prompt_text},
                     {"inline_data": {"mime_type": "audio/wav", "data": audio_b64}},
                 ],
             }],
             "generationConfig": {"temperature": 0},
         }
+        # The URL carries the API key as a query param (`?key=...`) — never
+        # logged, in full or in part. The prompt text is logged; the audio
+        # itself is not (binary, and already excluded from the 4xx log below
+        # for the same reason).
+        debug_event(log, "gemini stt request", model=self._model, prompt=prompt_text,
+                    audio_bytes=len(wav), language=config.language)
         url = f"{_BASE_URL}/{self._model}:generateContent?key={self._api_key}"
         async with httpx.AsyncClient(timeout=self._timeout) as client:
             resp = await client.post(url, json=body)
@@ -107,8 +119,10 @@ class GeminiSTTAdapter(ISTTProvider):
         # If Gemini returned meta-commentary about the audio instead of a
         # transcript (e.g. "No speech detected"), treat it as silence.
         if text and any(p in text.lower() for p in _NO_SPEECH_PHRASES):
+            debug_event(log, "gemini stt treated as silence", raw_text=text)
             text = ""
 
+        debug_event(log, "gemini stt response", text=text, raw_response=payload)
         return STTResult(
             text=text,
             confidence=1.0 if text else 0.0,
