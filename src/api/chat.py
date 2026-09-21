@@ -905,7 +905,16 @@ def _stored_previous_conversation(row: ChatSession | None) -> Optional[str]:
     if row is None:
         return None
     val = (row.extra_data or {}).get("previous_conversation")
-    return val if isinstance(val, str) and val.strip() else None
+    if not (isinstance(val, str) and val.strip()):
+        return None
+    # Capped here too, not only in _capture_previous_conversation. The frame
+    # path caps before storing, but it is not the only writer:
+    # ChatSession.extra_data is written wholesale from a caller-supplied
+    # `metadata` dict at session creation, which has no length constraint. An
+    # unbounded value seeded that way would ride every round of every turn for
+    # the life of the session, and contents never caches. Capping on read makes
+    # the bound a property of what reaches the model rather than of one writer.
+    return truncate_previous_conversation(val)
 
 
 def _warn_late_previous_conversation(msg: dict, session_id: str) -> None:

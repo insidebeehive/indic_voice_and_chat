@@ -337,3 +337,36 @@ async def test_previous_conversation_is_capped_at_capture_time(ws_pc_ctx, monkey
     async with sm() as db:
         row = await db.get(ChatSession, "sess1")
     assert row.extra_data.get("previous_conversation") == stored
+
+
+def test_stored_summary_is_capped_on_read_not_only_on_capture() -> None:
+    """The frame path caps before storing, but it is not the only writer:
+    ChatSession.extra_data is written wholesale from a caller-supplied
+    `metadata` dict at session creation, which carries no length constraint.
+    An unbounded value seeded that way rides every round of every turn for the
+    life of the session, and `contents` never caches -- so the bound has to be
+    a property of what reaches the model, not of one writer.
+    """
+    from src.agents.chatbot import PREVIOUS_CONVERSATION_MAX_CHARS
+
+    oversized = "word " * 5000
+    assert len(oversized) > PREVIOUS_CONVERSATION_MAX_CHARS
+
+    row = MagicMock()
+    row.extra_data = {"previous_conversation": oversized}
+
+    out = chat_api._stored_previous_conversation(row)
+
+    assert out is not None
+    assert len(out) <= PREVIOUS_CONVERSATION_MAX_CHARS + 1, (
+        f"read path returned {len(out)} chars, cap is {PREVIOUS_CONVERSATION_MAX_CHARS}"
+    )
+
+
+def test_stored_summary_under_cap_is_returned_verbatim() -> None:
+    """The read-path cap must not perturb a normal value -- otherwise every
+    session would silently get an altered summary."""
+    row = MagicMock()
+    row.extra_data = {"previous_conversation": "Customer asked about a withdrawal."}
+
+    assert chat_api._stored_previous_conversation(row) == "Customer asked about a withdrawal."

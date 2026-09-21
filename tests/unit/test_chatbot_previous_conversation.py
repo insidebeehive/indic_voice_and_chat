@@ -54,21 +54,32 @@ def test_truncate_under_cap_returned_unchanged() -> None:
 
 
 def test_truncate_over_cap_cuts_on_word_boundary_not_mid_word() -> None:
-    words = [f"tok{i}" for i in range(2000)]
+    """Fixed-width tokens with a trailing sentinel, deliberately: no token is a
+    prefix of another, so any mid-word cut yields a fragment that is provably
+    absent from `words`.
+
+    An earlier version used "tok0".."tok1999", where a mid-word cut of "tok19"
+    yields "tok1" -- which IS in `words`, so the assertion passed either way.
+    Replacing the implementation with a naive text[:CAP] left that version
+    green; this one fails under exactly that mutation.
+    """
+    # 7 chars + 1 separator = 8 per token, so the cap (1500) falls at 187.5
+    # tokens: a hard cut lands mid-token, which is the case being tested.
+    words = [f"t{i:05d}x" for i in range(2000)]
     text = " ".join(words)
     assert len(text) > PREVIOUS_CONVERSATION_MAX_CHARS
+    assert text[PREVIOUS_CONVERSATION_MAX_CHARS - 1] != " ", (
+        "input no longer places a hard cut mid-token; the test would pass "
+        "without exercising the boundary logic"
+    )
 
     result = truncate_previous_conversation(text)
 
     assert len(result) <= PREVIOUS_CONVERSATION_MAX_CHARS + 1  # +1 for the trailing ellipsis
     assert result.endswith("…")
     body = result[:-1]
-    # Every whitespace-split token in the truncated body must be a COMPLETE
-    # token from the original list -- proves the cut landed on a space, not
-    # mid-word (a mid-word cut would produce a truncated final token like
-    # "tok19" -> "tok1" that isn't in `words`).
     for tok in body.split(" "):
-        assert tok in words
+        assert tok in words, f"cut landed mid-token: {tok!r}"
 
 
 def test_truncate_exactly_at_cap_unchanged() -> None:
