@@ -297,3 +297,55 @@ def test_get_market_holiday_schedule_matches_crm_pr_3963_shipped_path() -> None:
     assert entry["parameters"]["date"]["source"] == "llm"
     assert "{market}" not in entry["default_path"]
     assert "{date}" not in entry["default_path"]
+
+
+def test_matka_market_params_tell_the_model_to_strip_the_session() -> None:
+    """Matka markets run Open and Close sessions, and customers name the one
+    they want ("Milan Morning Close"). The session is never part of the market
+    name -- per docs/crm-api-contract.md the CRM returns a `sessions` array and
+    the caller picks the entry it needs -- so every market-name parameter has
+    to say so explicitly.
+
+    Without it the model has nowhere to put the session word and puts the whole
+    phrase in the market field, which matches nothing; the turn then spends its
+    remaining tool round guessing and dies on the forced plain answer. Observed
+    in production ticket 7525, where five consecutive turns ended
+    rounds_exhausted with "no usable response (finish_reason=stop)".
+
+    Asserting on the market PARAMETER description, not the tool description:
+    the parameter is what the model reads when it decides what to put in that
+    field.
+    """
+    for tool_name, param in (
+        ("get_matka_result", "market"),
+        ("get_matka_bids", "market"),
+        ("get_matka_config", "market_name"),
+    ):
+        desc = ALL_TOOLS[tool_name]["parameters"][param]["description"].lower()
+        assert "close" in desc, f"{tool_name}.{param} never mentions the Close session"
+        assert "strip" in desc, (
+            f"{tool_name}.{param} does not tell the model to strip the session word"
+        )
+        # The concrete case that failed, so the guidance stays worked-through
+        # rather than becoming an abstract instruction nobody can apply.
+        assert "milan morning" in desc, (
+            f"{tool_name}.{param} dropped the worked example"
+        )
+
+
+def test_max_tool_rounds_leaves_a_recovery_round() -> None:
+    """Three rounds, not two. At two the model gets one lookup and one
+    correction: a first call that returns nothing useful leaves it out of
+    rounds before it can act on what it learned, and the forced plain-answer
+    call that follows routinely produces nothing usable.
+
+    Pinned because this is a cost/behaviour tradeoff someone may be tempted to
+    reverse while trimming tokens -- each round re-sends the whole prompt.
+    Lowering it back to 2 should be a deliberate decision, not a silent one.
+    """
+    import inspect
+
+    from src.agents.chatbot import ChatBotAgent
+
+    default = inspect.signature(ChatBotAgent.__init__).parameters["max_tool_rounds"].default
+    assert default == 3, f"max_tool_rounds default is {default}, expected 3"

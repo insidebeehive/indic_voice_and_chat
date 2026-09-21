@@ -93,15 +93,24 @@ but small: history measures ~4.3KB mean and ~700-2,100 tokens even at the
 eviction boundary, against a 14-26K-token turn. And since `contents` never
 caches, making history prefix-stable would not help regardless.
 
-## Cost figures are understated
+## Cost figures account for cached tokens
 
-`ProviderCost` carries `cost_per_1k_input_tokens` and
-`cost_per_1k_output_tokens` and **no cached-input rate**, so
-`src/api/chat_cost.py` bills a cached token at the same rate as a fresh one.
-Every cost number this platform reports is therefore wrong in the same
-direction, and the size of the error is whatever discount the provider applies
-to cached input. Modelling that rate is a precondition for any credible
-projection of what caching work would save.
+`ProviderCost` carries a `cost_per_1k_cached_tokens` column alongside
+`cost_per_1k_input_tokens` and `cost_per_1k_output_tokens` (migration
+`alembic/versions/0022_provider_cost_cached_rate.py`), and `src/api/chat_cost.py`
+bills a chat turn as `(input_tokens - cached_tokens) * in_rate + cached_tokens *
+cached_rate + output_tokens * out_rate`.
+
+The column is nullable with no server default, and that's deliberate: `NULL` means
+"no cached rate configured for this `(provider, model)`," and `compute_chat_turn_cost`
+falls back to billing cached tokens at the *full* input rate in that case, never at
+`0.0`. A missing cached-rate row silently collapsing cached-token cost to near-free
+would look like a spectacular saving and be a reporting bug, not a real one — the
+safety direction is "never invented as too cheap," matching the platform's existing
+figures until a rate is explicitly set. Every existing `provider_costs` row (and
+every new row that doesn't set the column) is `NULL` on this migration, so upgrading
+never changes a dollar figure the platform already reports; the discounted rate only
+takes effect once a `(kind='llm', provider, model)` row has it set explicitly.
 
 ## Explicit caching as implemented
 

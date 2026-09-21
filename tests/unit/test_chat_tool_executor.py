@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import json
 import logging
 
 import httpx
@@ -357,6 +358,61 @@ async def test_crm_tool_call_log_has_param_keys_not_values(caplog) -> None:
     assert record.__dict__.get("param_keys") == ["mobile"]
     assert "params" not in record.__dict__
     assert mobile not in repr(record.__dict__)
+
+
+@pytest.mark.asyncio
+async def test_crm_tool_call_log_logs_numeric_param_values_never_string_ones(caplog) -> None:
+    client = _FakeClient({"ok": True})
+    mobile = "+919876543210"
+
+    with caplog.at_level(logging.INFO, logger="src.chatbot.tool_executor"):
+        await execute_crm_tool(
+            endpoint="https://crm.example.com/api/search",
+            method="GET",
+            parameters={
+                "mobile": {"type": "string", "source": "llm"},
+                "limit": {"type": "number", "source": "llm"},
+                "min_amount": {"type": "number", "source": "llm"},
+                "include_closed": {"type": "boolean", "source": "llm"},
+            },
+            auth_type=None, token=None,
+            args={"mobile": mobile, "limit": 20, "min_amount": 99.5, "include_closed": True},
+            http_client=client,
+        )
+
+    call_records = [r for r in caplog.records if r.getMessage() == "crm tool call"]
+    assert len(call_records) == 1
+    record = call_records[0]
+
+    assert record.__dict__.get("numeric_params") == {"limit": 20, "min_amount": 99.5}
+    # The bool is a flag, not a size driver -- it must not ride into
+    # numeric_params just because isinstance(True, int) is True in Python.
+    assert "include_closed" not in record.__dict__.get("numeric_params", {})
+    # The string param's value must never appear anywhere in the record.
+    assert mobile not in repr(record.__dict__)
+
+
+@pytest.mark.asyncio
+async def test_crm_tool_response_log_has_result_chars(caplog) -> None:
+    payload = {"balance": 500, "currency": "INR"}
+    client = _FakeClient(payload)
+
+    with caplog.at_level(logging.INFO, logger="src.chatbot.tool_executor"):
+        out = await execute_crm_tool(
+            endpoint="https://crm.example.com/api/wallet",
+            method="GET", parameters={}, auth_type=None, token=None, args={},
+            http_client=client,
+        )
+
+    response_records = [r for r in caplog.records if r.getMessage() == "crm tool response"]
+    assert len(response_records) == 1
+    record = response_records[0]
+
+    assert record.__dict__.get("result_chars") == len(json.dumps(out))
+    # No actual response content (keys or values) may leak into the log.
+    assert "balance" not in record.getMessage()
+    assert "500" not in record.getMessage()
+    assert "INR" not in record.getMessage()
 
 
 def test_redact_url_scrubs_uuid() -> None:

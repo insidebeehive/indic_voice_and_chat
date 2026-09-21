@@ -88,3 +88,205 @@ async def test_persist_turn_with_reply_media_extends_agent_row(db_session):
     assert agent_row.type == "audio"
     # The customer's own row is untouched by the reply's media fields.
     assert customer_row.media_url is None
+
+
+@pytest.mark.asyncio
+async def test_persist_turn_with_source_media_url_sets_customer_row_only(db_session):
+    """`source_media_url` (the client's own original URL, e.g. the CRM's
+    inbound `media_url`) belongs on the CUSTOMER's row only — the agent's
+    reply row has no client-supplied URL of its own and must stay NULL."""
+    persisted = await chat_api._persist_turn(
+        "s1", "[image]", _FakeResult(),
+        user_type="image", media_mime="image/png", media_url="chat/t1/s1/shot.png",
+        source_media_url="https://crm.example.com/uploads/shot.png",
+    )
+    async with db_session() as db:
+        customer_row = await db.get(ChatMessage, persisted.customer_message_id)
+        agent_row = await db.get(ChatMessage, persisted.agent_message_id)
+    assert customer_row.source_media_url == "https://crm.example.com/uploads/shot.png"
+    # The object-key media_url keeps being stored exactly as before, alongside it.
+    assert customer_row.media_url == "chat/t1/s1/shot.png"
+    assert agent_row.source_media_url is None
+
+
+@pytest.mark.asyncio
+async def test_persist_turn_source_media_url_defaults_to_none(db_session):
+    """No `source_media_url` argument (the overwhelming majority of calls,
+    e.g. plain text turns) must leave the column NULL, not an empty string."""
+    persisted = await chat_api._persist_turn("s1", "hello", _FakeResult())
+    async with db_session() as db:
+        customer_row = await db.get(ChatMessage, persisted.customer_message_id)
+    assert customer_row.source_media_url is None
+
+
+@pytest.mark.asyncio
+async def test_persist_inbound_media_message_writes_one_committed_row(db_session):
+    """The pre-persist helper writes exactly one customer row with the media
+    fields set, commits it (readable from a fresh session), and bumps
+    message_count by 1 — see its docstring on why the commit matters:
+    submit_deposit_verification reads through a separate DB session."""
+    from sqlalchemy import select
+
+    msg_id = await chat_api._persist_inbound_media_message(
+        "s1", "[image]", user_type="image", media_mime="image/png",
+        media_url="chat/t1/s1/shot.png",
+        source_media_url="https://crm.example.com/uploads/shot.png",
+    )
+    assert isinstance(msg_id, int)
+
+    async with db_session() as db:
+        rows = (await db.execute(
+            select(ChatMessage).where(ChatMessage.session_id == "s1")
+        )).scalars().all()
+        session_row = await db.get(ChatSession, "s1")
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.id == msg_id
+    assert row.role == "customer"
+    assert row.type == "image"
+    assert row.media_mime == "image/png"
+    assert row.media_url == "chat/t1/s1/shot.png"
+    assert row.source_media_url == "https://crm.example.com/uploads/shot.png"
+    assert session_row.message_count == 1
+
+
+@pytest.mark.asyncio
+async def test_persist_inbound_media_message_returns_id_despite_close_failure(db_session):
+    """Regression test: if session teardown (`close()` / pool reset-on-return)
+    raises AFTER the commit has already gone through, the helper must still
+    return the committed row's id, not `None` — otherwise `_persist_turn`'s
+    fallback path would write a second customer row for the same image. See
+    the helper's docstring: teardown is deliberately split out of the
+    `except` that guards the write itself, so a close-time failure can't
+    masquerade as a write failure and flip a successful commit into `None`."""
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    class _FlakyCloseSession(AsyncSession):
+        async def close(self):
+            await super().close()
+            raise RuntimeError("pool reset-on-return failed")
+
+    engine = db_session.kw["bind"]
+    flaky_sm = async_sessionmaker(engine, class_=_FlakyCloseSession, expire_on_commit=False)
+    chat_api.set_chat_sessionmaker(flaky_sm)
+    try:
+        msg_id = await chat_api._persist_inbound_media_message(
+            "s1", "[image]", user_type="image", media_mime="image/png",
+            media_url="chat/t1/s1/shot.png",
+        )
+    finally:
+        chat_api.set_chat_sessionmaker(db_session)
+
+    assert isinstance(msg_id, int)
+
+    async with db_session() as db:
+        session_row = await db.get(ChatSession, "s1")
+        row = await db.get(ChatMessage, msg_id)
+    assert session_row.message_count == 1
+    assert row is not None
+    assert row.role == "customer"
+
+
+@pytest.mark.asyncio
+async def test_persist_turn_with_customer_message_id_writes_only_agent_row(db_session):
+    """When `customer_message_id` is passed, _persist_turn must not construct
+    or add a second customer row — only the agent row — and must bump
+    message_count by 1 (not 2), returning the passed-through customer id."""
+    from sqlalchemy import select
+
+    pre_id = await chat_api._persist_inbound_media_message(
+        "s1", "[image]", user_type="image", media_mime="image/png",
+        media_url="chat/t1/s1/shot.png",
+    )
+    persisted = await chat_api._persist_turn(
+        "s1", "[image]", _FakeResult(), customer_message_id=pre_id,
+    )
+    assert persisted.customer_message_id == pre_id
+
+    async with db_session() as db:
+        customer_rows = (await db.execute(
+            select(ChatMessage).where(
+                ChatMessage.session_id == "s1", ChatMessage.role == "customer")
+        )).scalars().all()
+        agent_row = await db.get(ChatMessage, persisted.agent_message_id)
+        session_row = await db.get(ChatSession, "s1")
+    # Exactly the one customer row from the pre-persist step — _persist_turn
+    # added none of its own.
+    assert len(customer_rows) == 1
+    assert customer_rows[0].id == pre_id
+    assert agent_row is not None
+    assert agent_row.role == "agent"
+    # +1 from the pre-persist, +1 from this call's agent-only write == 2.
+    assert session_row.message_count == 2
+
+
+@pytest.mark.asyncio
+async def test_persist_turn_without_customer_message_id_unchanged(db_session):
+    """No `customer_message_id` (every existing call site) must keep behaving
+    exactly as today: two rows written by this single call, message_count +2."""
+    from sqlalchemy import select
+
+    persisted = await chat_api._persist_turn("s1", "hello", _FakeResult())
+    assert persisted.customer_message_id is not None
+    assert persisted.agent_message_id is not None
+
+    async with db_session() as db:
+        rows = (await db.execute(
+            select(ChatMessage).where(ChatMessage.session_id == "s1")
+        )).scalars().all()
+        session_row = await db.get(ChatSession, "s1")
+    assert len(rows) == 2
+    assert {r.role for r in rows} == {"customer", "agent"}
+    assert session_row.message_count == 2
+
+
+@pytest.mark.asyncio
+async def test_persist_turn_falls_back_to_full_customer_row_when_pre_persist_fails(db_session):
+    """Direct unit check of `_persist_turn`'s own fallback branch (the
+    `if customer_message_id is None:` construction of the customer
+    `ChatMessage`): given `customer_message_id=None` plus a full set of media
+    kwargs, it must build a real type="image" row with all of them, not a
+    corrupt type="text"/no-media row.
+
+    This calls `_persist_turn` directly, so it CANNOT see whether the real
+    WS image/video call site (src/api/chat.py's image/video branch) actually
+    passes those kwargs through — passing `customer_message_id=None`
+    explicitly here hits the exact same branch as
+    `test_persist_turn_without_customer_message_id_unchanged` above (not
+    passing it at all), just with non-default arguments. For coverage of the
+    real call site — which is what matters when
+    `_persist_inbound_media_message` fails in production — see
+    `tests/unit/test_chat_image_s3.py::test_image_ws_falls_back_to_full_customer_row_when_pre_persist_returns_none`,
+    which drives an actual WS frame through it end-to-end."""
+    from sqlalchemy import select
+
+    persisted = await chat_api._persist_turn(
+        "s1", "[image]", _FakeResult(),
+        user_type="image", media_mime="image/png",
+        media_url="chat/t1/s1/shot.png",
+        source_media_url="https://crm.example.com/uploads/shot.png",
+        customer_message_id=None,  # simulates the pre-persist helper returning None
+    )
+    async with db_session() as db:
+        customer_rows = (await db.execute(
+            select(ChatMessage).where(
+                ChatMessage.session_id == "s1", ChatMessage.role == "customer")
+        )).scalars().all()
+    assert len(customer_rows) == 1
+    row = customer_rows[0]
+    assert row.id == persisted.customer_message_id
+    assert row.type == "image"
+    assert row.media_mime == "image/png"
+    assert row.media_url == "chat/t1/s1/shot.png"
+    assert row.source_media_url == "https://crm.example.com/uploads/shot.png"
+
+# NOTE: this module used to also have
+# `test_pre_persist_helper_row_survives_a_raising_turn` here. It was removed
+# as theatre: its "raising turn" was a locally-defined coroutine raised and
+# immediately caught by `pytest.raises` right there in the test body — it
+# never called `_persist_turn` or drove any real turn-failure path, so minus
+# those three lines it was assertion-for-assertion identical to
+# `test_persist_inbound_media_message_writes_one_committed_row` above. Real
+# coverage of "the pre-persisted customer row survives a raising turn" now
+# lives at the WS level, where a raising turn is actually possible:
+# `tests/unit/test_chat_image_s3.py::test_image_ws_pre_persisted_customer_row_survives_a_raising_turn`.

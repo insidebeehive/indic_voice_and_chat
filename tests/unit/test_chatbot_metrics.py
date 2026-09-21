@@ -269,11 +269,16 @@ async def test_rounds_exhausted_true_on_forced_final_answer(retriever) -> None:
             ToolCall(id="t1", name="get_player_transactions", arguments={})]),
         LLMResult(text="", finish_reason="tool_calls", tool_calls=[
             ToolCall(id="t2", name="get_player_transactions", arguments={})]),
-        # max_tool_rounds default is 2 -- the loop's `else` branch fires here.
+        # With max_tool_rounds pinned to 2 below, the loop's `else` branch
+        # fires here and this is the forced plain answer.
         LLMResult(text="I can't verify this right now, let me connect you to a human.",
                   finish_reason="stop"),
     ])
-    agent = _agent(llm, retriever, crm_tools=crm_tools, crm_executor=crm_exec)
+    # Pinned explicitly rather than riding the default: this test is about what
+    # happens WHEN rounds run out, not about how many there are, so it must not
+    # break the next time the budget is retuned.
+    agent = _agent(llm, retriever, crm_tools=crm_tools, crm_executor=crm_exec,
+                   max_tool_rounds=2)
     result = await agent.handle_message("where is my ₹19,600 withdrawal?")
 
     assert result.metrics is not None
@@ -492,3 +497,141 @@ async def test_per_tool_metric_failure_does_not_break_the_reply(retriever, monke
     # it being short) must still succeed.
     assert result.metrics is not None
     assert result.metrics.tools == ()
+
+
+async def test_unusable_response_warning_carries_redacted_raw_output(retriever, caplog) -> None:
+    """The "no usable response" warning must carry what the model actually
+    returned. Without it the warning is undiagnosable: the parser collapses
+    three different failures into one canned fallback -- nothing returned,
+    JSON-shaped but unparseable, and a valid envelope with no response_text --
+    and they need different fixes.
+
+    The output is a reply about the customer's own account and apply_pii_guard
+    has not run on it yet, so it must go through the same redactor the other
+    diagnostic log slices use.
+    """
+    import logging
+
+    leaky = '{"response_text": "call me on 9876543210", '  # unparseable: truncated
+    llm = ScriptedLLM([
+        LLMResult(text=leaky, finish_reason="stop"),
+        LLMResult(text="Sure, I can help with that.", finish_reason="stop"),
+    ])
+    agent = _agent(llm, retriever)
+    with caplog.at_level(logging.WARNING, logger="src.agents.chatbot"):
+        await agent.handle_message("hi")
+
+    warnings = [r for r in caplog.records if "no usable response" in r.getMessage()]
+    assert warnings, "the unusable-response path logged no warning"
+    msg = warnings[0].getMessage()
+    # The raw output is present -- this is the whole point of the log line.
+    assert "response_text" in msg, f"raw model output missing from: {msg}"
+    # ...and the mobile number in it is not.
+    assert "9876543210" not in msg, f"unredacted PII in log: {msg}"
+
+
+async def test_unusable_after_retry_escalates_instead_of_asking_to_rephrase(retriever) -> None:
+    """Two generations in a row with nothing usable means the customer cannot
+    fix this by rewording -- the retry already tried again. The parser's canned
+    lines invite exactly that ("could you ask that again?"), which in
+    production ticket 7525 went out six turns running before the customer left.
+
+    Asserting on all three: the canned line is gone, the action routes to a
+    human, and the reply says so. A test that only checked `action` would pass
+    while the customer still read "could you rephrase?".
+    """
+    from src.dialogue.response_parser import is_unusable_response
+
+    llm = ScriptedLLM([
+        LLMResult(text="", finish_reason="stop"),   # forced answer: empty
+        LLMResult(text="", finish_reason="stop"),   # retry: empty too
+    ])
+    agent = _agent(llm, retriever)
+    result = await agent.handle_message("win paisa abhi tak nahi chadha hai")
+
+    assert result.response.action == "escalate"
+    assert not is_unusable_response(result.response.response_text), (
+        f"customer still got a canned retry-me line: {result.response.response_text!r}"
+    )
+    assert "agent" in result.response.response_text.lower()
+
+
+# --- result_chars: measures the exact tool-result JSON sent to the model ---
+
+
+async def test_result_chars_equals_the_tool_message_actually_sent_to_the_model(
+    retriever,
+) -> None:
+    async def crm_exec(tc: ToolCall, *, timeout_s: float = 0.0) -> dict:
+        return {"balance": 500}
+
+    crm_tools = [ToolSpec(name="get_player_wallet", description="wallet",
+                          parameters={"type": "object", "properties": {}})]
+    llm = ScriptedLLM([
+        LLMResult(text="", finish_reason="tool_calls", tool_calls=[
+            ToolCall(id="t1", name="search_knowledge_base", arguments={"query": "plans"}),
+            ToolCall(id="t2", name="get_player_wallet", arguments={}),
+        ]),
+        LLMResult(text="Your balance is ₹500.", finish_reason="stop"),
+    ])
+    agent = _agent(llm, retriever, crm_tools=crm_tools, crm_executor=crm_exec)
+    result = await agent.handle_message("what's my balance and tell me about Plan B?")
+
+    m = result.metrics
+    assert m is not None
+    # The second LLM call's messages include round 1's tool results as
+    # role="tool" messages -- pull those to compare against what was
+    # actually sent, keyed by tool_call_id so this doesn't depend on order.
+    second_call_messages = llm.calls[1][0]
+    tool_messages_by_id = {
+        msg.tool_call_id: msg for msg in second_call_messages if msg.role == "tool"
+    }
+    kb_metric = next(t for t in m.tools if t.tool_name == "search_knowledge_base")
+    crm_metric = next(t for t in m.tools if t.tool_name == "get_player_wallet")
+    assert kb_metric.result_chars == len(tool_messages_by_id["t1"].content)
+    assert crm_metric.result_chars == len(tool_messages_by_id["t2"].content)
+    # KB carries the full chunk content (wrapped in source markers); the CRM
+    # result is just {"balance": 500}. KB's result_chars must be strictly
+    # bigger -- proving KB isn't somehow excluded/zeroed from this field.
+    assert kb_metric.result_chars > crm_metric.result_chars
+
+
+async def test_failed_tool_still_records_result_chars(retriever) -> None:
+    async def crm_exec(tc: ToolCall, *, timeout_s: float = 0.0) -> dict:
+        raise RuntimeError("crm executor exploded")
+
+    crm_tools = [ToolSpec(name="get_player_wallet", description="wallet",
+                          parameters={"type": "object", "properties": {}})]
+    llm = ScriptedLLM([
+        LLMResult(text="", finish_reason="tool_calls", tool_calls=[
+            ToolCall(id="t1", name="get_player_wallet", arguments={})]),
+        LLMResult(text="I can't check that right now.", finish_reason="stop"),
+    ])
+    agent = _agent(llm, retriever, crm_tools=crm_tools, crm_executor=crm_exec)
+    result = await agent.handle_message("what's my balance?")
+
+    m = result.metrics
+    assert m is not None
+    entry = next(t for t in m.tools if t.tool_name == "get_player_wallet")
+    assert entry.outcome != "ok"
+    second_call_messages = llm.calls[1][0]
+    tool_message = next(
+        msg for msg in second_call_messages if msg.role == "tool" and msg.tool_call_id == "t1")
+    assert entry.result_chars == len(tool_message.content)
+    assert entry.result_chars > 0
+
+
+async def test_usable_response_is_not_escalated(retriever) -> None:
+    """The escalation must fire only on the unusable path. A normal answer
+    keeps its own text and action -- otherwise this change would route every
+    turn to a human.
+    """
+    # No currency figure: apply_unverified_data_guard would replace an
+    # ungrounded one and this test would pass for the wrong reason.
+    llm = ScriptedLLM([LLMResult(text="Plan B includes unlimited data.",
+                                 finish_reason="stop")])
+    agent = _agent(llm, retriever)
+    result = await agent.handle_message("tell me about Plan B")
+
+    assert result.response.action != "escalate"
+    assert "unlimited data" in result.response.response_text

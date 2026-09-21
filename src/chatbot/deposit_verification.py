@@ -12,13 +12,16 @@ Two vendor contracts, selected by ``DepositVerificationConfig.contract``:
 - ``json_ticket_relay`` (newer) — POSTs a plain JSON body
   ``{"order_id", "screenshot_url", "mobile"?}`` with ``Content-Type:
   application/json`` and a bare-hex HMAC in ``X-Signature`` (``sign_body_hex``,
-  no ``sha256=`` prefix). ``screenshot_url`` is a time-limited signed URL from
-  the tenant's media store (``IMediaStorage.signed_url``), not the raw bytes —
-  so it requires a media store that can produce a real, publicly-fetchable
-  URL. A relative/unsigned URL (e.g. from ``LocalMediaStorage``) is refused
-  before any vendor call is attempted. See ``_post_json_ticket_vendor``.
+  no ``sha256=`` prefix). ``screenshot_url`` is either the CRM's own inbound
+  URL (``ChatMessage.source_media_url``, when the message carried one) or,
+  failing that, a time-limited signed URL from the tenant's media store
+  (``IMediaStorage.signed_url``) — never the raw bytes. Either way it must be
+  a real, publicly-fetchable https URL: a relative/unsigned URL (e.g. from
+  ``LocalMediaStorage``) or a plain-http CRM URL is refused before any vendor
+  call is attempted. See ``_post_json_ticket_vendor``.
 
-  Caveat: once the signed URL's TTL (``screenshot_url_ttl_seconds``) expires,
+  Caveat: once a signed URL's TTL (``screenshot_url_ttl_seconds``) expires —
+  or, on the source-URL path, once the CRM's own URL expires or is revoked —
   the vendor gets an opaque failure (e.g. an S3 403) with no re-issue channel
   in this vendor's protocol — there is no way to hand it a fresh URL after
   the fact. Operators should configure a generous TTL and rely on the
@@ -39,7 +42,7 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import urlsplit
 
 import httpx
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 
 from src.auth.context import TenantContext
 from src.campaign.dnd_filter import normalize_phone
@@ -104,12 +107,37 @@ async def submit_deposit_verification(
         }
 
     async with sessionmaker() as db:
+        # The row-selection predicate depends on the contract: `json_ticket_relay`
+        # can use EITHER our own `media_url` (download() + signed_url()) OR the
+        # CRM's `source_media_url` forwarded as-is (see module docstring and
+        # `use_source_url` below), so a row need only have one of the two to be
+        # usable. `multipart_verdict` genuinely needs the bytes in our own
+        # store, so it must keep requiring `media_url` exactly as before.
+        # Without this, a row persisted with `media_url=NULL` (object storage
+        # was unavailable at upload time — see src/api/chat.py) but a usable
+        # `source_media_url` would be invisible to this query, and the tool
+        # would report `no_screenshot` even though a usable URL exists — this
+        # is precisely the outage this feature exists to survive. An empty
+        # string `source_media_url` does not count as usable (falls back to
+        # the signed-URL path instead), matching the truthiness check used
+        # everywhere else this column is tested.
+        if dv_config.contract == "json_ticket_relay":
+            screenshot_predicate = or_(
+                ChatMessage.media_url.isnot(None),
+                and_(
+                    ChatMessage.source_media_url.isnot(None),
+                    ChatMessage.source_media_url != "",
+                ),
+            )
+        else:
+            screenshot_predicate = ChatMessage.media_url.isnot(None)
+
         screenshot_row = (await db.execute(
             select(ChatMessage)
             .where(
                 ChatMessage.session_id == session_id,
                 ChatMessage.type == "image",
-                ChatMessage.media_url.isnot(None),
+                screenshot_predicate,
             )
             .order_by(ChatMessage.id.desc())
             .limit(1)
@@ -140,24 +168,48 @@ async def submit_deposit_verification(
                 ),
             }
 
-        try:
-            data, mime = await media_store.download(screenshot_row.media_url)
-        except FileNotFoundError:
-            log.warning(
-                "deposit verification: screenshot missing from media store",
-                extra={
-                    "ticket_id": ticket_id, "session_id": session_id,
-                    "media_url": screenshot_row.media_url,
-                },
-            )
-            return {
-                "status": "no_screenshot",
-                "message": (
-                    "No screenshot has been uploaded in this conversation yet. Ask the "
-                    "customer to upload a screenshot of the successful transaction before "
-                    "calling this tool again."
-                ),
-            }
+        # `json_ticket_relay` rows that carry the CRM's own inbound URL
+        # (`source_media_url` — see src/api/chat.py's _persist_turn) never
+        # need the screenshot bytes: that URL gets forwarded to the vendor
+        # as-is (below), so skip the media-store round trip entirely for
+        # this case. This is also the case that no longer depends on our
+        # own object storage being reachable — everywhere else, `download()`
+        # doubles as both the existence probe (no_screenshot detection) and
+        # the byte source `_post_multipart_vendor` needs.
+        # Single source of truth for "does this row have a usable source URL",
+        # reused below at both the download-skip site and the URL-selection
+        # site (Finding: these two used to independently re-derive the same
+        # condition and only agreed because the contract string was
+        # hard-coded in both places). Gate on truthiness, not `is not None`:
+        # an empty string must fall back to the signed-URL path below rather
+        # than being treated as a usable URL (and, symmetrically, the query
+        # predicate above never selects a row on the strength of an empty
+        # `source_media_url` alone).
+        use_source_url = (
+            dv_config.contract == "json_ticket_relay"
+            and bool(screenshot_row.source_media_url)
+        )
+        data: bytes | None = None
+        mime: str | None = None
+        if not use_source_url:
+            try:
+                data, mime = await media_store.download(screenshot_row.media_url)
+            except FileNotFoundError:
+                log.warning(
+                    "deposit verification: screenshot missing from media store",
+                    extra={
+                        "ticket_id": ticket_id, "session_id": session_id,
+                        "media_url": screenshot_row.media_url,
+                    },
+                )
+                return {
+                    "status": "no_screenshot",
+                    "message": (
+                        "No screenshot has been uploaded in this conversation yet. Ask the "
+                        "customer to upload a screenshot of the successful transaction before "
+                        "calling this tool again."
+                    ),
+                }
 
         request_id = f"dvr_{uuid.uuid4().hex}"
         timeout_minutes = dv_config.timeout_minutes
@@ -177,26 +229,44 @@ async def submit_deposit_verification(
         await db.commit()
 
     if dv_config.contract == "json_ticket_relay":
-        # The raw screenshot bytes fetched above were only an existence probe
-        # for this contract (no_screenshot detection) — this vendor wants a
-        # fetchable URL, not the bytes, so `data`/`mime` are discarded here.
-        try:
-            url = await media_store.signed_url(
-                screenshot_row.media_url, dv_config.screenshot_url_ttl_seconds
-            )
-        except Exception:  # noqa: BLE001 — a failing vendor call must not kill the turn
-            log.exception(
-                "deposit verification: signed_url failed",
-                extra={"ticket_id": ticket_id, "session_id": session_id, "request_id": request_id},
-            )
-            await _mark_error(sessionmaker, request_id)
-            return {
-                "status": "error",
-                "message": (
-                    "Could not submit the verification request right now. Let the customer "
-                    "know you're having trouble and offer to escalate to a human agent."
-                ),
-            }
+        if use_source_url:
+            # Forward the CRM's own URL straight through instead of minting a
+            # signed one from our media store — this is the row for which the
+            # `download()` existence probe above was skipped, since the bytes
+            # were never needed on this path, only the URL.
+            #
+            # Tradeoff being encoded here: this removes our dependency on
+            # object storage for this contract (the thing that's actually
+            # down on this deploy), but the URL's lifetime and access rules
+            # now belong to the CRM instead of us, and — same as the
+            # signed-URL path below — this vendor's protocol has no channel
+            # to hand over a fresh URL later if it expires or is revoked. An
+            # expired/inaccessible CRM link falls through to the existing
+            # timeout-to-human escalation (`schedule_verification_timeout`)
+            # exactly like an expired signed URL would.
+            url = screenshot_row.source_media_url
+        else:
+            # The raw screenshot bytes fetched above were only an existence
+            # probe for this contract (no_screenshot detection) — this vendor
+            # wants a fetchable URL, not the bytes, so `data`/`mime` are
+            # discarded here.
+            try:
+                url = await media_store.signed_url(
+                    screenshot_row.media_url, dv_config.screenshot_url_ttl_seconds
+                )
+            except Exception:  # noqa: BLE001 — a failing vendor call must not kill the turn
+                log.exception(
+                    "deposit verification: signed_url failed",
+                    extra={"ticket_id": ticket_id, "session_id": session_id, "request_id": request_id},
+                )
+                await _mark_error(sessionmaker, request_id)
+                return {
+                    "status": "error",
+                    "message": (
+                        "Could not submit the verification request right now. Let the customer "
+                        "know you're having trouble and offer to escalate to a human agent."
+                    ),
+                }
         if urlsplit(url).scheme != "https":
             # Critical security gate: LocalMediaStorage.signed_url() happily
             # returns a relative, unsigned, non-expiring path — that must
@@ -257,6 +327,17 @@ async def submit_deposit_verification(
             session_id=session_id,
         )
     else:
+        # `use_source_url` is only ever True for `json_ticket_relay` (see its
+        # definition above), so this branch — reached only when the contract
+        # is NOT `json_ticket_relay` — always took the `if not use_source_url`
+        # download above, meaning `data`/`mime` are guaranteed populated here.
+        # Assert rather than trust the duplicated contract check: this makes
+        # the non-None-ness structural instead of something that only holds
+        # because two branches happen to test the same condition.
+        assert data is not None and mime is not None, (
+            "unreachable: multipart_verdict never sets use_source_url, so the "
+            "download() above always ran for this branch"
+        )
         ok = await _post_multipart_vendor(
             dv_config=dv_config,
             secret=secret,

@@ -739,3 +739,50 @@ def test_chatbot_static_body_is_identical_across_a_clock_tick_and_rag_change(mon
         include_variable_tail=False,
     )
     assert static_a == static_c
+
+
+def test_deposit_verification_covers_pending_not_only_failed() -> None:
+    """A deposit can be charged and left uncredited while its status still
+    reads pending -- per the CRM contract a raw PGS_SUCCESS buckets as pending
+    precisely because the wallet credit is unconfirmed -- so pending is the
+    case most worth verifying, not one to wait out.
+
+    The gate is model-facing text only (there is no status check in
+    submit_deposit_verification), so this text IS the rule and a regression
+    here silently narrows the tool back to failed-only with nothing else
+    catching it.
+    """
+    prompt = build_chatbot_system_prompt(
+        company_name="Acme", has_deposit_verification_tool=True,
+        prompt_pack="betting",
+    )
+    section = prompt[prompt.index("DEPOSIT DISPUTE VERIFICATION:"):]
+    section = section[:section.index("\n\n")] if "\n\n" in section else section
+
+    lowered = section.lower()
+    assert "anything other than successful" in lowered, (
+        "the trigger is still framed as failed-only"
+    )
+    assert "pending counts" in lowered, "no explicit pending-qualifies rule"
+    # The one status that must still rule the tool out.
+    assert "already confirmed successful" in lowered
+
+    # "Pending" now means two different things in this section -- the deposit's
+    # status and an already-submitted verification. They must be distinguished,
+    # or the model reads "already pending -> don't call" as covering a pending
+    # DEPOSIT and never calls the tool at all.
+    assert "- already submitted:" in lowered, (
+        "the already-submitted bullet still reads as 'already pending', which "
+        "collides with the deposit's own pending status"
+    )
+
+
+def test_deposit_verification_section_absent_without_the_tool() -> None:
+    """The section is gated on the tool actually being registered -- a tenant
+    without deposit verification must not be told to call a tool it does not
+    have."""
+    prompt = build_chatbot_system_prompt(
+        company_name="Acme", has_deposit_verification_tool=False,
+        prompt_pack="betting",
+    )
+    assert "DEPOSIT DISPUTE VERIFICATION:" not in prompt

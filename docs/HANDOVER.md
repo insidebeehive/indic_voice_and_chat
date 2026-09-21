@@ -1,10 +1,10 @@
 # Handover
 
 **Written:** 2026-09-04. This is the current source of truth for handing this project to
-a new owner. `docs/PROJECT-STATUS.md` and `docs/ARCHITECTURE.md` (last updated
-2026-06-15/16) are **stale on several major points** — see [What's stale in the old
-docs](#whats-stale-in-the-old-docs) before trusting them. `docs/chatbot.md` and
-`docs/crm-api-contract.md` (Aug 2026) are current and worth reading directly.
+a new owner. `docs/PROJECT-STATUS.md` is **stale on several major points** — see
+[What's stale in the old docs](#whats-stale-in-the-old-docs) before trusting it.
+`docs/ARCHITECTURE.md`, `docs/chatbot.md`, and `docs/crm-api-contract.md` are current
+and worth reading directly.
 
 ## What this is
 
@@ -40,17 +40,17 @@ shared DB), deployed to Northflank with auto-deploy from git.
 | Multi-tenant platform (5 core APIs, admin/console UIs) | live in production |
 | **ChatBot turn-metrics** (`chat_turn_metrics`/`chat_tool_metrics`, `GET /tenants/{id}/chat-turn-metrics`, Prometheus push, 90-day prune) | done — parity with voice's `TurnMetric`/`turn-metrics/summary` pipeline |
 | **Security posture** | **remediation sprint just completed** (2026-09-01/02) — read the section below before assuming anything is safe |
-| Tests | 2441 passing, 3 failing (1 known, 2 environmental — see [Testing](#testing)) |
+| Tests | 2908 passing, 2 failing — both pre-existing, unrelated to most work (see [Testing](#testing)) |
 | Campaign → live outbound calling | orchestration logic done; live dispatch/outcome wiring not fully validated |
 | Benchmarking harness | still a basic skeleton |
 | Code-switching / multilingual | not implemented — Hindi-only on voice |
 
 ## Architecture
 
-The diagram in `docs/ARCHITECTURE.md` is still structurally correct for the *voice*
-side but is missing LiveKit and says nothing about the chat/CRM side, which is now
-comparably large. Read both `docs/ARCHITECTURE.md` (voice/platform shape) and
-`docs/chatbot.md` (chat/CRM shape) together.
+`docs/ARCHITECTURE.md` covers both sides: a VoiceBot flow diagram (LiveKit included),
+a separate ChatBot flow diagram, a shared-knowledge-base diagram, and a
+tools/providers-by-module reference table. Read it alongside `docs/chatbot.md` for
+the fuller ChatBot API/DB reference.
 
 One FastAPI app (`src/main.py`), two tenant-facing surfaces:
 
@@ -156,9 +156,19 @@ All five are marked fixed+tested in their commit messages, but **verify independ
 before treating them as closed** — this is exactly the kind of thing a departing team
 says is fixed and a new owner should re-check.
 
-**Known remaining gap**: webhook signature-verification infra
-(`src/auth/webhook_auth.py`) exists but is **not wired into any live route yet** —
-`VOX_WEBHOOK_SIGNATURE_MODE` defaults to `"enforce"` but nothing currently calls it.
+**Webhook signature verification**: `src/auth/webhook_auth.py`'s Chatwoot HMAC check
+(`verify_chatwoot`) is wired into the live Chatwoot webhook route
+(`src/api/external_chat.py:308`) and runs whenever a tenant has a
+`chatwoot:webhook_hmac_secret` configured — HMAC is opt-in per tenant; the primary
+auth boundary is still the unguessable per-tenant `webhook_id` path segment.
+`VOX_WEBHOOK_SIGNATURE_MODE` (default `"enforce"`) controls what happens on a
+mismatch: `enforce` hard-rejects the request, `log_only` logs a warning and
+processes anyway; the same toggle also decides whether the deprecated, tokenless
+legacy Chatwoot route (`POST /integrations/chatwoot/webhook`) is hard-disabled
+(`enforce`) or still served with a deprecation warning (`log_only`). The module's
+other verification helpers — `verify_twilio`, `verify_stringee`,
+`verify_exotel_basic` — aren't called from any route yet; only the Chatwoot path
+and `signature_mode()` are wired in so far.
 
 Auth model: tenant bearer tokens (SHA-256 hashed, DB-backed), separate admin tokens
 (`VOX_ADMIN_TOKENS`, labeled per-admin), and per-tenant unguessable capability tokens
@@ -182,7 +192,7 @@ mini security changelog — read them.
   (Alembic has no cross-process lock).
 - **Datastores**: Postgres under schema `voicebot` (shared DB, `VOX_DB_SCHEMA`
   configurable), Redis for session storage.
-- **Schema** (20 migrations, actively maintained): tenants/secrets/api-keys/phone
+- **Schema** (22 migrations, actively maintained): tenants/secrets/api-keys/phone
   numbers; `provider_costs`; campaigns/leads; conversations/turns/events (voice);
   chat_sessions/chat_messages/chat_tools; crms/crm_tools/crm_secrets/crm_kb_documents
   (CRM-partner-level, shared across tenants under that CRM); deposit_verification_requests;
@@ -196,23 +206,27 @@ mini security changelog — read them.
   one-off data fixes, smoke-test callers per provider, KB ingestion, benchmark runner.
   `tools/mock_crm.py` is a mock CRM server for local dev.
 - **Static browser UIs** (`static/`): `/admin` (tenant registration+costs), `/console`
-  (campaigns/calls), `/admin/tenants` (backoffice: analytics/billing, human-agent
-  handover UI), `/dev/voice` (live voice testing), embeddable chat widget.
+  (campaigns/calls), `/admin/tenants` (backoffice — Analytics, Pipeline, CRM,
+  Campaign, Chat, Knowledge Base, Billing, Telephony, and Deposit verification tabs;
+  catalog-backed TTS/realtime voice pickers; token/cost/cache-hit-rate analytics),
+  `/bo-agent` (separate human-agent console: claim an escalated chat session and
+  reply live), `/dev/voice` (live voice testing), embeddable chat widget.
 
 ### Testing
-Current run: **2441 passed, 3 failed**.
-1. `test_chat_routes.py::test_claim_session_and_agent_ws` — pre-existing, documented
-   in `CLAUDE.md`, unrelated to most work. Still failing, unchanged.
-2. `test_dev_console.py::test_place_call_passes_tenant_creds_to_adapter` — **new**,
-   not previously known. Looks like real `.env` Stringee credentials are leaking into
-   a test that expects a monkeypatched fake SID — a precedence bug between
-   monkeypatched env and already-loaded settings/cache. Worth investigating before
-   handover; not yet diagnosed to root cause.
-3. `test_pgvector_crm_scoping.py::test_crm_scoped_chunk_is_isolated_from_tenant_scoped_chunk`
-   — `pgvector` is declared in `pyproject.toml` but not installed in `.venv` (stale
-   venv, not a code bug). Fix: `pip install -e ".[dev]"`.
+Current run: **2908 passed, 2 failed**. Both failures are pre-existing and unrelated
+to most work — don't chase either unless the task is specifically about it, and
+re-verify the count yourself before trusting it, since it drifts:
+1. `test_chat_routes.py::test_claim_session_and_agent_ws`.
+2. `test_dev_console.py::test_place_call_passes_tenant_creds_to_adapter` — real
+   `.env` Stringee credentials leak into a test that expects a monkeypatched fake
+   SID, a precedence bug between monkeypatched env and already-loaded
+   settings/cache. Not yet diagnosed to root cause.
 
-`tests/unit` (158 files) is fully mocked. `tests/integration` (6 files) runs by
+`test_pgvector_crm_scoping.py::test_crm_scoped_chunk_is_isolated_from_tenant_scoped_chunk`
+passes — it guards the multi-tenant KB isolation boundary and runs as part of the
+default suite, not something that needs `pgvector` installed separately.
+
+`tests/unit` (188 files) is fully mocked. `tests/integration` (6 files) runs by
 default against fixtures/mocks. `tests/live` (1 file) hits real provider APIs and is
 excluded by default (`-m 'not live'`); opt in with `VOX_LIVE_TESTS=1`.
 
@@ -220,21 +234,25 @@ Verify command: `.venv/bin/python -m pytest tests/ -q`
 
 ## What's stale in the old docs
 
-`docs/PROJECT-STATUS.md` and `docs/ARCHITECTURE.md` (2026-06-15/16) are wrong or
-missing on:
-- Calling RAG/ChatBot "untouched scaffold, not part of current work" — it's the
-  opposite: the primary active area, with 170+ commits since.
+`docs/ARCHITECTURE.md` is current, not stale — it documents LiveKit (in the voice
+diagram and the tools/providers table) and the ChatBot/CRM side (its own flow
+diagram, the shared-KB diagram, and the tools table) directly. Read it, don't
+mentally patch it.
+
+`docs/PROJECT-STATUS.md` self-declares stale in its own header ("Last updated:
+2026-06-15... this document is stale beyond that date") and points readers at this
+file instead. A few individual lines have been corrected since — its RAG/ChatBot
+row now reads "mature, primary active workstream" rather than "untouched scaffold"
+— but the rest hasn't had a full pass, and it's still wrong or missing on:
 - Calling Telnyx/Infobip "auth scaffold only" — they've been deleted entirely.
 - Saying telephony barge-in is "pending across all telephony" — true for cascade
-  mode, but S2S transports (browser, Twilio/Exotel S2S, LiveKit) have had native
-  barge-in for a while.
-- Not mentioning LiveKit at all — it's now the flagship telephony integration.
-- Not mentioning deposit verification, the security remediation, or the CRM/KB
-  layers at all.
+  mode, but S2S transports (browser, Twilio/Exotel S2S, LiveKit) have native
+  barge-in.
+- Not mentioning LiveKit, deposit verification, or the security remediation at all.
 
-Recommend either updating those two files or retiring them in favor of this one —
-your call; I didn't overwrite them since they're not simply wrong, they're a
-snapshot of a real prior state that may still have historical value.
+Recommend retiring `docs/PROJECT-STATUS.md` in favor of this one — your call; I
+didn't overwrite it since it's a snapshot of a real prior state that may still have
+historical value.
 
 ## Suggested reading order for a new owner
 

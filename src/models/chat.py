@@ -63,6 +63,14 @@ class ChatMessage(Base):
     content: Mapped[str] = mapped_column(Text, nullable=False)
     media_url: Mapped[Optional[str]] = mapped_column(String(500))
     media_mime: Mapped[Optional[str]] = mapped_column(String(50))
+    # The ORIGINAL client-supplied URL when the inbound message carried one
+    # (e.g. the CRM's own public https media_url) — kept alongside media_url
+    # (which stores OUR media-store object key for the same row) so a
+    # downstream consumer can forward the client's URL directly instead of
+    # re-deriving a signed URL from our own store. NULL when the client
+    # uploaded raw bytes (base64 data) instead of a URL, or for any row
+    # written before this column existed.
+    source_media_url: Mapped[Optional[str]] = mapped_column(Text)
     sources: Mapped[Optional[dict]] = mapped_column(JSON)
     tool_calls: Mapped[Optional[dict]] = mapped_column(JSON)
     latency_ms: Mapped[Optional[int]] = mapped_column(Integer)

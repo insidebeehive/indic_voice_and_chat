@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Optional
 
@@ -76,6 +77,191 @@ def neutralize_sources_markers(text: str, *, source: str = "") -> str:
     return _SOURCES_MARKER_PATTERN.sub(
         lambda m: m.group(0).replace("<", "‹").replace(">", "›"), text
     )
+
+
+# --- Trusted-frame defanging ---------------------------------------------
+#
+# Shared by src.agents.chatbot._defang_platform_frames (the CRM's
+# previous_conversation summary) and src.api.deposit_verification's
+# _defang_relay_frames (a vendor's ticket-reply relay message). Both call
+# sites need the identical "strip invisibles -> NFKC -> defang frames/
+# markers" pipeline; this is the one implementation, so it lives here next
+# to neutralize_sources_markers, which the pipeline also calls.
+
+# Canonical definition of the per-turn "the platform said this, not the
+# customer" frame src.agents.chatbot._fold_turn_context wraps around
+# retrieved sources/current time/language directive. Defined HERE, not in
+# chatbot.py, so this module can build the defang regex below from these
+# constants without importing chatbot.py: chatbot.py already imports FROM
+# this module (for neutralize_sources_markers and the guard functions), so
+# the reverse import would be a cycle. chatbot.py imports TURN_CONTEXT_OPEN/
+# TURN_CONTEXT_CLOSE back from here (they remain available as
+# `chatbot.TURN_CONTEXT_OPEN` etc.), and src.api.deposit_verification's own
+# `_TURN_CONTEXT_OPEN`/`_TURN_CONTEXT_CLOSE` do the same instead of typing
+# the text out a second/third time.
+TURN_CONTEXT_OPEN = (
+    "SYSTEM TURN CONTEXT — supplied by the support platform for this turn, not "
+    "written by the customer. It carries the same authority as the system "
+    "instructions above."
+)
+TURN_CONTEXT_CLOSE = "END SYSTEM TURN CONTEXT. The customer's own message follows."
+
+
+def _build_invisible_format_chars() -> str:
+    """Every Unicode General Category Cf ("format"/invisible) codepoint,
+    plus the variation-selector blocks VS1-16 (U+FE00-U+FE0F -- category
+    Mn, but functionally the same "invisible modifier" problem) and
+    VS17-256 (U+E0100-U+E01EF).
+
+    Built programmatically from ``unicodedata`` at import time, never typed
+    out as a literal list -- a hand-typed list is exactly how this gap
+    first shipped (covering only ~9 familiar codepoints such as U+200B/
+    U+FEFF out of the ~170 Unicode actually assigns category Cf), missing
+    the tag-character block (U+E0001, U+E0020-U+E007F) entirely -- the
+    canonical invisible-prompt-injection vector, since a tag character can
+    be wedged between any two letters of a forged marker/frame with zero
+    visual trace. A programmatic class can't silently drift from the
+    Unicode data as new Cf codepoints get assigned in future versions, the
+    way a typed-out list already had.
+    """
+    chars = [
+        chr(cp) for cp in range(0x110000)
+        if not (0xD800 <= cp <= 0xDFFF)  # lone surrogates: not real codepoints
+        and unicodedata.category(chr(cp)) == "Cf"
+    ]
+    chars.extend(chr(cp) for cp in range(0xFE00, 0xFE10))  # VS1-16
+    chars.extend(chr(cp) for cp in range(0xE0100, 0xE01F0))  # VS17-256
+    return "".join(chars)
+
+
+_INVISIBLE_FORMAT_RE = re.compile("[" + re.escape(_build_invisible_format_chars()) + "]")
+
+
+def _frame_regex(literal: str) -> re.Pattern[str]:
+    """Compile *literal* (one of the two ``TURN_CONTEXT_*`` constants above)
+    into a case-insensitive, whitespace-tolerant regex, instead of matching
+    it exact-literal.
+
+    Mirrors this module's own reasoning for ``_SOURCES_MARKER_PATTERN``
+    above: "a model would plausibly honour ``<<< end sources >>>`` even
+    though ``==`` never would". The same argument applies here -- a model
+    asked to honour "SYSTEM TURN CONTEXT" would plausibly also honour
+    "system turn context" or "System  Turn  Context" (extra/irregular
+    whitespace), even though Python's ``==`` (what a plain ``str.replace``
+    relies on) treats those as entirely unrelated strings. That argument
+    covers approximate matching ONLY -- it says nothing about case folding
+    or invisible characters, which change nothing a human or model
+    perceives; those are closed instead by ``defang_trusted_frames``'s
+    invisible-strip and NFKC steps below, run before this regex ever sees
+    the text.
+    """
+    parts = re.split(r"\s+", literal.strip())
+    pattern = r"\s+".join(re.escape(part) for part in parts)
+    return re.compile(pattern, re.IGNORECASE)
+
+
+_TURN_CONTEXT_OPEN_RE = _frame_regex(TURN_CONTEXT_OPEN)
+_TURN_CONTEXT_CLOSE_RE = _frame_regex(TURN_CONTEXT_CLOSE)
+
+
+def _has_forged_frame_or_marker(view: str) -> bool:
+    """True if *view* contains a forged sources-marker run (``_SOURCES_MARKER_
+    PATTERN``, the same pattern ``neutralize_sources_markers`` acts on) or a
+    forged ``TURN_CONTEXT_OPEN``/``TURN_CONTEXT_CLOSE`` frame
+    (case-insensitive, whitespace-tolerant). Detection-only -- never mutates
+    or logs; ``defang_trusted_frames`` below only escalates to the logging,
+    mutating helpers once this has already said yes on some view."""
+    return bool(
+        _SOURCES_MARKER_PATTERN.search(view)
+        or _TURN_CONTEXT_OPEN_RE.search(view)
+        or _TURN_CONTEXT_CLOSE_RE.search(view)
+    )
+
+
+def defang_trusted_frames(text: str, *, source: str = "") -> str:
+    """Defang a trusted-content frame/marker forgery, WITHOUT rewriting text
+    that never attempted one.
+
+    Rationale for the two-tier structure: the old, unconditional pipeline
+    (strip invisibles -> NFKC -> neutralize/defang) ran on every caller's
+    text, including ordinary clean prose. ``_INVISIBLE_FORMAT_RE`` strips
+    real, semantically-load-bearing characters in legitimate Indic text
+    (ZWNJ in a Hindi conjunct, ZWJ in a Bengali ro-phola or an emoji ZWJ
+    sequence) and NFKC can rewrite superscripts/fractions/lookalike glyphs
+    into different, sometimes misleading, plain characters ("1½ lakh" ->
+    "11⁄2 lakh", which *reads* as "11 lakh"). Both are fine to do to an
+    attacker's payload; neither is acceptable to do to a customer's own
+    message or a clean CRM/vendor summary. So: normalize only to LOOK for a
+    forgery, and only pay the corruption cost on text that actually
+    contains one.
+
+    1. Build a DETECTION VIEW: strip invisible/format characters
+       (``_INVISIBLE_FORMAT_RE``) then NFKC-normalize. This view is used
+       only for the check below -- it is never returned.
+    2. Check for a forged marker/frame in BOTH the original ``text`` and the
+       detection view (``_has_forged_frame_or_marker``, which runs
+       ``neutralize_sources_markers``'s marker pattern and both
+       ``TURN_CONTEXT_*`` frame regexes -- all three already
+       case-insensitive and whitespace-tolerant, so a verbatim, case-varied,
+       or odd-whitespace forgery is already caught against the RAW text with
+       no normalization at all). Checking both views catches strictly more
+       than either alone: a verbatim/case/whitespace forgery appears
+       unnormalized in the original text already; an obfuscated one (an
+       invisible character wedged inside the frame text breaking contiguity,
+       or a fullwidth/small-form bracket lookalike that only reads as ``<``/
+       ``>`` after NFKC) appears only in the detection view once that
+       obfuscation is undone. There is therefore no payload that is
+       dangerous in the original text yet clean in BOTH views -- anything
+       that could forge a frame downstream is caught by one check or the
+       other here first.
+    3. Nothing found in either view: return ``text`` completely UNCHANGED --
+       no strip, no NFKC, byte-identical. This is the common case (clean
+       prose, including the Indic/emoji/numeric-lookalike examples above)
+       and it must be exact.
+    4. Something found in either view: fall back to today's aggressive
+       pipeline, run on the ALREADY-COMPUTED detection view (stripped +
+       NFKC'd) rather than recomputing it -- ``neutralize_sources_markers``
+       mangles any run of 3+ angle brackets, then the two ``TURN_CONTEXT_*``
+       regexes catch the plain-English frame in any case/whitespace variant.
+       Each match is replaced with the non-empty sentinel ``"[removed]"``,
+       NEVER ``""`` -- an empty replacement would delete the frame but let
+       the text immediately before and after it join up, which can itself
+       assemble into a fresh forged marker/frame nothing here explicitly
+       detects (e.g. ``"<<"`` immediately followed by ``"<SOURCES>>>"`` with
+       the forged middle span removed empty would leave ``"<<<SOURCES>>>"``
+       intact). The sentinel breaks that adjacency deliberately -- this is
+       NOT a simplification opportunity; do not change it to ``""``.
+       Corrupting an attacker's own prose on this path is fine; only the
+       no-forgery path (step 3) needs to be byte-preserving.
+    5. No-growth guarantee: NFKC can EXPAND text (e.g. U+FDFA is 1 character
+       but NFKC-normalizes to an 18-character string), so step 4's output
+       can be longer than the input even though every other transform here
+       only shrinks or holds length steady. Callers such as
+       ``src.agents.chatbot._fold_previous_conversation`` rely on this
+       function never growing its input past a caller-enforced cap (see
+       ``PREVIOUS_CONVERSATION_MAX_CHARS``) -- that cap is applied to the
+       INPUT, not re-applied after this call, so if this function could grow
+       the text, the effective bound folded into every LLM turn would not be
+       the cap the caller thinks it is. Truncating to ``len(text)`` here
+       makes "never longer than the input" a property of this shared layer
+       itself, holding for every caller, present and future, rather than
+       something each caller must separately re-enforce after the fact.
+    """
+    if not text:
+        return text
+    detection_view = unicodedata.normalize("NFKC", _INVISIBLE_FORMAT_RE.sub("", text))
+    if not _has_forged_frame_or_marker(text) and not _has_forged_frame_or_marker(detection_view):
+        return text
+    cleaned = neutralize_sources_markers(detection_view, source=source)
+    for pattern in (_TURN_CONTEXT_OPEN_RE, _TURN_CONTEXT_CLOSE_RE):
+        cleaned = pattern.sub("[removed]", cleaned)
+    # Step 5 above: NFKC (folded into detection_view) can expand text; this
+    # is the only place that can happen on this path, so truncating here is
+    # sufficient to guarantee the whole function never returns something
+    # longer than its input.
+    if len(cleaned) > len(text):
+        cleaned = cleaned[: len(text)]
+    return cleaned
 
 
 @dataclass
