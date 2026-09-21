@@ -185,6 +185,20 @@ class TelephonyCreds(BaseModel):
     user_id_env: Optional[str] = None
 
 
+# Providers with no telephony adapter and no per-tenant account: no adapter is
+# ever built for them as the CONFIGURED provider, so a missing
+# account_sid_env/auth_token_env has nothing to silently fall back from and the
+# platform-billing risk validate_credentials guards against does not arise on
+# that path. Narrowly scoped on purpose: the top-level cred fields are not read
+# only for the configured provider — creds_for() takes an arbitrary provider and
+# falls through to them (src/api/dev_console.py passes a request-supplied one),
+# so an exempt tenant that also sets pipeline.telephony.outbound_from.<other>
+# can still reach a real adapter with unset creds. Case-insensitive match
+# against provider, consistent with how src/api/calls.py and creds_for()
+# normalize the provider string.
+CREDENTIAL_FREE_TELEPHONY_PROVIDERS = frozenset({"webconsole"})
+
+
 class TenantTelephonyConfig(BaseModel):
     provider: Optional[str] = None
     from_number: Optional[str] = None
@@ -541,7 +555,11 @@ def validate_credentials(settings: TenantSettings, *, source: str = "") -> None:
     would silently fall back to the platform's own telephony credentials
     (billing/placing calls on the wrong account). We raise this at load time
     so misconfigured tenants are caught on bootstrap rather than at
-    first-call.
+    first-call. Providers in ``CREDENTIAL_FREE_TELEPHONY_PROVIDERS`` (e.g.
+    ``webconsole``) are exempt from this one check: they have no telephony
+    adapter and no per-tenant account, so there is nothing to fall back from
+    and the platform-billing risk cannot arise. Every other rule below still
+    applies to them.
 
     STT/LLM/TTS/realtime/stt_streaming are different: those adapters
     *always* resolve their API key from the platform-level master env var
@@ -557,7 +575,7 @@ def validate_credentials(settings: TenantSettings, *, source: str = "") -> None:
     gaps: list[str] = []
     p = settings.pipeline
 
-    if p.telephony.provider:
+    if p.telephony.provider and (p.telephony.provider or "").lower() not in CREDENTIAL_FREE_TELEPHONY_PROVIDERS:
         if not p.telephony.account_sid_env:
             gaps.append(
                 f"pipeline.telephony.account_sid_env (provider={p.telephony.provider!r})"

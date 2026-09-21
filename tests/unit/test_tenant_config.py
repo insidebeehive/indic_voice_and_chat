@@ -349,6 +349,93 @@ def test_validate_credentials_passes_s2s_with_realtime() -> None:
     validate_credentials(t)
 
 
+def test_validate_credentials_passes_webconsole_without_creds() -> None:
+    """webconsole is a browser transport, not a real telephony account —
+    there is no adapter and no per-tenant creds to fall back from, so it is
+    exempt from the account_sid_env/auth_token_env requirement."""
+    from src.config_tenant import TenantPipelineConfig, TenantTelephonyConfig
+    t = TenantSettings(
+        id="t1", slug="t1", name="T1",
+        pipeline=TenantPipelineConfig(
+            telephony=TenantTelephonyConfig(provider="webconsole"),
+        ),
+    )
+    validate_credentials(t)
+
+
+def test_validate_credentials_passes_webconsole_mixed_case() -> None:
+    """The provider string is never normalized on write (tenants.py stores it
+    verbatim from the request body), and every other consumer of
+    telephony.provider lowercases before comparing. The exemption check must
+    do the same, or a tenant registered as "WebConsole" would be refused
+    outbound dialing by calls.py yet still be hard-required to declare
+    telephony creds here."""
+    from src.config_tenant import TenantPipelineConfig, TenantTelephonyConfig
+    t = TenantSettings(
+        id="t1", slug="t1", name="T1",
+        pipeline=TenantPipelineConfig(
+            telephony=TenantTelephonyConfig(provider="WebConsole"),
+        ),
+    )
+    validate_credentials(t)
+
+
+def test_validate_credentials_passes_webconsole_s2s_with_chat_voice() -> None:
+    """The real-world shape that motivated the exemption: a webconsole tenant
+    running s2s realtime with its own chat_voice TTS override, and no
+    telephony credentials at all — none are needed for webconsole."""
+    from src.config_tenant import (
+        ChatVoiceConfig, TenantPipelineConfig, TenantRealtimeConfig,
+        TenantTTSConfig, TenantTelephonyConfig,
+    )
+    t = TenantSettings(
+        id="t1", slug="t1", name="T1",
+        pipeline=TenantPipelineConfig(
+            mode="s2s",
+            telephony=TenantTelephonyConfig(provider="webconsole"),
+            realtime=TenantRealtimeConfig(provider="gemini_live"),
+            chat_voice=ChatVoiceConfig(enabled=True, tts=TenantTTSConfig(provider="google")),
+        ),
+    )
+    validate_credentials(t)
+
+
+def test_validate_credentials_raises_when_webconsole_chat_voice_has_no_tts() -> None:
+    """The exemption is narrow: it only skips the telephony credential check.
+    A webconsole tenant with chat_voice enabled and no resolvable TTS
+    anywhere still raises on the chat_voice rule."""
+    from src.config_tenant import ChatVoiceConfig, TenantPipelineConfig, TenantTelephonyConfig
+    t = TenantSettings(
+        id="t1", slug="t1", name="T1",
+        pipeline=TenantPipelineConfig(
+            telephony=TenantTelephonyConfig(provider="webconsole"),
+            chat_voice=ChatVoiceConfig(enabled=True),
+        ),
+    )
+    with pytest.raises(TenantConfigError, match="pipeline.chat_voice.tts") as exc:
+        validate_credentials(t)
+    assert "account_sid_env" not in str(exc.value)
+    assert "auth_token_env" not in str(exc.value)
+
+
+def test_validate_credentials_raises_when_webconsole_s2s_without_realtime() -> None:
+    """The exemption is narrow: it only skips the telephony credential check.
+    A webconsole tenant in s2s mode with no realtime.provider still raises on
+    the realtime rule."""
+    from src.config_tenant import TenantPipelineConfig, TenantTelephonyConfig
+    t = TenantSettings(
+        id="t1", slug="t1", name="T1",
+        pipeline=TenantPipelineConfig(
+            mode="s2s",
+            telephony=TenantTelephonyConfig(provider="webconsole"),
+        ),
+    )
+    with pytest.raises(TenantConfigError, match="pipeline.realtime") as exc:
+        validate_credentials(t)
+    assert "account_sid_env" not in str(exc.value)
+    assert "auth_token_env" not in str(exc.value)
+
+
 # --- Chat voice replies --------------------------------------------------
 
 
