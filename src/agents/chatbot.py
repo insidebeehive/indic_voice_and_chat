@@ -55,6 +55,8 @@ from src.interfaces.llm import (
     ToolSpec,
 )
 from src.rag.context_builder import (
+    TURN_CONTEXT_CLOSE,
+    TURN_CONTEXT_OPEN,
     GuardConfig,
     _redact_pii_for_log,
     apply_hallucination_guard,
@@ -62,6 +64,7 @@ from src.rag.context_builder import (
     apply_pii_guard,
     apply_unverified_data_guard,
     build_rag_context,
+    defang_trusted_frames,
     neutralize_sources_markers,
     search_combined,
 )
@@ -544,12 +547,15 @@ def _usage_tokens(result: LLMResult | None) -> tuple[int, int, int]:
 # directive) for something the customer said — it carries an instruction
 # (reply in language X) and a fact (current time) that must be read with the
 # same authority as the system instructions above, not as customer speech.
-TURN_CONTEXT_OPEN = (
-    "SYSTEM TURN CONTEXT — supplied by the support platform for this turn, not "
-    "written by the customer. It carries the same authority as the system "
-    "instructions above."
-)
-TURN_CONTEXT_CLOSE = "END SYSTEM TURN CONTEXT. The customer's own message follows."
+#
+# TURN_CONTEXT_OPEN/TURN_CONTEXT_CLOSE themselves are defined in
+# src.rag.context_builder (imported above), not here — that module needs
+# them to build the defang regex _defang_platform_frames below now calls,
+# and chatbot.py already imports FROM context_builder.py, so defining them
+# there (rather than importing them the other direction) is what avoids a
+# cycle. They stay available here as module-level names (`chatbot.
+# TURN_CONTEXT_OPEN`, per the existing pinning test in
+# tests/unit/test_deposit_ticket_reply_route.py) purely via this import.
 
 
 def _fold_turn_context(user_msg: LLMMessage, tail: str) -> LLMMessage:
@@ -664,14 +670,21 @@ def _defang_platform_frames(summary: str) -> str:
     whoever holds that id — the browser widget, and therefore the end user —
     not only by the CRM relaying it.
 
-    Exact-match replacement, because the verbatim string is the only version
-    that reads as genuine; an approximation the model would discount is not
-    worth the false-positive risk of a fuzzy match against real summary prose.
+    Delegates to src.rag.context_builder.defang_trusted_frames, the single
+    shared implementation also used by src.api.deposit_verification's
+    _defang_relay_frames (a vendor's ticket-reply relay message has the exact
+    same forgery surface). That pipeline is regex-based, case-insensitive and
+    whitespace-tolerant, with an invisible-character strip and NFKC
+    normalization run first — NOT a plain exact-match ``str.replace``, which
+    this function used to do. Exact-match replacement is right for one thing
+    only: preferring a real forgery attempt (the verbatim string) over a
+    fuzzy match that would risk false-positiving on real summary prose. It is
+    NOT a defense against case folding or invisible/look-alike characters,
+    which change nothing a human or model perceives while still defeating a
+    literal ``==``-style comparison — see defang_trusted_frames's own
+    docstring for how those are closed instead.
     """
-    body = neutralize_sources_markers(summary, source="previous_conversation")
-    for forged in (TURN_CONTEXT_OPEN, TURN_CONTEXT_CLOSE):
-        body = body.replace(forged, "[removed]")
-    return body
+    return defang_trusted_frames(summary, source="previous_conversation")
 
 
 def _fold_previous_conversation(user_msg: LLMMessage, summary: str) -> LLMMessage:

@@ -30,7 +30,6 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
-import unicodedata
 from datetime import datetime, timedelta, timezone
 from typing import Any, Literal, Optional
 
@@ -48,7 +47,12 @@ from src.auth.middleware import tenant_from_id
 from src.integration.tenant_events import verify_signature, verify_signature_hex
 from src.models.chat import ChatSession
 from src.models.deposit_verification import DepositVerificationRequest
-from src.rag.context_builder import neutralize_sources_markers
+from src.rag.context_builder import (
+    _INVISIBLE_FORMAT_RE,
+    TURN_CONTEXT_CLOSE as _TURN_CONTEXT_CLOSE,
+    TURN_CONTEXT_OPEN as _TURN_CONTEXT_OPEN,
+    defang_trusted_frames,
+)
 
 log = logging.getLogger(__name__)
 router = APIRouter(prefix="/deposit-verification", tags=["deposit-verification"])
@@ -201,52 +205,27 @@ _BIDI_OVERRIDE_RE = re.compile(r"[‪-‮⁦-⁩]")
 # has no legitimate use for them — same rationale as _BIDI_OVERRIDE_RE above,
 # just a different mechanism of "looks like X, isn't actually X".
 #
-# Built programmatically from `unicodedata.category` at import time, rather
-# than typed out as a literal list — a hardcoded list (U+00AD, U+200B-U+200F,
-# U+2060-U+2064, U+FEFF: 9 characters) is exactly how this gap shipped in the
-# first place, covering only 21 of the ~170 codepoints Unicode actually
-# assigns category Cf and missing, among others, the tag-character block
-# (U+E0001, U+E0020-U+E007F) — the canonical invisible-prompt-injection
-# vector, since a tag character can be wedged between ANY two letters of a
-# forged marker/frame with zero visual trace. A programmatic class can't
-# silently drift from the Unicode data as new Cf codepoints get assigned in
-# future Unicode versions, the way a typed-out list already had.
+# `_INVISIBLE_FORMAT_RE` itself now lives in src.rag.context_builder (built
+# there programmatically from `unicodedata.category` at import time, never a
+# hand-typed list — see that module's `_build_invisible_format_chars` for why
+# a hardcoded list is exactly how this gap first shipped, missing the
+# tag-character block among others) and is imported above, re-exported under
+# this same name so existing callers/tests (`dv._INVISIBLE_FORMAT_RE`) keep
+# working unchanged. It's the SAME instance src.agents.chatbot's
+# `_defang_platform_frames` now uses via `defang_trusted_frames` below — one
+# implementation, not two independently-drifting copies.
 #
-# U+061C (ARABIC LETTER MARK) is category Cf, so it's naturally subsumed by
-# this class too — not folded into _BIDI_OVERRIDE_RE above, since that regex
-# is itself just a hardcoded, non-programmatic list of a few bidi codepoints
-# and U+061C already has a correct, general home here instead.
-#
-# This is not merely cosmetic: both defences below it in _clean_relay_message
-# work by matching a CONTIGUOUS run of literal characters —
-# neutralize_sources_markers needs `<{3,}` / `>{3,}` (src/rag/context_
-# builder.py), and _defang_relay_frames's frame check (see that function)
-# matches _TURN_CONTEXT_OPEN/_TURN_CONTEXT_CLOSE. One invisible character
+# This is not merely cosmetic: both defences run inside `defang_trusted_
+# frames` work by matching a CONTIGUOUS run of literal characters —
+# neutralize_sources_markers needs `<{3,}` / `>{3,}`, and the frame check
+# matches `_TURN_CONTEXT_OPEN`/`_TURN_CONTEXT_CLOSE`. One invisible character
 # inserted between the brackets of "<<<SOURCES>>>", or between two letters of
-# "SYSTEM" inside _TURN_CONTEXT_OPEN, breaks that contiguity and lets the
+# "SYSTEM" inside `_TURN_CONTEXT_OPEN`, breaks that contiguity and lets the
 # forged marker/frame sail through BOTH checks untouched, only to read as the
 # genuine, un-broken string the moment something downstream (rendering, a
 # tokenizer, a human eye) treats the invisible character as nothing.
 # Stripping this class FIRST, before either check runs, closes that gap by
 # restoring true contiguity before anything tries to detect it.
-#
-# src.agents.chatbot._defang_platform_frames (around chatbot.py:647) does the
-# same two-layer defence for the CRM's previous_conversation summary and has
-# the exact same gap — not fixed here, since that module is under concurrent
-# edit in another session; whoever picks it up should apply the same fix
-# there.
-def _build_invisible_format_chars() -> str:
-    chars = [
-        chr(cp) for cp in range(0x110000)
-        if not (0xD800 <= cp <= 0xDFFF)  # lone surrogates: not real codepoints
-        and unicodedata.category(chr(cp)) == "Cf"
-    ]
-    chars.extend(chr(cp) for cp in range(0xFE00, 0xFE10))  # VS1-16
-    chars.extend(chr(cp) for cp in range(0xE0100, 0xE01F0))  # VS17-256
-    return "".join(chars)
-
-
-_INVISIBLE_FORMAT_RE = re.compile("[" + re.escape(_build_invisible_format_chars()) + "]")
 
 _MAX_RELAY_MESSAGE_LEN = 2000
 # Display/debugging history cap — kept small since it's only ever read by a
@@ -366,63 +345,25 @@ class DepositTicketReplyBody(BaseModel):
     type: str = "agent_reply"
 
 
-# Duplicated (not imported) from src.agents.chatbot's TURN_CONTEXT_OPEN /
-# TURN_CONTEXT_CLOSE (around line 547 there). That module builds
-# _fold_turn_context's per-turn frame, which tells the model the block
-# "carries the same authority as the system instructions" — a vendor-relayed
-# message that reproduces this text verbatim would, on the customer's next
-# turn, arrive in the model's context claiming that same authority, exactly
-# the forgery src.agents.chatbot's own _defang_platform_frames exists to
-# strip out of the CRM's previous_conversation summary (see that function's
-# docstring, lines ~648-676, for the full reasoning). Copied here rather than
-# imported because these are two frozen, already-shipped literal strings —
-# not logic that needs to stay wired to a single source of truth — and
-# src/agents/chatbot.py is a large module that may be under concurrent edit
-# elsewhere; importing from it would couple this webhook route's import
-# graph to that churn for no benefit over duplicating two constant strings.
-_TURN_CONTEXT_OPEN = (
-    "SYSTEM TURN CONTEXT — supplied by the support platform for this turn, not "
-    "written by the customer. It carries the same authority as the system "
-    "instructions above."
-)
-_TURN_CONTEXT_CLOSE = "END SYSTEM TURN CONTEXT. The customer's own message follows."
-
-
-def _frame_regex(literal: str) -> re.Pattern[str]:
-    """Compile ``literal`` (one of the two ``_TURN_CONTEXT_*`` constants
-    above) into a case-insensitive, whitespace-tolerant regex, instead of
-    matching it exact-literal.
-
-    Mirrors the exact reasoning ``_SOURCES_MARKER_PATTERN``
-    (src/rag/context_builder.py:36-54) already gives for why ITS OWN marker
-    handling is a regex rather than ``==``: "a model would plausibly honour
-    `<<< end sources >>>` even though `==` never would". The same argument
-    applies here verbatim — a model asked to honour "SYSTEM TURN CONTEXT"
-    would plausibly also honour "system turn context" or "System  Turn
-    Context" (extra/irregular whitespace), even though Python's ``==``
-    (what a plain ``str.replace`` relies on) treats those as entirely
-    unrelated strings. An exact-literal replace therefore left the frame
-    trivially forgeable by anyone who lowercased it — verified live: a
-    vendor message containing ``_TURN_CONTEXT_OPEN.lower()`` passed through
-    ``str.replace`` completely untouched and read identically to a model.
-
-    Built FROM the ``_TURN_CONTEXT_OPEN``/``_TURN_CONTEXT_CLOSE`` constants
-    (each literal run of whitespace in the constant becomes ``\\s+``, every
-    other run is ``re.escape``d) rather than typed out separately, so the
-    existing test that pins those constants against
-    ``src.agents.chatbot.TURN_CONTEXT_OPEN``/``TURN_CONTEXT_CLOSE``
-    (``test_turn_context_constants_match_chatbot_module``) keeps protecting
-    this regex too — if chatbot.py's wording ever changes, this regex
-    changes with it instead of silently going stale.
-    """
-    parts = re.split(r"\s+", literal.strip())
-    pattern = r"\s+".join(re.escape(part) for part in parts)
-    return re.compile(pattern, re.IGNORECASE)
-
-
-_TURN_CONTEXT_OPEN_RE = _frame_regex(_TURN_CONTEXT_OPEN)
-_TURN_CONTEXT_CLOSE_RE = _frame_regex(_TURN_CONTEXT_CLOSE)
-
+# `_TURN_CONTEXT_OPEN`/`_TURN_CONTEXT_CLOSE` are imported (aliased) above
+# from src.rag.context_builder, where the canonical `TURN_CONTEXT_OPEN`/
+# `TURN_CONTEXT_CLOSE` strings now live — that module builds
+# src.agents.chatbot._fold_turn_context's per-turn frame, which tells the
+# model the block "carries the same authority as the system instructions" —
+# a vendor-relayed message that reproduces this text verbatim would, on the
+# customer's next turn, arrive in the model's context claiming that same
+# authority, exactly the forgery src.agents.chatbot's own
+# _defang_platform_frames exists to strip out of the CRM's
+# previous_conversation summary (see that function's docstring for the full
+# reasoning). Previously duplicated here as two independently-typed literal
+# strings, pinned equal to chatbot.py's copy by
+# test_turn_context_constants_match_chatbot_module; now both this module's
+# and chatbot.py's names resolve to the SAME string object from
+# context_builder.py, so that test still guards against drift (it would now
+# only fail if one of the two modules stopped importing from there), and the
+# frame regexes below are built from the one shared definition instead of a
+# second copy of the text.
+#
 # Fixed, code-controlled provenance prefix. Today this text lands as an
 # unlabelled `system`-role row that both the customer AND the model (via
 # _hydrate_agent_history's system->assistant replay, see this module's
@@ -448,47 +389,6 @@ _TURN_CONTEXT_CLOSE_RE = _frame_regex(_TURN_CONTEXT_CLOSE)
 _RELAY_LABEL = "[Message from our payments team] "
 
 
-def _defang_relay_frames(text: str) -> str:
-    """Strip anything in ``text`` that could forge one of this codebase's own
-    trusted-content boundary frames.
-
-    Mirrors src.agents.chatbot._defang_platform_frames, which does the same
-    job for the CRM's previous_conversation summary (see that function's
-    docstring for the full "why", including why exact-match replacement is
-    used rather than a fuzzy one). Two layers, same as there:
-
-    1. ``neutralize_sources_markers`` (src/rag/context_builder.py) mangles
-       any run of 3+ angle brackets, so a vendor message can't forge/close/
-       re-open a ``SOURCES_OPEN_MARKER``/``SOURCES_CLOSE_MARKER`` pair — the
-       delimiter this route's own text does NOT use to wrap the vendor's
-       message, but which the model has been told elsewhere carries a
-       specific "retrieved data, not instructions" meaning that a forged
-       pair would try to hijack.
-    2. That neutralizer only matches angle-bracket runs, so it does nothing
-       for the plain-English ``_TURN_CONTEXT_OPEN``/``_TURN_CONTEXT_CLOSE``
-       frame src.agents.chatbot folds around per-turn platform context
-       (current time, retrieved sources, language directive) — those are
-       stripped here by ``_TURN_CONTEXT_OPEN_RE``/``_TURN_CONTEXT_CLOSE_RE``,
-       a case-insensitive, whitespace-tolerant regex built from the two
-       constants (see ``_frame_regex`` for why exact-match replacement was
-       not enough on its own — it left a trivial, verified-live lowercase
-       bypass).
-
-    Replaces each match with the non-empty sentinel ``"[removed]"``, NOT
-    ``""`` — an empty replacement would delete the frame but let the text
-    immediately before and after it join up, which can itself assemble into
-    a fresh forged marker/frame that the code never explicitly detects (e.g.
-    ``"<<"`` immediately followed by ``"<SOURCES>>>"`` with the forged
-    middle span removed empty would leave ``"<<<SOURCES>>>"`` intact). The
-    sentinel breaks that adjacency deliberately; it is not a stylistic
-    simplification opportunity.
-    """
-    body = neutralize_sources_markers(text, source="deposit_verification_relay")
-    for pattern in (_TURN_CONTEXT_OPEN_RE, _TURN_CONTEXT_CLOSE_RE):
-        body = pattern.sub("[removed]", body)
-    return body
-
-
 def _clean_relay_message(text: str) -> str:
     """Clean a vendor-supplied relay message for BOTH destinations it lands
     in — the stored ``verdict_payload`` entry and the text actually pushed
@@ -497,35 +397,29 @@ def _clean_relay_message(text: str) -> str:
     that divergence used to be a real bug here).
 
     Order matters:
-    1. Strip C0/C1 control characters (keeping '\\n'), Unicode bidi
-       override/embedding characters, AND the Cf "format"/invisible class
-       plus variation selectors (see ``_INVISIBLE_FORMAT_RE``) FIRST —
-       before the marker/frame check, so a vendor can't use one of these
-       invisible/non-printing characters to split up a marker string (e.g.
-       a stray tag character between the angle brackets of
-       ``<<<SOURCES>>>``, or between two letters of ``_TURN_CONTEXT_OPEN``'s
-       "SYSTEM") and slip it past the neutralizer undetected. This closes
-       that hole; see ``_INVISIBLE_FORMAT_RE``'s comment for why a plain
-       ordering claim isn't enough on its own — stripping this class first
-       is what actually restores contiguity for step 3 to detect.
-    2. Normalize the result to NFKC. This folds Unicode compatibility
-       lookalikes into their canonical form — fullwidth brackets
-       (``＜＜＜``/U+FF1C), small-form brackets (``﹤﹤﹤``/U+FE64), and
-       fullwidth/NBSP/ideographic-space stand-ins inside a frame all
-       normalize into the plain ASCII text the marker/frame checks below
-       actually look for, so a vendor can't dodge either check by
-       substituting a visually-identical codepoint for the real one.
-       Deliberately run AFTER the invisible-character strip (an invisible
-       character wedged mid-lookalike would otherwise survive NFKC as an
-       unrelated codepoint) and BEFORE the marker/frame check (so the
-       folded-back forgery is what gets caught). NFKC also normalizes other
-       text incidentally — fullwidth Latin, ligatures, some CJK
-       compatibility forms — which is an acceptable, one-way lossy
-       transform for a relayed support message; this route has no
-       legitimate use for compatibility-only Unicode variants.
-    3. Run the result through ``_defang_relay_frames`` so it can't forge
-       this codebase's own trusted-content boundary frames.
-    4. Prepend the fixed provenance label (``_RELAY_LABEL``) — but only if
+    1. Strip C0/C1 control characters (keeping '\\n') and Unicode bidi
+       override/embedding characters FIRST — this route-specific pair has
+       no legitimate use in a relayed support message and no bearing on the
+       marker/frame forgery this function's remaining steps defend against.
+    2. Run the result through ``defang_trusted_frames``
+       (src/rag/context_builder.py) — the ONE shared implementation also
+       used by src.agents.chatbot's ``_defang_platform_frames`` for the
+       CRM's previous_conversation summary, which has the identical forgery
+       surface (see that function's docstring for the full "why"). It only
+       rewrites text that actually attempted a forgery: it checks for a
+       forged ``SOURCES_OPEN_MARKER``/``SOURCES_CLOSE_MARKER`` (any run of
+       3+ angle brackets) or a forged ``_TURN_CONTEXT_OPEN``/
+       ``_TURN_CONTEXT_CLOSE`` frame in both the raw text and a
+       stripped-then-NFKC-normalized "detection view" of it (so an invisible
+       character wedged inside a marker/frame string, or a fullwidth/
+       small-form bracket lookalike, is still caught even though it isn't
+       visible in the raw text); a clean vendor message that trips neither
+       check comes back byte-identical. Only once something IS found does
+       it fall back to the aggressive strip-invisibles / NFKC / defang
+       pipeline against the sanitized text — see ``defang_trusted_frames``'s
+       own docstring for the full "why" and the non-empty ``"[removed]"``
+       sentinel (never ``""``).
+    3. Prepend the fixed provenance label (``_RELAY_LABEL``) — but only if
        there's actual cleaned content to label, once surrounding whitespace
        is discounted: a whitespace-only vendor message (e.g. ``"   "`` or
        ``"\\n\\n"``) must not become a chat bubble that's just the label and
@@ -533,16 +427,20 @@ def _clean_relay_message(text: str) -> str:
        strip()``, not ``cleaned`` itself — the un-stripped ``cleaned`` is
        still what gets labelled and returned, so genuine leading/trailing
        whitespace inside an otherwise-real message is preserved.
-    5. Truncate to ``_MAX_RELAY_MESSAGE_LEN`` LAST, so none of the above
-       transforms (which can only shrink, replace, or normalize text, never
-       grow it past what the vendor sent) can push the result back over the
-       cap.
+    4. Truncate to ``_MAX_RELAY_MESSAGE_LEN`` LAST. Most of the above only
+       shrinks, replaces, or leaves text as-is, but this is NOT universally
+       true of NFKC on ``defang_trusted_frames``'s forgery-found path — NFKC
+       can EXPAND text (e.g. U+FDFA is 1 character but normalizes to an
+       18-character string) — so it is ``defang_trusted_frames`` itself,
+       not this step, that guarantees its own output is never longer than
+       what it was given (see that function's docstring, step 5). This step
+       still has to run last regardless, so that a vendor message already
+       at the cap can't be pushed over it by the provenance label prepended
+       in step 3.
     """
     cleaned = _CONTROL_CHAR_RE.sub("", text)
     cleaned = _BIDI_OVERRIDE_RE.sub("", cleaned)
-    cleaned = _INVISIBLE_FORMAT_RE.sub("", cleaned)
-    cleaned = unicodedata.normalize("NFKC", cleaned)
-    cleaned = _defang_relay_frames(cleaned)
+    cleaned = defang_trusted_frames(cleaned, source="deposit_verification_relay")
     if cleaned.strip():
         cleaned = _RELAY_LABEL + cleaned
     else:
