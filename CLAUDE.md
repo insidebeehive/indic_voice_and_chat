@@ -57,19 +57,20 @@ Alembic migrations apply themselves on deploy — the `Dockerfile` CMD runs
 `alembic upgrade head` before exec'ing uvicorn. There is no manual upgrade step
 after shipping a migration, so don't tell anyone to run one.
 
-**A migration that does not reach head fails the deploy** (changed 2026-09-22).
-The container exits non-zero and the rollout stops rather than serving on an
-unmigrated schema. It retries three times with a 10s gap first, because the step
-was previously `;`-chained for a real reason: a plain `&&` caused a Northflank
-crash loop (bb6c6a4) when alembic blocked on a connection or lock held by the
-outgoing container during a rolling restart. The retries absorb that; a genuine
-migration error still fails all three and stops the deploy.
+**A migration that does not reach head fails the deploy.** The container exits
+non-zero and the rollout stops rather than serving on an unmigrated schema. It
+retries three times with a 10s gap first, because alembic can block on a
+connection or lock held by the outgoing container during a rolling restart —
+transient, and not something that should fail a deploy. A genuine migration
+error fails all three and does.
 
-The fail-open version hid the same bug twice — a revision id longer than
-`alembic_version.version_num`'s `VARCHAR(32)` (0019, then 0025) — each time
-leaving the app serving against columns that did not exist, with only whatever
-swallowed the resulting errors as evidence. Revision ids are now pinned by
-`tests/unit/test_alembic_revision_ids.py`.
+An unset `DATABASE_URL` skips migrations instead: `alembic/env.py` falls back to
+a localhost URL when it is absent, so there is no database to migrate. A set but
+unreachable one still fails.
+
+A revision id longer than `alembic_version.version_num`'s `VARCHAR(32)` can
+never be recorded, so its migration can never apply and everything behind it is
+blocked. `tests/unit/test_alembic_revision_ids.py` pins that.
 
 `src/main.py`'s `ensure_schema` is still fail-open by design (20s timeout, then
 boot proceeds). That is a different mechanism — it creates a missing schema and

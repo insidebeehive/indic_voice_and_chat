@@ -19,3 +19,12 @@
 - [Live testing](live-testing.md) — placing real calls, ngrok setup
 - [Multi-tenant plan](multi-tenant-plan.md)
 - [Stringee streaming](stringee-streaming.md)
+- [Debug logging](debug-logging.md) — DEBUG-level logging conventions and per-package checklist
+
+## Deployment
+- **[Northflank deploy runbook](deploy/northflank.md)** — Docker image, migration gating, rollout behavior
+
+## Contracts & integrations
+- [CRM chat media contract](crm-chat-media-contract.md)
+- [Deposit ticket signature](deposit-ticket-signature.md)
+- [Integrations](integrations/) — chat widget embed/frontend/backend integration, campaign-call handoff, coordination service, LiveKit room handoff, tenant call events

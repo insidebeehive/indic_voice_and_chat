@@ -4,7 +4,9 @@ Two stages: **(1) dev-console deploy now** (live test URL, no addons), and **(2)
 (Redis + Postgres + telephony). The image is built from the repo `Dockerfile`.
 
 The Dockerfile copies `src/ config/ static/ alembic/`, installs the `voice` extra (so **SileroVAD** works,
-not the rougher EnergyVAD fallback), and runs `uvicorn src.main:app --host 0.0.0.0 --port 8000`.
+not the rougher EnergyVAD fallback), applies migrations, and then runs
+`uvicorn src.main:app --host 0.0.0.0 --port 8000`. The migration step gates the app: see
+[Migrations](#migrations) below.
 
 ---
 
@@ -40,7 +42,9 @@ local `.env`:
 | `TENANT_DEV_ANTHROPIC_KEY` | `sk-ant-…` | optional (only if you switch the LLM to Claude) |
 
 Leave `REDIS_URL` / `DATABASE_URL` / `WEBHOOK_BASE_URL` **unset** for Stage 1 (defaults in
-`config/default.yaml` keep boot happy; telephony isn't used here).
+`config/default.yaml` keep boot happy; telephony isn't used here). An unset `DATABASE_URL`
+skips migrations rather than failing the boot — see [Migrations](#migrations); a `DATABASE_URL`
+that is *set* and unreachable does fail it.
 
 ### 4. Deploy + test
 Deploy, wait for build → healthy. Open `https://<service>.<project>.code.run/dev/voice` (Northflank
@@ -64,38 +68,47 @@ Add a Northflank **PostgreSQL** addon. Set `DATABASE_URL` using the **asyncpg** 
 addon's URI from `postgresql://USER:PASS@HOST:PORT/DB` to
 `postgresql+asyncpg://USER:PASS@HOST:PORT/DB` (the app uses the async driver).
 
-Migrations run on container start, but the step is **non-blocking and fails
-open**. The Docker `CMD` is:
+Migrations run on container start and **gate it**. The Docker `CMD` is:
 
 ```
-ok=0; for i in 1 2 3; do timeout 120 alembic upgrade head && { ok=1; break; }; echo "alembic upgrade head failed (attempt $i/3)"; sleep 10; done; [ "$ok" = 1 ] || { echo 'FATAL: ...'; exit 1; }; exec uvicorn src.main:app --host 0.0.0.0 --port 8000
+if [ -z "$DATABASE_URL" ]; then
+  echo "DATABASE_URL unset - skipping migrations (no database configured)"
+else
+  ok=0
+  for i in 1 2 3; do
+    timeout 120 alembic upgrade head && { ok=1; break; }
+    echo "alembic upgrade head failed (attempt $i/3)"; sleep 10
+  done
+  [ "$ok" = 1 ] || { echo 'FATAL: migrations did not reach head; refusing to start'; exit 1; }
+fi
+exec uvicorn src.main:app --host 0.0.0.0 --port 8000
 ```
 
-**A migration that does not reach head now fails the deploy.** The container
-exits non-zero and the rollout stops, rather than serving on an unmigrated
-schema.
+**A migration that does not reach head fails the deploy.** The container exits
+non-zero and the rollout stops rather than serving on an unmigrated schema.
 
-It retries three times first, with a 10-second gap. That is not timidity: the
-step used to be `;`-chained precisely because a plain `&&` caused a real crash
-loop (bb6c6a4), where alembic blocked on a DB connection or lock still held by
-the OUTGOING container during a rolling restart. That condition clears in
-seconds, so the retries absorb it while a genuine migration error still fails
-all three and stops the deploy.
+The three attempts are not timidity. During a rolling restart alembic can block
+on a DB connection or lock still held by the OUTGOING container — a condition
+that clears in seconds, and one that a single attempt would turn into a failed
+deploy. Three attempts absorb it; a genuine migration error fails all of them
+well inside a minute and stops the rollout, which is the distinction worth
+drawing: a transient block is not a broken migration.
 
-The fail-open version hid the same bug twice — see the `VARCHAR(32)` note below
-— each time leaving the app running against columns that did not exist. Two
-things still make a migration problem easy to misread:
+An unset `DATABASE_URL` skips the step entirely, because `alembic/env.py` then
+falls back to `config/default.yaml`'s localhost URL and there is no database to
+migrate. A `DATABASE_URL` that is set and unreachable still fails.
+
+Two things make a migration problem easy to misread:
 
 - A stale `alembic/versions/__pycache__` can make `alembic heads` report a
   revision whose source file no longer exists. Clear it before trusting that
   output.
 - Alembic's `alembic_version.version_num` is `VARCHAR(32)`. A revision id
   longer than that raises `StringDataRightTruncationError` at the point the
-  version is recorded, so the migration can never be applied. This has happened
-  twice (0019, then 0025) and the fail-open `CMD` hid both. Revision ids are now
-  pinned under 32 characters by
-  `tests/unit/test_alembic_revision_ids.py`, which also checks the chain
-  resolves and that there is exactly one head.
+  version is recorded, so the migration can never be applied and everything
+  behind it is blocked. `tests/unit/test_alembic_revision_ids.py` pins ids under
+  32 characters, and also checks the chain resolves and that there is exactly
+  one head.
 
 The DB role only needs rights on an already-provisioned schema; `env.py` skips
 `CREATE SCHEMA` when the schema already exists (first-time provisioning still

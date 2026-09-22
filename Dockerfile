@@ -56,7 +56,16 @@ EXPOSE 8000
 # three in well under a minute and the container exits non-zero, which is what
 # stops the rollout.
 #
-# 120s per attempt rather than 60: with `;` a premature kill was harmless (the
-# app booted anyway); now it fails the deploy, so the cap has to be generous
-# enough not to guillotine a legitimately slow migration.
-CMD ["sh", "-c", "ok=0; for i in 1 2 3; do timeout 120 alembic upgrade head && { ok=1; break; }; echo \"alembic upgrade head failed (attempt $i/3)\"; sleep 10; done; [ \"$ok\" = 1 ] || { echo 'FATAL: migrations did not reach head; refusing to start on an unmigrated schema'; exit 1; }; exec uvicorn src.main:app --host 0.0.0.0 --port 8000"]
+# 120s per attempt rather than 60: a premature kill now fails the deploy, so
+# the cap has to be generous enough not to guillotine a legitimately slow
+# migration.
+#
+# Unset DATABASE_URL skips migrations rather than failing. That is not a
+# loophole in the rule above: alembic/env.py falls back to config/default.yaml's
+# localhost URL when the variable is absent, so enforcing here would kill any
+# deployment that legitimately runs without a database addon (the no-addon
+# smoke-test stage in docs/deploy/northflank.md). A URL that IS set and cannot
+# be reached still fails all three attempts and stops the rollout -- the
+# distinction is "no database configured" versus "the configured database is
+# unreachable", and only the second is a deployment error.
+CMD ["sh", "-c", "if [ -z \"$DATABASE_URL\" ]; then echo \"DATABASE_URL unset - skipping migrations (no database configured)\"; else ok=0; for i in 1 2 3; do timeout 120 alembic upgrade head && { ok=1; break; }; echo \"alembic upgrade head failed (attempt $i/3)\"; sleep 10; done; [ \"$ok\" = 1 ] || { echo 'FATAL: migrations did not reach head; refusing to start on an unmigrated schema'; exit 1; }; fi; exec uvicorn src.main:app --host 0.0.0.0 --port 8000"]

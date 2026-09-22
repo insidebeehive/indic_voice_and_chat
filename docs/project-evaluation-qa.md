@@ -154,10 +154,13 @@ ML-project boilerplate.
     Customer-facing system — an unhandled exception mid-conversation is worse than
     an honest, unhelpful holding message.
 
-28. **Why is the Chatwoot inbound webhook unauthenticated, and is that a vulnerability?**
-    Explicitly documented as an accepted trade-off (temporary integration) — know
-    this cold since it reads as a glaring gap to a reviewer who doesn't have that
-    context.
+28. **How is the Chatwoot inbound webhook authenticated?**
+    The primary boundary is the unguessable per-tenant `webhook_id` path segment
+    (a capability token, not an enumerable ID). On top of that, `src/api/external_chat.py`
+    verifies an HMAC signature (`verify_chatwoot`) whenever a tenant has configured
+    `chatwoot:webhook_hmac_secret` — opt-in per tenant, since the path token is
+    already the primary control. The legacy tokenless route is hard-disabled once
+    `signature_mode()` is in `enforce` (its default).
 
 29. **Why is escalation-webhook signing fail-open (still sends unsigned if no secret configured) rather than fail-closed?**
     A missed escalation is judged worse than an unsigned payload to a tenant with no

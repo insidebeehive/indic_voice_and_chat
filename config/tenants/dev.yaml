@@ -10,7 +10,12 @@
 #
 #   export STRINGEE_API_KEY_SID=SK....           # Stringee telephony (read by the adapter directly,
 #   export STRINGEE_API_KEY_SECRET=...           #   not via *_env; region-scoped — see STRINGEE_BASE_URL)
-#   export TENANT_DEV_WEBHOOK_SECRET=...         # used to verify inbound webhook signatures
+#
+# Inbound telephony webhooks are signature-verified using existing provider
+# credentials, not a separate secret: Twilio reuses TENANT_DEV_TWILIO_TOKEN
+# below; Exotel/Stringee verify against the DB-backed per-tenant secrets
+# webhook:exotel_basic_user/webhook:exotel_basic_password and
+# webhook:stringee_signing_secret, minted via POST /tenants/{id}/webhook-credentials/rotate.
 #
 # To grant tenant API access, also set:
 #   export TENANT_DEV_API_TOKENS=dev-token-1,dev-token-2

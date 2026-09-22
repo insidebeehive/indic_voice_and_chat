@@ -193,9 +193,10 @@ def detect(self, pcm16: bytes) -> VADFrame:
 ```
 
 Two or three lines per utterance instead of fifty a second, and they answer
-more: `energy` beside `threshold` at the moment of the flip is what
-`BARGE_RMS` was tuned by hand against, with temporary diagnostics that were
-then deleted. The same move works per token — `SentenceDetector` logs each
+more: `energy` beside `threshold` at the moment of the flip is the pair a
+barge-in threshold has to be tuned against, and tuning it has previously meant
+adding temporary diagnostics and then deleting them again. The same move works
+per token — `SentenceDetector` logs each
 sentence EMITTED rather than each `feed()`, and `_SpokenTextExtractor` exposes
 what it accumulated for one read at end of turn.
 
@@ -259,11 +260,12 @@ something it does not govern.
 
 ## "Done" written before the standard existed does not mean done
 
-`chatbot/deposit_verification.py` was marked done in 1d97f8b, very early. That
-pass added a few bare `log.debug` calls — before `debug_event`, before the
-naming convention, before the cost and reserved-key rules. The file has ten log
-calls and no `debug_event` at all, so by the current standard it is not done,
-and the row said otherwise for eight packages.
+`chatbot/deposit_verification.py` is the case that shows how. It was marked
+done in 1d97f8b, very early — a pass that added a few bare `log.debug` calls
+before `debug_event`, the naming convention, and the cost and reserved-key
+rules existed. The row then said `done` for eight further packages while the
+file had no `debug_event` in it. It now has full boundary coverage of the
+vendor POST and both silent skips.
 
 This is the second time the checklist has overstated a file this way; the first
 was `agents/chatbot.py`, recorded above. The pattern is the same both times: a
@@ -301,27 +303,40 @@ done when every site in it has been classified — instrumented, or justified as
 control flow, or named as already covered by an existing log or a
 `chat_turn_metrics` field.
 
-58 of 182 files carry a `debug_event`. That count understates coverage a
-little — `chatbot/tool_executor.py` is done and uses none, because every path
-there already logs with a discriminator — but not by much.
+108 of 182 files call `debug_event`. Count call sites, not text matches:
+`src/utils/logging.py` contains the string because it DEFINES the helper, and a
+`grep -l` sweep counts it as instrumented when it is the one file that must
+never be. The remainder is mostly files with
+nothing to instrument — interface ABCs, declarative table definitions, static
+tool catalogues, empty `__init__` files — plus `benchmarks`, which is out of
+scope, and the three files excluded on purpose below.
 
-What is done is every path a live conversation touches, on both channels: the
+Every path a live conversation touches is covered, on both channels: the
 inbound webhook or websocket, tenant and provider config resolution, retrieval
 and ranking, tool dispatch, the provider call, the pipeline, and the reply
 going back out. A chat or voice turn can be followed end to end with full
 request and response bodies.
 
-What is left is mostly not on that path: the backoffice and reporting
-endpoints, dialogue/campaign machinery, `models`, `observability`, and
-`benchmarks`. The two worth doing next on operator value are `src/bootstrap.py`
-(1,301 lines, where wiring decisions are made once at startup and are invisible
-afterwards) and `src/api/dev_console.py` plus `external_chat.py`.
+Two caveats on reading the table, both of which have misled someone already:
 
-The conventions this doc describes are enforced by
-`tests/unit/test_debug_event_call_sites.py`, which AST-walks every call site.
-Reserved-key collisions and flat event names both survived being written down
-here and restated in per-pass instructions, twice, before that test existed —
-a convention that depends on remembering is not a convention.
+A file can be `done` and carry no `debug_event` — `chatbot/tool_executor.py` is
+done because every path there already logs with a discriminator. The count and
+the table measure different things.
+
+A file can be `done` and still carry plain `log.debug`. `api/chat.py` has 4
+`debug_event` and 17 `log.debug`, several in the silent-skip category this doc
+exists for. `done` there means its skips are classified, not that every site
+uses the helper — the first pass over it predates the helper.
+
+Four of the conventions are enforced by
+`tests/unit/test_debug_event_call_sites.py`, which AST-walks every call site:
+no reserved-key collision, namespaced event names, literal event names, and a
+grandfather list that cannot grow. The cost-and-guard rule, the
+boundary/decision/skip classification, and never-log-credentials are not
+mechanically checked and rely on review. Reserved-key collisions and flat event
+names each survived being written down here and restated in per-pass
+instructions, twice, before that test existed — a convention that depends on
+remembering is not a convention, which is why the four that CAN be checked are.
 
 | package | files | lines | status |
 |---|---|---|---|
@@ -336,19 +351,19 @@ a convention that depends on remembering is not a convention.
 | `agents` — `chatbot.py` | 1 | 2,212 | **done** |
 | `agents` — `voicebot.py`, `state_machine.py`, `base.py` | 3 | 1,337 | **done** |
 | `chatbot` — `tool_executor.py` | 1 | — | **done** (needed nothing; every path already logs with a discriminator) |
-| `chatbot` — `deposit_verification.py` | 1 | 572 | **in progress** — the 1d97f8b marking predates the helper; see below |
+| `chatbot` — `deposit_verification.py` | 1 | 572 | **done** (8 events; see the note below on its earlier marking) |
 | `chatbot` — the rest | 5 | 772 | **done** (`catalog.py`/`tools.py` are static tool tables — no functions, no branches) |
 | `auth` | 9 | 1,755 | **done** (7 instrumented; `audit.py` deliberately not — see below) |
 | `providers` | 33 | 5,045 | **done** (23 instrumented; 10 without — 8 empty `__init__`, plus `model_catalog.py` and `voice_catalog.py`, which are static tables. See 4a3be36) |
 | `rag` | 5 | 2,586 | **done** (4 files instrumented, `__init__` empty) |
 | `pipeline` | 8 | 1,379 | **done** (7 files instrumented, `__init__` empty) |
 | `dialogue` | 7 | 1,744 | **done** (incl. `prompts.py` — logging only, no prompt text touched) |
-| `campaign` | 5 | 863 | not started |
+| `campaign` | 5 | 863 | **done** (`orchestrator`/`scheduler`; `dnd_filter`/`models` need nothing) |
 | `models` | 11 | 1,297 | **in progress** — `database.py` + the 2 metric writers; the other 8 are declarative tables |
 | `observability` | 4 | 1,432 | **done** (2 instrumented; `trace_redaction.py` deliberately not — see below) |
-| `integration` | 6 | 662 | not started |
-| `analysis` | 3 | 459 | not started |
-| `utils` | 7 | 912 | not started |
+| `integration` | 6 | 662 | **done** (4 instrumented; `crm_client` is test doubles, `__init__` empty) |
+| `analysis` | 3 | 459 | **done** (2 instrumented, `__init__` empty) |
+| `utils` | 8 | 1,078 | **done** (nothing to instrument: ContextVar getters, pure functions, and an SSRF helper both of whose call sites already log the boundary; `logging.py` is excluded — see above) |
 | `interfaces` | 8 | 449 | **done** (ABCs and dataclasses — 32 functions, 0 branches between them) |
 | `benchmarks` | 11 | 2,472 | **out of scope** — dev tooling, no production path (decided 2026-09-22) |
 | `src/` root — all 7 files | 7 | 3,436 | **done** (`defaults.py`/`exceptions.py` are static data, nothing to classify) |

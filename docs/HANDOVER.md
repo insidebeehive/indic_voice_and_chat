@@ -40,7 +40,7 @@ shared DB), deployed to Northflank with auto-deploy from git.
 | Multi-tenant platform (5 core APIs, admin/console UIs) | live in production |
 | **ChatBot turn-metrics** (`chat_turn_metrics`/`chat_tool_metrics`, `GET /tenants/{id}/chat-turn-metrics`, Prometheus push, 90-day prune) | done — parity with voice's `TurnMetric`/`turn-metrics/summary` pipeline |
 | **Security posture** | **remediation sprint just completed** (2026-09-01/02) — read the section below before assuming anything is safe |
-| Tests | 2908 passing, 2 failing — both pre-existing, unrelated to most work (see [Testing](#testing)) |
+| Tests | 3213 passing, 2 failing — both pre-existing, unrelated to most work (see [Testing](#testing)) |
 | Campaign → live outbound calling | orchestration logic done; live dispatch/outcome wiring not fully validated |
 | Benchmarking harness | still a basic skeleton |
 | Code-switching / multilingual | not implemented — Hindi-only on voice |
@@ -166,9 +166,22 @@ mismatch: `enforce` hard-rejects the request, `log_only` logs a warning and
 processes anyway; the same toggle also decides whether the deprecated, tokenless
 legacy Chatwoot route (`POST /integrations/chatwoot/webhook`) is hard-disabled
 (`enforce`) or still served with a deprecation warning (`log_only`). The module's
-other verification helpers — `verify_twilio`, `verify_stringee`,
-`verify_exotel_basic` — aren't called from any route yet; only the Chatwoot path
-and `signature_mode()` are wired in so far.
+other verification helpers are wired into the routes that actually establish a
+call: `verify_twilio` into `/twilio/voice` and `/twilio/voice/{tenant_slug}`,
+`verify_exotel_basic` into `/exotel/voice` and `/exotel/voice/{tenant_slug}`,
+and `verify_stringee` into both Stringee answer routes (`_stringee_answer` in
+`src/api/telephony_hooks.py`). Twilio verification needs no new provisioning —
+it reuses the tenant's existing outbound auth token
+(`telephony.creds_for("twilio").auth_token_env`), the same credential already
+used for outbound calls. `signature_mode()` defaults to `enforce`, so
+verification is live in enforcing mode wherever a secret resolves; it is
+skipped entirely when no secret is configured for the tenant, which is what
+makes the rollout non-breaking for tenants that haven't set one up.
+
+Coverage is still partial: `/twilio/softphone-twiml/{slug}`,
+`/twilio/softphone-recording/{slug}`, `/stringee/softphone-answer`,
+`/stringee/softphone-recording`, `/stringee/event/{slug}`, and
+`/stringee/status/{slug}` have no signature verification.
 
 Auth model: tenant bearer tokens (SHA-256 hashed, DB-backed), separate admin tokens
 (`VOX_ADMIN_TOKENS`, labeled per-admin), and per-tenant unguessable capability tokens
@@ -187,12 +200,14 @@ mini security changelog — read them.
   docs say `main`, but active work happens on `stage`; check Northflank's actual
   tracking branch before assuming). `/health` always returns 200 so the app boots
   without Redis/Postgres present (used for a no-addon dev-console-only stage before
-  full production). Alembic runs on container start with a 60s non-blocking timeout —
-  for multi-replica deploys, run migrations as a separate pre-deploy job instead
-  (Alembic has no cross-process lock).
+  full production). Alembic runs on container start and the container refuses to
+  serve on an unmigrated schema — see `docs/deploy/northflank.md` for the retry
+  behavior and the unset-`DATABASE_URL` exception. For multi-replica deploys, run
+  migrations as a separate pre-deploy job instead (Alembic has no cross-process
+  lock).
 - **Datastores**: Postgres under schema `voicebot` (shared DB, `VOX_DB_SCHEMA`
   configurable), Redis for session storage.
-- **Schema** (22 migrations, actively maintained): tenants/secrets/api-keys/phone
+- **Schema** (26 migrations, actively maintained): tenants/secrets/api-keys/phone
   numbers; `provider_costs`; campaigns/leads; conversations/turns/events (voice);
   chat_sessions/chat_messages/chat_tools; crms/crm_tools/crm_secrets/crm_kb_documents
   (CRM-partner-level, shared across tenants under that CRM); deposit_verification_requests;
@@ -213,7 +228,7 @@ mini security changelog — read them.
   reply live), `/dev/voice` (live voice testing), embeddable chat widget.
 
 ### Testing
-Current run: **2908 passed, 2 failed**. Both failures are pre-existing and unrelated
+Current run: **3213 passed, 2 failed** (5 deselected). Both failures are pre-existing and unrelated
 to most work — don't chase either unless the task is specifically about it, and
 re-verify the count yourself before trusting it, since it drifts:
 1. `test_chat_routes.py::test_claim_session_and_agent_ws`.
@@ -226,7 +241,7 @@ re-verify the count yourself before trusting it, since it drifts:
 passes — it guards the multi-tenant KB isolation boundary and runs as part of the
 default suite, not something that needs `pgvector` installed separately.
 
-`tests/unit` (188 files) is fully mocked. `tests/integration` (6 files) runs by
+`tests/unit` (201 files) is fully mocked. `tests/integration` (7 files) runs by
 default against fixtures/mocks. `tests/live` (1 file) hits real provider APIs and is
 excluded by default (`-m 'not live'`); opt in with `VOX_LIVE_TESTS=1`.
 

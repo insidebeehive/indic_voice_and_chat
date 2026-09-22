@@ -38,15 +38,20 @@ export TENANT_DEV_GEMINI_KEY="AIza..."
 export TENANT_DEV_SARVAM_KEY="..."
 export TENANT_DEV_TWILIO_SID="AC..."
 export TENANT_DEV_TWILIO_TOKEN="..."
-# Random string used to verify inbound webhook signatures
-# (NOT the ngrok / tunnel URL — that goes in dev.yaml's webhook_base_url)
-export TENANT_DEV_WEBHOOK_SECRET="$(openssl rand -hex 32)"
 
 # Optional: API tokens that grant access to the dev tenant via /api/v1/*
 export TENANT_DEV_API_TOKENS="dev-token-1"
 ```
 
 Never commit these to the repo — `.env` is in `.gitignore`.
+
+Inbound telephony webhooks are signature-verified using the tenant's existing
+provider credentials, not a separate webhook secret: Twilio reuses
+`TENANT_DEV_TWILIO_TOKEN` above (the same Auth Token Twilio signs webhooks
+with), and Exotel/Stringee verify against `webhook:exotel_basic_user`/
+`webhook:exotel_basic_password` and `webhook:stringee_signing_secret` — DB-backed
+per-tenant secrets minted via `POST /tenants/{id}/webhook-credentials/rotate`,
+not environment variables.
 
 ---
 

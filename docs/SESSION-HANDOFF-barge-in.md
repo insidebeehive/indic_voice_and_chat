@@ -1,6 +1,28 @@
-# Session Handoff — Barge-in (IN PROGRESS) + session state
+# Session Handoff — Barge-in (HISTORICAL SNAPSHOT, 2026-06-04)
 
-**Date:** 2026-06-04. **Read this first on resume.** It captures uncommitted working-tree state and exactly where the in-flight barge-in work stands.
+> **Do not act on this document.** It is a point-in-time snapshot of one
+> session's working tree, kept for the measurements in it, and the mechanism it
+> describes no longer exists.
+>
+> Barge-in detection is **server-side**, not browser-side: `_barge_on_interim()`
+> in `src/api/browser_bridge.py`, triggering on sustained interim STT past
+> `BARGE_SUSTAIN_MS` (450ms). The client-side RMS detector this document tunes
+> — `BARGE_RMS`, `bargeMs`, the worklet VAD branch — was deliberately removed
+> (`docs/superpowers/specs/2026-06-10-barge-in-dev-console-design.md`), so none
+> of those identifiers exist in the tree.
+>
+> It also says to re-add temporary `[barge] rms=…` diagnostics when debugging.
+> That is no longer necessary: barge-in fire and suppress paths are permanently
+> instrumented in `browser_bridge.py`, `live_bridge_base.py`,
+> `telephony_live_bridge.py` and `livekit_bridge.py`, each carrying what was in
+> flight and what was cancelled. Turn on `VOX_LOG_LEVEL=DEBUG` instead — see
+> `docs/debug-logging.md`.
+>
+> What remains useful below is the measured data: user speech at ~0.008–0.012
+> RMS post-AEC against an echo floor under 0.005, and Deepgram's 1000ms
+> `UtteranceEnd` post-gap floor.
+
+**Date:** 2026-06-04. Captures the uncommitted working-tree state of that session.
 
 ---
 

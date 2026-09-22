@@ -8,12 +8,18 @@ auth), and Chatwoot (HMAC-SHA256 with a timestamp window against replay).
 Each ``verify_*`` function raises :class:`WebhookAuthError` on failure and
 returns ``None`` on success.
 
-``verify_chatwoot`` and :func:`signature_mode` are wired into the live
-Chatwoot webhook route (``src/api/external_chat.py``). ``verify_twilio``,
-``verify_stringee`` and ``verify_exotel_basic`` are not called from any route
-— check that with ``grep`` rather than trusting this line, since a docstring
-claiming something is unwired is exactly what outlives the wiring and sends
-someone to build what already exists.
+All four are wired into live routes: ``verify_chatwoot`` into the Chatwoot
+webhook (``src/api/external_chat.py``), and ``verify_twilio`` /
+``verify_exotel_basic`` / ``verify_stringee`` into the call-establishing
+telephony webhooks (``src/api/telephony_hooks.py``). The three telephony ones
+were unwired for a long time — written, tested, and called from nowhere, so
+those webhooks authenticated nothing — which is why this paragraph says to
+check with ``grep`` rather than trust it: a line about what is or is not wired
+is exactly the kind that outlives the wiring in either direction.
+
+Not every telephony route is covered. The Stringee event/status routes resolve
+no ``TenantContext`` and so have no secret to check against; see the comment
+above the verification helpers in ``telephony_hooks.py`` for the current list.
 
 See :func:`signature_mode` for the enforce-vs-log-only toggle.
 """
