@@ -23,6 +23,8 @@ from typing import Awaitable, Callable, Iterable, Optional
 import httpx
 
 from src.integration.event_bus import Event, EventBus
+from src.utils.logging import debug_event
+from src.utils.redact import redact_url
 
 log = logging.getLogger(__name__)
 
@@ -109,7 +111,16 @@ class WebhookManager:
     async def _on_event(self, event: Event) -> None:
         targets = [r for r in self._registry.values() if r.matches(event.type)]
         if not targets:
+            debug_event(
+                log, "integration webhooks dispatch_skipped",
+                event_type=event.type, reason="no_matching_registrations",
+                registered_count=len(self._registry),
+            )
             return
+        debug_event(
+            log, "integration webhooks dispatch_request",
+            event_type=event.type, target_count=len(targets),
+        )
         await asyncio.gather(*(self._deliver(r, event) for r in targets))
 
     async def _deliver(self, reg: WebhookRegistration, event: Event) -> None:
@@ -122,6 +133,15 @@ class WebhookManager:
         }
         for attempt in range(self._cfg.max_attempts):
             status = await self._post(reg.url, body, self._cfg.timeout_s)
+            # Success previously carried no log at any level -- only the
+            # final-failure warning below existed, so a webhook that
+            # succeeds on attempt 2 or 3 looked, from outside, identical to
+            # one that succeeded first try.
+            debug_event(
+                log, "integration webhooks deliver_response",
+                webhook_id=reg.id, url=redact_url(reg.url), event_type=event.type,
+                attempt=attempt + 1, max_attempts=self._cfg.max_attempts, status=status,
+            )
             if 200 <= status < 300:
                 self._delivered.append((reg.id, event.type, status))
                 return

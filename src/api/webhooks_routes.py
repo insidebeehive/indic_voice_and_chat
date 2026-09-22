@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field
 
 from src.integration.webhooks import WebhookManager
 from src.utils.logging import debug_event
+from src.utils.redact import redact_url
 
 log = logging.getLogger(__name__)
 
@@ -67,7 +68,11 @@ async def register_webhook(req: RegisterWebhookRequest) -> WebhookResponse:
     m = _require_manager()
     reg = m.register(url=req.url, event_filters=req.event_filters, secret=req.secret)
     # req.secret is a webhook-signing credential -- presence only, never the value.
-    debug_event(log, "webhooks register response", webhook_id=reg.id, url=reg.url,
+    # redact_url keeps scheme/host/path and drops query + userinfo, so the
+    # registered destination is still identifiable while a key in the
+    # query string is not. Same treatment as the tenant webhook urls in
+    # main.py and chat_webhooks.py.
+    debug_event(log, "webhooks register response", webhook_id=reg.id, url=redact_url(reg.url),
                 event_filters=reg.event_filters, active=reg.active, has_secret=bool(req.secret))
     return WebhookResponse(id=reg.id, url=reg.url, event_filters=reg.event_filters, active=reg.active)
 

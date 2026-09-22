@@ -17,6 +17,7 @@ from typing import Any
 from src.integration.tenant_events import deliver, resolve_events_webhook_url
 from src.models.database import get_sessionmaker
 from src.utils.logging import debug_event
+from src.utils.redact import redact_url
 
 log = logging.getLogger(__name__)
 
@@ -53,14 +54,19 @@ async def send_bo_webhook(tenant, event_type: str, payload: dict) -> bool:
     body: dict[str, Any] = {"event": event_type, **payload}
     if log.isEnabledFor(logging.DEBUG):
         debug_event(
+            # redact_url: this is the tenant's own configured webhook url, so
+            # it can carry an api key as a query param or basic-auth userinfo.
+            # src/main.py's _notify_tenant_event redacts the same category for
+            # the same reason; these two were inconsistent.
             log, "chat_webhooks bo_webhook request", event_type=event_type,
-            tenant_id=tenant_id, url=url, payload=payload, signed=bool(secret),
+            tenant_id=tenant_id, url=redact_url(url), payload=payload,
+            signed=bool(secret),
         )
     ok = await deliver(url, body, secret)
     if log.isEnabledFor(logging.DEBUG):
         debug_event(
             log, "chat_webhooks bo_webhook response", event_type=event_type,
-            tenant_id=tenant_id, url=url, ok=ok,
+            tenant_id=tenant_id, url=redact_url(url), ok=ok,
         )
     if not ok:
         log.warning("bo webhook delivery failed", extra={"event_type": event_type})

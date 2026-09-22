@@ -47,6 +47,7 @@ from src.integration.event_bus import (
     emit_call_initiated,
     emit_lead_qualified,
 )
+from src.utils.logging import debug_event
 
 log = logging.getLogger(__name__)
 
@@ -149,6 +150,13 @@ class CampaignOrchestrator:
                 run.active.add(lead.id)
                 self._sched.mark_attempted(now)
                 run.campaign.calls_attempted += 1
+                if log.isEnabledFor(logging.DEBUG):
+                    debug_event(
+                        log, "campaign dispatch spawned",
+                        lead_id=lead.id, campaign_id=run.campaign.id,
+                        phone_number=lead.phone_number,
+                        calls_attempted=run.campaign.calls_attempted,
+                    )
                 tasks.append(asyncio.create_task(self._handle_call(run, lead)))
 
             # Exit only when there's nothing left to dispatch AND every
@@ -215,6 +223,14 @@ class CampaignOrchestrator:
             self._sched.schedule_retry(lead)
         else:
             lead.status = LeadStatus.COMPLETED
+
+        if log.isEnabledFor(logging.DEBUG):
+            debug_event(
+                log, "campaign lead_result decided",
+                lead_id=lead.id, campaign_id=run.campaign.id,
+                disposition=result.disposition.value, resulting_status=lead.status.value,
+                outcome=(result.outcome.value if result.outcome else None),
+            )
 
         run.active.discard(lead.id)
         if lead.status in (LeadStatus.COMPLETED, LeadStatus.FAILED, LeadStatus.DND):

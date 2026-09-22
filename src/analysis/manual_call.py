@@ -31,6 +31,7 @@ from src.api.call_store import record_outcome
 from src.interfaces.llm import ILLMProvider, LLMMessage
 from src.interfaces.stt import ISTTProvider, STTConfig, STTResult
 from src.models.conversation import Conversation
+from src.utils.logging import debug_event
 
 log = logging.getLogger(__name__)
 
@@ -98,14 +99,31 @@ def build_transcript(channels: list[tuple[str, STTResult]]) -> list[LLMMessage]:
             cur_words.append(word)
         if cur_words and cur_role is not None:
             messages.append(LLMMessage(role=cur_role, content=" ".join(cur_words)))
+        if log.isEnabledFor(logging.DEBUG):
+            debug_event(
+                log, "analysis manual_call_transcript interleaved",
+                channel_count=len(channels), word_count=len(timed), message_count=len(messages),
+            )
         return messages
 
     # Coarse fallback: one message per channel (whole-channel transcript).
-    return [
+    fallback = [
         LLMMessage(role=role, content=(res.text or "").strip())
         for role, res in channels
         if (res.text or "").strip()
     ]
+    if log.isEnabledFor(logging.DEBUG):
+        # Loses conversational ordering across channels -- one message per
+        # WHOLE channel rather than interleaved turn-by-turn -- so the
+        # downstream LLM analysis reads the agent's and lead's full sides
+        # back to back rather than as a back-and-forth. Worth knowing when
+        # diagnosing a bad/odd call summary for a manual call.
+        debug_event(
+            log, "analysis manual_call_transcript fallback",
+            channel_count=len(channels), can_interleave=can_interleave,
+            message_count=len(fallback),
+        )
+    return fallback
 
 
 async def transcribe_channels(
@@ -167,7 +185,7 @@ async def finalize_manual_call(
     # We deliberately do NOT echo recording_url back to the CRM — the call_id
     # (provider_call_sid) is already in the event, and the CRM can fetch the
     # recording itself if it needs it.
-    return await record_outcome(
+    row = await record_outcome(
         session,
         provider_call_sid,
         status="ended",
@@ -177,3 +195,18 @@ async def finalize_manual_call(
         callback_at=analysis.callback_datetime,
         duration_ms=duration_ms,
     )
+    if log.isEnabledFor(logging.DEBUG):
+        # `persisted=False` is the "or None if no SID matches" case in this
+        # function's own docstring -- a manual call gets fully analyzed and
+        # then the result is silently dropped because no Conversation row
+        # matched `provider_call_sid`. Nothing else logs that at any level.
+        debug_event(
+            log, "analysis manual_call finalize_persisted",
+            provider_call_sid=provider_call_sid, outcome=analysis.outcome.value,
+            summary=analysis.summary, notes=analysis.notes,
+            callback_datetime=(
+                analysis.callback_datetime.isoformat() if analysis.callback_datetime else None
+            ),
+            persisted=(row is not None),
+        )
+    return row

@@ -24,6 +24,7 @@ from src.campaign.models import (
 )
 from src.dialogue.response_parser import _extract_json
 from src.interfaces.llm import ILLMProvider, LLMConfig, LLMMessage
+from src.utils.logging import debug_event
 
 log = logging.getLogger(__name__)
 
@@ -124,6 +125,11 @@ async def analyze_call(
 
     unreachable = outcome_from_telephony(telephony_status)
     if unreachable is not None:
+        if log.isEnabledFor(logging.DEBUG):
+            debug_event(
+                log, "analysis call_outcome telephony_short_circuit",
+                telephony_status=telephony_status, outcome=unreachable.value,
+            )
         return CallAnalysis(
             outcome=unreachable,
             summary=_TELEPHONY_SUMMARY.get(unreachable, ""),
@@ -139,6 +145,11 @@ async def analyze_call(
         if m.role not in ("system", "assistant")
     )
     if not has_lead_content:
+        if log.isEnabledFor(logging.DEBUG):
+            debug_event(
+                log, "analysis call_outcome no_lead_content",
+                transcript_len=len(transcript), telephony_status=telephony_status,
+            )
         return CallAnalysis(
             outcome=LeadCallOutcome.NO_ANSWER,
             summary="Call ended with no response from the lead.",
@@ -159,10 +170,24 @@ async def analyze_call(
     # failure -> wrong fallback outcome); the prompt now also caps output length.
     cfg = LLMConfig(temperature=0.2, max_tokens=1536, response_format="json")
 
+    if log.isEnabledFor(logging.DEBUG):
+        debug_event(
+            log, "analysis call_outcome llm request",
+            system=_SYSTEM_PROMPT, user=user_msg,
+            temperature=cfg.temperature, max_tokens=cfg.max_tokens,
+            response_format=cfg.response_format,
+        )
     try:
         result = await asyncio.wait_for(
             llm.generate(messages, cfg), timeout=ANALYSIS_TIMEOUT_S
         )
+        if log.isEnabledFor(logging.DEBUG):
+            # Logged before the JSON parse below so a parse failure (caught in
+            # the except clause under the existing WARNING) still leaves the
+            # raw text an operator can read, rather than only "analysis
+            # failed: ValueError" with nothing to reconstruct what the model
+            # actually said.
+            debug_event(log, "analysis call_outcome llm response", text=result.text)
         # Tolerant parse: Gemini intermittently wraps JSON in ```json fences or
         # adds prose even in JSON mode. Reuse the main turn parser's extractor.
         obj, perr = _extract_json(result.text)
@@ -203,6 +228,15 @@ async def analyze_agent_call(
     any bridge's agent (browser/telephony).
     """
     if llm is None or agent is None:
+        # The one place this whole module can return nothing at all -- the
+        # caller (e.g. OutcomeRecorderMixin) treats None as "no-op" with no
+        # signal of which of the two reasons applied, so without this a
+        # missing LLM and a missing agent are indistinguishable from outside.
+        if log.isEnabledFor(logging.DEBUG):
+            debug_event(
+                log, "analysis call_outcome agent_call_skipped",
+                llm_configured=(llm is not None), agent_present=(agent is not None),
+            )
         return None
     session = getattr(agent, "session", None)
     turns = getattr(session, "turns", []) if session is not None else []

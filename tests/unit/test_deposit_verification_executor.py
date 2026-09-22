@@ -482,7 +482,10 @@ async def test_executor_refuses_when_not_available(sm, monkeypatch, case, caplog
     assert out == {"status": "error", "message": "Verification is not available for this account."}
     assert await _rows(sm) == []
 
-    gate_logs = [r for r in caplog.records if "defensive gate" in r.message]
+    gate_logs = [
+        r for r in caplog.records
+        if r.message == "deposit_verification_tool submit gate_rejected"
+    ]
     assert len(gate_logs) == 1
     assert gate_logs[0].levelname == "DEBUG"
     for field, value in expect.items():

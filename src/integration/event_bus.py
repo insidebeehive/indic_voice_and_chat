@@ -17,6 +17,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Awaitable, Callable
 
+from src.utils.logging import debug_event
+
 log = logging.getLogger(__name__)
 
 
@@ -72,7 +74,19 @@ class EventBus:
         handlers.extend(self._subscribers.get(event.type, []))
         handlers.extend(self._subscribers.get("*", []))
         if not handlers:
+            # A published event that reaches nobody is otherwise invisible at
+            # any level -- e.g. a lead.qualified event with no WhatsApp
+            # handoff subscribed looks, from outside, identical to the
+            # handoff having silently declined to act on it.
+            debug_event(
+                log, "integration event_bus publish_skipped",
+                event_type=event.type, reason="no_subscribers",
+            )
             return
+        debug_event(
+            log, "integration event_bus publish_dispatched",
+            event_type=event.type, handler_count=len(handlers),
+        )
         await asyncio.gather(*(self._safe_invoke(h, event) for h in handlers))
 
     @staticmethod

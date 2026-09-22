@@ -257,6 +257,21 @@ caller, the event has to record which consumer it was built for. "What
 happened" is not enough — an event must not be readable as a claim about
 something it does not govern.
 
+## "Done" written before the standard existed does not mean done
+
+`chatbot/deposit_verification.py` was marked done in 1d97f8b, very early. That
+pass added a few bare `log.debug` calls — before `debug_event`, before the
+naming convention, before the cost and reserved-key rules. The file has ten log
+calls and no `debug_event` at all, so by the current standard it is not done,
+and the row said otherwise for eight packages.
+
+This is the second time the checklist has overstated a file this way; the first
+was `agents/chatbot.py`, recorded above. The pattern is the same both times: a
+pass touches a file, improves it genuinely, and the row is updated to "done"
+against a standard that has since moved. When the standard changes, the rows
+written before it are the ones to re-check — not the files that were never
+started.
+
 ## Two files are excluded on purpose
 
 **`src/auth/audit.py`** gets no `debug_event`, ever. `current_admin_label()`
@@ -321,7 +336,7 @@ a convention that depends on remembering is not a convention.
 | `agents` — `chatbot.py` | 1 | 2,212 | **done** |
 | `agents` — `voicebot.py`, `state_machine.py`, `base.py` | 3 | 1,337 | **done** |
 | `chatbot` — `tool_executor.py` | 1 | — | **done** (needed nothing; every path already logs with a discriminator) |
-| `chatbot` — `deposit_verification.py` | 1 | — | **done** |
+| `chatbot` — `deposit_verification.py` | 1 | 572 | **in progress** — the 1d97f8b marking predates the helper; see below |
 | `chatbot` — the rest | 5 | 772 | **done** (`catalog.py`/`tools.py` are static tool tables — no functions, no branches) |
 | `auth` | 9 | 1,755 | **done** (7 instrumented; `audit.py` deliberately not — see below) |
 | `providers` | 33 | 5,045 | **done** (23 instrumented; 10 without — 8 empty `__init__`, plus `model_catalog.py` and `voice_catalog.py`, which are static tables. See 4a3be36) |
@@ -329,13 +344,13 @@ a convention that depends on remembering is not a convention.
 | `pipeline` | 8 | 1,379 | **done** (7 files instrumented, `__init__` empty) |
 | `dialogue` | 7 | 1,744 | **done** (incl. `prompts.py` — logging only, no prompt text touched) |
 | `campaign` | 5 | 863 | not started |
-| `models` | 11 | 1,297 | not started |
+| `models` | 11 | 1,297 | **in progress** — `database.py` + the 2 metric writers; the other 8 are declarative tables |
 | `observability` | 4 | 1,432 | **done** (2 instrumented; `trace_redaction.py` deliberately not — see below) |
 | `integration` | 6 | 662 | not started |
 | `analysis` | 3 | 459 | not started |
 | `utils` | 7 | 912 | not started |
-| `interfaces` | 8 | 449 | not started |
-| `benchmarks` | 11 | 2,472 | not started |
+| `interfaces` | 8 | 449 | **done** (ABCs and dataclasses — 32 functions, 0 branches between them) |
+| `benchmarks` | 11 | 2,472 | **out of scope** — dev tooling, no production path (decided 2026-09-22) |
 | `src/` root — all 7 files | 7 | 3,436 | **done** (`defaults.py`/`exceptions.py` are static data, nothing to classify) |
 
 Tracked per file rather than per package where a pass covered only part of
