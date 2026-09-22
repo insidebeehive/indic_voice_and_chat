@@ -146,6 +146,123 @@ flowchart TB
    database as the voice side; the tenant's own or backoffice's console reads it back for
    history, handoff, and analytics.
 
+## One chat initiation, call by call
+
+The section above is the component view. This is the same flow as a call path — the
+functions one chat actually passes through, from `POST /chat/sessions` to the first
+reply frame. Function names are the stable handle; the line numbers are a pointer that
+drifts with the file.
+
+### Session create, then socket connect
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant W as CRM widget
+  participant API as src/api/chat.py
+  participant AUTH as src/auth/middleware.py
+  participant PG as Postgres
+  participant BOOT as src/bootstrap.py
+
+  rect rgb(17,33,58)
+  Note over W,PG: POST /api/v1/chat/sessions — create_session, chat.py:1386
+  W->>API: {user_id, customer_name, language, metadata}<br/>Authorization: Bearer &lt;tenant token&gt;
+  API->>AUTH: Depends(current_tenant) — middleware.py:247
+  AUTH-->>API: TenantContext (401 no credential · 403 suspended)
+  API->>PG: INSERT chat_sessions<br/>status=active · language = normalize_lang(req) ?? tenant default ?? "hi"
+  API-)API: _spawn_webhook_task(send_bo_webhook "session_started")<br/>fire-and-forget: a slow CRM endpoint must not stall creation
+  API-->>W: 201 {session_id, greeting (_greeting), ws_url (_ws_url)}
+  end
+
+  rect rgb(11,40,30)
+  Note over W,BOOT: WS /api/v1/chat/ws/{session_id} — chat_websocket, chat.py:1993
+  W->>API: WS connect — session_id IS the capability, no credential on the socket
+  API->>API: accept(); close 1011 if the chatbot factory is unset
+  API->>PG: db.get(ChatSession, session_id) → row; close 4004 if absent
+  API->>API: set_chat_context(session_id, ticket_id)<br/>ContextVars, so every record on this connection carries both ids
+  API->>AUTH: tenant_from_id(row.tenant_id) — middleware.py:409; close 1011 if absent
+  API->>PG: reconnect sweep — pending DepositVerificationRequest past timeout_at<br/>→ _check_and_timeout_verification, then re-fetch row (it may now be escalated)
+  API->>BOOT: factory(tenant, "{tenant_id}:{session_id}", customer_id, ticket_id)<br/>make_chatbot_factory, bootstrap.py:468
+  BOOT->>BOOT: resolve_crm_tools (per-tenant cached) — tenant's own chat_tools<br/>win outright, else the linked Crm's catalog
+  BOOT->>BOOT: + submit_deposit_verification, only with enabled + webhook_url<br/>+ a resolvable HMAC secret
+  BOOT-->>API: ChatBotAgent — platform LLM, tenant + CRM retrievers,<br/>Redis SessionStore, enable_tools=True
+  API->>API: agent._previous_conversation = _stored_previous_conversation(row)
+  API->>PG: _hydrate_agent_history — replay chat_messages into session.turns,<br/>joined through ChatSession so the query is tenant-scoped
+  API->>API: fresh _async_push_queues[session_id]<br/>(a new queue every connection, so the finally below can pop by identity)
+  alt row.mode in (awaiting_human, human)
+    API->>API: _run_human_mode — reconnect straight into a live handoff
+  else bot mode
+    API->>API: enter the receive loop<br/>session_first_frame_pending = (row.message_count == 0)
+  end
+  end
+```
+
+### The first turn
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant W as Widget
+  participant API as chat.py receive loop
+  participant AG as ChatBotAgent
+  participant LLM as Platform LLM — Gemini
+  participant KB as RAG
+  participant CRM as Operator CRM
+  participant PG as Postgres · Redis
+
+  W->>API: {type:"message", text:"..."}
+  API->>API: asyncio.wait({receive_text, async_q.get},<br/>timeout=chat_idle_timeout_seconds)
+  API->>API: _capture_previous_conversation — first frame of the session only
+  API->>API: _try_begin_turn(session_id, _turn_fingerprint) duplicate guard<br/>+ new_trace_id() / trace_id_scope
+  API-->>W: {type:"typing"}
+  API->>AG: _run_turn_with_keepalive(agent.handle_message(text))<br/>emits _interim_wait_text bubbles while the turn runs long
+  AG->>AG: handle_message → _handle_with_tools (chatbot.py:1035 → 1228)
+  AG->>AG: _compose — system prompt (prompt_pack) + per-turn language directive<br/>(_detect_script / _latin_language_hint) + hydrated history
+  loop up to _max_tool_rounds
+    AG->>LLM: generate(messages, tools = BUILTIN + CRM, response_format="text")
+    alt no tool calls
+      LLM-->>AG: final text, loop ends
+    else tool calls
+      AG->>KB: search_knowledge_base → _exec_kb_tool → search_combined<br/>tenant + CRM retrievers merged by score, own _KB_SEARCH_TIMEOUT_S
+      AG->>CRM: registered CRM tool → execute_crm_tool<br/>fair share of the per-turn _TOOL_BUDGET_S, capped at _TOOL_CALL_CEILING_S
+      AG->>AG: escalate_to_human / offer_voice_call — local builders, zero I/O, unbudgeted
+      AG->>AG: append role="tool" results, update the failure directive
+    end
+  end
+  AG->>AG: parse the JSON envelope; a parse failure falls back to extracted text,<br/>never raw LLM JSON
+  AG->>AG: guards — hallucination (retrieval happened) or no-grounding (it didn't),<br/>then unverified-data, then apply_pii_guard last
+  AG->>PG: _persist to the Redis SessionStore<br/>+ _emit_turn_metric → chat_turn_metrics / chat_tool_metrics
+  AG-->>API: ChatTurnResult(response, retrieved, escalation, call_offer)
+  API->>PG: _persist_turn — customer + agent rows in chat_messages, message_count += 2
+  opt result.call_offer
+    API->>PG: Redis SET chat_handoff:{token} ex=600 → call_url = _voice_call_url
+  end
+  API-->>W: _send_reply — {type:"message", text, sources, suggestions, action}<br/>plus an escalation / call_offer frame when the tools fired one
+  alt action == "resolved"
+    API->>PG: summarize_session → _end_session → _send_close_webhook
+    API-->>W: {type:"ended", summary, reason:"resolved"}
+  else result.escalation
+    API->>API: _handle_escalation → _run_human_mode
+  end
+```
+
+### What the two diagrams leave out
+
+- **Media frames** branch earlier in the loop than the text path above. An `audio` frame
+  transcribes first, runs the same `handle_message`, and gets a synthesized voice-note
+  reply back (`_synthesize_reply_audio`) when TTS and the media store are both wired.
+  `image`/`video` persist the customer's row **before** running the turn, because
+  `submit_deposit_verification` looks the screenshot up by querying `chat_messages` on a
+  separate DB session and would miss an uncommitted row.
+- **Three ways something other than a customer message reaches a live socket**: the
+  `_async_push_queues` entry (deposit-verification webhook or its timeout sweep), the
+  idle-timeout branch (farewell → `_end_session` → `ended` frame), and the human-mode
+  queues once a session escalates.
+- **Turn-level error containment** — a turn that raises is caught per-iteration:
+  `_classify_turn_error` picks the reason, `_record_ws_turn_failure_metric` writes it
+  before the customer-visible frame goes out, and the socket stays open for the next
+  message.
+
 ## Shared knowledge base (VoiceBot + ChatBot)
 
 ```mermaid
