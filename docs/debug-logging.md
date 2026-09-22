@@ -228,6 +228,19 @@ done when every site in it has been classified — instrumented, or justified as
 control flow, or named as already covered by an existing log or a
 `chat_turn_metrics` field.
 
+Five packages are done, and they are the live request path: a chat or voice
+conversation can be followed from the inbound frame through retrieval,
+ranking, tool dispatch, the provider call and back out, with full request and
+response bodies. 40 of 182 files carry a `debug_event`. That count understates
+coverage slightly — `chatbot/tool_executor.py` is done and uses none, because
+every path there already logs with a discriminator — but not by much.
+
+The largest remaining gap by far is the other 40 files of `api` (16,603
+lines): the CRM-facing endpoints, telephony webhooks, and the backoffice.
+`src/config_tenant.py` is the sharpest small one — 639 lines of tenant config
+resolution with no logging at any level, which is where "why is this tenant
+using the wrong provider" has to be answered.
+
 | package | files | lines | status |
 |---|---|---|---|
 | `api` — chat request path (`chat.py`) | 1 | — | **done** |
@@ -251,6 +264,7 @@ control flow, or named as already covered by an existing log or a
 | `utils` | 7 | 912 | not started |
 | `interfaces` | 8 | 449 | not started |
 | `benchmarks` | 11 | 2,472 | not started |
+| `src/` root — `bootstrap.py`, `main.py`, `config_tenant.py`, `config.py` | 7 | 3,436 | not started |
 
 Tracked per file rather than per package where a pass covered only part of
 one: the first pass followed the chat request path across four packages rather
