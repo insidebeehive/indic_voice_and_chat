@@ -725,6 +725,27 @@ def _fold_previous_conversation(user_msg: LLMMessage, summary: str) -> LLMMessag
     return _replace_cfg(user_msg, content=new_parts)
 
 
+def _measure_reply(text: str | None) -> tuple[int, int]:
+    """Length of a customer-visible reply, as (chars, words). One definition
+    of "word" for the whole codebase -- callers must not invent their own
+    ``.split()`` elsewhere.
+
+    ``len()`` here counts Unicode CODEPOINTS, not grapheme clusters.
+    Devanagari/Bengali/Tamil (and other Indic scripts) encode matras and
+    conjunct joiners as separate combining codepoints, so this measure runs
+    roughly 20-35% above what a reader would count as rendered characters/
+    graphemes for those scripts -- it is not comparable 1:1 across scripts.
+    Correct grapheme counting (e.g. via a Unicode segmentation library) would
+    add a new dependency for a measurement-only feature, so codepoint
+    counting is a deliberate choice, not an oversight. A future switch to
+    grapheme counting must be deliberate and test-visible (see
+    tests/unit/test_chatbot_metrics.py's Devanagari case, which pins this
+    exact semantics), not a silent drive-by "fix".
+    """
+    t = text or ""
+    return len(t), len(t.split())
+
+
 @dataclass(frozen=True)
 class ChatToolMetric:
     """One tool-call's metrics within a turn (chat_tool_metrics grain in the
@@ -802,6 +823,16 @@ class ChatTurnMetrics:
     guard_no_grounding_fired: bool
     guard_unverified_data_fired: bool
     escalated: bool
+    # Length of the FINAL customer-visible response_text -- measured after
+    # every guard (including apply_pii_guard) has already run, so this is
+    # byte-for-byte what the customer received, guard-substituted canned
+    # fallback text included (see _measure_reply's docstring for the
+    # char-vs-word/codepoint rationale). No default: forces both
+    # construction sites (_single_shot and _handle_with_tools) to supply a
+    # real measurement rather than silently defaulting to 0, which would be
+    # indistinguishable from "measured, reply genuinely empty".
+    reply_chars: int
+    reply_words: int
     tools: tuple[ChatToolMetric, ...] = ()
 
 
@@ -1016,6 +1047,8 @@ class ChatBotAgent(BaseAgent):
                     "guard_no_grounding_fired": metrics.guard_no_grounding_fired,
                     "guard_unverified_data_fired": metrics.guard_unverified_data_fired,
                     "escalated": metrics.escalated,
+                    "reply_chars": metrics.reply_chars,
+                    "reply_words": metrics.reply_words,
                 },
                 "tools": [
                     {
@@ -1135,6 +1168,11 @@ class ChatBotAgent(BaseAgent):
         # in the narrow case where ChatTurnMetrics construction itself fails.
         llm_total_ms_val = round(sum(llm_ms_list))
         escalated_flag = response.action == "escalate"
+        # Measured here, outside the try/except below, same reasoning as
+        # escalated_flag/llm_total_ms_val above: this is the FINAL
+        # response_text -- apply_pii_guard (the last guard, above) has
+        # already run -- so it is exactly what the customer received.
+        reply_chars_val, reply_words_val = _measure_reply(response.response_text)
         metrics: ChatTurnMetrics | None = None
         try:
             # Never let a metrics-assembly bug break a live turn — see
@@ -1194,6 +1232,8 @@ class ChatBotAgent(BaseAgent):
                 guard_no_grounding_fired=False,
                 guard_unverified_data_fired=False,
                 escalated=escalated_flag,
+                reply_chars=reply_chars_val,
+                reply_words=reply_words_val,
             )
         except Exception:  # noqa: BLE001 - metrics assembly must never break a reply
             log.warning("chat turn metrics assembly failed; continuing without metrics",
@@ -1707,6 +1747,11 @@ class ChatBotAgent(BaseAgent):
         kb_searches_count = len(kb_metrics)
         llm_total_ms_val = round(sum(llm_ms_list))
         escalated_flag = response.action == "escalate"
+        # Measured here, outside the try/except below, same reasoning as
+        # escalated_flag/llm_total_ms_val above: this is the FINAL
+        # response_text -- apply_pii_guard (the last guard, above) has
+        # already run -- so it is exactly what the customer received.
+        reply_chars_val, reply_words_val = _measure_reply(response.response_text)
         metrics: ChatTurnMetrics | None = None
         try:
             # Never let a metrics-assembly bug break a live turn — see
@@ -1747,6 +1792,8 @@ class ChatBotAgent(BaseAgent):
                 guard_no_grounding_fired=guard_no_grounding_fired,
                 guard_unverified_data_fired=guard_unverified_data_fired,
                 escalated=escalated_flag,
+                reply_chars=reply_chars_val,
+                reply_words=reply_words_val,
                 tools=tuple(tool_metrics),
             )
         except Exception:  # noqa: BLE001 - metrics assembly must never break a reply

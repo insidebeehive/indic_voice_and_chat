@@ -171,6 +171,29 @@ class ChatTurnMetric(Base):
     guard_no_grounding_fired: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     guard_unverified_data_fired: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     escalated: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # Length of the turn's FINAL customer-visible response_text, in chars and
+    # whitespace-split words (see src/agents/chatbot.py's _measure_reply for
+    # the exact definition, including the codepoint-vs-grapheme caveat).
+    # Measured post-guard -- includes guard-substituted canned fallback text
+    # when a guard fired, since that IS what the customer saw.
+    #
+    # NULLABLE, unlike every other integer column on this table (same
+    # convention as ChatToolMetricRow.result_chars below). NULL means "no
+    # measurement for this row": either it predates this migration (an older
+    # agent process mid-rolling-deploy), or it's a WS-layer failure row (see
+    # record_chat_turn_metric below and src/api/chat.py's
+    # _record_ws_turn_failure_metric) that never produced a reply at all.
+    # Backfilling either case to 0 would feed a false observation into any
+    # AVG/percentile query over this column.
+    #
+    # UNLIKE result_chars, 0 IS a legitimate, representable value here: it
+    # means "measured, reply genuinely empty" -- an alarming observation
+    # (the customer got nothing back), not a missing one -- and it must stay
+    # distinguishable from NULL ("we don't know"). AVG and percentile_cont
+    # both skip NULLs, so a genuine 0 correctly drags those statistics down
+    # while a NULL correctly doesn't.
+    reply_chars: Mapped[Optional[int]] = mapped_column(Integer)
+    reply_words: Mapped[Optional[int]] = mapped_column(Integer)
     # Indexed (both standalone, above via index=True on the column, and via
     # the composite in __table_args__) — see the class-level comment on why
     # both are required from day one.
@@ -288,6 +311,20 @@ async def record_chat_turn_metric(
                 guard_no_grounding_fired=metrics.get("guard_no_grounding_fired", False),
                 guard_unverified_data_fired=metrics.get("guard_unverified_data_fired", False),
                 escalated=metrics.get("escalated", False),
+                # DELIBERATE DEPARTURE from every other field on this parent
+                # row above, which all use `.get(key, 0/False)`: no default
+                # here means a payload that omits these keys stores NULL, not
+                # 0. That's exactly what makes a WS-layer failure row
+                # (_record_ws_turn_failure_metric sends only total_ms/action)
+                # come out NULL "for free" -- matching the column's own
+                # NULL-vs-0 contract documented on ChatTurnMetric above. The
+                # only other no-default precedent in this module is on the
+                # CHILD row (ChatToolMetricRow.result_chars below), not here
+                # -- don't "fix" this back to a uniform `.get(key, 0)`, or
+                # every future AVG/percentile over reply length silently
+                # starts treating unmeasured rows as empty replies.
+                reply_chars=metrics.get("reply_chars"),
+                reply_words=metrics.get("reply_words"),
             )
             db.add(row)
             # Flush (not commit) to allocate row.id without ending the

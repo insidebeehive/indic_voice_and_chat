@@ -2004,6 +2004,39 @@ class ChatTurnMetricsTurns(BaseModel):
     guard_no_grounding_fired_rate_pct: float
     guard_unverified_data_fired_rate_pct: float
     escalated_rate_pct: float
+    # Length of the turn's FINAL customer-visible reply (see
+    # src/models/chat_turn_metrics.py's reply_chars/reply_words column
+    # comments -- measured post-guard, so a guard-substituted canned fallback
+    # counts as what the customer actually saw). NULL rows -- pre-migration-
+    # 0026 rows, or a WS-layer failure row that never produced a reply -- are
+    # skipped by both the SQL AVG below and the Python-side percentile
+    # computation; reply_length_samples is how many rows actually fed these
+    # numbers.
+    #
+    # avg_reply_words/avg_reply_chars share the exact 0.0-ambiguity trap
+    # cache_hit_rate_pct documents above: `_h_avg` returns SQL NULL when
+    # every healthy row's column is NULL, and `round(float(x or 0.0), 1)`
+    # flattens that NULL to 0.0 -- indistinguishable from "every reply was
+    # genuinely empty". Same precedent as
+    # src/observability/chat_metrics_push.py's vox_chat_turn_cache_hit_rate_pct
+    # comment: don't trust a 0.0 reading here without also checking
+    # reply_length_samples != 0. p50_reply_words/p95_reply_words have the
+    # same ambiguity via their own `... if reply_words_values else 0`
+    # fallback (matching p50_total_ms's house style, deliberately not
+    # changed here) -- reply_length_samples disambiguates all four of these
+    # fields, not just the two averages.
+    avg_reply_words: float
+    p50_reply_words: int
+    p95_reply_words: int
+    avg_reply_chars: float
+    # Count of healthy rows with a non-NULL reply_words -- avg_reply_chars
+    # separately averages non-NULL reply_chars, but the two populations
+    # coincide today because record_chat_turn_metric always writes
+    # reply_chars/reply_words together (see chat_turn_metrics.py), so this
+    # one count also describes what fed avg_reply_chars. Without it, an
+    # analyst can't tell "no rows have been measured yet" apart from a
+    # genuine 0.0/0 reading.
+    reply_length_samples: int
     turns_with_tool_failure: int
     # WS-layer failure rows (src/api/chat.py::_record_ws_turn_failure_metric,
     # a turn that raised or timed out before the agent produced a
@@ -2130,6 +2163,17 @@ async def tenant_chat_turn_metrics(
             func.sum(case((healthy, ChatTurnMetric.input_tokens), else_=0)),
             func.sum(case((healthy, ChatTurnMetric.cached_tokens), else_=0)),
             _h_avg(ChatTurnMetric.rounds),
+            # reply_words/reply_chars are themselves nullable (unlike every
+            # other column _h_avg is used on above) -- but that needs no
+            # special-casing here: CASE WHEN healthy THEN reply_words END is
+            # already NULL for a NULL reply_words regardless of healthy, and
+            # SQL AVG skips NULL inputs on both sides (sum and count), so a
+            # pre-migration-0026 row is excluded "for free" as long as
+            # avg_total/etc below use `x or 0.0`, never a bare cast. See
+            # ChatTurnMetricsTurns' own field comment for the resulting
+            # 0.0-ambiguity trap.
+            _h_avg(ChatTurnMetric.reply_words),
+            _h_avg(ChatTurnMetric.reply_chars),
             _h_cond_sum(ChatTurnMetric.rounds_exhausted.is_(True)),
             _h_cond_sum(ChatTurnMetric.retry_fired.is_(True)),
             _h_cond_sum(ChatTurnMetric.failure_directive_fired.is_(True)),
@@ -2143,6 +2187,7 @@ async def tenant_chat_turn_metrics(
     (
         samples, n_failed_turns, avg_total, avg_llm_total, avg_tool_total, avg_kb_search,
         avg_input_tok, avg_output_tok, avg_cached_tok, sum_input_tok, sum_cached_tok, avg_rounds,
+        avg_reply_words, avg_reply_chars,
         n_rounds_exhausted, n_retry_fired, n_failure_directive, n_guard_hallucination,
         n_guard_no_grounding, n_guard_unverified, n_escalated, n_tool_failure,
     ) = agg
@@ -2158,11 +2203,43 @@ async def tenant_chat_turn_metrics(
         round(int(sum_cached_tok or 0) * 100 / sum_input_tok, 1) if sum_input_tok else 0.0
     )
 
-    total_ms_values = sorted((await session.execute(
-        select(ChatTurnMetric.total_ms).where(*turn_filter, healthy)
+    # Extended to also carry reply_words in this SAME single-scan query,
+    # rather than a second query -- that preserves both the
+    # _CHAT_TURN_METRICS_MAX_ROWS DoS bound and the deterministic oldest-first
+    # order_by(created_at) truncation for a second time (a second, separately
+    # truncated fetch could disagree with this one about which rows fall
+    # inside the cap when there are more than _CHAT_TURN_METRICS_MAX_ROWS in
+    # the window). reply_chars is NOT selected here -- avg_reply_chars above
+    # comes entirely from the SQL _h_avg(...) aggregate, and p50/p95 are only
+    # ever computed for reply_words, so a per-row reply_chars value has no
+    # reader on this path.
+    #
+    # `.all()` + tuple unpack, not `.scalars()` -- `.scalars()` only works for
+    # a single-column select.
+    #
+    # sorted() is applied to total_ms_values immediately below (that column is
+    # NOT NULL, same as before), but NOT to the raw reply_words fetch --
+    # every row written before migration 0026 has reply_words/reply_chars IS
+    # NULL, and this endpoint is a bare route handler with no `except`.
+    # `sorted()` over a list containing a bare `None` alongside ints raises
+    # TypeError, which would 500 this endpoint for the tenant's entire window,
+    # for every tenant, until enough pre-migration rows age out of the
+    # retention window. reply_words_values below filters `is not None`
+    # BEFORE sorting for exactly this reason.
+    turn_rows = (await session.execute(
+        select(
+            ChatTurnMetric.total_ms, ChatTurnMetric.reply_words,
+        ).where(*turn_filter, healthy)
         .order_by(ChatTurnMetric.created_at)
         .limit(_CHAT_TURN_METRICS_MAX_ROWS)
-    )).scalars().all())
+    )).all()
+
+    total_ms_values = sorted(r.total_ms for r in turn_rows)
+    # reply_length_samples is this filtered list's length -- see
+    # ChatTurnMetricsTurns' own field comment on why a caller needs this
+    # count to interpret a 0.0 avg_reply_words reading correctly.
+    reply_words_values = sorted(r.reply_words for r in turn_rows if r.reply_words is not None)
+    reply_length_samples = len(reply_words_values)
 
     turns = ChatTurnMetricsTurns(
         samples=samples,
@@ -2184,6 +2261,11 @@ async def tenant_chat_turn_metrics(
         guard_no_grounding_fired_rate_pct=_rate_pct(n_guard_no_grounding),
         guard_unverified_data_fired_rate_pct=_rate_pct(n_guard_unverified),
         escalated_rate_pct=_rate_pct(n_escalated),
+        avg_reply_words=round(float(avg_reply_words or 0.0), 1),
+        p50_reply_words=_percentile(reply_words_values, 50) if reply_words_values else 0,
+        p95_reply_words=_percentile(reply_words_values, 95) if reply_words_values else 0,
+        avg_reply_chars=round(float(avg_reply_chars or 0.0), 1),
+        reply_length_samples=reply_length_samples,
         turns_with_tool_failure=int(n_tool_failure or 0),
         failed_turns=failed_turns,
         turn_failure_rate_pct=round(failed_turns * 100 / total_turns, 1) if total_turns else 0.0,

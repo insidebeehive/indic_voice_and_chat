@@ -17,7 +17,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from src.agents import chatbot as chatbot_mod
 from src.agents.base import AgentSession
-from src.agents.chatbot import ChatBotAgent
+from src.agents.chatbot import ChatBotAgent, _measure_reply
 from src.interfaces.llm import ILLMProvider, LLMMessage, LLMResult, ToolCall, ToolSpec
 from src.interfaces.vector_store import Document
 from src.models.chat_turn_metrics import ChatToolMetricRow, ChatTurnMetric, record_chat_turn_metric
@@ -125,6 +125,9 @@ async def test_two_round_tool_turn_emits_correct_parent_and_child_payload(retrie
     assert m["kb_searches"] == 1
     assert m["rounds_exhausted"] is False
     assert m["retry_fired"] is False
+    expected_chars, expected_words = _measure_reply(result.response.response_text)
+    assert m["reply_chars"] == expected_chars
+    assert m["reply_words"] == expected_words
 
     tools = payload["tools"]
     names_kinds = {(t["tool_name"], t["kind"]) for t in tools}
@@ -481,3 +484,37 @@ async def test_result_chars_survives_to_the_chat_tool_metrics_row(
     for row in tools:
         assert row.result_chars == in_process_by_name[row.tool_name]
         assert row.result_chars is not None and row.result_chars > 0
+
+
+async def test_reply_length_survives_to_the_chat_turn_metrics_row(
+    retriever, chat_metrics_db, monkeypatch,
+) -> None:
+    """Same shape as test_result_chars_survives_to_the_chat_tool_metrics_row
+    above, but for reply_chars/reply_words on the PARENT row: a real turn
+    through the ACTUAL record_chat_turn_metric write path must persist both
+    columns as non-None values matching what the in-process ChatTurnMetrics
+    reported."""
+    monkeypatch.setattr(
+        "src.models.chat_turn_metrics.get_sessionmaker", lambda: chat_metrics_db,
+    )
+
+    llm = ScriptedLLM([LLMResult(text="Plan B has 500GB unlimited data.", finish_reason="stop")])
+    agent = ChatBotAgent(
+        session=AgentSession(session_id="cb-reply-len-persist"), llm=llm, retriever=retriever,
+        company_name="Acme", language_default="en",  # enable_tools defaults False
+        session_id="sess-reply-len",
+        record_metric=lambda payload: record_chat_turn_metric(
+            tenant_id="dev", crm_id="betstudio", **payload),
+    )
+    result = await agent.handle_message("Tell me about Plan B")
+
+    assert result.metrics is not None
+
+    async with chat_metrics_db() as db:
+        rows = (await db.execute(select(ChatTurnMetric))).scalars().all()
+
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.reply_chars is not None and row.reply_words is not None
+    assert row.reply_chars == result.metrics.reply_chars
+    assert row.reply_words == result.metrics.reply_words

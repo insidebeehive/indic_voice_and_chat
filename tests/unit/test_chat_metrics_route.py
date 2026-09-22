@@ -209,6 +209,49 @@ async def test_window_h_excludes_out_of_window_rows(ctx) -> None:
     assert "999999" not in resp.text
 
 
+async def test_reply_length_stats_and_pre_migration_rows_dont_500(ctx) -> None:
+    """B1 regression test (turn-metrics plan §2/§3): every chat_turn_metrics
+    row written before migration 0026 has reply_chars/reply_words IS NULL.
+    The percentile row-fetch this endpoint does for total_ms/reply_words/
+    reply_chars must tolerate that NULL without ever calling sorted() on a
+    list containing a bare None -- this endpoint is a bare route handler with
+    no `except`, so a TypeError here is a hard 500 for the tenant's entire
+    retention window, for every tenant, until enough pre-migration rows age
+    out."""
+    client, sm = ctx
+    for words, chars in ((10, 40), (20, 90), (30, 140), (40, 190)):
+        await _seed_turn(sm, total_ms=100, reply_words=words, reply_chars=chars)
+    # Pre-migration-shaped row: reply_chars/reply_words left at their
+    # ChatTurnMetric default (None -- simply not passed here), exactly what
+    # an older, pre-0026 agent process's row looks like. Still a healthy,
+    # non-failure row, so it must count toward `samples` but must be
+    # silently skipped by the reply-length avg/percentile/sample-count
+    # fields, not crash the endpoint.
+    await _seed_turn(sm, total_ms=100)
+    # A WS-layer failure row: excluded from `healthy` entirely (twice over --
+    # both by the `action` filter and because its own reply_words/reply_chars
+    # are NULL too), so even a wildly out-of-range reply_words here must
+    # never reach the reply-length stats.
+    await _seed_turn(
+        sm, total_ms=90000, action="failed_timeout",
+        reply_words=999999, reply_chars=999999,
+    )
+
+    resp = await client.get("/tenants/dev/chat-turn-metrics", headers=ADMIN_HEADERS)
+    assert resp.status_code == 200, resp.text
+    turns = resp.json()["turns"]
+
+    assert turns["samples"] == 5  # 4 measured + 1 pre-migration-shaped, both healthy
+    assert turns["failed_turns"] == 1
+    assert turns["reply_length_samples"] == 4  # the pre-migration row is excluded
+    assert turns["avg_reply_words"] == 25.0  # (10+20+30+40)/4
+    assert turns["p50_reply_words"] == 20  # nearest-rank p50 of [10,20,30,40]
+    assert turns["p95_reply_words"] == 40
+    assert turns["avg_reply_chars"] == 115.0  # (40+90+140+190)/4
+    # The WS-failure row's out-of-range values never leaked into the response.
+    assert "999999" not in resp.text
+
+
 async def test_tools_grouped_by_name_with_percentiles_and_failure_rate(ctx) -> None:
     client, sm = ctx
     await _seed_turn(sm, tools=[

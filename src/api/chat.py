@@ -825,10 +825,16 @@ async def _record_ws_turn_failure_metric(
     ``_classify_turn_error``'s fixed 4-value set — NEVER the raw exception
     string, which can embed player data via a CRM error message; see the PII
     section of ``src/models/chat_turn_metrics.py``). Every other numeric/
-    boolean column is left at its 0/False default via
-    ``record_chat_turn_metric``'s own ``metrics.get(..., 0/False)``
-    convention — there is nothing honest to fill in for a turn/tool-calls
-    that never finished.
+    boolean column except ``reply_chars``/``reply_words`` is left at its
+    0/False default via ``record_chat_turn_metric``'s own
+    ``metrics.get(..., 0/False)`` convention — there is nothing honest to
+    fill in for a turn/tool-calls that never finished. ``reply_chars``/
+    ``reply_words`` are the deliberate exception: this call site sends only
+    ``total_ms``/``action``, so those two columns come out NULL, not 0 — see
+    the no-default ``.get()`` departure comment on
+    ``record_chat_turn_metric``'s ``reply_chars=metrics.get("reply_chars")``
+    block in ``src/models/chat_turn_metrics.py`` for why a turn that never
+    produced a reply must not be recorded as a 0-length one.
 
     Best-effort like every metrics write in this codebase: never raises. This
     runs BEFORE the error-frame reply (see the call site's own comment on
