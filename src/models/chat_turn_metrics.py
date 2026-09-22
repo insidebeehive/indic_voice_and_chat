@@ -75,6 +75,7 @@ from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, String, fu
 from sqlalchemy.orm import Mapped, mapped_column
 
 from src.models.database import Base, get_sessionmaker
+from src.utils.logging import debug_event
 
 log = logging.getLogger(__name__)
 
@@ -355,7 +356,27 @@ async def record_chat_turn_metric(
             if child_rows:
                 db.add_all(child_rows)
             await db.commit()
+            # The only place this write's success is ever recorded -- a
+            # metric that fails to persist is invisible by definition, and so
+            # (less obviously) is one that succeeds silently: without this,
+            # "is this turn's metric even being written" needs a database
+            # query to answer.
+            debug_event(
+                log, "metrics chat_turn_metric_write response",
+                turn_id=row.id, tenant_id=tenant_id, session_id=session_id,
+                trace_id=trace_id, path=path, action=action,
+                tool_row_count=len(child_rows),
+            )
     except Exception:  # noqa: BLE001 - must never break a live chat turn
         log.warning(
             "record_chat_turn_metric failed; continuing without persistence", exc_info=True,
+        )
+        # The WARNING above carries no correlation id, so "which turn's
+        # metric just silently vanished" otherwise needs a second incident to
+        # notice and a source read to explain -- see docs/debug-logging.md's
+        # own motivating example for the skip category.
+        debug_event(
+            log, "metrics chat_turn_metric_write failed",
+            tenant_id=tenant_id, session_id=session_id, trace_id=trace_id,
+            path=path, action=action,
         )

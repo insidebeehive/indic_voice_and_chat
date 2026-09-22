@@ -522,6 +522,133 @@ def _session_is_live(session: Optional[ChatSession]) -> bool:
     return True
 
 
+# --- json_ticket_relay vendor: bank-statement request auto-escalation -----
+#
+# json_ticket_relay VENDOR's own phrasing for asking the customer to provide
+# a bank statement -- e.g. the production message "Please Provide Bank
+# Statement From the Day Of Transaction Till Today". This is a MODULE
+# constant, not a per-tenant config field: the wording is dictated entirely
+# by this vendor's own payments-team ticketing system on the far end of the
+# relay, not by anything a tenant configures, and every tenant using this
+# vendor sees the identical phrasing. If a second vendor ever words the same
+# request differently, that gets its OWN constant/regex here (e.g.
+# `_BANK_STATEMENT_REQUEST_RE_OTHER_VENDOR`), checked alongside this one at
+# the call site below -- not folded into this pattern, and not promoted to a
+# tenant setting just because a second vendor showed up.
+#
+# Requires an explicit request verb (provide/share/send/upload/submit/
+# attach) followed, within the same sentence, by "bank statement(s)" -- e.g.
+# "Please Provide Bank Statement...". Deliberately does NOT match the
+# vendor's closing-the-loop phrasing for the same document, e.g. "Thank you
+# for sharing the bank statement, we are checking": the `\b...\b` word
+# boundaries require the exact base verb form, and its inflections
+# ("sharing", "shared", "provided", "submitted", ...) do not match the base
+# form (no word boundary between the stem and its suffix) -- so an
+# acknowledgement that the document was ALREADY received does not trip this
+# pattern. One-directional (verb, then the target) on purpose: it is exactly
+# what the real vendor message looks like, and keeping the pattern narrow
+# keeps false positives out of a path that ends in a human handoff.
+_BANK_STATEMENT_REQUEST_RE = re.compile(
+    r"\b(?:provide|share|send|upload|submit|attach)\b[^.?!\n]{0,60}\bbank\s+statements?\b",
+    re.IGNORECASE,
+)
+
+
+def _is_bank_statement_request(cleaned_message: str) -> bool:
+    """True if ``cleaned_message`` -- the text that actually reached the
+    customer, i.e. the value returned by ``_clean_relay_message`` -- is the
+    json_ticket_relay vendor asking for a bank statement (see
+    ``_BANK_STATEMENT_REQUEST_RE`` above). Matched against the cleaned text,
+    not the raw vendor body, so this can never fire on something the
+    customer never actually saw."""
+    return bool(_BANK_STATEMENT_REQUEST_RE.search(cleaned_message))
+
+
+async def _escalate_for_bank_statement_request(
+    tenant: TenantContext, session: ChatSession, order_id: str,
+) -> None:
+    """The bot cannot usefully carry a "go find/upload a bank statement"
+    conversation, so once that request has been relayed to the customer
+    (the caller pushes it BEFORE calling this), hand the session to a human
+    agent.
+
+    Built on ``_escalate_session`` (``src/api/chat.py``) -- the same
+    non-websocket escalation core ``_check_and_timeout_verification`` uses
+    for this same deposit-verification flow -- rather than reimplementing
+    any of the mode flip / BO webhook / tenant event it does.
+
+    Two things this function guarantees on its own, on top of what
+    ``_escalate_session`` already gives every caller:
+
+    1. Only escalates from bot mode. If ``session.mode`` is already
+       ``awaiting_human`` or ``human`` (the same idiom used elsewhere in
+       ``src/api/chat.py``, e.g. its agent-ws mode gate), this is a no-op --
+       a second bank-statement message on an already-escalated session must
+       not fire a second BO webhook, and a human already has the
+       conversation.
+    2. Never lets a failure here reach the caller. This runs from inside a
+       vendor-facing webhook AFTER the relay itself has already succeeded --
+       raising out of this function would fail the HTTP response and make
+       the vendor retry a message the customer has already seen. Any
+       failure (the CRM declining the handoff, or an unexpected exception)
+       is logged via ``log.warning`` and swallowed here instead, since it
+       means a customer was just asked for a document and then not handed
+       to anyone.
+    """
+    if session.mode in ("awaiting_human", "human"):
+        if log.isEnabledFor(logging.DEBUG):
+            debug_event(
+                log, "deposit_verification relay bank_statement_request_skipped",
+                tenant_id=tenant.id, order_id=order_id, session_id=session.id,
+                session_mode=session.mode, reason="already_escalated",
+            )
+        return
+
+    try:
+        from src.api.chat import _escalate_session, push_async_message
+
+        outcome = await _escalate_session(
+            tenant, session.id, session,
+            reason="deposit verification: bank statement requested",
+            summary=(
+                f"Payments team requested a bank statement for order "
+                f"{order_id} -- handing off to a human agent since the "
+                "customer needs to upload or describe a document"
+            ),
+        )
+    except Exception:  # noqa: BLE001 — vendor-facing route must keep its 200
+        log.warning(
+            "deposit ticket reply: bank-statement escalation raised; customer "
+            "was asked for a document but not handed to anyone",
+            extra={"tenant_id": tenant.id, "order_id": order_id, "session_id": session.id},
+            exc_info=True,
+        )
+        return
+
+    if not outcome.ok:
+        # _escalate_session already reverted the session back to bot mode on
+        # a CRM decline -- log and stop, don't retry.
+        log.warning(
+            "deposit ticket reply: bank-statement escalation declined by CRM; "
+            "customer was asked for a document but not handed to anyone",
+            extra={"tenant_id": tenant.id, "order_id": order_id, "session_id": session.id},
+        )
+        return
+
+    if log.isEnabledFor(logging.DEBUG):
+        debug_event(
+            log, "deposit_verification relay bank_statement_request_escalated",
+            tenant_id=tenant.id, order_id=order_id, session_id=session.id,
+        )
+
+    await push_async_message(
+        session.id,
+        "I'm connecting you with a member of our support team who can help "
+        "with this directly. Thanks for your patience!",
+        role="system",
+    )
+
+
 @router.post("/reply/{token}")
 async def deposit_ticket_reply(
     token: str,
@@ -825,6 +952,12 @@ async def deposit_ticket_reply(
 
     if cleaned_message:
         await push_async_message(row.session_id, cleaned_message, role="system")
+
+        if _is_bank_statement_request(cleaned_message):
+            # Escalate AFTER the push above, never before -- the customer
+            # must see what the payments team actually asked for before any
+            # "connecting you to a human" notice lands on top of it.
+            await _escalate_for_bank_statement_request(tenant, session, body.order_id)
 
     # Re-arm the timeout for the new (slid) deadline. `_check_and_timeout_
     # verification`'s scheduled sleep does not reschedule itself if it wakes
