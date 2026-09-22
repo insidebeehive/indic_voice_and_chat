@@ -543,3 +543,51 @@ async def test_reconnect_sweep_failure_does_not_block_the_connection(
             assert frame["text"] == "ok"
 
     assert any("reconnect sweep failed" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["awaiting_human", "human"])
+async def test_timeout_does_not_re_escalate_a_session_already_with_a_human(
+    timeout_ctx, mode: str,
+) -> None:
+    """The atomic claim guarantees one timer per REQUEST, not one per SESSION.
+
+    A bank-statement relay (src/api/deposit_verification.py) hands the session
+    to a human and deliberately leaves the request `pending` -- the deposit
+    really is unresolved -- so this sweep firing afterwards for the same
+    request is the normal case, not an edge one.
+
+    `_escalate_session` sets mode unconditionally, so without this guard a
+    session an agent had already claimed would be flipped back to
+    `awaiting_human` and silently un-assigned mid-conversation, plus a second
+    BO webhook and a second chat.escalated event. The request still ends
+    `timed_out` -- it genuinely did -- and nothing is pushed to the customer,
+    because a human is already talking to them.
+    """
+    sm, _tenant_ctx, webhook = timeout_ctx
+    await _seed_request(sm)
+    async with sm() as db:
+        session = await db.get(ChatSession, "cs_1")
+        session.mode = mode
+        await db.commit()
+
+    events: list[dict] = []
+
+    async def _notifier(env: dict) -> None:
+        events.append(env)
+
+    set_tenant_event_notifier(_notifier)
+    try:
+        await chat_api._check_and_timeout_verification("dvr_1")
+    finally:
+        set_tenant_event_notifier(None)
+
+    row = await _get_request(sm, "dvr_1")
+    after = await _get_session(sm)
+
+    assert row.status == "timed_out", "the request did time out and must say so"
+    assert after.mode == mode, "the human's session was taken back from them"
+    webhook.assert_not_awaited()
+    assert events == [], "a duplicate chat.escalated event was emitted"
+    assert await _get_messages(sm) == [], \
+        "the customer was told they are being connected while already with an agent"

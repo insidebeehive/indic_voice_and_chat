@@ -3381,6 +3381,37 @@ async def _check_and_timeout_verification(request_id: str) -> None:
             if result.rowcount == 0:
                 return  # resolved (or claimed by a concurrent timer) in the meantime — no-op
 
+        # The atomic claim above guarantees only one timer escalates this
+        # REQUEST. It says nothing about the SESSION, which may have been
+        # handed to a human in the meantime — by the bank-statement relay in
+        # src/api/deposit_verification.py, by the bot mid-turn, or by an agent
+        # claiming it — and that is not a hypothetical: the relay path
+        # deliberately leaves the request `pending` (the deposit really is
+        # unresolved), so a handoff there is normally followed by this sweep
+        # firing for the same request.
+        #
+        # `_escalate_session` sets `mode = "awaiting_human"` unconditionally,
+        # so calling it on a session an agent already holds would silently
+        # un-assign them mid-conversation, on top of a duplicate BO webhook
+        # and a second `chat.escalated` event. Re-read the mode rather than
+        # trusting `chat_session_row`, which was loaded before the claim and
+        # is stale by exactly the window this guards.
+        async with _sm()() as db:
+            current = await db.get(ChatSession, deposit_session_id)
+        current_mode = current.mode if current is not None else None
+        if current_mode in ("awaiting_human", "human"):
+            # The request stays `timed_out` — it genuinely did — and nothing
+            # is pushed to the customer: a human is already on this
+            # conversation and a "connecting you to support" line would
+            # contradict what they can see.
+            debug_event(
+                log, "deposit_verification timeout escalation_skipped",
+                request_id=request_id, session_id=deposit_session_id,
+                ticket_id=ticket_id, session_mode=current_mode,
+                reason="session_already_with_human",
+            )
+            return
+
         outcome = await _escalate_session(
             tenant, deposit_session_id, chat_session_row,
             reason="deposit verification timed out",
