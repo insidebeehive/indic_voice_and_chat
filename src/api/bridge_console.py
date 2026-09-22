@@ -63,8 +63,13 @@ async def bridge_tenants() -> dict:
                 num = outbound.get(prov) or (tel.from_number if (tel.provider or "").lower() == prov else "")
                 if num:
                     from_numbers[prov] = num
-        except Exception:
-            pass
+        except Exception as e:  # noqa: BLE001
+            # Previously silent: the tenant is still listed but with an empty
+            # from_numbers dict, indistinguishable from "this tenant genuinely
+            # has no caller-ID configured" without reading YAML/DB by hand.
+            from src.utils.logging import debug_event
+            debug_event(log, "bridge_console tenants from_numbers_load_failed",
+                        tenant_slug=row.slug, error=str(e))
         tenants.append({"slug": row.slug, "name": row.name, "from_numbers": from_numbers})
 
     return {"tenants": tenants}
@@ -118,8 +123,15 @@ async def bridge_place_call(req: PlaceBridgeCallRequest) -> dict:
             from_number = (_yaml_tel.outbound_from or {}).get(provider)
             if not from_number and (_yaml_tel.provider or "").lower() == provider:
                 from_number = _yaml_tel.from_number
-        except Exception:
-            pass
+        except Exception as e:  # noqa: BLE001
+            from src.utils.logging import debug_event
+            debug_event(log, "bridge_console place_call yaml_fallback_failed",
+                        tenant_slug=req.tenant, provider=provider, error=str(e))
+        else:
+            from src.utils.logging import debug_event
+            debug_event(log, "bridge_console place_call yaml_fallback_resolved",
+                        tenant_slug=req.tenant, provider=provider,
+                        from_number=from_number, found=bool(from_number))
     if not from_number:
         raise HTTPException(
             status_code=400,
@@ -172,13 +184,31 @@ async def bridge_place_call(req: PlaceBridgeCallRequest) -> dict:
         from_number=from_number,
         webhook_url=f"{webhook_base.rstrip('/')}/{answer_path}",
     )
+    # Full request shape at DEBUG -- credential PRESENCE only, never the
+    # account_sid/auth_token values themselves.
+    from src.utils.logging import debug_event
+    debug_event(
+        log, "bridge_console place_call request", tenant_slug=tenant.slug, provider=provider,
+        to_number=cfg.to_number, from_number=cfg.from_number, webhook_url=cfg.webhook_url,
+        mode=req.mode, voice=req.voice.strip(), has_account_sid=bool(acct),
+        has_auth_token=bool(auth), has_user_id=bool(uid),
+    )
     try:
         session = await asyncio.wait_for(adapter.initiate_call(cfg), timeout=20.0)
     except asyncio.TimeoutError:
         dev_call_control.pop_override(tenant.slug)
+        # No log at any level previously existed on this path (unlike
+        # dev_console.py's equivalent, which logs at ERROR) -- an operator has
+        # zero server-side trace of a failed bridge-console call beyond the
+        # 502 the browser received.
+        debug_event(log, "bridge_console place_call timed_out",
+                    tenant_slug=tenant.slug, provider=provider, to_number=cfg.to_number)
         raise HTTPException(status_code=502, detail="call timed out after 20s")
     except Exception as e:
         dev_call_control.pop_override(tenant.slug)
+        debug_event(log, "bridge_console place_call failed",
+                    tenant_slug=tenant.slug, provider=provider, to_number=cfg.to_number,
+                    error=str(e))
         raise HTTPException(status_code=502, detail=f"call failed: {e}")
 
     from src.api import dev_call_control as _dcc

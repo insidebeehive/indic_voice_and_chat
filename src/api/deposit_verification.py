@@ -53,6 +53,7 @@ from src.rag.context_builder import (
     TURN_CONTEXT_OPEN as _TURN_CONTEXT_OPEN,
     defang_trusted_frames,
 )
+from src.utils.logging import debug_event
 
 log = logging.getLogger(__name__)
 router = APIRouter(prefix="/deposit-verification", tags=["deposit-verification"])
@@ -151,6 +152,12 @@ async def deposit_verification_callback(
     if row.status != "pending":
         # Already resolved (verdict or timeout) — idempotent no-op so a
         # retried/duplicate vendor callback doesn't clobber state or double-push.
+        if log.isEnabledFor(logging.DEBUG):
+            debug_event(
+                log, "deposit_verification callback already_processed",
+                request_id=request_id, tenant_id=row.tenant_id, order_id=row.order_id,
+                row_status=row.status, received_status=body.status,
+            )
         return {"status": "already processed"}
 
     row.status = body.status
@@ -159,6 +166,13 @@ async def deposit_verification_callback(
     await db.commit()
 
     from src.api.chat import push_async_message
+
+    if log.isEnabledFor(logging.DEBUG):
+        debug_event(
+            log, "deposit_verification callback verdict_applied",
+            request_id=request_id, tenant_id=row.tenant_id, order_id=row.order_id,
+            session_id=row.session_id, verdict_status=body.status, detail=body.detail,
+        )
 
     await push_async_message(
         row.session_id,
@@ -615,6 +629,14 @@ async def deposit_ticket_reply(
 
     session = await db.get(ChatSession, row.session_id)
     if not _session_is_live(session):
+        if log.isEnabledFor(logging.DEBUG):
+            debug_event(
+                log, "deposit_verification relay session_closed",
+                tenant_id=tenant.id, order_id=body.order_id, session_id=row.session_id,
+                session_found=session is not None,
+                session_status=getattr(session, "status", None),
+                session_mode=getattr(session, "mode", None),
+            )
         return {"status": "session closed"}
 
     # Known, accepted race (not fixed here): this whole block is a
@@ -658,6 +680,12 @@ async def deposit_ticket_reply(
         # attack, so an identical body is always treated as "already
         # relayed" — a deliberate simplification that also collapses two
         # genuinely-distinct-but-textually-identical messages into one hit.
+        if log.isEnabledFor(logging.DEBUG):
+            debug_event(
+                log, "deposit_verification relay duplicate_ignored",
+                tenant_id=tenant.id, order_id=body.order_id, body_hash=body_hash,
+                reply_sig_count=len(reply_sigs),
+            )
         return {"status": "duplicate ignored"}
 
     # Rate limits run AFTER signature verification (the caller has already
@@ -672,6 +700,12 @@ async def deposit_ticket_reply(
     # commit.
     now_utc = datetime.now(timezone.utc)
     if len(reply_sigs) >= _MAX_RELAYS_PER_ORDER:
+        if log.isEnabledFor(logging.DEBUG):
+            debug_event(
+                log, "deposit_verification relay rate_limited", limit="per_order",
+                tenant_id=tenant.id, order_id=body.order_id,
+                count=len(reply_sigs), threshold=_MAX_RELAYS_PER_ORDER,
+            )
         log.warning(
             "deposit ticket reply: per-order relay cap hit",
             extra={
@@ -685,6 +719,13 @@ async def deposit_ticket_reply(
         replies, now=now_utc, window=timedelta(seconds=_RELAY_WINDOW_SECONDS),
     )
     if recent >= _MAX_RELAYS_PER_WINDOW:
+        if log.isEnabledFor(logging.DEBUG):
+            debug_event(
+                log, "deposit_verification relay rate_limited", limit="window",
+                tenant_id=tenant.id, order_id=body.order_id,
+                count=recent, threshold=_MAX_RELAYS_PER_WINDOW,
+                window_seconds=_RELAY_WINDOW_SECONDS,
+            )
         log.warning(
             "deposit ticket reply: sliding-window relay cap hit",
             extra={
@@ -701,6 +742,14 @@ async def deposit_ticket_reply(
     # first, so a display/debug read of verdict_payload could show control
     # characters that were never actually shown to the customer).
     cleaned_message = _clean_relay_message(body.message)
+    if log.isEnabledFor(logging.DEBUG):
+        debug_event(
+            log, "deposit_verification relay message_cleaned",
+            tenant_id=tenant.id, order_id=body.order_id, message_type=body.type,
+            raw_message=body.message, raw_message_len=len(body.message),
+            cleaned_message=cleaned_message, cleaned_len=len(cleaned_message),
+            will_push=bool(cleaned_message),
+        )
 
     replies.append({
         "sig": body_hash,
@@ -762,6 +811,14 @@ async def deposit_ticket_reply(
         minutes=dv_config.timeout_minutes * _MAX_TOTAL_RELAY_TIMEOUT_MULTIPLIER
     )
     row.timeout_at = min(slid_timeout, ceiling)
+    if log.isEnabledFor(logging.DEBUG):
+        debug_event(
+            log, "deposit_verification relay timeout_updated",
+            tenant_id=tenant.id, order_id=body.order_id, session_id=row.session_id,
+            slid_timeout=slid_timeout.isoformat(), ceiling=ceiling.isoformat(),
+            applied_timeout_at=row.timeout_at.isoformat(),
+            clamped_by_ceiling=ceiling < slid_timeout,
+        )
     await db.commit()
 
     from src.api.chat import push_async_message, schedule_verification_timeout

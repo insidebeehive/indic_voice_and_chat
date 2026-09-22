@@ -29,6 +29,16 @@ logged. It is bounded by the level being off in normal running.
 not a diagnostic value and appears at no level. This is the one exception and
 it has no cases.
 
+**One boundary is stricter than this default, and it is test-enforced.**
+`src/api/external_chat.py` (the Chatwoot webhook) may not log raw customer
+content or the external user id at ANY level, DEBUG included —
+`test_chatwoot_webhook_does_not_log_raw_pii` and its `_id_route_` sibling pin
+that, scoping DEBUG capture to the module's own logger so the assertion means
+what it says. A pass over that file added a full-payload DEBUG event and had to
+revert it. Before adding a payload event anywhere, check whether a test already
+claims something stronger for that boundary; the tree-wide default is a default,
+not a licence.
+
 **Note on retention:** when `GRAFANA_LOKI_PUSH_URL` is set, the root level
 gates the Loki handler too, so DEBUG ships to Grafana Cloud and persists for
 its retention window. "On for an hour" means "stored for the retention period".
@@ -304,7 +314,10 @@ a convention that depends on remembering is not a convention.
 | `api` — telephony webhooks (`telephony_hooks/twilio/exotel/stringee/crm`, `answer_paths`) | 6 | 1,923 | **done** |
 | `api` — live media bridges (`browser_bridge`, `live_bridge_base`, `telephony_live_bridge`, `telephony_stringee_bridge`, livekit ×3, `gemini_live_bridge`) | 8 | 2,717 | **done** |
 | `api` — tenant/CRM config (`tenants`, `crms`, `crm_kb`, `catalog`) | 4 | 2,877 | **done** |
-| `api` — the remaining 22 files | 22 | ~5,400 | not started |
+| `api` — CRM-facing chat (`deposit_verification`, `external_chat`, `chat_tools`, `conversations`, `chat_cost`, `chat_webhooks`) | 6 | 2,011 | **done** |
+| `api` — dev/ops (`dev_console`, `bridge_console`, `dev_call_control`, `benchmarks`, `softphone`, `webhooks_routes`) | 6 | 1,785 | **done** |
+| `api` — stores (`knowledge`, `call_store`, `calls`, `campaigns`, `outcome_recorder`, `transfer_store`) | 6 | 1,592 | **done** |
+| `api` — the last 5 (`__init__`, `deps`, `sessions`, `config_routes`, `telephony_stringee`) | 5 | 166 | **done** (routing tables and SCCO builders — no branches) |
 | `agents` — `chatbot.py` | 1 | 2,212 | **done** |
 | `agents` — `voicebot.py`, `state_machine.py`, `base.py` | 3 | 1,337 | **done** |
 | `chatbot` — `tool_executor.py` | 1 | — | **done** (needed nothing; every path already logs with a discriminator) |

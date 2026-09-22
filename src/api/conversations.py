@@ -25,6 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.api.deps import get_db_session
 from src.auth import TenantContext, current_tenant
 from src.models.conversation import Conversation, Turn
+from src.utils.logging import debug_event
 
 log = logging.getLogger(__name__)
 router = APIRouter(prefix="/conversations", tags=["conversations"])
@@ -54,6 +55,13 @@ async def list_conversations(
         .order_by(Conversation.started_at.desc())
         .limit(limit).offset(offset)
     )).scalars().all()
+
+    if log.isEnabledFor(logging.DEBUG):
+        debug_event(
+            log, "conversations list response", tenant_id=tenant.id,
+            limit=limit, offset=offset, count=len(rows),
+            call_ids=[r.id for r in rows],
+        )
 
     return {
         "conversations": [_serialize(r) for r in rows],
@@ -100,6 +108,11 @@ async def reanalyze_conversation(
     )).scalars().all()
 
     if not turn_rows:
+        if log.isEnabledFor(logging.DEBUG):
+            debug_event(
+                log, "conversations reanalyze skipped", call_id=call_id, tenant_id=tenant.id,
+                reason="no_stored_transcript",
+            )
         raise HTTPException(
             status_code=422,
             detail="no transcript stored for this call — cannot re-analyze",
@@ -120,6 +133,11 @@ async def reanalyze_conversation(
 
     # --- Re-run analysis ---
     from src.analysis.call_outcome import analyze_call
+    if log.isEnabledFor(logging.DEBUG):
+        debug_event(
+            log, "conversations reanalyze request", call_id=call_id, tenant_id=tenant.id,
+            turn_count=len(turn_rows), slots=row.slots_data or {},
+        )
     try:
         analysis = await analyze_call(
             transcript=transcript,
@@ -141,6 +159,14 @@ async def reanalyze_conversation(
     if analysis.callback_datetime:
         row.callback_at = analysis.callback_datetime.replace(tzinfo=None)
     await db.commit()
+
+    if log.isEnabledFor(logging.DEBUG):
+        debug_event(
+            log, "conversations reanalyze response", call_id=call_id, tenant_id=tenant.id,
+            outcome=row.outcome, summary=row.summary, notes=row.notes,
+            callback_at=row.callback_at.isoformat() if row.callback_at else None,
+            analysis_source=analysis.analysis_source,
+        )
 
     log.info("reanalyzed conversation", extra={
         "call_id": call_id, "tenant": tenant.slug,

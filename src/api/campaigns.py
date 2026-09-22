@@ -26,6 +26,7 @@ from src.auth.audit import log_denied
 from src.campaign.models import LeadImportError, parse_leads_csv
 from src.models.campaign import Campaign as DbCampaign
 from src.models.campaign import Lead as DbLead
+from src.utils.logging import debug_event
 
 log = logging.getLogger(__name__)
 router = APIRouter(prefix="/campaigns", tags=["campaigns"])
@@ -122,6 +123,11 @@ async def create_campaign(
     session.add(campaign)
     await session.commit()
     await session.refresh(campaign)
+    debug_event(
+        log, "campaigns create_campaign response",
+        tenant_id=tenant.id, campaign_id=campaign.id, campaign_name=campaign.name,
+        campaign_script=req.script,
+    )
     return CampaignResponse.from_row(campaign)
 
 
@@ -155,9 +161,15 @@ async def end_campaign(
 ) -> CampaignResponse:
     """End Campaign — flip status to ``ended`` (terminal)."""
     campaign = await _scoped(session, campaign_id, tenant)
+    previous_status = campaign.status
     campaign.status = "ended"
     await session.commit()
     await session.refresh(campaign)
+    debug_event(
+        log, "campaigns end_campaign transition",
+        tenant_id=tenant.id, campaign_id=campaign_id,
+        previous_status=previous_status, new_status=campaign.status,
+    )
     return CampaignResponse.from_row(campaign)
 
 
@@ -172,9 +184,17 @@ async def upload_leads(
     data = await file.read()
     if not data:
         raise HTTPException(status_code=400, detail="empty upload")
+    debug_event(
+        log, "campaigns upload_leads request",
+        tenant_id=tenant.id, campaign_id=campaign_id, upload_bytes=len(data),
+    )
     try:
         leads, errors = parse_leads_csv(data, campaign_id=campaign_id, tenant_id=tenant.id)
     except LeadImportError as e:
+        debug_event(
+            log, "campaigns upload_leads parse_failed",
+            tenant_id=tenant.id, campaign_id=campaign_id, error=str(e),
+        )
         raise HTTPException(status_code=400, detail=str(e)) from e
 
     # Skip leads whose id already exists (idempotent re-upload).
@@ -182,8 +202,10 @@ async def upload_leads(
         select(DbLead.id).where(DbLead.campaign_id == campaign_id)
     )).scalars().all())
     added = 0
+    duplicate_count = 0
     for lead in leads:
         if lead.id in existing:
+            duplicate_count += 1
             continue
         session.add(DbLead(
             id=lead.id, tenant_id=lead.tenant_id, campaign_id=campaign_id,
@@ -196,6 +218,12 @@ async def upload_leads(
     campaign = await session.get(DbCampaign, campaign_id)
     campaign.total_leads = len(existing) + added
     await session.commit()
+    debug_event(
+        log, "campaigns upload_leads response",
+        tenant_id=tenant.id, campaign_id=campaign_id,
+        parsed_count=len(leads), added=added, duplicate_count=duplicate_count,
+        error_count=len(errors), total_leads=campaign.total_leads,
+    )
     return LeadUploadResponse(
         campaign_id=campaign_id,
         leads_added=added,

@@ -13,6 +13,7 @@ from typing import Optional
 
 from src.analysis.call_outcome import analyze_agent_call
 from src.interfaces.llm import ILLMProvider
+from src.utils.logging import debug_event
 
 log = logging.getLogger(__name__)
 
@@ -36,7 +37,22 @@ class OutcomeRecorderMixin:
         """Analyze the finished call and log its outcome. Idempotent; no-op
         without an LLM. Never raises — analysis must not break teardown."""
         if self._outcome_recorded or self._llm is None:
+            # Two very different reasons collapse into the same silent no-op:
+            # already recorded (fine, idempotent teardown) vs. no LLM
+            # configured at all, in which case this call's outcome is NEVER
+            # analyzed or persisted, for its entire lifetime, with nothing at
+            # any level saying so.
+            debug_event(
+                log, "outcome_recorder record_outcome skipped",
+                already_recorded=self._outcome_recorded,
+                llm_configured=(self._llm is not None),
+            )
             return
+        # NOTE (found, not fixed): this flag is set before analyze_agent_call
+        # is attempted, not after it succeeds. A transient failure below (the
+        # except immediately following) still leaves _outcome_recorded=True,
+        # so a retried/duplicate teardown call for the same bridge can never
+        # retry the analysis — the first failure is permanent for this call.
         self._outcome_recorded = True
         try:
             analysis = await analyze_agent_call(
@@ -50,6 +66,7 @@ class OutcomeRecorderMixin:
             log.exception("call outcome analysis failed")
             return
         if analysis is None:
+            debug_event(log, "outcome_recorder record_outcome analysis_empty")
             return
         cb = analysis.callback_datetime
         log.info(
@@ -65,6 +82,11 @@ class OutcomeRecorderMixin:
         # the host knows its SID and a persister is wired. No-op otherwise.
         from src.api import call_store
         call_sid = getattr(self, "_provider_call_sid", None) or getattr(self, "_call_sid", None)
+        debug_event(
+            log, "outcome_recorder record_outcome persist_dispatch",
+            call_sid=call_sid, has_call_sid=(call_sid is not None),
+            outcome=analysis.outcome.value,
+        )
         await call_store.deliver_to_persister(call_sid, {
             "type": "outcome", "outcome": analysis.outcome.value,
             "summary": analysis.summary, "notes": analysis.notes,

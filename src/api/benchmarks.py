@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -19,6 +20,9 @@ from src.api.deps import get_db_session
 from src.auth import require_admin
 from src.benchmarks.runner import SuiteRunner
 from src.models.turn_metrics import TurnMetric
+from src.utils.logging import debug_event
+
+log = logging.getLogger(__name__)
 
 router = APIRouter(
     prefix="/benchmarks",
@@ -37,6 +41,7 @@ def set_runner(runner: Optional[SuiteRunner]) -> None:
 
 def _require_runner() -> SuiteRunner:
     if _runner is None:
+        debug_event(log, "benchmarks runner unavailable", reason="not_initialized")
         raise HTTPException(status_code=503, detail="benchmark runner not initialized")
     return _runner
 
@@ -131,6 +136,8 @@ async def latency() -> LatencyResponse:
     for record in runner.records:
         latency_payload = (record.results or {}).get("latency")
         if not latency_payload:
+            debug_event(log, "benchmarks latency run_skipped",
+                        run_id=record.id, reason="no_latency_payload")
             continue
         runs += 1
         for run in (latency_payload.get("results") or []):
@@ -141,6 +148,9 @@ async def latency() -> LatencyResponse:
                 mean_ms=float(e2e.get("mean_ms", 0.0)),
                 samples=int(run.get("sample_count", 0)),
             ))
+    if log.isEnabledFor(logging.DEBUG):
+        debug_event(log, "benchmarks latency response", runs_considered=runs,
+                    entries=[e.model_dump() for e in entries])
     return LatencyResponse(runs_considered=runs, entries=entries)
 
 
@@ -152,6 +162,8 @@ async def accuracy() -> AccuracyResponse:
     for record in runner.records:
         stt = (record.results or {}).get("stt") or []
         if not stt:
+            debug_event(log, "benchmarks accuracy run_skipped",
+                        run_id=record.id, reason="no_stt_payload")
             continue
         runs += 1
         for r in stt:
@@ -162,6 +174,9 @@ async def accuracy() -> AccuracyResponse:
                 cer_mean=float(overall.get("cer_mean", 0.0)),
                 sample_count=int(r.get("sample_count", 0)),
             ))
+    if log.isEnabledFor(logging.DEBUG):
+        debug_event(log, "benchmarks accuracy response", runs_considered=runs,
+                    entries=[e.model_dump() for e in entries])
     return AccuracyResponse(runs_considered=runs, entries=entries)
 
 
@@ -179,6 +194,8 @@ async def list_runs() -> RunListResponse:
         )
         for r in runner.records
     ]
+    debug_event(log, "benchmarks runs list_response",
+                run_count=len(items), run_ids=[i.id for i in items])
     return RunListResponse(runs=items, total=len(items))
 
 
@@ -187,6 +204,8 @@ async def get_run(run_id: str) -> dict[str, Any]:
     runner = _require_runner()
     for r in runner.records:
         if r.id == run_id:
+            debug_event(log, "benchmarks run get_response", run_id=run_id, found=True,
+                        pipeline_config=r.pipeline_config, results=r.results)
             return {
                 "id": r.id,
                 "name": r.name,
@@ -197,6 +216,10 @@ async def get_run(run_id: str) -> dict[str, Any]:
                 "results": r.results,
                 "created_at": r.created_at.isoformat(),
             }
+    # Visible to the caller as a 404, but with no way to tell from that alone
+    # whether run_id was mistyped or the run genuinely never existed.
+    debug_event(log, "benchmarks run get_response", run_id=run_id, found=False,
+                available_run_ids=[r.id for r in runner.records])
     raise HTTPException(status_code=404, detail="run not found")
 
 
@@ -239,4 +262,7 @@ async def turn_metrics_summary(
         )
         for r in rows
     ]
+    if log.isEnabledFor(logging.DEBUG):
+        debug_event(log, "benchmarks turn_metrics_summary response",
+                    entry_count=len(entries), entries=[e.model_dump() for e in entries])
     return TurnMetricsSummaryResponse(entries=entries)

@@ -29,6 +29,8 @@ from src.interfaces.telephony import CallConfig
 from src.models.campaign import Campaign as DbCampaign
 from src.models.conversation import Conversation
 from src.providers import get_telephony_provider
+from src.utils.logging import debug_event
+from src.utils.redact import redact_url
 
 log = logging.getLogger(__name__)
 router = APIRouter(tags=["calls"])
@@ -136,6 +138,11 @@ async def transfer_result(
         raise HTTPException(status_code=400, detail="status must be 'success' or 'failure'")
     from src.api.transfer_store import resolve
     resolved = resolve(tenant.id, provider_call_sid, req.status)
+    debug_event(
+        log, "calls transfer_result response",
+        tenant_id=tenant.id, provider_call_sid=provider_call_sid,
+        status=req.status, resolved=resolved,
+    )
     if not resolved:
         # The store is keyed by (tenant_id, call_sid), so a miss here covers
         # BOTH "no such SID anywhere" and "that SID belongs to another tenant"
@@ -164,6 +171,12 @@ async def call_lead(
     session: AsyncSession = Depends(get_db_session),
     tenant: TenantContext = Depends(current_tenant),
 ) -> CallLeadResponse:
+    debug_event(
+        log, "calls call_lead request",
+        tenant_id=tenant.id, campaign_id=campaign_id, to_number=req.to_number,
+        from_number=req.from_number, voice=req.voice, lead_id=req.lead_id,
+        lead_name=req.lead_name, lead_gender=req.lead_gender,
+    )
     campaign = await _scoped_campaign(session, campaign_id, tenant)
     if campaign.status != "active":
         raise HTTPException(
@@ -183,7 +196,12 @@ async def call_lead(
 
     # Enforce the per-tenant concurrency cap.
     cap = tenant.settings.max_concurrent_calls
-    if await count_active_calls(session, tenant.id) >= cap:
+    active = await count_active_calls(session, tenant.id)
+    debug_event(
+        log, "calls call_lead concurrency_check decision",
+        tenant_id=tenant.id, active_calls=active, cap=cap, blocked=(active >= cap),
+    )
+    if active >= cap:
         raise HTTPException(
             status_code=429,
             detail=f"max concurrent calls reached ({cap}); retry when a call ends")
@@ -193,10 +211,17 @@ async def call_lead(
     registry = getattr(request.app.state, "registry", None)
     if registry is not None:
         dnd = registry.dnd.get(tenant)
-        if not dnd.hours.can_call_now():
+        hours_ok = dnd.hours.can_call_now()
+        dnd_blocked = dnd.filter.is_blocked(req.to_number)
+        debug_event(
+            log, "calls call_lead compliance_check decision",
+            tenant_id=tenant.id, to_number=req.to_number,
+            calling_hours_ok=hours_ok, dnd_blocked=dnd_blocked,
+        )
+        if not hours_ok:
             raise HTTPException(
                 status_code=403, detail="outside this tenant's configured calling hours")
-        if dnd.filter.is_blocked(req.to_number):
+        if dnd_blocked:
             raise HTTPException(
                 status_code=403, detail="destination is on the tenant's DND list")
 
@@ -215,7 +240,15 @@ async def call_lead(
     def _cred(name):
         try:
             return tenant.secret(name) if name else None
-        except Exception:  # noqa: BLE001 - missing env → let the adapter decide
+        except Exception as e:  # noqa: BLE001 - missing env → let the adapter decide
+            # Never the value -- only which named secret failed to resolve and
+            # why, so a resolution error (bad ciphertext, KMS outage) doesn't
+            # read identically to "not configured, adapter will fall back to
+            # env" in the logs.
+            debug_event(
+                log, "calls call_lead credential_resolve_failed",
+                tenant_id=tenant.id, secret_name=name, error=type(e).__name__,
+            )
             return None
 
     creds = tel.active_creds()
@@ -223,6 +256,13 @@ async def call_lead(
     # Stringee: the callout needs a non-null userId, or it goes out as a
     # phone->phone external call and the Answer URL/SCCO never runs (silent bot).
     uid = _cred(creds.user_id_env)
+    # Presence only -- never the resolved secret values themselves.
+    debug_event(
+        log, "calls call_lead credentials_resolved",
+        tenant_id=tenant.id, provider=provider,
+        account_sid_present=bool(acct), auth_token_present=bool(auth),
+        user_id_present=bool(uid),
+    )
     try:
         adapter = get_telephony_provider({
             "provider": provider,
@@ -257,6 +297,11 @@ async def call_lead(
     except Exception as e:  # noqa: BLE001
         log.exception("call lead failed", extra={"tenant": tenant.slug, "provider": provider})
         raise HTTPException(status_code=502, detail=f"call failed: {e}")
+    debug_event(
+        log, "calls call_lead initiate_call response",
+        tenant_id=tenant.id, campaign_id=campaign_id, provider=provider,
+        provider_call_sid=call_session.session_id, answer_url=redact_url(answer_url),
+    )
 
     # Store per-call overrides keyed by provider SID so the bridge factory
     # can pick them up when Twilio's answer webhook fires. SID-keyed (not
@@ -270,6 +315,12 @@ async def call_lead(
             lead_name=req.lead_name,
             lead_gender=req.lead_gender,
             campaign_id=campaign_id,
+        )
+        debug_event(
+            log, "calls call_lead sid_override_set",
+            tenant_id=tenant.id, provider_call_sid=call_session.session_id,
+            voice=req.voice, caller_name=req.caller_name, lead_name=req.lead_name,
+            lead_gender=req.lead_gender, campaign_id=campaign_id,
         )
 
     call_id = f"call_{uuid.uuid4().hex[:16]}"
@@ -328,6 +379,11 @@ async def summarize_outcome(
     if not audio_bytes:
         raise HTTPException(status_code=400, detail="audio file is empty")
     mime = audio_mime or audio.content_type or "audio/mpeg"
+    debug_event(
+        log, "calls summarize_outcome request",
+        tenant_id=tenant.id, call_id=call_id, audio_mime=mime,
+        audio_bytes=len(audio_bytes),
+    )
 
     registry = getattr(request.app.state, "registry", None)
     if registry is None:
@@ -350,6 +406,15 @@ async def summarize_outcome(
         text = await transcriber.transcribe_audio(audio_bytes, mime)
     except Exception as e:
         raise HTTPException(status_code=422, detail=f"transcription failed: {e}")
+    # An empty transcription silently produces an empty transcript below,
+    # which analyze_call still returns a structured (likely generic) outcome
+    # for -- indistinguishable from "the call genuinely had nothing to say"
+    # without seeing what the transcriber actually returned.
+    debug_event(
+        log, "calls summarize_outcome transcription_response",
+        tenant_id=tenant.id, call_id=call_id, transcript_text=text,
+        transcript_empty=(not (text or "").strip()),
+    )
 
     transcript = [LLMMessage(role="user", content=text)] if (text or "").strip() else []
     analysis = await analyze_call(

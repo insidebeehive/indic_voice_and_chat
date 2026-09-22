@@ -23,6 +23,7 @@ import logging
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.models.tenant import ProviderCost
+from src.utils.logging import debug_event
 
 log = logging.getLogger(__name__)
 
@@ -42,10 +43,21 @@ async def token_rates(
     apart from "bill them at $0" — see that function's fallback.
     """
     row = await session.get(ProviderCost, ("llm", provider, model or ""))
+    used_fallback = False
     if model and (row is None or (not row.cost_per_1k_input_tokens and not row.cost_per_1k_output_tokens)):
         fallback = await session.get(ProviderCost, ("llm", provider, ""))
         if fallback is not None:
             row = fallback
+            used_fallback = True
+    if log.isEnabledFor(logging.DEBUG):
+        debug_event(
+            log, "chat_cost token_rates resolved",
+            provider=provider, model=model, used_fallback=used_fallback,
+            row_found=row is not None,
+            input_rate=row.cost_per_1k_input_tokens if row is not None else None,
+            output_rate=row.cost_per_1k_output_tokens if row is not None else None,
+            cached_rate=row.cost_per_1k_cached_tokens if row is not None else None,
+        )
     if row is None:
         return 0.0, 0.0, None
     return row.cost_per_1k_input_tokens, row.cost_per_1k_output_tokens, row.cost_per_1k_cached_tokens

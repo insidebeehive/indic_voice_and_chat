@@ -36,6 +36,7 @@ from src.auth.audit import token_fingerprint
 from src.auth.webhook_auth import WebhookAuthError, signature_mode, verify_chatwoot
 from src.models.chat import ChatSession
 from src.models.database import get_sessionmaker
+from src.utils.logging import debug_event
 
 log = logging.getLogger(__name__)
 router = APIRouter(prefix="/integrations", tags=["integrations"])
@@ -303,6 +304,15 @@ async def chatwoot_webhook(
     # normal/expected case (the webhook_id capability token is the primary
     # control), so it's silently skipped with no log line.
     hmac_secret = tenant.secret_optional("chatwoot:webhook_hmac_secret")
+    # Absence of a configured secret silently skips this whole block (see the
+    # comment below) -- resolved unconditionally here so that skip itself has
+    # a trace instead of being indistinguishable, at every level, from the
+    # check having run and passed.
+    if log.isEnabledFor(logging.DEBUG):
+        debug_event(
+            log, "external_chat webhook_signature resolved",
+            tenant_id=tenant.id, mode=signature_mode(), hmac_configured=bool(hmac_secret),
+        )
     if hmac_secret:
         try:
             verify_chatwoot(
@@ -321,6 +331,11 @@ async def chatwoot_webhook(
                 "chatwoot webhook: HMAC check would have rejected (log_only mode)",
                 extra={"reason": e.reason, "tenant": tenant.slug, "mode": "log_only"},
             )
+        else:
+            if log.isEnabledFor(logging.DEBUG):
+                debug_event(
+                    log, "external_chat webhook_signature passed", tenant_id=tenant.id,
+                )
 
     # inbox_id consistency cross-check (defense-in-depth, not the primary
     # auth boundary): the webhook_id path segment above is already
@@ -449,25 +464,54 @@ async def _handle_chatwoot_event(tenant: TenantContext, payload: dict) -> dict:
         "private": payload.get("private"),
         "payload_keys": list(payload.keys()),
     })
+    # NOT instrumented with a full-payload DEBUG event here: this webhook
+    # carries the customer's raw content and external user id, and
+    # test_chatwoot_webhook_does_not_log_raw_pii /
+    # test_chatwoot_webhook_id_route_does_not_log_raw_pii pin a stronger
+    # guarantee for this specific boundary than the tree-wide "PII is logged
+    # at DEBUG" default — no raw identifier or message content may reach a
+    # log record here at any level. The per-branch events below stick to
+    # discriminators (event/message_type/sender_type/reason), never the
+    # payload itself.
 
     # Only act on incoming customer messages.
     if event != "message_created":
+        if log.isEnabledFor(logging.DEBUG):
+            debug_event(
+                log, "external_chat webhook message_ignored", tenant_id=tenant.id,
+                reason="event_not_message_created", webhook_event=event,
+            )
         return {"ignored": True, "reason": f"event={event}"}
 
     # Chatwoot serializes message_type as int (0=incoming) in most versions,
     # but some versions/serializers use the string "incoming".
     message_type = payload.get("message_type")
     if message_type not in (0, "incoming"):
+        if log.isEnabledFor(logging.DEBUG):
+            debug_event(
+                log, "external_chat webhook message_ignored", tenant_id=tenant.id,
+                reason="message_type_not_incoming", message_type=message_type,
+            )
         return {"ignored": True, "reason": f"message_type={message_type}"}
 
     # Skip outgoing messages from agents/bots (e.g. our own replies triggering a webhook).
     # Chatwoot Agent Bot webhooks often omit sender.type for customer messages, so we
     # don't gate on sender.type == "contact" — message_type="incoming" is sufficient.
     if sender.get("type") in ("agent", "agent_bot"):
+        if log.isEnabledFor(logging.DEBUG):
+            debug_event(
+                log, "external_chat webhook message_ignored", tenant_id=tenant.id,
+                reason="sender_is_agent", sender_type=sender.get("type"),
+            )
         return {"ignored": True, "reason": f"sender_type={sender.get('type')}"}
 
     text = (payload.get("content") or "").strip()
     if not text:
+        if log.isEnabledFor(logging.DEBUG):
+            debug_event(
+                log, "external_chat webhook message_ignored", tenant_id=tenant.id,
+                reason="empty_content",
+            )
         return {"ignored": True, "reason": "empty content"}
 
     conversation = payload.get("conversation") or {}

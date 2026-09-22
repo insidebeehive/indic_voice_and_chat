@@ -20,6 +20,7 @@ from src.auth.context import TenantContext
 from src.integration.tenant_events import build_envelope, channel_label
 from src.models.conversation import Conversation, Turn
 from src.models.tenant import ProviderCost
+from src.utils.logging import debug_event
 
 log = logging.getLogger(__name__)
 
@@ -71,6 +72,15 @@ async def insert_call(
     )
     session.add(row)
     await session.commit()
+    debug_event(
+        log, "call_store insert_call response",
+        call_id=call_id, tenant_id=tenant.id, provider_call_sid=provider_call_sid,
+        channel=channel, campaign_id=campaign_id, lead_id=lead_id,
+        agent_type=agent_type, mode=eff_mode, stt_provider=p.stt.provider,
+        llm_provider=p.llm.provider, tts_provider=tts_provider,
+        realtime_provider=realtime_provider, voice=v,
+        telephony_provider=(p.telephony.provider or None),
+    )
     event_data: dict = {"provider_call_sid": provider_call_sid, "mode": eff_mode,
                         "campaign_id": campaign_id, "lead_id": lead_id}
     if extra_event_data:
@@ -100,9 +110,23 @@ async def deliver_to_persister(call_sid: Optional[str], payload: dict) -> None:
     Never raises — outcome persistence must not break call teardown.
     """
     if _persister is None or not call_sid:
+        # Exactly the shape this sweep hunts for: a call outcome computed
+        # upstream and handed here to be persisted, dropped with no trace
+        # because either nothing was wired (tests / dev console without DB)
+        # or the caller never resolved a call_sid at all.
+        debug_event(
+            log, "call_store deliver_to_persister skipped",
+            call_sid=call_sid, persister_wired=(_persister is not None),
+            payload_type=payload.get("type") if isinstance(payload, dict) else None,
+        )
         return
     try:
         await _persister(call_sid, payload)
+        debug_event(
+            log, "call_store deliver_to_persister response",
+            call_sid=call_sid,
+            payload_type=payload.get("type") if isinstance(payload, dict) else None,
+        )
     except Exception:  # noqa: BLE001 — teardown must survive a DB hiccup
         log.exception("call outcome persistence failed", extra={"sid": call_sid})
 
@@ -126,9 +150,17 @@ async def emit_tenant_event(envelope: dict) -> None:
     """Hand a call-event envelope to the tenant notifier, if wired. Never raises —
     event emission must not break call insert/finalize."""
     if _event_notifier is None:
+        debug_event(
+            log, "call_store emit_tenant_event skipped",
+            event_type=envelope.get("event_type"), notifier_wired=False,
+        )
         return
     try:
         await _event_notifier(envelope)
+        debug_event(
+            log, "call_store emit_tenant_event response",
+            event_type=envelope.get("event_type"),
+        )
     except Exception:  # noqa: BLE001 - delivery must not break call handling
         log.exception("tenant event emit failed",
                       extra={"event": envelope.get("event_type")})
@@ -155,10 +187,27 @@ async def mark_answered(
         stmt = stmt.where(Conversation.tenant_id == tenant_id)
     row = (await session.execute(stmt)).scalar_one_or_none()
     if row is None:
+        # Exactly the "turn persisted against a session row that no longer
+        # exists" shape this sweep hunts for, just for "answered" instead of a
+        # turn: a provider's answer webhook fires and there is no trace, at
+        # any level, of why the answered-mark never landed (wrong SID, wrong
+        # tenant scope for a LiveKit room-name reuse, or the insert_call that
+        # should have preceded it never happened).
+        debug_event(
+            log, "call_store mark_answered miss",
+            provider_call_sid=provider_call_sid, tenant_id=tenant_id,
+        )
         return None
-    if row.status == "in_progress":
+    was_in_progress = row.status == "in_progress"
+    if was_in_progress:
         row.status = "answered"
         await session.commit()
+    debug_event(
+        log, "call_store mark_answered response",
+        call_id=row.id, provider_call_sid=provider_call_sid, tenant_id=row.tenant_id,
+        previous_status=("in_progress" if was_in_progress else row.status),
+        status_changed=was_in_progress,
+    )
     await emit_tenant_event(build_envelope(
         event_type="call.answered", call_id=row.id, tenant_id=row.tenant_id,
         channel=channel_label(row.agent_type),
@@ -206,7 +255,16 @@ async def _rate(session: AsyncSession, kind: str, provider: str, model: str) -> 
     row = await session.get(ProviderCost, (kind, provider, model or ""))
     if row is None and model:
         row = await session.get(ProviderCost, (kind, provider, ""))
-    return row.cost_per_min if row is not None else 0.0
+    if row is None:
+        # A missing catalog row bills this leg at $0.0 silently -- the
+        # decision that changes the reported cost, with nothing recording
+        # that it was made by omission rather than by an actual $0 rate.
+        debug_event(
+            log, "call_store rate_lookup miss",
+            kind=kind, provider=provider, model=model,
+        )
+        return 0.0
+    return row.cost_per_min
 
 
 async def telephony_tentative_cost(
@@ -288,6 +346,13 @@ async def record_outcome(
         log.warning("no conversation for call sid", extra={"sid": provider_call_sid})
         return None
 
+    debug_event(
+        log, "call_store record_outcome request",
+        call_id=row.id, provider_call_sid=provider_call_sid, tenant_id=tenant_id,
+        status=status, outcome=outcome, summary=summary, notes=notes,
+        callback_at=callback_at.isoformat() if callback_at else None,
+        duration_ms=duration_ms, turns_supplied=(len(turns) if turns else 0),
+    )
     if turns:
         row.total_turns = await save_turns(session, conversation_id=row.id, turns=turns)
 
@@ -324,6 +389,11 @@ async def record_outcome(
         duration_ms=row.duration_ms,
     )
     await session.commit()
+    debug_event(
+        log, "call_store record_outcome response",
+        call_id=row.id, status=row.status, outcome=row.outcome, cost=row.cost,
+        duration_ms=row.duration_ms, total_turns=row.total_turns,
+    )
     # Terminal event: the LLM outcome IS the tenant's end-call signal. Fires for
     # both voice-bot (via the persister) and softphone (manual_call → record_outcome).
     await emit_tenant_event(build_envelope(
@@ -363,6 +433,16 @@ async def reap_stale_calls(
         row.ended_at = row.ended_at or datetime.utcnow()
         row.notes = f"{row.notes}\n{note}" if row.notes else note
     if rows:
+        # A periodic sweep silently rewriting call status with zero logging
+        # at any level -- this is exactly a "state transition" the docs call
+        # out, and the only place these calls' true end state (never
+        # finalized) is recorded.
+        if log.isEnabledFor(logging.DEBUG):
+            debug_event(
+                log, "call_store reap_stale_calls response",
+                older_than_minutes=older_than_minutes, cutoff=cutoff.isoformat(),
+                closed_call_ids=[r.id for r in rows], closed_count=len(rows),
+            )
         await session.commit()
     return len(rows)
 
@@ -384,10 +464,20 @@ async def save_turns(
     ``provider_call_sid``, so that precondition always holds.
     """
     num = 0
+    skipped_system = 0
+    skipped_empty = 0
     for msg in turns:
         role = getattr(msg, "role", None)
         content = getattr(msg, "content", None)
-        if role == "system" or not content:
+        if role == "system":
+            skipped_system += 1
+            continue
+        if not content:
+            # The exact shape this sweep hunts for: a non-system turn (e.g. a
+            # human agent's reply, or an assistant turn) silently dropped from
+            # the transcript because its content came through empty, with the
+            # in-memory transcript looking otherwise complete to every caller.
+            skipped_empty += 1
             continue
         num += 1
         session.add(Turn(
@@ -396,6 +486,18 @@ async def save_turns(
             role=role,
             content=content if isinstance(content, str) else str(content),
         ))
+    if skipped_empty:
+        debug_event(
+            log, "call_store save_turns empty_content_dropped",
+            conversation_id=conversation_id, skipped_count=skipped_empty,
+            turns_supplied=len(turns),
+        )
+    debug_event(
+        log, "call_store save_turns response",
+        conversation_id=conversation_id, turns_saved=num,
+        turns_supplied=len(turns), skipped_system=skipped_system,
+        skipped_empty_content=skipped_empty,
+    )
     if num:
         await session.commit()
         log.info("saved %d turns for conversation %s", num, conversation_id)

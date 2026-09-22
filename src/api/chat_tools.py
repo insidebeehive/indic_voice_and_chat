@@ -27,6 +27,7 @@ from src.chatbot.catalog import ALL_TOOLS
 from src.models.chat import ChatTool
 from src.models.database import get_sessionmaker
 from src.models.tenant import TenantSecret
+from src.utils.logging import debug_event
 
 log = logging.getLogger(__name__)
 router = APIRouter(prefix="/chat", tags=["chat-tools"])
@@ -121,6 +122,7 @@ async def register_tools(
         row = (await session.execute(
             select(ChatTool).where(ChatTool.tenant_id == tenant.id, ChatTool.name == t.name)
         )).scalar_one_or_none()
+        is_update = row is not None
         if row is not None:
             row.description = t.description
             row.endpoint = t.endpoint
@@ -135,6 +137,13 @@ async def register_tools(
                 tenant_id=tenant.id, name=t.name, description=t.description,
                 endpoint=t.endpoint, method=t.method, auth_type=t.auth_type,
                 auth_config=auth_config, parameters=t.parameters))
+        if log.isEnabledFor(logging.DEBUG):
+            debug_event(
+                log, "chat_tools register tool_upserted", tenant_id=tenant.id,
+                tool_name=t.name, endpoint=t.endpoint, method=t.method,
+                auth_type=t.auth_type, is_update=is_update,
+                auth_token_provided=bool(t.auth_token), parameters=t.parameters,
+            )
         names.append(t.name)
     await session.commit()
     log.info("registered chat tools", extra={"tenant": tenant.slug, "tools": names})
@@ -210,7 +219,9 @@ async def delete_tool(
     if row is None:
         raise HTTPException(status_code=404, detail="tool not found")
     secret_name = (row.auth_config or {}).get("token_secret_name")
+    endpoint = row.endpoint
     await session.delete(row)
+    secret_deleted = False
     if secret_name:
         sec = (await session.execute(
             select(TenantSecret).where(
@@ -218,7 +229,14 @@ async def delete_tool(
         )).scalar_one_or_none()
         if sec is not None:
             await session.delete(sec)
+            secret_deleted = True
     await session.commit()
+    if log.isEnabledFor(logging.DEBUG):
+        debug_event(
+            log, "chat_tools delete tool_deleted", tenant_id=tenant.id,
+            tool_name=tool_name, endpoint=endpoint,
+            secret_name=secret_name, secret_deleted=secret_deleted,
+        )
     return {"tool_name": tool_name, "deleted": True}
 
 
@@ -288,6 +306,7 @@ async def seed_tools_from_catalog(
         row = (await session.execute(
             select(ChatTool).where(ChatTool.tenant_id == tenant.id, ChatTool.name == name)
         )).scalar_one_or_none()
+        is_update = row is not None
         if row is not None:
             row.description = spec["description"]
             row.endpoint = endpoint
@@ -306,6 +325,13 @@ async def seed_tools_from_catalog(
                 auth_config=auth_config,
                 parameters=spec["parameters"],
             ))
+        if log.isEnabledFor(logging.DEBUG):
+            debug_event(
+                log, "chat_tools seed_from_catalog tool_upserted", tenant_id=tenant.id,
+                tool_name=name, endpoint=endpoint, method=spec.get("method", "GET"),
+                auth_type=req.auth_type, is_update=is_update,
+                auth_token_provided=bool(req.auth_token), operator_id=req.operator_id,
+            )
         registered.append(name)
 
     await session.commit()
