@@ -107,6 +107,18 @@ class CallScheduler:
             )
         return lead
 
+    # --- Queries ----------------------------------------------------------
+
+    def dnd_blocked(self, leads: Iterable[Lead]) -> list[Lead]:
+        """Leads whose number is in the DND store. Query only -- status
+        transitions belong to the orchestrator, which owns lead state.
+
+        Uses the same ``self._dnd.is_blocked`` check as ``_lead_eligible``
+        (which also respects the filter's ``enabled`` flag) so the two never
+        disagree about what counts as blocked.
+        """
+        return [lead for lead in leads if self._dnd.is_blocked(lead.phone_number)]
+
     # --- Polling --------------------------------------------------------
 
     def poll(
@@ -201,12 +213,19 @@ class CallScheduler:
         # Same flooding concern as `_log_block_transition` above, but keyed
         # per lead: a DND-blocked or not-yet-due lead is re-checked on every
         # `poll()` call for as long as it sits in the queue, so only log when
-        # THIS lead's verdict changes -- a DND-blocked lead that never gets
-        # removed from the DND store (nothing in this package currently
-        # transitions `lead.status` to DND on this path -- see the
-        # orchestrator, which only does that from a call OUTCOME) logs once
-        # here and then goes silent, which is itself the signal something is
-        # stuck rather than a flood.
+        # THIS lead's verdict changes. Historically a DND-blocked lead never
+        # left the queue this way (nothing transitioned `lead.status`), so a
+        # single "dnd_blocked" line followed by silence was itself the signal
+        # something was stuck. That's no longer the failure mode: the
+        # orchestrator's run loop now calls `dnd_blocked()` (below) at the top
+        # of every iteration and transitions each blocked lead to
+        # `LeadStatus.DND` *before* calling `poll()`, so under that loop a
+        # lead this branch flags is removed from `remaining` -- and stops
+        # being passed to `poll()` at all -- on the very next iteration. This
+        # DND branch remains as a defensive, redundant check for any caller
+        # that invokes `poll()` directly without going through the
+        # orchestrator's sweep (e.g. the scheduler's own unit tests), not as
+        # the primary mechanism that clears a DND-blocked lead.
         previous = self._last_ineligible_reason.get(lead.id)
         if reason != previous:
             if log.isEnabledFor(logging.DEBUG):

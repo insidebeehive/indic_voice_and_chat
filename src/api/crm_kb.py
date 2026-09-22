@@ -210,12 +210,19 @@ async def delete_crm_document(
     row = await _scoped_crm_doc(session, document_id, crm_id)
     chunk_ids = (row.extra_data or {}).get("chunk_ids") or [
         f"{document_id}::chunk-{i}" for i in range(row.chunk_count or 0)]
+    # Vectors first, row second. If the retriever raises, the KBDocument row
+    # survives and the whole delete is retryable; committing the row first --
+    # which this did -- makes a retriever failure unrecoverable: the metadata
+    # is gone permanently while the chunks stay live in the index, invisible
+    # to list_crm_documents and stats but still returned by query. The same
+    # reordering was applied to knowledge.py's delete_document, which is this
+    # route's sibling and had the identical ordering.
+    filename = row.filename          # read before the row is expired by delete
+    n = await retriever.delete(chunk_ids)
     await session.delete(row)
     await session.commit()
-    n = await retriever.delete(chunk_ids)
     if n != len(chunk_ids):
-        # The DB row is gone either way (already committed above); this is
-        # whether the vector index actually shed every chunk it should have —
+        # Whether the vector index actually shed every chunk it should have —
         # a stale chunk left behind after "delete" reports success is exactly
         # the kind of drift that surfaces later as a citation from a document
         # that no longer appears in list_crm_documents.
@@ -225,7 +232,7 @@ async def delete_crm_document(
         )
     debug_event(
         log, "crm_kb delete result", crm_id=crm_id, document_id=document_id,
-        document_filename=row.filename, chunks_removed=n,
+        document_filename=filename, chunks_removed=n,
     )
     return {"document_id": document_id, "chunks_removed": n}
 

@@ -44,7 +44,15 @@ from src.api.telephony_stringee import reprompt_scco
 from src.api.telephony_stringee_bridge import StringeeIvrBridge, registry
 from src.api.telephony_twilio import softphone_dial_twiml, voice_twiml
 from src.auth import TenantContext
+from src.auth.audit import log_denied
 from src.auth.middleware import tenant_from_slug, tenant_from_twilio_to_number
+from src.auth.webhook_auth import (
+    WebhookAuthError,
+    signature_mode,
+    verify_exotel_basic,
+    verify_stringee,
+    verify_twilio,
+)
 from src.utils import public_url
 from src.utils.http_fetch import assert_safe_url, fetch_capped
 from src.utils.logging import debug_event
@@ -170,6 +178,222 @@ def _ws_stream_url(request: Request, path: str) -> str:
     return f"{ws_scheme}://{parsed.netloc}/api/v1/telephony/{path}"
 
 
+# --- Inbound webhook authentication (Twilio / Exotel / Stringee) -----------
+#
+# Wires src/auth/webhook_auth.py's verify_* helpers into the routes that
+# actually establish a call (the "voice"/"answer" webhooks) -- the ones an
+# attacker who merely knows the URL could otherwise use to drive a call flow.
+# Follows the src/api/external_chat.py Chatwoot-webhook precedent exactly:
+#
+#   - No secret configured for the tenant -> verification is skipped
+#     entirely (non-breaking for a tenant that hasn't set one up).
+#   - signature_mode() decides enforce (reject) vs log_only (warn + allow).
+#   - Every provider's *_env / secret name below is an established
+#     resolution path already used elsewhere in this tree -- see each
+#     helper's docstring -- never a newly-invented config key.
+#
+# NOT wired here (same gap, deliberately left unaddressed -- see the
+# deliverable notes): the per-turn `/stringee/event/{slug}` and lifecycle
+# `/stringee/status/{slug}` webhooks (neither currently resolves a
+# TenantContext at all; adding one purely to check a secret is a bigger,
+# separate change), the Stringee/Twilio browser-softphone answer+recording
+# routes, and Twilio's recording-status callback.
+
+
+def _tenant_secret_optional(tenant: object, name: str | None) -> str | None:
+    """``tenant.secret_optional(name)``, tolerant of a tenant object that
+    doesn't implement it.
+
+    Every real caller passes a ``TenantContext`` (which always has this
+    method), but several existing telephony-route tests pass a bare
+    ``SimpleNamespace(slug=..., id=...)`` stand-in for speed. Treating a
+    missing method the same as "secret not configured" keeps this a pure
+    addition for those tests -- skipped verification, not a crash -- rather
+    than requiring every test double in the tree to grow a full
+    ``TenantContext`` surface for an unrelated change.
+    """
+    if name is None:
+        return None
+    fn = getattr(tenant, "secret_optional", None)
+    return fn(name) if fn is not None else None
+
+
+def _reject_webhook_auth(message: str, *, reason: str, route: str, tenant: str | None) -> HTTPException:
+    """Log a webhook auth rejection and return the uniform 401 to raise.
+
+    Same log+return shape as external_chat.py's ``_reject_unauthorized``
+    (``raise _reject_webhook_auth(...) from None`` at the call site), but
+    logs via ``log_denied`` -- the auth-rejection primitive most of
+    src/api/ already uses (calls.py, chat.py, knowledge.py, campaigns.py) --
+    so these land in the same suppressed/rate-limited rejection stream
+    instead of a parallel one. Never pass the signature/secret in ``extra``.
+    """
+    log_denied(
+        logging.WARNING, message,
+        event="auth_rejected", reason=reason, route=route, tenant=tenant,
+    )
+    return HTTPException(status_code=401, detail="invalid webhook signature")
+
+
+def _signature_url_candidates(request: Request) -> list[str]:
+    """URL(s) Twilio may have computed its ``X-Twilio-Signature`` over.
+
+    The primary candidate is built the same proxy-aware way as
+    ``_ws_stream_url``/``_forwarded_base`` (``origin_from_headers``) --
+    Twilio signs the URL it actually POSTed to, which is the public,
+    proxy-fronted one Northflank terminates TLS in front of, not necessarily
+    what Starlette's own ``request.url`` reconstructs from the ASGI scope.
+    That raw reconstruction is included as a second candidate so a
+    header/proxy mismatch doesn't turn into a false reject.
+    """
+    path_and_query = request.url.path
+    if request.url.query:
+        path_and_query += f"?{request.url.query}"
+    forwarded = f"{public_url.origin_from_headers(request)}{path_and_query}"
+    raw = str(request.url)
+    return [forwarded, raw] if forwarded != raw else [forwarded]
+
+
+async def _verify_twilio_signature(request: Request, tenant: object, *, route: str) -> None:
+    """Verify the inbound Twilio webhook's ``X-Twilio-Signature`` against the
+    tenant's Twilio Auth Token.
+
+    Twilio signs webhooks with the SAME Auth Token used to authenticate our
+    outbound API calls (``twilio.request_validator.RequestValidator`` -- there
+    is no separate webhook-signing secret to provision), so this resolves
+    ``pipeline.telephony.creds_for("twilio").auth_token_env`` -- the existing
+    credential slot src/api/dev_console.py's ``_cred(pcreds.auth_token_env)``
+    already reads for the SAME provider's outbound calls.
+
+    Skipped entirely when the tenant has no Twilio auth token configured --
+    the non-breaking case for a tenant that hasn't set one up.
+    """
+    settings = getattr(tenant, "settings", None)
+    telephony = getattr(getattr(settings, "pipeline", None), "telephony", None)
+    auth_token_env = telephony.creds_for("twilio").auth_token_env if telephony is not None else None
+    auth_token = _tenant_secret_optional(tenant, auth_token_env)
+    tenant_slug = getattr(tenant, "slug", None)
+    if log.isEnabledFor(logging.DEBUG):
+        debug_event(
+            log, "telephony twilio_signature resolved",
+            tenant=tenant_slug, route=route, mode=signature_mode(), configured=bool(auth_token),
+        )
+    if not auth_token:
+        return
+    try:
+        verify_twilio(
+            _signature_url_candidates(request), dict(await request.form()),
+            request.headers.get("X-Twilio-Signature"), auth_token,
+        )
+    except WebhookAuthError as e:
+        if signature_mode() == "enforce":
+            raise _reject_webhook_auth(
+                "twilio webhook: signature verification failed",
+                reason=e.reason, route=route, tenant=tenant_slug,
+            ) from None
+        log.warning(
+            "twilio webhook: signature check would have rejected (log_only mode)",
+            extra={"reason": e.reason, "tenant": tenant_slug, "route": route, "mode": "log_only"},
+        )
+    else:
+        if log.isEnabledFor(logging.DEBUG):
+            debug_event(log, "telephony twilio_signature passed", tenant=tenant_slug, route=route)
+
+
+async def _verify_exotel_basic_auth(request: Request, tenant: object, *, route: str) -> None:
+    """Verify the inbound Exotel webhook's HTTP Basic ``Authorization`` header
+    against the tenant's ``webhook:exotel_basic_user``/``webhook:exotel_basic_password``
+    pair.
+
+    That pair is minted by ``POST /tenants/{id}/webhook-credentials/rotate``
+    for the tenant to configure as Basic Auth on Exotel's own
+    Passthru/Voicebot applet -- the same pair src/api/answer_paths.py's
+    ``answer_url_for`` already injects into the OUTBOUND-call answer URL's
+    netloc for this exact purpose.
+
+    Skipped entirely unless BOTH halves are configured (an incomplete pair
+    is treated as unconfigured, matching ``answer_url_for``'s
+    ``both_configured`` check) -- the non-breaking case for a tenant that
+    hasn't rotated these credentials.
+    """
+    user = _tenant_secret_optional(tenant, "webhook:exotel_basic_user")
+    password = _tenant_secret_optional(tenant, "webhook:exotel_basic_password")
+    configured = bool(user and password)
+    tenant_slug = getattr(tenant, "slug", None)
+    if log.isEnabledFor(logging.DEBUG):
+        debug_event(
+            log, "telephony exotel_basic_auth resolved",
+            tenant=tenant_slug, route=route, mode=signature_mode(), configured=configured,
+        )
+    if not configured:
+        return
+    try:
+        verify_exotel_basic(request.headers.get("Authorization"), username=user, password=password)
+    except WebhookAuthError as e:
+        if signature_mode() == "enforce":
+            raise _reject_webhook_auth(
+                "exotel webhook: basic auth verification failed",
+                reason=e.reason, route=route, tenant=tenant_slug,
+            ) from None
+        log.warning(
+            "exotel webhook: basic auth check would have rejected (log_only mode)",
+            extra={"reason": e.reason, "tenant": tenant_slug, "route": route, "mode": "log_only"},
+        )
+    else:
+        if log.isEnabledFor(logging.DEBUG):
+            debug_event(log, "telephony exotel_basic_auth passed", tenant=tenant_slug, route=route)
+
+
+async def _verify_stringee_signature(request: Request, tenant: object, *, route: str) -> None:
+    """Verify the inbound Stringee webhook's ``X-STRINGEE-SIGNATURE`` header
+    against the tenant's ``webhook:stringee_signing_secret`` (the tenant's
+    Stringee Project Signing secret key -- set via the generic
+    ``PATCH /tenants/{id}`` secret-update path; never auto-minted, see
+    src/api/tenants.py's ``rotate_webhook_credentials`` docstring).
+
+    Per Stringee's own docs (developer.stringee.com/docs/validating-requests-
+    are-coming-from-stringee): base64(HMAC-SHA1(secret, data)) in the
+    ``X-STRINGEE-SIGNATURE`` header, where ``data`` is the raw POST body for
+    an event_url POST, or the Request-URI (path+query, leading ``/``) for an
+    answer_url GET -- exactly what ``verify_stringee`` already implements.
+
+    Skipped entirely when the tenant has no signing secret configured -- the
+    non-breaking case for a tenant that hasn't set one up.
+    """
+    secret = _tenant_secret_optional(tenant, "webhook:stringee_signing_secret")
+    tenant_slug = getattr(tenant, "slug", None)
+    if log.isEnabledFor(logging.DEBUG):
+        debug_event(
+            log, "telephony stringee_signature resolved",
+            tenant=tenant_slug, route=route, mode=signature_mode(), configured=bool(secret),
+        )
+    if not secret:
+        return
+    is_post = request.method == "POST"
+    raw_body = await request.body() if is_post else None
+    path_and_query = request.url.path
+    if request.url.query:
+        path_and_query += f"?{request.url.query}"
+    try:
+        verify_stringee(
+            raw_body=raw_body, url_path_and_query=path_and_query,
+            signature=request.headers.get("X-STRINGEE-SIGNATURE"), signing_secret=secret,
+        )
+    except WebhookAuthError as e:
+        if signature_mode() == "enforce":
+            raise _reject_webhook_auth(
+                "stringee webhook: signature verification failed",
+                reason=e.reason, route=route, tenant=tenant_slug,
+            ) from None
+        log.warning(
+            "stringee webhook: signature check would have rejected (log_only mode)",
+            extra={"reason": e.reason, "tenant": tenant_slug, "route": route, "mode": "log_only"},
+        )
+    else:
+        if log.isEnabledFor(logging.DEBUG):
+            debug_event(log, "telephony stringee_signature passed", tenant=tenant_slug, route=route)
+
+
 @router.post("/twilio/voice", response_class=Response)
 async def twilio_voice(
     request: Request,
@@ -210,6 +434,7 @@ async def twilio_voice(
         lookup_number=lookup_number,
     )
     tenant = await tenant_from_twilio_to_number(lookup_number)
+    await _verify_twilio_signature(request, tenant, route="twilio_voice")
 
     # Tenant slug goes in the URL **path** — Twilio strips query strings
     # from <Stream url=...> attributes when opening the WSS connection.
@@ -247,6 +472,7 @@ async def twilio_voice_for_tenant(
             tenant_slug=tenant_slug, form=dict((await request.form()).multi_items()),
         )
     tenant = await tenant_from_slug(tenant_slug)
+    await _verify_twilio_signature(request, tenant, route="twilio_voice_for_tenant")
     # Embed CallSid in the stream path so the bridge factory can look up
     # per-call overrides (voice/caller_name/lead_name/lead_gender). Twilio
     # strips query strings from <Stream url=...> so the SID must be in the path.
@@ -933,6 +1159,7 @@ async def exotel_voice(
         lookup_number=lookup_number,
     )
     tenant = await tenant_from_twilio_to_number(lookup_number)
+    await _verify_exotel_basic_auth(request, tenant, route="exotel_voice")
 
     stream_url = _ws_stream_url(request, f"exotel/stream/{tenant.slug}")
     body = voicebot_xml(stream_url)
@@ -967,6 +1194,7 @@ async def exotel_voice_for_tenant(
             tenant_slug=tenant_slug, form=dict((await request.form()).multi_items()),
         )
     tenant = await tenant_from_slug(tenant_slug)
+    await _verify_exotel_basic_auth(request, tenant, route="exotel_voice_for_tenant")
     stream_url = _ws_stream_url(request, f"exotel/stream/{tenant.slug}")
     log.info(
         "exotel voice webhook (slug-scoped)",
@@ -1155,6 +1383,7 @@ async def _stringee_answer(request: Request, tenant: "TenantContext | None"):
     if tenant is None:
         log.warning("stringee answer: no tenant; keys=%s", sorted(data.keys()))
         return Response(status_code=404)
+    await _verify_stringee_signature(request, tenant, route="stringee_answer")
     if _stringee_bridge_factory is None:
         debug_event(log, "stringee answer rejected", call_id=call_id, reason="no_bridge_factory")
         return Response(status_code=503)

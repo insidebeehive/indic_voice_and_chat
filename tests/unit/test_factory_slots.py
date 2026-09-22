@@ -255,6 +255,33 @@ async def test_bridge_factory_kb_context_survives_cold_bm25(tmp_faiss_index) -> 
     assert "Casino games include slots" in bridge._agent._kb_context
 
 
+async def test_browser_factory_handoff_load_failure_logs_fingerprint_not_raw_token(fake_redis, caplog) -> None:
+    """Fix 3: the handoff-context load-failure path
+    (``make_browser_bridge_factory``'s ``except Exception`` around the Redis
+    lookup) must log ``token_fingerprint(handoff_token)``, never the raw
+    token -- WARNING is on in normal running, so a raw value logged here
+    ships to Loki. Mirrors tests/unit/test_auth_secret_logging.py's shape:
+    forces the failure with a malformed JSON blob (not a mock) so this is a
+    real run through the actual except-branch, not an assertion about intent.
+    """
+    import logging
+
+    from src.auth.audit import token_fingerprint
+
+    token = "tok-canary-raw-9f3b2c1d"
+    await fake_redis.set(f"chat_handoff:{token}", "not-valid-json{")
+    factory = make_browser_bridge_factory(
+        _providers(), handoff_store=SimpleNamespace(redis=fake_redis))
+    ws = SimpleNamespace(query_params={"handoff": token})
+
+    with caplog.at_level(logging.WARNING):
+        await factory(websocket=ws, tenant=_tenant())  # must not raise
+
+    logged = "\n".join(r.getMessage() + " " + repr(r.__dict__) for r in caplog.records)
+    assert token not in logged, "raw handoff token was logged"
+    assert token_fingerprint(token) in logged, "the token's fingerprint should be logged instead"
+
+
 async def test_browser_factory_resolves_campaign_per_call() -> None:
     from src.dialogue.campaign_loader import LoadedCampaign
     from src.dialogue.prompts import VoiceBotScript

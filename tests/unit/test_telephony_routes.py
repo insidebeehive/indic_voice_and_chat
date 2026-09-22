@@ -360,3 +360,195 @@ def test_exotel_websocket_drives_registered_bridge_with_tenant() -> None:
         set_tenant_resolver(None)
 
     assert received == [("dev", "hello")]
+
+
+# --- Fix 1: inbound webhook signature/credential verification ---------------
+#
+# Per-provider matrix: a valid signature/credential passes; an invalid one is
+# rejected in `enforce` mode and allowed-with-WARNING in `log_only` mode; and
+# — the non-breaking guarantee — a tenant with NO configured secret is
+# unaffected in either mode.
+
+import base64
+import logging as _logging
+
+from twilio.request_validator import RequestValidator
+
+from src.config_tenant import TenantPipelineConfig, TenantTelephonyConfig
+
+
+def _register_twilio_tenant(auth_token: str | None, phone: str = "+18888888888"):
+    telephony = TenantTelephonyConfig(
+        account_sid_env="T_DEV_TWILIO_SID", auth_token_env="T_DEV_TWILIO_TOKEN")
+    return register_tenant_for_test(
+        TenantSettings(
+            id="t_dev", slug="dev", name="Dev", phone_numbers=[phone],
+            pipeline=TenantPipelineConfig(telephony=telephony),
+        ),
+        secrets={"T_DEV_TWILIO_TOKEN": auth_token} if auth_token else None,
+    )
+
+
+def test_twilio_voice_valid_signature_passes(monkeypatch) -> None:
+    monkeypatch.setenv("VOX_WEBHOOK_SIGNATURE_MODE", "enforce")
+    _register_twilio_tenant("secret-token-1")
+    try:
+        params = {"To": "+18888888888"}
+        sig = RequestValidator("secret-token-1").compute_signature(
+            "http://testserver/telephony/twilio/voice", params)
+        resp = TestClient(_make_app()).post(
+            "/telephony/twilio/voice", data=params, headers={"X-Twilio-Signature": sig})
+        assert resp.status_code == 200, resp.text
+    finally:
+        set_tenant_resolver(None)
+
+
+def test_twilio_voice_invalid_signature_rejected_in_enforce_mode(monkeypatch) -> None:
+    monkeypatch.setenv("VOX_WEBHOOK_SIGNATURE_MODE", "enforce")
+    _register_twilio_tenant("secret-token-1")
+    try:
+        resp = TestClient(_make_app()).post(
+            "/telephony/twilio/voice", data={"To": "+18888888888"},
+            headers={"X-Twilio-Signature": "bogus"})
+        assert resp.status_code == 401
+    finally:
+        set_tenant_resolver(None)
+
+
+def test_twilio_voice_invalid_signature_allowed_with_warning_in_log_only_mode(monkeypatch, caplog) -> None:
+    monkeypatch.setenv("VOX_WEBHOOK_SIGNATURE_MODE", "log_only")
+    _register_twilio_tenant("secret-token-1")
+    try:
+        with caplog.at_level(_logging.WARNING):
+            resp = TestClient(_make_app()).post(
+                "/telephony/twilio/voice", data={"To": "+18888888888"},
+                headers={"X-Twilio-Signature": "bogus"})
+        assert resp.status_code == 200, resp.text
+        assert any("would have rejected" in r.getMessage() for r in caplog.records)
+    finally:
+        set_tenant_resolver(None)
+
+
+def test_twilio_voice_no_secret_configured_is_unaffected_in_enforce_mode(monkeypatch) -> None:
+    monkeypatch.setenv("VOX_WEBHOOK_SIGNATURE_MODE", "enforce")
+    _register_twilio_tenant(None)
+    try:
+        resp = TestClient(_make_app()).post(
+            "/telephony/twilio/voice", data={"To": "+18888888888"})
+        assert resp.status_code == 200, resp.text
+    finally:
+        set_tenant_resolver(None)
+
+
+def test_twilio_voice_no_secret_configured_is_unaffected_in_log_only_mode(monkeypatch) -> None:
+    monkeypatch.setenv("VOX_WEBHOOK_SIGNATURE_MODE", "log_only")
+    _register_twilio_tenant(None)
+    try:
+        resp = TestClient(_make_app()).post(
+            "/telephony/twilio/voice", data={"To": "+18888888888"})
+        assert resp.status_code == 200, resp.text
+    finally:
+        set_tenant_resolver(None)
+
+
+def test_twilio_voice_slug_route_invalid_signature_rejected_in_enforce_mode(monkeypatch) -> None:
+    """The slug-scoped outbound route (`_verify_twilio_signature` wired
+    separately there) is covered too, not just the bare `/voice` route."""
+    monkeypatch.setenv("VOX_WEBHOOK_SIGNATURE_MODE", "enforce")
+    _register_twilio_tenant("secret-token-1")
+    try:
+        resp = TestClient(_make_app()).post(
+            "/telephony/twilio/voice/dev", data={"To": "+918618795697"},
+            headers={"X-Twilio-Signature": "bogus"})
+        assert resp.status_code == 401
+    finally:
+        set_tenant_resolver(None)
+
+
+def _register_exotel_tenant(user: str | None, password: str | None, phone: str = "+18888888888"):
+    secrets = {}
+    if user:
+        secrets["webhook:exotel_basic_user"] = user
+    if password:
+        secrets["webhook:exotel_basic_password"] = password
+    return register_tenant_for_test(
+        TenantSettings(id="t_dev", slug="dev", name="Dev", phone_numbers=[phone]),
+        secrets=secrets or None,
+    )
+
+
+def _basic_header(user: str, password: str) -> str:
+    return "Basic " + base64.b64encode(f"{user}:{password}".encode()).decode()
+
+
+def test_exotel_voice_valid_credentials_pass(monkeypatch) -> None:
+    monkeypatch.setenv("VOX_WEBHOOK_SIGNATURE_MODE", "enforce")
+    _register_exotel_tenant("euser", "epass")
+    try:
+        resp = TestClient(_make_app()).post(
+            "/telephony/exotel/voice", data={"To": "+18888888888"},
+            headers={"Authorization": _basic_header("euser", "epass")})
+        assert resp.status_code == 200, resp.text
+    finally:
+        set_tenant_resolver(None)
+
+
+def test_exotel_voice_invalid_credentials_rejected_in_enforce_mode(monkeypatch) -> None:
+    monkeypatch.setenv("VOX_WEBHOOK_SIGNATURE_MODE", "enforce")
+    _register_exotel_tenant("euser", "epass")
+    try:
+        resp = TestClient(_make_app()).post(
+            "/telephony/exotel/voice", data={"To": "+18888888888"},
+            headers={"Authorization": _basic_header("euser", "wrong-password")})
+        assert resp.status_code == 401
+    finally:
+        set_tenant_resolver(None)
+
+
+def test_exotel_voice_invalid_credentials_allowed_with_warning_in_log_only_mode(monkeypatch, caplog) -> None:
+    monkeypatch.setenv("VOX_WEBHOOK_SIGNATURE_MODE", "log_only")
+    _register_exotel_tenant("euser", "epass")
+    try:
+        with caplog.at_level(_logging.WARNING):
+            resp = TestClient(_make_app()).post(
+                "/telephony/exotel/voice", data={"To": "+18888888888"},
+                headers={"Authorization": _basic_header("euser", "wrong-password")})
+        assert resp.status_code == 200, resp.text
+        assert any("would have rejected" in r.getMessage() for r in caplog.records)
+    finally:
+        set_tenant_resolver(None)
+
+
+def test_exotel_voice_no_credentials_configured_is_unaffected_in_enforce_mode(monkeypatch) -> None:
+    monkeypatch.setenv("VOX_WEBHOOK_SIGNATURE_MODE", "enforce")
+    _register_exotel_tenant(None, None)
+    try:
+        resp = TestClient(_make_app()).post(
+            "/telephony/exotel/voice", data={"To": "+18888888888"})
+        assert resp.status_code == 200, resp.text
+    finally:
+        set_tenant_resolver(None)
+
+
+def test_exotel_voice_no_credentials_configured_is_unaffected_in_log_only_mode(monkeypatch) -> None:
+    monkeypatch.setenv("VOX_WEBHOOK_SIGNATURE_MODE", "log_only")
+    _register_exotel_tenant(None, None)
+    try:
+        resp = TestClient(_make_app()).post(
+            "/telephony/exotel/voice", data={"To": "+18888888888"})
+        assert resp.status_code == 200, resp.text
+    finally:
+        set_tenant_resolver(None)
+
+
+def test_exotel_voice_incomplete_credential_pair_is_treated_as_unconfigured(monkeypatch) -> None:
+    """Only one of the two Basic Auth halves configured -- must be a no-op,
+    same as answer_paths.py's `both_configured` check for the outbound side."""
+    monkeypatch.setenv("VOX_WEBHOOK_SIGNATURE_MODE", "enforce")
+    _register_exotel_tenant("euser", None)
+    try:
+        resp = TestClient(_make_app()).post(
+            "/telephony/exotel/voice", data={"To": "+18888888888"})
+        assert resp.status_code == 200, resp.text
+    finally:
+        set_tenant_resolver(None)

@@ -37,14 +37,40 @@ from src.models.tenant import Tenant
 log = logging.getLogger(__name__)
 
 
-def _log_reload_collision(key_kind: str, key_repr: str, existing_tenant_slug: str, new_tenant_slug: str) -> None:
+def _log_reload_collision(
+    key_kind: str,
+    key_repr: str,
+    existing_tenant_id: str,
+    existing_tenant_slug: str,
+    new_tenant_id: str,
+    new_tenant_slug: str,
+) -> None:
     """One tenant's reload() entry overwrote another's under the same lookup
     key -- see the call sites in ``reload()`` for which keys are safe to log
-    in full (``key_repr``) versus pre-fingerprinted by the caller."""
-    from src.utils.logging import debug_event
-    debug_event(
-        log, "tenant_resolver reload_key_collision", key_kind=key_kind, key_repr=key_repr,
-        existing_tenant_slug=existing_tenant_slug, new_tenant_slug=new_tenant_slug,
+    in full (``key_repr``) versus pre-fingerprinted by the caller.
+
+    This is a data condition, not something we can safely raise on: failing
+    the whole resolver load over one bad row would take every tenant down,
+    not just the two colliding ones. So it stays last-write-wins and this is
+    the trace an operator needs to act on it without a database query -- both
+    tenant ids, which key, and what kind of key it was. ERROR (not the
+    DEBUG-only ``debug_event`` this replaced) because DEBUG is off in normal
+    running and a cross-tenant routing collision must reach whatever alerting
+    exists.
+    """
+    log.error(
+        "tenant resolver reload: %s collision on %s -- tenant %s (%s) was overwritten by "
+        "tenant %s (%s); inbound routing for %s now resolves to %s (last-loaded wins)",
+        key_kind, key_repr, existing_tenant_id, existing_tenant_slug,
+        new_tenant_id, new_tenant_slug, existing_tenant_slug, new_tenant_slug,
+        extra={
+            "key_kind": key_kind,
+            "key_repr": key_repr,
+            "existing_tenant_id": existing_tenant_id,
+            "existing_tenant_slug": existing_tenant_slug,
+            "new_tenant_id": new_tenant_id,
+            "new_tenant_slug": new_tenant_slug,
+        },
     )
 
 
@@ -190,14 +216,17 @@ class DbTenantResolver:
                     # number, safe in full at DEBUG.
                     if p.phone_number in by_phone and by_phone[p.phone_number].id != t.id:
                         _log_reload_collision(
-                            "phone_number", p.phone_number, by_phone[p.phone_number].slug, t.slug)
+                            "phone_number", p.phone_number,
+                            by_phone[p.phone_number].id, by_phone[p.phone_number].slug,
+                            t.id, t.slug)
                     by_phone[p.phone_number] = ctx
                 inbox_id = ctx.secrets_resolved.get("chatwoot:inbox_id")
                 if inbox_id:
                     key = str(inbox_id)
                     if key in by_cw_inbox and by_cw_inbox[key].id != t.id:
                         _log_reload_collision(
-                            "chatwoot_inbox_id", key, by_cw_inbox[key].slug, t.slug)
+                            "chatwoot_inbox_id", key,
+                            by_cw_inbox[key].id, by_cw_inbox[key].slug, t.id, t.slug)
                     by_cw_inbox[key] = ctx
                 # The next three are capability tokens -- presenting the raw
                 # value alone resolves (and thereby authenticates) a tenant
@@ -210,7 +239,8 @@ class DbTenantResolver:
                     if key in by_stringee_webhook_token and by_stringee_webhook_token[key].id != t.id:
                         _log_reload_collision(
                             "stringee_webhook_token", token_fingerprint(key),
-                            by_stringee_webhook_token[key].slug, t.slug)
+                            by_stringee_webhook_token[key].id, by_stringee_webhook_token[key].slug,
+                            t.id, t.slug)
                     by_stringee_webhook_token[key] = ctx
                 chatwoot_webhook_id = ctx.secrets_resolved.get("chatwoot:webhook_id")
                 if chatwoot_webhook_id:
@@ -218,7 +248,7 @@ class DbTenantResolver:
                     if key in by_cw_webhook_id and by_cw_webhook_id[key].id != t.id:
                         _log_reload_collision(
                             "chatwoot_webhook_id", token_fingerprint(key),
-                            by_cw_webhook_id[key].slug, t.slug)
+                            by_cw_webhook_id[key].id, by_cw_webhook_id[key].slug, t.id, t.slug)
                     by_cw_webhook_id[key] = ctx
                 dv_reply_token = ctx.secrets_resolved.get("deposit_verification:reply_token")
                 if dv_reply_token:
@@ -226,7 +256,7 @@ class DbTenantResolver:
                     if key in by_dv_reply_token and by_dv_reply_token[key].id != t.id:
                         _log_reload_collision(
                             "deposit_verification_reply_token", token_fingerprint(key),
-                            by_dv_reply_token[key].slug, t.slug)
+                            by_dv_reply_token[key].id, by_dv_reply_token[key].slug, t.id, t.slug)
                     by_dv_reply_token[key] = ctx
             self._by_token, self._by_slug, self._by_phone = by_token, by_slug, by_phone
             self._by_id = by_id

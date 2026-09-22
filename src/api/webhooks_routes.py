@@ -9,16 +9,25 @@ from __future__ import annotations
 import logging
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
+from src.auth import require_admin
 from src.integration.webhooks import WebhookManager
 from src.utils.logging import debug_event
 from src.utils.redact import redact_url
 
 log = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/webhooks", tags=["webhooks"])
+# Admin-gated, not tenant-scoped: WebhookManager.register()/list()/unregister()
+# are process-global (no tenant_id anywhere on a registration), so a
+# current_tenant dependency would be incoherent here -- there is no tenant to
+# scope to. Matches src/api/benchmarks.py's router-level require_admin gate.
+# The manager is inert today (set_webhook_manager is never called in src/, so
+# every route 503s via _require_manager below) but the gate belongs on the
+# router regardless of that -- wiring the manager later must not silently
+# reopen these routes to the world.
+router = APIRouter(prefix="/webhooks", tags=["webhooks"], dependencies=[Depends(require_admin)])
 
 
 # --- DI -----------------------------------------------------------------

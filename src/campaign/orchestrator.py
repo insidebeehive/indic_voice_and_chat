@@ -137,6 +137,32 @@ class CampaignOrchestrator:
                 break
             i += 1
 
+            # A lead whose number was already in the DND store before it was
+            # ever dialled is invisible to `_lead_eligible` in a way that
+            # matters: that check skips it on every poll but never changes
+            # `lead.status`, so it would stay PENDING and sit in `remaining`
+            # forever, the campaign never reaching COMPLETED. Sweep it here,
+            # per iteration (not once at the top of `run`) so a number added
+            # to the DND store mid-run is caught too -- once a lead is
+            # transitioned it leaves `remaining`, so this shrinks the work
+            # rather than repeating it every tick.
+            for lead in self._sched.dnd_blocked(run.remaining):
+                previous_status = lead.status
+                lead.status = LeadStatus.DND
+                # Counted as completed, matching `_on_call_result` below, which
+                # adds any lead reaching COMPLETED/FAILED/DND. Without this,
+                # `stats["completed"]` would sit permanently below
+                # `total_leads` by the number of pre-blocked leads -- an
+                # operator reading "95 of 100" would see 5 still to go, which
+                # is the same wrong conclusion the stall itself produced.
+                run.completed_leads.add(lead.id)
+                debug_event(
+                    log, "campaign lead_dnd transition",
+                    lead_id=lead.id, campaign_id=run.campaign.id,
+                    phone_number=lead.phone_number,
+                    previous_status=previous_status.value,
+                )
+
             now = now_fn()
             decision = self._sched.poll(
                 leads=run.remaining,

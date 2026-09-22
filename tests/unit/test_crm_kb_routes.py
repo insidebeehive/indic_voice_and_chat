@@ -256,3 +256,48 @@ async def test_ingest_with_normal_document_id_still_succeeds(client: AsyncClient
 async def test_requires_admin(client: AsyncClient) -> None:
     resp = await client.get("/crms/betstudio/kb/documents")
     assert resp.status_code == 401
+
+
+async def test_delete_crm_document_retriever_failure_leaves_row_intact(
+    client: AsyncClient, monkeypatch
+) -> None:
+    """The vector delete runs before the row delete, so a retriever failure is
+    recoverable.
+
+    Committing the row first -- which this route did -- makes the failure
+    permanent in the worst direction: the metadata is gone while the chunks
+    stay live in the index, so the document vanishes from list_crm_documents
+    and stats but its content is still returned by query. A citation from a
+    document that no longer exists. Ordering it the other way means a failure
+    leaves everything in place and the caller can simply retry.
+
+    Sibling of test_delete_document_retriever_failure_leaves_row_intact_and_is_retryable
+    in test_knowledge_routes.py -- both routes had the same ordering.
+    """
+    resp = await client.post(
+        "/crms/betstudio/kb/ingest",
+        files={"file": ("doomed.md", io.BytesIO(b"Plan C has 900GB"), "text/markdown")},
+        headers=ADMIN_HEADERS,
+    )
+    doc_id = resp.json()["document_id"]
+
+    from src.rag.retriever import HybridRetriever
+
+    async def _boom(self, chunk_ids):
+        raise RuntimeError("vector store unavailable")
+
+    monkeypatch.setattr(HybridRetriever, "delete", _boom)
+    with pytest.raises(RuntimeError):
+        await client.delete(f"/crms/betstudio/kb/documents/{doc_id}", headers=ADMIN_HEADERS)
+
+    # The row survived the failed delete -- nothing was committed.
+    monkeypatch.undo()
+    listed = await client.get("/crms/betstudio/kb/documents", headers=ADMIN_HEADERS)
+    assert doc_id in [d["id"] for d in listed.json()["documents"]], \
+        "row was deleted despite the vector delete failing -- chunks are now orphaned"
+
+    # ...and the retry now succeeds, which is the point of the ordering.
+    again = await client.delete(f"/crms/betstudio/kb/documents/{doc_id}", headers=ADMIN_HEADERS)
+    assert again.status_code == 200
+    listed2 = await client.get("/crms/betstudio/kb/documents", headers=ADMIN_HEADERS)
+    assert doc_id not in [d["id"] for d in listed2.json()["documents"]]

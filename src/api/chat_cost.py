@@ -27,6 +27,15 @@ from src.utils.logging import debug_event
 
 log = logging.getLogger(__name__)
 
+# A missing ProviderCost row bills the turn's LLM tokens at $0.0 -- a
+# reporting gap, not a runtime fault, so this only ever warns (never raises).
+# token_rates runs per chat turn, so an unpriced provider/model would
+# otherwise warn on every single turn; this set makes each distinct
+# (kind, provider, model) combo warn once per process -- same idiom as
+# call_store._rate's _warned_rate_misses (src/api/call_store.py), which in
+# turn mirrors _PushFailureWarner (src/observability/turn_metrics_push.py).
+_warned_rate_misses: set[tuple[str, ...]] = set()
+
 
 async def token_rates(
     session: AsyncSession, provider: str, model: str
@@ -59,7 +68,42 @@ async def token_rates(
             cached_rate=row.cost_per_1k_cached_tokens if row is not None else None,
         )
     if row is None:
+        # No catalog row at all for this (provider, model) -- neither the
+        # exact-model row nor its provider-level fallback -- so every token
+        # on this turn bills at $0.0. Same shape and same reason as
+        # call_store._rate's miss warning: distinguishing "genuinely free"
+        # from "nobody priced this yet" needs a trace, not silence.
+        key = ("llm", provider, model)
+        if key not in _warned_rate_misses:
+            _warned_rate_misses.add(key)
+            log.warning(
+                "no ProviderCost row for kind=llm provider=%s model=%s (nor "
+                "its provider-level fallback) -- billing this turn's tokens "
+                "at $0.0 until a row is added (further warnings for this "
+                "combination suppressed for this process)",
+                provider, model,
+            )
         return 0.0, 0.0, None
+    if not row.cost_per_1k_input_tokens and not row.cost_per_1k_output_tokens:
+        # A row exists and prices this at nothing. That is a legitimate state
+        # (a genuinely free model) and an equally plausible mistake: the two
+        # token-rate columns are NOT NULL with a 0.0 default, so a row added
+        # without them looks identical to one priced at zero on purpose.
+        # Silence would lose the half-configured case entirely -- it is the
+        # one this function cannot distinguish, so it is the one worth
+        # surfacing. Deduped per combination like the miss above, because it
+        # would otherwise fire on every turn for the lifetime of the row.
+        key = ("llm", provider, model, "zero_rated")
+        if key not in _warned_rate_misses:
+            _warned_rate_misses.add(key)
+            log.warning(
+                "ProviderCost row for kind=llm provider=%s model=%s prices "
+                "input and output tokens at $0.0 -- correct only if this model "
+                "is genuinely free; otherwise the row was added without its "
+                "rates (further warnings for this combination suppressed for "
+                "this process)",
+                provider, model,
+            )
     return row.cost_per_1k_input_tokens, row.cost_per_1k_output_tokens, row.cost_per_1k_cached_tokens
 
 
@@ -85,12 +129,17 @@ async def compute_chat_turn_cost(
     if not provider or (not input_tokens and not output_tokens):
         return 0.0
     in_rate, out_rate, cached_rate = await token_rates(session, provider, model)
-    if in_rate == 0.0 and out_rate == 0.0:
-        log.warning(
-            "chat cost resolved to $0 for %s/%s despite %d+%d tokens - "
-            "missing ProviderCost token rate row?",
-            provider, model, input_tokens, output_tokens,
-        )
+    # No separate "$0 despite N+M tokens" warning here: whenever token_rates
+    # resolves both rates to 0.0 it is because no ProviderCost row matched at
+    # all (exact or provider-level), and token_rates itself already warns
+    # that -- deduped per (kind, provider, model) rather than per turn, and
+    # naming kind/provider/model directly. A second, un-deduped warning here
+    # for the exact same condition would just be log noise on every turn for
+    # an already-known gap. (A row that DOES exist but has both token rates
+    # explicitly at 0.0 is indistinguishable from "never configured" on this
+    # schema -- cost_per_1k_input_tokens/output_tokens have no NULL state,
+    # unlike cost_per_1k_cached_tokens -- so that case is intentionally silent
+    # too, consistent with "a lookup that finds a row emits nothing".)
     # A provider report is not a trusted input: cached_tokens should always be
     # <= input_tokens (see ChatTurnMetric's own docstring in
     # src/agents/chatbot.py), but that is not enforced anywhere upstream, so

@@ -413,20 +413,23 @@ async def delete_document(
     stored_chunk_ids = (row.extra_data or {}).get("chunk_ids")
     chunk_ids = stored_chunk_ids or [
         f"{document_id}::chunk-{i}" for i in range(row.chunk_count or 0)]
-    # The DB row is committed-deleted BEFORE the vector-store delete below runs.
-    # If retriever.delete() then raises, the KBDocument row is already gone
-    # permanently while its chunks remain orphaned in the vector index --
-    # unreachable via list_documents but still live for search/query. Found,
-    # not fixed here; flagging in the deliverable.
     debug_event(
         log, "knowledge delete_document request",
         tenant_id=tenant.id, document_id=document_id,
         chunk_ids=chunk_ids, chunk_ids_source=("extra_data" if stored_chunk_ids else "derived_from_chunk_count"),
         stored_chunk_count=row.chunk_count,
     )
+    # Vector-store delete happens BEFORE the durable row delete/commit, not
+    # after: if retriever.delete() raises, the KBDocument row must survive so
+    # the operation is retryable. Doing it in the other order (row deleted +
+    # committed, then retriever.delete()) makes a vector-store failure
+    # unrecoverable -- the metadata row is already gone permanently while its
+    # chunks stay live in the index (unreachable via list_documents/stats, but
+    # still returned by query as a citation from a document that no longer
+    # exists).
+    n = await retriever.delete(chunk_ids)
     await session.delete(row)
     await session.commit()
-    n = await retriever.delete(chunk_ids)
     debug_event(
         log, "knowledge delete_document response",
         tenant_id=tenant.id, document_id=document_id,

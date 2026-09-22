@@ -250,6 +250,18 @@ def _components_used(
     return triples
 
 
+# A missing ProviderCost row bills the leg at $0.0 -- a reporting gap, not a
+# runtime fault, so this only ever warns (never raises). Rate lookups happen
+# per call leg, so an unpriced provider/model would otherwise warn on every
+# single call; this set makes each distinct (kind, provider, model) combo
+# warn once per process, same idiom as _PushFailureWarner in
+# src/observability/turn_metrics_push.py (there: one outage, here: one
+# missing catalog row, both re-armed only by a process restart -- a catalog
+# gap doesn't "recover" the way a push outage does, so there is no
+# mark_recovered() counterpart).
+_warned_rate_misses: set[tuple[str, str, str]] = set()
+
+
 async def _rate(session: AsyncSession, kind: str, provider: str, model: str) -> float:
     """Rate for (kind, provider, model); fall back to the provider-level ("") row."""
     row = await session.get(ProviderCost, (kind, provider, model or ""))
@@ -259,10 +271,16 @@ async def _rate(session: AsyncSession, kind: str, provider: str, model: str) -> 
         # A missing catalog row bills this leg at $0.0 silently -- the
         # decision that changes the reported cost, with nothing recording
         # that it was made by omission rather than by an actual $0 rate.
-        debug_event(
-            log, "call_store rate_lookup miss",
-            kind=kind, provider=provider, model=model,
-        )
+        key = (kind, provider, model)
+        if key not in _warned_rate_misses:
+            _warned_rate_misses.add(key)
+            log.warning(
+                "no ProviderCost row for kind=%s provider=%s model=%s (nor its "
+                "provider-level fallback) -- billing this leg at $0.0 until a "
+                "row is added (further warnings for this combination "
+                "suppressed for this process)",
+                kind, provider, model,
+            )
         return 0.0
     return row.cost_per_min
 

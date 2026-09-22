@@ -33,9 +33,16 @@ def _parse_schedule(support_hours: dict) -> dict:
             # trace that the tenant's configured hours for that key were
             # ever read. This is the entry that made a tenant's support
             # hours look "always closed" for one day with no error anywhere.
-            debug_event(
-                log, "support_hours schedule_entry_dropped", key=key,
-                timerange=timerange, reason="unrecognized_day_key",
+            # WARNING (not DEBUG, and not a raise): a live tenant config may
+            # already carry this typo, and a hard failure here would turn a
+            # degraded feature (one day silently unavailable) into an
+            # outright one at an unpredictable moment. The fix is visibility,
+            # not stricter parsing -- see the report for why.
+            log.warning(
+                "support_hours: unrecognized day key %r (value %r) -- this "
+                "entry is dropped entirely, not just this key; expected one "
+                "of mon-fri/weekdays/weekend/mon..sun",
+                key, timerange,
             )
             continue
         try:
@@ -44,10 +51,12 @@ def _parse_schedule(support_hours: dict) -> dict:
             eh, em = int(end_s.split(":")[0]), int(end_s.split(":")[1])
         except Exception:  # noqa: BLE001
             # A malformed "HH:MM-HH:MM" value (missing dash, non-numeric,
-            # etc) is dropped the same silent way -- same motivation as above.
-            debug_event(
-                log, "support_hours schedule_entry_dropped", key=key,
-                timerange=timerange, reason="unparseable_timerange",
+            # etc) is dropped the same silent way -- same motivation as above,
+            # same reason this is a warning and not a raise.
+            log.warning(
+                "support_hours: unparseable time range %r for key %r "
+                "(expected \"HH:MM-HH:MM\") -- this entry is dropped entirely",
+                timerange, key,
             )
             continue
         for d in days:

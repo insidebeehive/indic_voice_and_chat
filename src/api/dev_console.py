@@ -924,7 +924,8 @@ def make_browser_bridge_factory(
                                 reason="token_not_found",
                                 token_fp=token_fingerprint(handoff_token))
             except Exception:  # noqa: BLE001 — a bad handoff blob must not block the call
-                log.warning("chat handoff context load failed", extra={"token": handoff_token})
+                log.warning("chat handoff context load failed",
+                            extra={"token_fp": token_fingerprint(handoff_token)})
 
         # When a valid handoff is present, replace the campaign script with a
         # support-mode script. Campaign objective/opening/slots are irrelevant here.
