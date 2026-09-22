@@ -47,11 +47,13 @@ You can track the status of your withdrawal from the transaction history section
 
 ## Cancelling a Withdrawal Request
 
-A withdrawal request can be cancelled by the player only while it is still **Pending** — that is, submitted and awaiting platform review, not yet picked up for processing. While it is Pending, a "Cancel Withdraw" action appears on the request in wallet history; cancelling returns the amount to the wallet balance immediately.
+A withdrawal request can be cancelled by the player only while its status is **Pending**. On a Pending request, a "Cancel Withdraw" action appears in wallet history; cancelling returns the amount to the wallet balance immediately.
 
-Once the request has moved past Pending and been sent on to the payment gateway, it can no longer be cancelled and the "Cancel Withdraw" action is not shown. At that point the request runs through to completion or rejection, and a player who wants it stopped has to be handed to a human agent — there are no app steps that will do it.
+Pending is the only status that allows this. A status that merely sounds like the request is still waiting — submitted, under review, in progress, being processed — is not Pending, and a request on any of those cannot be cancelled by the player. Do not reason from what a status sounds like: if it does not read Pending, the answer is no.
 
-Only offer the self-cancellation steps when the request's status is confirmed Pending. On any other status the button the player is being sent to look for does not exist on their screen.
+Once a request leaves Pending it has gone on to the payment gateway, the "Cancel Withdraw" action is no longer shown, and it runs through to completion or rejection. A player who wants it stopped from that point has to be handed to a human agent — no app steps will do it.
+
+So the self-cancellation steps are only worth giving on a request confirmed to be Pending. On anything else they send the player hunting for a button that is not on their screen.
 
 ## Rejected Withdrawals
 
