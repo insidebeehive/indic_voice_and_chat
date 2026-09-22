@@ -22,7 +22,7 @@ Bank details (OTP + admin approval — see `04-withdrawals.md`) and, on casino l
 1. Tabs per product: Wallet / Casino / Sports / Matka (or Teer) — the visible set depends on the operator's products.
 2. Date-range filtering with quick presets ("Today" … "Last 45 days"). Range limits are enforced in-UI: selections are limited to the last 45 days ("You can only select dates within the last 45 days."); some layouts restrict the span to a two-day window ("You can only select dates within a two-day range from the selected 'From date'.").
 3. Rows drill into details ("Round Details", "Bet Details", "Market Bet Details").
-4. The Wallet tab supports cancelling pending withdrawals ("Cancel Withdraw").
+4. The Wallet tab offers "Cancel Withdraw" on a withdrawal request that is still Pending; the action is not shown once the request has moved past Pending — see `04-withdrawals.md`.
 5. Empty states: "No Transactions", "No WALLET/CASINO/SPORTS/MATKA transactions found for selected date range!".
 
 ## Language & theme

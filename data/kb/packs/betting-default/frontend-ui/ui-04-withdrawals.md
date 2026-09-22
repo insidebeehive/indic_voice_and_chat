@@ -22,7 +22,11 @@ If a deposit-rolling bonus is active, a warning dialog intercepts the withdrawal
 
 ## Cancelling a withdrawal
 
-Pending withdrawal requests can be cancelled from the statements/wallet-history list: "Cancel Withdraw" → confirm "Are you sure you want to cancel this withdrawal request?" → toast "Withdraw cancelled successfully" (or "Failed to cancel withdraw").
+A withdrawal request can be cancelled by the player **only while it is still Pending** in back-office review. On a Pending request the statements/wallet-history row offers "Cancel Withdraw" → confirm "Are you sure you want to cancel this withdrawal request?" → toast "Withdraw cancelled successfully" (or "Failed to cancel withdraw"), and the amount returns to the wallet balance.
+
+Once the request moves past Pending — it has been picked up for processing and sent on to the payment gateway — the "Cancel Withdraw" action is no longer shown on the row. There is no self-serve cancellation from that point: the request runs through to completion or rejection. A player who wants a non-Pending request stopped needs a human agent, not app steps.
+
+So the cancellation route is only worth offering to a player whose request is confirmed Pending. On any other status, telling them to cancel it themselves sends them looking for a button that is not on their screen.
 
 ## Bank account form
 

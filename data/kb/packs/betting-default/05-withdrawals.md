@@ -45,6 +45,14 @@ You can track the status of your withdrawal from the transaction history section
 - **Completed**: Funds have been sent to your account
 - **Rejected**: The request was declined (you will be notified of the reason)
 
+## Cancelling a Withdrawal Request
+
+A withdrawal request can be cancelled by the player only while it is still **Pending** — that is, submitted and awaiting platform review, not yet picked up for processing. While it is Pending, a "Cancel Withdraw" action appears on the request in wallet history; cancelling returns the amount to the wallet balance immediately.
+
+Once the request has moved past Pending and been sent on to the payment gateway, it can no longer be cancelled and the "Cancel Withdraw" action is not shown. At that point the request runs through to completion or rejection, and a player who wants it stopped has to be handed to a human agent — there are no app steps that will do it.
+
+Only offer the self-cancellation steps when the request's status is confirmed Pending. On any other status the button the player is being sent to look for does not exist on their screen.
+
 ## Rejected Withdrawals
 
 A withdrawal may be rejected if:
