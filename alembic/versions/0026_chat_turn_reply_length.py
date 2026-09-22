@@ -24,7 +24,7 @@ Integer, not BigInteger: a single chat reply overflowing a 32-bit int would
 require billions of characters in one turn.
 
 Revision: 0026_chat_turn_reply_length
-Down: 0025_deposit_verification_order_idx
+Down: 0025_dv_requests_order_idx
 """
 
 from __future__ import annotations
@@ -33,7 +33,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision = "0026_chat_turn_reply_length"
-down_revision = "0025_deposit_verification_order_idx"
+down_revision = "0025_dv_requests_order_idx"
 branch_labels = None
 depends_on = None
 

@@ -1,4 +1,4 @@
-"""alembic/versions/0025_deposit_verification_order_idx.py
+"""alembic/versions/0025_dv_requests_order_idx.py
 
 Adds a composite index on deposit_verification_requests(tenant_id, order_id).
 
@@ -30,7 +30,7 @@ that query in src/api/deposit_verification.py) has nothing meaningful left to
 sort.
 A third column would add write cost for no read benefit.
 
-Revision: 0025_deposit_verification_order_idx
+Revision: 0025_dv_requests_order_idx
 Down: 0024_chat_msg_source_media_url
 """
 
@@ -38,7 +38,7 @@ from __future__ import annotations
 
 from alembic import op
 
-revision = "0025_deposit_verification_order_idx"
+revision = "0025_dv_requests_order_idx"
 down_revision = "0024_chat_msg_source_media_url"
 branch_labels = None
 depends_on = None
