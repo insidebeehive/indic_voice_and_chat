@@ -21,6 +21,7 @@ from typing import Any, Optional
 from src.dialogue.packs import betting as _betting_pack
 from src.dialogue.packs import generic as _generic_pack
 from src.dialogue.slots import SlotSchema
+from src.utils.logging import debug_event
 
 log = logging.getLogger(__name__)
 
@@ -479,7 +480,22 @@ def build_voicebot_system_prompt(
     if extra_directives:
         parts.append("Additional directives:\n" + "\n".join(f"- {d}" for d in extra_directives))
 
-    return "\n\n".join(parts)
+    prompt_text = "\n\n".join(parts)
+    # Assembly decision, not a copy of the prompt: which optional blocks were
+    # selected and their sizes -- src/providers/llm/gemini.py already logs the
+    # full assembled system text on every request, so repeating prompt_text
+    # itself here would be waste (see this file's module docstring / the pass
+    # brief). Runs once per call setup, not per turn.
+    debug_event(
+        log, "prompts voicebot_system_prompt built",
+        agent_name=script.agent_name, company_name=script.company_name,
+        language_default=script.language_default, gender=script.gender,
+        gender_directive_applied=bool(_gd), lead_address_directive_applied=bool(_lad),
+        slot_count=len(schema.specs), required_slot_count=len(schema.required_names()),
+        lead_data_present=bool(lead_data), kb_context_chars=len(kb_context) if kb_context else 0,
+        extra_directives_count=len(extra_directives or []), prompt_chars=len(prompt_text),
+    )
+    return prompt_text
 
 
 def build_s2s_system_instruction(
@@ -618,7 +634,17 @@ def build_s2s_system_instruction(
             kb_context,
         ))
 
-    return "\n\n".join(parts)
+    prompt_text = "\n\n".join(parts)
+    debug_event(
+        log, "prompts s2s_system_instruction built",
+        agent_name=script.agent_name, company_name=script.company_name,
+        language_default=script.language_default, gender=script.gender,
+        gender_directive_applied=bool(_gd), lead_address_directive_applied=bool(_lad),
+        slot_count=len(schema.specs), required_slot_count=len(schema.required_names()),
+        lead_data_present=bool(lead_data), kb_context_chars=len(kb_context) if kb_context else 0,
+        prompt_chars=len(prompt_text),
+    )
+    return prompt_text
 
 
 def _variable_tail_parts(
@@ -689,6 +715,20 @@ def _variable_tail_parts(
     if extra_directives:
         tail.append("Additional directives:\n" + "\n".join(f"- {d}" for d in extra_directives))
 
+    # Shared by both callers (build_chatbot_system_prompt's inline append and
+    # build_chatbot_variable_tail's standalone build for the caching split --
+    # see this function's own docstring), so one event here covers both
+    # rather than needing a second copy at each call site. Runs once per
+    # chat turn -- values are cheap len()/bool() over what's already held, no
+    # guard needed per docs/debug-logging.md's cost section.
+    debug_event(
+        log, "prompts variable_tail built",
+        rag_context_injected=bool(rag_context),
+        rag_context_chars=len(rag_context) if rag_context else 0,
+        tenant_timezone_requested=tenant_timezone, tenant_timezone_resolved=tz_label,
+        extra_directives_count=len(extra_directives or []),
+        tail_chars=sum(len(p) for p in tail),
+    )
     return tail
 
 
@@ -721,6 +761,14 @@ def build_chatbot_system_prompt(
     own — build_chatbot_variable_tail does the latter.
     """
     pack = PACKS.get(prompt_pack, _generic_pack)
+    if prompt_pack not in PACKS:
+        # Silent fallback per the module comment above ("never raises") -- but
+        # an unrecognized pack name reaching here at all is a tenant
+        # config/deploy mismatch worth knowing about, not just tolerating.
+        debug_event(
+            log, "prompts pack fallback_to_generic",
+            requested_prompt_pack=prompt_pack,
+        )
     parts: list[str] = []
 
     # ── Identity ──────────────────────────────────────────────────────────────
@@ -1057,7 +1105,18 @@ def build_chatbot_system_prompt(
     if include_variable_tail:
         parts.extend(_variable_tail_parts(rag_context, extra_directives, tenant_timezone))
 
-    return "\n\n".join(parts)
+    prompt_text = "\n\n".join(parts)
+    debug_event(
+        log, "prompts chatbot_system_prompt built",
+        company_name=company_name, language_default=language_default,
+        prompt_pack=prompt_pack, has_player_tools=has_player_tools,
+        has_operator_tools=has_operator_tools,
+        has_deposit_verification_tool=has_deposit_verification_tool,
+        tenant_timezone=tenant_timezone, include_variable_tail=include_variable_tail,
+        rag_context_chars=len(rag_context) if rag_context else 0,
+        extra_directives_count=len(extra_directives or []), prompt_chars=len(prompt_text),
+    )
+    return prompt_text
 
 
 def build_chatbot_variable_tail(

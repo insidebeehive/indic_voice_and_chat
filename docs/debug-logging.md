@@ -247,6 +247,28 @@ caller, the event has to record which consumer it was built for. "What
 happened" is not enough — an event must not be readable as a claim about
 something it does not govern.
 
+## Two files are excluded on purpose
+
+**`src/auth/audit.py`** gets no `debug_event`, ever. `current_admin_label()`
+lives there and is called from inside `_AdminLabelLogFilter.filter()`
+(`src/utils/logging.py`), which is attached to the HANDLER — so it runs on
+every record the process emits. An event inside it would create a record, whose
+filters call it again, unbounded. The diagnostic value is available without the
+hazard by instrumenting the CALL SITES of `set_admin_label` in
+`src/auth/middleware.py`, which run once per successful auth and are ordinary
+application code. `log_denied` is left alone for a duller reason: it is already
+the logging call, so wrapping it in a DEBUG event would duplicate its own
+payload.
+
+**`src/observability/trace_redaction.py`** gets none either, and its docstring
+says why better than this file can: "no network calls, no file I/O, no logging
+side effects". It is the scrubber that will sit between what an LLM saw and a
+tracing backend, written after a production PII leak. Logging its input and
+output would defeat the module entirely.
+
+The general rule: **instrumenting the machinery that carries or sanitises logs
+is not the same as instrumenting the system.** Log its callers instead.
+
 ## Coverage
 
 One pass per package, in the order an operator would need them. A package is
@@ -287,16 +309,15 @@ a convention that depends on remembering is not a convention.
 | `agents` — `voicebot.py`, `state_machine.py`, `base.py` | 3 | 1,337 | **done** |
 | `chatbot` — `tool_executor.py` | 1 | — | **done** (needed nothing; every path already logs with a discriminator) |
 | `chatbot` — `deposit_verification.py` | 1 | — | **done** |
-| `chatbot` — the rest | 5 | — | not started |
-| `auth` — `registry.py` (`get_chat_tts`) | 1 | — | **done** |
-| `auth` — the rest | 8 | — | not started |
+| `chatbot` — the rest | 5 | 772 | **done** (`catalog.py`/`tools.py` are static tool tables — no functions, no branches) |
+| `auth` | 9 | 1,755 | **done** (7 instrumented; `audit.py` deliberately not — see below) |
 | `providers` | 33 | 5,045 | **done** (23 instrumented; 10 without — 8 empty `__init__`, plus `model_catalog.py` and `voice_catalog.py`, which are static tables. See 4a3be36) |
 | `rag` | 5 | 2,586 | **done** (4 files instrumented, `__init__` empty) |
 | `pipeline` | 8 | 1,379 | **done** (7 files instrumented, `__init__` empty) |
-| `dialogue` | 11 | 2,017 | not started |
+| `dialogue` | 7 | 1,744 | **done** (incl. `prompts.py` — logging only, no prompt text touched) |
 | `campaign` | 5 | 863 | not started |
 | `models` | 11 | 1,297 | not started |
-| `observability` | 4 | 1,432 | not started |
+| `observability` | 4 | 1,432 | **done** (2 instrumented; `trace_redaction.py` deliberately not — see below) |
 | `integration` | 6 | 662 | not started |
 | `analysis` | 3 | 459 | not started |
 | `utils` | 7 | 912 | not started |

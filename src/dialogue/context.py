@@ -12,9 +12,14 @@ doesn't expire mid-conversation.
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any, Optional
 
 from redis.asyncio import Redis
+
+from src.utils.logging import debug_event
+
+log = logging.getLogger(__name__)
 
 
 class SessionStore:
@@ -42,42 +47,98 @@ class SessionStore:
     # --- State -----------------------------------------------------------
 
     async def set_state(self, session_id: str, state: dict[str, Any]) -> None:
-        await self.redis.set(self._state_key(session_id), json.dumps(state), ex=self.ttl)
+        key = self._state_key(session_id)
+        # Write boundary with no logging of its own until now — the only callers
+        # (src/agents/base.py's persist_state) already log the full payload
+        # before calling this, but only that ONE caller; anything reaching
+        # SessionStore directly (bootstrap wiring, tests, a future caller) had
+        # no trace of the write actually happening or what key/TTL it landed
+        # under. See docs/debug-logging.md's "why the skip category exists".
+        debug_event(
+            log, "session_store set_state request",
+            session_id=session_id, tenant_id=self.tenant_id, redis_key=key,
+            state=state, ttl=self.ttl,
+        )
+        await self.redis.set(key, json.dumps(state), ex=self.ttl)
 
     async def get_state(self, session_id: str) -> Optional[dict[str, Any]]:
-        raw = await self.redis.get(self._state_key(session_id))
+        key = self._state_key(session_id)
+        raw = await self.redis.get(key)
         if raw is None:
+            # A miss here means the caller's session state is gone (expired,
+            # never written, or a key/tenant-prefix mismatch) — indistinguishable
+            # from a fresh session to everything downstream unless this fires.
+            debug_event(
+                log, "session_store get_state miss",
+                session_id=session_id, tenant_id=self.tenant_id, redis_key=key,
+            )
             return None
-        return json.loads(raw)
+        state = json.loads(raw)
+        debug_event(
+            log, "session_store get_state hit",
+            session_id=session_id, tenant_id=self.tenant_id, redis_key=key, state=state,
+        )
+        return state
 
     # --- History ---------------------------------------------------------
 
     async def append_history(self, session_id: str, turn: dict[str, Any]) -> None:
         key = self._history_key(session_id)
+        debug_event(
+            log, "session_store append_history request",
+            session_id=session_id, tenant_id=self.tenant_id, redis_key=key,
+            turn=turn, ttl=self.ttl,
+        )
         await self.redis.rpush(key, json.dumps(turn))
         await self.redis.expire(key, self.ttl)
 
     async def get_history(self, session_id: str) -> list[dict[str, Any]]:
-        items = await self.redis.lrange(self._history_key(session_id), 0, -1)
-        return [json.loads(i) for i in items]
+        key = self._history_key(session_id)
+        items = await self.redis.lrange(key, 0, -1)
+        history = [json.loads(i) for i in items]
+        debug_event(
+            log, "session_store get_history response",
+            session_id=session_id, tenant_id=self.tenant_id, redis_key=key,
+            turn_count=len(history), history=history,
+        )
+        return history
 
     # --- Slots -----------------------------------------------------------
 
     async def set_slot(self, session_id: str, name: str, value: Any) -> None:
         key = self._slots_key(session_id)
+        debug_event(
+            log, "session_store set_slot request",
+            session_id=session_id, tenant_id=self.tenant_id, redis_key=key,
+            slot_name=name, value=value, ttl=self.ttl,
+        )
         await self.redis.hset(key, name, json.dumps(value))
         await self.redis.expire(key, self.ttl)
 
     async def get_slots(self, session_id: str) -> dict[str, Any]:
-        raw = await self.redis.hgetall(self._slots_key(session_id))
-        return {
+        key = self._slots_key(session_id)
+        raw = await self.redis.hgetall(key)
+        slots = {
             (k.decode() if isinstance(k, bytes) else k): json.loads(v)
             for k, v in raw.items()
         }
+        debug_event(
+            log, "session_store get_slots response",
+            session_id=session_id, tenant_id=self.tenant_id, redis_key=key,
+            slot_count=len(slots), slots=slots,
+        )
+        return slots
 
     # --- Lifecycle -------------------------------------------------------
 
     async def delete(self, session_id: str) -> None:
+        # Session teardown: a session that stops working right after this,
+        # with no trace of it having been deleted, used to be indistinguishable
+        # from a store outage.
+        debug_event(
+            log, "session_store delete request",
+            session_id=session_id, tenant_id=self.tenant_id,
+        )
         await self.redis.delete(
             self._state_key(session_id),
             self._history_key(session_id),

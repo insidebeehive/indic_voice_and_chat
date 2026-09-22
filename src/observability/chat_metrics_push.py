@@ -60,6 +60,7 @@ from src.models.chat_turn_metrics import (
     ChatTurnMetric,
 )
 from src.observability.turn_metrics_push import _PushFailureWarner, _percentile, _push
+from src.utils.logging import debug_event
 from src.utils.redact import redact_url
 
 log = logging.getLogger(__name__)
@@ -222,7 +223,10 @@ async def aggregate_and_push_chat_metrics(
     in the window).
     """
     if not push_url:
-        log.debug("chat-metrics push skipped (GRAFANA_PROMETHEUS_PUSH_URL unset)")
+        debug_event(
+            log, "metrics push skipped", job_name=_JOB_NAME,
+            reason="push_url_unset",
+        )
         return 0
 
     try:
@@ -283,6 +287,17 @@ async def aggregate_and_push_chat_metrics(
     for row in tool_rows:
         key = tuple(getattr(row, label) or "" for label in _TOOL_GROUP_LABELS)
         tool_groups.setdefault(key, []).append(row)
+
+    # Same motivation as turn_metrics_push.py's identical event: this
+    # function's 0 return is ambiguous across push_url-unset/query-failed/
+    # registry-failed/genuinely-empty-window, and main.py's `if n_chat:
+    # log.info(...)` caller only distinguishes truthy from falsy.
+    debug_event(
+        log, "metrics aggregate result", job_name=_JOB_NAME, window_s=window_s,
+        turn_row_count=len(turn_rows), tool_row_count=len(tool_rows),
+        turn_group_count=len(turn_groups), failure_group_count=len(failure_groups),
+        tool_group_count=len(tool_groups),
+    )
 
     try:
         registry = _build_registry(turn_groups, failure_groups, tool_groups)

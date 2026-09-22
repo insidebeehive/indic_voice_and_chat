@@ -48,7 +48,9 @@ async def seed_tenants_from_yaml(session, tenant_dir=None) -> int:
         # it inside the pipeline_config JSON so it round-trips without a migration.
         # db_resolver pulls it back out (TenantPipelineConfig ignores the extra key).
         cfg["compliance"] = s.compliance.model_dump()
+        from src.utils.logging import debug_event
         if row is None:
+            debug_event(log, "seed tenant upsert", tenant_slug=s.slug, tenant_id=s.id, action="created")
             session.add(Tenant(
                 id=s.id, slug=s.slug, name=s.name, status=s.status,
                 timezone=s.timezone, default_language=s.default_language,
@@ -56,6 +58,7 @@ async def seed_tenants_from_yaml(session, tenant_dir=None) -> int:
                 pipeline_config=cfg,
             ))
         else:  # refresh config from YAML
+            debug_event(log, "seed tenant upsert", tenant_slug=s.slug, tenant_id=s.id, action="updated")
             row.name, row.status, row.timezone = s.name, s.status, s.timezone
             row.default_language, row.mode = s.default_language, s.pipeline.mode
             row.max_concurrent_calls, row.pipeline_config = s.max_concurrent_calls, cfg
@@ -77,10 +80,26 @@ async def seed_tenants_from_yaml(session, tenant_dir=None) -> int:
         tel = s.pipeline.telephony
         for name in (tel.account_sid_env, tel.auth_token_env):
             value = os.environ.get(name) if name else None
-            if name and value and have_key:
-                if await session.get(TenantSecret, (s.id, name)) is None:
-                    session.add(TenantSecret(
-                        tenant_id=s.id, name=name, value_encrypted=crypto.encrypt(value)))
+            if not name:
+                continue
+            if not value:
+                debug_event(log, "seed telephony_secret decision", tenant_slug=s.slug,
+                            secret_name=name, action="skipped_no_value")
+            elif not have_key:
+                # The tenant declared a telephony credential env var, but
+                # VOX_SECRET_KEY is unset, so it is silently never persisted
+                # to tenant_secrets on every future boot until a key exists —
+                # previously invisible at any level.
+                debug_event(log, "seed telephony_secret decision", tenant_slug=s.slug,
+                            secret_name=name, action="skipped_no_vox_secret_key")
+            elif await session.get(TenantSecret, (s.id, name)) is None:
+                debug_event(log, "seed telephony_secret decision", tenant_slug=s.slug,
+                            secret_name=name, action="stored")
+                session.add(TenantSecret(
+                    tenant_id=s.id, name=name, value_encrypted=crypto.encrypt(value)))
+            else:
+                debug_event(log, "seed telephony_secret decision", tenant_slug=s.slug,
+                            secret_name=name, action="already_present")
         count += 1
 
     await session.commit()
@@ -92,6 +111,8 @@ async def seed_if_empty(sessionmaker, tenant_dir=None) -> int:
     """Seed from YAML only when the tenants table is empty (boot-safe bridge)."""
     async with sessionmaker() as session:
         if (await session.execute(select(Tenant.id).limit(1))).first() is not None:
+            from src.utils.logging import debug_event
+            debug_event(log, "seed tenants_from_yaml skipped", reason="table_not_empty")
             return 0
         return await seed_tenants_from_yaml(session, tenant_dir)
 
@@ -111,7 +132,15 @@ async def sync_telephony_from_yaml(sessionmaker, tenant_dir=None) -> int:
         for row in rows:
             try:
                 yaml_cfg = load_tenant(row.slug, base)
-            except Exception:
+            except Exception as exc:
+                # Previously silent at every level: a tenant row whose YAML
+                # no longer parses (or was removed from config/tenants/) is
+                # skipped with zero trace, and telephony caller-ID changes for
+                # it are never synced -- indistinguishable from "there was
+                # nothing to change".
+                from src.utils.logging import debug_event
+                debug_event(log, "seed sync_telephony load_failed",
+                            tenant_slug=row.slug, exc_type=type(exc).__name__)
                 continue
             yaml_tel = yaml_cfg.pipeline.telephony
             pc = dict(row.pipeline_config or {})

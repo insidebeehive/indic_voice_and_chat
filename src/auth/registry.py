@@ -86,6 +86,9 @@ class TenantProviders:
         per-tenant pipeline_config.llm overrides.
         """
         if self._platform_llm is None:
+            from src.utils.logging import debug_event
+            debug_event(log, "registry provider_client build_triggered", layer="llm",
+                        scope="platform")
             self._platform_llm = self.llm_factory(self.global_defaults.get("llm", {}))
         return self._platform_llm
 
@@ -158,6 +161,13 @@ class TenantProviders:
         key = (tenant.id, layer)
         if key in self._cache:
             return self._cache[key]
+        # Fires once per (tenant, layer) until the next evict() -- not a
+        # per-turn/per-request cost, so cheap to leave unguarded. This is the
+        # state transition the doc calls out (cache arming): the first time a
+        # tenant's provider client for this layer is actually constructed.
+        from src.utils.logging import debug_event
+        debug_event(log, "registry provider_client build_triggered",
+                    layer=layer, tenant_id=tenant.id)
         cfg = self._config_for(tenant, layer)
         client = factory(cfg)
         self._cache[key] = client
@@ -166,10 +176,15 @@ class TenantProviders:
     def evict(self, tenant_id: Optional[str] = None) -> None:
         """Drop cached clients so a config/key update takes effect. ``tenant_id``
         None drops everything (e.g. on a full resolver reload)."""
+        from src.utils.logging import debug_event
         if tenant_id is None:
+            debug_event(log, "registry provider_client cache evict_all", cached_keys=len(self._cache))
             self._cache.clear()
             return
-        for key in [k for k in self._cache if k[0] == tenant_id]:
+        evicted = [k for k in self._cache if k[0] == tenant_id]
+        debug_event(log, "registry provider_client cache evict", tenant_id=tenant_id,
+                    layers=[k[1] for k in evicted])
+        for key in evicted:
             del self._cache[key]
 
 
@@ -227,6 +242,9 @@ class TenantRuntimeRegistry:
         return base + ((self.crm_tools,) if self.crm_tools is not None else ())
 
     def evict_tenant(self, tenant_id: str) -> None:
+        from src.utils.logging import debug_event
+        debug_event(log, "registry tenant_runtime cache evict", tenant_id=tenant_id,
+                    subregistry_count=len(self._subregistries()))
         self.providers.evict(tenant_id)
         for reg in self._subregistries():
             reg.evict(tenant_id)
@@ -234,6 +252,9 @@ class TenantRuntimeRegistry:
     def evict_all(self) -> None:
         """Drop every cached per-tenant instance (providers + sub-registries) —
         wired to the resolver's on_reload so a config/key update is picked up."""
+        from src.utils.logging import debug_event
+        debug_event(log, "registry tenant_runtime cache evict_all",
+                    subregistry_count=len(self._subregistries()))
         self.providers.evict(None)
         for reg in self._subregistries():
             reg.clear()

@@ -216,7 +216,19 @@ def verify_chatwoot(
         raise WebhookAuthError("malformed_credentials") from None
 
     now = int(time.time())
-    if abs(now - ts) > max_age_seconds:
+    skew_seconds = abs(now - ts)
+    if skew_seconds > max_age_seconds:
+        # The caller (src/api/external_chat.py) logs only `reason=
+        # "stale_timestamp"` at WARNING -- not by how much the timestamp
+        # missed the window, which is what actually distinguishes "clock
+        # drift" from "a replayed/stale request". Neither `ts` nor `now` is
+        # forgeable/secret on its own; this is a decision value, not an HMAC
+        # input.
+        from src.utils.logging import debug_event
+        debug_event(
+            log, "webhook_auth chatwoot verify stale_timestamp",
+            skew_seconds=skew_seconds, max_age_seconds=max_age_seconds,
+        )
         raise WebhookAuthError("stale_timestamp")
 
     try:

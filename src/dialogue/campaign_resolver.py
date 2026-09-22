@@ -25,6 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from src.dialogue.campaign_loader import LoadedCampaign, parse_campaign_yaml
 from src.models.campaign import Campaign
+from src.utils.logging import debug_event
 
 log = logging.getLogger(__name__)
 
@@ -64,14 +65,37 @@ class DbCampaignResolver:
     ) -> LoadedCampaign:
         """Return the script + slots for this call, or raise
         ``CampaignNotConfigured`` when the tenant has no usable campaign."""
+        debug_event(
+            log, "campaign resolve request",
+            tenant_id=tenant_id, requested_campaign_id=campaign_id,
+        )
         async with self._sm() as session:
             row = await self._row(session, tenant_id, campaign_id)
         if row is None:
+            # The one raise this class makes with NO db row behind it -- there
+            # is no global fallback by design (module docstring), so this is
+            # the whole answer to "why didn't the call proceed".
+            debug_event(
+                log, "campaign resolve not_configured",
+                tenant_id=tenant_id, requested_campaign_id=campaign_id,
+            )
             raise CampaignNotConfigured(
                 f"tenant {tenant_id} has no campaign (campaign_id={campaign_id})")
         try:
-            return parse_campaign_yaml(row.config_yaml)
+            loaded = parse_campaign_yaml(row.config_yaml)
         except Exception as e:  # noqa: BLE001 - a broken config_yaml must fail clearly
+            debug_event(
+                log, "campaign resolve invalid_config",
+                tenant_id=tenant_id, requested_campaign_id=campaign_id,
+                resolved_campaign_id=row.id, config_yaml=row.config_yaml, error=str(e),
+            )
             raise CampaignNotConfigured(
                 f"campaign {row.id} for tenant {tenant_id} has invalid config_yaml: {e}"
             ) from e
+        debug_event(
+            log, "campaign resolve resolved",
+            tenant_id=tenant_id, requested_campaign_id=campaign_id,
+            resolved_campaign_id=row.id, resolved_campaign_status=row.status,
+            explicit_id_honored=bool(campaign_id) and row.id == campaign_id,
+        )
+        return loaded

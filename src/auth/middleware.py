@@ -30,6 +30,16 @@ from src.auth.audit import log_denied, set_admin_label, token_fingerprint
 from src.auth.context import TenantContext, hash_api_token
 from src.config_tenant import TenantSettings
 
+# debug_event (src/utils/logging.py) is imported LAZILY inside each function
+# that needs it, not at module level: src.utils.logging imports src.auth.audit
+# at its own module level, and importing src.auth.audit for the first time
+# runs src/auth/__init__.py (its package), which imports THIS module -- so if
+# src.utils.logging is the first thing to trigger that chain (e.g. `import
+# src.utils.logging` on its own, or anything importing it before src.auth is
+# otherwise initialized), a module-level import here raises "cannot import
+# name 'debug_event' from partially initialized module 'src.utils.logging'".
+# Verified: see src/config_tenant.py's own module comment for the same hazard.
+
 log = logging.getLogger(__name__)
 
 
@@ -215,6 +225,11 @@ async def _resolve(request: Request, *, allow_slug_header: bool = False) -> Opti
         bearer_token = auth.split(" ", 1)[1].strip()
         tctx = await _resolver.resolve_by_token(hash_api_token(bearer_token))
         if tctx is not None:
+            from src.utils.logging import debug_event
+            debug_event(
+                log, "middleware auth resolve success", scheme="bearer_token",
+                tenant_slug=tctx.slug, tenant_id=tctx.id, route=request.url.path,
+            )
             return tctx
 
     if allow_slug_header and bearer_token:
@@ -230,6 +245,11 @@ async def _resolve(request: Request, *, allow_slug_header: bool = False) -> Opti
                     # activity is never anonymous. Not a logging call — safe
                     # under the "_resolve never logs" invariant below.
                     set_admin_label(admin_label)
+                    from src.utils.logging import debug_event
+                    debug_event(
+                        log, "middleware auth resolve success", scheme="admin_slug_header",
+                        tenant_slug=slug, admin_label=admin_label, route=request.url.path,
+                    )
                 return tctx
 
     return None
@@ -248,6 +268,17 @@ async def current_tenant(request: Request) -> TenantContext:
     """Require a tenant — 401 if missing, 403 if invalid."""
     tctx = await _resolve(request, allow_slug_header=True)
     if tctx is None:
+        # log_denied's payload for this reason carries no token_fp (a bad/
+        # unrecognized bearer token and "no header at all" are otherwise
+        # indistinguishable from the WARNING record alone) -- this fills that
+        # gap without changing log_denied's own call/behaviour.
+        from src.utils.logging import debug_event
+        bearer_fp = _bearer_fp(request)
+        debug_event(
+            log, "middleware auth resolve failed", reason="no_valid_tenant_credential",
+            route=request.url.path, has_bearer_header=bearer_fp is not None,
+            token_fp=bearer_fp,
+        )
         log_denied(
             logging.WARNING, "tenant auth rejected",
             event="auth_rejected", reason="no_valid_tenant_credential",
@@ -305,6 +336,14 @@ async def require_admin(request: Request) -> None:
         )
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="admin access denied")
     set_admin_label(label)
+    # No log at all previously existed on the success path -- a rejection is
+    # always visible via log_denied above, but "which operator's admin token
+    # authenticated this request" had no trace anywhere at any level.
+    from src.utils.logging import debug_event
+    debug_event(
+        log, "middleware admin_auth success", scheme="bearer_token",
+        admin_label=label, route=request.url.path,
+    )
 
 
 def is_admin_token(token: str | None) -> bool:
@@ -342,6 +381,11 @@ async def require_admin_ws(websocket: WebSocket) -> None:
         )
         raise WebSocketException(code=1008, reason="admin token required")
     set_admin_label(label)
+    from src.utils.logging import debug_event
+    debug_event(
+        log, "middleware admin_auth success", scheme="ws",
+        admin_label=label, route=_ws_route(websocket),
+    )
 
 
 async def tenant_from_twilio_to_number(to_number: str) -> TenantContext:
@@ -410,13 +454,35 @@ async def tenant_from_id(tenant_id: str) -> Optional[TenantContext]:
     """Resolve a tenant by its id (e.g. from a chat_sessions row). Returns None
     if unknown — callers decide how to fail (a closed WS, not an HTTP error)."""
     if _resolver is None:
+        from src.utils.logging import debug_event
+        debug_event(log, "middleware auth resolve failed", reason="resolver_uninitialized",
+                    scheme="tenant_id", tenant_id=tenant_id)
         return None
-    return await _resolver.resolve_by_id(tenant_id)
+    tctx = await _resolver.resolve_by_id(tenant_id)
+    if tctx is None:
+        # A chat_sessions (or similar) row referencing a tenant_id that no
+        # longer resolves -- previously silent at every level, indistinguishable
+        # from "the feature is broken" from outside.
+        from src.utils.logging import debug_event
+        debug_event(log, "middleware auth resolve failed", reason="unknown_tenant_id",
+                    scheme="tenant_id", tenant_id=tenant_id)
+    return tctx
 
 
 async def tenant_from_bearer_token(token: str) -> Optional[TenantContext]:
     """Resolve a tenant from a raw bearer token (no 'Bearer ' prefix).
     Used for WebSocket endpoints where the token is passed as a query param."""
     if _resolver is None:
+        from src.utils.logging import debug_event
+        debug_event(log, "middleware auth resolve failed", reason="resolver_uninitialized",
+                    scheme="bearer_token_ws")
         return None
-    return await _resolver.resolve_by_token(hash_api_token(token))
+    tctx = await _resolver.resolve_by_token(hash_api_token(token))
+    if tctx is None:
+        from src.utils.logging import debug_event
+        debug_event(
+            log, "middleware auth resolve failed", reason="unknown_bearer_token",
+            scheme="bearer_token_ws",
+            token_fp=token_fingerprint(token) if token else None,
+        )
+    return tctx
