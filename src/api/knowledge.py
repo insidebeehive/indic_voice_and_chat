@@ -34,6 +34,7 @@ from src.models.benchmark import KBDocument
 from src.rag.context_builder import search_combined
 from src.rag.ingestion import ChunkConfig, detect_language, get_chunker, parse_document
 from src.rag.retriever import HybridRetriever
+from src.utils.logging import debug_event
 
 log = logging.getLogger(__name__)
 router = APIRouter(prefix="/knowledge", tags=["knowledge"])
@@ -238,6 +239,11 @@ async def _ingest_text(
     retriever = _retriever_for(tenant)
     doc_id = document_id or _new_id()
     language = detect_language(text)
+    debug_event(
+        log, "knowledge ingest_text request",
+        tenant_id=tenant.id, document_id=doc_id, document_filename=filename,
+        language=language, document_text=text,
+    )
     chunker = get_chunker(_chunk_config)
     raw_chunks = chunker(text, {
         "filename": filename, "document_id": doc_id, "language": language,
@@ -253,6 +259,17 @@ async def _ingest_text(
         for c in raw_chunks
     ]
     indexed = await retriever.index(docs)
+    # `indexed` is what retriever.index() actually reports back, not len(docs)
+    # recomputed here -- the same divergence an earlier pass found in
+    # crm_kb.py's ingest (chunk count reported without measuring what was
+    # actually stored). This event makes that divergence visible if it recurs;
+    # the DB row and response below already use `indexed`, not len(docs).
+    debug_event(
+        log, "knowledge ingest_text response",
+        tenant_id=tenant.id, document_id=doc_id, document_filename=filename,
+        chunks_built=len(docs), chunks_indexed=indexed,
+        chunk_count_mismatch=(len(docs) != indexed),
+    )
     # merge (not add): re-ingesting the same document_id (e.g. the deterministic
     # layout_<layout> id used by /ingest-layout) updates the existing row instead
     # of raising a primary-key conflict — safe to call twice for the same id.
@@ -289,6 +306,11 @@ async def ingest_document(
     data = await file.read()
     if not data:
         raise HTTPException(status_code=400, detail="empty upload")
+    debug_event(
+        log, "knowledge ingest_document request",
+        tenant_id=tenant.id, document_filename=file.filename,
+        upload_bytes=len(data), requested_document_id=document_id,
+    )
     text = parse_document(file.filename or "uploaded", data)
     return await _ingest_text(
         tenant, session, filename=file.filename or "uploaded",
@@ -316,6 +338,11 @@ async def ingest_layout_document(
     paths = _INGESTIBLE_DOCS.get(req.layout)
     if paths is None:
         raise HTTPException(status_code=400, detail=f"unknown layout {req.layout!r}")
+    debug_event(
+        log, "knowledge ingest_layout request",
+        tenant_id=tenant.id, layout_key=req.layout,
+        resolved_paths=[str(p) for p in paths],
+    )
     # Pre-flight ALL files for this key before ingesting ANY of them.
     # _ingest_text commits per file, and there is no enclosing transaction, so
     # checking existence inside the loop meant a paired key (casino/sports/
@@ -348,6 +375,11 @@ async def ingest_layout_document(
             document_id=ingested.document_id, filename=ingested.filename,
             chunks_indexed=ingested.chunks_indexed, language=ingested.language,
         ))
+    debug_event(
+        log, "knowledge ingest_layout response",
+        tenant_id=tenant.id, layout_key=req.layout,
+        documents=[r.model_dump() for r in results],
+    )
     return IngestLayoutResponse(documents=results)
 
 
@@ -378,11 +410,32 @@ async def delete_document(
 ) -> dict:
     retriever = _retriever_for(tenant)
     row = await _scoped_kb_doc(session, document_id, tenant)
-    chunk_ids = (row.extra_data or {}).get("chunk_ids") or [
+    stored_chunk_ids = (row.extra_data or {}).get("chunk_ids")
+    chunk_ids = stored_chunk_ids or [
         f"{document_id}::chunk-{i}" for i in range(row.chunk_count or 0)]
+    debug_event(
+        log, "knowledge delete_document request",
+        tenant_id=tenant.id, document_id=document_id,
+        chunk_ids=chunk_ids, chunk_ids_source=("extra_data" if stored_chunk_ids else "derived_from_chunk_count"),
+        stored_chunk_count=row.chunk_count,
+    )
+    # Vector-store delete happens BEFORE the durable row delete/commit, not
+    # after: if retriever.delete() raises, the KBDocument row must survive so
+    # the operation is retryable. Doing it in the other order (row deleted +
+    # committed, then retriever.delete()) makes a vector-store failure
+    # unrecoverable -- the metadata row is already gone permanently while its
+    # chunks stay live in the index (unreachable via list_documents/stats, but
+    # still returned by query as a citation from a document that no longer
+    # exists).
+    n = await retriever.delete(chunk_ids)
     await session.delete(row)
     await session.commit()
-    n = await retriever.delete(chunk_ids)
+    debug_event(
+        log, "knowledge delete_document response",
+        tenant_id=tenant.id, document_id=document_id,
+        chunks_expected=len(chunk_ids), chunks_removed=n,
+        chunk_count_mismatch=(n != len(chunk_ids)),
+    )
     return {"document_id": document_id, "chunks_removed": n}
 
 
@@ -393,6 +446,11 @@ def _chunks_for_doc(retriever: HybridRetriever, document_id: str) -> str:
                   if c.id.startswith(f"{document_id}::") or
                   (c.metadata or {}).get("document_id") == document_id]
     doc_chunks.sort(key=lambda c: (c.metadata or {}).get("section", 0))
+    debug_event(
+        log, "knowledge chunks_for_doc response",
+        document_id=document_id, total_chunks_scanned=len(all_chunks),
+        matched_chunk_count=len(doc_chunks),
+    )
     return "\n\n".join(c.content for c in doc_chunks)
 
 
@@ -406,6 +464,16 @@ async def download_document(
     row = await _scoped_kb_doc(session, document_id, tenant)
     retriever = _retriever_for(tenant)
     text = _chunks_for_doc(retriever, document_id)
+    # A document with a positive stored chunk_count that reconstructs to
+    # empty text is a 200 response the caller reads as "this document has no
+    # content" -- indistinguishable from an actually-empty document without
+    # this event.
+    debug_event(
+        log, "knowledge download_document response",
+        tenant_id=tenant.id, document_id=document_id,
+        stored_chunk_count=row.chunk_count, reconstructed_length=len(text),
+        reconstructed_empty_despite_stored_chunks=(not text and bool(row.chunk_count)),
+    )
     filename = (row.filename or document_id).rsplit(".", 1)[0] + ".txt"
     return Response(content=text, media_type="text/plain; charset=utf-8",
                     headers={"Content-Disposition": f'attachment; filename="{filename}"'})

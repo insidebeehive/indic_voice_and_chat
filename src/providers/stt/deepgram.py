@@ -27,6 +27,7 @@ from src.interfaces.stt import (
     STTConfig,
     STTStreamEvent,
 )
+from src.utils.logging import debug_event
 
 DEEPGRAM_WS_URL = "wss://api.deepgram.com/v1/listen"
 DEFAULT_MODEL = "nova-2"
@@ -60,6 +61,11 @@ class DeepgramStreamSession(ISTTStreamSession):
         try:
             msg = json.loads(raw)
         except (ValueError, TypeError):
+            # A malformed/non-JSON frame from Deepgram is dropped entirely —
+            # the caller never learns a frame was even received. Logging the
+            # raw frame (not just "it failed") is what makes this diagnosable
+            # instead of indistinguishable from a dropped connection.
+            debug_event(log, "deepgram frame unparseable", raw=raw)
             return None
         mtype = msg.get("type")
         if mtype == "UtteranceEnd":
@@ -190,6 +196,12 @@ class DeepgramSTTAdapter(IStreamingSTTProvider):
     async def open_stream(self, config: STTConfig) -> ISTTStreamSession:
         url = self._build_url(config)
         headers = {"Authorization": f"Token {self._api_key}"}
+        # `url` carries the resolved model/language/sample_rate as query
+        # params (no secret — the key rides in the Authorization header
+        # below), so it's safe to log whole. `header_keys` only, never the
+        # header values, same convention as src/chatbot/tool_executor.py.
+        debug_event(log, "deepgram stream opening", url=url,
+                    header_keys=list(headers.keys()))
         ws = await self._connector(url, headers)
         return DeepgramStreamSession(
             ws, keepalive_interval=self._keepalive_interval, start_tasks=True

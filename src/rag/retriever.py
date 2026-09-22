@@ -50,6 +50,7 @@ from src.interfaces.vector_store import (
     SearchResult,
 )
 from src.rag.embeddings import IEmbedder, _tokenize
+from src.utils.logging import debug_event
 
 if TYPE_CHECKING:
     # Type-checking only to keep this module importable without pulling in
@@ -218,12 +219,20 @@ class BM25Index:
 
     def search(self, query: str, top_k: int) -> list[tuple[Document, float]]:
         if not self._docs:
+            debug_event(log, "bm25 search response", query=query, top_k=top_k,
+                        corpus_size=0, returned=0, reason="empty_corpus")
             return []
         if self._bm25 is None:
             corpus = [_tokenize(self._docs[i].content) for i in self._order]
             self._bm25 = BM25Okapi(corpus)
         q_tokens = _tokenize(query)
         if not q_tokens:
+            # The tokenizer dropped every character of the query (e.g. pure
+            # punctuation/emoji) -- BM25 has nothing to score against, so the
+            # dense arm alone decides fusion. Worth its own reason: from
+            # outside this is indistinguishable from "BM25 found nothing".
+            debug_event(log, "bm25 search response", query=query, top_k=top_k,
+                        corpus_size=len(self._docs), returned=0, reason="no_query_tokens")
             return []
         scores = self._bm25.get_scores(q_tokens)
         ranked = sorted(zip(self._order, scores), key=lambda x: x[1], reverse=True)
@@ -232,6 +241,19 @@ class BM25Index:
             if score <= 0:
                 continue
             out.append((self._docs[doc_id], float(score)))
+        if log.isEnabledFor(logging.DEBUG):
+            # A third way to end up with returned=0: the corpus was non-empty,
+            # the query tokenized fine, BM25 scored every candidate, and every
+            # score was <= 0 (the `continue` above skips them all). That is a
+            # distinct diagnosis from empty_corpus/no_query_tokens above --
+            # otherwise it's distinguishable only by the absence of a reason.
+            kwargs = {}
+            if not out:
+                kwargs["reason"] = "no_positive_scores"
+            debug_event(log, "bm25 search response", query=query, top_k=top_k,
+                        corpus_size=len(self._docs), returned=len(out),
+                        hits=[{"chunk_id": d.id, "score": s, "text": d.content[:200]}
+                              for d, s in out], **kwargs)
         return out
 
 
@@ -310,7 +332,11 @@ class HybridRetriever:
         # Dual-write. BM25 first so a FAISS failure doesn't leave us with
         # half-indexed state we can't roll back. (Both are still in-memory.)
         self._bm25.index(chunks)
-        return await self._dense.index(chunks)
+        result = await self._dense.index(chunks)
+        if log.isEnabledFor(logging.DEBUG):
+            debug_event(log, "retriever index", count=len(chunks), indexed=result,
+                        backfilled_embeddings=len(missing), chunk_ids=[c.id for c in chunks])
+        return result
 
     def list_all(self, max_chunks: int = 200) -> list[Document]:
         """Return all indexed chunks (drawn from the in-memory BM25 index)."""
@@ -402,6 +428,7 @@ class HybridRetriever:
         explicit call by the caller.
         """
         docs = await self.list_all_persistent(max_chunks)
+        debug_event(log, "retriever hydrate_sparse", max_chunks=max_chunks, docs_pulled=len(docs))
         if not docs:
             return 0
         self._bm25.index(docs)
@@ -516,6 +543,10 @@ class HybridRetriever:
     ) -> list[RetrievedChunk]:
         cfg = self._config
         k = top_k or cfg.top_k
+        debug_event(log, "retriever search request", query=query, strategy=cfg.strategy,
+                    top_k=k, oversample_k=cfg.oversample_k, dense_weight=cfg.dense_weight,
+                    bm25_weight=cfg.bm25_weight, rrf_k=cfg.rrf_k,
+                    similarity_threshold=cfg.similarity_threshold, filters=filters)
 
         if cfg.strategy == "dense":
             dense_results = await self._dense_search(query, cfg.oversample_k, filters)
@@ -554,7 +585,24 @@ class HybridRetriever:
 
         # Apply post-fusion threshold then trim.
         passing = [c for c in fused if c.score >= cfg.similarity_threshold]
-        return passing[:k]
+        if log.isEnabledFor(logging.DEBUG):
+            dropped = [c for c in fused if c.score < cfg.similarity_threshold]
+            if dropped:
+                # This is exactly how a correct chunk silently vanishes: it
+                # was retrieved and fused, then never seen again because it
+                # scored below the floor -- with no trace at any other level.
+                debug_event(log, "retriever threshold_dropped", query=query,
+                            threshold=cfg.similarity_threshold, dropped_count=len(dropped),
+                            dropped=[{"chunk_id": c.document.id, "score": c.score,
+                                      "text": c.document.content[:200]} for c in dropped])
+        result = passing[:k]
+        if log.isEnabledFor(logging.DEBUG):
+            debug_event(log, "retriever search result", query=query, strategy=cfg.strategy,
+                        top_k=k, returned=len(result),
+                        chunks=[{"chunk_id": c.document.id, "score": c.score,
+                                 "dense_score": c.dense_score, "bm25_score": c.bm25_score,
+                                 "text": c.document.content[:200]} for c in result])
+        return result
 
     async def _dense_search(
         self,
@@ -567,7 +615,13 @@ class HybridRetriever:
         # On a single-worker deployment a blocking call here freezes every
         # concurrent session, not just this one.
         q_vec = await asyncio.to_thread(self._embedder.embed_query, query)
-        return await self._dense.search(q_vec, top_k=k, filters=filters)
+        results = await self._dense.search(q_vec, top_k=k, filters=filters)
+        if log.isEnabledFor(logging.DEBUG):
+            debug_event(log, "retriever dense_search response", query=query, top_k=k,
+                        filters=filters, returned=len(results),
+                        hits=[{"chunk_id": r.document.id, "score": r.score,
+                               "text": r.document.content[:200]} for r in results])
+        return results
 
 
 # --- score fusion --------------------------------------------------------
@@ -605,6 +659,25 @@ def _fuse(
 
     fused = list(by_id.values())
     fused.sort(key=lambda rc: rc.score, reverse=True)
+    if log.isEnabledFor(logging.DEBUG):
+        # Rank position within each arm's own (already-sorted) list -- this
+        # plus the fused score is what answers "why did rank 1 in dense end
+        # up rank 5 overall": it shows which arm did and didn't see it, and
+        # at what rank, before the weighting combined them.
+        # 1-based so a logged rank agrees with the rrf_k + i + 1 formula in
+        # _fuse_rrf's docstring and with how a human reads "rank 1" -- this
+        # dict is diagnostic only, never fed into the score computation above.
+        dense_rank = {r.document.id: i + 1 for i, r in enumerate(dense_results)}
+        bm25_rank = {d.id: i + 1 for i, (d, _s) in enumerate(bm25_results)}
+        debug_event(log, "retriever fuse hybrid", dense_weight=dense_weight,
+                    bm25_weight=bm25_weight, dense_count=len(dense_results),
+                    bm25_count=len(bm25_results), fused_count=len(fused),
+                    ranking=[{"chunk_id": rc.document.id, "fused_score": rc.score,
+                              "dense_score": rc.dense_score, "dense_norm": dense_norm.get(rc.document.id),
+                              "dense_rank": dense_rank.get(rc.document.id),
+                              "bm25_score": rc.bm25_score, "bm25_norm": bm25_norm.get(rc.document.id),
+                              "bm25_rank": bm25_rank.get(rc.document.id)}
+                             for rc in fused])
     return fused
 
 
@@ -679,6 +752,18 @@ def _fuse_rrf(
 
     fused = list(by_id.values())
     fused.sort(key=lambda rc: rc.score, reverse=True)
+    if log.isEnabledFor(logging.DEBUG):
+        # 1-based, same rationale as _fuse's dense_rank/bm25_rank above --
+        # diagnostic only, does not feed dense_rr/bm25_rr's rank math.
+        dense_rank = {r.document.id: i + 1 for i, r in enumerate(dense_results)}
+        bm25_rank = {d.id: i + 1 for i, (d, _s) in enumerate(bm25_results)}
+        debug_event(log, "retriever fuse rrf", dense_weight=dense_weight, bm25_weight=bm25_weight,
+                    rrf_k=rrf_k, dense_count=len(dense_results), bm25_count=len(bm25_results),
+                    fused_count=len(fused),
+                    ranking=[{"chunk_id": rc.document.id, "fused_score": rc.score,
+                              "dense_score": rc.dense_score, "dense_rank": dense_rank.get(rc.document.id),
+                              "bm25_score": rc.bm25_score, "bm25_rank": bm25_rank.get(rc.document.id)}
+                             for rc in fused])
     return fused
 
 

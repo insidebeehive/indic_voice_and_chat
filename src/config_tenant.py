@@ -59,6 +59,7 @@ Schema (all sections optional — global defaults fill the gaps):
 
 from __future__ import annotations
 
+import logging
 import os
 from functools import lru_cache
 from pathlib import Path
@@ -67,6 +68,19 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
 from pydantic import BaseModel, Field, ValidationError, field_validator
+
+log = logging.getLogger(__name__)
+
+# debug_event (src/utils/logging.py) and token_fingerprint (src/auth/audit.py)
+# are imported LAZILY inside each function that needs them, not at module
+# level: src.utils.logging imports src.auth.audit, which (via the src.auth
+# package's own __init__) drags in src.auth.context, which imports
+# TenantSettings from THIS module -- a real circular import, not a
+# hypothetical one (verified: a module-level import here raises "cannot
+# import name 'TenantSettings' from partially initialized module
+# 'src.config_tenant'"). Same reason platform_webhook_base_url() below
+# already lazy-imports src.config and resolve_livekit_creds() lazy-imports
+# sqlalchemy/src.auth.secrets/src.models.crm.
 
 if TYPE_CHECKING:  # pragma: no cover - type-checking only, avoids import cycles at runtime
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -185,6 +199,20 @@ class TelephonyCreds(BaseModel):
     user_id_env: Optional[str] = None
 
 
+# Providers with no telephony adapter and no per-tenant account: no adapter is
+# ever built for them as the CONFIGURED provider, so a missing
+# account_sid_env/auth_token_env has nothing to silently fall back from and the
+# platform-billing risk validate_credentials guards against does not arise on
+# that path. Narrowly scoped on purpose: the top-level cred fields are not read
+# only for the configured provider — creds_for() takes an arbitrary provider and
+# falls through to them (src/api/dev_console.py passes a request-supplied one),
+# so an exempt tenant that also sets pipeline.telephony.outbound_from.<other>
+# can still reach a real adapter with unset creds. Case-insensitive match
+# against provider, consistent with how src/api/calls.py and creds_for()
+# normalize the provider string.
+CREDENTIAL_FREE_TELEPHONY_PROVIDERS = frozenset({"webconsole"})
+
+
 class TenantTelephonyConfig(BaseModel):
     provider: Optional[str] = None
     from_number: Optional[str] = None
@@ -257,11 +285,21 @@ def _tenant_livekit_creds(tel: TenantTelephonyConfig) -> TelephonyCreds:
     through cleanly to the CRM-level project, not half-resolve with the
     wrong provider's secret.
     """
-    slot = tel.creds_by_provider.get("livekit")
-    if slot is not None:
-        return slot
+    from src.utils.logging import debug_event
+
+    if "livekit" in tel.creds_by_provider:
+        debug_event(log, "tenant_config livekit_creds_slot decision", source="creds_by_provider")
+        return tel.creds_by_provider["livekit"]
     if (tel.provider or "").lower() == "livekit":
+        debug_event(log, "tenant_config livekit_creds_slot decision", source="active_provider")
         return tel.active_creds()
+    # Deliberately empty, NOT tel.active_creds() -- see the docstring above:
+    # falling back to the top-level account_sid_env/auth_token_env here would
+    # hand a different telephony provider's account secret to the LiveKit SDK.
+    debug_event(
+        log, "tenant_config livekit_creds_slot decision", source="none",
+        active_telephony_provider=tel.provider,
+    )
     return TelephonyCreds()
 
 
@@ -282,16 +320,39 @@ async def resolve_livekit_creds(
     below never touches it, so that path still resolves; the CRM-level
     fallback is simply unavailable in that case.
     """
+    from src.utils.logging import debug_event
+
     tel = tenant.settings.pipeline.telephony
     creds = _tenant_livekit_creds(tel)
     url = tel.livekit_url
     api_key = tenant.secret_optional(creds.account_sid_env)
     api_secret = tenant.secret_optional(creds.auth_token_env)
+    # Presence/length only for api_key/api_secret -- both are the LiveKit
+    # project's real credentials (reused via the telephony account_sid_env/
+    # auth_token_env slots, see _tenant_livekit_creds) and never appear at
+    # any level. This is the full precedence chain the docstring describes:
+    # an operator debugging "why did this tenant's LiveKit room join fail"
+    # can see here whether it was the tenant-level project (and which part
+    # was missing) before it falls through to the CRM-level one below.
     if url and api_key and api_secret:
+        debug_event(
+            log, "tenant_config livekit_creds_resolve result", tier="tenant",
+            tenant_id=tenant.id, url=url,
+            api_key_len=len(api_key), api_secret_len=len(api_secret),
+        )
         return url, api_key, api_secret
+    debug_event(
+        log, "tenant_config livekit_creds_resolve tenant_tier_incomplete",
+        tenant_id=tenant.id, url_set=bool(url), api_key_set=bool(api_key),
+        api_secret_set=bool(api_secret),
+    )
 
     crm_id = tenant.settings.crm_id
     if not crm_id or session is None:
+        debug_event(
+            log, "tenant_config livekit_creds_resolve no_crm_fallback",
+            tenant_id=tenant.id, crm_id=crm_id, session_available=session is not None,
+        )
         return None
 
     from sqlalchemy import select
@@ -301,6 +362,11 @@ async def resolve_livekit_creds(
 
     crm = await session.get(Crm, crm_id)
     if crm is None or not crm.livekit_url:
+        debug_event(
+            log, "tenant_config livekit_creds_resolve crm_tier_unusable",
+            tenant_id=tenant.id, crm_id=crm_id, crm_found=crm is not None,
+            crm_livekit_url_set=bool(crm.livekit_url) if crm is not None else None,
+        )
         return None
 
     rows = (await session.execute(
@@ -311,8 +377,17 @@ async def resolve_livekit_creds(
     )).scalars().all()
     by_name = {r.name: r.value_encrypted for r in rows}
     if "livekit_api_key" not in by_name or "livekit_api_secret" not in by_name:
+        debug_event(
+            log, "tenant_config livekit_creds_resolve crm_tier_secrets_missing",
+            tenant_id=tenant.id, crm_id=crm_id,
+            secret_names_found=sorted(by_name.keys()),
+        )
         return None
 
+    debug_event(
+        log, "tenant_config livekit_creds_resolve result", tier="crm",
+        tenant_id=tenant.id, crm_id=crm_id, url=crm.livekit_url,
+    )
     return (
         crm.livekit_url,
         crypto.decrypt(by_name["livekit_api_key"]),
@@ -370,10 +445,35 @@ def resolve_chat_tts_config(pipeline: TenantPipelineConfig) -> Optional[TenantTT
     separately, and ``validate_credentials`` must flag the enabled-but-
     unresolvable combination.
     """
+    from src.utils.logging import debug_event
+
     if pipeline.chat_voice.tts.provider:
+        debug_event(
+            log, "tenant_config chat_tts_resolve decision", source="chat_voice_override",
+            provider=pipeline.chat_voice.tts.provider, model=pipeline.chat_voice.tts.model,
+            voice_id=pipeline.chat_voice.tts.voice_id,
+            pipeline_tts_provider=pipeline.tts.provider,
+        )
         return pipeline.chat_voice.tts
     if pipeline.tts.provider:
+        # The incident this function exists to prevent a repeat of: a tenant
+        # relying on this fallback looks IDENTICAL to one that configured its
+        # own chat voice, from every angle except this log line -- see
+        # ChatVoiceConfig's docstring and TenantSummary.chat_voice's "source"
+        # field (src/api/tenants.py), which surfaces the same distinction to
+        # the backoffice.
+        debug_event(
+            log, "tenant_config chat_tts_resolve decision", source="pipeline_cascade_fallback",
+            provider=pipeline.tts.provider, model=pipeline.tts.model,
+            voice_id=pipeline.tts.voice_id,
+            chat_voice_tts_provider=pipeline.chat_voice.tts.provider,
+        )
         return pipeline.tts
+    debug_event(
+        log, "tenant_config chat_tts_resolve decision", source="none",
+        chat_voice_tts_provider=pipeline.chat_voice.tts.provider,
+        pipeline_tts_provider=pipeline.tts.provider,
+    )
     return None
 
 
@@ -492,6 +592,21 @@ class TenantSettings(BaseModel):
             raise MissingEnvError(
                 f"tenant {self.slug!r} references env var {env_var!r} which is not set"
             )
+        # Boundary: every telephony/webhook/LiveKit credential a tenant uses
+        # resolves through here. The VALUE is a credential and never appears
+        # at any level (docs/debug-logging.md) -- only the env var NAME (a
+        # reference, not a secret) plus a fingerprint + length, so an
+        # operator can confirm "yes, this tenant's account_sid_env resolved,
+        # and it's the same 40-char value as last week" without the value
+        # ever leaving os.environ.
+        from src.auth.audit import token_fingerprint
+        from src.utils.logging import debug_event
+        debug_event(
+            log, "tenant_config secret resolved",
+            tenant_slug=self.slug, env_var=env_var,
+            value_fp=token_fingerprint(value, domain="vox-logfp-tenant-secret-v1"),
+            value_len=len(value),
+        )
         return value
 
 
@@ -505,6 +620,50 @@ def _resolve_dir(tenant_dir: Optional[Path]) -> Path:
     return Path(tenant_dir or os.environ.get("VOX_TENANT_DIR") or _TENANT_DIR_DEFAULT)
 
 
+# {dotted path into the parsed YAML: model class} for the sub-blocks worth
+# checking for unknown keys -- deliberately not a full recursive walk of
+# every nested model (this only runs at tenant load time, but a typo three
+# levels deep is rare and the maintenance cost of mirroring the whole schema
+# here isn't worth it). These are the blocks past incidents actually hit: a
+# misspelled field under pipeline.<layer> resolves to that layer's default
+# with NO error, exactly like config/default.yaml's inert `tts.model` (see
+# docs/debug-logging.md's coverage note on this file).
+_UNKNOWN_KEY_CHECK_PATHS: dict[str, type[BaseModel]] = {
+    "pipeline.stt": TenantSTTConfig, "pipeline.llm": TenantLLMConfig,
+    "pipeline.tts": TenantTTSConfig, "pipeline.telephony": TenantTelephonyConfig,
+    "pipeline.chat_voice": ChatVoiceConfig, "pipeline.realtime": TenantRealtimeConfig,
+    "pipeline.vector_store": TenantVectorStoreConfig,
+    "crm": TenantCRMConfig, "compliance": TenantCompliance,
+    "whatsapp": TenantWhatsAppConfig, "chat_support": ChatSupportConfig,
+    "deposit_verification": DepositVerificationConfig,
+}
+
+
+def _unknown_keys(data: dict) -> dict[str, list[str]]:
+    """{dotted path: [unknown key, ...]} for every checked sub-block, plus the
+    top-level itself. Empty dict when nothing is unrecognized. Pydantic's
+    default ``extra="ignore"`` (verified: TenantSTTConfig(provider=...,
+    bogus_key=...) constructs cleanly with no trace of ``bogus_key``
+    afterwards) means a typo here is INDISTINGUISHABLE from a value that was
+    never set, once the model exists -- this has to run on the raw dict,
+    before TenantSettings(**data) discards the evidence.
+    """
+    out: dict[str, list[str]] = {}
+    top_unknown = [k for k in data if k not in TenantSettings.model_fields]
+    if top_unknown:
+        out["<top-level>"] = sorted(top_unknown)
+    pipeline = data.get("pipeline") or {}
+    for dotted, cls in _UNKNOWN_KEY_CHECK_PATHS.items():
+        prefix, _, key = dotted.partition(".")
+        block = (pipeline if prefix == "pipeline" else data).get(key or prefix)
+        if not isinstance(block, dict):
+            continue
+        unknown = [k for k in block if k not in cls.model_fields]
+        if unknown:
+            out[dotted] = sorted(unknown)
+    return out
+
+
 def load_tenant(slug: str, tenant_dir: Optional[Path] = None) -> TenantSettings:
     """Load + validate one tenant by slug.
 
@@ -514,6 +673,8 @@ def load_tenant(slug: str, tenant_dir: Optional[Path] = None) -> TenantSettings:
        its credential env-var names so we never silently fall back to a
        platform-wide key at runtime.
     """
+    from src.utils.logging import debug_event
+
     base = _resolve_dir(tenant_dir)
     path = base / f"{slug}.yaml"
     if not path.exists():
@@ -522,11 +683,31 @@ def load_tenant(slug: str, tenant_dir: Optional[Path] = None) -> TenantSettings:
         data = yaml.safe_load(f) or {}
     if not isinstance(data, dict):
         raise ValueError(f"{path}: top-level YAML must be a mapping")
+    if log.isEnabledFor(logging.DEBUG):
+        # Guarded: walks the whole parsed dict against every checked
+        # sub-model's field set, once per tenant per load -- load_tenant runs
+        # at bootstrap and on every backoffice-triggered reload, not per
+        # request, but the walk itself is real work, not a scalar read.
+        unknown = _unknown_keys(data)
+        if unknown:
+            debug_event(
+                log, "tenant_config load unknown_keys_discarded",
+                tenant_slug=slug, source=str(path), unknown_by_block=unknown,
+            )
     try:
         settings = TenantSettings(**data)
     except ValidationError as e:
         raise ValueError(f"{path}: invalid tenant config: {e}") from e
     validate_credentials(settings, source=str(path))
+    debug_event(
+        log, "tenant_config load result", tenant_slug=slug, tenant_id=settings.id,
+        source=str(path), pipeline_mode=settings.pipeline.mode,
+        stt_provider=settings.pipeline.stt.provider,
+        llm_provider=settings.pipeline.llm.provider,
+        tts_provider=settings.pipeline.tts.provider,
+        telephony_provider=settings.pipeline.telephony.provider,
+        crm_id=settings.crm_id, prompt_pack=settings.prompt_pack,
+    )
     return settings
 
 
@@ -541,7 +722,11 @@ def validate_credentials(settings: TenantSettings, *, source: str = "") -> None:
     would silently fall back to the platform's own telephony credentials
     (billing/placing calls on the wrong account). We raise this at load time
     so misconfigured tenants are caught on bootstrap rather than at
-    first-call.
+    first-call. Providers in ``CREDENTIAL_FREE_TELEPHONY_PROVIDERS`` (e.g.
+    ``webconsole``) are exempt from this one check: they have no telephony
+    adapter and no per-tenant account, so there is nothing to fall back from
+    and the platform-billing risk cannot arise. Every other rule below still
+    applies to them.
 
     STT/LLM/TTS/realtime/stt_streaming are different: those adapters
     *always* resolve their API key from the platform-level master env var
@@ -557,7 +742,7 @@ def validate_credentials(settings: TenantSettings, *, source: str = "") -> None:
     gaps: list[str] = []
     p = settings.pipeline
 
-    if p.telephony.provider:
+    if p.telephony.provider and (p.telephony.provider or "").lower() not in CREDENTIAL_FREE_TELEPHONY_PROVIDERS:
         if not p.telephony.account_sid_env:
             gaps.append(
                 f"pipeline.telephony.account_sid_env (provider={p.telephony.provider!r})"
@@ -584,6 +769,20 @@ def validate_credentials(settings: TenantSettings, *, source: str = "") -> None:
             f"adapter falls back to the platform-wide env vars at runtime, "
             f"which silently bills the platform for the tenant's calls."
         )
+    # No debug_event on the failure branch above: TenantConfigError's own
+    # message already carries every gap, and every caller either re-raises it
+    # (load_tenant) or turns it into a 422 naming the gaps (update_tenant,
+    # src/api/tenants.py) -- a second copy here would just be the same
+    # string twice. The success case has NO trace anywhere otherwise, so an
+    # operator can't tell "validation never ran for this tenant" apart from
+    # "it ran and passed" -- this line is that distinction.
+    from src.utils.logging import debug_event
+    debug_event(
+        log, "tenant_config validate_credentials passed",
+        tenant_slug=settings.slug, source=source,
+        telephony_provider=p.telephony.provider, mode=p.mode,
+        chat_voice_enabled=p.chat_voice.enabled,
+    )
 
 
 def discover_tenant_slugs(tenant_dir: Optional[Path] = None) -> list[str]:
@@ -596,7 +795,11 @@ def discover_tenant_slugs(tenant_dir: Optional[Path] = None) -> list[str]:
 
 def load_all_tenants(tenant_dir: Optional[Path] = None) -> dict[str, TenantSettings]:
     """Load every tenant in ``config/tenants/``. Returns ``{slug: settings}``."""
-    return {slug: load_tenant(slug, tenant_dir) for slug in discover_tenant_slugs(tenant_dir)}
+    from src.utils.logging import debug_event
+
+    slugs = discover_tenant_slugs(tenant_dir)
+    debug_event(log, "tenant_config load_all_tenants request", slugs=slugs, count=len(slugs))
+    return {slug: load_tenant(slug, tenant_dir) for slug in slugs}
 
 
 # --- Merge with global defaults ----------------------------------------
@@ -613,9 +816,47 @@ def merge_provider_config(
     override" semantics promised in the plan.
     """
     out = dict(global_layer)
+    overridden: list[str] = []
+    discarded_env_refs: list[str] = []
     for k, v in tenant_layer.model_dump().items():
-        if v is not None and not k.endswith("_env"):
+        if k.endswith("_env"):
+            # *_env fields are credential REFERENCES (an env var name), not
+            # values -- they never belong in a provider config dict (that
+            # would ship a var NAME to the adapter in place of a resolved
+            # secret). Recorded here as a name only, matching the rest of
+            # this package's credential rule.
+            if v is not None:
+                discarded_env_refs.append(k)
+            continue
+        if v is not None:
             out[k] = v
+            overridden.append(k)
     if api_key is not None:
         out["api_key"] = api_key
+    # This is the merge every "why is this tenant using provider X" question
+    # in the task brief resolves through -- overridden names the fields THIS
+    # tenant set; anything in `out` not in `overridden` fell through from
+    # global_layer (config/default.yaml), which is the exact "silently
+    # inherited" shape the chat-voice-TTS incident turned out to be.
+    # Guarded: model_dump() + two list builds run on every cache-miss
+    # (registry.py, once per tenant/layer) and on every backoffice tenant-list
+    # render (src/api/tenants.py's _layer(), N tenants x 4 layers) -- neither
+    # is per-turn, but neither is a bare scalar read either.
+    if log.isEnabledFor(logging.DEBUG):
+        from src.utils.logging import debug_event
+        # `out` itself is never logged: if a caller ever does pass `api_key`
+        # (no current call site does -- see the finding recorded for this
+        # function), it lands in `out["api_key"]` and `out` would then BE the
+        # credential. Logging the individual non-credential fields instead
+        # of the dict keeps that impossible by construction rather than by
+        # remembering to strip a key every time this function changes.
+        debug_event(
+            log, "tenant_config merge_provider_config result",
+            layer_model=type(tenant_layer).__name__,
+            tenant_overridden_fields=overridden,
+            tenant_overridden_values={k: out[k] for k in overridden},
+            platform_default_fields=[k for k in out if k not in overridden and k != "api_key"],
+            discarded_env_ref_fields=discarded_env_refs,
+            api_key_set=api_key is not None,
+        )
     return out

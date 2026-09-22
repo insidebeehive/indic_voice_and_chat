@@ -55,6 +55,28 @@ async def test_persist_turn_returns_customer_msg_id(db_session):
 
 
 @pytest.mark.asyncio
+async def test_persist_turn_missing_session_logs_debug_and_writes_nothing(db_session, caplog):
+    """A vanished/nonexistent chat_sessions row used to make an entire turn's
+    transcript (both the customer's message and the reply) disappear with
+    only a generic all-None PersistedTurnIds -- indistinguishable from any
+    other persistence failure. Mutation proof: an existing session id (see
+    test_persist_turn_returns_customer_msg_id above) does not log this line
+    at all."""
+    with caplog.at_level("DEBUG", logger="src.api.chat"):
+        persisted = await chat_api._persist_turn("does-not-exist", "hello", _FakeResult())
+    assert persisted == chat_api.PersistedTurnIds()
+    missing_logs = [r for r in caplog.records if "chat session row missing" in r.message]
+    assert len(missing_logs) == 1
+    assert missing_logs[0].levelname == "DEBUG"
+    assert missing_logs[0].session_id == "does-not-exist"
+
+    from sqlalchemy import select
+    async with db_session() as db:
+        rows = (await db.execute(select(ChatMessage))).scalars().all()
+    assert rows == []
+
+
+@pytest.mark.asyncio
 async def test_persist_turn_with_media_url(db_session):
     from sqlalchemy import select
     from src.models.chat import ChatMessage

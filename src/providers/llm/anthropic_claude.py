@@ -24,11 +24,14 @@ the Devanagari directive lives in the agent system prompt, not here.
 
 from __future__ import annotations
 
+import logging
 import os
 from typing import Any, AsyncIterator, Optional
 
 from src.interfaces.llm import ILLMProvider, LLMConfig, LLMMessage, LLMResult
+from src.utils.logging import debug_event
 
+log = logging.getLogger(__name__)
 
 DEFAULT_MODEL = "claude-haiku-4-5"
 DEFAULT_MAX_TOKENS = 1024
@@ -129,13 +132,31 @@ class AnthropicClaudeAdapter(ILLMProvider):
         config: LLMConfig,
     ) -> LLMResult:
         kwargs, prefill = self._build_request(messages, config)
-        message = await self._client.messages.create(**kwargs)
+        # `kwargs` is the exact wire body (model/system/messages/temperature)
+        # this method is about to send — logging it directly is the real
+        # request, not a reconstruction of it.
+        debug_event(log, "anthropic generate request", **kwargs)
+        try:
+            message = await self._client.messages.create(**kwargs)
+        except Exception as exc:  # noqa: BLE001 - re-raised unchanged; this adapter has no retry
+            # Nothing else in this adapter logs a failed call at any level —
+            # unlike the Gemini adapter's retry/give-up logging, a Claude 4xx/5xx
+            # would otherwise propagate with no record of which model/request
+            # produced it. Re-raised as-is; this is purely observational.
+            debug_event(log, "anthropic generate failed", model=kwargs.get("model"),
+                        error=str(exc))
+            raise
         text = prefill + self._extract_text(message)
+        finish_reason = self._map_stop_reason(getattr(message, "stop_reason", None))
+        usage = self._extract_usage(message)
+        raw = _dump(message)
+        debug_event(log, "anthropic generate response", model=kwargs.get("model"),
+                    text=text, finish_reason=finish_reason, usage=usage, raw_response=raw)
         return LLMResult(
             text=text,
-            finish_reason=self._map_stop_reason(getattr(message, "stop_reason", None)),
-            usage=self._extract_usage(message),
-            raw_response=_dump(message),
+            finish_reason=finish_reason,
+            usage=usage,
+            raw_response=raw,
         )
 
     async def generate_stream(
@@ -144,15 +165,28 @@ class AnthropicClaudeAdapter(ILLMProvider):
         config: LLMConfig,
     ) -> AsyncIterator[str]:
         kwargs, prefill = self._build_request(messages, config)
+        debug_event(log, "anthropic generate_stream request", **kwargs)
         # Emit the prefilled '{' first: the SDK streams only the *generated*
         # text, so without this the accumulated envelope would be missing its
         # opening brace and fail to parse.
         if prefill:
             yield prefill
-        async with self._client.messages.stream(**kwargs) as stream:
-            async for text in stream.text_stream:
-                if text:
-                    yield text
+        collecting = log.isEnabledFor(logging.DEBUG)  # see gemini.py's generate_stream for why
+        chunks: list[str] = [prefill] if (prefill and collecting) else []
+        try:
+            async with self._client.messages.stream(**kwargs) as stream:
+                async for text in stream.text_stream:
+                    if text:
+                        if collecting:
+                            chunks.append(text)
+                        yield text
+        except Exception as exc:  # noqa: BLE001 - re-raised unchanged
+            debug_event(log, "anthropic generate_stream failed", model=kwargs.get("model"),
+                        error=str(exc))
+            raise
+        if collecting:
+            debug_event(log, "anthropic generate_stream response", model=kwargs.get("model"),
+                        text="".join(chunks), chunks=len(chunks))
 
     # --- Response shape helpers (resilient to SDK changes) -------------
 

@@ -1263,3 +1263,197 @@ async def test_whitespace_only_message_produces_no_push(reply_app, whitespace_ms
     assert await _messages(sm) == []
     row = await _row(sm)
     assert row.verdict_payload["replies"][0]["message"] == ""
+
+
+# --- Bank-statement request auto-escalation ---------------------------------
+#
+# The bot cannot usefully carry a "go find/upload a bank statement"
+# conversation, so a json_ticket_relay message asking for one hands the
+# session to a human agent AFTER the message itself has been relayed to the
+# customer (see `_escalate_for_bank_statement_request` in
+# src/api/deposit_verification.py, and `_escalate_session`/
+# `_check_and_timeout_verification` in src/api/chat.py, which it reuses).
+
+from unittest.mock import AsyncMock  # noqa: E402
+
+# The real production example this whole feature exists for -- a REQUEST.
+_BANK_STATEMENT_REQUEST = "Please Provide Bank Statement From the Day Of Transaction Till Today"
+
+# The vendor closing the loop on the SAME document -- an ACKNOWLEDGEMENT,
+# not a request -- which must NOT trigger a handoff.
+_BANK_STATEMENT_ACK = "Thank you for sharing the bank statement, we are checking"
+
+
+def _mock_bo_webhook(monkeypatch, *, ok: bool = True) -> AsyncMock:
+    webhook = AsyncMock(return_value=ok)
+    monkeypatch.setattr("src.api.chat_webhooks.send_bo_webhook", webhook)
+    return webhook
+
+
+async def _session(sm, session_id: str = "sess-1") -> ChatSession:
+    async with sm() as db:
+        return await db.get(ChatSession, session_id)
+
+
+async def test_bank_statement_request_escalates_and_calls_bo_webhook(reply_app, monkeypatch):
+    """The vendor's real production wording (a REQUEST) both relays to the
+    customer and hands the session to a human agent -- the bot has no useful
+    way to carry a "go find/upload a document" conversation."""
+    app, sm, _ = reply_app
+    webhook = _mock_bo_webhook(monkeypatch)
+    client = TestClient(app)
+
+    resp = _post(client, _raw("ORD-9", _BANK_STATEMENT_REQUEST))
+    assert resp.status_code == 200
+
+    messages = await _messages(sm)
+    assert messages[0].content == dv._RELAY_LABEL + _BANK_STATEMENT_REQUEST
+
+    session = await _session(sm)
+    assert session.mode == "awaiting_human"
+    webhook.assert_awaited_once()
+    tenant_arg, event_type, payload = webhook.await_args.args
+    assert event_type == "escalation_requested"
+    assert payload["session_id"] == "sess-1"
+    assert "ORD-9" in payload["summary"]
+
+
+async def test_vendor_message_is_pushed_before_the_escalation_not_just_both(reply_app, monkeypatch):
+    """Order matters: the customer must see what the payments team asked for
+    BEFORE any "connecting you to a human" notice -- assert the actual call
+    order, not merely that both a push and an escalation happened."""
+    app, sm, _ = reply_app
+    calls: list[str] = []
+
+    async def _recording_webhook(tenant, event_type, payload):
+        calls.append("bo_webhook")
+        return True
+
+    monkeypatch.setattr("src.api.chat_webhooks.send_bo_webhook", _recording_webhook)
+
+    real_push = chat.push_async_message
+
+    async def _recording_push(session_id, text, *, role="system", frame_type="async_message",
+                               ticket_id=None):
+        calls.append(f"push:{text}")
+        return await real_push(session_id, text, role=role, frame_type=frame_type, ticket_id=ticket_id)
+
+    monkeypatch.setattr(chat, "push_async_message", _recording_push)
+
+    client = TestClient(app)
+    resp = _post(client, _raw("ORD-9", _BANK_STATEMENT_REQUEST))
+    assert resp.status_code == 200
+
+    # Exactly: vendor message pushed, THEN the BO webhook (escalation),
+    # THEN the "connecting you" notice pushed.
+    assert len(calls) == 3
+    assert calls[0] == f"push:{dv._RELAY_LABEL + _BANK_STATEMENT_REQUEST}"
+    assert calls[1] == "bo_webhook"
+    assert calls[2].startswith("push:")
+    assert calls[2] != calls[0]
+
+
+async def test_ordinary_status_update_does_not_escalate(reply_app, monkeypatch):
+    """A routine, non-bank-statement status update must relay normally and
+    leave the session untouched -- this feature is additive, not a change to
+    the existing relay behaviour for every other message."""
+    app, sm, _ = reply_app
+    webhook = _mock_bo_webhook(monkeypatch)
+    client = TestClient(app)
+
+    resp = _post(client, _raw("ORD-9", "we are checking your deposit"))
+    assert resp.status_code == 200
+
+    session = await _session(sm)
+    assert session.mode == "ai"
+    webhook.assert_not_awaited()
+
+
+async def test_bank_statement_acknowledgement_does_not_escalate(reply_app, monkeypatch):
+    """The vendor CLOSING the loop on a bank statement already received
+    ("thank you for sharing...") is not a request, and must not hand the
+    conversation off -- that would escalate a thread that is finishing, not
+    one that needs a human."""
+    app, sm, _ = reply_app
+    webhook = _mock_bo_webhook(monkeypatch)
+    client = TestClient(app)
+
+    resp = _post(client, _raw("ORD-9", _BANK_STATEMENT_ACK))
+    assert resp.status_code == 200
+
+    messages = await _messages(sm)
+    assert messages[0].content == dv._RELAY_LABEL + _BANK_STATEMENT_ACK
+
+    session = await _session(sm)
+    assert session.mode == "ai"
+    webhook.assert_not_awaited()
+
+
+async def test_session_already_in_human_mode_does_not_re_escalate(reply_app, monkeypatch):
+    """A human already has the conversation -- a second bank-statement
+    message must not fire a second BO webhook or disturb the claim."""
+    app, sm, _ = reply_app
+    async with sm() as db:
+        session = await db.get(ChatSession, "sess-1")
+        session.mode = "human"
+        session.claimed_by = "agent-1"
+        await db.commit()
+
+    webhook = _mock_bo_webhook(monkeypatch)
+    client = TestClient(app)
+
+    resp = _post(client, _raw("ORD-9", _BANK_STATEMENT_REQUEST))
+    assert resp.status_code == 200
+
+    messages = await _messages(sm)
+    assert messages[0].content == dv._RELAY_LABEL + _BANK_STATEMENT_REQUEST
+
+    session_after = await _session(sm)
+    assert session_after.mode == "human"  # untouched
+    assert session_after.claimed_by == "agent-1"
+    webhook.assert_not_awaited()
+
+
+async def test_crm_declined_escalation_still_returns_200_with_message_delivered(reply_app, monkeypatch):
+    """`_escalate_session` returning `ok=False` (CRM declined the transfer)
+    must not fail this vendor-facing route -- the relay already succeeded by
+    that point, so the response must stay a normal 200 and the customer must
+    still have received the vendor's message."""
+    app, sm, _ = reply_app
+    webhook = _mock_bo_webhook(monkeypatch, ok=False)
+    client = TestClient(app)
+
+    resp = _post(client, _raw("ORD-9", _BANK_STATEMENT_REQUEST))
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "ok"}
+
+    messages = await _messages(sm)
+    assert messages[0].content == dv._RELAY_LABEL + _BANK_STATEMENT_REQUEST
+    # No "connecting you" notice -- the CRM never accepted the handoff.
+    assert len(messages) == 1
+
+    session = await _session(sm)
+    assert session.mode == "bot"  # _escalate_session's own revert-on-failure
+
+
+async def test_escalation_raising_still_returns_200_with_message_delivered(reply_app, monkeypatch):
+    """An unexpected exception inside the escalation path must be swallowed,
+    not surfaced to the vendor -- a non-200 here would make the vendor retry
+    a message the customer has already seen."""
+    app, sm, _ = reply_app
+
+    async def _boom(*args, **kwargs):
+        raise RuntimeError("crm exploded")
+
+    monkeypatch.setattr("src.api.chat._escalate_session", _boom)
+    client = TestClient(app)
+
+    resp = _post(client, _raw("ORD-9", _BANK_STATEMENT_REQUEST))
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "ok"}
+
+    messages = await _messages(sm)
+    assert messages[0].content == dv._RELAY_LABEL + _BANK_STATEMENT_REQUEST
+
+    session = await _session(sm)
+    assert session.mode == "ai"  # never got flipped -- the raise happened inside _escalate_session

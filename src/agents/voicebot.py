@@ -40,6 +40,7 @@ from src.rag.context_builder import (
     _numeric_tokens,
     GuardConfig,
 )
+from src.utils.logging import debug_event
 from src.utils.trace_id import new_trace_id, trace_id_scope
 
 
@@ -550,6 +551,18 @@ class VoiceBotAgent(BaseAgent):
                         "figures": _voice_currency_matches(sentence),
                     },
                 )
+                # The WARNING above (kept as-is) carries only the matched
+                # figures, keys-only per the INFO+ convention. This is the
+                # DEBUG companion: the full sentence that got replaced, what
+                # it was replaced WITH, and the grounded/customer text the
+                # decision was made against -- "was the figure actually
+                # ungrounded" is unanswerable from the WARNING alone.
+                debug_event(
+                    log, "voicebot sentence_guard tripped",
+                    session_id=session_id, campaign_id=self.session.campaign_id,
+                    sentence=sentence, replacement=replacement,
+                    grounded_text=grounded_text, customer_text=customer_text,
+                )
             return replacement
 
         return _guard
@@ -579,6 +592,14 @@ class VoiceBotAgent(BaseAgent):
         else:
             opening = (self._script.opening or "").strip()
         if not opening:
+            # For an outbound call the caller just answered and is silent --
+            # skipping here means the agent never speaks first. Indistinguishable
+            # from a dead call from outside; worth naming why.
+            debug_event(
+                log, "voicebot opening skipped",
+                session_id=self.session.session_id, campaign_id=self.session.campaign_id,
+                reason="no_opening_configured", agent_gender=agent_gender,
+            )
             return
         # Substitute simple template tokens with known lead data.
         import re as _re
@@ -624,6 +645,17 @@ class VoiceBotAgent(BaseAgent):
             return
         if tts_result.audio:
             await audio_sink(tts_result.audio)
+        else:
+            # tts_result.audio was empty/falsy but synthesize() didn't raise --
+            # nothing was sent to the caller, yet the lines below still record
+            # the opening as spoken (turns.append + persist_turn). See report:
+            # this looks like a real bug (transcript would show a line the
+            # caller never heard), not just a logging gap -- flagged, not fixed.
+            debug_event(
+                log, "voicebot opening empty_audio",
+                session_id=self.session.session_id, campaign_id=self.session.campaign_id,
+                rendered_text=rendered,
+            )
         self.session.turns.append(LLMMessage(role="assistant", content=rendered))
         await self.persist_turn("agent", rendered, metadata={"phase": "opening"})
 
@@ -715,6 +747,11 @@ class VoiceBotAgent(BaseAgent):
         LISTENING (response delivered) | ESCALATING | ENDED.
         """
         if self.state.state is not State.LISTENING:
+            debug_event(
+                log, "voicebot handle_turn rejected",
+                session_id=self.session.session_id, campaign_id=self.session.campaign_id,
+                current_state=self.state.state.value, reason="not_listening",
+            )
             raise RuntimeError(
                 f"handle_turn called from {self.state.state.value}, expected listening"
             )
@@ -741,6 +778,16 @@ class VoiceBotAgent(BaseAgent):
                 # machine back to LISTENING (PROCESSING -> RESPONDING -> LISTENING)
                 # so the conversation survives instead of crashing the call.
                 log.exception("pipeline turn failed; recovering to LISTENING")
+                # log.exception above carries no structured fields (no extra=)
+                # and no session/campaign id -- an operator sees WHAT failed
+                # but has to correlate by trace_id alone to find WHICH call.
+                debug_event(
+                    log, "voicebot turn pipeline_failed",
+                    session_id=self.session.session_id, campaign_id=self.session.campaign_id,
+                    error=f"{type(exc).__name__}: {exc}",
+                    captured_audio_bytes=len(captured_audio),
+                    history_turns=len(self._history_window()),
+                )
                 await self.state.fire(Event.LLM_RESPONSE_READY)
                 await self.state.fire(Event.RESPONSE_DELIVERED)
                 return TurnOutcome(
@@ -760,6 +807,18 @@ class VoiceBotAgent(BaseAgent):
                 )
 
             if pipeline_result.cancelled:
+                # Barge-in (or an engine-internal cancel, already logged at
+                # ERROR from inside pipeline/engine.py) -- either way, this is
+                # the first point in voicebot.py where the turn is discarded,
+                # and today there is no log line here at all: the caller-facing
+                # outcome (turn dropped, back to LISTENING) is invisible.
+                debug_event(
+                    log, "voicebot turn cancelled",
+                    session_id=self.session.session_id, campaign_id=self.session.campaign_id,
+                    reason="cancelled_before_finish", user_text=pipeline_result.user_text,
+                    sentences_spoken=len(pipeline_result.sentences_spoken),
+                    audio_bytes_sent=pipeline_result.audio_bytes_sent,
+                )
                 await self.state.fire(Event.LLM_RESPONSE_READY)
                 await self.state.fire(Event.RESPONSE_DELIVERED)
                 return TurnOutcome(
@@ -792,6 +851,13 @@ class VoiceBotAgent(BaseAgent):
         # Empty STT — no real user turn happened. Walk the state machine back to
         # LISTENING and let the silence handler decide what to do next.
         if not pipeline_result.user_text:
+            debug_event(
+                log, "voicebot turn empty_stt",
+                session_id=self.session.session_id, campaign_id=self.session.campaign_id,
+                user_confidence=pipeline_result.user_confidence,
+                user_language=pipeline_result.user_language,
+                stt_latency_ms=pipeline_result.metrics.stt_latency_ms,
+            )
             await self.state.fire(Event.LLM_RESPONSE_READY)
             await self.state.fire(Event.RESPONSE_DELIVERED)
             return TurnOutcome(
@@ -803,6 +869,12 @@ class VoiceBotAgent(BaseAgent):
 
         response = parse_voicebot_response(pipeline_result.agent_text)
         if response.parse_error:
+            # Tracks which of the several recovery paths below actually ran,
+            # for the single summary event emitted once the whole block is
+            # done (see below) -- this is a multi-branch recovery cascade and
+            # today none of its branches log anything at all.
+            _recovery_path = "unresolved"
+            original_parse_error = response.parse_error
             spoken = _join_spoken_sentences(pipeline_result.sentences_spoken)
             if spoken:
                 # The malformed JSON's response_text was already extracted and
@@ -814,6 +886,7 @@ class VoiceBotAgent(BaseAgent):
                 # redundant "please repeat that" the caller never heard asked.
                 response.response_text = spoken
                 _apply_recovered_fields(response, pipeline_result.agent_text)
+                _recovery_path = "spoken_before_parse_failure"
             else:
                 # Nothing was spoken this turn at all — no audio has gone out yet,
                 # so it's safe to regenerate once before falling back. Reuses the
@@ -851,6 +924,7 @@ class VoiceBotAgent(BaseAgent):
                 except Exception:  # noqa: BLE001 - the retry itself must not crash the turn
                     log.exception("retry after empty/unparseable LLM response failed")
                     retried = None
+                    _recovery_path = "retry_raised"
                 if retried is not None:
                     retried_spoken = _join_spoken_sentences(retried.sentences_spoken)
                     if not retried.cancelled:
@@ -859,6 +933,17 @@ class VoiceBotAgent(BaseAgent):
                         if response.parse_error and retried_spoken:
                             response.response_text = retried_spoken
                             _apply_recovered_fields(response, pipeline_result.agent_text)
+                            _recovery_path = "retry_spoken_recovered"
+                        elif response.parse_error:
+                            # Retry ran, wasn't cancelled, still failed to parse,
+                            # AND nothing was spoken this time either -- the turn
+                            # ends with response.action defaulted to "continue"
+                            # and an empty response_text: dead air, indistinguishable
+                            # from the feature being broken. Nothing recorded this
+                            # before.
+                            _recovery_path = "retry_reparse_failed_silent"
+                        else:
+                            _recovery_path = "retry_parsed_clean"
                     elif retried_spoken:
                         # The retry itself got cancelled (LLM budget exceeded,
                         # barge-in, or MAX_CONSECUTIVE_TTS_FAILURES — all set
@@ -887,6 +972,24 @@ class VoiceBotAgent(BaseAgent):
                             action="continue",
                             parse_error=response.parse_error or "retry cancelled",
                         )
+                        _recovery_path = "retry_cancelled_forced_continue"
+                    else:
+                        # Retry ran, got cancelled, AND spoke nothing -- every
+                        # branch above is exhausted. `response`/`pipeline_result`
+                        # are left exactly as they were before the retry was
+                        # even attempted (still empty response_text, still the
+                        # original parse_error): the caller gets dead air and
+                        # nothing distinguishes this from every other silent
+                        # failure mode above.
+                        _recovery_path = "retry_cancelled_nothing_spoken"
+
+            debug_event(
+                log, "voicebot turn parse_recovered",
+                session_id=self.session.session_id, campaign_id=self.session.campaign_id,
+                original_parse_error=original_parse_error, recovery_path=_recovery_path,
+                final_parse_error=response.parse_error, final_action=response.action,
+                final_response_text=response.response_text,
+            )
         # Update the conversation's active language from this turn's signals (the
         # LLM's explicitly-reported language wins; STT detection is the fallback).
         # Takes effect from the next turn's STT/TTS.
@@ -953,6 +1056,15 @@ class VoiceBotAgent(BaseAgent):
             self._system_prompt = updated_prompt
             if self.session.turns:
                 self.session.turns[0] = LLMMessage(role="system", content=updated_prompt)
+            # Not logging updated_prompt's full text here: it's already carried
+            # in full at the LLM provider boundary (gemini.py logs `system` on
+            # every request) on the very next turn. This is the decision that
+            # triggered the rebuild, not the boundary itself.
+            debug_event(
+                log, "voicebot prompt system_prompt_rebuilt",
+                session_id=self.session.session_id, reason="lead_gender_learned",
+                lead_gender=applied["lead_gender"],
+            )
 
         if agent_text:
             self.session.turns.append(LLMMessage(role="assistant", content=agent_text))
@@ -1011,6 +1123,17 @@ class VoiceBotAgent(BaseAgent):
         if sentiment:
             self.session.sentiment_history.append(sentiment)
 
+        # Which of the three branches below fires only shows up afterward as
+        # a state_machine transition (ESCALATION_REQUESTED / HANGUP /
+        # RESPONSE_DELIVERED) -- that tells you the resulting event but not
+        # the `action` value (transfer vs schedule_callback both produce the
+        # same ESCALATION_REQUESTED) that drove the routing decision.
+        debug_event(
+            log, "voicebot turn action_routed",
+            session_id=self.session.session_id, campaign_id=self.session.campaign_id,
+            action=action, escalation=action in _ESCALATION_ACTIONS,
+            end=action in _END_ACTIONS,
+        )
         if action in _ESCALATION_ACTIONS:
             # RESPONDING -> ESCALATING -> ENDED. We complete the escalation
             # immediately: the agent's conversational role is done (the actual
@@ -1039,6 +1162,11 @@ class VoiceBotAgent(BaseAgent):
         pipeline mid-stream.
         """
         if self.state.state is not State.LISTENING:
+            debug_event(
+                log, "voicebot handle_turn_text rejected",
+                session_id=self.session.session_id, campaign_id=self.session.campaign_id,
+                current_state=self.state.state.value, reason="not_listening",
+            )
             raise RuntimeError(
                 f"handle_turn_text called from {self.state.state.value}, expected listening"
             )
@@ -1061,6 +1189,12 @@ class VoiceBotAgent(BaseAgent):
                 )
             except Exception as exc:  # noqa: BLE001 - a provider failure (incl. timeout) must not drop the call
                 log.exception("pipeline turn (text) failed; recovering to LISTENING")
+                debug_event(
+                    log, "voicebot turn pipeline_failed",
+                    session_id=self.session.session_id, campaign_id=self.session.campaign_id,
+                    error=f"{type(exc).__name__}: {exc}", user_text=user_text,
+                    history_turns=len(self._history_window()),
+                )
                 await self.state.fire(Event.LLM_RESPONSE_READY)
                 await self.state.fire(Event.RESPONSE_DELIVERED)
                 return TurnOutcome(
@@ -1088,6 +1222,13 @@ class VoiceBotAgent(BaseAgent):
                         LLMMessage(role="user", content=pipeline_result.user_text)
                     )
                     await self.persist_turn("user", pipeline_result.user_text)
+                debug_event(
+                    log, "voicebot turn cancelled",
+                    session_id=self.session.session_id, campaign_id=self.session.campaign_id,
+                    reason="barge_in", user_text=pipeline_result.user_text,
+                    sentences_spoken=len(pipeline_result.sentences_spoken),
+                    audio_bytes_sent=pipeline_result.audio_bytes_sent,
+                )
                 await self.state.fire(Event.LLM_RESPONSE_READY)
                 await self.state.fire(Event.RESPONSE_DELIVERED)
                 return TurnOutcome(
@@ -1108,6 +1249,16 @@ class VoiceBotAgent(BaseAgent):
         state machine.
         """
         if self.state.state is not State.LISTENING:
+            # A silence timer fired after the call already moved past
+            # LISTENING (e.g. a turn started processing right before the
+            # timer expired) -- this re-prompt/end-of-call decision is
+            # dropped entirely, silently, and there is nothing else in this
+            # method that would show it happened.
+            debug_event(
+                log, "voicebot silence_timeout skipped",
+                session_id=self.session.session_id, campaign_id=self.session.campaign_id,
+                current_state=self.state.state.value, reason="not_listening",
+            )
             return None
         await self.state.fire(Event.SILENCE_TIMEOUT)
         # Auto-return to LISTENING so the call doesn't get stuck.
@@ -1117,12 +1268,23 @@ class VoiceBotAgent(BaseAgent):
     async def handle_extended_silence(self) -> None:
         if self.state.state is State.LISTENING:
             await self.state.fire(Event.EXTENDED_SILENCE)
+        else:
+            debug_event(
+                log, "voicebot extended_silence skipped",
+                session_id=self.session.session_id, campaign_id=self.session.campaign_id,
+                current_state=self.state.state.value, reason="not_listening",
+            )
         await self.persist_state()
 
     async def handle_hangup(self) -> None:
         # If we're already terminal (e.g. close_positive set last_action),
         # don't overwrite the persisted final state.
         if self.state.is_terminal:
+            debug_event(
+                log, "voicebot hangup skipped",
+                session_id=self.session.session_id, campaign_id=self.session.campaign_id,
+                reason="already_terminal",
+            )
             return
         await self.state.fire_if_possible(Event.HANGUP)
         await self.persist_state()

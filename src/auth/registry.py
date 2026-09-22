@@ -21,12 +21,15 @@ goes elsewhere.
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
 
 from src.auth.context import TenantContext
 from src.config_tenant import merge_provider_config, resolve_chat_tts_config
+
+log = logging.getLogger(__name__)
 
 
 # --- Provider clients ---------------------------------------------------
@@ -83,6 +86,9 @@ class TenantProviders:
         per-tenant pipeline_config.llm overrides.
         """
         if self._platform_llm is None:
+            from src.utils.logging import debug_event
+            debug_event(log, "registry provider_client build_triggered", layer="llm",
+                        scope="platform")
             self._platform_llm = self.llm_factory(self.global_defaults.get("llm", {}))
         return self._platform_llm
 
@@ -114,9 +120,24 @@ class TenantProviders:
         """
         pipeline = tenant.settings.pipeline
         if not pipeline.chat_voice.enabled:
+            # Routine: most tenants never opt into chat voice-note replies at
+            # all (this is the common case, not a problem) -- DEBUG only, no
+            # promotion, so it stays silent unless someone turns DEBUG on to
+            # investigate a specific tenant/session.
+            log.debug("chat tts skipped: chat_voice.enabled is false",
+                      extra={"tenant_id": tenant.id})
             return None
         tenant_tts = resolve_chat_tts_config(pipeline)
         if tenant_tts is None:
+            # Distinguishes "opted in but nothing resolvable" from the
+            # not-enabled case above -- this is the shape that produced a
+            # tenant-reported "voice replies aren't working" ticket with no
+            # trace anywhere (see src/api/chat.py's _synthesize_reply_audio
+            # module comment): chat_voice.enabled=true but neither
+            # chat_voice.tts nor pipeline.tts declares a provider.
+            log.debug("chat tts skipped: chat_voice.enabled is true but no "
+                      "chat_voice.tts or pipeline.tts provider resolves",
+                      extra={"tenant_id": tenant.id})
             return None
         key = (tenant.id, "chat_tts")
         if key in self._cache:
@@ -140,6 +161,13 @@ class TenantProviders:
         key = (tenant.id, layer)
         if key in self._cache:
             return self._cache[key]
+        # Fires once per (tenant, layer) until the next evict() -- not a
+        # per-turn/per-request cost, so cheap to leave unguarded. This is the
+        # state transition the doc calls out (cache arming): the first time a
+        # tenant's provider client for this layer is actually constructed.
+        from src.utils.logging import debug_event
+        debug_event(log, "registry provider_client build_triggered",
+                    layer=layer, tenant_id=tenant.id)
         cfg = self._config_for(tenant, layer)
         client = factory(cfg)
         self._cache[key] = client
@@ -148,10 +176,15 @@ class TenantProviders:
     def evict(self, tenant_id: Optional[str] = None) -> None:
         """Drop cached clients so a config/key update takes effect. ``tenant_id``
         None drops everything (e.g. on a full resolver reload)."""
+        from src.utils.logging import debug_event
         if tenant_id is None:
+            debug_event(log, "registry provider_client cache evict_all", cached_keys=len(self._cache))
             self._cache.clear()
             return
-        for key in [k for k in self._cache if k[0] == tenant_id]:
+        evicted = [k for k in self._cache if k[0] == tenant_id]
+        debug_event(log, "registry provider_client cache evict", tenant_id=tenant_id,
+                    layers=[k[1] for k in evicted])
+        for key in evicted:
             del self._cache[key]
 
 
@@ -209,6 +242,9 @@ class TenantRuntimeRegistry:
         return base + ((self.crm_tools,) if self.crm_tools is not None else ())
 
     def evict_tenant(self, tenant_id: str) -> None:
+        from src.utils.logging import debug_event
+        debug_event(log, "registry tenant_runtime cache evict", tenant_id=tenant_id,
+                    subregistry_count=len(self._subregistries()))
         self.providers.evict(tenant_id)
         for reg in self._subregistries():
             reg.evict(tenant_id)
@@ -216,6 +252,9 @@ class TenantRuntimeRegistry:
     def evict_all(self) -> None:
         """Drop every cached per-tenant instance (providers + sub-registries) —
         wired to the resolver's on_reload so a config/key update is picked up."""
+        from src.utils.logging import debug_event
+        debug_event(log, "registry tenant_runtime cache evict_all",
+                    subregistry_count=len(self._subregistries()))
         self.providers.evict(None)
         for reg in self._subregistries():
             reg.clear()

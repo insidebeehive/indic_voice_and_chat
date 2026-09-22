@@ -55,3 +55,7 @@ logs/
 # Local scratch dir (e.g. source recordings like tmp/breath.mp4)
 tmp/
 crm-softphone-bundle.zip
+
+# mutation testing state (scripts/mutation_test.sh)
+.mutmut-cache
+html/

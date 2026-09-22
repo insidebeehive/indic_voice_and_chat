@@ -189,6 +189,118 @@ async def test_backoffice_hidden_attribute_is_defended_at_stylesheet_level() -> 
 
 
 @pytest.mark.asyncio
+async def test_backoffice_pipeline_hint_shows_effective_value_and_source() -> None:
+    """The Pipeline tab's "(current: ...)" hint (pipeLayerHtml) must render
+    the EFFECTIVE provider/model (LayerInfo.effective_provider/effective_model
+    from src/api/tenants.py) and label whether each field is inherited from
+    the platform default or set on this tenant — not the raw stored override,
+    which is None (and rendered as a bare "—") for any tenant running the
+    platform default untouched. This is the exact bug the PR fixes: 3 of 6
+    live tenants stored no stt/llm/tts override and showed three dashes each.
+
+    NOTE: this is a served-HTML string match, not a browser — it cannot
+    execute the JS, so it cannot confirm that a real inherited-vs-overridden
+    tenant actually renders the two different strings at runtime, only that
+    the source still contains the branching logic that would produce them.
+    """
+    transport = ASGITransport(app=_app())
+    async with AsyncClient(transport=transport, base_url="http://test") as c:
+        resp = await c.get("/admin/tenants")
+    body = resp.text
+
+    # pipeLayerHtml's hint must call the source-aware renderer, not the bare
+    # provider/model formatter used elsewhere.
+    assert '(current: ${layHint(current)})' in body
+
+    # layHint must exist and read the additive LayerInfo fields (a regression
+    # back to a plain `l.provider`/`l.model` formatter — the original bug —
+    # would still satisfy the line above if left in place unedited, but not
+    # this: it pins the function to the effective_* / *_source fields).
+    assert "function layHint(l)" in body
+    import re
+    layhint_body = re.search(r"function layHint\(l\)\s*\{(.*?)\n\}", body, re.S)
+    assert layhint_body, "layHint function body not found"
+    lh = layhint_body.group(1)
+    assert "l.effective_provider" in lh and "l.effective_model" in lh
+    assert "l.provider_source" in lh and "l.model_source" in lh
+    assert "platform default" in lh and "set on this tenant" in lh
+
+    # The compact list-table renderer (`lay`, used for the LLM/STT/TTS/
+    # Realtime columns on the main tenant list) must ALSO have moved onto the
+    # effective fields — the same three-dashes bug is equally visible there.
+    lay_body = re.search(r"function lay\(l\)\s*\{(.*?)\n\}", body, re.S)
+    assert lay_body, "lay function body not found"
+    assert "l.effective_provider" in lay_body.group(1)
+
+    # Editing semantics untouched: every pipeline control still defaults to
+    # the "leave unchanged" sentinel and PATCH only sends touched fields —
+    # this change is about the hint text, not the control. (Already covered
+    # more thoroughly elsewhere in this file/test_tenants_routes.py; this is
+    # a cheap guard that the hint rewrite didn't collaterally touch it.)
+    assert 'onchange="onPipeProviderChange(\'${kind}\')"' in body
+    assert "— leave unchanged —" in body
+
+
+@pytest.mark.asyncio
+async def test_backoffice_chat_voice_hint_shows_effective_config_and_source() -> None:
+    """The Chat voice replies section used to render two hard-coded
+    disclaimers ("current on/off state isn't exposed by the API until you
+    save here" and "current chat-voice TTS config isn't exposed by any GET
+    until you save here") because TenantSummary (src/api/tenants.py) had no
+    chat_voice field at all — GET /api/v1/tenants could not answer either
+    question, only a PATCH response echoed it back for the rest of that
+    session. Both disclaimers must be gone now that ChatVoiceInfo is always
+    present on every tenant row, and the section must render from it.
+
+    NOTE: this is a served-HTML string match, not a browser — it cannot
+    execute the JS, so it cannot confirm that a real tenant's enabled/source/
+    effective_provider actually produces the right rendered text at runtime,
+    only that the source no longer contains the two disclaimer strings and
+    still contains the branching that would read the real fields instead.
+    """
+    transport = ASGITransport(app=_app())
+    async with AsyncClient(transport=transport, base_url="http://test") as c:
+        resp = await c.get("/admin/tenants")
+    body = resp.text
+
+    # The exact disclaimer strings quoted in the task brief — as rendered
+    # string literals, not merely as a substring, since an explanatory code
+    # comment describing the fix legitimately mentions "isn't exposed by any
+    # GET" as history and must not itself fail this check.
+    assert '"current on/off state isn\'t exposed by the API until you save here"' not in body
+    assert '"current chat-voice TTS config isn\'t exposed by any GET until you save here"' not in body
+    assert "CHAT_VOICE_CACHE = {}" not in body   # the session-only workaround they required is gone too
+
+    # chatVoiceHtml must take the tenant's resolved chat_voice and read it
+    # through chatVoiceHint, not a per-session cache keyed by tenant id.
+    assert "function chatVoiceHtml(id, cv)" in body
+    assert "chatVoiceHint(cv)" in body
+
+    import re
+    hint_body = re.search(r"function chatVoiceHint\(cv\)\s*\{(.*?)\n\}", body, re.S)
+    assert hint_body, "chatVoiceHint function body not found"
+    ch = hint_body.group(1)
+    # Must report `enabled` distinctly from `source` (see ChatVoiceInfo's
+    # docstring in src/api/tenants.py) — a hint that only branched on
+    # `source` would report the not-enabled state identically to the
+    # falls-back-and-would-work state, which is the exact ambiguity that
+    # made the lotterystage report unverifiable from this tab.
+    assert "cv.enabled" in ch
+    assert 'cv.source === "none"' in ch
+    assert 'cv.source === "own"' in ch
+
+    # The chat-voice voice picker must now be seeded from the resolved
+    # voice id (ChatVoiceInfo.effective_voice_id) instead of a literal null.
+    assert 'voicePickerHtml("cv_tts", "Chat TTS", cv ? cv.effective_voice_id : null)' in body
+
+    # Editing semantics untouched: the sentinel and provider-change wiring
+    # for the chat-voice controls specifically (not just elsewhere on the
+    # page) are still present.
+    assert 'id="p_cv_tts_provider" onchange="onPipeProviderChange(\'cv_tts\')"' in body
+    assert 'id="p_cv_enabled"' in body
+
+
+@pytest.mark.asyncio
 async def test_backoffice_dropped_selection_warning_is_present_in_source() -> None:
     """refreshVoiceOptions must not silently revert a non-empty prior voice
     pick to the sentinel when the new provider/language roster doesn't

@@ -10,6 +10,7 @@ from src.agents.state_machine import AgentStateMachine
 from src.dialogue.context import SessionStore
 from src.dialogue.slots import SlotFiller
 from src.interfaces.llm import LLMMessage
+from src.utils.logging import debug_event
 
 log = logging.getLogger(__name__)
 
@@ -48,6 +49,14 @@ class BaseAgent:
     async def persist_turn(self, role: str, content: str, metadata: Optional[dict] = None) -> None:
         if self.store is None:
             return
+        # This Redis write boundary has no logging of its own (SessionStore,
+        # src/dialogue/context.py, is un-instrumented) -- carry the full turn
+        # here rather than leave it invisible until the WARNING below fires.
+        debug_event(
+            log, "agent persist_turn request",
+            session_id=self.session.session_id, role=role, content=content,
+            metadata=metadata or {},
+        )
         # Best-effort: a slow/dead store (e.g. Redis outage) must not drop a live
         # call — degrade to no-persistence rather than crashing the bridge.
         try:
@@ -67,6 +76,10 @@ class BaseAgent:
         }
         if extra:
             payload.update(extra)
+        debug_event(
+            log, "agent persist_state request",
+            session_id=self.session.session_id, payload=payload,
+        )
         try:
             await self.store.set_state(self.session.session_id, payload)
         except Exception:  # noqa: BLE001

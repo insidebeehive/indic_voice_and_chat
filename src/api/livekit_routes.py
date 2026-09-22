@@ -33,6 +33,7 @@ from src.auth.middleware import tenant_from_slug
 from src.config_tenant import resolve_livekit_creds
 from src.exceptions import LiveKitModeNotSupported
 from src.models.database import get_sessionmaker
+from src.utils.logging import debug_event
 
 log = logging.getLogger(__name__)
 router = APIRouter(prefix="/telephony", tags=["telephony-livekit"])
@@ -86,7 +87,10 @@ def _parse_vox_blob(raw: str | None) -> dict | None:
     try:
         data = json.loads(raw)
     except (ValueError, TypeError):
-        log.debug("livekit webhook: metadata is not valid JSON", extra={"raw": raw[:200]})
+        # Was a hand-rolled log.debug(..., extra=...) — converted to debug_event
+        # to match the rest of the sweep's convention (structured field, not a
+        # bespoke extra dict).
+        debug_event(log, "livekit webhook metadata_parse invalid", raw_metadata=raw[:200])
         return None
     if not isinstance(data, dict):
         return None
@@ -149,9 +153,19 @@ def _extract_vox_metadata(event) -> dict:
     # Accessing event.room / event.participant on an event that doesn't carry
     # them is safe: proto3 returns a default instance (metadata == ""), never
     # raises — no need to guard on event.HasField(...) here.
-    for raw in (event.room.metadata, event.participant.metadata):
+    #
+    # Which of the three sources actually supplied the metadata isn't
+    # otherwise visible anywhere downstream, and it changes which fields the
+    # bridge factory sees — logged once per call (webhook fires once per
+    # participant join), not a hot path.
+    for source_name, raw in (
+        ("room_metadata", event.room.metadata),
+        ("participant_metadata", event.participant.metadata),
+    ):
         vox = _parse_vox_blob(raw)
         if vox:
+            debug_event(log, "livekit webhook metadata_source resolved",
+                        source=source_name, meta_keys=sorted(vox.keys()))
             return _validate_vox_meta({k: vox[k] for k in _META_KEYS if k in vox})
 
     # Attributes fallback: ScalarMap[str, str], so values are strings only — a
@@ -171,6 +185,9 @@ def _extract_vox_metadata(event) -> dict:
         lead["gender"] = attrs["lead_gender"]
     if lead:
         meta["lead"] = lead
+    debug_event(log, "livekit webhook metadata_source resolved",
+                source="participant_attributes" if meta else "none",
+                meta_keys=sorted(meta.keys()))
     # Attributes are a ScalarMap[str, str] (proto), so every value here is
     # already a str — _validate_vox_meta is still applied for uniformity /
     # future-proofing, but is a no-op on this path today.

@@ -18,6 +18,7 @@ from typing import Optional
 
 from src.integration.crm_client import IChatChannel
 from src.integration.event_bus import Event, EventBus, EventType
+from src.utils.logging import debug_event
 
 log = logging.getLogger(__name__)
 
@@ -68,13 +69,31 @@ class WhatsAppHandoff:
         payload = event.payload or {}
         session_id = payload.get("session_id")
         if not session_id or session_id in self._dispatched:
+            debug_event(
+                log, "integration lead_qualified_handoff skipped",
+                session_id=session_id,
+                reason="no_session_id" if not session_id else "already_dispatched",
+            )
             return
         interest = (payload.get("interest_level") or "").lower()
         if interest not in self._cfg.qualifying_levels:
+            debug_event(
+                log, "integration lead_qualified_handoff skipped",
+                session_id=session_id, interest_level=interest,
+                reason="interest_not_qualifying",
+            )
             return
         slots = payload.get("slots") or {}
         whatsapp = slots.get("whatsapp_number")
         if not whatsapp:
+            # The gap this pass exists to close: a hot/warm lead qualifies but
+            # never gave a WhatsApp number, so no follow-up goes out -- from
+            # outside, indistinguishable from the handoff being broken.
+            debug_event(
+                log, "integration lead_qualified_handoff skipped",
+                session_id=session_id, interest_level=interest,
+                reason="no_whatsapp_number",
+            )
             return
 
         language = slots.get("language") or self._cfg.default_language
@@ -83,9 +102,18 @@ class WhatsAppHandoff:
             log.warning("no handoff template for interest %r / language %r", interest, language)
             return
 
+        debug_event(
+            log, "integration lead_qualified_handoff request",
+            session_id=session_id, whatsapp=whatsapp, language=language,
+            interest_level=interest,
+        )
         try:
-            await self._channel.send_message(whatsapp, template, language=language)
+            msg_id = await self._channel.send_message(whatsapp, template, language=language)
             self._dispatched.add(session_id)
+            debug_event(
+                log, "integration lead_qualified_handoff response",
+                session_id=session_id, whatsapp=whatsapp, msg_id=msg_id,
+            )
         except Exception:  # noqa: BLE001
             log.exception("whatsapp handoff failed", extra={"session_id": session_id})
 

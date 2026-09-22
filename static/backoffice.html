@@ -140,7 +140,61 @@ async function apiSend(method, path, body) {
   } catch (e) { return { ok: false, status: 0, json: { error: String(e) } }; }
 }
 
-const lay = (l) => l && l.provider ? `${l.provider}${l.model ? " · " + l.model : ""}` : "—";
+// Effective provider/model for one pipeline layer (LayerInfo.effective_provider
+// / effective_model in src/api/tenants.py — the tenant's stored override
+// merged over config/default.yaml, same merge TenantProviders._config_for
+// runs at request time), marking any field this tenant did NOT set itself.
+// Before this, a tenant with no stt/llm/tts override at all (running the
+// platform default) rendered as a bare "—" here, identical to a genuinely
+// unconfigured pipeline — see pipeLayerHtml's docstring-equivalent comment
+// below for the fuller per-field version used in the editor hint.
+function lay(l) {
+  if (!l) return "—";
+  const p = l.effective_provider, m = l.effective_model;
+  if (!p && !m) return "—";
+  const tag = (src) => src === "platform_default" ? " (default)" : "";
+  return `${p ? p + tag(l.provider_source) : "—"}${m ? " · " + m + tag(l.model_source) : ""}`;
+}
+
+// Verbose per-field breakdown for the pipeline editor's "(current: ...)" hint
+// (pipeLayerHtml) — distinguishes "inherits the platform default" from "set
+// on this tenant" PER FIELD, since a tenant can pin `provider` while
+// inheriting `model` (merge_provider_config merges field-by-field, not
+// layer-by-layer) — a single whole-layer suffix would misreport that case as
+// fully one or the other.
+function layHint(l) {
+  if (!l) return "—";
+  const p = l.effective_provider, m = l.effective_model;
+  if (!p && !m) return "—";
+  const label = (src) => src === "tenant" ? "set on this tenant" : "platform default";
+  if (!m) return `${p} — ${label(l.provider_source)}`;
+  if (l.provider_source === l.model_source) return `${p} · ${m} — ${label(l.provider_source)}`;
+  return `${p} (${label(l.provider_source)}) · ${m} (${label(l.model_source)})`;
+}
+
+// Hint text for pipeline.chat_voice (ChatVoiceInfo.enabled/effective_provider/
+// effective_model/source in src/api/tenants.py) — resolved the same way
+// get_chat_tts (src/auth/registry.py) picks a TTS at runtime, via
+// resolve_chat_tts_config. Unlike layHint, this is not a per-field
+// tenant/platform-default split: resolve_chat_tts_config picks one whole TTS
+// block (chat_voice.tts, or pipeline.tts, or neither), so `source` covers
+// provider and model together, not separately. `enabled` is reported first
+// and always, because it is orthogonal to `source` — a tenant can have a
+// fully resolvable TTS block and still be disabled, or be enabled with
+// nothing resolvable; conflating the two is what made a "voice replies not
+// working" report unverifiable from this tab in the first place.
+function chatVoiceHint(cv) {
+  if (!cv) return "disabled — no chat voice-note replies are sent";
+  const onOff = cv.enabled ? "enabled" : "disabled";
+  if (cv.source === "none") {
+    return `${onOff} — no chat TTS resolvable (neither chat_voice.tts nor pipeline.tts declares a provider)`;
+  }
+  const val = cv.effective_provider + (cv.effective_model ? " · " + cv.effective_model : "");
+  const via = cv.source === "own"
+    ? "own chat_voice.tts"
+    : "falling back to the call TTS, pipeline.tts";
+  return `${onOff} — ${val} (${via})`;
+}
 let SELECTED = null;
 let CHAT_WINDOW_H = 24;
 
@@ -495,11 +549,6 @@ async function loadBilling(id) {
 // value is shown as a hint next to each field instead.
 let MODELS = {};
 let MODELS_LOADED = false;
-// Chat-voice current state (enabled / effective TTS provider) is NOT exposed
-// by any GET today — only a PATCH response echoes it back. This session-only
-// cache remembers the last value this page saw for a tenant so the hint text
-// can show it after a save; before any save this session it just says so.
-let CHAT_VOICE_CACHE = {};
 
 async function ensureModelsLoaded() {
   if (MODELS_LOADED) return;
@@ -589,11 +638,12 @@ function voiceFieldValue(kind) {
 }
 
 function voicePickerHtml(kind, label, currentVoiceId) {
-  const hint = currentVoiceId
-    ? `current: ${escT(currentVoiceId)}`
-    : (kind === "cv_tts"
-        ? "current chat-voice TTS config isn't exposed by any GET until you save here"
-        : "current: —");
+  // cv_tts used to need a special-cased "isn't exposed by any GET" message
+  // here (list_tenants had no chat_voice field at all — TenantSummary,
+  // src/api/tenants.py). Now that it does (effective_voice_id, resolved the
+  // same way get_chat_tts picks a TTS at runtime), cv_tts's current voice
+  // reads exactly like every other layer's.
+  const hint = currentVoiceId ? `current: ${escT(currentVoiceId)}` : "current: —";
   return `
     <label>${label} voice <small class="hint">(${hint})</small>
       <select id="p_${kind}_voice_select" onchange="onVoiceSelectChange('${kind}')">
@@ -683,7 +733,7 @@ function pipeLayerHtml(kind, label, current, extraHtml) {
   const providers = Object.keys(MODELS[catKind] || {});
   return `
     <div class="creds" style="gap:.6rem;flex-wrap:wrap;margin-bottom:.5rem;">
-      <label>${label} provider <small class="hint">(current: ${lay(current)})</small>
+      <label>${label} provider <small class="hint">(current: ${layHint(current)})</small>
         <select id="p_${kind}_provider" onchange="onPipeProviderChange('${kind}')">
           <option value="">— leave unchanged —</option>
           ${providers.map(p => `<option value="${escAttr(p)}">${escT(p)}</option>`).join("")}
@@ -698,11 +748,7 @@ function pipeLayerHtml(kind, label, current, extraHtml) {
     </div>`;
 }
 
-function chatVoiceHtml(id) {
-  const cache = CHAT_VOICE_CACHE[id];
-  const curLabel = cache
-    ? `current (as of last save this session): ${cache.enabled ? "enabled" : "disabled"}${cache.tts_provider ? " · effective tts=" + escT(cache.tts_provider) : ""}`
-    : "current on/off state isn't exposed by the API until you save here";
+function chatVoiceHtml(id, cv) {
   const providers = Object.keys(MODELS.tts || {});
   return `
     <h2 style="margin-top:1.2rem;">Chat voice replies</h2>
@@ -710,17 +756,21 @@ function chatVoiceHtml(id) {
       Voice-note replies in the <b>chat</b> channel — a separate setting from the call TTS above.
       A tenant can run S2S for calls and still need a TTS here for chat voice notes. If left unset,
       chat voice falls back to the call TTS (pipeline.tts); if enabled with neither set, saving is
-      rejected. <br /><small class="hint">${curLabel}</small>
+      rejected. <br /><small class="hint">current: ${escT(chatVoiceHint(cv))}</small>
     </div>
     <div class="creds" style="gap:.6rem;flex-wrap:wrap;">
-      <label>Enabled
+      <label>Enabled <small class="hint">(current: ${cv && cv.enabled ? "enabled" : "disabled"})</small>
         <select id="p_cv_enabled">
           <option value="">— leave unchanged —</option>
           <option value="true">enabled</option>
           <option value="false">disabled</option>
         </select>
       </label>
-      <label>Chat TTS provider
+      <label>Chat TTS provider <small class="hint">(current: ${
+        cv && cv.effective_provider
+          ? `${escT(cv.effective_provider)} — ${cv.source === "own" ? "set on this tenant's chat_voice.tts" : "falling back to pipeline.tts"}`
+          : "— (nothing resolvable)"
+      })</small>
         <select id="p_cv_tts_provider" onchange="onPipeProviderChange('cv_tts')">
           <option value="">— leave unchanged —</option>
           ${providers.map(p => `<option value="${escAttr(p)}">${escT(p)}</option>`).join("")}
@@ -731,7 +781,7 @@ function chatVoiceHtml(id) {
       </label>
       <label>Chat TTS language <input id="p_cv_tts_language" placeholder="blank = leave unchanged" onchange="refreshVoiceOptions('cv_tts')" /></label>
       <label>Chat TTS speed <input id="p_cv_tts_speed" type="number" step="0.05" placeholder="blank = leave unchanged" /></label>
-      ${voicePickerHtml("cv_tts", "Chat TTS", null)}
+      ${voicePickerHtml("cv_tts", "Chat TTS", cv ? cv.effective_voice_id : null)}
     </div>`;
 }
 
@@ -740,19 +790,24 @@ async function loadPipeline(id) {
   if (SELECTED !== id) return;   // a different tenant may have been selected while this awaited
   const t = (window.TENANTS || {})[id] || {};
   const stt = t.stt || {}, llm = t.llm || {}, tts = t.tts || {}, realtime = t.realtime || {};
+  const chatVoice = t.chat_voice || null;
   // Seeds for each voice picker's provider/language fallback (resolveVoiceQuery)
   // when the operator hasn't touched those fields. `realtime` already carries
   // `language`/`voice_id` — not `language_code`/`voice` — thanks to the
   // _layer() mapping in src/api/tenants.py, so no per-kind translation is
-  // needed here. chat_voice's own tts config has no GET representation at all
-  // (see the CHAT_VOICE_CACHE comment above); the fallback consistent with
-  // its documented runtime behavior ("if left unset, chat voice falls back to
-  // the call TTS") is the call TTS layer itself.
-  const cvCache = CHAT_VOICE_CACHE[id];
+  // needed here. cv_tts seeds off chat_voice.effective_provider/
+  // effective_language directly (ChatVoiceInfo, src/api/tenants.py) — that
+  // field is already resolved via resolve_chat_tts_config, the same
+  // chat_voice.tts-then-pipeline.tts fallback this picker's query needs, so
+  // no separate approximation is needed here the way there was before
+  // ChatVoiceInfo existed.
   PIPE_CURRENT = {
     tts: { provider: tts.provider || "", language: tts.language || "" },
     realtime: { provider: realtime.provider || "", language: realtime.language || "" },
-    cv_tts: { provider: (cvCache && cvCache.tts_provider) || tts.provider || "", language: tts.language || "" },
+    cv_tts: {
+      provider: (chatVoice && chatVoice.effective_provider) || "",
+      language: (chatVoice && chatVoice.effective_language) || tts.language || "",
+    },
   };
   $("pane_pipe").innerHTML = `
     <div class="hint" style="margin-bottom:.6rem;">
@@ -783,7 +838,7 @@ async function loadPipeline(id) {
     ${pipeLayerHtml("realtime", "Realtime", realtime, `
       <label>Realtime language_code <input id="p_realtime_language_code" placeholder="blank = leave unchanged" onchange="refreshVoiceOptions('realtime')" /></label>
       ${voicePickerHtml("realtime", "Realtime", realtime.voice_id)}`)}
-    ${chatVoiceHtml(id)}
+    ${chatVoiceHtml(id, chatVoice)}
     <div style="margin-top:1rem;">
       <button id="p_save_btn" onclick="savePipeline('${id}')">Save pipeline</button>
       <span id="p_result" class="hint" style="margin-left:.6rem;"></span>
@@ -861,8 +916,11 @@ async function savePipeline(id) {
   const r = await apiSend("PATCH", `/api/v1/tenants/${id}`, { pipeline });
   btn.disabled = false;
   if (r.ok) {
-    CHAT_VOICE_CACHE[id] = { enabled: r.json.chat_voice_enabled, tts_provider: r.json.chat_voice_tts_provider };
     $("p_result").textContent = "✓ saved";
+    // loadTenants() refreshes window.TENANTS' chat_voice (ChatVoiceInfo) via
+    // GET, same as stt/llm/tts/realtime — no separate cache of the PATCH
+    // response is needed for this anymore (there used to be one here, back
+    // when chat_voice's current state had no GET representation at all).
     await loadTenants();   // refresh table + window.TENANTS with the now-effective values
     loadPipeline(id);      // re-render so hints reflect the new current values
   } else {

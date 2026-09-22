@@ -10,6 +10,7 @@ the interface stays honest.
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 from typing import Any, AsyncIterator
 
@@ -20,6 +21,9 @@ from src.interfaces.telephony import (
     CallSession,
     ITelephonyProvider,
 )
+from src.utils.logging import debug_event
+
+log = logging.getLogger(__name__)
 
 
 _STATUS_MAP = {
@@ -53,7 +57,20 @@ class TwilioAdapter(ITelephonyProvider):
                 timeout=config.timeout_seconds,
             )
 
-        call = await asyncio.to_thread(_create)
+        # No credential in this request body -- account_sid/auth_token were
+        # already consumed building `self._client` and never appear per-call --
+        # so the full request/response is safe to log without redaction.
+        debug_event(log, "twilio initiate_call request", to=config.to_number,
+                    from_=config.from_number, webhook_url=config.webhook_url,
+                    timeout_seconds=config.timeout_seconds)
+        try:
+            call = await asyncio.to_thread(_create)
+        except Exception as exc:  # noqa: BLE001 - re-raised unchanged; this adapter has no logging at all today
+            debug_event(log, "twilio initiate_call failed", to=config.to_number,
+                        from_=config.from_number, error=str(exc))
+            raise
+        debug_event(log, "twilio initiate_call response", session_id=call.sid,
+                    status=call.status)
         return CallSession(
             session_id=call.sid,
             status=_STATUS_MAP.get(call.status, call.status or "ringing"),
@@ -80,6 +97,12 @@ class TwilioAdapter(ITelephonyProvider):
         )
 
     async def hangup(self, session_id: str) -> None:
+        # Call-state transition; none of hangup/transfer/redirect_to_stream
+        # logged anything before this pass, so a hangup that silently no-ops
+        # (wrong session_id, call already ended) looked identical to one that
+        # worked.
+        debug_event(log, "twilio hangup", session_id=session_id)
+
         def _hangup() -> None:
             self._client.calls(session_id).update(status="completed")
 
@@ -87,6 +110,7 @@ class TwilioAdapter(ITelephonyProvider):
 
     async def transfer(self, session_id: str, to_number: str) -> None:
         twiml = f'<Response><Dial>{to_number}</Dial></Response>'
+        debug_event(log, "twilio transfer", session_id=session_id, to_number=to_number)
 
         def _transfer() -> None:
             self._client.calls(session_id).update(twiml=twiml)
@@ -100,6 +124,8 @@ class TwilioAdapter(ITelephonyProvider):
             f'<Connect><Stream url="{stream_wss_url}"/></Connect>'
             "</Response>"
         )
+        debug_event(log, "twilio redirect_to_stream", call_sid=call_sid,
+                    stream_wss_url=stream_wss_url)
 
         def _redirect() -> None:
             self._client.calls(call_sid).update(twiml=twiml)

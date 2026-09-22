@@ -214,6 +214,13 @@
       $("typing").textContent = "";
       if (m.type === "message") {
         add("agent", m.text);
+        // Voice-note replies: the server adds audio_url/audio_mime to this same
+        // `message` frame rather than sending a new frame type (see _send_reply
+        // in src/api/chat.py). A client that ignores the field renders text only
+        // -- which is exactly what this widget did, so a customer who sent a
+        // voice note got a silent text answer even though synthesis, upload and
+        // the reply frame had all succeeded server-side.
+        if (m.audio_url) addAudioBubble(m.audio_url + "?session_id=" + sessionId, "agent");
         if (m.sources && m.sources.length) meta("sources: " + m.sources.join(", "));
         setSuggestions(m.suggestions);
       } else if (m.type === "call_offer") {

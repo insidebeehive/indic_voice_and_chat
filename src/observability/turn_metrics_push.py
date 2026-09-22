@@ -51,6 +51,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from src.models.turn_metrics import TurnMetric
+from src.utils.logging import debug_event
 from src.utils.redact import redact_url
 
 log = logging.getLogger(__name__)
@@ -189,8 +190,25 @@ async def _push(
             )
     url = f"{push_url.rstrip('/')}/metrics/job/{job_name}"
     data = generate_latest(registry)
+    # Boundary: this is the only outbound HTTP call this module makes. Runs
+    # once per push interval (60-120s), never per turn, so no isEnabledFor
+    # guard is needed. auth itself never appears -- only whether one was
+    # supplied -- and the URL is redact_url'd in case push_auth-less
+    # basic-auth userinfo ever ends up embedded in push_url itself.
+    debug_event(
+        log, "metrics push request", job_name=job_name, url=redact_url(url),
+        auth_present=push_auth is not None, payload_bytes=len(data),
+    )
     async with httpx.AsyncClient(timeout=10.0, auth=auth) as client:
         resp = await client.put(url, content=data, headers={"Content-Type": CONTENT_TYPE_LATEST})
+        # Logged before raise_for_status() so a non-2xx status is captured
+        # here too, not only via the caller's warn-once-per-outage warning
+        # (which deliberately omits the status to avoid the raw exception's
+        # embedded URL -- see aggregate_and_push_turn_metrics's comment).
+        debug_event(
+            log, "metrics push response", job_name=job_name, url=redact_url(url),
+            status_code=resp.status_code,
+        )
         resp.raise_for_status()
 
 
@@ -215,7 +233,10 @@ async def aggregate_and_push_turn_metrics(
     a periodic background loop and must never affect a live call/turn.
     """
     if not push_url:
-        log.debug("turn-metrics push skipped (GRAFANA_PROMETHEUS_PUSH_URL unset)")
+        debug_event(
+            log, "metrics push skipped", job_name=_JOB_NAME,
+            reason="push_url_unset",
+        )
         return 0
 
     try:
@@ -256,6 +277,17 @@ async def aggregate_and_push_turn_metrics(
     for row in rows:
         key = tuple(getattr(row, label) for label in _GROUP_LABELS)
         groups.setdefault(key, []).append(row)
+
+    # aggregate_and_push_turn_metrics returns 0 on FOUR different outcomes
+    # (push_url unset, query failed, registry build failed, genuinely 0 rows
+    # in the window) that main.py's `if n: log.info(...)` caller can't tell
+    # apart -- this is the one that distinguishes "0 rows, still pushing an
+    # empty registry to clear stale gauges" from the other three, each of
+    # which already has its own log line above/below.
+    debug_event(
+        log, "metrics aggregate result", job_name=_JOB_NAME, window_s=window_s,
+        row_count=len(rows), group_count=len(groups),
+    )
 
     try:
         registry = _build_registry(groups)

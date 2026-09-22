@@ -188,6 +188,104 @@ def test_event_without_call_id_query_returns_reprompt_not_422(client):
     assert scco[0]["action"] == "talk", f"expected talk reprompt, got {scco!r}"
 
 
+# --- Fix 1: inbound webhook signature verification (X-STRINGEE-SIGNATURE) ---
+#
+# Per Stringee's own docs (validating-requests-are-coming-from-stringee):
+# base64(HMAC-SHA1(signing_secret, Request-URI)) for a GET answer_url fetch.
+# Uses a REAL registered tenant (not the bare SimpleNamespace the fixtures
+# above use) because verification needs `tenant.secret_optional`.
+
+import base64 as _base64
+import hashlib as _hashlib
+import hmac as _hmac
+import logging as _logging
+
+from src.auth import register_tenant_for_test
+from src.auth.middleware import set_tenant_resolver
+from src.config_tenant import TenantSettings
+
+
+def _stringee_sig(secret: str, data: bytes) -> str:
+    mac = _hmac.new(secret.encode("utf-8"), data, _hashlib.sha1)
+    return _base64.b64encode(mac.digest()).decode()
+
+
+@pytest.fixture
+def signed_client():
+    """Same bridge-factory wiring as `client`, but the answer route resolves a
+    REAL registered tenant by slug (`stringee_answer_for_tenant` -> the
+    module-level `tenant_from_slug`, unlike `client`'s monkeypatched
+    `tenant_from_twilio_to_number`)."""
+    app = FastAPI()
+    app.include_router(hooks.router, prefix="/api/v1")
+
+    async def _fetch(url):
+        return pcm16_to_wav(b"\x00\x00" * 80, 8000)
+
+    def _factory(*, call_id, tenant, base_url, fetch):
+        return StringeeIvrBridge(
+            call_id=str(call_id), agent=_Agent(), llm=None,
+            tenant_timezone="Asia/Kolkata", tts_sample_rate=16000,
+            base_url=base_url, tenant_slug="dev", fetch=_fetch,
+        )
+
+    hooks.set_stringee_bridge_factory(_factory)
+    yield TestClient(app)
+    hooks.set_stringee_bridge_factory(None)
+    set_tenant_resolver(None)
+
+
+_ANSWER_PATH = ("/api/v1/telephony/stringee/answer/dev"
+                "?call_id=s1&from=918204268005&to=918618795697")
+
+
+def test_stringee_answer_valid_signature_passes(signed_client, monkeypatch):
+    monkeypatch.setenv("VOX_WEBHOOK_SIGNATURE_MODE", "enforce")
+    register_tenant_for_test(
+        TenantSettings(id="t_dev", slug="dev", name="Dev"),
+        secrets={"webhook:stringee_signing_secret": "str-secret"},
+    )
+    sig = _stringee_sig("str-secret", _ANSWER_PATH.encode("utf-8"))
+    r = signed_client.get(_ANSWER_PATH, headers={"X-STRINGEE-SIGNATURE": sig})
+    assert r.status_code == 200, r.text
+
+
+def test_stringee_answer_invalid_signature_rejected_in_enforce_mode(signed_client, monkeypatch):
+    monkeypatch.setenv("VOX_WEBHOOK_SIGNATURE_MODE", "enforce")
+    register_tenant_for_test(
+        TenantSettings(id="t_dev", slug="dev", name="Dev"),
+        secrets={"webhook:stringee_signing_secret": "str-secret"},
+    )
+    r = signed_client.get(_ANSWER_PATH, headers={"X-STRINGEE-SIGNATURE": "bogus"})
+    assert r.status_code == 401
+
+
+def test_stringee_answer_invalid_signature_allowed_with_warning_in_log_only_mode(signed_client, monkeypatch, caplog):
+    monkeypatch.setenv("VOX_WEBHOOK_SIGNATURE_MODE", "log_only")
+    register_tenant_for_test(
+        TenantSettings(id="t_dev", slug="dev", name="Dev"),
+        secrets={"webhook:stringee_signing_secret": "str-secret"},
+    )
+    with caplog.at_level(_logging.WARNING):
+        r = signed_client.get(_ANSWER_PATH, headers={"X-STRINGEE-SIGNATURE": "bogus"})
+    assert r.status_code == 200, r.text
+    assert any("would have rejected" in rec.getMessage() for rec in caplog.records)
+
+
+def test_stringee_answer_no_secret_configured_is_unaffected_in_enforce_mode(signed_client, monkeypatch):
+    monkeypatch.setenv("VOX_WEBHOOK_SIGNATURE_MODE", "enforce")
+    register_tenant_for_test(TenantSettings(id="t_dev", slug="dev", name="Dev"))
+    r = signed_client.get(_ANSWER_PATH)
+    assert r.status_code == 200, r.text
+
+
+def test_stringee_answer_no_secret_configured_is_unaffected_in_log_only_mode(signed_client, monkeypatch):
+    monkeypatch.setenv("VOX_WEBHOOK_SIGNATURE_MODE", "log_only")
+    register_tenant_for_test(TenantSettings(id="t_dev", slug="dev", name="Dev"))
+    r = signed_client.get(_ANSWER_PATH)
+    assert r.status_code == 200, r.text
+
+
 def test_event_accepts_file_url_field_name(client):
     """The broadened recording-url probe must recognise 'fileUrl' as a valid field name."""
     client.post(

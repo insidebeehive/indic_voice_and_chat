@@ -18,13 +18,26 @@ predictable approximation that doesn't pull in a tokenizer dependency).
 from __future__ import annotations
 
 import io
+import logging
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional, Protocol
 
+from src.utils.logging import debug_event
+
+log = logging.getLogger(__name__)
 
 _TOKEN_TO_CHAR = 4  # rough rule of thumb; we don't ship a tokenizer here
+
+# Cap on per-page "pdf_page_extract_failed" DEBUG events for a single
+# document. A pathological PDF can fail on every page; LokiPushHandler's
+# queue is bounded (src/utils/logging.py) and drops silently on overflow, so
+# an uncapped per-page event stream from one bad document can evict unrelated
+# DEBUG lines from an active debug session. The aggregate
+# "ingestion pdf_pages_blank" event below still carries the true total, so
+# nothing is lost diagnostically by capping the per-page ones.
+_MAX_PDF_PAGE_FAILURE_EVENTS = 20
 
 
 # --- Parsers --------------------------------------------------------------
@@ -53,12 +66,28 @@ class PDFParser:
             raise RuntimeError("pypdf is required for PDF parsing") from e
         reader = PdfReader(io.BytesIO(data))
         pages = []
-        for page in reader.pages:
+        page_failures_logged = 0
+        for i, page in enumerate(reader.pages):
             try:
                 pages.append(page.extract_text() or "")
-            except Exception:
+            except Exception as exc:
+                # Swallowed by design (one bad page must not fail the whole
+                # document) -- but silent otherwise, so a page that never
+                # yields text is indistinguishable from a page that was
+                # genuinely blank unless this is logged. Capped at
+                # _MAX_PDF_PAGE_FAILURE_EVENTS; the "ingestion pdf_pages_blank"
+                # aggregate below carries the full count regardless.
+                if page_failures_logged < _MAX_PDF_PAGE_FAILURE_EVENTS:
+                    debug_event(log, "ingestion pdf_page_extract_failed",
+                                document_filename=filename, page=i, error=str(exc))
+                    page_failures_logged += 1
                 pages.append("")
-        return "\n\n".join(p for p in pages if p.strip())
+        kept = [p for p in pages if p.strip()]
+        if len(kept) != len(pages) and log.isEnabledFor(logging.DEBUG):
+            debug_event(log, "ingestion pdf_pages_blank", document_filename=filename,
+                        total_pages=len(pages), kept_pages=len(kept),
+                        blank_pages=[i for i, p in enumerate(pages) if not p.strip()])
+        return "\n\n".join(kept)
 
 
 class DOCXParser:
@@ -70,7 +99,11 @@ class DOCXParser:
         except ImportError as e:
             raise RuntimeError("python-docx is required for DOCX parsing") from e
         doc = docx.Document(io.BytesIO(data))
-        return "\n\n".join(p.text for p in doc.paragraphs if p.text.strip())
+        paragraphs = doc.paragraphs
+        kept = [p.text for p in paragraphs if p.text.strip()]
+        debug_event(log, "ingestion docx_parsed", document_filename=filename,
+                    total_paragraphs=len(paragraphs), kept_paragraphs=len(kept))
+        return "\n\n".join(kept)
 
 
 _DEFAULT_PARSERS: list[IDocumentParser] = [MarkdownParser(), PDFParser(), DOCXParser()]
@@ -82,9 +115,16 @@ def parse_document(filename: str, data: bytes, parsers: Optional[list[IDocumentP
     ext = Path(filename).suffix.lower()
     for parser in parsers:
         if ext in parser.extensions:
-            return parser.parse(filename, data)
+            text = parser.parse(filename, data)
+            debug_event(log, "ingestion parse_document", document_filename=filename, ext=ext,
+                        parser=type(parser).__name__, input_bytes=len(data),
+                        output_chars=len(text))
+            return text
     # Fallback: best-effort utf-8 decode.
-    return data.decode("utf-8", errors="replace")
+    text = data.decode("utf-8", errors="replace")
+    debug_event(log, "ingestion parse_document", document_filename=filename, ext=ext,
+                parser="utf8_fallback", input_bytes=len(data), output_chars=len(text))
+    return text
 
 
 # --- Chunkers ------------------------------------------------------------
@@ -145,6 +185,10 @@ class FixedChunker:
                 ))
                 idx += 1
             i += step
+        if log.isEnabledFor(logging.DEBUG):
+            debug_event(log, "ingestion chunk fixed", input_chars=len(text), chunk_chars=size,
+                        overlap_chars=overlap, chunk_count=len(out),
+                        sizes=[len(c.text) for c in out])
         return out
 
 
@@ -206,6 +250,10 @@ class RecursiveChunker:
                 metadata=dict(meta),
             ))
             cursor = end
+        if log.isEnabledFor(logging.DEBUG):
+            debug_event(log, "ingestion chunk recursive", input_chars=len(text),
+                        target_chars=target, overlap_chars=overlap, chunk_count=len(out),
+                        sizes=[len(c.text) for c in out])
         return out
 
     def _recursive_split(self, text: str, target: int) -> list[str]:

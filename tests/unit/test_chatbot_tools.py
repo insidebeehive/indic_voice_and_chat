@@ -720,14 +720,28 @@ async def test_handle_image_sends_multimodal_to_llm(retriever) -> None:
 
 
 @pytest.mark.asyncio
-async def test_deposit_verification_tool_without_executor_returns_error(retriever) -> None:
+async def test_deposit_verification_tool_without_executor_returns_error(retriever, caplog) -> None:
+    """This silent `return` used to give the model an opaque error with
+    nothing in the logs distinguishing "not wired for this agent" from any
+    other failure shape. Mutation proof against
+    test_deposit_verification_executor_exception_is_swallowed just above: an
+    executor exception logs at ERROR ("deposit verification submission
+    failed"); this not-wired path must log its OWN, distinct DEBUG
+    `debug_event` instead, not that one."""
     agent = _agent(ScriptedLLM([]), retriever)
     tc = ToolCall(id="t1", name="submit_deposit_verification", arguments={"order_id": "ORD-1"})
-    result, chunks, escalation, call_offer = await agent._dispatch_tool(tc, timeout_s=10.0)
+    with caplog.at_level(logging.DEBUG, logger="src.agents.chatbot"):
+        result, chunks, escalation, call_offer = await agent._dispatch_tool(tc, timeout_s=10.0)
     assert result == {"error": "verification is not available"}
     assert chunks == []
     assert escalation is None
     assert call_offer is None
+    not_wired = [r for r in caplog.records
+                 if r.message == "chatbot tool_dispatch deposit_verification_no_executor"]
+    assert len(not_wired) == 1
+    assert not_wired[0].levelname == "DEBUG"
+    assert not_wired[0].tool_name == "submit_deposit_verification"
+    assert not any("submission failed" in r.message for r in caplog.records)
 
 
 @pytest.mark.asyncio
@@ -934,8 +948,12 @@ async def test_crm_executor_exception_fallback_forbids_pending_framing(retriever
 
 
 @pytest.mark.asyncio
-async def test_no_executor_fallback_forbids_pending_framing(retriever) -> None:
-    """Regression for the no-crm-executor-configured payload."""
+async def test_no_executor_fallback_forbids_pending_framing(retriever, caplog) -> None:
+    """Regression for the no-crm-executor-configured payload. Also proves (by
+    mutation against test_crm_executor_exception_fallback_forbids_pending_framing
+    above) that this config-gap path logs its own distinct DEBUG `debug_event`
+    naming the tool, rather than reusing the exception handler's ERROR-level
+    "crm tool failed" message -- the two are different failure classes."""
     crm_tools = [ToolSpec(name="get_player_wallet", description="wallet",
                           parameters={"type": "object", "properties": {}})]
     llm = ScriptedLLM([
@@ -945,7 +963,8 @@ async def test_no_executor_fallback_forbids_pending_framing(retriever) -> None:
                   finish_reason="stop"),
     ])
     agent = _agent(llm, retriever, crm_tools=crm_tools, crm_executor=None)
-    await agent.handle_message("what's my balance?")
+    with caplog.at_level(logging.DEBUG, logger="src.agents.chatbot"):
+        await agent.handle_message("what's my balance?")
     tool_msgs = [m for m in llm.calls[1][0] if m.role == "tool"]
     payload = json.loads(tool_msgs[0].content)
     assert "integration is not yet connected" not in payload.get("message", "").lower()
@@ -953,6 +972,11 @@ async def test_no_executor_fallback_forbids_pending_framing(retriever) -> None:
     directive_msgs = [m for m in llm.calls[1][0]
                        if m.role == "user" and "SYSTEM NOTE" in (m.content or "")]
     assert directive_msgs
+    not_wired = [r for r in caplog.records if r.message == "chatbot tool_dispatch crm_no_executor"]
+    assert len(not_wired) == 1
+    assert not_wired[0].levelname == "DEBUG"
+    assert not_wired[0].tool_name == "get_player_wallet"
+    assert not any("crm tool failed" in r.message for r in caplog.records)
 
 
 # --- Post-review fixes to the Step 5 guard's wiring (false-positive fixes) ---

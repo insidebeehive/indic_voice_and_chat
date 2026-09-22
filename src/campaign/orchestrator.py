@@ -47,6 +47,7 @@ from src.integration.event_bus import (
     emit_call_initiated,
     emit_lead_qualified,
 )
+from src.utils.logging import debug_event
 
 log = logging.getLogger(__name__)
 
@@ -136,6 +137,32 @@ class CampaignOrchestrator:
                 break
             i += 1
 
+            # A lead whose number was already in the DND store before it was
+            # ever dialled is invisible to `_lead_eligible` in a way that
+            # matters: that check skips it on every poll but never changes
+            # `lead.status`, so it would stay PENDING and sit in `remaining`
+            # forever, the campaign never reaching COMPLETED. Sweep it here,
+            # per iteration (not once at the top of `run`) so a number added
+            # to the DND store mid-run is caught too -- once a lead is
+            # transitioned it leaves `remaining`, so this shrinks the work
+            # rather than repeating it every tick.
+            for lead in self._sched.dnd_blocked(run.remaining):
+                previous_status = lead.status
+                lead.status = LeadStatus.DND
+                # Counted as completed, matching `_on_call_result` below, which
+                # adds any lead reaching COMPLETED/FAILED/DND. Without this,
+                # `stats["completed"]` would sit permanently below
+                # `total_leads` by the number of pre-blocked leads -- an
+                # operator reading "95 of 100" would see 5 still to go, which
+                # is the same wrong conclusion the stall itself produced.
+                run.completed_leads.add(lead.id)
+                debug_event(
+                    log, "campaign lead_dnd transition",
+                    lead_id=lead.id, campaign_id=run.campaign.id,
+                    phone_number=lead.phone_number,
+                    previous_status=previous_status.value,
+                )
+
             now = now_fn()
             decision = self._sched.poll(
                 leads=run.remaining,
@@ -149,6 +176,13 @@ class CampaignOrchestrator:
                 run.active.add(lead.id)
                 self._sched.mark_attempted(now)
                 run.campaign.calls_attempted += 1
+                if log.isEnabledFor(logging.DEBUG):
+                    debug_event(
+                        log, "campaign dispatch spawned",
+                        lead_id=lead.id, campaign_id=run.campaign.id,
+                        phone_number=lead.phone_number,
+                        calls_attempted=run.campaign.calls_attempted,
+                    )
                 tasks.append(asyncio.create_task(self._handle_call(run, lead)))
 
             # Exit only when there's nothing left to dispatch AND every
@@ -215,6 +249,14 @@ class CampaignOrchestrator:
             self._sched.schedule_retry(lead)
         else:
             lead.status = LeadStatus.COMPLETED
+
+        if log.isEnabledFor(logging.DEBUG):
+            debug_event(
+                log, "campaign lead_result decided",
+                lead_id=lead.id, campaign_id=run.campaign.id,
+                disposition=result.disposition.value, resulting_status=lead.status.value,
+                outcome=(result.outcome.value if result.outcome else None),
+            )
 
         run.active.discard(lead.id)
         if lead.status in (LeadStatus.COMPLETED, LeadStatus.FAILED, LeadStatus.DND):

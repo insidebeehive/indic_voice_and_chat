@@ -101,6 +101,8 @@ async def run_browser_voice(websocket: WebSocket, tenant: TenantContext) -> None
     Shared by the dev console (/dev/voice) and the chat→voice handoff
     (/chat/voice)."""
     if _browser_bridge_factory is None:
+        from src.utils.logging import debug_event
+        debug_event(log, "dev_console browser_bridge factory_unset", tenant_slug=tenant.slug)
         await websocket.close(code=1011, reason="browser bridge factory unset")
         return
     try:
@@ -374,8 +376,15 @@ async def dev_place_call(req: PlaceCallRequest) -> dict:
             from_number = (_yaml_tel.outbound_from or {}).get(provider)
             if not from_number and (_yaml_tel.provider or "").lower() == provider:
                 from_number = _yaml_tel.from_number
-        except Exception:
-            pass
+        except Exception as e:  # noqa: BLE001
+            from src.utils.logging import debug_event
+            debug_event(log, "dev_console place_call yaml_fallback_failed",
+                        tenant_slug=req.tenant, provider=provider, error=str(e))
+        else:
+            from src.utils.logging import debug_event
+            debug_event(log, "dev_console place_call yaml_fallback_resolved",
+                        tenant_slug=req.tenant, provider=provider,
+                        from_number=from_number, found=bool(from_number))
     if not from_number:
         raise HTTPException(
             status_code=400,
@@ -438,6 +447,17 @@ async def dev_place_call(req: PlaceCallRequest) -> dict:
         to_number=req.to_number.strip(),
         from_number=from_number,
         webhook_url=f"{webhook_base.rstrip('/')}/{answer_path}",
+    )
+    # Full request shape at DEBUG -- tenant/provider/numbers/mode/voice, plus
+    # credential PRESENCE only (never the account_sid/auth_token values
+    # themselves) so a failed adapter build or a silent-bot call can be
+    # diagnosed without a database query.
+    from src.utils.logging import debug_event
+    debug_event(
+        log, "dev_console place_call request", tenant_slug=tenant.slug, provider=provider,
+        to_number=cfg.to_number, from_number=cfg.from_number, webhook_url=cfg.webhook_url,
+        mode=req.mode, voice=req.voice.strip(), has_account_sid=bool(acct),
+        has_auth_token=bool(auth), has_user_id=bool(uid),
     )
     try:
         # Hard 20-second cap so Northflank's 30-second proxy timeout is never
@@ -605,8 +625,13 @@ async def _run_billed_session(tenant, bridge, *, mode: str) -> None:
     # can offer a Reanalyze button once the call ends.
     try:
         await bridge._send_json({"type": "session", "call_id": call_id})
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as e:  # noqa: BLE001
+        # Previously silent: the console never learns the call_id, so its
+        # Reanalyze button never appears -- indistinguishable from outside
+        # from the feature simply not existing for this call.
+        from src.utils.logging import debug_event
+        debug_event(log, "dev_console webconsole session_push_failed",
+                    call_id=call_id, tenant_slug=tenant.slug, error=str(e))
     try:
         await bridge.run()
     finally:
@@ -654,6 +679,9 @@ async def dev_voice_live_ws(websocket: WebSocket) -> None:
 
     await websocket.accept()
     if _live_bridge_factory is None:
+        from src.utils.logging import debug_event
+        debug_event(log, "dev_console live_bridge factory_unset",
+                    tenant_slug=websocket.query_params.get("tenant", "dev"))
         await websocket.close(code=1011, reason="live bridge factory unset")
         return
     try:
@@ -705,6 +733,13 @@ def _build_stream_provider(tenant: TenantContext):
     """
     cfg = getattr(tenant.settings.pipeline, "stt_streaming", None)
     if cfg is None or not getattr(cfg, "provider", None):
+        # Distinguish "not configured" (expected, most tenants) from the
+        # except branch below ("configured but failed to build") -- both used
+        # to collapse into the same silent None, indistinguishable from
+        # outside without reading this function.
+        from src.utils.logging import debug_event
+        debug_event(log, "dev_console stream_provider skipped",
+                    reason="not_configured", tenant_slug=getattr(tenant, "slug", None))
         return None
     try:
         merged = {
@@ -805,6 +840,14 @@ def make_browser_bridge_factory(
                 roster = set()
             if sel_voice in roster:
                 tts_voice = sel_voice
+            else:
+                # Silent fallback to the tenant default otherwise -- the console
+                # shows the requested voice as selected while the call actually
+                # speaks in tts_voice, with nothing at any level saying so.
+                from src.utils.logging import debug_event
+                debug_event(log, "dev_console browser_bridge voice_override_rejected",
+                            requested_voice=sel_voice, tts_language=tts_language,
+                            roster_size=len(roster), fallback_voice=tts_voice)
         pipeline_cfg = PipelineConfig(
             stt=STTConfig(language=tenant.settings.pipeline.stt.language or "hi-IN"),
             llm=LLMConfig(
@@ -852,6 +895,8 @@ def make_browser_bridge_factory(
         handoff_token = (query_params.get("handoff") or "").strip()
         handoff_ctx: dict | None = None
         if handoff_token and handoff_store is not None:
+            from src.auth.audit import token_fingerprint
+            from src.utils.logging import debug_event
             try:
                 import json as _json
                 raw = await handoff_store.redis.get(f"chat_handoff:{handoff_token}")
@@ -865,8 +910,22 @@ def make_browser_bridge_factory(
                         lead_data["chat_summary"] = handoff_ctx["chat_summary"]
                     if handoff_ctx.get("customer_id"):
                         lead_data["customer_id"] = handoff_ctx["customer_id"]
+                    debug_event(log, "dev_console chat_handoff resolved",
+                                token_fp=token_fingerprint(handoff_token),
+                                customer_name=name or None,
+                                customer_id=handoff_ctx.get("customer_id"),
+                                has_chat_summary=bool(handoff_ctx.get("chat_summary")),
+                                language=handoff_ctx.get("language"))
+                else:
+                    # The blob expired or the token was never valid -- from
+                    # outside this is indistinguishable from a normal call with
+                    # no handoff at all; the customer just never gets continuity.
+                    debug_event(log, "dev_console chat_handoff resolve_failed",
+                                reason="token_not_found",
+                                token_fp=token_fingerprint(handoff_token))
             except Exception:  # noqa: BLE001 — a bad handoff blob must not block the call
-                log.warning("chat handoff context load failed", extra={"token": handoff_token})
+                log.warning("chat handoff context load failed",
+                            extra={"token_fp": token_fingerprint(handoff_token)})
 
         # When a valid handoff is present, replace the campaign script with a
         # support-mode script. Campaign objective/opening/slots are irrelevant here.
@@ -985,8 +1044,13 @@ def make_live_bridge_factory(
         # Voice: ?voice= overrides the config default. Any catalog voice allowed.
         from src.providers.voice_catalog import list_voices as _lv
         _catalog_voices = {v["voice_id"] for v in _lv("gemini_live")}
-        voice = (qp.get("voice") or "").strip() or rt.voice
+        requested_voice = (qp.get("voice") or "").strip()
+        voice = requested_voice or rt.voice
         if voice and voice not in _catalog_voices:
+            if requested_voice:
+                from src.utils.logging import debug_event
+                debug_event(log, "dev_console live_bridge voice_override_rejected",
+                            requested_voice=requested_voice, fallback_voice=rt.voice)
             voice = rt.voice
 
         # Derive agent gender from selected voice; apply caller_name override.

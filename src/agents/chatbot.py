@@ -69,6 +69,7 @@ from src.rag.context_builder import (
     search_combined,
 )
 from src.rag.retriever import HybridRetriever, RetrievedChunk
+from src.utils.logging import debug_event
 from src.utils.trace_id import current_trace_id
 
 log = logging.getLogger(__name__)
@@ -706,6 +707,13 @@ def _fold_previous_conversation(user_msg: LLMMessage, summary: str) -> LLMMessag
     (well, once per turn, freshly folded, but never persisted).
     """
     body = _defang_platform_frames(summary)
+    # Fires at most once per turn, only for sessions carrying a previous_
+    # conversation summary — rare enough not to need a level guard. Full
+    # before/after: an operator investigating a forged-frame attempt (or a
+    # garbled CRM relay) needs to see exactly what was received and what the
+    # defang pipeline did to it, same reasoning as neutralize_sources_markers'
+    # own debug_event in context_builder.py.
+    debug_event(log, "chatbot previous_conversation folded", summary=summary, defanged=body)
     frame = (
         f"{PREVIOUS_CONVERSATION_LABEL}\n{SOURCES_OPEN_MARKER}\n{body}\n"
         f"{SOURCES_CLOSE_MARKER}\n{PREVIOUS_CONVERSATION_REANCHOR}"
@@ -715,6 +723,27 @@ def _fold_previous_conversation(user_msg: LLMMessage, summary: str) -> LLMMessag
         return _replace_cfg(user_msg, content=new_content)
     new_parts = [ContentPart(type="text", text=frame), *user_msg.content]
     return _replace_cfg(user_msg, content=new_parts)
+
+
+def _measure_reply(text: str | None) -> tuple[int, int]:
+    """Length of a customer-visible reply, as (chars, words). One definition
+    of "word" for the whole codebase -- callers must not invent their own
+    ``.split()`` elsewhere.
+
+    ``len()`` here counts Unicode CODEPOINTS, not grapheme clusters.
+    Devanagari/Bengali/Tamil (and other Indic scripts) encode matras and
+    conjunct joiners as separate combining codepoints, so this measure runs
+    roughly 20-35% above what a reader would count as rendered characters/
+    graphemes for those scripts -- it is not comparable 1:1 across scripts.
+    Correct grapheme counting (e.g. via a Unicode segmentation library) would
+    add a new dependency for a measurement-only feature, so codepoint
+    counting is a deliberate choice, not an oversight. A future switch to
+    grapheme counting must be deliberate and test-visible (see
+    tests/unit/test_chatbot_metrics.py's Devanagari case, which pins this
+    exact semantics), not a silent drive-by "fix".
+    """
+    t = text or ""
+    return len(t), len(t.split())
 
 
 @dataclass(frozen=True)
@@ -794,6 +823,16 @@ class ChatTurnMetrics:
     guard_no_grounding_fired: bool
     guard_unverified_data_fired: bool
     escalated: bool
+    # Length of the FINAL customer-visible response_text -- measured after
+    # every guard (including apply_pii_guard) has already run, so this is
+    # byte-for-byte what the customer received, guard-substituted canned
+    # fallback text included (see _measure_reply's docstring for the
+    # char-vs-word/codepoint rationale). No default: forces both
+    # construction sites (_single_shot and _handle_with_tools) to supply a
+    # real measurement rather than silently defaulting to 0, which would be
+    # indistinguishable from "measured, reply genuinely empty".
+    reply_chars: int
+    reply_words: int
     tools: tuple[ChatToolMetric, ...] = ()
 
 
@@ -1008,6 +1047,8 @@ class ChatBotAgent(BaseAgent):
                     "guard_no_grounding_fired": metrics.guard_no_grounding_fired,
                     "guard_unverified_data_fired": metrics.guard_unverified_data_fired,
                     "escalated": metrics.escalated,
+                    "reply_chars": metrics.reply_chars,
+                    "reply_words": metrics.reply_words,
                 },
                 "tools": [
                     {
@@ -1127,6 +1168,11 @@ class ChatBotAgent(BaseAgent):
         # in the narrow case where ChatTurnMetrics construction itself fails.
         llm_total_ms_val = round(sum(llm_ms_list))
         escalated_flag = response.action == "escalate"
+        # Measured here, outside the try/except below, same reasoning as
+        # escalated_flag/llm_total_ms_val above: this is the FINAL
+        # response_text -- apply_pii_guard (the last guard, above) has
+        # already run -- so it is exactly what the customer received.
+        reply_chars_val, reply_words_val = _measure_reply(response.response_text)
         metrics: ChatTurnMetrics | None = None
         try:
             # Never let a metrics-assembly bug break a live turn — see
@@ -1186,6 +1232,8 @@ class ChatBotAgent(BaseAgent):
                 guard_no_grounding_fired=False,
                 guard_unverified_data_fired=False,
                 escalated=escalated_flag,
+                reply_chars=reply_chars_val,
+                reply_words=reply_words_val,
             )
         except Exception:  # noqa: BLE001 - metrics assembly must never break a reply
             log.warning("chat turn metrics assembly failed; continuing without metrics",
@@ -1299,11 +1347,22 @@ class ChatBotAgent(BaseAgent):
             in_tok += _round_in
             out_tok += _round_out
             cached_tok += _round_cached
-            log.debug(
-                "chatbot llm turn: finish=%s usage=%s text_len=%d tool_calls=%d",
-                result.finish_reason, result.usage, len(result.text or ""), len(result.tool_calls),
-                extra={"ticket_id": self._ticket_id, "session_id": self._session_id},
-            )
+            # Why THIS round continued or stopped -- a turn that hits the
+            # round cap (see the `else` of this `for`, below) or one that
+            # stops because the model returned no tool calls look identical
+            # from outside; this is the one place both are told apart, per
+            # round. Supersedes the file's original ad-hoc log.debug here
+            # (same fields, plus tool_call_names/round/continuing, via the
+            # shared helper instead of a hand-rolled extra=).
+            if log.isEnabledFor(logging.DEBUG):
+                debug_event(
+                    log, "chatbot tool_round decision", round=rounds,
+                    finish_reason=result.finish_reason, usage=result.usage,
+                    text_len=len(result.text or ""),
+                    tool_call_names=[t.name for t in result.tool_calls],
+                    tool_call_count=len(result.tool_calls),
+                    continuing=bool(result.tool_calls),
+                )
             if not result.tool_calls:
                 text = result.text
                 break
@@ -1313,6 +1372,18 @@ class ChatBotAgent(BaseAgent):
             for i, tc in enumerate(result.tool_calls):
                 tool_start = time.perf_counter()
                 slice_s = 0.0
+                # Which tool the model asked for, with the ARGUMENTS it
+                # passed, before dispatch -- tool_executor.py's own "crm tool
+                # call" INFO log (src/chatbot/tool_executor.py) carries only
+                # param_keys, never values, so this is the only place the
+                # actual argument values reach a log at all. Qualified keys
+                # (tool_name/tool_args, not name/args) -- both collide with
+                # LogRecord attributes.
+                if log.isEnabledFor(logging.DEBUG):
+                    debug_event(
+                        log, "chatbot tool_call selected", tool_name=tc.name,
+                        tool_call_id=tc.id, tool_args=tc.arguments, round=rounds,
+                    )
                 if tc.name == SEARCH_KB:
                     # KB search has its own independent budget (see
                     # _KB_SEARCH_TIMEOUT_S) — it must never draw from, or be
@@ -1461,6 +1532,18 @@ class ChatBotAgent(BaseAgent):
         else:
             # Ran out of rounds still wanting tools — force a final plain answer.
             rounds_exhausted = True
+            # Why the loop stopped short: the model still wanted another
+            # round (result is the last round's LLMResult, still in scope
+            # from the loop above) when the cap hit. Without this, a turn
+            # that hit the round cap is indistinguishable from one that
+            # finished cleanly, except via the "chat turn done" INFO's
+            # rounds_exhausted flag -- which says THAT it happened, not what
+            # the model was still trying to do.
+            if log.isEnabledFor(logging.DEBUG):
+                debug_event(
+                    log, "chatbot tool_round exhausted", max_rounds=self._max_tool_rounds,
+                    last_round_tool_calls=[t.name for t in result.tool_calls],
+                )
             llm_start = time.perf_counter()
             result = await self._llm.generate(
                 messages, LLMConfig(temperature=cfg.temperature, max_tokens=cfg.max_tokens,
@@ -1487,7 +1570,19 @@ class ChatBotAgent(BaseAgent):
                 extra={"ticket_id": self._ticket_id, "session_id": self._session_id},
             )
 
-        rag = build_rag_context(retrieved_all, max_chars=self._max_context_chars)
+        # purpose="citation_scope_only": on this path (tools enabled -- the
+        # production chat path, see bootstrap.py) rag.text is NEVER composed
+        # into the prompt -- KB content instead reaches the model as a
+        # role="tool" message (see _dispatch_tool's own comment below). This
+        # call exists only to get source_tags/chunk_count for
+        # apply_hallucination_guard's citation check; say so on the DEBUG
+        # events build_rag_context logs, so an operator investigating a
+        # hallucination via those events doesn't conclude a chunk named in a
+        # "dropped for budget" event never reached the model -- it did, via
+        # the (untruncated) tool JSON, just not via this text.
+        rag = build_rag_context(
+            retrieved_all, max_chars=self._max_context_chars, purpose="citation_scope_only",
+        )
         # Dedupe tool-retrieved sources, preserving order.
         sources = list(dict.fromkeys(_chunk_source(c) for c in retrieved_all))
         # The model usually emits the structured JSON envelope (per the system
@@ -1533,6 +1628,22 @@ class ChatBotAgent(BaseAgent):
                 # this parses to the same canned fallback as before — no worse
                 # off than not retrying at all.
                 parsed = parse_chatbot_response(retried.text)
+        # The model is asked for a structured JSON envelope; when parsing
+        # falls back, log what was recovered. Deliberately NOT the raw model
+        # text -- src/providers/llm/gemini.py already logs the full response
+        # text on every generate() call, so repeating it here would be a
+        # restatement of the provider boundary, not a new decision. This
+        # fires for every plain-text (non-JSON) reply, not only the
+        # genuinely "unusable" case _retry_if_unusable's own WARNING covers
+        # (that one only fires when the parser had to use a canned fallback
+        # line) -- a legitimate plain-text answer falls back silently here
+        # today, with no log at any level.
+        if parsed.parse_error:
+            debug_event(
+                log, "chatbot response_envelope parse_fallback",
+                parse_error=parsed.parse_error, had_raw_envelope=bool(parsed.raw),
+                recovered_response_text=parsed.response_text, retry_fired=retry_fired,
+            )
         if parsed.raw and not parsed.parse_error:
             response = parsed   # a real JSON envelope with a response_text
         else:
@@ -1636,6 +1747,11 @@ class ChatBotAgent(BaseAgent):
         kb_searches_count = len(kb_metrics)
         llm_total_ms_val = round(sum(llm_ms_list))
         escalated_flag = response.action == "escalate"
+        # Measured here, outside the try/except below, same reasoning as
+        # escalated_flag/llm_total_ms_val above: this is the FINAL
+        # response_text -- apply_pii_guard (the last guard, above) has
+        # already run -- so it is exactly what the customer received.
+        reply_chars_val, reply_words_val = _measure_reply(response.response_text)
         metrics: ChatTurnMetrics | None = None
         try:
             # Never let a metrics-assembly bug break a live turn — see
@@ -1676,6 +1792,8 @@ class ChatBotAgent(BaseAgent):
                 guard_no_grounding_fired=guard_no_grounding_fired,
                 guard_unverified_data_fired=guard_unverified_data_fired,
                 escalated=escalated_flag,
+                reply_chars=reply_chars_val,
+                reply_words=reply_words_val,
                 tools=tuple(tool_metrics),
             )
         except Exception:  # noqa: BLE001 - metrics assembly must never break a reply
@@ -1806,6 +1924,21 @@ class ChatBotAgent(BaseAgent):
             # restructured beyond that — same "results" list shape, same
             # content/source/score keys, just each content wrapped and a
             # top-level warning note added once.
+            #
+            # The wrapping decision itself (how many chunks, which tags) is
+            # the thing built here -- the marker-neutralisation ALREADY logs
+            # itself (WARNING + debug_event) when it actually fires, inside
+            # neutralize_sources_markers, and search_combined already logged
+            # the retrieval decision that produced `chunks`. This just ties
+            # the two together with "this is what this dispatch actually
+            # assembled into the role=tool message" -- not the payload text
+            # itself (json.dumps(out) a few lines up the call stack goes to
+            # the model, and gemini.py logs that `contents` in full).
+            if log.isEnabledFor(logging.DEBUG):
+                debug_event(
+                    log, "chatbot tool_result kb_assembled", chunk_count=len(chunks),
+                    sources=[_chunk_source(c) for c in chunks],
+                )
             return (
                 {
                     "note": SOURCES_DATA_WARNING,
@@ -1826,12 +1959,27 @@ class ChatBotAgent(BaseAgent):
             )
         if tc.name == ESCALATE:
             esc = {"reason": args.get("reason", ""), "summary": args.get("summary", "")}
+            # State transition -- the conversation is handing off to a human.
+            # The aggregate "chat turn done" INFO records action="escalate",
+            # but never the reason/summary VALUES the model gave; today those
+            # are visible only if they happen to survive into response_text.
+            debug_event(log, "chatbot escalate requested", reason=esc["reason"], summary=esc["summary"])
             return {"status": "escalated", **esc}, [], esc, None
         if tc.name == OFFER_CALL:
             off = {"reason": args.get("reason", "")}
+            debug_event(log, "chatbot offer_call requested", reason=off["reason"])
             return {"status": "offered", **off}, [], None, off
         if tc.name == SUBMIT_DEPOSIT_VERIFICATION:
             if self._deposit_verification_executor is None:
+                # Should be unreachable in practice -- src/bootstrap.py only
+                # registers this tool spec when it also builds an executor
+                # for it (see make_chatbot_factory) -- but the model was
+                # still handed this tool and got a plain "not available" with
+                # nothing here recording why, if the two ever drift apart.
+                debug_event(
+                    log, "chatbot tool_dispatch deposit_verification_no_executor",
+                    tool_name=tc.name, tool_args=args,
+                )
                 return {"error": "verification is not available"}, [], None, None
             try:
                 out = await self._deposit_verification_executor(tc, timeout_s=max(0.5, timeout_s - 1.0))
@@ -1875,6 +2023,13 @@ class ChatBotAgent(BaseAgent):
                         "satisfies the response-quality bar for this turn."
                     ),
                 }, [], None, None
+        # No crm_executor was ever wired for this agent (self._crm_executor is
+        # None), yet the model was handed a CRM tool spec to call -- a real
+        # config/registration gap, not a per-call transient failure like the
+        # except block just above.
+        debug_event(
+            log, "chatbot tool_dispatch crm_no_executor", tool_name=tc.name, tool_args=args,
+        )
         return {
             "status": "error",
             "error": "no CRM integration is connected for this tool",
@@ -2027,6 +2182,19 @@ class ChatBotAgent(BaseAgent):
             ]
         else:
             extra = None  # no signal mid-conversation — follow the conversation
+        # This branch has a documented history of 3 prior production bugs (see
+        # the comment above _detect_script/_latin_language_hint) and carried
+        # zero telemetry before this event -- an operator diagnosing a 4th
+        # recurrence had nothing but the final reply text to work from. Runs
+        # on every turn (both _single_shot and _handle_with_tools call
+        # _compose), so guarded even though the values themselves are cheap.
+        if log.isEnabledFor(logging.DEBUG):
+            debug_event(
+                log, "chatbot language directive_selected", query_text=query_text,
+                detected_script=lang,
+                has_prior_user_turn=any(m.role == "user" for m in self.session.turns),
+                directive=extra[0] if extra else None,
+            )
         # cache_split_prompt (see ChatBotAgent.__init__ and GeminiLLMAdapter's
         # explicit-cache registry in src/providers/llm/gemini.py): when on,
         # the system prompt is built WITHOUT its per-turn variable tail

@@ -13,8 +13,13 @@ from __future__ import annotations
 
 import audioop
 import io
+import logging
 import wave
 from typing import Optional
+
+from src.utils.logging import debug_event
+
+log = logging.getLogger(__name__)
 
 
 # --- μ-law <-> 16-bit PCM (Twilio uses μ-law @ 8 kHz) --------------------
@@ -74,11 +79,28 @@ def wav_to_pcm16(wav_bytes: bytes) -> tuple[bytes, int]:
         sample_rate = wf.getframerate()
         sample_width = wf.getsampwidth()
         if sample_width != 2:
+            # Genuine edge case, not ordinary control flow: whatever produced
+            # this WAV (a telephony recording fetch, an STT upload) sent a
+            # format this pipeline can't decode. The caller's own except
+            # block (e.g. telephony_hooks.py) logs the exception but not the
+            # format that triggered it -- lengths/rates only, no audio bytes.
+            debug_event(
+                log, "wav wav_decode rejected",
+                reason="unsupported_bit_depth",
+                sample_width_bits=sample_width * 8, nchannels=nchannels,
+                sample_rate=sample_rate,
+            )
             raise ValueError(f"Only 16-bit PCM supported, got {sample_width * 8}-bit")
         frames = wf.readframes(wf.getnframes())
     if nchannels == 2:
         frames = audioop.tomono(frames, 2, 0.5, 0.5)
     elif nchannels != 1:
+        debug_event(
+            log, "wav wav_decode rejected",
+            reason="unsupported_channel_count",
+            sample_width_bits=sample_width * 8, nchannels=nchannels,
+            sample_rate=sample_rate,
+        )
         raise ValueError(f"Unsupported channel count: {nchannels}")
     return frames, sample_rate
 
@@ -95,11 +117,27 @@ def wav_split_stereo(wav_bytes: bytes) -> tuple[bytes, bytes, int]:
         sample_rate = wf.getframerate()
         sample_width = wf.getsampwidth()
         if sample_width != 2:
+            debug_event(
+                log, "wav wav_decode rejected",
+                reason="unsupported_bit_depth",
+                sample_width_bits=sample_width * 8, nchannels=nchannels,
+                sample_rate=sample_rate,
+            )
             raise ValueError(f"Only 16-bit PCM supported, got {sample_width * 8}-bit")
         frames = wf.readframes(wf.getnframes())
     if nchannels == 1:
         return frames, frames, sample_rate
     if nchannels != 2:
+        # A dual-channel-recording caller (telephony_hooks.py) expects
+        # exactly 1 or 2 tracks; anything else means the vendor sent a
+        # format this pipeline never anticipated. The caller's except block
+        # logs the exception without this -- lengths/rates only.
+        debug_event(
+            log, "wav wav_decode rejected",
+            reason="unsupported_channel_count",
+            sample_width_bits=sample_width * 8, nchannels=nchannels,
+            sample_rate=sample_rate,
+        )
         raise ValueError(f"Unsupported channel count: {nchannels}")
     left = audioop.tomono(frames, 2, 1.0, 0.0)
     right = audioop.tomono(frames, 2, 0.0, 1.0)

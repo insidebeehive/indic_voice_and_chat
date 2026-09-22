@@ -29,6 +29,7 @@ from src.interfaces.llm import (
     LLMResult,
     ToolCall,
 )
+from src.utils.logging import debug_event
 
 log = logging.getLogger(__name__)
 
@@ -139,8 +140,17 @@ class OpenAICompatLLMAdapter(ILLMProvider):
         return kwargs
 
     async def generate(self, messages: list[LLMMessage], config: LLMConfig) -> LLMResult:
-        resp = await self._client.chat.completions.create(
-            **self._request_kwargs(messages, config))
+        kwargs = self._request_kwargs(messages, config)
+        debug_event(log, "vllm generate request", base_url=str(getattr(self._client, "base_url", "")),
+                    **kwargs)
+        try:
+            resp = await self._client.chat.completions.create(**kwargs)
+        except Exception as exc:  # noqa: BLE001 - re-raised unchanged; no retry in this adapter
+            # A self-hosted pod failing (cold start, OOM, network) has no other
+            # log here — the exception would otherwise reach the caller with no
+            # record of which model/base_url it was talking to.
+            debug_event(log, "vllm generate failed", model=kwargs.get("model"), error=str(exc))
+            raise
         choice = resp.choices[0]
         tool_calls: list[ToolCall] = []
         for tc in choice.message.tool_calls or []:
@@ -160,9 +170,14 @@ class OpenAICompatLLMAdapter(ILLMProvider):
             usage = {"prompt_tokens": resp.usage.prompt_tokens,
                      "completion_tokens": resp.usage.completion_tokens,
                      "cached_tokens": _cached_prompt_tokens(resp.usage)}
+        text = choice.message.content or ""
+        finish_reason = _FINISH_REASONS.get(choice.finish_reason or "stop", "stop")
+        debug_event(log, "vllm generate response", model=kwargs.get("model"), text=text,
+                    finish_reason=finish_reason, usage=usage, tool_calls=tool_calls,
+                    raw_response=resp.model_dump() if hasattr(resp, "model_dump") else {})
         return LLMResult(
-            text=choice.message.content or "",
-            finish_reason=_FINISH_REASONS.get(choice.finish_reason or "stop", "stop"),
+            text=text,
+            finish_reason=finish_reason,
             usage=usage,
             tool_calls=tool_calls,
         )
@@ -170,11 +185,25 @@ class OpenAICompatLLMAdapter(ILLMProvider):
     async def generate_stream(
         self, messages: list[LLMMessage], config: LLMConfig,
     ) -> AsyncIterator[str]:
-        stream = await self._client.chat.completions.create(
-            **self._request_kwargs(messages, config), stream=True)
-        async for chunk in stream:
-            if not chunk.choices:
-                continue
-            delta = chunk.choices[0].delta
-            if delta and delta.content:
-                yield delta.content
+        kwargs = self._request_kwargs(messages, config)
+        debug_event(log, "vllm generate_stream request",
+                    base_url=str(getattr(self._client, "base_url", "")), **kwargs)
+        collecting = log.isEnabledFor(logging.DEBUG)  # see gemini.py's generate_stream for why
+        chunks: list[str] = []
+        try:
+            stream = await self._client.chat.completions.create(**kwargs, stream=True)
+            async for chunk in stream:
+                if not chunk.choices:
+                    continue
+                delta = chunk.choices[0].delta
+                if delta and delta.content:
+                    if collecting:
+                        chunks.append(delta.content)
+                    yield delta.content
+        except Exception as exc:  # noqa: BLE001 - re-raised unchanged
+            debug_event(log, "vllm generate_stream failed", model=kwargs.get("model"),
+                        error=str(exc))
+            raise
+        if collecting:
+            debug_event(log, "vllm generate_stream response", model=kwargs.get("model"),
+                        text="".join(chunks), chunks=len(chunks))

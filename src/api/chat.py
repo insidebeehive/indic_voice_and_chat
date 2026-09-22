@@ -24,6 +24,7 @@ import base64
 import io
 import json
 import logging
+import os
 import time
 import uuid
 import wave
@@ -57,6 +58,7 @@ from src.agents.chatbot import (
     truncate_previous_conversation,
 )
 from src.api.chat_cost import compute_chat_turn_cost
+from src.config_tenant import resolve_chat_tts_config
 from src.interfaces.media_storage import IMediaStorage
 from src.api.deps import get_db_session
 from src.auth import TenantContext, current_tenant
@@ -71,6 +73,8 @@ from src.pipeline.text_normalize import normalize_for_tts
 import src.utils.http_fetch as http_fetch
 from src.utils.http_fetch import MAX_FETCH_BYTES as _MAX_MEDIA_FETCH_BYTES
 from src.utils.http_fetch import fetch_capped as _fetch_capped
+from src.utils.chat_context import set_chat_context
+from src.utils.logging import debug_event
 from src.utils.trace_id import new_trace_id, trace_id_scope
 
 log = logging.getLogger(__name__)
@@ -205,7 +209,40 @@ def _media_key(tenant_id: str, session_id: str, mime: str) -> str:
 # on. At 300 chars: 300/12*32_000+44 = 800_044 bytes (~781 KiB, ~76% of the
 # 1_048_576-byte limit) — comfortably under. Re-derive this if the cap, the
 # requested sample rate, or the cps estimate ever changes.
-_TTS_MAX_REPLY_CHARS = 300
+_TTS_MAX_REPLY_CHARS_DEFAULT = 300
+
+
+def _tts_max_reply_chars() -> int:
+    """Cap on a reply's length before it is synthesized, overridable with
+    ``VOX_TTS_MAX_REPLY_CHARS``.
+
+    Overridable because the cap is silent: a reply over it produces no audio,
+    no error and (before debug_event below) no log, which is
+    indistinguishable from chat voice being broken. Raising it on stage is how
+    you confirm the rest of the path works end to end without editing code.
+
+    Read live rather than bound at import, so a change takes effect without a
+    restart — same convention as ``explicit_cache_enabled``
+    (src/providers/llm/gemini.py) and for the same reason: an operator
+    changing it mid-investigation should not have to bounce the process.
+
+    Raising it past ~390 breaks the 1 MB media contract. At 16 kHz mono PCM16
+    (32,000 bytes/sec) and the slow end of 12 chars/sec, 1_048_576 bytes is
+    1_048_576 * 12 / 32_000 = 393 characters of source text. Above that the
+    WAV exceeds what docs/crm-chat-media-contract.md documents, and a rejection
+    at the widget will look like a synthesis failure rather than an oversized
+    clip. An invalid or non-positive value falls back to the default rather
+    than disabling the cap, so a typo cannot silently start emitting
+    multi-megabyte audio.
+    """
+    raw = os.environ.get("VOX_TTS_MAX_REPLY_CHARS", "").strip()
+    if not raw:
+        return _TTS_MAX_REPLY_CHARS_DEFAULT
+    try:
+        value = int(raw)
+    except ValueError:
+        return _TTS_MAX_REPLY_CHARS_DEFAULT
+    return value if value > 0 else _TTS_MAX_REPLY_CHARS_DEFAULT
 
 # Ceiling on the TTS synthesis call itself. This is deliberately its own
 # timeout, NOT covered by `_TURN_TIMEOUT_S` above: synthesis runs AFTER
@@ -255,27 +292,66 @@ async def _synthesize_reply_audio(
     shipped. Verify with a real call against each tenant's configured TTS
     provider before relying on this for Hindi-configured tenants.
     """
-    if not text or len(text) > _TTS_MAX_REPLY_CHARS:
+    if not text:
+        # Rare/edge: the turn produced no text at all, so there is nothing to
+        # speak. DEBUG only -- see the module-wide "uniform DEBUG" policy
+        # this file's skip-instrumentation follows (no level promotion).
+        log.debug("tts reply skipped: empty reply text", extra={"tenant_id": tenant.id})
+        return None
+    max_chars = _tts_max_reply_chars()
+    if len(text) > max_chars:
+        # This is the exact condition that produced a tenant-reported "voice
+        # replies aren't working" ticket with zero trace anywhere -- config
+        # was correct, the key was present, and this early return still gave
+        # no signal (see this function's own docstring history). The
+        # discriminating values (actual length vs. the cap) are what make
+        # this diagnosable without a DB query + code read next time.
+        log.debug("tts reply skipped: reply exceeds max length for synthesis",
+                  extra={"tenant_id": tenant.id, "reply_chars": len(text),
+                         "max_chars": max_chars})
         return None
     if _tts_providers is None:
+        # Process-level, not tenant-specific: no TenantProviders registry was
+        # ever wired via set_tts_providers (most unit tests; a deployment
+        # that never turns chat voice replies on anywhere).
+        log.debug("tts reply skipped: no TTS provider registry wired for this process",
+                  extra={"tenant_id": tenant.id})
         return None
     try:
         # None = this tenant hasn't opted into chat voice replies, or has no
-        # resolvable chat TTS config. Not a failure: no provider was built, no
-        # cost incurred, and no warning is logged (it would fire on every voice
-        # note from every non-opted-in tenant). The text reply still goes out.
+        # resolvable chat TTS config. Not a failure: no provider was built and
+        # no cost incurred. get_chat_tts itself logs the specific reason at
+        # DEBUG (see src/auth/registry.py) -- no need to duplicate that here.
         tts = _tts_providers.get_chat_tts(tenant)
         if tts is None:
             return None
-        return await asyncio.wait_for(
+        result = await asyncio.wait_for(
             _synthesize_reply_audio_uncapped(tenant, text, language, tts),
             timeout=_TTS_SYNTH_TIMEOUT_S,
         )
+        # Success is logged too, not only the skips. Without this the ONLY
+        # signal that audio was produced is the absence of a skip line, so
+        # "we never synthesized" and "we synthesized, attached the url, and
+        # the widget did not play it" are indistinguishable from here -- and
+        # the second is live, since playing audio_url is a CRM-side change.
+        # A successful call nobody can see is as hard to debug as a failed one.
+        debug_event(log, "tts_reply_synthesized",
+                    tenant_id=tenant.id, language=language,
+                    reply_chars=len(text), max_chars=max_chars,
+                    audio_bytes=len(result[0]) if result else 0,
+                    audio_mime=result[1] if result else None)
+        return result
     except asyncio.CancelledError:
         raise
     except Exception:  # noqa: BLE001 — audio is a nicety, the text reply is not
+        # Provider name is read purely for this log line's diagnostic value
+        # (a config lookup, not a client build) -- it does not change what
+        # gets returned. "configured but the provider raised" is exactly the
+        # case an operator greps for during an incident.
+        _provider = getattr(resolve_chat_tts_config(tenant.settings.pipeline), "provider", None)
         log.warning("tts reply synthesis failed; sending text-only reply",
-                    extra={"tenant_id": tenant.id, "language": language}, exc_info=True)
+                    extra={"tenant_id": tenant.id, "language": language,
+                           "tts_provider": _provider}, exc_info=True)
         return None
 
 
@@ -749,10 +825,16 @@ async def _record_ws_turn_failure_metric(
     ``_classify_turn_error``'s fixed 4-value set — NEVER the raw exception
     string, which can embed player data via a CRM error message; see the PII
     section of ``src/models/chat_turn_metrics.py``). Every other numeric/
-    boolean column is left at its 0/False default via
-    ``record_chat_turn_metric``'s own ``metrics.get(..., 0/False)``
-    convention — there is nothing honest to fill in for a turn/tool-calls
-    that never finished.
+    boolean column except ``reply_chars``/``reply_words`` is left at its
+    0/False default via ``record_chat_turn_metric``'s own
+    ``metrics.get(..., 0/False)`` convention — there is nothing honest to
+    fill in for a turn/tool-calls that never finished. ``reply_chars``/
+    ``reply_words`` are the deliberate exception: this call site sends only
+    ``total_ms``/``action``, so those two columns come out NULL, not 0 — see
+    the no-default ``.get()`` departure comment on
+    ``record_chat_turn_metric``'s ``reply_chars=metrics.get("reply_chars")``
+    block in ``src/models/chat_turn_metrics.py`` for why a turn that never
+    produced a reply must not be recorded as a 0-length one.
 
     Best-effort like every metrics write in this codebase: never raises. This
     runs BEFORE the error-frame reply (see the call site's own comment on
@@ -960,6 +1042,11 @@ async def _capture_previous_conversation(agent: ChatBotAgent, session_id: str, m
         async with _sm()() as db:
             db_row = await db.get(ChatSession, session_id)
             if db_row is None:
+                # agent._previous_conversation is already set above (this
+                # connection benefits immediately), but the DB write that
+                # would let a RECONNECT pick it back up is silently skipped.
+                log.debug("previous_conversation not persisted: chat session row missing",
+                          extra={"session_id": session_id})
                 return
             extra = dict(db_row.extra_data or {})
             # The stored value is the latch, not the caller's first-frame flag.
@@ -1571,7 +1658,12 @@ async def chat_voice_ws(websocket: WebSocket) -> None:
             if raw:
                 chat_session_id = json.loads(raw).get("chat_session_id")
         except Exception:  # noqa: BLE001
-            pass
+            # This voice WS never gets registered in _active_voice_ws, so a
+            # later _end_session for the originating chat session won't close
+            # it -- the call just keeps running past the chat's own end.
+            log.debug("chat voice handoff token resolution failed; call won't be "
+                      "linked to its originating chat session",
+                      extra={"tenant": tenant.slug if tenant else None}, exc_info=True)
     if chat_session_id:
         _active_voice_ws[chat_session_id] = websocket
     try:
@@ -1646,7 +1738,11 @@ async def get_media(
         if cfg is not None:
             ttl = cfg.signed_url_ttl_seconds
     except Exception:  # noqa: BLE001
-        pass
+        # Falls back to the 3600s default above -- harmless, but worth a
+        # trace if a signed URL's lifetime is ever shorter/longer than an
+        # operator configured and expected.
+        log.debug("media_storage.signed_url_ttl_seconds lookup failed; "
+                  "using the default ttl", extra={"default_ttl": ttl}, exc_info=True)
 
     url = await _media_store.signed_url(msg.media_url, ttl_seconds=ttl)
     return RedirectResponse(url=url, status_code=302)
@@ -1869,6 +1965,12 @@ async def agent_websocket(websocket: WebSocket, session_id: str) -> None:
                             ))
                             r2.message_count = (r2.message_count or 0) + 1
                             await db.commit()
+                        else:
+                            # Still delivered to the customer below even though
+                            # it was never written to chat_messages -- the
+                            # transcript would show a gap where this reply was.
+                            log.debug("agent reply not persisted: chat session row missing",
+                                      extra={"ticket_id": ticket_id, "session_id": session_id})
                     await cq.put(json.dumps({"type": "message", "text": text, "from": "human_agent"}))
                 elif mtype == "end":
                     await cq.put(json.dumps({"type": "ended"}))
@@ -1916,6 +2018,19 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
     # below) — a session's crm_ticket_id doesn't change mid-conversation, and
     # this is used purely for log correlation with the external CRM ticket.
     ticket_id = _ticket_id_from_row(row)
+    # Publish both ids for the rest of this connection so EVERY record emitted
+    # while handling it carries them -- including from layers holding no
+    # session object at all (_synthesize_reply_audio takes a tenant and some
+    # text; every src/providers/ adapter gets a config dict). Threading them
+    # through extra={} only reaches call sites that happen to have them, which
+    # is how the voice-reply skip came to log a tenant_id and nothing tying it
+    # to a conversation. See src/utils/chat_context.py.
+    #
+    # Set, not scoped: ContextVars are per-asyncio-Task and this handler owns
+    # the task for the connection's lifetime, so the values die with it. A
+    # `with` block here would mean re-indenting several hundred lines, and the
+    # reset it buys is one the task boundary already provides.
+    set_chat_context(session_id, ticket_id)
     tenant = await tenant_from_id(row.tenant_id)
     if tenant is None:
         await websocket.close(code=1011, reason="tenant unavailable")
@@ -2154,6 +2269,20 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
             # close together in time is the grep signature of the
             # double-reply bug this whole mechanism exists to catch.
             turn_trace_id = new_trace_id()
+            # What the customer actually sent. Nothing recorded the inbound
+            # frame type, so "no voice reply came back" could not be told
+            # apart from "the customer sent text" without asking them --
+            # every downstream line describes the TURN, and by then the
+            # modality that decided whether audio was even attempted is gone.
+            # Sizes rather than payloads: `data` is base64 audio and can be
+            # megabytes, and a log line is not the place for it.
+            debug_event(log, "chat_frame_received",
+                        session_id=session_id, message_type=mtype,
+                        has_data=bool(msg.get("data")),
+                        has_media_url=bool(msg.get("media_url")),
+                        mime=msg.get("mime"),
+                        text_chars=len(msg.get("text") or msg.get("message") or ""),
+                        trace_id=turn_trace_id)
             fingerprint = _turn_fingerprint(msg)
             guard_token = _try_begin_turn(session_id, fingerprint)
             if guard_token is None:
@@ -2600,6 +2729,15 @@ async def _send_reply(
     if audio_url:
         frame["audio_url"] = audio_url
         frame["audio_mime"] = audio_mime
+    # What actually went out on the wire, audio or not. This is the line that
+    # separates "we sent no audio" from "we sent audio and the customer did
+    # not hear it" -- the split the reply-frame layer is the only place that
+    # can answer, since synthesis succeeding does not prove the url shipped.
+    debug_event(log, "chat_reply_frame_sent",
+                session_id=session_id, has_audio=bool(audio_url),
+                audio_url=audio_url, audio_mime=audio_mime,
+                action=result.response.action,
+                text_chars=len(result.response.response_text or ""))
     await websocket.send_text(json.dumps(frame))
     if result.escalation:
         await websocket.send_text(json.dumps({
@@ -2725,6 +2863,12 @@ async def _persist_inbound_media_message(
     try:
         row = await db.get(ChatSession, session_id)
         if row is None:
+            # The customer's inbound media is silently dropped here -- no
+            # ChatMessage row, no message_count bump -- with nothing else in
+            # this function's control flow to signal it (the caller only sees
+            # a plain None, indistinguishable from any other failure).
+            log.debug("inbound media message not persisted: chat session row missing",
+                      extra={"ticket_id": ticket_id, "session_id": session_id})
             return None
         customer_msg = ChatMessage(
             session_id=session_id, role="customer", type=user_type,
@@ -2792,6 +2936,12 @@ async def _persist_turn(
         async with _sm()() as db:
             row = await db.get(ChatSession, session_id)
             if row is None:
+                # Neither the customer nor the agent row for this turn gets
+                # written -- the whole turn's transcript entry vanishes with
+                # no trace beyond a generic all-None return the caller can't
+                # tell apart from any other persistence failure.
+                log.debug("chat turn not persisted: chat session row missing",
+                          extra={"ticket_id": ticket_id, "session_id": session_id})
                 return PersistedTurnIds()
             if customer_message_id is None:
                 customer_msg = ChatMessage(
@@ -2908,6 +3058,11 @@ async def push_async_message(
         async with _sm()() as db:
             row = await db.get(ChatSession, session_id)
             if row is None:
+                # Whatever background flow called this (a deposit-verdict
+                # push, a timeout notice) loses its message entirely -- the
+                # caller only gets a generic None, same as any other failure.
+                log.debug("push_async_message not persisted: chat session row missing",
+                          extra={"ticket_id": ticket_id, "session_id": session_id})
                 return None
             message = ChatMessage(
                 session_id=session_id, role=role, type="text", content=text,
@@ -2943,6 +3098,11 @@ async def _end_session(
         async with _sm()() as db:
             row = await db.get(ChatSession, session_id)
             if row is None:
+                # The session never gets marked ended/closed in the DB -- a
+                # later reconnect (or the reconnect sweep) would still see
+                # whatever stale status/mode the row last had.
+                log.debug("chat session not ended: chat session row missing",
+                          extra={"ticket_id": ticket_id, "session_id": session_id})
                 return
             row.status = "ended"
             row.mode = "closed"
@@ -2962,7 +3122,12 @@ async def _end_session(
         try:
             await voice_ws.close(code=1000, reason="chat session ended")
         except Exception:  # noqa: BLE001
-            pass
+            # The live voice call this chat session started may keep running
+            # past the chat's own end -- the close attempt is best-effort
+            # (the socket may already be gone), but a real failure to close
+            # it otherwise leaves no trace at all.
+            log.debug("closing linked voice call on chat session end failed",
+                      extra={"ticket_id": ticket_id, "session_id": session_id}, exc_info=True)
 
 
 class EscalationOutcome(NamedTuple):
@@ -3216,6 +3381,37 @@ async def _check_and_timeout_verification(request_id: str) -> None:
             if result.rowcount == 0:
                 return  # resolved (or claimed by a concurrent timer) in the meantime — no-op
 
+        # The atomic claim above guarantees only one timer escalates this
+        # REQUEST. It says nothing about the SESSION, which may have been
+        # handed to a human in the meantime — by the bank-statement relay in
+        # src/api/deposit_verification.py, by the bot mid-turn, or by an agent
+        # claiming it — and that is not a hypothetical: the relay path
+        # deliberately leaves the request `pending` (the deposit really is
+        # unresolved), so a handoff there is normally followed by this sweep
+        # firing for the same request.
+        #
+        # `_escalate_session` sets `mode = "awaiting_human"` unconditionally,
+        # so calling it on a session an agent already holds would silently
+        # un-assign them mid-conversation, on top of a duplicate BO webhook
+        # and a second `chat.escalated` event. Re-read the mode rather than
+        # trusting `chat_session_row`, which was loaded before the claim and
+        # is stale by exactly the window this guards.
+        async with _sm()() as db:
+            current = await db.get(ChatSession, deposit_session_id)
+        current_mode = current.mode if current is not None else None
+        if current_mode in ("awaiting_human", "human"):
+            # The request stays `timed_out` — it genuinely did — and nothing
+            # is pushed to the customer: a human is already on this
+            # conversation and a "connecting you to support" line would
+            # contradict what they can see.
+            debug_event(
+                log, "deposit_verification timeout escalation_skipped",
+                request_id=request_id, session_id=deposit_session_id,
+                ticket_id=ticket_id, session_mode=current_mode,
+                reason="session_already_with_human",
+            )
+            return
+
         outcome = await _escalate_session(
             tenant, deposit_session_id, chat_session_row,
             reason="deposit verification timed out",
@@ -3263,6 +3459,12 @@ async def _revert_to_bot(websocket: WebSocket, session_id: str) -> None:
         if r:
             r.mode = "bot"
             await db.commit()
+        else:
+            # The DB mode flip is skipped, but the two frames below still go
+            # out unconditionally -- the customer is told "mode: bot" even
+            # though the row that would record that never got updated.
+            log.debug("revert to bot skipped DB update: chat session row missing",
+                      extra={"session_id": session_id})
     await websocket.send_text(json.dumps({"type": "mode_change", "mode": "bot"}))
     await websocket.send_text(json.dumps({
         "type": "message",
@@ -3290,6 +3492,12 @@ async def _forward_pending_text_to_bo(session_id: str, text: str) -> None:
             ))
             r.message_count = (r.message_count or 0) + 1
             await db.commit()
+        else:
+            # The message still gets forwarded to the BO queue below even
+            # though it was never written to chat_messages -- the transcript
+            # and the live handoff queue disagree about what was said.
+            log.debug("pending text not persisted before BO handoff: chat session row missing",
+                      extra={"session_id": session_id})
     bq = _bo_queues.setdefault(session_id, asyncio.Queue())
     await bq.put(json.dumps({
         "type": "customer_message", "text": text, "session_id": session_id,
@@ -3381,6 +3589,12 @@ async def _run_human_mode(
                             ))
                             r.message_count = (r.message_count or 0) + 1
                             await db.commit()
+                        else:
+                            # Still forwarded to the BO agent queue below even
+                            # though it was never written to chat_messages.
+                            log.debug("customer text not persisted in human mode: "
+                                      "chat session row missing",
+                                      extra={"ticket_id": ticket_id, "session_id": session_id})
                     await bq.put(json.dumps({
                         "type": "customer_message",
                         "text": user_text,

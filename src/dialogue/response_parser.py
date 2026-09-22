@@ -15,10 +15,14 @@ moving instead of crashing.
 from __future__ import annotations
 
 import json
+import logging
 import re
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+from src.utils.logging import debug_event
+
+log = logging.getLogger(__name__)
 
 _FENCE_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL | re.IGNORECASE)
 
@@ -100,6 +104,14 @@ def parse_voicebot_response(text: str) -> VoiceBotResponse:
 
     response_text = _str(obj.get("response_text"), "")
     if not response_text:
+        # The envelope parsed cleanly (unlike the _extract_json failure above)
+        # but the model didn't put anything in response_text -- a distinct
+        # outcome from a malformed envelope. agents/voicebot.py's own
+        # "voicebot turn parse_recovered" event already covers this at both
+        # of its call sites (it fires on any truthy parse_error, including
+        # this one), but that event only exists there -- log it here too so
+        # any OTHER caller of this parser isn't silent about it.
+        debug_event(log, "response_parser voicebot_response empty", raw=text, parsed=obj)
         return VoiceBotResponse(
             response_text=_VOICEBOT_FALLBACK_TEXT,
             action="clarify",
@@ -130,6 +142,13 @@ def parse_chatbot_response(text: str) -> ChatBotResponse:
 
     response_text = _str(obj.get("response_text"), "")
     if not response_text:
+        # agents/chatbot.py's _handle_with_tools logs this via its own
+        # "chatbot response_envelope parse_fallback" event (any truthy
+        # parse_error, including this one), but its sibling _single_shot path
+        # calls this same function with no parse_error logging of its own --
+        # so this is the only trace that call site leaves. Reported as a gap
+        # rather than fixed there: out of this package's scope.
+        debug_event(log, "response_parser chatbot_response empty", raw=text, parsed=obj)
         return ChatBotResponse(
             response_text=_CHATBOT_FALLBACK_TEXT,
             parse_error="missing response_text",
@@ -158,26 +177,46 @@ def _extract_json(text: str) -> tuple[Optional[dict[str, Any]], Optional[str]]:
 
     # Try fenced code block first.
     fence = _FENCE_RE.search(text)
-    candidates: list[str] = []
+    candidates: list[tuple[str, str]] = []
     if fence:
-        candidates.append(fence.group(1))
+        candidates.append(("fenced_block", fence.group(1)))
     # Try the whole text.
-    candidates.append(text.strip())
+    candidates.append(("whole_text", text.strip()))
     # Try the largest balanced {...} block.
     block = _largest_balanced_block(text)
     if block:
-        candidates.append(block)
+        candidates.append(("balanced_block", block))
 
     last_error = "no JSON object found"
-    for c in candidates:
+    for source, c in candidates:
         try:
             obj = json.loads(c, strict=False)
             if isinstance(obj, dict):
+                if source != "whole_text":
+                    # Direct parse of the whole text (the first candidate
+                    # tried when there's no fence) is the happy path and
+                    # would fire on every clean turn -- not worth a line.
+                    # Reaching a later candidate means the raw text needed
+                    # salvaging (a code fence stripped, or a stray prose
+                    # prefix/suffix cut away by the balanced-brace scan),
+                    # which is exactly the "what did the model actually
+                    # emit vs. what we recovered" question an operator asks.
+                    debug_event(
+                        log, "response_parser extract_json recovered",
+                        source=source, raw=text, recovered=c,
+                    )
                 return obj, None
             last_error = "JSON was not an object"
         except json.JSONDecodeError as e:
             last_error = f"json decode: {e}"
             continue
+    # Every candidate failed -- shared by both parse_voicebot_response and
+    # parse_chatbot_response (their callers' own recovery events log the
+    # fallback TEXT substituted, not this decoder-level detail: which
+    # candidates were tried and the literal JSONDecodeError) -- and by
+    # src/analysis/call_outcome.py, which calls this function directly with
+    # no logging of its own around the result at all.
+    debug_event(log, "response_parser extract_json failed", raw=text, error=last_error)
     return None, last_error
 
 

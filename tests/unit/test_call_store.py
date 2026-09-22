@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from sqlalchemy import select
 
+from src.api import call_store
 from src.api.call_store import (
     compute_call_cost,
     count_active_calls,
@@ -19,6 +20,23 @@ from src.interfaces.llm import LLMMessage
 from src.models.database import Base
 from src.models.conversation import Conversation, Turn
 from src.models.tenant import ProviderCost, Tenant
+
+
+@pytest.fixture(autouse=True)
+def _reset_warned_rate_misses():
+    """``call_store._warned_rate_misses`` is a module-level set that persists
+    "already warned this (kind, provider, model)" state ACROSS tests in this
+    file (it's the same set ``_rate`` uses in production, populated once at
+    import time and never cleared). Without resetting it here, whichever test
+    happens to run first against a given (kind, provider, model) combo
+    consumes the one-warning-per-process budget, and a later test asserting
+    the warning fired for that same combo would silently see zero log
+    records — the same footgun test_turn_metrics_push.py's
+    _reset_module_push_failure_warner fixture exists to avoid for
+    _PushFailureWarner."""
+    call_store._warned_rate_misses.clear()
+    yield
+    call_store._warned_rate_misses.clear()
 
 
 @pytest_asyncio.fixture
@@ -593,3 +611,52 @@ async def test_reap_stale_calls_closes_only_old_active(sm):
 
         # Idempotent: a second sweep closes nothing new.
         assert await reap_stale_calls(s, older_than_minutes=30) == 0
+
+
+# --- Fix 1: unpriced provider/model warns, once per (kind, provider, model) ---
+#
+# Before this fix, _rate() fell all the way to 0.0 with only a DEBUG event
+# (off in normal running) -- an operator had no way to tell "this leg
+# genuinely costs nothing" apart from "nobody added a ProviderCost row for
+# it" without querying the catalog directly. These tests pin the visibility
+# fix and its log-flood guard (_rate runs once per component per call leg).
+
+
+async def test_rate_miss_warns_naming_kind_provider_model(sm, caplog):
+    """A rate lookup with no matching row (exact or provider-level) must warn,
+    and the message must name kind/provider/model so an operator can add the
+    missing row without a query."""
+    with caplog.at_level("WARNING", logger="src.api.call_store"):
+        async with sm() as s:
+            await call_store._rate(s, "stt", "no-such-provider", "no-such-model")
+    assert len(caplog.records) == 1
+    msg = caplog.records[0].message
+    assert "kind=stt" in msg
+    assert "provider=no-such-provider" in msg
+    assert "model=no-such-model" in msg
+
+
+async def test_rate_miss_warns_once_per_combination(sm, caplog):
+    """A second lookup of the SAME (kind, provider, model) must not warn again
+    -- otherwise a provider missing from the catalog would log on every call
+    leg forever. A DIFFERENT combination must still warn."""
+    with caplog.at_level("WARNING", logger="src.api.call_store"):
+        async with sm() as s:
+            await call_store._rate(s, "llm", "ghost", "model-a")
+            await call_store._rate(s, "llm", "ghost", "model-a")   # same combo -- silent
+            await call_store._rate(s, "llm", "ghost", "model-b")   # different model -- warns
+    messages = [rec.message for rec in caplog.records]
+    assert len(messages) == 2
+    assert "model=model-a" in messages[0]
+    assert "model=model-b" in messages[1]
+
+
+async def test_rate_found_row_emits_no_warning(sm, caplog):
+    """A lookup that resolves to an actual catalog row -- exact match or
+    provider-level fallback -- must emit nothing."""
+    with caplog.at_level("WARNING", logger="src.api.call_store"):
+        async with sm() as s:
+            await call_store._rate(s, "stt", "groq", "")                 # exact provider-level row
+            await call_store._rate(s, "llm", "gemini", "gemini-2.5-pro")  # exact model row
+            await call_store._rate(s, "llm", "gemini", "gemini-9-ultra")  # provider fallback
+    assert caplog.records == []

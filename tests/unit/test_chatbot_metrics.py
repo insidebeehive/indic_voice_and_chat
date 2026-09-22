@@ -17,10 +17,11 @@ import pytest
 
 from src.agents import chatbot as chatbot_mod
 from src.agents.base import AgentSession
-from src.agents.chatbot import ChatBotAgent, _usage_tokens
+from src.agents.chatbot import ChatBotAgent, _measure_reply, _usage_tokens
 from src.interfaces.llm import ILLMProvider, LLMMessage, LLMResult, ToolCall, ToolSpec
 from src.interfaces.vector_store import Document
 from src.providers.vector_store.faiss_store import FAISSAdapter
+from src.rag.context_builder import GuardConfig
 from src.rag.embeddings import HashEmbedder
 from src.rag.retriever import HybridRetriever, RetrievalConfig
 
@@ -55,6 +56,18 @@ async def retriever(tmp_faiss_index: str) -> HybridRetriever:
                  metadata={"filename": "plans.pdf", "page": 2}),
     ])
     return r
+
+
+@pytest.fixture
+async def empty_retriever(tmp_faiss_index: str) -> HybridRetriever:
+    """Same shape as ``retriever`` above but with nothing indexed -- forces
+    ``search_combined`` to return no chunks, which is what puts
+    ``apply_hallucination_guard`` on its no-retrieval fallback path."""
+    store = FAISSAdapter({"embedding_dim": 64, "index_path": tmp_faiss_index})
+    return HybridRetriever(
+        embedder=HashEmbedder(dim=64), vector_store=store,
+        config=RetrievalConfig(strategy="hybrid", top_k=2, oversample_k=8,
+                               similarity_threshold=0.0))
 
 
 def _agent(llm, retriever, **kw) -> ChatBotAgent:
@@ -635,3 +648,83 @@ async def test_usable_response_is_not_escalated(retriever) -> None:
 
     assert result.response.action != "escalate"
     assert "unlimited data" in result.response.response_text
+
+
+# --- Reply length measurement (reply_chars/reply_words) ---------------------
+
+
+async def test_known_reply_yields_expected_reply_chars_and_words(retriever) -> None:
+    """A plain, non-JSON reply on the single-shot path -- confidence stays
+    "medium" (response_parser's plain-text fallback default), so neither
+    hallucination-guard branch rewrites it, and reply_chars/reply_words on
+    result.metrics must match _measure_reply applied to that exact text."""
+    text = "Plan B has 500GB unlimited data."
+    llm = ScriptedLLM([LLMResult(text=text, finish_reason="stop")])
+    agent = ChatBotAgent(
+        session=AgentSession(session_id="cb-reply-len"), llm=llm, retriever=retriever,
+        company_name="Acme", language_default="en")  # enable_tools defaults False
+
+    result = await agent.handle_message("Tell me about Plan B")
+
+    assert result.metrics is not None
+    assert result.response.response_text == text
+    expected_chars, expected_words = _measure_reply(text)
+    assert result.metrics.reply_chars == expected_chars
+    assert result.metrics.reply_words == expected_words
+
+
+async def test_devanagari_reply_word_count_is_whitespace_split_and_chars_exceed_words(
+    retriever,
+) -> None:
+    """Pins the documented codepoint-not-grapheme semantics: Devanagari
+    encodes matras/conjunct joiners as separate combining codepoints, so
+    reply_chars must run well above reply_words for real Devanagari prose,
+    and reply_words must match a plain whitespace split (the one definition
+    of "word" _measure_reply uses -- not a script-aware tokenizer).
+
+    The fixture string is exactly 66 Unicode codepoints (len()) and 14
+    whitespace-split words. It has 19 combining-mark codepoints (Unicode
+    category Mn/Mc -- matras and other vowel signs), so its grapheme-cluster
+    count is approximately 47 (66 - 19). The exact-codepoint-count assertion
+    below must fail if _measure_reply is ever switched to grapheme counting:
+    a grapheme-based implementation would return ~47 for reply_chars, not 66,
+    and 47 == 66 is false. (The weaker `reply_chars > reply_words` check this
+    replaced would NOT have caught that switch: 47 > 14 is still true.)"""
+    devanagari_text = "आपका मौजूदा बैलेंस पाँच सौ रुपये है, और आपकी अगली किस्त कल देय है।"
+    llm = ScriptedLLM([LLMResult(text=devanagari_text, finish_reason="stop")])
+    agent = ChatBotAgent(
+        session=AgentSession(session_id="cb-reply-len-hi"), llm=llm, retriever=retriever,
+        company_name="Acme", language_default="hi")  # enable_tools defaults False
+
+    result = await agent.handle_message("mera balance kitna hai?")
+
+    assert result.metrics is not None
+    assert result.response.response_text == devanagari_text
+    assert result.metrics.reply_words == len(devanagari_text.split())
+    assert result.metrics.reply_chars == len(devanagari_text)
+    assert result.metrics.reply_chars == 66
+
+
+async def test_guard_substituted_reply_records_canned_text_length_not_models(
+    empty_retriever,
+) -> None:
+    """When apply_hallucination_guard's no-retrieval branch substitutes its
+    canned fallback (see src/rag/context_builder.py:648-671), the FINAL
+    response_text the customer receives is the canned line, not whatever the
+    model originally said -- reply_chars/reply_words must reflect that,
+    pinning the "measure post-guard" contract from the plan."""
+    model_text = "Your balance is exactly five hundred rupees, guaranteed."
+    llm = ScriptedLLM([LLMResult(text=model_text, finish_reason="stop")])
+    agent = ChatBotAgent(
+        session=AgentSession(session_id="cb-reply-len-guard"), llm=llm,
+        retriever=empty_retriever, company_name="Acme", language_default="en")
+
+    result = await agent.handle_message("what's my balance?")
+
+    canned = GuardConfig().fallback_text_en
+    assert result.response.response_text == canned
+    assert result.response.response_text != model_text
+    assert result.metrics is not None
+    expected_chars, expected_words = _measure_reply(canned)
+    assert result.metrics.reply_chars == expected_chars
+    assert result.metrics.reply_words == expected_words

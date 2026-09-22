@@ -29,7 +29,9 @@ from src.auth.middleware import require_admin
 from src.interfaces.vector_store import Document
 from src.models.crm import Crm, CrmKBDocument
 from src.rag.ingestion import ChunkConfig, detect_language, get_chunker, parse_document
+from src.utils.logging import debug_event
 
+log = logging.getLogger(__name__)
 router = APIRouter(prefix="/crms", tags=["crm-kb"])
 
 _crm_retrievers: "object | None" = None
@@ -45,9 +47,15 @@ def set_crm_retrievers(registry) -> None:
 
 def _retriever_for_crm(crm_id: str):
     if _crm_retrievers is None:
+        # Process-wiring gap, not a per-CRM one: set_crm_retrievers() never
+        # ran (app startup order / DI wiring), so EVERY CRM KB route 503s
+        # until that's fixed — worth distinguishing from the per-CRM case
+        # below, where wiring is fine but this one CRM has no usable index.
+        debug_event(log, "crm_kb retriever_lookup registry_not_initialized", crm_id=crm_id)
         raise HTTPException(status_code=503, detail="CRM KB not initialized")
     retriever = _crm_retrievers.get(crm_id)
     if retriever is None:
+        debug_event(log, "crm_kb retriever_lookup no_retriever_for_crm", crm_id=crm_id)
         raise HTTPException(status_code=503, detail=f"CRM {crm_id!r} has no usable KB retriever")
     return retriever
 
@@ -143,12 +151,29 @@ async def ingest_crm_document(
         for c in raw_chunks
     ]
     indexed = await retriever.index(docs)
+    if indexed != len(docs):
+        # Decision the retriever made, not this route -- it accepted fewer
+        # (or more) chunks than were produced. chunk_count below is stored as
+        # `indexed`, so a silent mismatch here would make the document list
+        # and the actual retrievable content disagree with no trace.
+        debug_event(
+            log, "crm_kb ingest chunk_count_mismatch", crm_id=crm_id, document_id=doc_id,
+            chunks_produced=len(docs), chunks_indexed=indexed,
+        )
     session.add(CrmKBDocument(
         id=doc_id, crm_id=crm_id, filename=file.filename or doc_id,
         source_type=(Path(file.filename).suffix.lstrip(".").lower() if file.filename else None),
         language=language, chunk_count=indexed,
         extra_data={"chunk_ids": [d.id for d in docs]},
     ))
+    # CRUD boundary: a CRM KB doc is shared across every tenant linked to
+    # this CRM (module docstring). Full non-PII values — this is platform
+    # reference content the model is meant to cite, not customer data.
+    debug_event(
+        log, "crm_kb ingest result", crm_id=crm_id, document_id=doc_id,
+        document_filename=file.filename, language=language, text_chars=len(text),
+        chunks_produced=len(docs), chunks_indexed=indexed,
+    )
     await session.commit()
     return IngestResponse(document_id=doc_id, filename=file.filename or "",
                           chunks_indexed=indexed, language=language)
@@ -185,9 +210,30 @@ async def delete_crm_document(
     row = await _scoped_crm_doc(session, document_id, crm_id)
     chunk_ids = (row.extra_data or {}).get("chunk_ids") or [
         f"{document_id}::chunk-{i}" for i in range(row.chunk_count or 0)]
+    # Vectors first, row second. If the retriever raises, the KBDocument row
+    # survives and the whole delete is retryable; committing the row first --
+    # which this did -- makes a retriever failure unrecoverable: the metadata
+    # is gone permanently while the chunks stay live in the index, invisible
+    # to list_crm_documents and stats but still returned by query. The same
+    # reordering was applied to knowledge.py's delete_document, which is this
+    # route's sibling and had the identical ordering.
+    filename = row.filename          # read before the row is expired by delete
+    n = await retriever.delete(chunk_ids)
     await session.delete(row)
     await session.commit()
-    n = await retriever.delete(chunk_ids)
+    if n != len(chunk_ids):
+        # Whether the vector index actually shed every chunk it should have —
+        # a stale chunk left behind after "delete" reports success is exactly
+        # the kind of drift that surfaces later as a citation from a document
+        # that no longer appears in list_crm_documents.
+        debug_event(
+            log, "crm_kb delete chunk_removal_mismatch", crm_id=crm_id,
+            document_id=document_id, chunk_ids_expected=len(chunk_ids), chunks_removed=n,
+        )
+    debug_event(
+        log, "crm_kb delete result", crm_id=crm_id, document_id=document_id,
+        document_filename=filename, chunks_removed=n,
+    )
     return {"document_id": document_id, "chunks_removed": n}
 
 
@@ -211,6 +257,16 @@ async def download_crm_document(
     row = await _scoped_crm_doc(session, document_id, crm_id)
     retriever = _retriever_for_crm(crm_id)
     text = _chunks_for_doc(retriever, document_id)
+    if not text and (row.chunk_count or 0) > 0:
+        # The DB row claims chunks exist but none of them matched this
+        # document_id in the retriever's own index (_chunks_for_doc's id-
+        # prefix / metadata match) — the download silently comes back empty
+        # rather than 404ing, which otherwise looks identical to "this
+        # document genuinely has no content".
+        debug_event(
+            log, "crm_kb download empty_despite_chunk_count", crm_id=crm_id,
+            document_id=document_id, stored_chunk_count=row.chunk_count,
+        )
     filename = (row.filename or document_id).rsplit(".", 1)[0] + ".txt"
     return Response(content=text, media_type="text/plain; charset=utf-8",
                     headers={"Content-Disposition": f'attachment; filename="{filename}"'})

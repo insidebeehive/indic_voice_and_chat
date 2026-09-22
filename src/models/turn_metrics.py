@@ -13,6 +13,7 @@ from sqlalchemy import DateTime, ForeignKey, Index, Integer, String, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from src.models.database import Base, get_sessionmaker
+from src.utils.logging import debug_event
 
 log = logging.getLogger(__name__)
 
@@ -72,7 +73,7 @@ async def record_turn_metric(
     try:
         sessionmaker = get_sessionmaker()
         async with sessionmaker() as db:
-            db.add(TurnMetric(
+            row = TurnMetric(
                 tenant_id=tenant_id,
                 session_id=session_id,
                 campaign_id=campaign_id,
@@ -88,7 +89,24 @@ async def record_turn_metric(
                 tts_total_ms=metrics.get("tts_total_ms", 0),
                 total_latency_ms=metrics.get("total_latency_ms", 0),
                 tts_segments_dropped=metrics.get("tts_segments_dropped", 0),
-            ))
+            )
+            db.add(row)
             await db.commit()
+            # Mirrors src/models/chat_turn_metrics.py's record_chat_turn_metric:
+            # the only place a successful write is ever recorded, so "did this
+            # turn's metric actually persist" doesn't need a database query.
+            debug_event(
+                log, "metrics turn_metric_write response",
+                turn_id=row.id, tenant_id=tenant_id, session_id=session_id,
+                campaign_id=campaign_id, mode=mode, action=action,
+            )
     except Exception:  # noqa: BLE001 - must never break a live call
         log.warning("record_turn_metric failed; continuing without persistence", exc_info=True)
+        # The WARNING above carries no correlation id -- add one so a lost
+        # turn metric can be tied back to its session without a second
+        # incident to notice the gap.
+        debug_event(
+            log, "metrics turn_metric_write failed",
+            tenant_id=tenant_id, session_id=session_id, campaign_id=campaign_id,
+            mode=mode, action=action,
+        )

@@ -83,13 +83,14 @@ from src.bootstrap import (
     make_livekit_bridge_factory,
     make_stringee_bridge_factory,
 )
-from src.config import Settings, get_settings
+from src.config import Settings, drain_load_diagnostics, get_settings
 from src.config_tenant import TenantSettings
 from src.dialogue.campaign_resolver import DbCampaignResolver
 from src.dialogue.context import SessionStore
 from src.models.database import dispose_engine, ensure_schema, get_engine, get_sessionmaker
 from src.utils.client_ip import ClientIPMiddleware
-from src.utils.logging import configure_logging, get_logger
+from src.utils.logging import configure_logging, debug_event, get_logger
+from src.utils.redact import redact_url
 
 log = get_logger(__name__)
 
@@ -117,7 +118,14 @@ def _parse_callback(value):
     try:
         from datetime import datetime
         return datetime.fromisoformat(value)
-    except (ValueError, TypeError):
+    except (ValueError, TypeError) as exc:
+        # Silent before this line: a malformed callback datetime in a call
+        # outcome payload used to just vanish -- the callback was silently
+        # never scheduled, with nothing at any level to say why.
+        debug_event(
+            log, "call_outcome callback_parse failed",
+            raw_value=value, exc_type=type(exc).__name__,
+        )
         return None
 
 
@@ -154,6 +162,13 @@ async def _resolve_tenant_event_secret(
             "see docs/integrations/chat-widget-backend-integration.md#4-webhook-events",
             extra={"tenant_id": tenant_id, "event_type": event_type},
         )
+    # has_secret only -- secret itself is the outbound webhook's HMAC signing
+    # key and never appears at any level, per docs/debug-logging.md.
+    debug_event(
+        log, "tenant_event secret_resolve decision",
+        tenant_id=tenant_id, event_type=event_type, secret_env=secret_env,
+        has_secret=bool(secret),
+    )
     return secret
 
 
@@ -283,6 +298,11 @@ async def prune_chat_turn_metrics(sessionmaker, retention_days: float) -> int:
         cutoff = datetime.utcnow() - timedelta(days=retention_days)
     else:
         cutoff = func.now() - func.make_interval(0, 0, 0, 0, 0, 0, retention_days * 86400.0)
+    debug_event(
+        log, "chat_metrics_prune cutoff decision",
+        dialect=dialect_name, retention_days=retention_days,
+        cutoff_source="python_utcnow" if dialect_name == "sqlite" else "db_server_clock",
+    )
 
     total_deleted = 0
     while True:
@@ -361,10 +381,22 @@ async def _seed_crm_kb(
     from src.models.crm import Crm, CrmKBDocument
     from src.rag.ingestion import ChunkConfig, detect_language, get_chunker, parse_document
 
+    auto_prune_explicit = auto_prune is not None
     if auto_prune is None:
         auto_prune = _kb_auto_prune_enabled()
+    debug_event(
+        log, "startup kb_seed auto_prune decision",
+        auto_prune=auto_prune,
+        source="explicit_arg" if auto_prune_explicit else "env_VOX_KB_AUTO_PRUNE",
+    )
 
     if not kb_dir.is_dir():
+        # Whole reseed is a no-op with nothing at any level otherwise --
+        # indistinguishable from "no bundled KB pack shipped" from outside.
+        debug_event(
+            log, "startup kb_seed skipped",
+            reason="kb_dir_missing", kb_dir=str(kb_dir), bundled_kb_pack=bundled_kb_pack,
+        )
         return
     async with sessionmaker() as session:
         crm_ids = [
@@ -375,6 +407,10 @@ async def _seed_crm_kb(
             ).all()
         ]
     if not crm_ids:
+        debug_event(
+            log, "startup kb_seed skipped",
+            reason="no_crm_opted_in", bundled_kb_pack=bundled_kb_pack, kb_dir=str(kb_dir),
+        )
         return
     exts = {".md", ".txt", ".pdf", ".docx", ".csv"}
     files = sorted(
@@ -382,7 +418,15 @@ async def _seed_crm_kb(
         if p.is_file() and p.suffix.lower() in exts and not p.name.startswith(".")
     )
     if not files:
+        debug_event(
+            log, "startup kb_seed skipped",
+            reason="no_files_found", kb_dir=str(kb_dir), extensions=sorted(exts),
+        )
         return
+    debug_event(
+        log, "startup kb_seed scope resolved",
+        file_count=len(files), crm_count=len(crm_ids), bundled_kb_pack=bundled_kb_pack,
+    )
 
     chunker = get_chunker(ChunkConfig())
     total = 0
@@ -444,6 +488,15 @@ async def _seed_crm_kb(
             failed_stems.add(f.stem)
     if total:
         log.info("CRM KB seeded", extra={"files": len(files), "chunks": total, "crms": len(crm_ids)})
+    else:
+        # Files and opted-in CRMs both existed (the two early returns above
+        # didn't fire) but nothing was indexed -- e.g. every file parsed to
+        # empty text, or chunking produced no chunks. log.info above never
+        # fires in this case, so this was previously silent.
+        debug_event(
+            log, "startup kb_seed indexed_zero",
+            file_count=len(files), crm_count=len(crm_ids), failed_files=sorted(failed_stems),
+        )
 
     # Reconcile: prune CrmKBDocument rows (and their pgvector chunks) that
     # this seeder itself wrote in a previous pass but that no longer
@@ -530,6 +583,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
     log.info("startup", extra={"app": settings.app.name, "version": settings.app.version})
 
+    # get_settings() above had to run FIRST -- it is where the log level comes
+    # from -- so everything load_settings() decided was decided while the root
+    # logger was still unconfigured, and its own debug_event calls went nowhere.
+    # This is the first moment they can be seen. Without it the unknown-key
+    # sweep would be silent on every production boot, which is the one place it
+    # is worth having: config/default.yaml's `tts.model` has been inert for
+    # months precisely because nothing reported it.
+    if (load_diagnostics := drain_load_diagnostics()):
+        debug_event(
+            log, "config load_diagnostics replayed", diagnostics=load_diagnostics,
+        )
+
     # Eagerly create engine + redis pool so missing config fails on boot, not first request.
     get_engine(settings.database.url)
     # Ensure our schema exists before anything touches a table (no-op on SQLite).
@@ -538,8 +603,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     import asyncio as _asyncio
     try:
         await _asyncio.wait_for(ensure_schema(settings.database.url), timeout=20.0)
-    except Exception:
+    except Exception as exc:
         log.warning("ensure_schema skipped (timeout or error); schema assumed current")
+        # The WARNING above is deliberately terse (no exception detail); this
+        # is the "which was it" companion -- timeout vs. a real DB error, and
+        # what the error actually was.
+        debug_event(
+            log, "startup ensure_schema failed",
+            exc_type=type(exc).__name__, exc_message=str(exc),
+        )
     redis_client = redis_async.from_url(settings.redis.url, decode_responses=False)
     app.state.redis = redis_client
     app.state.settings = settings
@@ -551,8 +623,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         log.info("seeded tenants from YAML into DB", extra={"count": seeded})
     try:
         await _asyncio.wait_for(sync_telephony_from_yaml(sessionmaker), timeout=10.0)
-    except Exception:
+    except Exception as exc:
         log.warning("sync_telephony_from_yaml skipped (timeout or error)")
+        debug_event(
+            log, "startup sync_telephony_from_yaml failed",
+            exc_type=type(exc).__name__, exc_message=str(exc),
+        )
     await seed_provider_costs(sessionmaker)
     resolver = DbTenantResolver(sessionmaker)
     await resolver.reload()
@@ -589,12 +665,23 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         for t in (getattr(app.state, "tenants", {}) or {}).values():
             if getattr(t, "id", None) == tenant_id:
                 return t
+        # A call-outcome envelope referencing a tenant_id absent from the
+        # currently loaded app.state.tenants -- e.g. a reload race, or a
+        # deleted tenant with a call still in flight.
+        debug_event(log, "tenant_event tenant_lookup miss", tenant_id=tenant_id)
         return None
 
     async def _notify_tenant_event(envelope: dict) -> None:
         settings = _tenant_settings_by_id(envelope.get("tenant_id"))
         url = await resolve_events_webhook_url(settings, sessionmaker)
         if not url:
+            # No events_webhook_url configured for this tenant/CRM -- the
+            # event is dropped here, silently, with nothing at any level.
+            debug_event(
+                log, "tenant_event dispatch skipped",
+                tenant_id=envelope.get("tenant_id"), event_type=envelope.get("event_type"),
+                reason="no_webhook_url_configured",
+            )
             return
         secret_env = getattr(settings, "events_webhook_secret_env", None)
         resolver = getattr(app.state, "tenant_resolver", None)
@@ -602,6 +689,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             settings, secret_env, resolver,
             tenant_id=envelope.get("tenant_id"),
             event_type=envelope.get("event_type"),
+        )
+        debug_event(
+            log, "tenant_event dispatch request",
+            tenant_id=envelope.get("tenant_id"), event_type=envelope.get("event_type"),
+            # redact_url like every other url in this file: this one is
+            # tenant-configured, so it can carry an api key as a query param
+            # or basic-auth userinfo -- both of which redact_url drops.
+            url=redact_url(url), has_secret=bool(secret),
         )
         # Detached so delivery (retries/backoff) never blocks the caller.
         asyncio.create_task(deliver_tenant_event(url, envelope, secret))
@@ -616,6 +711,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             "telephony": settings.pipeline.telephony.model_dump(),
             "vector_store": settings.pipeline.vector_store.model_dump(),
         },
+    )
+    debug_event(
+        log, "startup provider_registry built",
+        stt_provider=settings.pipeline.stt.provider, stt_model=settings.pipeline.stt.model,
+        llm_provider=settings.pipeline.llm.provider, llm_model=settings.pipeline.llm.model,
+        tts_provider=settings.pipeline.tts.provider,
+        telephony_provider=settings.pipeline.telephony.provider,
+        vector_store_provider=settings.pipeline.vector_store.provider,
     )
     base_session_store = SessionStore(
         redis=redis_client, ttl_seconds=settings.redis.session_ttl_seconds
@@ -694,6 +797,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             )
         )
         log.info("dev console enabled at /dev/voice")
+    else:
+        debug_event(log, "startup dev_console skipped", reason="VOX_DEV_CONSOLE not set to '1'")
     # Browser softphone recording webhook transcribes + analyzes with the
     # tenant's STT + LLM, so it needs the same per-tenant provider registry.
     telephony_hooks.set_softphone_providers(providers)
@@ -721,10 +826,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             bucket=ms.bucket,
             region=ms.region,
         ))
+        debug_event(
+            log, "startup media_storage configured", backend="s3",
+            endpoint_url=ms.endpoint_url, bucket=ms.bucket, region=ms.region,
+            has_access_key=bool(ms.access_key), has_secret_key=bool(ms.secret_key),
+        )
     else:
         from src.providers.media.local import LocalMediaStorage
         log.info("media storage: using local filesystem fallback (/tmp/chat_media)")
         chat_api.set_media_store(LocalMediaStorage())
+        debug_event(log, "startup media_storage configured", backend="local_filesystem")
         # json_ticket_relay vendors need a real, publicly-fetchable signed URL
         # (see src/chatbot/deposit_verification.py); LocalMediaStorage only
         # ever produces a relative, unsigned path, so any tenant on that
@@ -752,11 +863,24 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     reaper_task = asyncio.create_task(_reap_stale_calls_loop())
     kb_seed_task = asyncio.create_task(_seed_crm_kb(crm_retrievers, sessionmaker))
+    # URL redacted (never raw): GRAFANA_PROMETHEUS_PUSH_URL isn't itself a
+    # credential, but redact_url is cheap insurance against a push URL that
+    # embeds one. The paired GRAFANA_PROMETHEUS_PUSH_AUTH never appears here.
+    debug_event(
+        log, "startup metrics_push scheduled",
+        interval_s=settings.secrets.METRICS_PUSH_INTERVAL_S,
+        push_url=redact_url(settings.secrets.GRAFANA_PROMETHEUS_PUSH_URL)
+        if settings.secrets.GRAFANA_PROMETHEUS_PUSH_URL else None,
+    )
     metrics_push_task = asyncio.create_task(_push_turn_metrics_loop(
         settings.secrets.METRICS_PUSH_INTERVAL_S,
         settings.secrets.GRAFANA_PROMETHEUS_PUSH_URL,
         settings.secrets.GRAFANA_PROMETHEUS_PUSH_AUTH,
     ))
+    debug_event(
+        log, "startup chat_metrics_prune scheduled",
+        retention_days=settings.secrets.CHAT_METRICS_RETENTION_DAYS,
+    )
     chat_metrics_prune_task = asyncio.create_task(_prune_chat_turn_metrics_loop(
         settings.secrets.CHAT_METRICS_RETENTION_DAYS,
     ))
@@ -769,6 +893,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         kb_seed_task.cancel()
         metrics_push_task.cancel()
         chat_metrics_prune_task.cancel()
+        # None of the four are awaited after cancel() -- a task that ignores
+        # or is slow to honor cancellation would leave this event as the only
+        # trace that teardown even asked it to stop.
+        debug_event(
+            log, "shutdown background_tasks cancel_requested",
+            tasks=["reap_stale_calls", "seed_crm_kb", "push_turn_metrics", "prune_chat_turn_metrics"],
+        )
         telephony_hooks.set_bridge_factory(None)
         telephony_hooks.set_exotel_bridge_factory(None)
         telephony_hooks.set_stringee_bridge_factory(None)

@@ -336,3 +336,51 @@ def test_evict_drops_chat_tts_cache(tmp_path, env) -> None:
     providers.evict(t.id)
     providers.get_chat_tts(t)
     assert len(calls["tts"]) == 2
+
+
+# --- get_chat_tts skip instrumentation -----------------------------------
+#
+# The two `return None` branches in get_chat_tts used to be indistinguishable
+# from outside: both "tenant never opted in" (the common, routine case) and
+# "tenant opted in but nothing resolves" (a real misconfiguration -- this is
+# the exact shape that produced a tenant-reported "voice replies aren't
+# working" ticket with zero trace, see src/api/chat.py's
+# _synthesize_reply_audio module comment) returned the same bare `None`.
+# These tests prove each branch now logs at DEBUG with which reason applied,
+# by mutation: flip the tenant's config from one branch to the other and
+# check the log line (and its absence on the other branch) follows.
+
+
+def test_get_chat_tts_logs_debug_when_voice_replies_not_enabled(tmp_path, env, caplog) -> None:
+    providers, _calls = _providers(tmp_path)
+    t = _chat_tenant(enabled=False, pipeline_tts=TenantTTSConfig(provider="sarvam", voice_id="meera"))
+    with caplog.at_level("DEBUG", logger="src.auth.registry"):
+        assert providers.get_chat_tts(t) is None
+    not_enabled = [r for r in caplog.records if "chat_voice.enabled is false" in r.message]
+    assert len(not_enabled) == 1
+    assert not_enabled[0].levelname == "DEBUG"
+    assert not_enabled[0].tenant_id == t.id
+    # Mutation proof: the "enabled but unresolvable" message must NOT also
+    # fire for this tenant -- the two reasons are mutually exclusive log lines.
+    assert not any("no chat_voice.tts or pipeline.tts provider resolves" in r.message
+                   for r in caplog.records)
+
+
+def test_get_chat_tts_logs_debug_when_enabled_but_unresolvable(tmp_path, env, caplog) -> None:
+    providers, _calls = _providers(tmp_path)
+    # enabled=True, but neither chat_voice.tts nor pipeline.tts declares a
+    # provider -- resolve_chat_tts_config(pipeline) returns None. This is the
+    # real-world misconfiguration shape, not the routine opt-out.
+    t = _chat_tenant(enabled=True, chat_tts=TenantTTSConfig(), pipeline_tts=TenantTTSConfig())
+    with caplog.at_level("DEBUG", logger="src.auth.registry"):
+        assert providers.get_chat_tts(t) is None
+    unresolvable = [r for r in caplog.records
+                    if "no chat_voice.tts or pipeline.tts provider resolves" in r.message]
+    assert len(unresolvable) == 1
+    assert unresolvable[0].levelname == "DEBUG"
+    assert unresolvable[0].tenant_id == t.id
+    # Mutation proof: flipping `enabled` fires the OTHER message instead (see
+    # test_get_chat_tts_logs_debug_when_voice_replies_not_enabled) -- these two
+    # tests together pin that the log line actually discriminates the reason,
+    # not just that "some" DEBUG line appears either way.
+    assert not any("chat_voice.enabled is false" in r.message for r in caplog.records)

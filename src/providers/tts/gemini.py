@@ -23,6 +23,7 @@ from typing import Any, AsyncIterator
 import httpx
 
 from src.interfaces.tts import ITTSProvider, TTSConfig, TTSResult
+from src.utils.logging import debug_event
 
 log = logging.getLogger(__name__)
 
@@ -68,6 +69,12 @@ class GeminiTTSAdapter(ITTSProvider):
             },
         }
         url = f"{_BASE_URL}/{self._model}:generateContent"
+        # The API key rides in the `?key=` query param, so only the
+        # key-less `url`/`url2` constants are logged, never the request as
+        # sent. `body` includes the customer's text, which DEBUG is meant to
+        # carry in full.
+        debug_event(log, "gemini tts request", url=url, body=body)
+        model_used = self._model
         async with httpx.AsyncClient(timeout=self._timeout) as client:
             resp = await client.post(url, params={"key": self._api_key}, json=body)
             if not resp.is_success:
@@ -75,6 +82,9 @@ class GeminiTTSAdapter(ITTSProvider):
                 # Try fallback model once
                 if resp.status_code in (400, 404) and self._model != _FALLBACK_MODEL:
                     url2 = f"{_BASE_URL}/{_FALLBACK_MODEL}:generateContent"
+                    model_used = _FALLBACK_MODEL
+                    debug_event(log, "gemini tts fallback request", url=url2, body=body,
+                                primary_model=self._model, primary_status=resp.status_code)
                     resp = await client.post(url2, params={"key": self._api_key}, json=body)
                     if not resp.is_success:
                         log.error(
@@ -93,9 +103,12 @@ class GeminiTTSAdapter(ITTSProvider):
         else:
             pcm = raw_pcm24
 
+        duration_ms = (len(pcm) / max(target_rate * 2, 1)) * 1000.0
+        debug_event(log, "gemini tts response", model=model_used, audio_bytes=len(pcm),
+                    duration_ms=duration_ms, sample_rate=target_rate)
         return TTSResult(
             audio=pcm,
-            duration_ms=(len(pcm) / max(target_rate * 2, 1)) * 1000.0,
+            duration_ms=duration_ms,
             sample_rate=target_rate,
         )
 

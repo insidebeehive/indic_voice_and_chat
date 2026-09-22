@@ -786,3 +786,138 @@ def test_deposit_verification_section_absent_without_the_tool() -> None:
         prompt_pack="betting",
     )
     assert "DEPOSIT DISPUTE VERIFICATION:" not in prompt
+
+
+# ── REPLY LENGTH — brevity rule added to shorten ChatBot replies ────────────
+#
+# Before this section, RESPONSE QUALITY's own brevity line ("LENGTH: two or
+# three short sentences is the DEFAULT ... Go longer only when ...") sat at
+# sentence 4 of a mid-prompt paragraph, 76% of the way through the prompt, and
+# granted four self-adjudicated licenses the model always found a way to
+# invoke. It never bound. REPLY LENGTH replaces it: a standalone section
+# placed right after Identity (the structural position of the S2S voice
+# block's "1. CRITICAL — BE BRIEF", the one brevity rule that demonstrably
+# works), with a single unconditional rule instead of self-granted exceptions.
+
+
+def test_chatbot_prompt_reply_length_precedes_scope_and_response_quality() -> None:
+    """Regression guard for the exact failure mode being fixed: the old brevity
+    rule drifted into section 9 of 11 (inside RESPONSE QUALITY) and, buried
+    there, never bound. REPLY LENGTH must sit early -- before SCOPE, long
+    before RESPONSE QUALITY -- so it reads as a standing constraint rather
+    than a paragraph the model can reason past."""
+    prompt = build_chatbot_system_prompt(company_name="Acme")
+    assert "REPLY LENGTH" in prompt
+    assert (
+        prompt.index("REPLY LENGTH")
+        < prompt.index("SCOPE:")
+        < prompt.index("RESPONSE QUALITY:")
+    )
+
+
+def test_chatbot_prompt_reply_length_wording_pinned() -> None:
+    """The brevity rule was previously completely untested -- RESPONSE
+    QUALITY's old LENGTH line had no coverage at all. Pin only the
+    load-bearing phrases that carry the actual constraint, not the whole
+    block: a test that reproduces the paragraph verbatim is one nobody would
+    ever dare edit.
+
+    Deliberately NOT pinned: the "about 40 words" gloss. Sentences are the
+    binding unit because they are script-independent; a word budget is
+    English-calibrated and is the known over-compression risk for the
+    agglutinative Indic scripts (Malayalam/Tamil/Kannada/Telugu), where 40
+    words is a great deal of content. Rewording or dropping that gloss is
+    the most likely legitimate follow-up edit here, and this test must not
+    stand in its way."""
+    prompt = build_chatbot_system_prompt(company_name="Acme")
+    assert "ONE OR TWO short sentences" in prompt
+    assert "then STOP" in prompt
+    assert "ACROSS TURNS" in prompt
+    assert "Length is not helpfulness" in prompt
+
+
+def test_chatbot_prompt_reply_length_has_no_competing_license() -> None:
+    """The old RESPONSE QUALITY brevity line granted four self-adjudicated
+    exceptions ("asked for detail", "genuinely needs it", "several fields",
+    "multi-part question") and a weaker restatement ("a long answer does not
+    beat a short complete one"). Restoring either alongside the new
+    unconditional rule would be worse than either alone -- the model would
+    read the old license as still standing and use it to escape REPLY
+    LENGTH."""
+    prompt = build_chatbot_system_prompt(company_name="Acme")
+    assert "two or three short sentences" not in prompt
+    assert "Go longer only when" not in prompt
+    assert "long answer does not beat" not in prompt
+
+
+def test_chatbot_prompt_reply_length_no_dangling_cross_reference() -> None:
+    """DEPTH-MATCHING used to quote RESPONSE QUALITY as saying 'a couple of
+    sentences for simple answers' -- a string that exists nowhere else in the
+    repo, a dangling cross-reference to text that was never actually written.
+    It must now point at REPLY LENGTH instead. What this asserts is that the
+    REFERENCE appears inside DEPTH-MATCHING's own slice -- the section
+    heading itself lives several sections earlier and could not be in this
+    slice. The pairing with the "a couple of sentences" check is the point:
+    the reference exists AND the string it names is real."""
+    prompt = build_chatbot_system_prompt(company_name="Acme")
+    assert "a couple of sentences" not in prompt
+
+    depth_matching_idx = prompt.index("DEPTH-MATCHING:")
+    action_values_idx = prompt.index("ACTION VALUES")
+    depth_matching_section = prompt[depth_matching_idx:action_values_idx]
+    assert "REPLY LENGTH" in depth_matching_section
+
+
+def test_chatbot_prompt_flexibility_sentence_no_longer_licenses_reply_length() -> None:
+    """The Identity block's conflict-tiebreaker sentence used to read
+    'this flexibility is about how you help (tone, pacing, how much detail to
+    give)' -- and 'how much detail to give' pre-authorised the model to bend
+    any new length rule that wasn't explicitly on the non-overridable list
+    below it, since the list is scoped to rules that withhold/refuse/decline,
+    which a length rule is not. The parenthetical is narrowed to (tone,
+    pacing) so no future length rule is licensed away by this sentence.
+    The sentence's other pinned content (the non-overridable-rules list) is
+    covered by test_chatbot_prompt_tool_failure_listed_in_protected_rules and
+    is intentionally not re-asserted here."""
+    prompt = build_chatbot_system_prompt(company_name="Acme")
+    assert "how much detail to give" not in prompt
+    assert "(tone, pacing)" in prompt
+
+
+def test_chatbot_prompt_reply_length_section_is_pack_independent() -> None:
+    """REPLY LENGTH is fully static (no pack vars, no clock) so it stays in
+    the cacheable prefix -- pin that no pack variable has crept into it by
+    asserting the section is byte-identical between the generic and betting
+    packs."""
+    generic_prompt = build_chatbot_system_prompt(
+        company_name="Acme", prompt_pack="generic", include_variable_tail=False,
+    )
+    betting_prompt = build_chatbot_system_prompt(
+        company_name="Acme", prompt_pack="betting", include_variable_tail=False,
+    )
+    generic_section = generic_prompt[
+        generic_prompt.index("REPLY LENGTH"):generic_prompt.index("SCOPE:")
+    ]
+    betting_section = betting_prompt[
+        betting_prompt.index("REPLY LENGTH"):betting_prompt.index("SCOPE:")
+    ]
+    assert generic_section == betting_section
+
+
+def test_chatbot_prompt_before_you_send_precedes_schema() -> None:
+    """The pre-send self-check ('re-read your response_text... cut it down
+    before you answer') is a last-line-of-defense re-read, so it must land
+    immediately before the JSON-schema instruction -- the last substantive
+    text the model sees before the response-format instruction -- not
+    somewhere earlier where later sections could add length back on."""
+    prompt = build_chatbot_system_prompt(company_name="Acme")
+    assert "BEFORE YOU SEND" in prompt
+    start = prompt.index("BEFORE YOU SEND")
+    schema = prompt.index("Respond with a single JSON object matching this schema:")
+    assert start < schema
+    # "immediately before", not merely "somewhere before": parts are joined
+    # with a blank line, so exactly one separator may sit between the two.
+    # A bare ordering assertion would still pass with this check parked
+    # near the top of the prompt, which is the placement it exists to rule
+    # out -- recency is the whole mechanism here.
+    assert prompt[start:schema].count("\n\n") == 1

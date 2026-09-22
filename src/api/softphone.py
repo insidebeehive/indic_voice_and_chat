@@ -24,6 +24,7 @@ from src.providers.telephony.softphone import (
     SoftphoneUnsupported,
     mint_browser_credentials,
 )
+from src.utils.logging import debug_event
 
 log = logging.getLogger(__name__)
 router = APIRouter(prefix="/softphone", tags=["softphone"])
@@ -53,8 +54,15 @@ async def mint_softphone_token(
             tenant, req.agent_identity, ttl_seconds=req.ttl_seconds
         )
     except SoftphoneUnsupported as e:
+        # Previously unlogged server-side at any level -- the CRM backend sees
+        # a 400, but an operator investigating "softphone doesn't work for
+        # tenant X" from Loki had no trace of why.
+        debug_event(log, "softphone token_mint rejected", reason="unsupported_provider",
+                    tenant_slug=tenant.slug, agent_identity=req.agent_identity, error=str(e))
         raise HTTPException(status_code=400, detail=str(e))
     except SoftphoneConfigError as e:
+        debug_event(log, "softphone token_mint rejected", reason="config_error",
+                    tenant_slug=tenant.slug, agent_identity=req.agent_identity, error=str(e))
         raise HTTPException(status_code=400, detail=str(e))
     log.info("softphone token minted", extra={
         "tenant": tenant.slug, "provider": creds.provider, "identity": creds.identity})
@@ -67,6 +75,12 @@ async def mint_softphone_token(
         caller_id = ((tel.outbound_from or {}).get("stringee") or tel.from_number or "").lstrip("+")
         if caller_id:
             params["from_number"] = caller_id
+        else:
+            # A minted token the browser can never actually place a call with --
+            # Stringee will reject the app-to-phone call at dial time, far from
+            # here and with nothing in our logs pointing back to this mint.
+            debug_event(log, "softphone token_mint stringee_caller_id_missing",
+                        tenant_slug=tenant.slug)
     return SoftphoneTokenResponse(
         provider=creds.provider, token=creds.token, identity=creds.identity,
         ttl_seconds=creds.ttl_seconds, params=params,

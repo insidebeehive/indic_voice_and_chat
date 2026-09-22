@@ -17,6 +17,7 @@ from typing import Any, AsyncIterator
 import httpx
 
 from src.interfaces.tts import ITTSProvider, TTSConfig, TTSResult
+from src.utils.logging import debug_event
 
 log = logging.getLogger(__name__)
 
@@ -119,6 +120,11 @@ class AzureTTSAdapter(ITTSProvider):
             "Content-Type": "application/ssml+xml",
             "X-Microsoft-OutputFormat": output_format,
         }
+        # SSML carries the customer's text, which DEBUG is meant to log in
+        # full (docs/debug-logging.md) — but only the body, never `headers`
+        # (the subscription key lives there), same rule as the 4xx path below.
+        debug_event(log, "azure tts request", url=self._tts_url, ssml=ssml,
+                    output_format=output_format)
         async with httpx.AsyncClient(timeout=self._timeout) as client:
             resp = await client.post(self._tts_url, headers=headers, content=ssml.encode())
             try:
@@ -134,9 +140,12 @@ class AzureTTSAdapter(ITTSProvider):
                               e.response.text[:500])
                 raise
         pcm = resp.content
+        duration_ms = (len(pcm) / max(rate * 2, 1)) * 1000.0
+        debug_event(log, "azure tts response", audio_bytes=len(pcm),
+                    duration_ms=duration_ms, sample_rate=rate)
         return TTSResult(
             audio=pcm,
-            duration_ms=(len(pcm) / max(rate * 2, 1)) * 1000.0,
+            duration_ms=duration_ms,
             sample_rate=rate,
         )
 

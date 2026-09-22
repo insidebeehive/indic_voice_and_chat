@@ -44,9 +44,18 @@ from src.api.telephony_stringee import reprompt_scco
 from src.api.telephony_stringee_bridge import StringeeIvrBridge, registry
 from src.api.telephony_twilio import softphone_dial_twiml, voice_twiml
 from src.auth import TenantContext
+from src.auth.audit import log_denied
 from src.auth.middleware import tenant_from_slug, tenant_from_twilio_to_number
+from src.auth.webhook_auth import (
+    WebhookAuthError,
+    signature_mode,
+    verify_exotel_basic,
+    verify_stringee,
+    verify_twilio,
+)
 from src.utils import public_url
 from src.utils.http_fetch import assert_safe_url, fetch_capped
+from src.utils.logging import debug_event
 
 log = logging.getLogger(__name__)
 router = APIRouter(prefix="/telephony", tags=["telephony"])
@@ -129,6 +138,7 @@ async def prewarm_stringee_call(call_id: str, tenant) -> None:
     bridge is stored in the registry so _stringee_answer reuses it.
     """
     if _stringee_bridge_factory is None:
+        debug_event(log, "stringee prewarm_call skipped", call_id=call_id, reason="no_bridge_factory")
         return
     from src.config_tenant import platform_webhook_base_url as _plat_wb
     raw_base = _plat_wb() or None
@@ -145,6 +155,10 @@ async def prewarm_stringee_call(call_id: str, tenant) -> None:
         from src.api.telephony_stringee_bridge import registry
         registry.put(bridge)
         await bridge.prewarm()
+        debug_event(
+            log, "stringee prewarm_call succeeded",
+            call_id=call_id, tenant=getattr(tenant, "slug", None),
+        )
     except Exception:
         log.exception("stringee prewarm failed", extra={"call_id": call_id})
 
@@ -162,6 +176,222 @@ def _ws_stream_url(request: Request, path: str) -> str:
     parsed = urlsplit(origin)
     ws_scheme = "wss" if parsed.scheme == "https" else "ws"
     return f"{ws_scheme}://{parsed.netloc}/api/v1/telephony/{path}"
+
+
+# --- Inbound webhook authentication (Twilio / Exotel / Stringee) -----------
+#
+# Wires src/auth/webhook_auth.py's verify_* helpers into the routes that
+# actually establish a call (the "voice"/"answer" webhooks) -- the ones an
+# attacker who merely knows the URL could otherwise use to drive a call flow.
+# Follows the src/api/external_chat.py Chatwoot-webhook precedent exactly:
+#
+#   - No secret configured for the tenant -> verification is skipped
+#     entirely (non-breaking for a tenant that hasn't set one up).
+#   - signature_mode() decides enforce (reject) vs log_only (warn + allow).
+#   - Every provider's *_env / secret name below is an established
+#     resolution path already used elsewhere in this tree -- see each
+#     helper's docstring -- never a newly-invented config key.
+#
+# NOT wired here (same gap, deliberately left unaddressed -- see the
+# deliverable notes): the per-turn `/stringee/event/{slug}` and lifecycle
+# `/stringee/status/{slug}` webhooks (neither currently resolves a
+# TenantContext at all; adding one purely to check a secret is a bigger,
+# separate change), the Stringee/Twilio browser-softphone answer+recording
+# routes, and Twilio's recording-status callback.
+
+
+def _tenant_secret_optional(tenant: object, name: str | None) -> str | None:
+    """``tenant.secret_optional(name)``, tolerant of a tenant object that
+    doesn't implement it.
+
+    Every real caller passes a ``TenantContext`` (which always has this
+    method), but several existing telephony-route tests pass a bare
+    ``SimpleNamespace(slug=..., id=...)`` stand-in for speed. Treating a
+    missing method the same as "secret not configured" keeps this a pure
+    addition for those tests -- skipped verification, not a crash -- rather
+    than requiring every test double in the tree to grow a full
+    ``TenantContext`` surface for an unrelated change.
+    """
+    if name is None:
+        return None
+    fn = getattr(tenant, "secret_optional", None)
+    return fn(name) if fn is not None else None
+
+
+def _reject_webhook_auth(message: str, *, reason: str, route: str, tenant: str | None) -> HTTPException:
+    """Log a webhook auth rejection and return the uniform 401 to raise.
+
+    Same log+return shape as external_chat.py's ``_reject_unauthorized``
+    (``raise _reject_webhook_auth(...) from None`` at the call site), but
+    logs via ``log_denied`` -- the auth-rejection primitive most of
+    src/api/ already uses (calls.py, chat.py, knowledge.py, campaigns.py) --
+    so these land in the same suppressed/rate-limited rejection stream
+    instead of a parallel one. Never pass the signature/secret in ``extra``.
+    """
+    log_denied(
+        logging.WARNING, message,
+        event="auth_rejected", reason=reason, route=route, tenant=tenant,
+    )
+    return HTTPException(status_code=401, detail="invalid webhook signature")
+
+
+def _signature_url_candidates(request: Request) -> list[str]:
+    """URL(s) Twilio may have computed its ``X-Twilio-Signature`` over.
+
+    The primary candidate is built the same proxy-aware way as
+    ``_ws_stream_url``/``_forwarded_base`` (``origin_from_headers``) --
+    Twilio signs the URL it actually POSTed to, which is the public,
+    proxy-fronted one Northflank terminates TLS in front of, not necessarily
+    what Starlette's own ``request.url`` reconstructs from the ASGI scope.
+    That raw reconstruction is included as a second candidate so a
+    header/proxy mismatch doesn't turn into a false reject.
+    """
+    path_and_query = request.url.path
+    if request.url.query:
+        path_and_query += f"?{request.url.query}"
+    forwarded = f"{public_url.origin_from_headers(request)}{path_and_query}"
+    raw = str(request.url)
+    return [forwarded, raw] if forwarded != raw else [forwarded]
+
+
+async def _verify_twilio_signature(request: Request, tenant: object, *, route: str) -> None:
+    """Verify the inbound Twilio webhook's ``X-Twilio-Signature`` against the
+    tenant's Twilio Auth Token.
+
+    Twilio signs webhooks with the SAME Auth Token used to authenticate our
+    outbound API calls (``twilio.request_validator.RequestValidator`` -- there
+    is no separate webhook-signing secret to provision), so this resolves
+    ``pipeline.telephony.creds_for("twilio").auth_token_env`` -- the existing
+    credential slot src/api/dev_console.py's ``_cred(pcreds.auth_token_env)``
+    already reads for the SAME provider's outbound calls.
+
+    Skipped entirely when the tenant has no Twilio auth token configured --
+    the non-breaking case for a tenant that hasn't set one up.
+    """
+    settings = getattr(tenant, "settings", None)
+    telephony = getattr(getattr(settings, "pipeline", None), "telephony", None)
+    auth_token_env = telephony.creds_for("twilio").auth_token_env if telephony is not None else None
+    auth_token = _tenant_secret_optional(tenant, auth_token_env)
+    tenant_slug = getattr(tenant, "slug", None)
+    if log.isEnabledFor(logging.DEBUG):
+        debug_event(
+            log, "telephony twilio_signature resolved",
+            tenant=tenant_slug, route=route, mode=signature_mode(), configured=bool(auth_token),
+        )
+    if not auth_token:
+        return
+    try:
+        verify_twilio(
+            _signature_url_candidates(request), dict(await request.form()),
+            request.headers.get("X-Twilio-Signature"), auth_token,
+        )
+    except WebhookAuthError as e:
+        if signature_mode() == "enforce":
+            raise _reject_webhook_auth(
+                "twilio webhook: signature verification failed",
+                reason=e.reason, route=route, tenant=tenant_slug,
+            ) from None
+        log.warning(
+            "twilio webhook: signature check would have rejected (log_only mode)",
+            extra={"reason": e.reason, "tenant": tenant_slug, "route": route, "mode": "log_only"},
+        )
+    else:
+        if log.isEnabledFor(logging.DEBUG):
+            debug_event(log, "telephony twilio_signature passed", tenant=tenant_slug, route=route)
+
+
+async def _verify_exotel_basic_auth(request: Request, tenant: object, *, route: str) -> None:
+    """Verify the inbound Exotel webhook's HTTP Basic ``Authorization`` header
+    against the tenant's ``webhook:exotel_basic_user``/``webhook:exotel_basic_password``
+    pair.
+
+    That pair is minted by ``POST /tenants/{id}/webhook-credentials/rotate``
+    for the tenant to configure as Basic Auth on Exotel's own
+    Passthru/Voicebot applet -- the same pair src/api/answer_paths.py's
+    ``answer_url_for`` already injects into the OUTBOUND-call answer URL's
+    netloc for this exact purpose.
+
+    Skipped entirely unless BOTH halves are configured (an incomplete pair
+    is treated as unconfigured, matching ``answer_url_for``'s
+    ``both_configured`` check) -- the non-breaking case for a tenant that
+    hasn't rotated these credentials.
+    """
+    user = _tenant_secret_optional(tenant, "webhook:exotel_basic_user")
+    password = _tenant_secret_optional(tenant, "webhook:exotel_basic_password")
+    configured = bool(user and password)
+    tenant_slug = getattr(tenant, "slug", None)
+    if log.isEnabledFor(logging.DEBUG):
+        debug_event(
+            log, "telephony exotel_basic_auth resolved",
+            tenant=tenant_slug, route=route, mode=signature_mode(), configured=configured,
+        )
+    if not configured:
+        return
+    try:
+        verify_exotel_basic(request.headers.get("Authorization"), username=user, password=password)
+    except WebhookAuthError as e:
+        if signature_mode() == "enforce":
+            raise _reject_webhook_auth(
+                "exotel webhook: basic auth verification failed",
+                reason=e.reason, route=route, tenant=tenant_slug,
+            ) from None
+        log.warning(
+            "exotel webhook: basic auth check would have rejected (log_only mode)",
+            extra={"reason": e.reason, "tenant": tenant_slug, "route": route, "mode": "log_only"},
+        )
+    else:
+        if log.isEnabledFor(logging.DEBUG):
+            debug_event(log, "telephony exotel_basic_auth passed", tenant=tenant_slug, route=route)
+
+
+async def _verify_stringee_signature(request: Request, tenant: object, *, route: str) -> None:
+    """Verify the inbound Stringee webhook's ``X-STRINGEE-SIGNATURE`` header
+    against the tenant's ``webhook:stringee_signing_secret`` (the tenant's
+    Stringee Project Signing secret key -- set via the generic
+    ``PATCH /tenants/{id}`` secret-update path; never auto-minted, see
+    src/api/tenants.py's ``rotate_webhook_credentials`` docstring).
+
+    Per Stringee's own docs (developer.stringee.com/docs/validating-requests-
+    are-coming-from-stringee): base64(HMAC-SHA1(secret, data)) in the
+    ``X-STRINGEE-SIGNATURE`` header, where ``data`` is the raw POST body for
+    an event_url POST, or the Request-URI (path+query, leading ``/``) for an
+    answer_url GET -- exactly what ``verify_stringee`` already implements.
+
+    Skipped entirely when the tenant has no signing secret configured -- the
+    non-breaking case for a tenant that hasn't set one up.
+    """
+    secret = _tenant_secret_optional(tenant, "webhook:stringee_signing_secret")
+    tenant_slug = getattr(tenant, "slug", None)
+    if log.isEnabledFor(logging.DEBUG):
+        debug_event(
+            log, "telephony stringee_signature resolved",
+            tenant=tenant_slug, route=route, mode=signature_mode(), configured=bool(secret),
+        )
+    if not secret:
+        return
+    is_post = request.method == "POST"
+    raw_body = await request.body() if is_post else None
+    path_and_query = request.url.path
+    if request.url.query:
+        path_and_query += f"?{request.url.query}"
+    try:
+        verify_stringee(
+            raw_body=raw_body, url_path_and_query=path_and_query,
+            signature=request.headers.get("X-STRINGEE-SIGNATURE"), signing_secret=secret,
+        )
+    except WebhookAuthError as e:
+        if signature_mode() == "enforce":
+            raise _reject_webhook_auth(
+                "stringee webhook: signature verification failed",
+                reason=e.reason, route=route, tenant=tenant_slug,
+            ) from None
+        log.warning(
+            "stringee webhook: signature check would have rejected (log_only mode)",
+            extra={"reason": e.reason, "tenant": tenant_slug, "route": route, "mode": "log_only"},
+        )
+    else:
+        if log.isEnabledFor(logging.DEBUG):
+            debug_event(log, "telephony stringee_signature passed", tenant=tenant_slug, route=route)
 
 
 @router.post("/twilio/voice", response_class=Response)
@@ -184,9 +414,27 @@ async def twilio_voice(
     The resolved slug is embedded in the WS URL so the stream handler can
     re-resolve the same tenant on connect.
     """
+    if log.isEnabledFor(logging.DEBUG):
+        # Only the fields FastAPI declared above (To/From/CallSid/Direction)
+        # are captured anywhere at any level -- Form(...) silently drops
+        # every other field in Twilio's POST body (CallStatus, AccountSid,
+        # ApiVersion, Caller, Called, FromCity, ...). A shape Twilio has
+        # already changed is otherwise invisible until this is raised.
+        debug_event(
+            log, "twilio voice webhook_received",
+            form=dict((await request.form()).multi_items()),
+        )
     is_outbound = (Direction or "").startswith("outbound")
     lookup_number = From if (is_outbound and From) else To
+    # Decision with a directly user-visible outcome: the wrong lookup_number
+    # resolves the wrong tenant, which answers with the wrong agent/prompt.
+    debug_event(
+        log, "twilio voice tenant_lookup_decision",
+        direction=Direction, is_outbound=is_outbound, to=To, from_=From,
+        lookup_number=lookup_number,
+    )
     tenant = await tenant_from_twilio_to_number(lookup_number)
+    await _verify_twilio_signature(request, tenant, route="twilio_voice")
 
     # Tenant slug goes in the URL **path** — Twilio strips query strings
     # from <Stream url=...> attributes when opening the WSS connection.
@@ -218,7 +466,13 @@ async def twilio_voice_for_tenant(
     Inbound calls keep using the bare ``/twilio/voice`` (resolve by number)."""
     from src.auth.middleware import tenant_from_slug
 
+    if log.isEnabledFor(logging.DEBUG):
+        debug_event(
+            log, "twilio voice webhook_received (slug-scoped)",
+            tenant_slug=tenant_slug, form=dict((await request.form()).multi_items()),
+        )
     tenant = await tenant_from_slug(tenant_slug)
+    await _verify_twilio_signature(request, tenant, route="twilio_voice_for_tenant")
     # Embed CallSid in the stream path so the bridge factory can look up
     # per-call overrides (voice/caller_name/lead_name/lead_gender). Twilio
     # strips query strings from <Stream url=...> so the SID must be in the path.
@@ -261,6 +515,7 @@ async def twilio_stream(websocket: WebSocket, tenant_slug: str) -> None:
     bridge = _bridge_factory(websocket, tenant)
     if inspect.isawaitable(bridge):
         bridge = await bridge
+    debug_event(log, "twilio stream bridged", tenant=tenant.slug)
     try:
         await bridge.run()
     except WebSocketDisconnect:
@@ -298,6 +553,7 @@ async def twilio_stream_with_sid(
     bridge = _bridge_factory(websocket, tenant)
     if inspect.isawaitable(bridge):
         bridge = await bridge
+    debug_event(log, "twilio stream bridged", tenant=tenant.slug, call_sid=call_sid)
     try:
         await bridge.run()
     except WebSocketDisconnect:
@@ -342,7 +598,16 @@ async def _provider_caller_id(
         ).limit(1)
     )).scalars().first()
     tel = tenant.settings.pipeline.telephony
-    return owned or (tel.outbound_from or {}).get(provider) or tel.from_number
+    outbound_from = (tel.outbound_from or {}).get(provider)
+    caller_id = owned or outbound_from or tel.from_number
+    debug_event(
+        log, "telephony caller_id resolved",
+        tenant=tenant.slug, provider=provider, caller_id=caller_id,
+        source=("owned_number" if owned else
+                "outbound_from_config" if outbound_from else
+                "from_number_fallback" if tel.from_number else "none"),
+    )
+    return caller_id
 
 
 @router.post("/twilio/softphone-twiml/{tenant_slug}", response_class=Response)
@@ -369,9 +634,21 @@ async def twilio_softphone_twiml(
     from src.api.call_store import insert_call
     from src.models.conversation import Conversation
 
+    if log.isEnabledFor(logging.DEBUG):
+        debug_event(
+            log, "twilio softphone_twiml webhook_received",
+            tenant_slug=tenant_slug, form=dict((await request.form()).multi_items()),
+        )
     tenant = await tenant_from_slug(tenant_slug)
     caller_id = await _provider_caller_id(session, tenant, "twilio")
     if not caller_id:
+        # Raised as an HTTPException (visible to the browser SDK as a 400),
+        # but nothing today records WHY the tenant had no caller-ID -- an
+        # operator sees only "call failed" from the human agent's side.
+        debug_event(
+            log, "twilio softphone_twiml rejected",
+            tenant=tenant.slug, reason="no_caller_id_configured",
+        )
         raise HTTPException(status_code=400, detail="tenant has no Twilio caller-ID configured")
 
     if CallSid:
@@ -384,6 +661,9 @@ async def twilio_softphone_twiml(
                 provider_call_sid=CallSid, channel="softphone", agent_type="human")
             row.notes = f"manual softphone call → {To}"
             await session.commit()
+            debug_event(log, "twilio softphone_twiml call_row created", tenant=tenant.slug, sid=CallSid)
+        else:
+            debug_event(log, "twilio softphone_twiml call_row exists", tenant=tenant.slug, sid=CallSid)
 
     base = _forwarded_base(request)
     cb = f"{base}/twilio/softphone-recording/{tenant_slug}"
@@ -421,10 +701,15 @@ async def _download_twilio_recording(url: str, account_sid: str | None, auth_tok
         raise
 
     auth = (account_sid, auth_token) if (account_sid and auth_token) else None
+    # `wav_url` is the RecordingUrl Twilio's own webhook sent us (a media URL,
+    # the category the standard names explicitly) -- never account_sid/
+    # auth_token, which are the actual credentials and never appear here.
+    debug_event(log, "twilio recording_download request", url=wav_url, authenticated=auth is not None)
     content, _ct = await fetch_capped(
         wav_url, auth=auth, allowed_host_pattern=_TWILIO_RECORDING_HOST_PATTERN,
         max_bytes=_TWILIO_RECORDING_MAX_BYTES,
         timeout=httpx.Timeout(30.0, connect=10.0))
+    debug_event(log, "twilio recording_download response", url=wav_url, bytes=len(content))
     return content
 
 
@@ -450,6 +735,11 @@ async def twilio_softphone_recording(
     from src.interfaces.stt import STTConfig
     from src.pipeline.audio_utils import pcm16_to_wav, wav_split_stereo
 
+    if log.isEnabledFor(logging.DEBUG):
+        debug_event(
+            log, "twilio softphone_recording webhook_received",
+            tenant_slug=tenant_slug, form=dict((await request.form()).multi_items()),
+        )
     tenant = await tenant_from_slug(tenant_slug)
     if not (CallSid and RecordingUrl):
         log.warning("twilio softphone recording missing CallSid/RecordingUrl")
@@ -466,6 +756,10 @@ async def twilio_softphone_recording(
         wav = await _download_twilio_recording(
             RecordingUrl, tenant.secret(c.account_sid_env), tenant.secret(c.auth_token_env))
         left, right, sr = wav_split_stereo(wav)
+        debug_event(
+            log, "twilio softphone_recording split",
+            sid=CallSid, sample_rate=sr, left_bytes=len(left), right_bytes=len(right),
+        )
     except Exception:  # noqa: BLE001 — a fetch/parse failure must not 500 Twilio
         log.exception("twilio softphone recording fetch/split failed", extra={"sid": CallSid})
         await record_outcome(
@@ -543,6 +837,11 @@ async def _log_softphone_call(tenant: TenantContext, provider_call_sid: str, to_
                 await session.commit()
             # The softphone answer IS the connect → mark answered (call.answered).
             await mark_answered(session, provider_call_sid)
+            debug_event(
+                log, "stringee softphone log_call succeeded",
+                tenant=tenant.slug, call_sid=provider_call_sid, to_number=to_number,
+                row_created=existing is None,
+            )
     except Exception:  # noqa: BLE001 — logging must never break; the call already connected
         log.exception("stringee softphone: manual-call logging failed", extra={
             "call_sid": provider_call_sid})
@@ -574,6 +873,10 @@ async def stringee_softphone_answer(
     req_from = str(data.get("from") or "").lstrip("+")
     caller_id = req_from if req_from.isdigit() else \
         (await _provider_caller_id(session, tenant, "stringee") or "").lstrip("+")
+    debug_event(
+        log, "stringee softphone_answer caller_id_decision",
+        tenant=tenant.slug, req_from=req_from, used_req_from=req_from.isdigit(), caller_id=caller_id,
+    )
     if not caller_id:
         log.warning("stringee softphone: no caller-ID for tenant %s", tenant.slug)
         return Response(status_code=400)
@@ -591,6 +894,10 @@ async def stringee_softphone_answer(
     event_url = f"{_stringee_base(request)}/softphone-recording/{tenant_slug}"
     scco = softphone_connect_scco(
         caller_id=caller_id, to_number=to_number, event_url=event_url)
+    debug_event(
+        log, "stringee softphone_answer scco_built",
+        tenant=tenant.slug, call_id=call_id, to_number=to_number, event_url=event_url, scco=scco,
+    )
     return JSONResponse(scco)
 
 
@@ -614,12 +921,25 @@ async def stringee_softphone_recording(
     call_id = str(data.get("call_id") or data.get("callId") or data.get("call_sid") or "")
     rec_url = _stringee_recording_url(data)
     if not (call_id and rec_url):
+        # Silent ack today -- an operator watching for a missing outcome sees
+        # nothing distinguishing "not a recording event" (expected, e.g. a
+        # status ping) from "was a recording event but we couldn't find the
+        # URL field" (a shape change worth chasing).
+        debug_event(
+            log, "stringee softphone_recording not_a_recording_event",
+            tenant=tenant_slug, has_call_id=bool(call_id), has_rec_url=bool(rec_url),
+            keys=sorted(data.keys()),
+        )
         return Response(status_code=200)   # not a recording event — ack and move on
     if _softphone_providers is None:
         log.warning("stringee softphone recording hit but provider registry unset")
         return Response(status_code=503)
     dur_raw = data.get("duration") or data.get("callDuration") or data.get("recordDuration")
     dur_ms = int(float(dur_raw) * 1000) if dur_raw else None
+    debug_event(
+        log, "stringee softphone_recording finalize_dispatched",
+        tenant=tenant_slug, call_id=call_id, rec_url=rec_url, duration_ms=dur_ms,
+    )
     background_tasks.add_task(_finalize_softphone_recording, tenant, call_id, rec_url, dur_ms)
     return Response(status_code=200)
 
@@ -637,10 +957,13 @@ def _audio_transcriber(tenant_llm):
     transcriber from GEMINI_API_KEY — Gemini handles Indian languages + the long
     mono mp3. Returns None if no audio-capable transcriber is available."""
     if getattr(tenant_llm, "transcribe_audio", None):
+        debug_event(log, "softphone_recording transcriber_decision", source="tenant_llm")
         return tenant_llm
     from src.providers import get_llm_provider
     try:
-        return get_llm_provider({"provider": "gemini"})  # GEMINI_API_KEY from env
+        provider = get_llm_provider({"provider": "gemini"})  # GEMINI_API_KEY from env
+        debug_event(log, "softphone_recording transcriber_decision", source="platform_gemini_fallback")
+        return provider
     except Exception:  # noqa: BLE001
         log.warning("softphone recording: no Gemini transcriber — set the platform GEMINI_API_KEY")
         return None
@@ -663,6 +986,7 @@ async def _mark_recording_unavailable(call_id: str, dur_ms: int | None) -> None:
                 summary="Call recording could not be retrieved for analysis.",
                 duration_ms=dur_ms,
             )
+        debug_event(log, "softphone_recording marked_unavailable", call_id=call_id, duration_ms=dur_ms)
     except Exception:  # noqa: BLE001
         log.exception("failed to mark recording-unavailable", extra={"call_id": call_id})
 
@@ -700,6 +1024,13 @@ async def _finalize_softphone_recording(
         log.exception("stringee softphone recording transcription failed", extra={"call_id": call_id})
         await _mark_recording_unavailable(call_id, dur_ms)
         return
+    if not (text or "").strip():
+        # STT produced nothing -- finalize proceeds with an empty transcript
+        # rather than failing, so nothing else marks this. The existing INFO
+        # line's transcript_chars=0 hints at it after the fact; this names
+        # the branch at the point it's decided, for `event=~"telephony .*"`
+        # queries that don't already know to look for a zero.
+        debug_event(log, "stringee softphone_recording transcript_empty", call_id=call_id)
     transcript = [LLMMessage(role="user", content=text)] if (text or "").strip() else []
 
     sm = _softphone_sessionmaker or get_sessionmaker()
@@ -765,16 +1096,31 @@ async def _download_stringee_recording(
     headers = {}
     if sid and secret:
         headers["X-STRINGEE-AUTH"] = mint_server_token(sid, secret)
+    # `authenticated` only -- never sid/secret/the minted server token itself.
+    debug_event(
+        log, "stringee recording_download request",
+        url=url, authenticated=bool(headers), attempts=attempts,
+    )
     delay = 3.0
     async with httpx.AsyncClient(
         timeout=httpx.Timeout(30.0, connect=10.0), follow_redirects=False) as client:
         for attempt in range(attempts):
             resp = await client.get(url, headers=headers)
             if resp.status_code == 404 and attempt < attempts - 1:
+                # Bounded to `attempts` (default 6) -- not a hot loop, safe
+                # to log every retry rather than only the edge.
+                debug_event(
+                    log, "stringee recording_download retry",
+                    url=url, attempt=attempt, next_delay_s=delay,
+                )
                 await _sleep(delay)            # recording not ready yet — wait + retry
                 delay = min(delay * 2, 30.0)
                 continue
             resp.raise_for_status()
+            debug_event(
+                log, "stringee recording_download response",
+                url=url, status=resp.status_code, bytes=len(resp.content), attempt=attempt,
+            )
             return resp.content
     resp.raise_for_status()   # exhausted retries on 404
     return resp.content
@@ -797,9 +1143,23 @@ async def exotel_voice(
     ``Direction``) so the resolution logic is identical: for outbound calls
     the tenant owns ``From``; for inbound it owns ``To``.
     """
+    if log.isEnabledFor(logging.DEBUG):
+        # Same gap as the Twilio webhook: Form(...) only captures the fields
+        # declared above, dropping every other Exotel field (CallType,
+        # DialCallStatus, digits, ...).
+        debug_event(
+            log, "exotel voice webhook_received",
+            form=dict((await request.form()).multi_items()),
+        )
     is_outbound = (Direction or "").startswith("outbound")
     lookup_number = From if (is_outbound and From) else To
+    debug_event(
+        log, "exotel voice tenant_lookup_decision",
+        direction=Direction, is_outbound=is_outbound, to=To, from_=From,
+        lookup_number=lookup_number,
+    )
     tenant = await tenant_from_twilio_to_number(lookup_number)
+    await _verify_exotel_basic_auth(request, tenant, route="exotel_voice")
 
     stream_url = _ws_stream_url(request, f"exotel/stream/{tenant.slug}")
     body = voicebot_xml(stream_url)
@@ -828,7 +1188,13 @@ async def exotel_voice_for_tenant(
     the Twilio slug route; inbound keeps the bare ``/exotel/voice``."""
     from src.auth.middleware import tenant_from_slug
 
+    if log.isEnabledFor(logging.DEBUG):
+        debug_event(
+            log, "exotel voice webhook_received (slug-scoped)",
+            tenant_slug=tenant_slug, form=dict((await request.form()).multi_items()),
+        )
     tenant = await tenant_from_slug(tenant_slug)
+    await _verify_exotel_basic_auth(request, tenant, route="exotel_voice_for_tenant")
     stream_url = _ws_stream_url(request, f"exotel/stream/{tenant.slug}")
     log.info(
         "exotel voice webhook (slug-scoped)",
@@ -861,6 +1227,7 @@ async def exotel_stream(websocket: WebSocket, tenant_slug: str) -> None:
     bridge = _exotel_bridge_factory(websocket, tenant)
     if inspect.isawaitable(bridge):
         bridge = await bridge
+    debug_event(log, "exotel stream bridged", tenant=tenant.slug)
     try:
         await bridge.run()
     except WebSocketDisconnect:
@@ -913,11 +1280,13 @@ async def _download(url: str, tenant: TenantContext) -> bytes:
     # exception handling and silently reprompts the caller forever.
     parts = urlsplit(url if "://" in url else "https://" + url)
     url = f"https://{parts.netloc}{parts.path}" + (f"?{parts.query}" if parts.query else "")
+    debug_event(log, "stringee ivr_turn_recording request", url=url)
     content, _ct = await fetch_capped(
         url, allowed_host_pattern=_STRINGEE_HOST_PATTERN,
         extra_allowed_hosts={extra_host} if extra_host else None,
         max_bytes=_STRINGEE_TURN_MAX_BYTES,
         timeout=httpx.Timeout(8.0, connect=5.0))
+    debug_event(log, "stringee ivr_turn_recording response", url=url, bytes=len(content))
     return content
 
 
@@ -965,7 +1334,16 @@ async def _stringee_params(request: Request) -> dict:
     if request.method == "POST":
         try:
             body = await request.json()
-        except Exception:  # noqa: BLE001 - tolerate empty/non-JSON bodies
+        except Exception as e:  # noqa: BLE001 - tolerate empty/non-JSON bodies
+            # Swallowed on purpose (Stringee sometimes POSTs an empty body),
+            # but a genuinely malformed JSON body is silently indistinguishable
+            # from that today -- the caller only ever sees query_params, with
+            # every POSTed field missing, which looks exactly like a routing
+            # miss rather than a parse failure.
+            debug_event(
+                log, "stringee params body_parse_failed",
+                method=request.method, error_type=type(e).__name__,
+            )
             body = None
         if isinstance(body, dict):
             data = {**data, **body}
@@ -981,8 +1359,14 @@ async def _resolve_stringee_tenant(data: dict):
         if not num:
             continue
         try:
-            return await tenant_from_twilio_to_number(num)
-        except Exception:  # noqa: BLE001 - not this number; try the next
+            tenant = await tenant_from_twilio_to_number(num)
+            debug_event(log, "stringee tenant_resolve matched", field=key, number=num, tenant=tenant.slug)
+            return tenant
+        except Exception as e:  # noqa: BLE001 - not this number; try the next
+            debug_event(
+                log, "stringee tenant_resolve candidate_failed",
+                field=key, number=num, error_type=type(e).__name__,
+            )
             continue
     return None
 
@@ -999,7 +1383,9 @@ async def _stringee_answer(request: Request, tenant: "TenantContext | None"):
     if tenant is None:
         log.warning("stringee answer: no tenant; keys=%s", sorted(data.keys()))
         return Response(status_code=404)
+    await _verify_stringee_signature(request, tenant, route="stringee_answer")
     if _stringee_bridge_factory is None:
+        debug_event(log, "stringee answer rejected", call_id=call_id, reason="no_bridge_factory")
         return Response(status_code=503)
     # Derive the base URL for audio/event webhook links. Prefer the platform
     # webhook_base_url (always the public-internet address) over request headers,
@@ -1014,6 +1400,7 @@ async def _stringee_answer(request: Request, tenant: "TenantContext | None"):
     if bridge is not None:
         log.info("stringee answer: reusing prewarmed bridge", extra={"call_id": call_id})
     else:
+        debug_event(log, "stringee answer building_fresh_bridge", call_id=call_id, tenant=tenant.slug)
         bridge = _stringee_bridge_factory(
             call_id=call_id, tenant=tenant,
             base_url=stringee_base, fetch=functools.partial(_download, tenant=tenant),
@@ -1026,6 +1413,7 @@ async def _stringee_answer(request: Request, tenant: "TenantContext | None"):
     if call_id:
         from src.api import dev_call_control
         dev_call_control.monitor.set_status(call_id, "answered")
+        debug_event(log, "stringee answer dev_call_control_updated", call_id=call_id, status="answered")
     log.info("stringee answer registered", extra={"tenant": tenant.slug, "call_id": call_id})
     return JSONResponse(scco)
 
@@ -1037,7 +1425,11 @@ async def stringee_answer_for_tenant(tenant_slug: str, request: Request):
     follow who placed the call — not the shared caller/dialed number."""
     try:
         tenant = await tenant_from_slug(tenant_slug)
-    except Exception:  # noqa: BLE001 - unknown slug → 404 below
+    except Exception as e:  # noqa: BLE001 - unknown slug → 404 below
+        debug_event(
+            log, "stringee answer_for_tenant slug_resolution_failed",
+            tenant_slug=tenant_slug, error_type=type(e).__name__,
+        )
         tenant = None
     return await _stringee_answer(request, tenant)
 
@@ -1074,12 +1466,23 @@ async def stringee_event(tenant_slug: str, request: Request, call_id: str | None
     )
     bridge = registry.get(call_id) if call_id else None
     if bridge is None or not rec_url:
+        # A silent reprompt today, with the two distinct causes (registry
+        # miss -- the bridge expired/was never registered -- vs. Stringee
+        # simply not sending a recording URL for this event) indistinguishable
+        # from outside. A caller stuck reprompting forever is exactly the
+        # motivating shape for this category.
+        debug_event(
+            log, "stringee event reprompt",
+            tenant=tenant_slug, call_id=call_id, bridge_found=bridge is not None,
+            has_rec_url=bool(rec_url),
+        )
         base = _stringee_base(request)
         return JSONResponse(reprompt_scco(
             text="Maaf kijiye, dobara boliye?",
             event_url=f"{base}/event/{tenant_slug}?call_id={call_id or ''}",
         ))
     scco = await bridge.handle_turn(recording_url=rec_url)
+    debug_event(log, "stringee event turn_handled", tenant=tenant_slug, call_id=call_id, scco=scco)
     return JSONResponse(scco)
 
 
@@ -1112,9 +1515,17 @@ async def stringee_status(tenant_slug: str, request: Request):
     status = (data.get("status") or data.get("event") or data.get("call_status") or "").upper()
     log.info("stringee status", extra={"call_id": call_id, "status": status,
                                         "method": request.method, "data": data})
-    if status in ("ENDED", "FAILED", "NO_ANSWER", "BUSY"):
+    is_terminal = status in ("ENDED", "FAILED", "NO_ANSWER", "BUSY")
+    if is_terminal:
         await registry.end(call_id)
         if call_id:
             from src.api import dev_call_control
             dev_call_control.monitor.set_status(call_id, "ended")
+    else:
+        # A status Stringee sends that isn't in the terminal set skips
+        # registry cleanup entirely and silently leaves the bridge (and its
+        # audio cache) registered -- worth naming explicitly since the INFO
+        # line above already shows `status` but not whether it was RECOGNIZED
+        # as terminal.
+        debug_event(log, "stringee status not_terminal", call_id=call_id, status=status)
     return Response(status_code=200)

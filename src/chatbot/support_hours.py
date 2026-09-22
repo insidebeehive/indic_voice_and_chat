@@ -1,8 +1,13 @@
 """BO support-hours availability checker."""
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+from src.utils.logging import debug_event
+
+log = logging.getLogger(__name__)
 
 _DAY_NAMES = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
 
@@ -21,11 +26,38 @@ def _parse_schedule(support_hours: dict) -> dict:
         if not timerange:
             continue
         days = _DAY_RANGES.get(key.lower(), [])
+        if not days:
+            # A key that doesn't match any known day range (typo, e.g.
+            # "mon-fry") silently drops this whole entry -- the `for d in
+            # days` loop below would just no-op on an empty list with no
+            # trace that the tenant's configured hours for that key were
+            # ever read. This is the entry that made a tenant's support
+            # hours look "always closed" for one day with no error anywhere.
+            # WARNING (not DEBUG, and not a raise): a live tenant config may
+            # already carry this typo, and a hard failure here would turn a
+            # degraded feature (one day silently unavailable) into an
+            # outright one at an unpredictable moment. The fix is visibility,
+            # not stricter parsing -- see the report for why.
+            log.warning(
+                "support_hours: unrecognized day key %r (value %r) -- this "
+                "entry is dropped entirely, not just this key; expected one "
+                "of mon-fri/weekdays/weekend/mon..sun",
+                key, timerange,
+            )
+            continue
         try:
             start_s, end_s = timerange.split("-", 1)
             sh, sm = int(start_s.split(":")[0]), int(start_s.split(":")[1])
             eh, em = int(end_s.split(":")[0]), int(end_s.split(":")[1])
         except Exception:  # noqa: BLE001
+            # A malformed "HH:MM-HH:MM" value (missing dash, non-numeric,
+            # etc) is dropped the same silent way -- same motivation as above,
+            # same reason this is a warning and not a raise.
+            log.warning(
+                "support_hours: unparseable time range %r for key %r "
+                "(expected \"HH:MM-HH:MM\") -- this entry is dropped entirely",
+                timerange, key,
+            )
             continue
         for d in days:
             schedule[d] = (sh * 60 + sm, eh * 60 + em)
@@ -40,17 +72,33 @@ def is_bo_available(chat_support) -> tuple:
     """
     support_hours = getattr(chat_support, "support_hours", {}) or {}
     if not support_hours:
+        debug_event(
+            log, "support_hours availability decision", available=True,
+            reason="support_hours_check_disabled",
+        )
         return True, ""
 
     tz_name = getattr(chat_support, "support_timezone", "Asia/Kolkata") or "Asia/Kolkata"
     try:
         tz = ZoneInfo(tz_name)
     except (ZoneInfoNotFoundError, ValueError):
+        # Silent fallback: a mistyped/unknown IANA zone name in tenant config
+        # would otherwise make every availability decision below silently
+        # evaluate against the wrong timezone, with nothing to show it wasn't
+        # the tenant's own configured one.
+        debug_event(
+            log, "support_hours timezone_resolve fallback",
+            configured_timezone=tz_name, fallback_timezone="Asia/Kolkata",
+        )
         tz = ZoneInfo("Asia/Kolkata")
 
     now = datetime.now(tz)
     schedule = _parse_schedule(support_hours)
     if not schedule:
+        debug_event(
+            log, "support_hours availability decision", available=True,
+            reason="schedule_parse_empty", support_hours=support_hours,
+        )
         return True, ""
 
     cur_day = now.weekday()  # 0=Mon
@@ -60,6 +108,11 @@ def is_bo_available(chat_support) -> tuple:
     if cur_day in schedule:
         start, end = schedule[cur_day]
         if start <= cur_min < end:
+            debug_event(
+                log, "support_hours availability decision", available=True,
+                reason="within_today_window", now=now.isoformat(), timezone=tz_name,
+                cur_day=cur_day, cur_min=cur_min, window=[start, end],
+            )
             return True, ""
 
     # Find next available slot (search up to 7 days ahead)
@@ -71,6 +124,16 @@ def is_bo_available(chat_support) -> tuple:
             next_dt = next_dt.replace(
                 hour=start // 60, minute=start % 60, second=0, microsecond=0)
             label = next_dt.strftime("%A, %d %b at %I:%M %p %Z")
+            debug_event(
+                log, "support_hours availability decision", available=False,
+                reason="outside_hours", now=now.isoformat(), timezone=tz_name,
+                cur_day=cur_day, cur_min=cur_min, next_slot=label,
+            )
             return False, label
 
+    debug_event(
+        log, "support_hours availability decision", available=False,
+        reason="no_slot_found_in_7_days", now=now.isoformat(), timezone=tz_name,
+        schedule=schedule,
+    )
     return False, "soon"

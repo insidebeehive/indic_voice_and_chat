@@ -31,7 +31,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from src.api import campaigns, webhooks_routes
 from src.api.deps import get_db_session
 from src.auth import register_tenant_for_test
-from src.auth.middleware import set_tenant_resolver
+from src.auth.middleware import set_admin_tokens, set_tenant_resolver
 from src.auth.registry import TenantProviders
 from src.campaign.dnd_filter import (
     CallingHoursPolicy,
@@ -238,9 +238,16 @@ async def wired_app(env):
     app.include_router(webhooks_routes.router)
     app.dependency_overrides[get_db_session] = _session_override
 
+    # The /webhooks routes are admin-gated at the router level, so this
+    # fixture needs an admin token as well as the two tenant tokens -- webhook
+    # registration is a platform operation (WebhookManager is process-global),
+    # not something a tenant bearer token can do.
+    set_admin_tokens(["admin-token"])
+
     yield {"app": app, "bus": bus, "crm": crm, "webhook_calls": webhook_calls,
            "orchestrator": orchestrator}
 
+    set_admin_tokens([])
     webhooks_routes.set_webhook_manager(None)
     set_tenant_resolver(None)
     await engine.dispose()
@@ -258,12 +265,19 @@ async def test_two_tenants_run_concurrently_with_full_isolation(wired_app) -> No
 
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
-        # 1. Each tenant registers its own webhook URL.
+        # 1. Two webhook URLs are registered. This is an ADMIN operation, not
+        # a tenant one: WebhookManager is process-global and its routes carry
+        # no tenant scoping, so the router is gated with require_admin. Both
+        # registrations subscribe to "*" on the shared bus, which is what
+        # makes every event below arrive at both URLs.
+        admin_hdr = {"Authorization": "Bearer admin-token"}
         await client.post(
-            "/webhooks", json={"url": "https://acme.example/wh", "event_filters": ["*"]},
+            "/webhooks", headers=admin_hdr,
+            json={"url": "https://acme.example/wh", "event_filters": ["*"]},
         )
         await client.post(
-            "/webhooks", json={"url": "https://globex.example/wh", "event_filters": ["*"]},
+            "/webhooks", headers=admin_hdr,
+            json={"url": "https://globex.example/wh", "event_filters": ["*"]},
         )
 
         # 2. Each tenant creates its own campaign (DB-backed, tenant-scoped).

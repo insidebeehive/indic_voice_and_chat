@@ -52,6 +52,7 @@ from src.integration.tenant_events import sign_body, sign_body_hex
 from src.interfaces.media_storage import IMediaStorage
 from src.models.chat import ChatMessage, ChatSession
 from src.models.deposit_verification import DepositVerificationRequest
+from src.utils.logging import debug_event
 
 log = logging.getLogger(__name__)
 
@@ -84,6 +85,18 @@ async def submit_deposit_verification(
         # the inbound verdict callback (src/api/deposit_verification.py)
         # 401s anything it can't HMAC-verify — submitting without one would
         # create a request whose verdict can never be accepted.
+        #
+        # This should be unreachable (make_chatbot_factory only registers the
+        # tool when all four hold), so hitting it at all means the
+        # registration-time check and this one have drifted apart -- the
+        # discriminating value is WHICH condition failed, not just that one did.
+        if log.isEnabledFor(logging.DEBUG):
+            debug_event(
+                log, "deposit_verification_tool submit gate_rejected",
+                tool_name="submit_deposit_verification", ticket_id=ticket_id, session_id=session_id,
+                dv_enabled=dv_config.enabled, has_webhook_url=bool(dv_config.webhook_url),
+                has_media_store=media_store is not None, has_secret=bool(secret),
+            )
         return {"status": "error", "message": "Verification is not available for this account."}
 
     order_id = (order_id or "").strip()
@@ -143,6 +156,12 @@ async def submit_deposit_verification(
             .limit(1)
         )).scalars().first()
         if screenshot_row is None:
+            if log.isEnabledFor(logging.DEBUG):
+                debug_event(
+                    log, "deposit_verification_tool submit no_screenshot",
+                    tool_name="submit_deposit_verification", ticket_id=ticket_id,
+                    session_id=session_id, order_id=order_id, contract=dv_config.contract,
+                )
             return {
                 "status": "no_screenshot",
                 "message": (
@@ -159,6 +178,14 @@ async def submit_deposit_verification(
             )
         )).scalars().first()
         if existing_pending is not None:
+            if log.isEnabledFor(logging.DEBUG):
+                debug_event(
+                    log, "deposit_verification_tool submit already_pending",
+                    tool_name="submit_deposit_verification", ticket_id=ticket_id,
+                    session_id=session_id, order_id=order_id,
+                    existing_request_id=existing_pending.id,
+                    existing_order_id=existing_pending.order_id,
+                )
             return {
                 "status": "already_pending",
                 "message": (
@@ -227,6 +254,15 @@ async def submit_deposit_verification(
         )
         db.add(row)
         await db.commit()
+
+    if log.isEnabledFor(logging.DEBUG):
+        debug_event(
+            log, "deposit_verification_tool submit initiated",
+            tool_name="submit_deposit_verification", ticket_id=ticket_id, session_id=session_id,
+            request_id=request_id, order_id=order_id, contract=dv_config.contract,
+            screenshot_message_id=screenshot_row.id, use_source_url=use_source_url,
+            timeout_at=timeout_at.isoformat(),
+        )
 
     if dv_config.contract == "json_ticket_relay":
         if use_source_url:
@@ -425,6 +461,15 @@ async def _post_multipart_vendor(
     # caller, so this is always a real signature — never an empty header.
     signature = sign_body(secret, canonical_bytes)
 
+    if log.isEnabledFor(logging.DEBUG):
+        debug_event(
+            log, "deposit_verification_tool vendor_post request",
+            tool_name="submit_deposit_verification", contract="multipart_verdict",
+            ticket_id=ticket_id, session_id=session_id, request_id=request_id, order_id=order_id,
+            webhook_url=dv_config.webhook_url, callback_url=callback_url, mime=mime,
+            data_len=len(data),
+        )
+
     bounded_timeout = min(timeout_s, _MAX_TIMEOUT_S)
     try:
         async with httpx.AsyncClient(timeout=bounded_timeout) as client:
@@ -434,7 +479,15 @@ async def _post_multipart_vendor(
                 files={"screenshot": (f"{request_id}.bin", data, mime)},
                 headers={_SIGNATURE_HEADER: signature},
             )
-        return 200 <= resp.status_code < 300
+        ok = 200 <= resp.status_code < 300
+        if log.isEnabledFor(logging.DEBUG):
+            debug_event(
+                log, "deposit_verification_tool vendor_post response",
+                tool_name="submit_deposit_verification", contract="multipart_verdict",
+                ticket_id=ticket_id, session_id=session_id, request_id=request_id, order_id=order_id,
+                status_code=resp.status_code, ok=ok,
+            )
+        return ok
     except Exception:  # noqa: BLE001 — a failing vendor call must not kill the turn
         log.exception("deposit verification vendor POST failed", extra={
             "ticket_id": ticket_id, "session_id": session_id, "request_id": request_id,
@@ -466,11 +519,20 @@ async def _post_json_ticket_vendor(
     raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
     headers = {"Content-Type": "application/json", _SIGNATURE_HEADER: sign_body_hex(secret, raw)}
 
+    if log.isEnabledFor(logging.DEBUG):
+        debug_event(
+            log, "deposit_verification_tool vendor_post request",
+            tool_name="submit_deposit_verification", contract="json_ticket_relay",
+            ticket_id=ticket_id, session_id=session_id, order_id=order_id,
+            webhook_url=dv_config.webhook_url, screenshot_url=screenshot_url, mobile=mobile,
+        )
+
     bounded_timeout = min(timeout_s, _MAX_TIMEOUT_S)
     try:
         async with httpx.AsyncClient(timeout=bounded_timeout) as client:
             resp = await client.post(dv_config.webhook_url, content=raw, headers=headers)
         ok = 200 <= resp.status_code < 300
+        body = None
         if ok:
             try:
                 body = resp.json()
@@ -487,6 +549,13 @@ async def _post_json_ticket_vendor(
                     "safety net here",
                     extra={"ticket_id": ticket_id, "session_id": session_id, "order_id": order_id},
                 )
+        if log.isEnabledFor(logging.DEBUG):
+            debug_event(
+                log, "deposit_verification_tool vendor_post response",
+                tool_name="submit_deposit_verification", contract="json_ticket_relay",
+                ticket_id=ticket_id, session_id=session_id, order_id=order_id,
+                status_code=resp.status_code, ok=ok, response_body=body,
+            )
         return ok
     except Exception:  # noqa: BLE001 — a failing vendor call must not kill the turn
         log.exception("deposit verification vendor POST failed", extra={

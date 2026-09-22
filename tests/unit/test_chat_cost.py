@@ -2,14 +2,33 @@
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 import pytest_asyncio
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from src.api import chat_cost
 from src.api.chat_cost import compute_chat_turn_cost, token_rates
 from src.auth.seed import seed_provider_costs
 from src.models.database import Base
 from src.models.tenant import ProviderCost
+
+
+@pytest.fixture(autouse=True)
+def _reset_warned_rate_misses():
+    """``chat_cost._warned_rate_misses`` is a module-level set that persists
+    "already warned this (kind, provider, model)" state ACROSS tests in this
+    file (it's the same set token_rates uses in production, populated once at
+    import time and never cleared). Without resetting it here, whichever test
+    happens to run first against a given (provider, model) combo consumes the
+    one-warning-per-process budget, and a later test asserting the warning
+    fired for that same combo would silently see zero log records — the same
+    footgun test_turn_metrics_push.py's _reset_module_push_failure_warner
+    fixture exists to avoid for _PushFailureWarner."""
+    chat_cost._warned_rate_misses.clear()
+    yield
+    chat_cost._warned_rate_misses.clear()
 
 
 @pytest_asyncio.fixture
@@ -220,7 +239,12 @@ async def test_token_rates_real_yaml_seeds_gemini_3_5_flash_cached_rate(real_see
 async def test_compute_chat_turn_cost_warns_when_rate_resolves_to_zero(sm, caplog):
     """A provider/model with no ProviderCost row at all (no exact-model row and
     no provider-level fallback) must resolve to $0 cost *and* log a warning —
-    silent $0 billing for real tokens should never pass without a trace."""
+    silent $0 billing for real tokens should never pass without a trace.
+
+    The warning now comes from token_rates()'s own catalog-miss check (see the
+    Fix 1 tests below), not a second, separate check inside
+    compute_chat_turn_cost — this test pins that the behaviour survives going
+    through the higher-level entry point."""
     with caplog.at_level("WARNING", logger="src.api.chat_cost"):
         async with sm() as s:
             cost = await compute_chat_turn_cost(
@@ -229,5 +253,110 @@ async def test_compute_chat_turn_cost_warns_when_rate_resolves_to_zero(sm, caplo
             )
     assert cost == 0.0
     assert any(
-        "chat cost resolved to $0" in rec.message for rec in caplog.records
+        "no ProviderCost row for kind=llm provider=unknown-provider model=some-model" in rec.message
+        for rec in caplog.records
     )
+
+
+# --- Fix 1: unpriced provider/model warns, once per (kind, provider, model) ---
+#
+# Before this fix, token_rates() fell all the way to (0.0, 0.0, None) with only
+# a DEBUG event (off in normal running) -- an operator had no way to tell "this
+# LLM genuinely costs nothing" apart from "nobody added a ProviderCost row for
+# it" without querying the catalog directly. These tests pin the visibility
+# fix and its log-flood guard (token_rates runs once per chat turn).
+
+
+async def test_token_rates_miss_warns_naming_kind_provider_model(sm, caplog):
+    """A rate lookup with no matching row (exact or provider-level) must warn,
+    and the message must name kind/provider/model so an operator can add the
+    missing row without a query."""
+    with caplog.at_level("WARNING", logger="src.api.chat_cost"):
+        async with sm() as s:
+            await token_rates(s, "no-such-provider", "no-such-model")
+    assert len(caplog.records) == 1
+    msg = caplog.records[0].message
+    assert "kind=llm" in msg
+    assert "provider=no-such-provider" in msg
+    assert "model=no-such-model" in msg
+
+
+async def test_token_rates_miss_warns_once_per_combination(sm, caplog):
+    """A second lookup of the SAME (provider, model) must not warn again --
+    otherwise a provider missing from the catalog would log on every chat
+    turn forever. A DIFFERENT combination must still warn."""
+    with caplog.at_level("WARNING", logger="src.api.chat_cost"):
+        async with sm() as s:
+            await token_rates(s, "ghost", "model-a")
+            await token_rates(s, "ghost", "model-a")   # same combo -- silent
+            await token_rates(s, "ghost", "model-b")   # different model -- warns
+    messages = [rec.message for rec in caplog.records]
+    assert len(messages) == 2
+    assert "model=model-a" in messages[0]
+    assert "model=model-b" in messages[1]
+
+
+async def test_token_rates_found_row_emits_no_warning(sm, caplog):
+    """A lookup that resolves to an actual catalog row -- exact-model or
+    provider-level fallback -- must emit nothing, even though the pre-fix
+    "resolved to $0" check inside compute_chat_turn_cost would have fired on a
+    row with both token rates explicitly at 0.0. That check is gone precisely
+    because a resolved row can no longer be told apart from a missing one at
+    that level -- see compute_chat_turn_cost's comment."""
+    with caplog.at_level("WARNING", logger="src.api.chat_cost"):
+        async with sm() as s:
+            await token_rates(s, "gemini", "gemini-3.5-flash")   # exact row
+            await token_rates(s, "gemini", "gemini-9-ultra")     # provider fallback
+    assert caplog.records == []
+
+
+async def test_zero_rated_row_still_warns(sm, caplog) -> None:
+    """A row that prices everything at zero is the case this function cannot
+    interpret, so it is the one worth saying out loud.
+
+    `cost_per_1k_input_tokens`/`_output_tokens` are NOT NULL with a 0.0
+    default, so a row added without its rates is byte-identical to one priced
+    at zero deliberately. Dropping the older "$0 despite N tokens" warning in
+    favour of the missing-row warning alone would have made the
+    half-configured row silent -- the likelier of the two, since nobody adds
+    a ProviderCost row to record that something is free.
+    """
+    async with sm() as s:
+        s.add(ProviderCost(
+            kind="llm", provider="zeroco", model="zero-1",
+            cost_per_1k_input_tokens=0.0, cost_per_1k_output_tokens=0.0,
+        ))
+        await s.commit()
+        with caplog.at_level(logging.WARNING):
+            in_rate, out_rate, _ = await token_rates(s, "zeroco", "zero-1")
+
+    assert in_rate == 0.0 and out_rate == 0.0
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "zeroco" in text and "zero-1" in text
+    assert "genuinely free" in text, "the warning should name the benign reading too"
+
+
+async def test_zero_rated_row_warns_once_per_combination(sm, caplog) -> None:
+    """Deduped like the miss, or it fires on every turn for the row's lifetime."""
+    async with sm() as s:
+        s.add(ProviderCost(
+            kind="llm", provider="zeroco", model="zero-2",
+            cost_per_1k_input_tokens=0.0, cost_per_1k_output_tokens=0.0,
+        ))
+        await s.commit()
+        with caplog.at_level(logging.WARNING):
+            await token_rates(s, "zeroco", "zero-2")
+            first = len(caplog.records)
+            await token_rates(s, "zeroco", "zero-2")
+
+    assert first == 1
+    assert len(caplog.records) == 1, "same combination warned twice"
+
+
+async def test_priced_row_emits_no_warning(sm, caplog) -> None:
+    """The guard against over-warning: a normally-priced row stays quiet."""
+    async with sm() as s:
+        with caplog.at_level(logging.WARNING):
+            await token_rates(s, "gemini", "gemini-3.5-flash")
+
+    assert caplog.records == []

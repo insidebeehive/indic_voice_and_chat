@@ -13,6 +13,7 @@ import base64
 import logging
 
 from src.interfaces.llm import ContentPart
+from src.utils.logging import debug_event
 
 log = logging.getLogger(__name__)
 
@@ -72,6 +73,16 @@ def extract_key_frames(video: bytes, max_frames: int = _MAX_VIDEO_FRAMES) -> lis
                 frames.append(buf.getvalue())
                 if len(frames) >= max_frames:
                     break
+        # Covers the silent-skip case a caller can't otherwise see: no
+        # exception, PyAV installed, and yet frames comes back empty (e.g. a
+        # container with a video stream that reports 0 decodable frames) --
+        # from the caller's side that's indistinguishable from "video
+        # couldn't be decoded" without total/step to show what was tried.
+        debug_event(
+            log, "media video_frame_extract result",
+            total_frames=total, step=step, frames_extracted=len(frames),
+            max_frames=max_frames,
+        )
         return frames
     except Exception:  # noqa: BLE001 — never let a bad video break the turn
         log.exception("video frame extraction failed")

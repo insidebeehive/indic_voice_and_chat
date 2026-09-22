@@ -22,6 +22,7 @@ Endpoint reference: https://developer.exotel.com/api/
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 from typing import Any, AsyncIterator, Optional
 from urllib.parse import urljoin
@@ -33,6 +34,9 @@ from src.interfaces.telephony import (
     CallSession,
     ITelephonyProvider,
 )
+from src.utils.logging import debug_event
+
+log = logging.getLogger(__name__)
 
 
 # Region-aware base URLs. Exotel's Indian region (``api.exotel.com``) is the
@@ -101,8 +105,20 @@ class ExotelAdapter(ITelephonyProvider):
             "CallType": "trans",  # full duplex
             "TimeLimit": str(config.timeout_seconds) if config.timeout_seconds else "30",
         }
+        url = self._account_url("Calls", "connect")
+        # `data` carries no credential -- api_key/api_token travel only in the
+        # httpx `auth=` basic-auth tuple, never in the form body -- so the
+        # request is safe to log whole.
+        debug_event(log, "exotel initiate_call request", url=url, form=data)
         async with httpx.AsyncClient(auth=self._auth, timeout=self._timeout) as client:
-            resp = await client.post(self._account_url("Calls", "connect"), data=data)
+            resp = await client.post(url, data=data)
+            # Logged at DEBUG before raise_for_status so both a success body
+            # and a 4xx/5xx rejection are captured the same way -- unlike the
+            # TTS/STT adapters, this file had no error-body logging at any
+            # level, so a bad request here previously surfaced as nothing but
+            # httpx's uninformative status line.
+            debug_event(log, "exotel initiate_call response", status=resp.status_code,
+                        body=resp.text)
             resp.raise_for_status()
             payload = resp.json()
         # Response shape: {"Call": {"Sid": "...", "Status": "queued", ...}}
@@ -118,8 +134,11 @@ class ExotelAdapter(ITelephonyProvider):
 
     async def hangup(self, session_id: str) -> None:
         """Terminate an in-progress call by call SID."""
+        debug_event(log, "exotel hangup", session_id=session_id)
         async with httpx.AsyncClient(auth=self._auth, timeout=self._timeout) as client:
             resp = await client.delete(self._account_url("Calls", session_id))
+            debug_event(log, "exotel hangup response", session_id=session_id,
+                        status=resp.status_code, body=resp.text)
             # Exotel returns 200 even for already-ended calls; treat as best-effort.
             if resp.status_code >= 500:
                 resp.raise_for_status()
@@ -127,8 +146,11 @@ class ExotelAdapter(ITelephonyProvider):
     async def transfer(self, session_id: str, to_number: str) -> None:
         """Redirect the call to ``to_number`` via an updated CallType."""
         data = {"To": to_number, "CallType": "trans"}
+        debug_event(log, "exotel transfer request", session_id=session_id, form=data)
         async with httpx.AsyncClient(auth=self._auth, timeout=self._timeout) as client:
             resp = await client.post(self._account_url("Calls", session_id), data=data)
+            debug_event(log, "exotel transfer response", session_id=session_id,
+                        status=resp.status_code, body=resp.text)
             resp.raise_for_status()
 
     async def redirect_to_stream(self, call_sid: str, stream_wss_url: str) -> None:
@@ -146,8 +168,12 @@ class ExotelAdapter(ITelephonyProvider):
             "</Response>"
         )
         data = {"Xml": xml}
+        debug_event(log, "exotel redirect_to_stream request", call_sid=call_sid,
+                    stream_wss_url=stream_wss_url)
         async with httpx.AsyncClient(auth=self._auth, timeout=self._timeout) as client:
             resp = await client.post(self._account_url("Calls", call_sid), data=data)
+            debug_event(log, "exotel redirect_to_stream response", call_sid=call_sid,
+                        status=resp.status_code, body=resp.text)
             resp.raise_for_status()
 
     # --- Media Streams stubs --------------------------------------------

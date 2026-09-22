@@ -40,6 +40,7 @@ from src.config_tenant import (
     TenantSTTConfig,
     TenantTelephonyConfig,
     TenantTTSConfig,
+    merge_provider_config,
     platform_webhook_base_url,
     resolve_chat_tts_config,
     validate_credentials,
@@ -49,6 +50,7 @@ from src.dialogue.campaign_loader import parse_campaign_yaml
 from src.models.campaign import Campaign
 from src.models.conversation import Conversation
 from src.models.tenant import ProviderCost, Tenant, TenantApiKey, TenantPhoneNumber, TenantSecret
+from src.utils.logging import debug_event
 
 log = logging.getLogger(__name__)
 router = APIRouter(prefix="/tenants", tags=["tenants"])
@@ -274,6 +276,28 @@ async def register_tenant(
     session.add(TenantApiKey(
         token_hash=hash_api_token(api_token), tenant_id=tenant_id, label="register"))
 
+    # CRUD boundary: what this tenant was actually registered with. The
+    # existing "registered tenant" INFO line (below) carries only
+    # tenant_id/slug — everything an operator would need to answer "why does
+    # this tenant have no telephony creds" or "what LLM did we register it
+    # with" lived nowhere until now. Telephony key VALUES never appear —
+    # env_fields is {*_env field: synthetic env var NAME}, and secret_rows'
+    # values are dropped here (only the count + the env names above go out).
+    debug_event(
+        log, "tenants register_tenant result", tenant_id=tenant_id, slug=slug,
+        mode=req.mode, timezone=req.timezone, default_language=req.default_language,
+        max_concurrent_calls=req.max_concurrent_calls,
+        stt=(req.stt.model_dump() if req.stt else None),
+        llm=(req.llm.model_dump() if req.llm else None),
+        tts=(req.tts.model_dump() if req.tts else None),
+        realtime=(req.realtime.model_dump() if req.realtime else None),
+        telephony_provider=tel.provider, telephony_from_number=tel.from_number,
+        telephony_phone_numbers=tel.phone_numbers,
+        telephony_key_names_provided=sorted(tel.keys.keys()),
+        telephony_env_fields_set=sorted(env_fields.keys()),
+        events_webhook_url=req.events_webhook_url,
+        crm_operator_id=req.crm_operator_id, crm_id=req.crm_id,
+    )
     await session.commit()
 
     # Refresh the live resolver so the new tenant resolves immediately.
@@ -494,10 +518,26 @@ def _merge_layer_fields(cfg: dict, upd: "LayerUpdateIn", fields: tuple[str, ...]
     same shape as the telephony block's merge below, just for a single dict
     instead of TelephonyUpdateIn's flatter set of fields."""
     out = dict(cfg)
-    for f in fields:
-        v = getattr(upd, f)
-        if v is not None:
+    ignored: list[str] = []
+    for f in ("provider", "model", "language", "voice_id", "speed"):
+        v = getattr(upd, f, None)
+        if v is None:
+            continue
+        if f in fields:
             out[f] = v
+        else:
+            # Discarded input, not a bug in the usual sense: LayerUpdateIn is
+            # one shared shape for stt/llm/tts (docstring), so a caller CAN
+            # send voice_id/speed for an stt/llm layer -- `fields` is what
+            # silently drops it, "harmless no-op" per LayerUpdateIn's own
+            # docstring. An admin who set it expecting an effect gets a 200
+            # with no error and no change; this is the only trace of that.
+            ignored.append(f)
+    if ignored:
+        debug_event(
+            log, "tenants pipeline_layer_update field_discarded",
+            fields_not_applicable_to_layer=ignored, layer_fields=list(fields),
+        )
     return out
 
 
@@ -568,6 +608,13 @@ async def update_tenant(
     adapter for the old provider) survives the edit.
     """
     t = await _require_tenant(session, tenant_id)
+    # CRUD boundary: this PATCH is near-invisible otherwise -- the only
+    # existing trace was "updated tenant" + tenant_id at the very end (below),
+    # with no record of what changed. Snapshot the pre-PATCH state once here;
+    # each block below logs its own before/after, and _admin_label (the
+    # ambient log filter stamped by whichever admin token authenticated this
+    # request) answers "by whom" without this endpoint threading it through.
+    _before_status, _before_crm_id = t.status, t.crm_id
 
     if req.status is not None:
         t.status = req.status
@@ -583,6 +630,7 @@ async def update_tenant(
 
     if req.telephony is not None:
         tu = req.telephony
+        _before_tel_cfg = dict(pc.get("telephony") or {})
         tel_cfg = dict(pc.get("telephony") or {})
         if tu.provider is not None:
             tel_cfg["provider"] = tu.provider
@@ -635,6 +683,18 @@ async def update_tenant(
                 session.add(TenantPhoneNumber(
                     phone_number=ph, tenant_id=tenant_id, provider=tel_cfg.get("provider")))
 
+        # Non-secret telephony fields only (provider/from_number/urls) —
+        # secret VALUES never appear; env_fields/secret_rows carry only the
+        # synthetic env var NAMES `_map_telephony_keys` generated, never the
+        # key material itself.
+        debug_event(
+            log, "tenants update_tenant telephony_block result", tenant_id=tenant_id,
+            before={k: v for k, v in _before_tel_cfg.items() if k != "creds_by_provider"},
+            after={k: v for k, v in tel_cfg.items() if k != "creds_by_provider"},
+            telephony_key_names_provided=sorted(tu.keys.keys()),
+            phone_numbers_replaced=(tu.phone_numbers if tu.phone_numbers is not None else None),
+        )
+
     if req.chatwoot is not None:
         cw = req.chatwoot
         if not crypto.has_key():
@@ -661,6 +721,16 @@ async def update_tenant(
                 session.add(TenantSecret(
                     tenant_id=tenant_id, name=name,
                     value_encrypted=crypto.encrypt(value)))
+        # api_url/account_id/inbox_id are NOT write-only -- get_chat_config
+        # (below) already returns them in plaintext, so logging the same
+        # values here discloses nothing get_chat_config doesn't. api_token
+        # stays a name only, matching its "write-only; never returned" field
+        # (ChatwootUpdateIn).
+        debug_event(
+            log, "tenants update_tenant chatwoot_block result", tenant_id=tenant_id,
+            api_url=cw.api_url, account_id=cw.account_id, inbox_id=cw.inbox_id,
+            api_token_set=cw.api_token is not None,
+        )
 
     if req.crm is not None:
         crm = req.crm
@@ -692,9 +762,20 @@ async def update_tenant(
             crm_cfg = dict(pc.get("crm") or {})
             crm_cfg["operator_id"] = crm.operator_id
             pc["crm"] = crm_cfg
+        # base_url/auth_type/operator_id are returned in plaintext by
+        # get_chat_config below (not write-only), so logging them discloses
+        # nothing that endpoint doesn't already. api_token/x_api_key stay
+        # presence-only, matching their "write-only; never returned" fields
+        # (CrmCredentialsIn).
+        debug_event(
+            log, "tenants update_tenant crm_block result", tenant_id=tenant_id,
+            base_url=crm.base_url, auth_type=crm.auth_type, operator_id=crm.operator_id,
+            api_token_set=crm.api_token is not None, x_api_key_set=crm.x_api_key is not None,
+        )
 
     if req.deposit_verification is not None:
         dv = req.deposit_verification
+        _before_dv_cfg = dict(pc.get("deposit_verification") or {})
         dv_cfg = dict(pc.get("deposit_verification") or {})
         if dv.enabled is not None:
             dv_cfg["enabled"] = dv.enabled
@@ -733,6 +814,15 @@ async def update_tenant(
                     value_encrypted=crypto.encrypt(dv.webhook_secret)))
             dv_cfg["webhook_secret_env"] = name
         pc["deposit_verification"] = dv_cfg
+        # webhook_secret itself never appears (write-only, per
+        # DepositVerificationUpdateIn) -- webhook_secret_set records only
+        # that a new one was minted this PATCH.
+        debug_event(
+            log, "tenants update_tenant deposit_verification_block result", tenant_id=tenant_id,
+            before={k: v for k, v in _before_dv_cfg.items() if k != "webhook_secret_env"},
+            after={k: v for k, v in dv_cfg.items() if k != "webhook_secret_env"},
+            webhook_secret_set=bool(dv.webhook_secret),
+        )
 
     if req.pipeline is not None:
         pl = req.pipeline
@@ -780,6 +870,20 @@ async def update_tenant(
             validate_credentials(prospective_settings, source=f"tenant:{t.slug}")
         except TenantConfigError as e:
             raise HTTPException(status_code=422, detail=str(e))
+        # validate_credentials itself already emits "tenant_config
+        # validate_credentials passed" (src/config_tenant.py) on this same
+        # success path -- this event is the CRUD side: which layers this
+        # PATCH actually touched and what they now hold, not just that the
+        # result was valid.
+        debug_event(
+            log, "tenants update_tenant pipeline_block result", tenant_id=tenant_id,
+            mode=pc.get("mode"),
+            stt=(pc.get("stt") if pl.stt is not None else None),
+            llm=(pc.get("llm") if pl.llm is not None else None),
+            tts=(pc.get("tts") if pl.tts is not None else None),
+            realtime=(pc.get("realtime") if pl.realtime is not None else None),
+            chat_voice=(pc.get("chat_voice") if pl.chat_voice is not None else None),
+        )
 
     if req.status is not None or req.events_webhook_url is not None \
             or req.telephony is not None or req.chatwoot is not None \
@@ -809,6 +913,21 @@ async def update_tenant(
     chat_tts_cfg = resolve_chat_tts_config(effective_pipeline)
     if chat_tts_cfg is not None:
         chat_voice_tts_provider = chat_tts_cfg.provider
+    # Summary of the whole PATCH: status/crm_id (the two fields set directly
+    # on the row, outside pipeline_config) plus the same effective-state view
+    # the HTTP response returns below -- reaching for this in Loki rather
+    # than re-requesting GET /tenants is the point, and it correlates by
+    # tenant_id with every per-block event already emitted above.
+    debug_event(
+        log, "tenants update_tenant result", tenant_id=tenant_id, slug=t.slug,
+        status_before=_before_status, status_after=t.status,
+        crm_id_before=_before_crm_id, crm_id_after=t.crm_id,
+        pipeline_mode=pc.get("mode", "layered"),
+        stt_provider=stt_cfg.get("provider"), llm_provider=llm_cfg.get("provider"),
+        tts_provider=tts_cfg.get("provider"), realtime_provider=realtime_cfg.get("provider"),
+        chat_voice_enabled=bool(chat_voice_cfg.get("enabled")),
+        chat_voice_tts_provider=chat_voice_tts_provider,
+    )
     return UpdateTenantResponse(
         tenant_id=t.id, slug=t.slug, status=t.status,
         telephony_provider=tel_cfg.get("provider"),
@@ -866,6 +985,14 @@ async def rotate_tenant_token(
     session.add(TenantApiKey(
         token_hash=hash_api_token(new_token), tenant_id=tenant_id, label="rotated"))
 
+    # Count only -- token/hash values never appear at any level. Distinguishes
+    # a genuine rotation (revoked_count > 0) from effectively a first
+    # issuance (0 -- no prior key existed), which the existing "rotated
+    # tenant api token" INFO line can't, since it never counted `existing_keys`.
+    debug_event(
+        log, "tenants rotate_tenant_token result", tenant_id=tenant_id,
+        revoked_count=len(existing_keys),
+    )
     await session.commit()
     try:
         await _refresh_resolver(request, tenant_id)
@@ -1091,6 +1218,74 @@ class LayerInfo(BaseModel):
     # the realtime layer stores these under different config keys.
     language: Optional[str] = None
     voice_id: Optional[str] = None
+    # Additive (Task: backoffice "(current: —)" fix). `provider`/`model` above
+    # are the RAW stored override — None on a tenant that never set this
+    # layer, which is exactly the "—" that made 3 of 6 live tenants look
+    # unconfigured on stt/llm/tts while actually running the platform default
+    # from config/default.yaml. These two fields are the EFFECTIVE value
+    # (tenant override merged over the platform default, via the same
+    # merge_provider_config() TenantProviders._config_for runs at request
+    # time — see _layer()), plus a per-field source so the backoffice can
+    # tell "inherits sarvam" apart from "pinned to sarvam" instead of
+    # rendering both identically.
+    effective_provider: Optional[str] = None
+    effective_model: Optional[str] = None
+    # "tenant": this tenant's pipeline_config sets the field.
+    # "platform_default": the tenant has no override; the value shown is
+    #   config/default.yaml's.
+    # "unset": neither has a value — only reachable for `realtime`, which has
+    #   no platform-level default (config.py's PipelineConfig declares
+    #   stt/llm/tts but not realtime; s2s is a tenant-only concept).
+    provider_source: Literal["tenant", "platform_default", "unset"] = "unset"
+    model_source: Literal["tenant", "platform_default", "unset"] = "unset"
+
+
+class ChatVoiceInfo(BaseModel):
+    """Effective state of pipeline.chat_voice — CHAT voice-note TTS replies,
+    not the call cascade (ChatVoiceConfig, src/config_tenant.py).
+
+    Deliberately not a LayerInfo: stt/llm/tts merge tenant fields over a
+    platform default field-by-field (merge_provider_config); chat voice has
+    no platform-level default to merge against at all (there is no
+    ``global_defaults["chat_tts"]`` — see get_chat_tts's docstring,
+    src/auth/registry.py). It is a discrete choice between two whole TTS
+    blocks, made by resolve_chat_tts_config: chat_voice.tts if it names a
+    provider, else pipeline.tts, else nothing resolves. ``source`` records
+    which of those three actually won, because the middle case (silently
+    borrowing the call cascade's TTS) and the last (nothing at all, which for
+    an s2s tenant means falling through to the platform's own account — see
+    0c011a6) look identical to an operator unless the source is named.
+    """
+    # pipeline.chat_voice.enabled, read directly rather than derived from
+    # `source` — resolve_chat_tts_config deliberately ignores `enabled` (it
+    # answers "what WOULD be used"), so a disabled tenant with a fully
+    # resolvable TTS block and an enabled tenant with nothing resolvable can
+    # both reach here; only `enabled` distinguishes "voice replies are off"
+    # from "voice replies are on but broken" — the tenant reported in the
+    # task brief (lotterystage) needed exactly this distinction and the tab
+    # could not make it before this field existed.
+    enabled: bool = False
+    effective_provider: Optional[str] = None
+    effective_model: Optional[str] = None
+    # Same resolved TenantTTSConfig's language/voice_id — lets the
+    # backoffice's shared voice picker (voicePickerHtml("cv_tts", ...),
+    # static/backoffice.html) show a real "(current: ...)" instead of the
+    # "isn't exposed by any GET" placeholder it used to fall back to for this
+    # one picker only.
+    effective_language: Optional[str] = None
+    effective_voice_id: Optional[str] = None
+    # "own": pipeline.chat_voice.tts declares a provider — this tenant
+    #   configured chat voice-note replies separately from its call cascade.
+    # "cascade": chat_voice.tts is empty; resolve_chat_tts_config fell back to
+    #   pipeline.tts. Not a problem for a layered tenant reusing voice it
+    #   already pays for, but the trap for an s2s tenant, which may have no
+    #   pipeline.tts to borrow — that case shows as "none", not "cascade".
+    # "none": neither block declares a provider; resolve_chat_tts_config
+    #   returned None. Combined with `enabled: true` this is the
+    #   enabled-but-nothing-resolvable gap validate_credentials rejects at
+    #   config-write time (0c011a6) — reachable here for a stored config that
+    #   predates that check or was edited around it.
+    source: Literal["own", "cascade", "none"] = "none"
 
 
 class TenantSummary(BaseModel):
@@ -1104,6 +1299,7 @@ class TenantSummary(BaseModel):
     llm: LayerInfo
     tts: LayerInfo
     realtime: LayerInfo
+    chat_voice: ChatVoiceInfo
     telephony_provider: Optional[str] = None
     # Non-secret telephony config (so the backoffice can prefill it) + the NAMES
     # (never values) of the creds configured for the active provider.
@@ -1156,7 +1352,32 @@ class TenantListResponse(BaseModel):
     total: int
 
 
-def _layer(pc: dict, key: str) -> LayerInfo:
+# {layer: TenantXConfig class} — the model _layer() reconstructs the stored
+# dict into before handing it to merge_provider_config, so a field this
+# tenant genuinely didn't set reads as None (not an empty string or missing
+# key) when deciding provider_source/model_source below. "llm" is aliased as
+# _LLM at import time (name collision with the stdlib-adjacent `llm` var used
+# elsewhere in this module).
+_LAYER_MODEL_CLS = {"stt": TenantSTTConfig, "llm": _LLM, "tts": TenantTTSConfig}
+
+
+def _layer(pc: dict, key: str, global_defaults: dict[str, dict]) -> LayerInfo:
+    """Build the display LayerInfo for one pipeline layer.
+
+    ``provider``/``model`` stay the RAW stored override (None when this
+    tenant never set the layer) — unchanged from before, since the
+    backoffice's editing pickers (PIPE_CURRENT in static/backoffice.html)
+    seed their voice-catalog fallback query off exactly that raw value and
+    must keep doing so; this function only ADDS the effective/source fields
+    the "(current: —)" fix needs.
+
+    ``effective_provider``/``effective_model`` resolve the tenant override
+    over the platform default via ``merge_provider_config`` — the same
+    tenant-over-global merge ``TenantProviders._config_for`` (src/auth/
+    registry.py) runs at request time — so this display can't disagree with
+    what actually executes. ``global_defaults`` must be built ONCE by the
+    caller (a single ``get_settings()`` call), not per tenant.
+    """
     d = pc.get(key) or {}
     if key == "realtime":
         # TenantRealtimeConfig (src/config_tenant.py) names these fields
@@ -1167,15 +1388,60 @@ def _layer(pc: dict, key: str) -> LayerInfo:
         # layer kind instead of special-casing s2s — without this mapping
         # the realtime layer's current voice/language would silently come
         # back null even though they're stored.
-        return LayerInfo(
-            provider=d.get("provider"), model=d.get("model"),
-            language=d.get("language_code"), voice_id=d.get("voice"),
-        )
-    # stt/tts read straight off TenantSTTConfig/TenantTTSConfig's own
-    # `language`/`voice_id` field names; llm has neither and both stay None.
+        language, voice_id = d.get("language_code"), d.get("voice")
+        tenant_model = TenantRealtimeConfig(**d)
+        # No platform-level default for realtime to merge against: config.py's
+        # PipelineConfig declares stt/llm/tts only — s2s/realtime is a
+        # tenant-only concept, so config/default.yaml has nothing to inherit.
+        merged = merge_provider_config(tenant_model, {})
+    else:
+        # stt/tts read straight off TenantSTTConfig/TenantTTSConfig's own
+        # `language`/`voice_id` field names; llm has neither and both stay None.
+        language, voice_id = d.get("language"), d.get("voice_id")
+        tenant_model = _LAYER_MODEL_CLS[key](**d)
+        merged = merge_provider_config(tenant_model, global_defaults.get(key, {}))
+
+    def _source(field: str) -> Literal["tenant", "platform_default", "unset"]:
+        if getattr(tenant_model, field, None) is not None:
+            return "tenant"
+        return "platform_default" if merged.get(field) is not None else "unset"
+
     return LayerInfo(
         provider=d.get("provider"), model=d.get("model"),
-        language=d.get("language"), voice_id=d.get("voice_id"),
+        language=language, voice_id=voice_id,
+        effective_provider=merged.get("provider"), effective_model=merged.get("model"),
+        provider_source=_source("provider"), model_source=_source("model"),
+    )
+
+
+def _chat_voice_info(pc: dict) -> ChatVoiceInfo:
+    """Build the display ChatVoiceInfo for pipeline.chat_voice.
+
+    Resolved through resolve_chat_tts_config (src/config_tenant.py) — the
+    same function TenantProviders.get_chat_tts (src/auth/registry.py) calls
+    to decide which TTS an actual chat voice-note reply uses — instead of a
+    second merge written for display, so this tab cannot disagree with what
+    runs. ``TenantPipelineConfig(**pc)`` mirrors the same reconstruction
+    update_tenant's PATCH response already does for this purpose; pydantic
+    ignores the pc keys (deposit_verification, events_webhook_url, ...) that
+    aren't TenantPipelineConfig fields.
+    """
+    pipeline_model = TenantPipelineConfig(**pc)
+    cv = pipeline_model.chat_voice
+    resolved = resolve_chat_tts_config(pipeline_model)
+    if resolved is None:
+        source: Literal["own", "cascade", "none"] = "none"
+    elif cv.tts.provider:
+        source = "own"
+    else:
+        source = "cascade"
+    return ChatVoiceInfo(
+        enabled=cv.enabled,
+        effective_provider=resolved.provider if resolved else None,
+        effective_model=resolved.model if resolved else None,
+        effective_language=resolved.language if resolved else None,
+        effective_voice_id=resolved.voice_id if resolved else None,
+        source=source,
     )
 
 
@@ -1199,6 +1465,19 @@ async def list_tenants(
     """List every tenant with its mode + selected providers/models (admin)."""
     rows = (await session.execute(select(Tenant).order_by(Tenant.created_at))).scalars().all()
     base = (platform_webhook_base_url() or "").rstrip("/")
+
+    # Platform pipeline defaults, resolved ONCE for the whole list — not per
+    # tenant in the loop below. get_settings() is an lru_cache singleton so a
+    # second call here would be cheap too, but a call per tenant still means
+    # every backoffice list-tenants page load re-derives the same dict N
+    # times for no reason.
+    from src.config import get_settings
+    platform_pipeline = get_settings().pipeline
+    global_defaults = {
+        "stt": platform_pipeline.stt.model_dump(),
+        "llm": platform_pipeline.llm.model_dump(),
+        "tts": platform_pipeline.tts.model_dump(),
+    }
 
     # Webhook-credential secret names, per tenant — a dedicated query instead
     # of lazy-loading Tenant.secrets (the query above doesn't eager-load that
@@ -1260,11 +1539,36 @@ async def list_tenants(
             dv = DepositVerificationConfig()
         dv_env = dv_env_by_tenant.get(t.id)
         dv_secret_set = dv_env is not None and (t.id, dv_env) in dv_secret_pairs
+        stt_info = _layer(pc, "stt", global_defaults)
+        llm_info = _layer(pc, "llm", global_defaults)
+        tts_info = _layer(pc, "tts", global_defaults)
+        realtime_info = _layer(pc, "realtime", global_defaults)
+        chat_voice_info = _chat_voice_info(pc)
+        if log.isEnabledFor(logging.DEBUG):
+            # THE decision this whole endpoint exists to surface (af33cb8,
+            # 9808a21 — see this file's module-level history): for each
+            # layer, whether the effective value came from this tenant's own
+            # override or was silently inherited from config/default.yaml.
+            # Guarded because this walks every tenant on every backoffice
+            # list-tenants page load.
+            debug_event(
+                log, "tenants effective_config decision", tenant_id=t.id, slug=t.slug,
+                stt={"effective": stt_info.effective_provider, "source": stt_info.provider_source},
+                llm={"effective": llm_info.effective_provider, "source": llm_info.provider_source},
+                tts={"effective": tts_info.effective_provider, "source": tts_info.provider_source},
+                realtime={"effective": realtime_info.effective_provider,
+                          "source": realtime_info.provider_source},
+                chat_voice={"enabled": chat_voice_info.enabled,
+                            "effective_provider": chat_voice_info.effective_provider,
+                            "source": chat_voice_info.source},
+            )
         items.append(TenantSummary(
             tenant_id=t.id, slug=t.slug, name=t.name, status=t.status,
             mode=t.mode, max_concurrent_calls=t.max_concurrent_calls,
-            stt=_layer(pc, "stt"), llm=_layer(pc, "llm"), tts=_layer(pc, "tts"),
-            realtime=_layer(pc, "realtime"),
+            stt=stt_info, llm=llm_info,
+            tts=tts_info,
+            realtime=realtime_info,
+            chat_voice=chat_voice_info,
             telephony_provider=tel.get("provider"),
             telephony_from_number=tel.get("from_number"),
             telephony_stringee_base_url=tel.get("stringee_base_url"),
@@ -1700,6 +2004,39 @@ class ChatTurnMetricsTurns(BaseModel):
     guard_no_grounding_fired_rate_pct: float
     guard_unverified_data_fired_rate_pct: float
     escalated_rate_pct: float
+    # Length of the turn's FINAL customer-visible reply (see
+    # src/models/chat_turn_metrics.py's reply_chars/reply_words column
+    # comments -- measured post-guard, so a guard-substituted canned fallback
+    # counts as what the customer actually saw). NULL rows -- pre-migration-
+    # 0026 rows, or a WS-layer failure row that never produced a reply -- are
+    # skipped by both the SQL AVG below and the Python-side percentile
+    # computation; reply_length_samples is how many rows actually fed these
+    # numbers.
+    #
+    # avg_reply_words/avg_reply_chars share the exact 0.0-ambiguity trap
+    # cache_hit_rate_pct documents above: `_h_avg` returns SQL NULL when
+    # every healthy row's column is NULL, and `round(float(x or 0.0), 1)`
+    # flattens that NULL to 0.0 -- indistinguishable from "every reply was
+    # genuinely empty". Same precedent as
+    # src/observability/chat_metrics_push.py's vox_chat_turn_cache_hit_rate_pct
+    # comment: don't trust a 0.0 reading here without also checking
+    # reply_length_samples != 0. p50_reply_words/p95_reply_words have the
+    # same ambiguity via their own `... if reply_words_values else 0`
+    # fallback (matching p50_total_ms's house style, deliberately not
+    # changed here) -- reply_length_samples disambiguates all four of these
+    # fields, not just the two averages.
+    avg_reply_words: float
+    p50_reply_words: int
+    p95_reply_words: int
+    avg_reply_chars: float
+    # Count of healthy rows with a non-NULL reply_words -- avg_reply_chars
+    # separately averages non-NULL reply_chars, but the two populations
+    # coincide today because record_chat_turn_metric always writes
+    # reply_chars/reply_words together (see chat_turn_metrics.py), so this
+    # one count also describes what fed avg_reply_chars. Without it, an
+    # analyst can't tell "no rows have been measured yet" apart from a
+    # genuine 0.0/0 reading.
+    reply_length_samples: int
     turns_with_tool_failure: int
     # WS-layer failure rows (src/api/chat.py::_record_ws_turn_failure_metric,
     # a turn that raised or timed out before the agent produced a
@@ -1826,6 +2163,17 @@ async def tenant_chat_turn_metrics(
             func.sum(case((healthy, ChatTurnMetric.input_tokens), else_=0)),
             func.sum(case((healthy, ChatTurnMetric.cached_tokens), else_=0)),
             _h_avg(ChatTurnMetric.rounds),
+            # reply_words/reply_chars are themselves nullable (unlike every
+            # other column _h_avg is used on above) -- but that needs no
+            # special-casing here: CASE WHEN healthy THEN reply_words END is
+            # already NULL for a NULL reply_words regardless of healthy, and
+            # SQL AVG skips NULL inputs on both sides (sum and count), so a
+            # pre-migration-0026 row is excluded "for free" as long as
+            # avg_total/etc below use `x or 0.0`, never a bare cast. See
+            # ChatTurnMetricsTurns' own field comment for the resulting
+            # 0.0-ambiguity trap.
+            _h_avg(ChatTurnMetric.reply_words),
+            _h_avg(ChatTurnMetric.reply_chars),
             _h_cond_sum(ChatTurnMetric.rounds_exhausted.is_(True)),
             _h_cond_sum(ChatTurnMetric.retry_fired.is_(True)),
             _h_cond_sum(ChatTurnMetric.failure_directive_fired.is_(True)),
@@ -1839,6 +2187,7 @@ async def tenant_chat_turn_metrics(
     (
         samples, n_failed_turns, avg_total, avg_llm_total, avg_tool_total, avg_kb_search,
         avg_input_tok, avg_output_tok, avg_cached_tok, sum_input_tok, sum_cached_tok, avg_rounds,
+        avg_reply_words, avg_reply_chars,
         n_rounds_exhausted, n_retry_fired, n_failure_directive, n_guard_hallucination,
         n_guard_no_grounding, n_guard_unverified, n_escalated, n_tool_failure,
     ) = agg
@@ -1854,11 +2203,43 @@ async def tenant_chat_turn_metrics(
         round(int(sum_cached_tok or 0) * 100 / sum_input_tok, 1) if sum_input_tok else 0.0
     )
 
-    total_ms_values = sorted((await session.execute(
-        select(ChatTurnMetric.total_ms).where(*turn_filter, healthy)
+    # Extended to also carry reply_words in this SAME single-scan query,
+    # rather than a second query -- that preserves both the
+    # _CHAT_TURN_METRICS_MAX_ROWS DoS bound and the deterministic oldest-first
+    # order_by(created_at) truncation for a second time (a second, separately
+    # truncated fetch could disagree with this one about which rows fall
+    # inside the cap when there are more than _CHAT_TURN_METRICS_MAX_ROWS in
+    # the window). reply_chars is NOT selected here -- avg_reply_chars above
+    # comes entirely from the SQL _h_avg(...) aggregate, and p50/p95 are only
+    # ever computed for reply_words, so a per-row reply_chars value has no
+    # reader on this path.
+    #
+    # `.all()` + tuple unpack, not `.scalars()` -- `.scalars()` only works for
+    # a single-column select.
+    #
+    # sorted() is applied to total_ms_values immediately below (that column is
+    # NOT NULL, same as before), but NOT to the raw reply_words fetch --
+    # every row written before migration 0026 has reply_words/reply_chars IS
+    # NULL, and this endpoint is a bare route handler with no `except`.
+    # `sorted()` over a list containing a bare `None` alongside ints raises
+    # TypeError, which would 500 this endpoint for the tenant's entire window,
+    # for every tenant, until enough pre-migration rows age out of the
+    # retention window. reply_words_values below filters `is not None`
+    # BEFORE sorting for exactly this reason.
+    turn_rows = (await session.execute(
+        select(
+            ChatTurnMetric.total_ms, ChatTurnMetric.reply_words,
+        ).where(*turn_filter, healthy)
         .order_by(ChatTurnMetric.created_at)
         .limit(_CHAT_TURN_METRICS_MAX_ROWS)
-    )).scalars().all())
+    )).all()
+
+    total_ms_values = sorted(r.total_ms for r in turn_rows)
+    # reply_length_samples is this filtered list's length -- see
+    # ChatTurnMetricsTurns' own field comment on why a caller needs this
+    # count to interpret a 0.0 avg_reply_words reading correctly.
+    reply_words_values = sorted(r.reply_words for r in turn_rows if r.reply_words is not None)
+    reply_length_samples = len(reply_words_values)
 
     turns = ChatTurnMetricsTurns(
         samples=samples,
@@ -1880,6 +2261,11 @@ async def tenant_chat_turn_metrics(
         guard_no_grounding_fired_rate_pct=_rate_pct(n_guard_no_grounding),
         guard_unverified_data_fired_rate_pct=_rate_pct(n_guard_unverified),
         escalated_rate_pct=_rate_pct(n_escalated),
+        avg_reply_words=round(float(avg_reply_words or 0.0), 1),
+        p50_reply_words=_percentile(reply_words_values, 50) if reply_words_values else 0,
+        p95_reply_words=_percentile(reply_words_values, 95) if reply_words_values else 0,
+        avg_reply_chars=round(float(avg_reply_chars or 0.0), 1),
+        reply_length_samples=reply_length_samples,
         turns_with_tool_failure=int(n_tool_failure or 0),
         failed_turns=failed_turns,
         turn_failure_rate_pct=round(failed_turns * 100 / total_turns, 1) if total_turns else 0.0,
@@ -1997,7 +2383,16 @@ def _campaign_script_fields(config_yaml: str) -> dict:
     parser the runtime uses). Returns {} if the YAML can't be parsed."""
     try:
         sc = parse_campaign_yaml(config_yaml).script
-    except Exception:  # noqa: BLE001 - a broken row shouldn't break the list
+    except Exception as e:  # noqa: BLE001 - a broken row shouldn't break the list
+        # Swallowed exception that changes resolved config: the caller
+        # (list_tenant_campaigns / update_campaign_script) gets back {} —
+        # indistinguishable from "this campaign genuinely has no script
+        # fields yet" unless this line is on. Full config_yaml: it's the
+        # tenant's own campaign script, not customer PII.
+        debug_event(
+            log, "tenants campaign_script_parse_failed", error=f"{type(e).__name__}: {e}",
+            config_yaml=config_yaml,
+        )
         return {}
     closing = sc.closing.get("default") or next(iter(sc.closing.values()), "") if sc.closing else ""
     return {

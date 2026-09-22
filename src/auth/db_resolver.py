@@ -22,6 +22,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
 from src.auth import secrets as secret_crypto
+from src.auth.audit import token_fingerprint
 from src.auth.context import TenantContext
 from src.config_tenant import (
     ChatSupportConfig,
@@ -34,6 +35,43 @@ from src.config_tenant import (
 from src.models.tenant import Tenant
 
 log = logging.getLogger(__name__)
+
+
+def _log_reload_collision(
+    key_kind: str,
+    key_repr: str,
+    existing_tenant_id: str,
+    existing_tenant_slug: str,
+    new_tenant_id: str,
+    new_tenant_slug: str,
+) -> None:
+    """One tenant's reload() entry overwrote another's under the same lookup
+    key -- see the call sites in ``reload()`` for which keys are safe to log
+    in full (``key_repr``) versus pre-fingerprinted by the caller.
+
+    This is a data condition, not something we can safely raise on: failing
+    the whole resolver load over one bad row would take every tenant down,
+    not just the two colliding ones. So it stays last-write-wins and this is
+    the trace an operator needs to act on it without a database query -- both
+    tenant ids, which key, and what kind of key it was. ERROR (not the
+    DEBUG-only ``debug_event`` this replaced) because DEBUG is off in normal
+    running and a cross-tenant routing collision must reach whatever alerting
+    exists.
+    """
+    log.error(
+        "tenant resolver reload: %s collision on %s -- tenant %s (%s) was overwritten by "
+        "tenant %s (%s); inbound routing for %s now resolves to %s (last-loaded wins)",
+        key_kind, key_repr, existing_tenant_id, existing_tenant_slug,
+        new_tenant_id, new_tenant_slug, existing_tenant_slug, new_tenant_slug,
+        extra={
+            "key_kind": key_kind,
+            "key_repr": key_repr,
+            "existing_tenant_id": existing_tenant_id,
+            "existing_tenant_slug": existing_tenant_slug,
+            "new_tenant_id": new_tenant_id,
+            "new_tenant_slug": new_tenant_slug,
+        },
+    )
 
 
 def tenant_context_from_row(
@@ -94,6 +132,26 @@ def tenant_context_from_row(
         except secret_crypto.SecretsError:
             log.exception("failed to decrypt tenant secret", extra={
                 "tenant": tenant.slug, "secret_name": s.name})
+    # The single line that answers "what did this tenant resolve to" --
+    # prompt_pack/pronunciation_overrides/events_webhook_url are all
+    # denormalized/fallback-cascaded from several sources above, and a tenant
+    # silently landing on the wrong one is exactly the "resolves to the wrong
+    # row" incident class this file exists to make diagnosable.
+    from src.utils.logging import debug_event
+    debug_event(
+        log, "tenant_resolver context_from_row built",
+        tenant_id=tenant.id, tenant_slug=tenant.slug, crm_id=tenant.crm_id,
+        prompt_pack=settings.prompt_pack,
+        prompt_pack_source="crm" if crm_prompt_pack else "default",
+        pronunciation_overrides_set=crm_pronunciation_overrides is not None,
+        events_webhook_url_set=bool(events_webhook_url),
+        events_webhook_url_source=(
+            "top_level" if pc.get("events_webhook_url")
+            else "telephony_legacy" if tel_pc.get("events_webhook_url")
+            else None
+        ),
+        secrets_resolved_count=len(resolved), secrets_declared_count=len(tenant.secrets),
+    )
     return TenantContext(settings=settings, secrets_resolved=resolved)
 
 
@@ -151,19 +209,55 @@ class DbTenantResolver:
                 for k in t.api_keys:
                     by_token[k.token_hash] = ctx
                 for p in t.phone_numbers:
+                    # A duplicate phone number across two tenants silently
+                    # picks "whichever tenant loaded last" with no trace at
+                    # any level -- inbound calls to it would route to the
+                    # wrong tenant. Not a credential: it's the customer-facing
+                    # number, safe in full at DEBUG.
+                    if p.phone_number in by_phone and by_phone[p.phone_number].id != t.id:
+                        _log_reload_collision(
+                            "phone_number", p.phone_number,
+                            by_phone[p.phone_number].id, by_phone[p.phone_number].slug,
+                            t.id, t.slug)
                     by_phone[p.phone_number] = ctx
                 inbox_id = ctx.secrets_resolved.get("chatwoot:inbox_id")
                 if inbox_id:
-                    by_cw_inbox[str(inbox_id)] = ctx
+                    key = str(inbox_id)
+                    if key in by_cw_inbox and by_cw_inbox[key].id != t.id:
+                        _log_reload_collision(
+                            "chatwoot_inbox_id", key,
+                            by_cw_inbox[key].id, by_cw_inbox[key].slug, t.id, t.slug)
+                    by_cw_inbox[key] = ctx
+                # The next three are capability tokens -- presenting the raw
+                # value alone resolves (and thereby authenticates) a tenant
+                # for that webhook route, so they are credentials by the same
+                # rule as a bearer token: fingerprint only, never the value,
+                # even when reporting a collision between two tenants.
                 stringee_webhook_token = ctx.secrets_resolved.get("webhook:stringee_path_token")
                 if stringee_webhook_token:
-                    by_stringee_webhook_token[str(stringee_webhook_token)] = ctx
+                    key = str(stringee_webhook_token)
+                    if key in by_stringee_webhook_token and by_stringee_webhook_token[key].id != t.id:
+                        _log_reload_collision(
+                            "stringee_webhook_token", token_fingerprint(key),
+                            by_stringee_webhook_token[key].id, by_stringee_webhook_token[key].slug,
+                            t.id, t.slug)
+                    by_stringee_webhook_token[key] = ctx
                 chatwoot_webhook_id = ctx.secrets_resolved.get("chatwoot:webhook_id")
                 if chatwoot_webhook_id:
-                    by_cw_webhook_id[str(chatwoot_webhook_id)] = ctx
+                    key = str(chatwoot_webhook_id)
+                    if key in by_cw_webhook_id and by_cw_webhook_id[key].id != t.id:
+                        _log_reload_collision(
+                            "chatwoot_webhook_id", token_fingerprint(key),
+                            by_cw_webhook_id[key].id, by_cw_webhook_id[key].slug, t.id, t.slug)
+                    by_cw_webhook_id[key] = ctx
                 dv_reply_token = ctx.secrets_resolved.get("deposit_verification:reply_token")
                 if dv_reply_token:
-                    by_dv_reply_token[str(dv_reply_token)] = ctx
+                    key = str(dv_reply_token)
+                    if key in by_dv_reply_token and by_dv_reply_token[key].id != t.id:
+                        _log_reload_collision(
+                            "deposit_verification_reply_token", token_fingerprint(key),
+                            by_dv_reply_token[key].id, by_dv_reply_token[key].slug, t.id, t.slug)
+                    by_dv_reply_token[key] = ctx
             self._by_token, self._by_slug, self._by_phone = by_token, by_slug, by_phone
             self._by_id = by_id
             self._by_chatwoot_inbox = by_cw_inbox

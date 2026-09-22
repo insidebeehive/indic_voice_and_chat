@@ -13,10 +13,13 @@ stored secret, so treat it like a master credential.
 
 from __future__ import annotations
 
+import logging
 import os
 from functools import lru_cache
 
 from cryptography.fernet import Fernet, InvalidToken
+
+log = logging.getLogger(__name__)
 
 VOX_SECRET_KEY_ENV = "VOX_SECRET_KEY"
 
@@ -35,25 +38,46 @@ def _fernet() -> Fernet:
             f"python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())'"
         )
     try:
-        return Fernet(key.encode("utf-8") if isinstance(key, str) else key)
+        fernet = Fernet(key.encode("utf-8") if isinstance(key, str) else key)
     except (ValueError, TypeError) as e:
         raise SecretsError(f"{VOX_SECRET_KEY_ENV} is not a valid Fernet key: {e}") from e
+    # Fires once per process (lru_cache maxsize=1) -- never the key itself,
+    # only its length, so an operator can confirm a key IS configured and
+    # roughly matches expectations without it ever leaving os.environ.
+    from src.utils.logging import debug_event
+    debug_event(log, "secrets fernet_key loaded", key_len=len(key))
+    return fernet
 
 
 def encrypt(plaintext: str) -> str:
     """Encrypt a secret for storage. Returns a urlsafe-base64 token (str)."""
-    return _fernet().encrypt(plaintext.encode("utf-8")).decode("ascii")
+    token = _fernet().encrypt(plaintext.encode("utf-8")).decode("ascii")
+    # Boundary: every telephony secret written to tenant_secrets crosses here.
+    # Lengths only -- never plaintext or the encrypted token itself (the
+    # token is not the plaintext, but it is a working, decryptable credential
+    # and is treated with the same care).
+    from src.utils.logging import debug_event
+    debug_event(log, "secrets encrypt response", plaintext_len=len(plaintext), token_len=len(token))
+    return token
 
 
 def decrypt(token: str) -> str:
     """Decrypt a stored secret token back to plaintext."""
     try:
-        return _fernet().decrypt(token.encode("utf-8")).decode("utf-8")
+        value = _fernet().decrypt(token.encode("utf-8")).decode("utf-8")
     except InvalidToken as e:
         raise SecretsError(
             "could not decrypt a stored secret — the VOX_SECRET_KEY likely changed "
             "since it was encrypted"
         ) from e
+    # Boundary: every per-tenant telephony secret decrypted at resolver-reload
+    # time crosses here. Length only, never the decrypted value -- the caller
+    # (db_resolver.py's tenant_context_from_row) already logs a decrypt
+    # FAILURE at ERROR level with the secret name; this covers the success
+    # side, which previously left no trace at any level.
+    from src.utils.logging import debug_event
+    debug_event(log, "secrets decrypt response", token_len=len(token), value_len=len(value))
+    return value
 
 
 def has_key() -> bool:

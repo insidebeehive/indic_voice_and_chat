@@ -140,6 +140,13 @@ async def test_ws_turn_timeout_writes_failure_row(app: FastAPI, monkeypatch) -> 
     assert row.rounds == 0
     assert row.rounds_exhausted is False
     assert row.escalated is False
+    # The end-to-end pin on NULL-not-0: _record_ws_turn_failure_metric sends
+    # only total_ms/action, so reply_chars/reply_words must come out NULL
+    # ("no measurement" -- this turn never produced a reply), never 0
+    # ("measured, reply genuinely empty"). Every future AVG/percentile over
+    # reply length depends on this distinction holding.
+    assert row.reply_chars is None
+    assert row.reply_words is None
 
 
 async def test_ws_turn_exception_writes_failure_row_with_no_tool_children(

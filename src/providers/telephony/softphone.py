@@ -23,11 +23,15 @@ our token endpoint server-side and passes the result to its browser.
 
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass, field
 from typing import Optional
 
 from src.auth.context import TenantContext
+from src.utils.logging import debug_event
+
+log = logging.getLogger(__name__)
 
 # Telephony providers with a usable browser softphone SDK.
 SUPPORTED_PROVIDERS = ("twilio", "stringee")
@@ -75,6 +79,11 @@ def mint_browser_credentials(
     if not agent_identity:
         raise SoftphoneConfigError("agent_identity is required")
     provider = (tenant.settings.pipeline.telephony.provider or "").lower()
+    # Which provider path a tenant resolves to is a real decision (it decides
+    # whether the browser gets a usable credential at all) -- the minted
+    # token itself never appears here or in either _mint_* helper below.
+    debug_event(log, "softphone mint requested", tenant=tenant.slug, provider=provider,
+                agent_identity=agent_identity, ttl_seconds=ttl_seconds)
     if provider == "twilio":
         return _mint_twilio(tenant, agent_identity, ttl_seconds)
     if provider == "stringee":
@@ -114,6 +123,10 @@ def _mint_twilio(tenant: TenantContext, identity: str, ttl: int) -> SoftphoneCre
     jwt_str = token.to_jwt()
     if isinstance(jwt_str, bytes):  # twilio<9 returned bytes
         jwt_str = jwt_str.decode("ascii")
+    # `jwt_str` itself never appears in the log -- it's a bearer credential
+    # the browser will use to place calls, no different from an API key.
+    debug_event(log, "softphone minted", provider="twilio", tenant=tenant.slug,
+                identity=identity, ttl_seconds=ttl)
     return SoftphoneCredentials(
         provider="twilio", token=jwt_str, identity=identity, ttl_seconds=ttl,
     )
@@ -151,6 +164,8 @@ def _mint_stringee(
     )
     if isinstance(token, bytes):  # PyJWT<2 returned bytes
         token = token.decode("ascii")
+    debug_event(log, "softphone minted", provider="stringee", tenant=tenant.slug,
+                identity=identity, ttl_seconds=ttl)
     return SoftphoneCredentials(
         provider="stringee", token=token, identity=identity, ttl_seconds=ttl,
     )

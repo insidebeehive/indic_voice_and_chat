@@ -32,6 +32,7 @@ from src.interfaces.llm import (
     ToolCall,
     is_llm_spending_cap_error,
 )
+from src.utils.logging import debug_event
 
 
 log = logging.getLogger(__name__)
@@ -108,7 +109,9 @@ def _concurrency_sem() -> asyncio.Semaphore:
 # See docs/llm-prompt-caching.md for the measurements this rests on: Gemini's
 # IMPLICIT cache only covers the single contiguous ``system_instruction``
 # field (never ``contents``, never ``config.tools``), and even there it's
-# capped around 4,024-4,028 tokens against this codebase's real prompts —
+# capped around 4,024-4,028 tokens against this codebase's real prompts (stale —
+# measured at a ~17,803-char generic-pack prompt, before the reply-length
+# prompt change grew it; needs re-measuring) —
 # 51% of a ~7,900-token turn. An EXPLICIT cache (``client.caches.create``),
 # measured the same session, covered 99.7% of that same prompt including
 # tool declarations. But creation took 1.77s — far too slow to sit on a live
@@ -428,6 +431,17 @@ class GeminiLLMAdapter(ILLMProvider):
                     await asyncio.sleep(delay)
                     total_backoff += delay
                     continue
+                # Every path above either retries (continue) or raises inline
+                # with its own log (spend cap / free tier / quota-give-up all
+                # log.error before raising). Falling through to here means
+                # NONE of those matched -- a non-retriable status (e.g. 400
+                # INVALID_ARGUMENT) or a 429/5xx that exhausted its retry
+                # budget -- and until now that raised with zero trace: the
+                # caller sees the exception, but nothing records which Gemini
+                # call it was or how many attempts preceded it.
+                debug_event(log, "gemini call failed", what=what, code=code,
+                            error=str(exc), attempt=attempt,
+                            rate_limit_attempt=rate_limit_attempt)
                 raise
             else:
                 waited = total_sem_wait + total_backoff
@@ -478,6 +492,7 @@ class GeminiLLMAdapter(ILLMProvider):
         entries = self._cache_entries
         if len(entries) <= _CACHE_MAX_ENTRIES:
             return
+        before = len(entries)
         ordered = sorted(
             entries.items(),
             key=lambda kv: (kv[1].name is not None, kv[1].last_used),
@@ -486,6 +501,8 @@ class GeminiLLMAdapter(ILLMProvider):
             if len(entries) <= _CACHE_MAX_ENTRIES:
                 break
             del entries[key]
+        debug_event(log, "gemini cache registry evicted", before=before,
+                    after=len(entries), cap=_CACHE_MAX_ENTRIES)
 
     def _cache_lookup_and_arm(
         self, model: str, system: str, tools: Optional[list[dict]],
@@ -525,6 +542,8 @@ class GeminiLLMAdapter(ILLMProvider):
         if entry.name is not None:
             if entry.expires_at > now:
                 cache_name = entry.name
+                debug_event(log, "gemini cache hit", model=model, cache_key=key,
+                            cache_name=cache_name, sightings=entry.sightings)
             else:
                 # Expired (or past our safety margin before real expiry) —
                 # clear the name but keep `sightings` so the very next
@@ -540,6 +559,9 @@ class GeminiLLMAdapter(ILLMProvider):
             and entry.cooldown_until <= now
         ):
             entry.creating = True
+            debug_event(log, "gemini cache creation scheduled", model=model,
+                        cache_key=key, sightings=entry.sightings,
+                        system_chars=len(system))
             task = asyncio.create_task(self._create_cache(key, model, system, tools))
             _inflight_cache_tasks.add(task)
             task.add_done_callback(_inflight_cache_tasks.discard)
@@ -582,6 +604,9 @@ class GeminiLLMAdapter(ILLMProvider):
             # 30s safety margin (see _CACHE_EXPIRY_MARGIN_S) so a request
             # already in flight never races the server's real expiry boundary.
             entry.expires_at = monotonic() + _cache_ttl_s() - _CACHE_EXPIRY_MARGIN_S
+            debug_event(log, "gemini cache armed", model=model, cache_key=key,
+                        cache_name=entry.name, ttl_s=_cache_ttl_s(),
+                        system_chars=len(system))
         except Exception:  # noqa: BLE001 - a failed cache create must never break a turn
             entry.cooldown_until = monotonic() + _CACHE_CREATE_COOLDOWN_S
             log.warning(
@@ -636,6 +661,12 @@ class GeminiLLMAdapter(ILLMProvider):
             if system:
                 gen["system_instruction"] = system
 
+        # Full request boundary, including the prompt: `gen` and `contents`
+        # are the exact wire shapes handed to the SDK (plain dicts already —
+        # nothing here needs a separate serialization step), so this is the
+        # actual payload sent, not a reconstruction of it.
+        debug_event(log, "gemini generate request", model=model, system=system,
+                    contents=contents, config=gen, cache_name=cache_name)
         try:
             response = await self._call_with_retry(
                 lambda: self._client.aio.models.generate_content(
@@ -687,12 +718,20 @@ class GeminiLLMAdapter(ILLMProvider):
         text = self._extract_text(response)
         usage = self._extract_usage(response)
         finish_reason = self._extract_finish_reason(response)
+        tool_calls = self._extract_tool_calls(response)
+        raw = _dump(response)
+        # Covers both the cache-hit and the stale-cache-fallback path above —
+        # both flow through this one return, so one log line here is the
+        # complete response boundary regardless of which branch produced it.
+        debug_event(log, "gemini generate response", model=model, text=text,
+                    finish_reason=finish_reason, usage=usage,
+                    tool_calls=tool_calls, raw_response=raw)
         return LLMResult(
             text=text,
             finish_reason=finish_reason,
             usage=usage,
-            raw_response=_dump(response),
-            tool_calls=self._extract_tool_calls(response),
+            raw_response=raw,
+            tool_calls=tool_calls,
         )
 
     async def transcribe_audio(self, audio: bytes, mime_type: str = "audio/mpeg") -> str:
@@ -709,12 +748,19 @@ class GeminiLLMAdapter(ILLMProvider):
             {"text": prompt},
             {"inline_data": {"mime_type": mime_type, "data": audio}},
         ]}]
+        # The prompt is the diagnostic text; the audio itself is never logged
+        # (same rule the STT adapters follow) — it's binary and its size, not
+        # its content, is what's useful here.
+        debug_event(log, "gemini transcribe_audio request", model=self._default_model,
+                    mime_type=mime_type, audio_bytes=len(audio), prompt=prompt)
         try:
             response = await self._call_with_retry(
                 lambda: self._client.aio.models.generate_content(
                     model=self._default_model, contents=contents),
                 what="transcribe")
-            return self._extract_text(response) or ""
+            text = self._extract_text(response) or ""
+            debug_event(log, "gemini transcribe_audio response", text=text)
+            return text
         except Exception:  # noqa: BLE001 - transcription failure must not crash finalize
             log.exception("gemini audio transcription failed")
             return ""
@@ -739,6 +785,8 @@ class GeminiLLMAdapter(ILLMProvider):
         if system:
             gen_config["system_instruction"] = system
         model = config.model or self._default_model
+        debug_event(log, "gemini generate_stream request", model=model, system=system,
+                    contents=contents, config=gen_config)
 
         # Transient 5xx can surface either when opening the stream or on the
         # first chunk, so the retry must cover both — but only up to the first
@@ -762,14 +810,31 @@ class GeminiLLMAdapter(ILLMProvider):
         )
 
         if first is None:
+            debug_event(log, "gemini generate_stream response", model=model, text="", chunks=0)
             return
+
+        # The accumulator only exists to feed the debug line below, so it's
+        # only built when DEBUG is actually on -- an f-string-free version of
+        # the same rule debug_event itself follows (don't pay for a
+        # diagnostic nobody is reading). This is the voice path: an
+        # unconditional per-token string accumulation would add real
+        # per-token cost to every live call for a line that's off by default.
+        collecting = log.isEnabledFor(logging.DEBUG)
+        chunks: list[str] = []
         text = self._extract_text(first)
         if text:
+            if collecting:
+                chunks.append(text)
             yield text
         async for chunk in agen:
             text = self._extract_text(chunk)
             if text:
+                if collecting:
+                    chunks.append(text)
                 yield text
+        if collecting:
+            debug_event(log, "gemini generate_stream response", model=model,
+                        text="".join(chunks), chunks=len(chunks))
 
     # --- Response shape helpers (resilient to SDK changes) -------------
 

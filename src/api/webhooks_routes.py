@@ -6,14 +6,28 @@ registry, the routes just expose register/list/delete.
 
 from __future__ import annotations
 
+import logging
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
+from src.auth import require_admin
 from src.integration.webhooks import WebhookManager
+from src.utils.logging import debug_event
+from src.utils.redact import redact_url
 
-router = APIRouter(prefix="/webhooks", tags=["webhooks"])
+log = logging.getLogger(__name__)
+
+# Admin-gated, not tenant-scoped: WebhookManager.register()/list()/unregister()
+# are process-global (no tenant_id anywhere on a registration), so a
+# current_tenant dependency would be incoherent here -- there is no tenant to
+# scope to. Matches src/api/benchmarks.py's router-level require_admin gate.
+# The manager is inert today (set_webhook_manager is never called in src/, so
+# every route 503s via _require_manager below) but the gate belongs on the
+# router regardless of that -- wiring the manager later must not silently
+# reopen these routes to the world.
+router = APIRouter(prefix="/webhooks", tags=["webhooks"], dependencies=[Depends(require_admin)])
 
 
 # --- DI -----------------------------------------------------------------
@@ -29,6 +43,7 @@ def set_webhook_manager(manager: Optional[WebhookManager]) -> None:
 
 def _require_manager() -> WebhookManager:
     if _manager is None:
+        debug_event(log, "webhooks manager unavailable", reason="not_initialized")
         raise HTTPException(status_code=503, detail="webhook manager not initialized")
     return _manager
 
@@ -61,6 +76,13 @@ class WebhooksListResponse(BaseModel):
 async def register_webhook(req: RegisterWebhookRequest) -> WebhookResponse:
     m = _require_manager()
     reg = m.register(url=req.url, event_filters=req.event_filters, secret=req.secret)
+    # req.secret is a webhook-signing credential -- presence only, never the value.
+    # redact_url keeps scheme/host/path and drops query + userinfo, so the
+    # registered destination is still identifiable while a key in the
+    # query string is not. Same treatment as the tenant webhook urls in
+    # main.py and chat_webhooks.py.
+    debug_event(log, "webhooks register response", webhook_id=reg.id, url=redact_url(reg.url),
+                event_filters=reg.event_filters, active=reg.active, has_secret=bool(req.secret))
     return WebhookResponse(id=reg.id, url=reg.url, event_filters=reg.event_filters, active=reg.active)
 
 
@@ -71,12 +93,16 @@ async def list_webhooks() -> WebhooksListResponse:
         WebhookResponse(id=r.id, url=r.url, event_filters=r.event_filters, active=r.active)
         for r in m.list()
     ]
+    debug_event(log, "webhooks list response", webhook_count=len(items),
+                webhooks=[i.model_dump() for i in items])
     return WebhooksListResponse(webhooks=items, total=len(items))
 
 
 @router.delete("/{webhook_id}")
 async def delete_webhook(webhook_id: str) -> dict:
     m = _require_manager()
-    if not m.unregister(webhook_id):
+    deleted = m.unregister(webhook_id)
+    debug_event(log, "webhooks delete response", webhook_id=webhook_id, deleted=deleted)
+    if not deleted:
         raise HTTPException(status_code=404, detail="webhook not found")
     return {"deleted": webhook_id}

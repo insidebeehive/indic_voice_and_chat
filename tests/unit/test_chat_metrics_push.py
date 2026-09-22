@@ -265,6 +265,56 @@ async def test_cache_hit_rate_is_zero_not_error_when_input_tokens_is_zero(sessio
     assert 'vox_chat_turn_cache_hit_rate_pct{path="tools",tenant_id="dev"} 0.0' in body
 
 
+@respx.mock
+async def test_reply_length_gauge_present_and_null_row_does_not_break_registry(
+    sessionmaker,
+) -> None:
+    """A ChatTurnMetric row with reply_words/reply_chars=None (the shape of
+    every row written before migration 0026) landing in the push window must
+    neither raise (which would abort _build_registry and, per this module's
+    own hazard comment on _TURN_LATENCY_COLUMNS/_TOKEN_COLUMNS, silently
+    discard the ENTIRE push window -- every unrelated gauge in it) nor zero
+    out the reply-length gauge for the OTHER rows in its group."""
+    route = respx.put(CHAT_PUSH_ROUTE).mock(return_value=httpx.Response(200))
+    for i, (words, chars) in enumerate([(10, 40), (20, 90), (30, 140)]):
+        await _seed_turn(
+            sessionmaker, session_id=f"cs_words_{i}", path="tools", total_ms=100,
+            reply_words=words, reply_chars=chars,
+        )
+    # Pre-migration-shaped row: reply_words/reply_chars simply not passed,
+    # so they're NULL, same as a real pre-0026 row.
+    await _seed_turn(sessionmaker, session_id="cs_words_null", path="tools", total_ms=100)
+
+    n = await aggregate_and_push_chat_metrics(sessionmaker, PUSH_URL, None, window_s=100)
+
+    assert n == 4
+    assert route.called
+    body = route.calls.last.request.content.decode()
+
+    # The rest of the registry (an ordinary, pre-existing gauge) is still
+    # present -- proof _build_registry did not abort/get swallowed by the
+    # `except` in aggregate_and_push_chat_metrics.
+    assert 'vox_chat_turn_metric_count{path="tools",tenant_id="dev"} 4.0' in body
+    # Percentiles computed over only the 3 non-NULL rows: words=[10,20,30],
+    # chars=[40,90,140] -- nearest-rank p50/p95 of a 3-element list.
+    assert (
+        'vox_chat_turn_reply_length{path="tools",quantile="p50",'
+        'tenant_id="dev",unit="words"} 20.0' in body
+    )
+    assert (
+        'vox_chat_turn_reply_length{path="tools",quantile="p95",'
+        'tenant_id="dev",unit="words"} 30.0' in body
+    )
+    assert (
+        'vox_chat_turn_reply_length{path="tools",quantile="p50",'
+        'tenant_id="dev",unit="chars"} 90.0' in body
+    )
+    assert (
+        'vox_chat_turn_reply_length{path="tools",quantile="p95",'
+        'tenant_id="dev",unit="chars"} 140.0' in body
+    )
+
+
 async def test_db_query_failure_is_caught_and_does_not_raise() -> None:
     class _BrokenSessionmaker:
         def __call__(self):

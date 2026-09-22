@@ -27,10 +27,14 @@ def _ist(year: int, month: int, day: int, hour: int, minute: int = 0) -> datetim
     return datetime(year, month, day, hour, minute, tzinfo=IST)
 
 
-def _scheduler(rate: Optional[RateLimitConfig] = None, retry: Optional[RetryConfig] = None) -> CallScheduler:
+def _scheduler(
+    rate: Optional[RateLimitConfig] = None,
+    retry: Optional[RetryConfig] = None,
+    dnd: Optional[DNDFilter] = None,
+) -> CallScheduler:
     return CallScheduler(
         hours=CallingHoursPolicy(start="00:00", end="23:59", skip_weekday=None),
-        dnd_filter=DNDFilter(InMemoryDNDStore()),
+        dnd_filter=dnd or DNDFilter(InMemoryDNDStore()),
         rate_limit=rate or RateLimitConfig(calls_per_minute=100, max_concurrent_calls=10),
         retry=retry or RetryConfig(max_retry_attempts=3, retry_interval_hours=2),
     )
@@ -137,6 +141,102 @@ async def test_run_dnd_disposition_updates_crm_and_sets_lead_status() -> None:
 
     assert run.leads["l1"].status is LeadStatus.DND
     assert crm.dnd_requests == ["+919999999999"]
+
+
+@pytest.mark.asyncio
+async def test_run_dnd_preexisting_lead_completes_without_call() -> None:
+    """A lead whose number was already in the DND store before it was ever
+    dialled is a different situation from one discovered mid-call:
+    `_on_call_result` is the only place that normally sets `LeadStatus.DND`,
+    and that path requires a call to have actually happened. This lead must
+    never be dispatched at all -- yet it still has to leave `remaining`, or
+    the campaign sits PENDING forever (skipped every poll tick, never
+    reaching COMPLETED). Before the fix this assertion on `campaign.status`
+    fails because `remaining` never empties."""
+    bus = EventBus()
+    crm = FakeCRMClient()
+    dnd = DNDFilter(InMemoryDNDStore(["+919999999999"]))
+    sched = _scheduler(dnd=dnd)
+    dispatched: list[str] = []
+
+    async def dispatch(c, lead: Lead) -> CallResult:
+        dispatched.append(lead.id)
+        return _result(lead.id, CallDisposition.NOT_INTERESTED)
+
+    orch = CampaignOrchestrator(scheduler=sched, dispatch=dispatch, bus=bus, crm=crm)
+    run = await orch.run(
+        _campaign(), [_lead("l1", "+919999999999")],
+        max_iterations=5, sleep_fn=_zero_sleep,
+    )
+
+    assert run.campaign.status is CampaignStatus.COMPLETED
+    assert run.leads["l1"].status is LeadStatus.DND
+    # The dispatch agent was never invoked -- no call was placed for a
+    # number that was already known to be DND.
+    assert dispatched == []
+    assert run.campaign.calls_attempted == 0
+    # Terminal, so it counts as completed -- `_on_call_result` adds any lead
+    # reaching COMPLETED/FAILED/DND, and a pre-blocked lead is no less
+    # finished than one DND'd by a call. Without this, stats would report
+    # "0 of 1 completed" for a campaign that has nothing left to do, which is
+    # the same wrong conclusion the stall itself produced.
+    assert run.completed_leads == {"l1"}
+    assert run.stats["completed"] == 1
+
+
+@pytest.mark.asyncio
+async def test_run_dnd_preexisting_mixed_with_clean_lead() -> None:
+    """One lead is pre-blocked, one is clean. The blocked lead must not hold
+    up the clean one: the campaign should still complete, the clean lead
+    should still get called, and the counters should reflect exactly the
+    one real call -- not the blocked lead."""
+    bus = EventBus()
+    crm = FakeCRMClient()
+    dnd = DNDFilter(InMemoryDNDStore(["+919999999999"]))
+    sched = _scheduler(dnd=dnd)
+    dispatched: list[str] = []
+
+    async def dispatch(c, lead: Lead) -> CallResult:
+        dispatched.append(lead.id)
+        return _result(lead.id, CallDisposition.NOT_INTERESTED)
+
+    orch = CampaignOrchestrator(scheduler=sched, dispatch=dispatch, bus=bus, crm=crm)
+    leads = [_lead("blocked", "+919999999999"), _lead("clean", "+918888888888")]
+    run = await orch.run(_campaign(), leads, max_iterations=10, sleep_fn=_zero_sleep)
+
+    assert run.campaign.status is CampaignStatus.COMPLETED
+    assert run.leads["blocked"].status is LeadStatus.DND
+    assert run.leads["clean"].status is LeadStatus.COMPLETED
+    assert dispatched == ["clean"]
+    assert run.campaign.calls_attempted == 1
+
+
+@pytest.mark.asyncio
+async def test_run_dnd_disabled_calls_prelisted_lead_normally() -> None:
+    """With the filter disabled, a number sitting in the DND store is not
+    consulted at all: `DNDFilter.is_blocked` short-circuits to False, and
+    `dnd_blocked()` must agree, so the lead is dispatched exactly like any
+    other -- the orchestrator's sweep must not reimplement its own opinion
+    of "blocked" independent of the filter's `enabled` flag."""
+    bus = EventBus()
+    crm = FakeCRMClient()
+    dnd = DNDFilter(InMemoryDNDStore(["+919999999999"]), enabled=False)
+    sched = _scheduler(dnd=dnd)
+    dispatched: list[str] = []
+
+    async def dispatch(c, lead: Lead) -> CallResult:
+        dispatched.append(lead.id)
+        return _result(lead.id, CallDisposition.NOT_INTERESTED)
+
+    orch = CampaignOrchestrator(scheduler=sched, dispatch=dispatch, bus=bus, crm=crm)
+    run = await orch.run(
+        _campaign(), [_lead("l1", "+919999999999")],
+        max_iterations=5, sleep_fn=_zero_sleep,
+    )
+
+    assert dispatched == ["l1"]
+    assert run.leads["l1"].status is LeadStatus.COMPLETED
+    assert run.campaign.calls_attempted == 1
 
 
 @pytest.mark.asyncio

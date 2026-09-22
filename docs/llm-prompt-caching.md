@@ -169,7 +169,9 @@ realistic Hinglish chat history.
   declaration set to the same cache costs **9,468 tokens** — the 26 tools
   alone are **4,894 tokens**, i.e. tool declarations are *larger* than the
   static system prompt they ride alongside. This is materially bigger than
-  the ~4,024-4,028-token implicit-cache ceiling measured above — the implicit
+  the ~4,024-4,028-token implicit-cache ceiling measured above (at a
+  ~17,803-char generic-pack prompt, before the reply-length prompt change
+  grew it — stale, needs re-measuring) — the implicit
   cache structurally cannot see this content at all (`config.tools` never
   contributed to the cached count, confirmed above), so this is real,
   previously-unreachable coverage, not a duplicate of the existing implicit

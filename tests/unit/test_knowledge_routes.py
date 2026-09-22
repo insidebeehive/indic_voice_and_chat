@@ -175,6 +175,50 @@ def test_delete_document(app: FastAPI) -> None:
     assert after["total"] == 0
 
 
+def test_delete_document_retriever_failure_leaves_row_intact_and_is_retryable(
+    app: FastAPI, monkeypatch,
+) -> None:
+    """delete_document must remove chunks from the vector store BEFORE
+    deleting+committing the KBDocument row, not after: if retriever.delete()
+    raises, the row has to survive so the operation is retryable. The old
+    order (commit the row delete, then call retriever.delete()) made a
+    vector-store failure unrecoverable -- the metadata row is gone forever
+    while its chunks stay live in the index, invisible to list_documents/
+    stats but still returned by query as a citation for a document that no
+    longer exists."""
+    client = TestClient(app, raise_server_exceptions=False)
+    ingested = client.post(
+        "/knowledge/ingest",
+        files={"file": ("plans.md", io.BytesIO(b"Plan B has 500GB"), "text/markdown")},
+        headers=HEADERS,
+    ).json()
+    doc_id = ingested["document_id"]
+
+    async def _boom(self, chunk_ids):
+        raise RuntimeError("vector store unavailable")
+
+    original_delete = HybridRetriever.delete
+    monkeypatch.setattr(HybridRetriever, "delete", _boom)
+    try:
+        resp = client.delete(f"/knowledge/documents/{doc_id}", headers=HEADERS)
+        assert resp.status_code == 500
+
+        # The KBDocument row must have survived the failed delete -- still
+        # listed, not orphaned/gone while chunks live on in the index.
+        listed = client.get("/knowledge/documents", headers=HEADERS).json()
+        assert any(d["id"] == doc_id for d in listed["documents"])
+        stats = client.get("/knowledge/stats", headers=HEADERS).json()
+        assert stats["document_count"] == 1
+    finally:
+        monkeypatch.setattr(HybridRetriever, "delete", original_delete)
+
+    # Retryable: the same delete call now succeeds against a healthy retriever.
+    retry = client.delete(f"/knowledge/documents/{doc_id}", headers=HEADERS)
+    assert retry.status_code == 200
+    after = client.get("/knowledge/documents", headers=HEADERS).json()
+    assert after["total"] == 0
+
+
 def test_delete_unknown_document_404(app: FastAPI) -> None:
     client = TestClient(app)
     resp = client.delete("/knowledge/documents/missing", headers=HEADERS)

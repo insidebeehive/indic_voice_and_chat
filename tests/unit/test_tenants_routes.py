@@ -597,6 +597,265 @@ async def test_list_tenants_maps_realtime_voice_and_language(ctx) -> None:
     assert acme["realtime"]["provider"] == "gemini_live"
     assert acme["realtime"]["voice_id"] == "Aoede"
     assert acme["realtime"]["language"] == "hi-IN"
+    # An s2s tenant that DID set realtime must report it as "tenant", not
+    # "unset" or "platform_default" — there is no platform default to
+    # confuse this with (see test below), so the only wrong answer possible
+    # here is mislabeling a real override as absent.
+    assert acme["realtime"]["effective_provider"] == "gemini_live"
+    assert acme["realtime"]["effective_model"] == "gemini-3.1-flash-live-preview"
+    assert acme["realtime"]["provider_source"] == "tenant"
+    assert acme["realtime"]["model_source"] == "tenant"
+
+
+async def test_list_tenants_inherited_layer_reports_platform_default(ctx) -> None:
+    """The bug this whole change exists to fix: a tenant that never overrides
+    stt/llm/tts still runs config/default.yaml's platform default at request
+    time (TenantProviders._config_for merges onto it), but the old
+    LayerInfo.provider/model (the raw stored override, None here) rendered as
+    a bare "—" in the backoffice — indistinguishable from a genuinely broken
+    pipeline. This asserts the effective fields resolve to the real running
+    values and are labeled "platform_default", not "tenant".
+
+    Mutation check performed manually: reverting _layer()'s merge_provider_config
+    call to `merged = d` (i.e. no platform overlay) makes effective_provider
+    come back None instead of "sarvam"/"gemini" — this test catches that
+    directly, not just via a truthiness check.
+    """
+    client, _, _ = ctx
+    body = _body(slug="no-overrides", mode="layered", stt=None, llm=None, tts=None)
+    await client.post("/tenants", json=body, headers=ADMIN_HEADERS)
+    resp = await client.get("/tenants", headers=ADMIN_HEADERS)
+    assert resp.status_code == 200
+    t = next(x for x in resp.json()["tenants"] if x["slug"] == "no-overrides")
+
+    # Raw stored override stays None (unchanged contract — the backoffice's
+    # voice-catalog fallback in PIPE_CURRENT still reads this field).
+    assert t["stt"]["provider"] is None and t["stt"]["model"] is None
+    assert t["llm"]["provider"] is None and t["llm"]["model"] is None
+    assert t["tts"]["provider"] is None and t["tts"]["model"] is None
+
+    # Effective value == config/default.yaml, source == platform_default.
+    assert t["stt"]["effective_provider"] == "sarvam"
+    assert t["stt"]["effective_model"] == "saaras:v3"
+    assert t["stt"]["provider_source"] == "platform_default"
+    assert t["stt"]["model_source"] == "platform_default"
+
+    assert t["llm"]["effective_provider"] == "gemini"
+    assert t["llm"]["effective_model"] == "gemini-3.5-flash"
+    assert t["llm"]["provider_source"] == "platform_default"
+    assert t["llm"]["model_source"] == "platform_default"
+
+    assert t["tts"]["effective_provider"] == "sarvam"
+    assert t["tts"]["provider_source"] == "platform_default"
+    # NOT "bulbul:v3"/"platform_default": src/config.py's TTSConfig (the
+    # platform Settings model) has no `model` field at all — only
+    # provider/language/voice_id/speed — so config/default.yaml's
+    # `tts.model: bulbul:v3` never reaches settings.pipeline.tts.model_dump()
+    # (silently dropped as an unmodeled key). The comment in
+    # config/default.yaml says this value only documents what the sarvam
+    # adapter's own hardcoded DEFAULT_MODEL constant resolves to internally —
+    # that constant is invisible to merge_provider_config, and reusing it
+    # here (rather than the merge that actually runs) is exactly the kind of
+    # second source of truth this change was told to avoid. So the honest
+    # effective_model for an unset tenant TTS model is None/"unset", matching
+    # what TenantProviders._config_for actually hands the tts_factory.
+    assert t["tts"]["effective_model"] is None
+    assert t["tts"]["model_source"] == "unset"
+
+
+async def test_list_tenants_full_layer_override_reports_tenant_source(ctx) -> None:
+    """The other half of the same distinction: a tenant that pins BOTH
+    provider and model must show its own values, labeled "tenant" not
+    "platform_default" — proving the merge doesn't just always echo the
+    platform default regardless of what the tenant actually set (a
+    always-return-global-default bug would pass the inherited test above but
+    fail this one)."""
+    client, _, _ = ctx
+    body = _body(slug="full-override", mode="layered",
+                 llm={"provider": "groq", "model": "llama-3.3-70b-versatile"})
+    await client.post("/tenants", json=body, headers=ADMIN_HEADERS)
+    resp = await client.get("/tenants", headers=ADMIN_HEADERS)
+    t = next(x for x in resp.json()["tenants"] if x["slug"] == "full-override")
+
+    assert t["llm"]["effective_provider"] == "groq"
+    assert t["llm"]["effective_model"] == "llama-3.3-70b-versatile"
+    assert t["llm"]["provider_source"] == "tenant"
+    assert t["llm"]["model_source"] == "tenant"
+
+
+async def test_list_tenants_partial_layer_override_merges_per_field(ctx) -> None:
+    """A tenant can set `provider` and leave `model` unset (LayerChoice.model
+    is Optional) — merge_provider_config merges FIELD BY FIELD, not whole-
+    layer, so this must resolve to the tenant's provider but the platform's
+    model, with each field's source reported independently. A whole-layer
+    merge (picking the tenant's dict wholesale whenever ANY field is set)
+    would instead return model=None here and fail the second assertion."""
+    client, _, _ = ctx
+    body = _body(slug="partial-override", mode="layered",
+                 llm={"provider": "groq"})   # model deliberately omitted
+    await client.post("/tenants", json=body, headers=ADMIN_HEADERS)
+    resp = await client.get("/tenants", headers=ADMIN_HEADERS)
+    t = next(x for x in resp.json()["tenants"] if x["slug"] == "partial-override")
+
+    assert t["llm"]["effective_provider"] == "groq"
+    assert t["llm"]["provider_source"] == "tenant"
+    assert t["llm"]["effective_model"] == "gemini-3.5-flash"   # inherited
+    assert t["llm"]["model_source"] == "platform_default"
+
+
+async def test_list_tenants_realtime_unset_for_layered_tenant_is_not_platform_default(ctx) -> None:
+    """A `layered` tenant legitimately has no `pipeline.realtime` at all — s2s
+    is a tenant-only concept with no platform-level default in
+    config/default.yaml's PipelineConfig (src/config.py). This must show as
+    genuinely unset ("unset"), NOT mislabeled "platform_default" the way
+    stt/llm/tts would be — there is nothing to have inherited. A merge that
+    (wrongly) fell back to some hardcoded realtime default would fail the
+    None checks below; a merge that mislabeled the source would fail the
+    _source checks while the None checks still passed."""
+    client, _, _ = ctx
+    body = _body(slug="layered-no-realtime", mode="layered")   # no `realtime` key at all
+    await client.post("/tenants", json=body, headers=ADMIN_HEADERS)
+    resp = await client.get("/tenants", headers=ADMIN_HEADERS)
+    t = next(x for x in resp.json()["tenants"] if x["slug"] == "layered-no-realtime")
+
+    assert t["realtime"]["provider"] is None
+    assert t["realtime"]["effective_provider"] is None
+    assert t["realtime"]["effective_model"] is None
+    assert t["realtime"]["provider_source"] == "unset"
+    assert t["realtime"]["model_source"] == "unset"
+
+
+async def test_list_tenants_chat_voice_not_enabled(ctx) -> None:
+    """A freshly registered tenant never touches pipeline.chat_voice at all —
+    `enabled` must read False even though pipeline.tts IS configured and
+    resolve_chat_tts_config (which deliberately ignores `enabled`) would
+    still resolve it. This is the fourth state the task exists to separate
+    from "enabled but nothing resolvable": both have real chat TTS costs
+    riding on `enabled` alone, and collapsing them is what left the
+    lotterystage on/off question unanswerable from this tab.
+
+    Mutation check: hardcoding ChatVoiceInfo.enabled=True in
+    _chat_voice_info (instead of cv.enabled) makes this assert False is True
+    and fails; the source/effective_provider fields alone would not catch
+    that mutation since they're unaffected by it.
+    """
+    client, _, _ = ctx
+    body = _body(slug="acme", mode="layered")   # default tts = sarvam/bulbul:v3
+    await client.post("/tenants", json=body, headers=ADMIN_HEADERS)
+    resp = await client.get("/tenants", headers=ADMIN_HEADERS)
+    t = next(x for x in resp.json()["tenants"] if x["slug"] == "acme")
+
+    assert t["chat_voice"]["enabled"] is False
+    # Still reports what WOULD run if enabled (matches resolve_chat_tts_config's
+    # documented "ignores enabled" contract) rather than blanking these out —
+    # an operator flipping `enabled` on needs to see this ahead of time.
+    assert t["chat_voice"]["effective_provider"] == "sarvam"
+    assert t["chat_voice"]["source"] == "cascade"
+
+
+async def test_list_tenants_chat_voice_enabled_with_own_tts(ctx) -> None:
+    """The lotterystage shape from the task brief: chat_voice.enabled=true
+    with its own tts block (elevenlabs/eleven_multilingual_v2/a voice id) —
+    must report source="own", not "cascade", and must surface the resolved
+    voice_id so the backoffice's chat-TTS voice picker gets a real
+    "(current: ...)" instead of the old "isn't exposed by any GET" hint.
+
+    Mutation check: changing `elif cv.tts.provider: source = "own"` to
+    `source = "cascade"` unconditionally leaves effective_provider/model
+    unchanged (resolve_chat_tts_config still returns chat_voice.tts first)
+    but flips this test's source assertion from "own" to "cascade" — proving
+    the source label, not just the resolved value, is under test.
+    """
+    client, _, _ = ctx
+    body = _body(slug="lotterystage", mode="layered")   # pipeline.tts = sarvam
+    tid = (await client.post("/tenants", json=body, headers=ADMIN_HEADERS)).json()["tenant_id"]
+
+    patch = await client.patch(
+        f"/tenants/{tid}",
+        json={"pipeline": {"chat_voice": {
+            "enabled": True,
+            "tts": {"provider": "elevenlabs", "model": "eleven_multilingual_v2",
+                     "voice_id": "21m00Tcm4TlvDq8ikWAM"},
+        }}},
+        headers=ADMIN_HEADERS)
+    assert patch.status_code == 200, patch.text
+
+    t = next(x for x in (await client.get("/tenants", headers=ADMIN_HEADERS))
+             .json()["tenants"] if x["tenant_id"] == tid)
+    assert t["chat_voice"]["enabled"] is True
+    assert t["chat_voice"]["effective_provider"] == "elevenlabs"
+    assert t["chat_voice"]["effective_model"] == "eleven_multilingual_v2"
+    assert t["chat_voice"]["effective_voice_id"] == "21m00Tcm4TlvDq8ikWAM"
+    assert t["chat_voice"]["source"] == "own"
+    # Not accidentally reporting the call cascade's TTS instead.
+    assert t["chat_voice"]["effective_provider"] != "sarvam"
+
+
+async def test_list_tenants_chat_voice_enabled_falls_back_to_pipeline_tts(ctx) -> None:
+    """chat_voice.enabled=true with NO chat_voice.tts override: the documented
+    fallback (resolve_chat_tts_config) reuses pipeline.tts, and this tab must
+    label that "cascade" — the middle of the three states, and the one an
+    operator can mistake for "own" if the label is missing (a tenant that
+    looks fully configured is actually silently reusing the call TTS, which
+    breaks the moment that tenant switches to s2s and pipeline.tts goes away).
+
+    Mutation check: swapping resolve_chat_tts_config for a stub that only
+    ever reads chat_voice.tts (never falls back to pipeline.tts) makes
+    effective_provider come back None instead of "sarvam" here — this test
+    catches losing the fallback, not just mislabeling it.
+    """
+    client, _, _ = ctx
+    body = _body(slug="acme", mode="layered")   # pipeline.tts = sarvam/bulbul:v3
+    tid = (await client.post("/tenants", json=body, headers=ADMIN_HEADERS)).json()["tenant_id"]
+
+    patch = await client.patch(
+        f"/tenants/{tid}",
+        json={"pipeline": {"chat_voice": {"enabled": True}}},
+        headers=ADMIN_HEADERS)
+    assert patch.status_code == 200, patch.text
+
+    t = next(x for x in (await client.get("/tenants", headers=ADMIN_HEADERS))
+             .json()["tenants"] if x["tenant_id"] == tid)
+    assert t["chat_voice"]["enabled"] is True
+    assert t["chat_voice"]["effective_provider"] == "sarvam"
+    assert t["chat_voice"]["effective_model"] == "bulbul:v3"
+    assert t["chat_voice"]["source"] == "cascade"
+
+
+async def test_list_tenants_chat_voice_enabled_but_nothing_resolvable(ctx) -> None:
+    """The gap validate_credentials rejects at PATCH time (0c011a6) — see
+    test_pipeline_enable_chat_voice_with_no_tts_anywhere_rejected, which
+    proves the PATCH path can't write this combination. It is still a real
+    state the list endpoint must be able to report: a row written before
+    that validator existed, or edited directly against the database, can
+    carry `chat_voice.enabled: true` with no TTS resolvable anywhere — the
+    exact "voice replies not working" shape with no trace anywhere the task
+    brief describes. Written directly via the DB session (not PATCH) because
+    the API correctly refuses to create it.
+
+    Mutation check: having _chat_voice_info treat a None `resolved` as
+    source="cascade" (instead of "none") would still pass an effective_
+    provider-is-None check but fail this test's explicit source assertion.
+    """
+    client, resolver, sm = ctx
+    body = _body(slug="acme", mode="layered")
+    body["tts"] = None   # no pipeline.tts at all -> nothing to fall back to
+    tid = (await client.post("/tenants", json=body, headers=ADMIN_HEADERS)).json()["tenant_id"]
+
+    async with sm() as session:
+        t = await session.get(Tenant, tid)
+        pc = dict(t.pipeline_config or {})
+        pc["chat_voice"] = {"enabled": True}   # no tts block either
+        t.pipeline_config = pc
+        session.add(t)
+        await session.commit()
+
+    resp = await client.get("/tenants", headers=ADMIN_HEADERS)
+    t = next(x for x in resp.json()["tenants"] if x["tenant_id"] == tid)
+    assert t["chat_voice"]["enabled"] is True
+    assert t["chat_voice"]["effective_provider"] is None
+    assert t["chat_voice"]["effective_model"] is None
+    assert t["chat_voice"]["source"] == "none"
 
 
 async def test_list_tenants_requires_admin(ctx) -> None:

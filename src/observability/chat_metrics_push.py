@@ -60,6 +60,7 @@ from src.models.chat_turn_metrics import (
     ChatTurnMetric,
 )
 from src.observability.turn_metrics_push import _PushFailureWarner, _percentile, _push
+from src.utils.logging import debug_event
 from src.utils.redact import redact_url
 
 log = logging.getLogger(__name__)
@@ -77,6 +78,21 @@ _push_failure_warner = _PushFailureWarner()
 _TURN_GROUP_LABELS = ("tenant_id", "path")
 _TURN_LATENCY_COLUMNS = ("total_ms", "llm_total_ms", "tool_total_ms", "kb_search_ms")
 _TOKEN_COLUMNS = ("input_tokens", "output_tokens", "cached_tokens")
+
+# Reply-length columns, kept OUT of _TURN_LATENCY_COLUMNS deliberately. Every
+# column in that tuple (and in _TOKEN_COLUMNS) is `nullable=False`, which is
+# exactly why the loop at _build_registry's `for column in
+# _TURN_LATENCY_COLUMNS` can get away with `sorted(getattr(r, column) for r in
+# rows)` with no None-filter -- reply_chars/reply_words are the first nullable
+# columns on this table (pre-migration-0026 rows, and WS-layer failure rows
+# that never produced a reply, both leave them NULL). Adding them to that
+# tuple would let a single None reach `sorted()`, raise TypeError,
+# abort _build_registry, and (via the `except` at the bottom of
+# aggregate_and_push_chat_metrics) silently discard this ENTIRE push window --
+# every unrelated gauge in it, not just this one. Same hazard on
+# _TOKEN_COLUMNS' `sum()`. Handled instead in their own loop below with an
+# explicit `is not None` filter.
+_REPLY_LENGTH_COLUMNS = (("words", "reply_words"), ("chars", "reply_chars"))
 
 # WS-layer failure rows (action in WS_TURN_FAILURE_ACTIONS -- a turn that
 # raised or timed out before the agent produced a ChatTurnResult, see
@@ -139,6 +155,19 @@ def _build_registry(
         _TURN_GROUP_LABELS,
         registry=registry,
     )
+    turn_reply_length_gauge = Gauge(
+        "vox_chat_turn_reply_length",
+        "Pre-computed percentile length (words/chars) of the turn's FINAL "
+        "customer-visible reply, over COMPLETED (non-failure) turns in this "
+        "push window. A row whose reply_words/reply_chars is NULL (predates "
+        "migration 0026, or is a WS-layer failure row that never produced a "
+        "reply) is filtered out of its group before computing percentiles; a "
+        "group left with zero rows after that filter gets NO gauge child at "
+        "all (not a 0 reading) -- 0 would misleadingly claim 'measured, "
+        "replies are genuinely empty' for a group that's actually unmeasured.",
+        _TURN_GROUP_LABELS + ("unit", "quantile"),
+        registry=registry,
+    )
     for key, rows in turn_groups.items():
         labels = dict(zip(_TURN_GROUP_LABELS, key, strict=True))
         turn_count_gauge.labels(**labels).set(len(rows))
@@ -149,6 +178,24 @@ def _build_registry(
             for pct in _PERCENTILES:
                 turn_latency_gauge.labels(**labels, stage=column, quantile=f"p{pct}").set(
                     _percentile(values, pct)
+                )
+
+        # Own loop, deliberately separate from the _TURN_LATENCY_COLUMNS loop
+        # above -- see _REPLY_LENGTH_COLUMNS' module-level comment for why
+        # these nullable columns can't share that loop's bare
+        # `sorted(getattr(...))`. Explicit `is not None` filter BEFORE
+        # sorting; a group where every row is NULL for a given unit is
+        # skipped entirely (no gauge child), same convention as the "if not
+        # values: continue" above for an empty latency population.
+        for unit, column in _REPLY_LENGTH_COLUMNS:
+            reply_values = sorted(
+                v for r in rows if (v := getattr(r, column)) is not None
+            )
+            if not reply_values:
+                continue
+            for pct in _PERCENTILES:
+                turn_reply_length_gauge.labels(**labels, unit=unit, quantile=f"p{pct}").set(
+                    _percentile(reply_values, pct)
                 )
 
         token_sums = {column: sum(getattr(r, column) for r in rows) for column in _TOKEN_COLUMNS}
@@ -222,7 +269,10 @@ async def aggregate_and_push_chat_metrics(
     in the window).
     """
     if not push_url:
-        log.debug("chat-metrics push skipped (GRAFANA_PROMETHEUS_PUSH_URL unset)")
+        debug_event(
+            log, "metrics push skipped", job_name=_JOB_NAME,
+            reason="push_url_unset",
+        )
         return 0
 
     try:
@@ -283,6 +333,17 @@ async def aggregate_and_push_chat_metrics(
     for row in tool_rows:
         key = tuple(getattr(row, label) or "" for label in _TOOL_GROUP_LABELS)
         tool_groups.setdefault(key, []).append(row)
+
+    # Same motivation as turn_metrics_push.py's identical event: this
+    # function's 0 return is ambiguous across push_url-unset/query-failed/
+    # registry-failed/genuinely-empty-window, and main.py's `if n_chat:
+    # log.info(...)` caller only distinguishes truthy from falsy.
+    debug_event(
+        log, "metrics aggregate result", job_name=_JOB_NAME, window_s=window_s,
+        turn_row_count=len(turn_rows), tool_row_count=len(tool_rows),
+        turn_group_count=len(turn_groups), failure_group_count=len(failure_groups),
+        tool_group_count=len(tool_groups),
+    )
 
     try:
         registry = _build_registry(turn_groups, failure_groups, tool_groups)

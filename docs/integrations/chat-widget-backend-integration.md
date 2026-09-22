@@ -214,7 +214,7 @@ Forward every frame from our WS to CRM Frontend, **except rewrite any URL fields
 |---|---|---|
 | `history` | ✓ | Rewrite `media_url` fields |
 | `typing` | ✓ | |
-| `message` | ✓ | |
+| `message` | ✓ | Rewrite `audio_url` when present (voice-note reply — see Media URLs) |
 | `audio_ack` | ✓ | Rewrite `media_url` |
 | `escalation` | ✓ | |
 | `mode_change` | ✓ | |
@@ -230,6 +230,16 @@ Every `media_url` we send points to our platform (`/api/v1/chat/media/{id}`) and
 We send:    "media_url": "/api/v1/chat/media/103"
 You forward: "media_url": "https://your-backend.com/chat/media/103"
 ```
+
+**`audio_url` on a `message` frame is the same kind of URL and needs the same
+rewrite.** It appears when the AI replies to a voice note, alongside
+`audio_mime`; it is the same `/api/v1/chat/media/{id}` shape pointing at the
+agent's own message row, and it goes through the same proxy route — no second
+endpoint. It is easy to miss because it is the only URL field that is not named
+`media_url` and the only one on a frame type that otherwise forwards untouched.
+Relaying it unrewritten sends CRM Frontend a link it cannot fetch, and because
+the reply's `text` is always present and complete, the result is a text-only
+answer with a broken player rather than a visible failure.
 
 Your proxy endpoint then fetches from us with the Bearer token and streams the response to CRM Frontend:
 
@@ -263,6 +273,8 @@ async def relay_session(frontend_ws, ws_url: str, base_url: str, session_id: str
                 # Rewrite media URLs before forwarding
                 if msg.get("media_url"):
                     msg["media_url"] = rewrite_url(msg["media_url"], base_url)
+                if msg.get("audio_url"):   # voice-note reply on a `message` frame
+                    msg["audio_url"] = rewrite_url(msg["audio_url"], base_url)
                 if msg.get("type") == "history":
                     for m in msg.get("messages", []):
                         if m.get("media_url"):
@@ -538,6 +550,7 @@ async def download_media(message_id: int, token: str) -> bytes:
 - [ ] Send attachments ONLY as typed media frames (`image`/`video`/`audio`) — never as `type:"message"` with a `media_url` (ignored) or empty `text` (rejected)
 - [ ] Enforce the 1 MB per-file limit before forwarding (better customer error than our rejection)
 - [ ] Forward all frames us → CRM Frontend; rewrite `media_url` fields to your proxy endpoint
+- [ ] Rewrite `audio_url` on `message` frames too — same proxy route, only URL field not named `media_url`
 - [ ] Expose a media proxy route (`GET /chat/media/{id}`) that fetches from us with Bearer token
 - [ ] If our WS drops: reconnect and re-forward the `history` frame to CRM Frontend
 - [ ] On `ended` frame: close both connections

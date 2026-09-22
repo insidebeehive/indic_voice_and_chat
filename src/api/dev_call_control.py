@@ -18,7 +18,12 @@ stale call records.
 
 from __future__ import annotations
 
+import logging
 import time
+
+from src.utils.logging import debug_event
+
+log = logging.getLogger(__name__)
 
 _MONITOR_TTL = 1800.0  # 30 min: long enough to finish a call + read the outcome
 
@@ -48,6 +53,8 @@ class _Monitor:
         item = self._entry(call_sid)
         item["status"] = status
         item["ts"] = time.monotonic()
+        debug_event(log, "dev_call_control monitor status_transition",
+                    call_sid=call_sid, status=status)
 
     def set_outcome(self, call_sid: str, outcome: dict) -> None:
         self._sweep()
@@ -55,6 +62,8 @@ class _Monitor:
         item["outcome"] = outcome
         item["status"] = "ended"
         item["ts"] = time.monotonic()
+        debug_event(log, "dev_call_control monitor outcome_set",
+                    call_sid=call_sid, outcome=outcome)
 
     def get(self, call_sid: str) -> dict | None:
         self._sweep()
@@ -90,11 +99,20 @@ def set_override(
         "lead_gender": lead_gender,
         "transfer_webhook_url": transfer_webhook_url,
     }
+    debug_event(log, "dev_call_control override armed", tenant_slug=tenant_slug,
+                mode=mode, voice=voice, caller_name=caller_name, lead_name=lead_name,
+                lead_gender=lead_gender, has_transfer_webhook_url=bool(transfer_webhook_url))
 
 
 def pop_override(tenant_slug: str) -> dict | None:
     """Return and clear the pending override for a tenant (one-shot)."""
-    return _overrides.pop(tenant_slug, None)
+    value = _overrides.pop(tenant_slug, None)
+    # `found=False` is the shape that wastes time: the console armed an
+    # override and the bridge factory consumed nothing, so the call runs on
+    # tenant/campaign defaults with no trace of why Mode/Voice didn't apply.
+    debug_event(log, "dev_call_control override consumed", tenant_slug=tenant_slug,
+                found=value is not None)
+    return value
 
 
 # --- per-call SID overrides (production outbound; keyed by provider call SID) ---
@@ -120,8 +138,14 @@ def set_sid_override(
         "lead_gender": lead_gender,
         "campaign_id": campaign_id,
     }
+    debug_event(log, "dev_call_control sid_override armed", call_sid=call_sid,
+                voice=voice, caller_name=caller_name, lead_name=lead_name,
+                lead_gender=lead_gender, campaign_id=campaign_id)
 
 
 def pop_sid_override(call_sid: str) -> dict | None:
     """Return and clear the SID-keyed override (one-shot)."""
-    return _sid_overrides.pop(call_sid, None)
+    value = _sid_overrides.pop(call_sid, None)
+    debug_event(log, "dev_call_control sid_override consumed", call_sid=call_sid,
+                found=value is not None)
+    return value

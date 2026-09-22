@@ -16,9 +16,62 @@ import httpx
 from pythonjsonlogger import jsonlogger
 
 from src.auth.audit import current_admin_label
+from src.utils.chat_context import current_chat_session_id, current_chat_ticket_id
 from src.utils.client_ip import current_client_ip
 from src.utils.redact import redact_url
 from src.utils.trace_id import current_trace_id
+
+
+# LogRecord's own attribute names. Passing any of these through `extra=`
+# makes logging raise "Attempt to overwrite %r in LogRecord" — and the raise
+# happens inside the handler, so it takes out the caller rather than just
+# losing the line. That is not hypothetical here: a resolver reload once
+# logged a secret's `name` through `extra` and the KeyError aborted the reload
+# for every tenant, not only the one with the bad secret. debug_event renames
+# a colliding key rather than letting a diagnostic line break the thing it is
+# diagnosing — `name` becomes `name_`, and the value still reaches the log.
+_LOG_RECORD_ATTRS = frozenset(
+    logging.LogRecord("", 0, "", 0, "", None, None).__dict__
+) | {"message", "asctime", "taskName"}
+
+# `event` is reserved twice over: it is the name debug_event gives the line
+# itself (set below, after the rename), and it is the helper's own second
+# parameter. The parameter is positional-only (`/`) so that passing `event=...`
+# can never raise "got multiple values for argument 'event'" — two separate
+# agents instrumenting `state_machine.py` and `voicebot.py` wrote exactly that
+# and took out every state transition with a TypeError from inside a log line,
+# which is the one thing a diagnostic helper must never do. With the marker in
+# place the keyword lands in `values` and is renamed to `event_` here, the same
+# way a LogRecord collision is handled.
+_RESERVED_EVENT_KEYS = _LOG_RECORD_ATTRS | {"event"}
+
+
+def debug_event(logger: logging.Logger, event: str, /, **values: object) -> None:
+    """Emit one structured DEBUG event: ``event`` names it, ``values`` carry it.
+
+    DEBUG is off in normal running and switched on to investigate something
+    (``VOX_LOG_LEVEL=DEBUG``), so these lines carry FULL values — customer
+    text, identifiers, media URLs, prompts, request and response bodies. They
+    are deliberately not routed through ``_redact_pii_for_log`` or the
+    keys-only conventions that govern INFO and above: a redacted debug line
+    cannot answer the question it was turned on to answer. See
+    docs/debug-logging.md for the operator decision behind that, and for the
+    one exception — credentials appear at no level.
+
+    Values land as structured fields (jsonlogger promotes ``extra`` into the
+    JSON object), so they are queryable in Loki rather than grep-able text.
+    That is the whole reason this exists instead of a f-string ``log.debug``.
+
+    Returns immediately when DEBUG is disabled, so the cost of an uncalled
+    event is one level check. Build nothing expensive for the arguments — pass
+    what you already hold; an f-string or a serialisation in the call site is
+    paid on every turn whether or not anyone is listening.
+    """
+    if not logger.isEnabledFor(logging.DEBUG):
+        return
+    safe = {(f"{k}_" if k in _RESERVED_EVENT_KEYS else k): v for k, v in values.items()}
+    safe["event"] = event
+    logger.debug(event, extra=safe)
 
 
 class _ClientIPLogFilter(logging.Filter):
@@ -85,6 +138,38 @@ class _TraceIdLogFilter(logging.Filter):
             trace_id = current_trace_id()
             if trace_id is not None:
                 record.trace_id = trace_id
+        return True
+
+
+class _ChatContextLogFilter(logging.Filter):
+    """Stamp records emitted while handling a chat connection with that
+    connection's session and ticket ids (see src/utils/chat_context.py).
+
+    Threading these through `extra={}` only works where the caller happens to
+    hold them. `_synthesize_reply_audio` (src/api/chat.py) takes a tenant and
+    some text and has neither, and every adapter under src/providers/ gets a
+    config dict with no session context — which is precisely where a debug
+    session needs to follow a conversation across layers.
+
+    Stamps ONLY when a value is actually set, matching _TraceIdLogFilter: most
+    records are emitted outside any chat scope, and adding `session_id: null`
+    to every line in the system would change the shape of all of them for no
+    signal. An explicit value passed via extra={} still wins, so a call site
+    with better information keeps it.
+
+    Dependency direction is one-way: this module imports
+    src.utils.chat_context; that module must never import this one.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if not hasattr(record, "session_id"):
+            session_id = current_chat_session_id()
+            if session_id is not None:
+                record.session_id = session_id
+        if not hasattr(record, "ticket_id"):
+            ticket_id = current_chat_ticket_id()
+            if ticket_id is not None:
+                record.ticket_id = ticket_id
         return True
 
 
@@ -402,6 +487,7 @@ def configure_logging(
     handler.addFilter(_ClientIPLogFilter())
     handler.addFilter(_AdminLabelLogFilter())
     handler.addFilter(_TraceIdLogFilter())
+    handler.addFilter(_ChatContextLogFilter())
     root.addHandler(handler)
 
     if loki_url:
@@ -411,9 +497,17 @@ def configure_logging(
         loki_handler.addFilter(_ClientIPLogFilter())
         loki_handler.addFilter(_AdminLabelLogFilter())
         loki_handler.addFilter(_TraceIdLogFilter())
+        loki_handler.addFilter(_ChatContextLogFilter())
         root.addHandler(loki_handler)
 
-    # Quiet down noisy libraries.
+    # Quiet down noisy libraries. This is not only about noise: httpx logs
+    # "HTTP Request: GET <full url>" at INFO, and a CRM url carries the player
+    # id in its path -- the very thing tool_executor.py redacts before logging
+    # the same call itself. Without this line that redaction is decorative,
+    # because httpx has already shipped the unredacted url to stdout and Loki
+    # from one frame away. Pinned to WARNING rather than left to inherit the
+    # root level, so turning DEBUG on for an investigation cannot switch it
+    # back on. See tests/unit/test_noisy_library_loggers_are_pinned.py.
     for noisy in ("uvicorn.access", "httpx", "httpcore"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 

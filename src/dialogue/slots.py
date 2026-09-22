@@ -12,11 +12,16 @@ dropped, never raise.
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from typing import Any, Optional
+
+from src.utils.logging import debug_event
+
+log = logging.getLogger(__name__)
 
 
 class SlotType(str, Enum):
@@ -83,6 +88,15 @@ class SlotFiller:
     def apply_updates(self, updates: dict[str, Any]) -> dict[str, Any]:
         """Validate + merge ``updates``. Returns the slots actually applied."""
         applied: dict[str, Any] = {}
+        # Runs on every turn that carries updated_slots, so anything built
+        # purely for the debug line below is gated on the level check rather
+        # than paid unconditionally (docs/debug-logging.md's cost rule) --
+        # this module had zero logging before this pass, so a rejected slot
+        # (bad LLM output, silently dropped per this file's own docstring)
+        # left no trace at any level.
+        debug_on = log.isEnabledFor(logging.DEBUG)
+        previous: dict[str, Any] = {}
+        rejected_before = len(self._rejected)
         for name, raw_value in (updates or {}).items():
             spec = self.schema.specs.get(name)
             if spec is None:
@@ -94,8 +108,16 @@ class SlotFiller:
             if not ok:
                 self._rejected.append((name, raw_value, reason))
                 continue
+            if debug_on:
+                previous[name] = self._values.get(name)
             self._values[name] = coerced
             applied[name] = coerced
+        if debug_on:
+            debug_event(
+                log, "slots apply_updates completed",
+                updates=dict(updates or {}), applied=applied,
+                previous_values=previous, rejected=self._rejected[rejected_before:],
+            )
         return applied
 
     def missing_required(self) -> list[str]:

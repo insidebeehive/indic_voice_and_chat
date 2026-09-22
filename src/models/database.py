@@ -14,6 +14,7 @@ skipped there and tables stay in the default — test fixtures need no changes.
 
 from __future__ import annotations
 
+import logging
 from typing import Optional
 
 from sqlalchemy.ext.asyncio import (
@@ -24,6 +25,11 @@ from sqlalchemy.ext.asyncio import (
 )
 from sqlalchemy.orm import DeclarativeBase
 from sqlalchemy.schema import CreateSchema
+
+from src.utils.logging import debug_event
+from src.utils.redact import redact_url
+
+log = logging.getLogger(__name__)
 
 
 class Base(DeclarativeBase):
@@ -79,12 +85,26 @@ def get_engine(url: Optional[str] = None) -> AsyncEngine:
         db_config = get_settings().database
         if url is None:
             url = db_config.url
-        pool_kwargs = {} if _is_sqlite(url) else {
+        is_sqlite = _is_sqlite(url)
+        pool_kwargs = {} if is_sqlite else {
             "pool_size": db_config.pool_size, "max_overflow": db_config.max_overflow,
         }
+        connect_args = search_path_connect_args(url)
+        # The one moment the resolved URL/schema/pool settings are ever
+        # visible -- an engine built against the wrong URL (a stale env var,
+        # a misconfigured secret) otherwise surfaces only much later as an
+        # unrelated runtime error (a table "not found" in the wrong schema, a
+        # pool-exhaustion timeout). url goes through redact_url: a Postgres
+        # DSN embeds the password.
+        debug_event(
+            log, "database engine_create response",
+            url=redact_url(url), is_sqlite=is_sqlite, schema=get_schema(url),
+            pool_kwargs=pool_kwargs,
+            search_path_set="server_settings" in connect_args,
+        )
         _engine = create_async_engine(
             url, future=True, pool_pre_ping=True,
-            connect_args=search_path_connect_args(url),
+            connect_args=connect_args,
             **pool_kwargs,
         )
         _sessionmaker = async_sessionmaker(_engine, expire_on_commit=False)
@@ -107,10 +127,20 @@ async def ensure_schema(url: Optional[str] = None) -> None:
     url = url or get_settings().database.url
     schema = get_schema(url)
     if not schema:
+        # sqlite (tests) or no VOX_DB_SCHEMA configured -- a deliberate no-op,
+        # but silent otherwise: nothing else records that this ran and chose
+        # to do nothing, which matters when "the schema silently did not
+        # apply" is exactly the failure mode this function exists to prevent.
+        debug_event(
+            log, "database ensure_schema skipped",
+            reason="sqlite" if _is_sqlite(url) else "no_schema_configured",
+        )
         return
     engine = get_engine(url)
+    created = False
     async with engine.begin() as conn:
         def _ensure(sync_conn) -> None:
+            nonlocal created
             # pg_namespace (not information_schema.schemata, which is filtered by
             # the caller's privileges) so a least-privilege user that already has
             # access to an existing schema doesn't trigger a CREATE attempt.
@@ -123,7 +153,12 @@ async def ensure_schema(url: Optional[str] = None) -> None:
             # CreateSchema isn't a schema-qualified table ref, so the translate
             # map doesn't touch it — emits CREATE SCHEMA with the real name.
             sync_conn.execute(CreateSchema(schema))
+            created = True
         await conn.run_sync(_ensure)
+    # The success path -- main.py's lifespan only logs the exception path
+    # (see "startup ensure_schema failed"), so this is the only place that
+    # ever records whether the schema already existed or was just created.
+    debug_event(log, "database ensure_schema response", schema=schema, schema_created=created)
 
 
 def get_sessionmaker() -> async_sessionmaker[AsyncSession]:
@@ -140,6 +175,7 @@ async def dispose_engine() -> None:
         await _engine.dispose()
         _engine = None
         _sessionmaker = None
+        debug_event(log, "database engine_dispose response")
 
 
 def reset_engine_for_tests(url: str) -> AsyncEngine:

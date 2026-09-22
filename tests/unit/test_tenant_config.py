@@ -133,6 +133,49 @@ def test_secret_returns_none_when_env_name_is_none() -> None:
     assert t.secret(None) is None
 
 
+def _all_logged_text(caplog) -> str:
+    """Every field of every captured record, flattened to one grep-able
+    string -- catches a leak in a `debug_event`/`extra=` field, not just the
+    message. Mirrors tests/unit/test_provider_debug_logging.py's helper of
+    the same name."""
+    chunks = []
+    for r in caplog.records:
+        chunks.append(r.getMessage())
+        for k, v in vars(r).items():
+            chunks.append(f"{k}={v!r}")
+    return "\n".join(chunks)
+
+
+def test_secret_resolution_debug_log_never_carries_the_value(monkeypatch, caplog) -> None:
+    """TenantSettings.secret() resolves telephony/webhook/LiveKit credentials
+    (docs/debug-logging.md: "This package is where credentials LIVE") and its
+    DEBUG boundary event ("tenant_config secret resolved") must carry a
+    fingerprint + length, never the value itself -- the one absolute
+    exception to "DEBUG logs full values".
+
+    This is the regression test for the credential-leak demonstration run
+    while writing this pass: temporarily adding `value=value` to that
+    debug_event call (src/config_tenant.py's TenantSettings.secret) makes
+    this test fail immediately, because the raw secret then appears in the
+    captured record text below. No test in this file (or test_tenant_auth.py
+    / test_tenant_registry.py / test_tenants_routes.py) exercised
+    `secret()` at DEBUG before this one -- test_secret_resolution_success
+    above asserts the RETURN value, never what gets logged.
+    """
+    caplog.set_level("DEBUG")
+    monkeypatch.setenv("ACME_CANARY_SECRET", "s3cr3t-leak-canary-abcdef123456")
+    t = TenantSettings(id="t_acme", slug="acme", name="Acme")
+    resolved = t.secret("ACME_CANARY_SECRET")
+    assert resolved == "s3cr3t-leak-canary-abcdef123456"
+    logged = _all_logged_text(caplog)
+    assert "s3cr3t-leak-canary-abcdef123456" not in logged
+    # The event still needs to be USEFUL, not just safe -- fingerprint,
+    # length, and the env var NAME (a reference, not a secret) should be
+    # present so an operator can confirm the right value resolved.
+    assert "ACME_CANARY_SECRET" in logged
+    assert "value_len" in logged and "31" in logged
+
+
 def test_platform_webhook_base_url_reads_settings(monkeypatch) -> None:
     """The telephony webhook base is platform-level (WEBHOOK_BASE_URL →
     settings.pipeline.telephony.webhook_base_url), not per-tenant — the inbound
@@ -347,6 +390,93 @@ def test_validate_credentials_passes_s2s_with_realtime() -> None:
                            mode="s2s",
                            realtime=TenantRealtimeConfig(provider="gemini_live", api_key_env="GK")))
     validate_credentials(t)
+
+
+def test_validate_credentials_passes_webconsole_without_creds() -> None:
+    """webconsole is a browser transport, not a real telephony account —
+    there is no adapter and no per-tenant creds to fall back from, so it is
+    exempt from the account_sid_env/auth_token_env requirement."""
+    from src.config_tenant import TenantPipelineConfig, TenantTelephonyConfig
+    t = TenantSettings(
+        id="t1", slug="t1", name="T1",
+        pipeline=TenantPipelineConfig(
+            telephony=TenantTelephonyConfig(provider="webconsole"),
+        ),
+    )
+    validate_credentials(t)
+
+
+def test_validate_credentials_passes_webconsole_mixed_case() -> None:
+    """The provider string is never normalized on write (tenants.py stores it
+    verbatim from the request body), and every other consumer of
+    telephony.provider lowercases before comparing. The exemption check must
+    do the same, or a tenant registered as "WebConsole" would be refused
+    outbound dialing by calls.py yet still be hard-required to declare
+    telephony creds here."""
+    from src.config_tenant import TenantPipelineConfig, TenantTelephonyConfig
+    t = TenantSettings(
+        id="t1", slug="t1", name="T1",
+        pipeline=TenantPipelineConfig(
+            telephony=TenantTelephonyConfig(provider="WebConsole"),
+        ),
+    )
+    validate_credentials(t)
+
+
+def test_validate_credentials_passes_webconsole_s2s_with_chat_voice() -> None:
+    """The real-world shape that motivated the exemption: a webconsole tenant
+    running s2s realtime with its own chat_voice TTS override, and no
+    telephony credentials at all — none are needed for webconsole."""
+    from src.config_tenant import (
+        ChatVoiceConfig, TenantPipelineConfig, TenantRealtimeConfig,
+        TenantTTSConfig, TenantTelephonyConfig,
+    )
+    t = TenantSettings(
+        id="t1", slug="t1", name="T1",
+        pipeline=TenantPipelineConfig(
+            mode="s2s",
+            telephony=TenantTelephonyConfig(provider="webconsole"),
+            realtime=TenantRealtimeConfig(provider="gemini_live"),
+            chat_voice=ChatVoiceConfig(enabled=True, tts=TenantTTSConfig(provider="google")),
+        ),
+    )
+    validate_credentials(t)
+
+
+def test_validate_credentials_raises_when_webconsole_chat_voice_has_no_tts() -> None:
+    """The exemption is narrow: it only skips the telephony credential check.
+    A webconsole tenant with chat_voice enabled and no resolvable TTS
+    anywhere still raises on the chat_voice rule."""
+    from src.config_tenant import ChatVoiceConfig, TenantPipelineConfig, TenantTelephonyConfig
+    t = TenantSettings(
+        id="t1", slug="t1", name="T1",
+        pipeline=TenantPipelineConfig(
+            telephony=TenantTelephonyConfig(provider="webconsole"),
+            chat_voice=ChatVoiceConfig(enabled=True),
+        ),
+    )
+    with pytest.raises(TenantConfigError, match="pipeline.chat_voice.tts") as exc:
+        validate_credentials(t)
+    assert "account_sid_env" not in str(exc.value)
+    assert "auth_token_env" not in str(exc.value)
+
+
+def test_validate_credentials_raises_when_webconsole_s2s_without_realtime() -> None:
+    """The exemption is narrow: it only skips the telephony credential check.
+    A webconsole tenant in s2s mode with no realtime.provider still raises on
+    the realtime rule."""
+    from src.config_tenant import TenantPipelineConfig, TenantTelephonyConfig
+    t = TenantSettings(
+        id="t1", slug="t1", name="T1",
+        pipeline=TenantPipelineConfig(
+            mode="s2s",
+            telephony=TenantTelephonyConfig(provider="webconsole"),
+        ),
+    )
+    with pytest.raises(TenantConfigError, match="pipeline.realtime") as exc:
+        validate_credentials(t)
+    assert "account_sid_env" not in str(exc.value)
+    assert "auth_token_env" not in str(exc.value)
 
 
 # --- Chat voice replies --------------------------------------------------

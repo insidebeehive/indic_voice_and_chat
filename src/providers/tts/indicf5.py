@@ -24,6 +24,7 @@ import httpx
 from src.interfaces.tts import ITTSProvider, TTSConfig, TTSResult
 from src.pipeline.audio_utils import resample_pcm16
 from src.pipeline.text_normalize import normalize_for_tts
+from src.utils.logging import debug_event
 
 log = logging.getLogger(__name__)
 
@@ -88,6 +89,11 @@ class IndicF5TTSAdapter(ITTSProvider):
         timeout = httpx.Timeout(self._timeout, connect=min(self._timeout, 5.0))
         chunks: list[bytes] | None = None
         last_exc: Exception | None = None
+        # No credential in this request at all -- IndicF5 is a self-hosted
+        # pod with no API key -- so the full body (customer text included)
+        # is safe to log without any redaction.
+        debug_event(log, "indicf5 tts request",
+                    url=f"{self._base_url}{_STREAM_PATH}", body=body)
         for attempt in range(_TTS_ATTEMPTS):
             try:
                 collected: list[bytes] = []
@@ -148,6 +154,8 @@ class IndicF5TTSAdapter(ITTSProvider):
         if actual_rate != config.sample_rate:
             audio_bytes, _ = resample_pcm16(audio_bytes, actual_rate, config.sample_rate)
         duration_ms = (len(audio_bytes) / max(config.sample_rate * 2, 1)) * 1000.0
+        debug_event(log, "indicf5 tts response", audio_bytes=len(audio_bytes),
+                    duration_ms=duration_ms, sample_rate=config.sample_rate)
         return TTSResult(
             audio=audio_bytes,
             duration_ms=duration_ms,

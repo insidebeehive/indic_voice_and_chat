@@ -15,7 +15,12 @@ sentence ends.
 
 from __future__ import annotations
 
+import logging
 import re
+
+from src.utils.logging import debug_event
+
+log = logging.getLogger(__name__)
 
 # Punctuation that can end a sentence in any of our supported scripts.
 _TERMINATORS = ".!?;।॥"
@@ -66,10 +71,29 @@ class SentenceDetector:
         rest = self._buffer.strip()
         if rest:
             out.append(rest)
+            # Whatever was left buffered when the turn ended, force-emitted as
+            # a final sentence. That covers two different cases and this
+            # event doesn't distinguish them: text that never reached a
+            # terminator at all, AND text that did contain one but was
+            # rejected by _drain for another reason -- below min_chars
+            # ("Hi."), an abbreviation ("Meet Dr."), or a decimal point
+            # ("It is 3.5"). Either way it's being spoken as a fragment
+            # because the turn ended, not because _drain judged it complete.
+            # Worth knowing when TTS is reading out a trailing fragment that
+            # looks like it should have been caught earlier.
+            debug_event(log, "sentence flush emitted", sentence=rest, chars=len(rest))
         self._buffer = ""
         return out
 
     def reset(self) -> None:
+        if self._buffer.strip():
+            # Unlike flush(), reset() throws the pending text away instead of
+            # emitting it -- a caller doing this mid-turn would produce dead
+            # air with no other trace, since this text never reaches
+            # _drain()/flush() again. No current caller in this codebase
+            # invokes reset() (confirmed by a repo-wide search), but the event
+            # is here so a future caller doesn't reintroduce a silent drop.
+            debug_event(log, "sentence reset pending_discarded", pending=self._buffer)
         self._buffer = ""
         self._emitted_any = False
 
@@ -90,6 +114,13 @@ class SentenceDetector:
                 return emitted
             emitted.append(frag)
             self._emitted_any = True
+            # This is the latency-critical moment (first audio the caller
+            # will hear) -- log it here rather than per feed() call, one
+            # event per turn instead of one per token/chunk.
+            debug_event(
+                log, "sentence detect emitted",
+                sentence=frag, reason="first_chunk_soft", pending=self._buffer,
+            )
         # Index from which to keep scanning the buffer for the next terminator.
         scan_start = 0
         while scan_start < len(self._buffer):
@@ -109,8 +140,18 @@ class SentenceDetector:
             if not _is_real_sentence_end(self._buffer, idx):
                 scan_start = end
                 continue
+            terminator = self._buffer[idx]
             emitted.append(candidate)
             self._buffer = self._buffer[end:].lstrip()
+            # One event per SENTENCE EMITTED (a handful per turn) -- not per
+            # feed() call, which runs per LLM token/chunk. `pending` shows
+            # what's left buffered, so a sentence that never follows is
+            # visible without a second query.
+            debug_event(
+                log, "sentence detect emitted",
+                sentence=candidate, reason="terminator", terminator=terminator,
+                pending=self._buffer,
+            )
             scan_start = 0
         return emitted
 

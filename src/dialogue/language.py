@@ -12,8 +12,13 @@ Codes are kept in a canonical **base form** internally (``"mr"``, ``"hi"``);
 
 from __future__ import annotations
 
+import logging
 import re
 from typing import Optional
+
+from src.utils.logging import debug_event
+
+log = logging.getLogger(__name__)
 
 # ISO-639-1/639-2 codes are 2-3 lowercase letters. This is a shape check, not
 # a fixed allowlist — different STT/TTS providers support different language
@@ -72,8 +77,34 @@ def resolve_active_language(
     cur = normalize_lang(current)
     llm = normalize_lang(llm_lang)
     if llm:
+        # The LLM is the arbiter (see docstring) -- an explicit self-reported
+        # language always wins, so this is the common case, not a fallback.
+        debug_event(
+            log, "language resolve_active_language decided",
+            current=current, stt_lang=stt_lang, llm_lang=llm_lang,
+            resolved=llm, reason="llm_reported",
+        )
         return llm
     stt = normalize_lang(stt_lang)
     if stt and stt != cur:
+        # The LLM omitted a language this turn and STT detected a different
+        # one than what's currently active -- a language SWITCH, which is
+        # exactly the customer-visible decision worth a value-carrying line:
+        # a wrong switch here is heard by the caller immediately.
+        debug_event(
+            log, "language resolve_active_language decided",
+            current=current, stt_lang=stt_lang, llm_lang=llm_lang,
+            resolved=stt, reason="stt_detected_switch",
+        )
         return stt
+    # No signal either way -- current language sticks. Also the outcome when
+    # llm_lang/stt_lang carried something that didn't normalize to a real
+    # code (e.g. the LLM spelling out "hindi" instead of "hi") -- current,
+    # stt_lang and llm_lang are all logged raw above so that case is visible
+    # here even though it isn't a distinct branch.
+    debug_event(
+        log, "language resolve_active_language decided",
+        current=current, stt_lang=stt_lang, llm_lang=llm_lang,
+        resolved=cur, reason="sticky",
+    )
     return cur

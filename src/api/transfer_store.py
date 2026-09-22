@@ -19,6 +19,8 @@ from __future__ import annotations
 import asyncio
 import logging
 
+from src.utils.logging import debug_event
+
 log = logging.getLogger(__name__)
 
 _pending: dict[tuple[str, str], "asyncio.Future[str]"] = {}
@@ -29,6 +31,7 @@ def register(tenant_id: str, call_sid: str) -> "asyncio.Future[str]":
     loop = asyncio.get_running_loop()
     fut: asyncio.Future[str] = loop.create_future()
     _pending[(tenant_id, call_sid)] = fut
+    debug_event(log, "transfer_store register request", tenant_id=tenant_id, call_sid=call_sid)
     return fut
 
 
@@ -38,13 +41,32 @@ def resolve(tenant_id: str, call_sid: str, status: str) -> bool:
     if fut is not None and not fut.done():
         fut.set_result(status)
         log.info("transfer resolved", extra={"call_sid": call_sid, "status": status})
+        # Supplements the INFO line above with tenant_id, which that line
+        # doesn't carry -- useful when the same call_sid space is being
+        # reasoned about across tenants during an investigation.
+        debug_event(
+            log, "transfer_store resolve response",
+            tenant_id=tenant_id, call_sid=call_sid, status=status, resolved=True,
+        )
         return True
     log.warning("transfer resolve: no pending future", extra={"call_sid": call_sid})
+    debug_event(
+        log, "transfer_store resolve response",
+        tenant_id=tenant_id, call_sid=call_sid, status=status, resolved=False,
+        future_existed=(fut is not None),
+    )
     return False
 
 
 def cancel_pending(tenant_id: str, call_sid: str) -> None:
     """Cancel a pending Future (call dropped before CS responded)."""
     fut = _pending.pop((tenant_id, call_sid), None)
+    cancelled = False
     if fut is not None and not fut.done():
         fut.cancel()
+        cancelled = True
+    debug_event(
+        log, "transfer_store cancel_pending response",
+        tenant_id=tenant_id, call_sid=call_sid,
+        future_existed=(fut is not None), cancelled=cancelled,
+    )

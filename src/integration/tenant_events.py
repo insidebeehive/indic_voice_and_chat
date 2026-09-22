@@ -30,6 +30,9 @@ from typing import Any, Awaitable, Callable, Optional
 
 import httpx
 
+from src.utils.logging import debug_event
+from src.utils.redact import redact_url
+
 log = logging.getLogger(__name__)
 
 # ``http_post(url, raw_body, headers) -> status_code``. ``-1`` means no response.
@@ -146,10 +149,22 @@ async def resolve_events_webhook_url(tenant, sessionmaker) -> Optional[str]:
 
     explicit = getattr(settings, "events_webhook_url", None)
     if explicit:
+        debug_event(
+            log, "tenant_events url_resolve resolved",
+            source="tenant_override", url=redact_url(explicit),
+        )
         return explicit
 
     crm_id = getattr(settings, "crm_id", None)
     if not crm_id or sessionmaker is None:
+        # Both collapse to "no URL" for the caller, but for different
+        # reasons -- a tenant with no CRM linked at all vs. this call site
+        # not having DB access to look one up -- and the caller only ever
+        # sees the coarse "no_webhook_url_configured" outcome, never which.
+        debug_event(
+            log, "tenant_events url_resolve skipped",
+            reason="no_crm_linked" if not crm_id else "no_sessionmaker",
+        )
         return None
 
     from src.models.crm import Crm
@@ -157,6 +172,11 @@ async def resolve_events_webhook_url(tenant, sessionmaker) -> Optional[str]:
     async with sessionmaker() as db:
         crm = await db.get(Crm, crm_id)
     if crm is None or not crm.events_webhook_url_template:
+        debug_event(
+            log, "tenant_events url_resolve skipped",
+            reason="crm_not_found" if crm is None else "crm_missing_template",
+            crm_id=crm_id,
+        )
         return None
 
     crm_config = getattr(settings, "crm", None)
@@ -165,7 +185,12 @@ async def resolve_events_webhook_url(tenant, sessionmaker) -> Optional[str]:
         or getattr(settings, "id", None)
         or getattr(tenant, "id", None)
     )
-    return crm.events_webhook_url_template.replace("{operator_id}", operator_id)
+    url = crm.events_webhook_url_template.replace("{operator_id}", operator_id)
+    debug_event(
+        log, "tenant_events url_resolve resolved",
+        source="crm_template", url=redact_url(url), crm_id=crm_id,
+    )
+    return url
 
 
 async def deliver(
@@ -182,12 +207,27 @@ async def deliver(
     if secret:
         headers["X-Signature"] = sign_body(secret, raw)
     poster = http_post or _httpx_post
+    event_type = envelope.get("event_type")
     for attempt in range(_MAX_ATTEMPTS):
+        debug_event(
+            log, "tenant_events deliver request",
+            url=redact_url(url), event_type=event_type,
+            attempt=attempt + 1, max_attempts=_MAX_ATTEMPTS, signed=bool(secret),
+        )
         try:
             status = await poster(url, raw, headers)
         except Exception:  # noqa: BLE001 - a custom poster must not break the call
             log.exception("tenant event poster raised", extra={"url": url})
             status = -1
+        # Only the final outcome reaches the caller (see call_store.py's/
+        # chat_webhooks.py's "response" events) -- without this, a delivery
+        # that fails twice and succeeds on the third attempt looks identical
+        # to one that succeeded immediately.
+        debug_event(
+            log, "tenant_events deliver response",
+            url=redact_url(url), event_type=event_type,
+            attempt=attempt + 1, status=status,
+        )
         if 200 <= status < 300:
             return True
         if attempt < _MAX_ATTEMPTS - 1:

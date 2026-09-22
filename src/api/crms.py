@@ -12,6 +12,7 @@ tenant-scoped. A tenant is linked to a CRM via ``PATCH /tenants/{id}``
 
 from __future__ import annotations
 
+import logging
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -23,7 +24,9 @@ from src.api.deps import get_db_session
 from src.auth import secrets as crypto
 from src.auth.middleware import require_admin
 from src.models.crm import Crm, CrmSecret, CrmTool
+from src.utils.logging import debug_event
 
+log = logging.getLogger(__name__)
 router = APIRouter(prefix="/crms", tags=["crms"])
 
 
@@ -109,6 +112,18 @@ async def create_crm(
         session.add(CrmTool(crm_id=req.id, name=t.name, description=t.description,
                              endpoint=t.endpoint, method=t.method, parameters=t.parameters))
     await _upsert_livekit_secrets(session, req.id, req.livekit_api_key, req.livekit_api_secret)
+    # CRUD boundary: a CRM is shared platform config (module docstring) -- its
+    # tool catalog and base_url are what every tenant linked to it resolves
+    # through (resolve_crm_tools, src/bootstrap.py). Full non-secret fields;
+    # LiveKit secret values never appear, only whether they were provided.
+    debug_event(
+        log, "crm create result", crm_id=req.id, crm_name=req.name, base_url=req.base_url,
+        auth_type=req.auth_type, events_webhook_url_template=req.events_webhook_url_template,
+        livekit_url=req.livekit_url,
+        livekit_api_key_provided=req.livekit_api_key is not None,
+        livekit_api_secret_provided=req.livekit_api_secret is not None,
+        tool_names=[t.name for t in req.tools], tool_count=len(req.tools),
+    )
     await session.commit()
     return await _detail(session, req.id)
 
@@ -132,6 +147,11 @@ async def update_crm(
     crm = await session.get(Crm, crm_id)
     if crm is None:
         raise HTTPException(status_code=404, detail="CRM not found")
+    before = {
+        "name": crm.name, "base_url": crm.base_url,
+        "events_webhook_url_template": crm.events_webhook_url_template,
+        "auth_type": crm.auth_type, "livekit_url": crm.livekit_url,
+    }
     if req.name is not None:
         crm.name = req.name
     if req.base_url is not None:
@@ -143,16 +163,36 @@ async def update_crm(
     if req.livekit_url is not None:
         crm.livekit_url = req.livekit_url
     await _upsert_livekit_secrets(session, crm_id, req.livekit_api_key, req.livekit_api_secret)
+    old_tool_names: Optional[list[str]] = None
     if req.tools is not None:
         existing_tools = (await session.execute(
             select(CrmTool).where(CrmTool.crm_id == crm_id)
         )).scalars().all()
+        old_tool_names = [t.name for t in existing_tools]
         for t in existing_tools:
             await session.delete(t)
         await session.flush()
         for t in req.tools:
             session.add(CrmTool(crm_id=crm_id, name=t.name, description=t.description,
                                  endpoint=t.endpoint, method=t.method, parameters=t.parameters))
+    # CRUD boundary, before/after (never touches CrmSecret values — see
+    # _upsert_livekit_secrets, which logs presence/names only). ``tools`` is a
+    # wholesale REPLACE (module docstring), not a merge, so the old name list
+    # is the only record of what a PATCH just discarded -- the response body
+    # only ever shows what's there now.
+    debug_event(
+        log, "crm update result", crm_id=crm_id, before=before,
+        after={
+            "name": crm.name, "base_url": crm.base_url,
+            "events_webhook_url_template": crm.events_webhook_url_template,
+            "auth_type": crm.auth_type, "livekit_url": crm.livekit_url,
+        },
+        livekit_api_key_provided=req.livekit_api_key is not None,
+        livekit_api_secret_provided=req.livekit_api_secret is not None,
+        tools_replaced=req.tools is not None,
+        old_tool_names=old_tool_names,
+        new_tool_names=([t.name for t in req.tools] if req.tools is not None else None),
+    )
     await session.commit()
     return await _detail(session, crm_id)
 
@@ -176,14 +216,25 @@ async def _upsert_livekit_secrets(
         raise HTTPException(
             status_code=503,
             detail="VOX_SECRET_KEY is not set — cannot encrypt LiveKit credentials")
+    updated: list[str] = []
+    inserted: list[str] = []
     for name, value in provided.items():
         existing = (await session.execute(
             select(CrmSecret).where(CrmSecret.crm_id == crm_id, CrmSecret.name == name)
         )).scalar_one_or_none()
         if existing is not None:
             existing.value_encrypted = crypto.encrypt(value)
+            updated.append(name)
         else:
             session.add(CrmSecret(crm_id=crm_id, name=name, value_encrypted=crypto.encrypt(value)))
+            inserted.append(name)
+    # Names only, never values -- these are the CRM-level LiveKit project's
+    # real credentials (src.config_tenant.resolve_livekit_creds' CRM-tier
+    # fallback reads them straight back out).
+    debug_event(
+        log, "crm livekit_secrets_upsert result", crm_id=crm_id,
+        inserted=inserted, updated=updated,
+    )
 
 
 async def _detail(session: AsyncSession, crm_id: str) -> CrmDetail:
