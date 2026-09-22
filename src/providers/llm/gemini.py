@@ -109,7 +109,9 @@ def _concurrency_sem() -> asyncio.Semaphore:
 # See docs/llm-prompt-caching.md for the measurements this rests on: Gemini's
 # IMPLICIT cache only covers the single contiguous ``system_instruction``
 # field (never ``contents``, never ``config.tools``), and even there it's
-# capped around 4,024-4,028 tokens against this codebase's real prompts —
+# capped around 4,024-4,028 tokens against this codebase's real prompts (stale —
+# measured at a ~17,803-char generic-pack prompt, before the reply-length
+# prompt change grew it; needs re-measuring) —
 # 51% of a ~7,900-token turn. An EXPLICIT cache (``client.caches.create``),
 # measured the same session, covered 99.7% of that same prompt including
 # tool declarations. But creation took 1.77s — far too slow to sit on a live
