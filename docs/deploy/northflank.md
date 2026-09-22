@@ -68,27 +68,34 @@ Migrations run on container start, but the step is **non-blocking and fails
 open**. The Docker `CMD` is:
 
 ```
-timeout 60 alembic upgrade head; exec uvicorn src.main:app --host 0.0.0.0 --port 8000
+ok=0; for i in 1 2 3; do timeout 120 alembic upgrade head && { ok=1; break; }; echo "alembic upgrade head failed (attempt $i/3)"; sleep 10; done; [ "$ok" = 1 ] || { echo 'FATAL: ...'; exit 1; }; exec uvicorn src.main:app --host 0.0.0.0 --port 8000
 ```
 
-Note the `timeout 60` and the `;` (not `&&`): if the migration errors or
-exceeds 60 seconds, **uvicorn starts anyway against an unmigrated database.**
-This was deliberate — it broke a crash loop caused by an alembic hang — but it
-means a deploy is *not* a reliable way to apply a migration, and a failure is
-quiet rather than loud.
+**A migration that does not reach head now fails the deploy.** The container
+exits non-zero and the rollout stops, rather than serving on an unmigrated
+schema.
 
-**Apply pending migrations yourself before deploying** (`alembic upgrade head`),
-and confirm with `alembic current` afterwards. Two things make the quiet failure
-easy to miss:
+It retries three times first, with a 10-second gap. That is not timidity: the
+step used to be `;`-chained precisely because a plain `&&` caused a real crash
+loop (bb6c6a4), where alembic blocked on a DB connection or lock still held by
+the OUTGOING container during a rolling restart. That condition clears in
+seconds, so the retries absorb it while a genuine migration error still fails
+all three and stops the deploy.
+
+The fail-open version hid the same bug twice — see the `VARCHAR(32)` note below
+— each time leaving the app running against columns that did not exist. Two
+things still make a migration problem easy to misread:
 
 - A stale `alembic/versions/__pycache__` can make `alembic heads` report a
   revision whose source file no longer exists. Clear it before trusting that
   output.
 - Alembic's `alembic_version.version_num` is `VARCHAR(32)`. A revision id
   longer than that raises `StringDataRightTruncationError` at the point the
-  version is recorded, so the migration can never be applied — and with the
-  fail-open `CMD` above, every deploy would skip it silently. Keep revision ids
-  comfortably under 32 characters.
+  version is recorded, so the migration can never be applied. This has happened
+  twice (0019, then 0025) and the fail-open `CMD` hid both. Revision ids are now
+  pinned under 32 characters by
+  `tests/unit/test_alembic_revision_ids.py`, which also checks the chain
+  resolves and that there is exactly one head.
 
 The DB role only needs rights on an already-provisioned schema; `env.py` skips
 `CREATE SCHEMA` when the schema already exists (first-time provisioning still

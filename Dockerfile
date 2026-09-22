@@ -41,7 +41,22 @@ COPY data/kb ./data/kb
 
 EXPOSE 8000
 
-# Run migrations with a 60-second timeout (non-blocking: uvicorn starts even if
-# alembic hangs — safe because we have no new migrations in this deploy and the
-# schema is already at head from the last successful boot).
-CMD ["sh", "-c", "timeout 60 alembic upgrade head; exec uvicorn src.main:app --host 0.0.0.0 --port 8000"]
+# Migrations must reach head before the app serves. This used to be `;` rather
+# than `&&`, so a failed migration started uvicorn anyway against an unmigrated
+# schema — and that hid the same bug twice: a revision id longer than
+# alembic_version.version_num's VARCHAR(32) (0019, then 0025), each time
+# leaving the app running for hours against columns that did not exist, with
+# nothing failing except whatever quietly swallowed the resulting errors.
+#
+# Retried rather than failed on the first attempt, because the `;` was not
+# arbitrary: bb6c6a4 introduced it to break a real Northflank crash loop where
+# alembic blocked on a DB connection or lock still held by the OUTGOING
+# container during a rolling restart. That condition is transient and clears in
+# seconds, so three attempts absorb it. A genuine migration error fails all
+# three in well under a minute and the container exits non-zero, which is what
+# stops the rollout.
+#
+# 120s per attempt rather than 60: with `;` a premature kill was harmless (the
+# app booted anyway); now it fails the deploy, so the cap has to be generous
+# enough not to guillotine a legitimately slow migration.
+CMD ["sh", "-c", "ok=0; for i in 1 2 3; do timeout 120 alembic upgrade head && { ok=1; break; }; echo \"alembic upgrade head failed (attempt $i/3)\"; sleep 10; done; [ \"$ok\" = 1 ] || { echo 'FATAL: migrations did not reach head; refusing to start on an unmigrated schema'; exit 1; }; exec uvicorn src.main:app --host 0.0.0.0 --port 8000"]

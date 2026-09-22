@@ -54,15 +54,26 @@ stops being read.
 ## Deployment
 
 Alembic migrations apply themselves on deploy — the `Dockerfile` CMD runs
-`timeout 60 alembic upgrade head` before exec'ing uvicorn. There is no manual
-upgrade step after shipping a migration, so don't tell anyone to run one.
+`alembic upgrade head` before exec'ing uvicorn. There is no manual upgrade step
+after shipping a migration, so don't tell anyone to run one.
 
-That command is `;`-chained, not `&&`: uvicorn starts even if alembic times out
-or fails, leaving the app serving on the old schema with only container logs as
-evidence. The Dockerfile comment justifies the non-blocking choice with "we have
-no new migrations in this deploy", which stops holding the moment one ships — so
-when a deploy carries a migration, check the container logs to confirm it
-actually reached head.
+**A migration that does not reach head fails the deploy** (changed 2026-09-22).
+The container exits non-zero and the rollout stops rather than serving on an
+unmigrated schema. It retries three times with a 10s gap first, because the step
+was previously `;`-chained for a real reason: a plain `&&` caused a Northflank
+crash loop (bb6c6a4) when alembic blocked on a connection or lock held by the
+outgoing container during a rolling restart. The retries absorb that; a genuine
+migration error still fails all three and stops the deploy.
+
+The fail-open version hid the same bug twice — a revision id longer than
+`alembic_version.version_num`'s `VARCHAR(32)` (0019, then 0025) — each time
+leaving the app serving against columns that did not exist, with only whatever
+swallowed the resulting errors as evidence. Revision ids are now pinned by
+`tests/unit/test_alembic_revision_ids.py`.
+
+`src/main.py`'s `ensure_schema` is still fail-open by design (20s timeout, then
+boot proceeds). That is a different mechanism — it creates a missing schema and
+no-ops on SQLite — and is not covered by the change above.
 
 ## Existing standing preferences
 
