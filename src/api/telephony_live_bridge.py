@@ -25,6 +25,7 @@ from src.api import dev_call_control
 from src.api.live_bridge_base import _BaseLiveBridge
 from src.interfaces.realtime import RealtimeConfig
 from src.pipeline.audio_utils import mulaw_to_pcm16, pcm16_to_mulaw, resample_pcm16
+from src.utils.logging import debug_event
 
 log = logging.getLogger(__name__)
 
@@ -164,14 +165,22 @@ class TelephonyLiveBridge(_BaseLiveBridge):
                 log.info("telephony model audio -> caller", extra={"out_frames": self._out_frames})
 
     async def _send_interrupt(self) -> None:
-        # Barge-in: drop queued+playing agent audio and reset pacing.
+        # Barge-in: drop queued+playing agent audio and reset pacing. Fires a
+        # handful of times per call at most (not per media frame) — carries
+        # what was cancelled, since this is the telephony side of the same
+        # gap browser_bridge.py's _handle_barge_in documents.
+        dropped = 0
         while not self._audio_q.empty():
             try:
                 self._audio_q.get_nowait()
+                dropped += 1
             except asyncio.QueueEmpty:
                 break
         self._play_deadline = 0.0
-        if self._supports_clear and self._stream_sid is not None:
+        clear_frame_sent = self._supports_clear and self._stream_sid is not None
+        debug_event(log, "telephony live barge_in interrupt",
+                    dropped_queued_chunks=dropped, clear_frame_sent=clear_frame_sent)
+        if clear_frame_sent:
             await self._ws.send_text(json.dumps(
                 {"event": "clear", self._sid_field: self._stream_sid}))
 
@@ -195,7 +204,12 @@ class TelephonyLiveBridge(_BaseLiveBridge):
                         await asyncio.sleep(slack)
         except asyncio.CancelledError:
             raise
-        except Exception:  # noqa: BLE001 - WS closed mid-send (teardown race); stop quietly
+        except Exception as exc:  # noqa: BLE001 - WS closed mid-send (teardown race); stop quietly
+            # No log fires here at any level today — see the classification
+            # table (a real gap, reported not fixed). This at least makes the
+            # cause visible under DEBUG.
+            debug_event(log, "telephony live sender_loop ended_by_exception",
+                        error=repr(exc), out_frames=self._out_frames)
             self._stopped = True
 
     # --- transfer hold ---------------------------------------------------

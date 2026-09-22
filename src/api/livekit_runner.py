@@ -25,6 +25,7 @@ from src.api.call_store import insert_call, mark_answered, record_outcome
 from src.campaign.models import LeadCallOutcome
 from src.config_tenant import resolve_livekit_creds
 from src.models.conversation import Conversation
+from src.utils.logging import debug_event
 
 log = logging.getLogger(__name__)
 
@@ -265,6 +266,12 @@ async def run_call(tenant, room_name: str, meta: dict, *, bridge_factory, sessio
         if getattr(track, "kind", None) != rtc.TrackKind.KIND_AUDIO:
             return
         if state["audio_stream"] is not None:
+            # Rare (only if a participant publishes a second audio track) but
+            # a real skip: silently ignoring it could otherwise look like a
+            # missing/late track from the operator's side.
+            debug_event(log, "livekit run_call track_subscribed ignored_additional",
+                        room_name=room_name, tenant=tenant.slug,
+                        participant_identity=getattr(participant, "identity", None))
             return  # already have the caller's track — ignore any further ones
         state["audio_stream"] = rtc.AudioStream(
             track, sample_rate=_INBOUND_SAMPLE_RATE, num_channels=1)

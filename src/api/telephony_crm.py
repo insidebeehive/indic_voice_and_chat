@@ -28,6 +28,7 @@ from src.api.call_store import insert_call
 from src.api.deps import get_db_session
 from src.auth import TenantContext, current_tenant
 from src.models.conversation import Conversation
+from src.utils.logging import debug_event
 
 log = logging.getLogger(__name__)
 router = APIRouter(prefix="/telephony", tags=["telephony-crm"])
@@ -87,15 +88,27 @@ async def register_call(
     Returns 200 (not 201) if the SID is already registered, so it is safe to
     call idempotently.
     """
+    debug_event(
+        log, "telephony_crm register_call request",
+        tenant=tenant.slug, provider=req.provider, provider_call_sid=req.provider_call_sid,
+        campaign_id=req.campaign_id,
+    )
     provider = req.provider.lower()
     if provider not in _SUPPORTED_PROVIDERS:
+        debug_event(
+            log, "telephony_crm register_call rejected",
+            tenant=tenant.slug, provider=req.provider, reason="unsupported_provider",
+        )
         raise HTTPException(
             status_code=400,
             detail=f"provider {req.provider!r} is not supported for call registration "
                    f"(supported: {', '.join(sorted(_SUPPORTED_PROVIDERS))})",
         )
 
-    # Idempotency: return the existing row if the SID is already known.
+    # Idempotency: return the existing row if the SID is already known. A
+    # skip a CRM integrator could easily mistake for "the call was never
+    # registered" without this — the 200 (vs 201) status code is the only
+    # other signal, and it's easy to not check for that.
     existing = (await db.execute(
         select(Conversation).where(
             Conversation.provider_call_sid == req.provider_call_sid,
@@ -103,6 +116,11 @@ async def register_call(
         )
     )).scalar_one_or_none()
     if existing is not None:
+        debug_event(
+            log, "telephony_crm register_call idempotent_hit",
+            tenant=tenant.slug, provider=provider, provider_call_sid=req.provider_call_sid,
+            existing_call_id=existing.id, existing_status=existing.status,
+        )
         response.status_code = 200
         return {"call_id": existing.id, "status": existing.status}
 
@@ -118,6 +136,12 @@ async def register_call(
         )
     except IntegrityError as e:
         await db.rollback()
+        debug_event(
+            log, "telephony_crm register_call rejected",
+            tenant=tenant.slug, provider=provider, call_id=call_id,
+            campaign_id=req.campaign_id, reason="invalid_campaign_id",
+            error=str(e),
+        )
         raise HTTPException(
             status_code=400,
             detail="campaign_id does not reference an existing campaign — "

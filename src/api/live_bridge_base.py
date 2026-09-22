@@ -21,6 +21,7 @@ from src.agents.state_machine import Event, State
 from src.analysis.call_outcome import analyze_call
 from src.interfaces.llm import LLMMessage
 from src.interfaces.realtime import IRealtimeSession, RealtimeConfig, RealtimeTool
+from src.utils.logging import debug_event
 
 log = logging.getLogger(__name__)
 
@@ -146,8 +147,11 @@ class _BaseLiveBridge:
             # Salvage an in-progress turn (call ended mid-reply) so the transcript
             # + outcome aren't lost.
             try:
-                if ((self._user_buf.strip() or self._agent_buf.strip())
-                        and not getattr(self._agent.state, "is_terminal", False)):
+                user_left = self._user_buf.strip()
+                agent_left = self._agent_buf.strip()
+                if (user_left or agent_left) and not getattr(self._agent.state, "is_terminal", False):
+                    debug_event(log, "live bridge turn salvage triggered",
+                                user_chars=len(user_left), agent_chars=len(agent_left))
                     await self._commit_turn()
             except Exception:  # noqa: BLE001 - never let salvage break teardown
                 log.exception("turn salvage on teardown failed")
@@ -221,10 +225,25 @@ class _BaseLiveBridge:
                     if ev.tool_name == "record_turn_signal":
                         self._pending_action = ev.tool_args.get("action") or self._pending_action
                         self._pending_slots.update(ev.tool_args.get("updated_slots") or {})
+                        debug_event(log, "live bridge tool_call record_turn_signal",
+                                    action=ev.tool_args.get("action"),
+                                    updated_slots=ev.tool_args.get("updated_slots"))
+                    else:
+                        debug_event(log, "live bridge tool_call unrecognized",
+                                    tool_name=ev.tool_name, tool_args=ev.tool_args)
                     await self._session.send_tool_response(
                         tool_id=ev.tool_id, name=ev.tool_name, response={"ok": True})
                 elif ev.type == "interrupted":
                     self._speaking = False
+                    # The model's own barge-in (S2S has no separate client-side
+                    # detector — see browser_bridge.py's _handle_barge_in for
+                    # that side). Fires a handful of times per call at most;
+                    # carries what was in flight so an operator can tell
+                    # whether the model cut itself off mid-reply.
+                    debug_event(log, "live bridge native_interrupt fired",
+                                had_audio_this_turn=self._first_audio_at is not None,
+                                user_chars_buffered=len(self._user_buf),
+                                agent_chars_buffered=len(self._agent_buf))
                     await self._send_interrupt()
                     await self._emit_status("listening")
                 elif ev.type == "turn_complete":
@@ -251,6 +270,7 @@ class _BaseLiveBridge:
     async def _commit_turn(self) -> None:
         """Record the completed turn (transcript + slots) and advance state."""
         if getattr(self._agent.state, "is_terminal", False):
+            debug_event(log, "live bridge commit_turn skipped_terminal")
             return
         user = self._user_buf.strip()
         agent = self._agent_buf.strip()
@@ -335,6 +355,8 @@ class _BaseLiveBridge:
 
     async def _emit_outcome(self) -> None:
         if self._outcome_emitted or self._llm is None:
+            debug_event(log, "live bridge emit_outcome skipped",
+                        already_emitted=self._outcome_emitted, has_llm=self._llm is not None)
             return
         self._outcome_emitted = True
         try:

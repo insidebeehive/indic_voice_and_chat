@@ -31,6 +31,7 @@ from src.analysis.call_outcome import analyze_call
 from src.interfaces.llm import LLMMessage
 from src.pipeline.turn_capture import accumulate_and_detect
 from src.pipeline.vad import EndpointConfig, EndpointDetector, VADDetector
+from src.utils.logging import debug_event
 
 log = logging.getLogger(__name__)
 
@@ -143,6 +144,15 @@ class BrowserVoiceBridge:
         self._last_action: str | None = None
         self._outcome_emitted = False
         self._outcome_payload = None  # dict set by _emit_outcome; read for billing
+        # Logging-only latches: mirror the vad.py pattern of logging a FLIP,
+        # not a per-frame/per-call state. _mic_gate_active tracks whether the
+        # echo gate in _on_pcm_frame is currently dropping mic audio (that
+        # check itself runs at browser mic-quantum rate, far above 50/s);
+        # _playback_active tracks whether _send_pcm has audio in flight this
+        # turn, so "playback started" fires once per turn rather than once
+        # per outbound chunk.
+        self._mic_gate_active = False
+        self._playback_active = False
 
     # --- outbound helpers ---------------------------------------------
 
@@ -166,6 +176,9 @@ class BrowserVoiceBridge:
         """
         if not pcm16 or self._stopped:
             return
+        if not self._playback_active:
+            self._playback_active = True
+            debug_event(log, "browser bridge playback started", pcm_bytes=len(pcm16))
         await self._send_json({"type": "status", "status": "speaking"})
         for i in range(0, len(pcm16), _SEND_CHUNK):
             if self._stopped:
@@ -320,7 +333,8 @@ class BrowserVoiceBridge:
             try:
                 json.loads(message["text"])
             except (ValueError, TypeError):
-                pass
+                debug_event(log, "browser bridge hello parse failed",
+                            raw_text=message["text"][:200])
 
     async def _play_opening(self) -> None:
         await self._send_json({"type": "status", "status": "opening"})
@@ -355,9 +369,20 @@ class BrowserVoiceBridge:
             # Half-duplex echo gate — drop the agent's own audio. Skipped in
             # barge mode: headphones ⇒ no echo, and we need the user's audio
             # during playback to detect an interruption.
-            if not self._barge_enabled and (
+            #
+            # Per-frame path (browser mic quanta arrive well above 50/s) — only
+            # the gate FLIPPING is logged (vad.py's transition pattern), never
+            # a per-frame line, so an operator can see when/why mic audio
+            # started or stopped being dropped without a per-frame flood.
+            gated = not self._barge_enabled and (
                 self._agent_busy or time.monotonic() < self._play_until
-            ):
+            )
+            if gated != self._mic_gate_active:
+                debug_event(log, "browser bridge mic_gate transition",
+                            gated=gated, agent_busy=self._agent_busy,
+                            barge_enabled=self._barge_enabled)
+                self._mic_gate_active = gated
+            if gated:
                 return
             try:
                 await self._stream_session.send(pcm16)
@@ -369,7 +394,13 @@ class BrowserVoiceBridge:
         # Batch mode: echo gate — discard mic frames while agent TTS is still
         # playing (mirrors the streaming path). Without this, opening audio picked
         # up by the mic (speakers, not headphones) is transcribed as a user turn.
-        if not self._barge_enabled and time.monotonic() < self._play_until:
+        gated = not self._barge_enabled and time.monotonic() < self._play_until
+        if gated != self._mic_gate_active:
+            debug_event(log, "browser bridge mic_gate transition",
+                        gated=gated, agent_busy=self._agent_busy,
+                        barge_enabled=self._barge_enabled)
+            self._mic_gate_active = gated
+        if gated:
             return
 
         self._inbound.extend(pcm16)
@@ -427,6 +458,7 @@ class BrowserVoiceBridge:
             self._stopped = True
             # Surface the terminal action so devs can see why the call ended.
             action = outcome.response.action
+            debug_event(log, "browser bridge call ending", mode="batch", action=action)
             await self._send_json({"type": "error", "message": f"call ended: action={action}"})
             # The call is ending: let the browser finish playing the closing
             # line before run() returns and the socket closes (closing the
@@ -461,8 +493,9 @@ class BrowserVoiceBridge:
         if self._stream_session is not None and self._stt_language() != self._stream_language:
             try:
                 await self._stream_session.aclose()
-            except Exception:  # noqa: BLE001 - consumer loop handles reopen/fallback
-                pass
+            except Exception as exc:  # noqa: BLE001 - consumer loop handles reopen/fallback
+                debug_event(log, "browser bridge stt_stream close_for_language_switch failed",
+                            error=repr(exc))
 
     async def _run_stream_consumer(self) -> None:
         """Consume streaming-STT events, reopening the upstream if it drops.
@@ -639,6 +672,8 @@ class BrowserVoiceBridge:
 
         if getattr(self._agent.state, "is_terminal", False):
             self._stopped = True
+            debug_event(log, "browser bridge call ending", mode="stream",
+                        action=outcome.response.action)
             remaining = self._play_until - time.monotonic()
             if remaining > 0:
                 await asyncio.sleep(remaining + 0.5)
@@ -654,6 +689,8 @@ class BrowserVoiceBridge:
         """Handle a client control message (called from the run() WS loop)."""
         if ctrl.get("type") == "config":
             self._barge_enabled = bool(ctrl.get("barge"))
+            debug_event(log, "browser bridge barge_enabled set",
+                        barge_enabled=self._barge_enabled)
         elif ctrl.get("type") == "barge_in":
             # Retained transport-agnostic entry point: a future server-side/
             # telephony detector can request a barge via this control message
@@ -667,8 +704,20 @@ class BrowserVoiceBridge:
         # Fire whenever the agent is AUDIBLE — generating (_agent_busy) OR its
         # audio is still playing (now < _play_until). Most interruptions land
         # during playback, after generation finished and _agent_busy is False.
-        if not (self._agent_busy or time.monotonic() < self._play_until):
+        now = time.monotonic()
+        agent_busy_before = self._agent_busy
+        playback_remaining_ms = round(max(0.0, self._play_until - now) * 1000, 1)
+        if not (agent_busy_before or now < self._play_until):
+            # Requested (sustained interim speech, or an explicit control
+            # message) but the agent isn't audible — nothing to cancel. Kept
+            # as an explicit event rather than silence: barge-in tuning has
+            # needed exactly this fact by hand before, then had the ad-hoc
+            # diagnostics stripped again (docs/SESSION-HANDOFF-barge-in.md).
+            debug_event(log, "browser bridge barge_in suppressed",
+                        agent_busy=agent_busy_before,
+                        playback_remaining_ms=playback_remaining_ms)
             return
+        had_in_flight_turn = self._cancel_event is not None
         if self._cancel_event is not None:
             self._cancel_event.set()
         self._agent_busy = False
@@ -676,6 +725,10 @@ class BrowserVoiceBridge:
         # otherwise the user's interrupting speech would be dropped as "echo"
         # until the cancelled reply's original end time.
         self._play_until = 0.0
+        debug_event(log, "browser bridge barge_in fired",
+                    had_in_flight_turn=had_in_flight_turn,
+                    agent_busy_before=agent_busy_before,
+                    playback_remaining_ms=playback_remaining_ms)
         log.info("barge-in: cancelling current turn")
 
     def _barge_on_interim(self) -> bool:
@@ -692,6 +745,11 @@ class BrowserVoiceBridge:
             return False
         if self._barge_start_t is None:
             self._barge_start_t = now
+            # Transition (timer arming), not a per-interim line — this branch
+            # is only reached once per sustained-speech attempt, since every
+            # other call while the timer is already running falls through to
+            # the elapsed check below without re-entering here.
+            debug_event(log, "browser bridge barge_timer started", agent_busy=self._agent_busy)
             return False
         if now - self._barge_start_t >= BARGE_SUSTAIN_MS / 1000:
             self._barge_start_t = None
@@ -760,6 +818,9 @@ class BrowserVoiceBridge:
     def _reset_capture(self) -> None:
         """Discard any audio buffered while the agent was busy, so the next
         listen starts clean (no greeting/echo/noise leading into the turn)."""
+        if self._playback_active:
+            debug_event(log, "browser bridge playback ended")
+            self._playback_active = False
         self._capture_buffer.clear()
         self._inbound.clear()
         self._endpoint.reset()

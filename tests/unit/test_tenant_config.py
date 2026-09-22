@@ -133,6 +133,49 @@ def test_secret_returns_none_when_env_name_is_none() -> None:
     assert t.secret(None) is None
 
 
+def _all_logged_text(caplog) -> str:
+    """Every field of every captured record, flattened to one grep-able
+    string -- catches a leak in a `debug_event`/`extra=` field, not just the
+    message. Mirrors tests/unit/test_provider_debug_logging.py's helper of
+    the same name."""
+    chunks = []
+    for r in caplog.records:
+        chunks.append(r.getMessage())
+        for k, v in vars(r).items():
+            chunks.append(f"{k}={v!r}")
+    return "\n".join(chunks)
+
+
+def test_secret_resolution_debug_log_never_carries_the_value(monkeypatch, caplog) -> None:
+    """TenantSettings.secret() resolves telephony/webhook/LiveKit credentials
+    (docs/debug-logging.md: "This package is where credentials LIVE") and its
+    DEBUG boundary event ("tenant_config secret resolved") must carry a
+    fingerprint + length, never the value itself -- the one absolute
+    exception to "DEBUG logs full values".
+
+    This is the regression test for the credential-leak demonstration run
+    while writing this pass: temporarily adding `value=value` to that
+    debug_event call (src/config_tenant.py's TenantSettings.secret) makes
+    this test fail immediately, because the raw secret then appears in the
+    captured record text below. No test in this file (or test_tenant_auth.py
+    / test_tenant_registry.py / test_tenants_routes.py) exercised
+    `secret()` at DEBUG before this one -- test_secret_resolution_success
+    above asserts the RETURN value, never what gets logged.
+    """
+    caplog.set_level("DEBUG")
+    monkeypatch.setenv("ACME_CANARY_SECRET", "s3cr3t-leak-canary-abcdef123456")
+    t = TenantSettings(id="t_acme", slug="acme", name="Acme")
+    resolved = t.secret("ACME_CANARY_SECRET")
+    assert resolved == "s3cr3t-leak-canary-abcdef123456"
+    logged = _all_logged_text(caplog)
+    assert "s3cr3t-leak-canary-abcdef123456" not in logged
+    # The event still needs to be USEFUL, not just safe -- fingerprint,
+    # length, and the env var NAME (a reference, not a secret) should be
+    # present so an operator can confirm the right value resolved.
+    assert "ACME_CANARY_SECRET" in logged
+    assert "value_len" in logged and "31" in logged
+
+
 def test_platform_webhook_base_url_reads_settings(monkeypatch) -> None:
     """The telephony webhook base is platform-level (WEBHOOK_BASE_URL →
     settings.pipeline.telephony.webhook_base_url), not per-tenant — the inbound

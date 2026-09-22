@@ -46,6 +46,7 @@ from src.pipeline.vad import (
     EndpointDetector,
     VADDetector,
 )
+from src.utils.logging import debug_event
 
 log = logging.getLogger(__name__)
 
@@ -162,8 +163,15 @@ class TwilioMediaBridge(OutcomeRecorderMixin):
         else:
             self._idle_silence_ms += self._vad.frame_ms
 
-        # Extended silence -> hang up gracefully.
+        # Extended silence -> hang up gracefully. Fires at most once per call
+        # (guarded by _stopped), so logging it doesn't repeat at frame rate
+        # despite living inside the per-frame method.
         if self._idle_silence_ms >= self._config.max_idle_silence_s * 1000:
+            debug_event(
+                log, "twilio media extended_silence_hangup",
+                stream_sid=self._stream_sid, idle_silence_ms=self._idle_silence_ms,
+                max_idle_silence_s=self._config.max_idle_silence_s,
+            )
             self._capture_buffer.extend(pcm)
             await self._agent.handle_extended_silence()
             self._stopped.set()
@@ -185,9 +193,14 @@ class TwilioMediaBridge(OutcomeRecorderMixin):
         if outcome is not None:
             self._last_action = getattr(getattr(outcome, "response", None), "action", None)
         # If the agent ended the call, stop reading.
-        if getattr(self._agent, "state", None) is not None and getattr(
+        is_terminal = getattr(self._agent, "state", None) is not None and getattr(
             self._agent.state, "is_terminal", False
-        ):
+        )
+        if is_terminal:
+            debug_event(
+                log, "twilio media call_terminal",
+                stream_sid=self._stream_sid, last_action=self._last_action,
+            )
             self._stopped.set()
 
     # --- outbound ------------------------------------------------------
@@ -200,6 +213,14 @@ class TwilioMediaBridge(OutcomeRecorderMixin):
         utterance and plays it back at warp speed — the audio sounds garbled.
         """
         if not pcm16 or self._stream_sid is None:
+            # Silently dropped reply audio -- exactly the shape of failure
+            # that motivated this instrumentation: the customer just hears
+            # nothing, indistinguishable from the TTS/agent being broken.
+            debug_event(
+                log, "twilio media send_pcm dropped",
+                has_pcm=bool(pcm16), pcm_bytes=len(pcm16) if pcm16 else 0,
+                stream_sid=self._stream_sid,
+            )
             return
         # Resample internal pcm -> 8k for Twilio.
         if self._config.pcm_sample_rate != TWILIO_SAMPLE_RATE:

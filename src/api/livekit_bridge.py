@@ -31,6 +31,7 @@ from src.api import dev_call_control
 from src.api.live_bridge_base import _BaseLiveBridge
 from src.interfaces.realtime import RealtimeConfig
 from src.pipeline.audio_utils import resample_pcm16
+from src.utils.logging import debug_event
 
 log = logging.getLogger(__name__)
 
@@ -160,12 +161,18 @@ class LiveKitBridge(_BaseLiveBridge):
                 log.info("livekit model audio -> room", extra={"out_frames": self._out_frames})
 
     async def _send_interrupt(self) -> None:
-        # Barge-in: drop queued+playing agent audio.
+        # Barge-in: drop queued+playing agent audio. Fires a handful of times
+        # per call at most (not per media frame) — the LiveKit counterpart to
+        # browser_bridge.py's _handle_barge_in / telephony_live_bridge.py's
+        # _send_interrupt, carrying what was cancelled.
+        dropped = 0
         while not self._audio_q.empty():
             try:
                 self._audio_q.get_nowait()
+                dropped += 1
             except asyncio.QueueEmpty:
                 break
+        debug_event(log, "livekit bridge barge_in interrupt", dropped_queued_chunks=dropped)
         # AudioSource.clear_queue is a plain (sync) method on the real SDK
         # (livekit/rtc/audio_source.py) — no await.
         self._audio_source.clear_queue()
@@ -181,5 +188,10 @@ class LiveKitBridge(_BaseLiveBridge):
                     await self._audio_source.capture_frame(frame)
         except asyncio.CancelledError:
             raise
-        except Exception:  # noqa: BLE001 - source closed mid-send (teardown race); stop quietly
+        except Exception as exc:  # noqa: BLE001 - source closed mid-send (teardown race); stop quietly
+            # No log fires here at any level today — see the classification
+            # table (a real gap, reported not fixed). This at least makes the
+            # cause visible under DEBUG.
+            debug_event(log, "livekit bridge sender_loop ended_by_exception",
+                        error=repr(exc), out_frames=self._out_frames)
             self._stopped = True

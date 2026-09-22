@@ -24,6 +24,7 @@ from src.api.telephony_stringee import (
     reprompt_scco,
 )
 from src.interfaces.llm import ILLMProvider
+from src.utils.logging import debug_event
 
 log = logging.getLogger(__name__)
 
@@ -48,6 +49,10 @@ def wav_to_pcm16(blob: bytes) -> tuple[bytes, int]:
     recognizable RIFF/WAVE container (defensive — Stringee recordings vary).
     """
     if len(blob) < 44 or blob[:4] != b"RIFF" or blob[8:12] != b"WAVE":
+        # Decision that silently changes the assumed sample rate downstream —
+        # once per turn (webhook-driven, not a hot loop), worth the full value.
+        debug_event(log, "stringee audio wav_decode fallback",
+                    blob_bytes=len(blob), assumed_sample_rate=8000)
         return blob, 8000
     with wave.open(io.BytesIO(blob), "rb") as w:
         rate = w.getframerate()
@@ -96,7 +101,10 @@ class AudioStore:
 
     def _sweep(self) -> None:
         cutoff = time.monotonic() - self._ttl
-        for tok in [k for k, (ts, _) in self._items.items() if ts < cutoff]:
+        expired = [k for k, (ts, _) in self._items.items() if ts < cutoff]
+        if expired:  # only log an actual eviction, not every sweep (called on every put/get)
+            debug_event(log, "stringee audio_store sweep_evicted", evicted_tokens=len(expired))
+        for tok in expired:
             self._items.pop(tok, None)
 
     def put(self, wav: bytes) -> str:
@@ -213,9 +221,17 @@ class StringeeIvrBridge(OutcomeRecorderMixin):
         reply_pcm = sink.pcm
 
         if outcome.response.action in _TERMINAL_ACTIONS:
+            debug_event(log, "stringee turn outcome terminal", call_id=self.call_id,
+                        action=outcome.response.action,
+                        response_text=(outcome.response.response_text or "")[:160])
             return closing_scco(audio_url=self._host(reply_pcm))
         if not (outcome.response.response_text or "").strip():
+            debug_event(log, "stringee turn outcome empty_reply", call_id=self.call_id,
+                        action=outcome.response.action)
             return reprompt_scco(text=_REPROMPT_TEXT, event_url=self._event_url())
+        debug_event(log, "stringee turn outcome reply", call_id=self.call_id,
+                    action=outcome.response.action,
+                    response_text=(outcome.response.response_text or "")[:160])
         return reply_scco(audio_url=self._host(reply_pcm), event_url=self._event_url())
 
     async def end(self) -> None:

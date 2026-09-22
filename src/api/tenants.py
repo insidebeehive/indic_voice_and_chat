@@ -50,6 +50,7 @@ from src.dialogue.campaign_loader import parse_campaign_yaml
 from src.models.campaign import Campaign
 from src.models.conversation import Conversation
 from src.models.tenant import ProviderCost, Tenant, TenantApiKey, TenantPhoneNumber, TenantSecret
+from src.utils.logging import debug_event
 
 log = logging.getLogger(__name__)
 router = APIRouter(prefix="/tenants", tags=["tenants"])
@@ -275,6 +276,28 @@ async def register_tenant(
     session.add(TenantApiKey(
         token_hash=hash_api_token(api_token), tenant_id=tenant_id, label="register"))
 
+    # CRUD boundary: what this tenant was actually registered with. The
+    # existing "registered tenant" INFO line (below) carries only
+    # tenant_id/slug — everything an operator would need to answer "why does
+    # this tenant have no telephony creds" or "what LLM did we register it
+    # with" lived nowhere until now. Telephony key VALUES never appear —
+    # env_fields is {*_env field: synthetic env var NAME}, and secret_rows'
+    # values are dropped here (only the count + the env names above go out).
+    debug_event(
+        log, "tenants register_tenant result", tenant_id=tenant_id, slug=slug,
+        mode=req.mode, timezone=req.timezone, default_language=req.default_language,
+        max_concurrent_calls=req.max_concurrent_calls,
+        stt=(req.stt.model_dump() if req.stt else None),
+        llm=(req.llm.model_dump() if req.llm else None),
+        tts=(req.tts.model_dump() if req.tts else None),
+        realtime=(req.realtime.model_dump() if req.realtime else None),
+        telephony_provider=tel.provider, telephony_from_number=tel.from_number,
+        telephony_phone_numbers=tel.phone_numbers,
+        telephony_key_names_provided=sorted(tel.keys.keys()),
+        telephony_env_fields_set=sorted(env_fields.keys()),
+        events_webhook_url=req.events_webhook_url,
+        crm_operator_id=req.crm_operator_id, crm_id=req.crm_id,
+    )
     await session.commit()
 
     # Refresh the live resolver so the new tenant resolves immediately.
@@ -495,10 +518,26 @@ def _merge_layer_fields(cfg: dict, upd: "LayerUpdateIn", fields: tuple[str, ...]
     same shape as the telephony block's merge below, just for a single dict
     instead of TelephonyUpdateIn's flatter set of fields."""
     out = dict(cfg)
-    for f in fields:
-        v = getattr(upd, f)
-        if v is not None:
+    ignored: list[str] = []
+    for f in ("provider", "model", "language", "voice_id", "speed"):
+        v = getattr(upd, f, None)
+        if v is None:
+            continue
+        if f in fields:
             out[f] = v
+        else:
+            # Discarded input, not a bug in the usual sense: LayerUpdateIn is
+            # one shared shape for stt/llm/tts (docstring), so a caller CAN
+            # send voice_id/speed for an stt/llm layer -- `fields` is what
+            # silently drops it, "harmless no-op" per LayerUpdateIn's own
+            # docstring. An admin who set it expecting an effect gets a 200
+            # with no error and no change; this is the only trace of that.
+            ignored.append(f)
+    if ignored:
+        debug_event(
+            log, "tenants pipeline_layer_update field_discarded",
+            fields_not_applicable_to_layer=ignored, layer_fields=list(fields),
+        )
     return out
 
 
@@ -569,6 +608,13 @@ async def update_tenant(
     adapter for the old provider) survives the edit.
     """
     t = await _require_tenant(session, tenant_id)
+    # CRUD boundary: this PATCH is near-invisible otherwise -- the only
+    # existing trace was "updated tenant" + tenant_id at the very end (below),
+    # with no record of what changed. Snapshot the pre-PATCH state once here;
+    # each block below logs its own before/after, and _admin_label (the
+    # ambient log filter stamped by whichever admin token authenticated this
+    # request) answers "by whom" without this endpoint threading it through.
+    _before_status, _before_crm_id = t.status, t.crm_id
 
     if req.status is not None:
         t.status = req.status
@@ -584,6 +630,7 @@ async def update_tenant(
 
     if req.telephony is not None:
         tu = req.telephony
+        _before_tel_cfg = dict(pc.get("telephony") or {})
         tel_cfg = dict(pc.get("telephony") or {})
         if tu.provider is not None:
             tel_cfg["provider"] = tu.provider
@@ -636,6 +683,18 @@ async def update_tenant(
                 session.add(TenantPhoneNumber(
                     phone_number=ph, tenant_id=tenant_id, provider=tel_cfg.get("provider")))
 
+        # Non-secret telephony fields only (provider/from_number/urls) —
+        # secret VALUES never appear; env_fields/secret_rows carry only the
+        # synthetic env var NAMES `_map_telephony_keys` generated, never the
+        # key material itself.
+        debug_event(
+            log, "tenants update_tenant telephony_block result", tenant_id=tenant_id,
+            before={k: v for k, v in _before_tel_cfg.items() if k != "creds_by_provider"},
+            after={k: v for k, v in tel_cfg.items() if k != "creds_by_provider"},
+            telephony_key_names_provided=sorted(tu.keys.keys()),
+            phone_numbers_replaced=(tu.phone_numbers if tu.phone_numbers is not None else None),
+        )
+
     if req.chatwoot is not None:
         cw = req.chatwoot
         if not crypto.has_key():
@@ -662,6 +721,16 @@ async def update_tenant(
                 session.add(TenantSecret(
                     tenant_id=tenant_id, name=name,
                     value_encrypted=crypto.encrypt(value)))
+        # api_url/account_id/inbox_id are NOT write-only -- get_chat_config
+        # (below) already returns them in plaintext, so logging the same
+        # values here discloses nothing get_chat_config doesn't. api_token
+        # stays a name only, matching its "write-only; never returned" field
+        # (ChatwootUpdateIn).
+        debug_event(
+            log, "tenants update_tenant chatwoot_block result", tenant_id=tenant_id,
+            api_url=cw.api_url, account_id=cw.account_id, inbox_id=cw.inbox_id,
+            api_token_set=cw.api_token is not None,
+        )
 
     if req.crm is not None:
         crm = req.crm
@@ -693,9 +762,20 @@ async def update_tenant(
             crm_cfg = dict(pc.get("crm") or {})
             crm_cfg["operator_id"] = crm.operator_id
             pc["crm"] = crm_cfg
+        # base_url/auth_type/operator_id are returned in plaintext by
+        # get_chat_config below (not write-only), so logging them discloses
+        # nothing that endpoint doesn't already. api_token/x_api_key stay
+        # presence-only, matching their "write-only; never returned" fields
+        # (CrmCredentialsIn).
+        debug_event(
+            log, "tenants update_tenant crm_block result", tenant_id=tenant_id,
+            base_url=crm.base_url, auth_type=crm.auth_type, operator_id=crm.operator_id,
+            api_token_set=crm.api_token is not None, x_api_key_set=crm.x_api_key is not None,
+        )
 
     if req.deposit_verification is not None:
         dv = req.deposit_verification
+        _before_dv_cfg = dict(pc.get("deposit_verification") or {})
         dv_cfg = dict(pc.get("deposit_verification") or {})
         if dv.enabled is not None:
             dv_cfg["enabled"] = dv.enabled
@@ -734,6 +814,15 @@ async def update_tenant(
                     value_encrypted=crypto.encrypt(dv.webhook_secret)))
             dv_cfg["webhook_secret_env"] = name
         pc["deposit_verification"] = dv_cfg
+        # webhook_secret itself never appears (write-only, per
+        # DepositVerificationUpdateIn) -- webhook_secret_set records only
+        # that a new one was minted this PATCH.
+        debug_event(
+            log, "tenants update_tenant deposit_verification_block result", tenant_id=tenant_id,
+            before={k: v for k, v in _before_dv_cfg.items() if k != "webhook_secret_env"},
+            after={k: v for k, v in dv_cfg.items() if k != "webhook_secret_env"},
+            webhook_secret_set=bool(dv.webhook_secret),
+        )
 
     if req.pipeline is not None:
         pl = req.pipeline
@@ -781,6 +870,20 @@ async def update_tenant(
             validate_credentials(prospective_settings, source=f"tenant:{t.slug}")
         except TenantConfigError as e:
             raise HTTPException(status_code=422, detail=str(e))
+        # validate_credentials itself already emits "tenant_config
+        # validate_credentials passed" (src/config_tenant.py) on this same
+        # success path -- this event is the CRUD side: which layers this
+        # PATCH actually touched and what they now hold, not just that the
+        # result was valid.
+        debug_event(
+            log, "tenants update_tenant pipeline_block result", tenant_id=tenant_id,
+            mode=pc.get("mode"),
+            stt=(pc.get("stt") if pl.stt is not None else None),
+            llm=(pc.get("llm") if pl.llm is not None else None),
+            tts=(pc.get("tts") if pl.tts is not None else None),
+            realtime=(pc.get("realtime") if pl.realtime is not None else None),
+            chat_voice=(pc.get("chat_voice") if pl.chat_voice is not None else None),
+        )
 
     if req.status is not None or req.events_webhook_url is not None \
             or req.telephony is not None or req.chatwoot is not None \
@@ -810,6 +913,21 @@ async def update_tenant(
     chat_tts_cfg = resolve_chat_tts_config(effective_pipeline)
     if chat_tts_cfg is not None:
         chat_voice_tts_provider = chat_tts_cfg.provider
+    # Summary of the whole PATCH: status/crm_id (the two fields set directly
+    # on the row, outside pipeline_config) plus the same effective-state view
+    # the HTTP response returns below -- reaching for this in Loki rather
+    # than re-requesting GET /tenants is the point, and it correlates by
+    # tenant_id with every per-block event already emitted above.
+    debug_event(
+        log, "tenants update_tenant result", tenant_id=tenant_id, slug=t.slug,
+        status_before=_before_status, status_after=t.status,
+        crm_id_before=_before_crm_id, crm_id_after=t.crm_id,
+        pipeline_mode=pc.get("mode", "layered"),
+        stt_provider=stt_cfg.get("provider"), llm_provider=llm_cfg.get("provider"),
+        tts_provider=tts_cfg.get("provider"), realtime_provider=realtime_cfg.get("provider"),
+        chat_voice_enabled=bool(chat_voice_cfg.get("enabled")),
+        chat_voice_tts_provider=chat_voice_tts_provider,
+    )
     return UpdateTenantResponse(
         tenant_id=t.id, slug=t.slug, status=t.status,
         telephony_provider=tel_cfg.get("provider"),
@@ -867,6 +985,14 @@ async def rotate_tenant_token(
     session.add(TenantApiKey(
         token_hash=hash_api_token(new_token), tenant_id=tenant_id, label="rotated"))
 
+    # Count only -- token/hash values never appear at any level. Distinguishes
+    # a genuine rotation (revoked_count > 0) from effectively a first
+    # issuance (0 -- no prior key existed), which the existing "rotated
+    # tenant api token" INFO line can't, since it never counted `existing_keys`.
+    debug_event(
+        log, "tenants rotate_tenant_token result", tenant_id=tenant_id,
+        revoked_count=len(existing_keys),
+    )
     await session.commit()
     try:
         await _refresh_resolver(request, tenant_id)
@@ -1413,13 +1539,36 @@ async def list_tenants(
             dv = DepositVerificationConfig()
         dv_env = dv_env_by_tenant.get(t.id)
         dv_secret_set = dv_env is not None and (t.id, dv_env) in dv_secret_pairs
+        stt_info = _layer(pc, "stt", global_defaults)
+        llm_info = _layer(pc, "llm", global_defaults)
+        tts_info = _layer(pc, "tts", global_defaults)
+        realtime_info = _layer(pc, "realtime", global_defaults)
+        chat_voice_info = _chat_voice_info(pc)
+        if log.isEnabledFor(logging.DEBUG):
+            # THE decision this whole endpoint exists to surface (af33cb8,
+            # 9808a21 — see this file's module-level history): for each
+            # layer, whether the effective value came from this tenant's own
+            # override or was silently inherited from config/default.yaml.
+            # Guarded because this walks every tenant on every backoffice
+            # list-tenants page load.
+            debug_event(
+                log, "tenants effective_config decision", tenant_id=t.id, slug=t.slug,
+                stt={"effective": stt_info.effective_provider, "source": stt_info.provider_source},
+                llm={"effective": llm_info.effective_provider, "source": llm_info.provider_source},
+                tts={"effective": tts_info.effective_provider, "source": tts_info.provider_source},
+                realtime={"effective": realtime_info.effective_provider,
+                          "source": realtime_info.provider_source},
+                chat_voice={"enabled": chat_voice_info.enabled,
+                            "effective_provider": chat_voice_info.effective_provider,
+                            "source": chat_voice_info.source},
+            )
         items.append(TenantSummary(
             tenant_id=t.id, slug=t.slug, name=t.name, status=t.status,
             mode=t.mode, max_concurrent_calls=t.max_concurrent_calls,
-            stt=_layer(pc, "stt", global_defaults), llm=_layer(pc, "llm", global_defaults),
-            tts=_layer(pc, "tts", global_defaults),
-            realtime=_layer(pc, "realtime", global_defaults),
-            chat_voice=_chat_voice_info(pc),
+            stt=stt_info, llm=llm_info,
+            tts=tts_info,
+            realtime=realtime_info,
+            chat_voice=chat_voice_info,
             telephony_provider=tel.get("provider"),
             telephony_from_number=tel.get("from_number"),
             telephony_stringee_base_url=tel.get("stringee_base_url"),
@@ -2152,7 +2301,16 @@ def _campaign_script_fields(config_yaml: str) -> dict:
     parser the runtime uses). Returns {} if the YAML can't be parsed."""
     try:
         sc = parse_campaign_yaml(config_yaml).script
-    except Exception:  # noqa: BLE001 - a broken row shouldn't break the list
+    except Exception as e:  # noqa: BLE001 - a broken row shouldn't break the list
+        # Swallowed exception that changes resolved config: the caller
+        # (list_tenant_campaigns / update_campaign_script) gets back {} —
+        # indistinguishable from "this campaign genuinely has no script
+        # fields yet" unless this line is on. Full config_yaml: it's the
+        # tenant's own campaign script, not customer PII.
+        debug_event(
+            log, "tenants campaign_script_parse_failed", error=f"{type(e).__name__}: {e}",
+            config_yaml=config_yaml,
+        )
         return {}
     closing = sc.closing.get("default") or next(iter(sc.closing.values()), "") if sc.closing else ""
     return {

@@ -12,6 +12,8 @@ pricing changes.
 
 from __future__ import annotations
 
+import logging
+
 from fastapi import APIRouter, Depends, Query, Request
 from pydantic import BaseModel, Field
 from sqlalchemy import select
@@ -22,8 +24,10 @@ from src.auth import TenantContext
 from src.auth.middleware import optional_tenant, require_admin
 from src.models.tenant import ProviderCost
 from src.providers.model_catalog import list_models
-from src.providers.voice_catalog import list_voices
+from src.providers.voice_catalog import list_voices, supported_providers
+from src.utils.logging import debug_event
 
+log = logging.getLogger(__name__)
 router = APIRouter(tags=["catalog"])
 
 
@@ -127,6 +131,18 @@ async def update_provider_cost(
     ``model`` defaults to "" (provider-level / telephony).
     """
     row = await session.get(ProviderCost, (kind, provider, req.model))
+    # CRUD boundary: this rate feeds every per-call/per-token cost calculation
+    # (tenant billing, chat token cost) from the next read onward with no
+    # further gate -- a fat-fingered PUT here is invisible anywhere else in
+    # the system until a bill looks wrong. Before/after values, and whether
+    # this created a new row or updated one, so an operator can answer "when
+    # did this rate change and from what" without a DB audit table.
+    before = None if row is None else {
+        "cost_per_min": row.cost_per_min,
+        "cost_per_1k_input_tokens": row.cost_per_1k_input_tokens,
+        "cost_per_1k_output_tokens": row.cost_per_1k_output_tokens,
+        "cost_per_1k_cached_tokens": row.cost_per_1k_cached_tokens,
+    }
     if row is None:
         row = ProviderCost(kind=kind, provider=provider, model=req.model,
                            cost_per_min=req.cost_per_min,
@@ -159,6 +175,17 @@ async def update_provider_cost(
         # "omitted").
         if req.cost_per_1k_cached_tokens is not None:
             row.cost_per_1k_cached_tokens = req.cost_per_1k_cached_tokens
+    debug_event(
+        log, "catalog provider_cost_update result",
+        kind=kind, provider=provider, model=req.model, row_created=before is None,
+        before=before,
+        after={
+            "cost_per_min": row.cost_per_min,
+            "cost_per_1k_input_tokens": row.cost_per_1k_input_tokens,
+            "cost_per_1k_output_tokens": row.cost_per_1k_output_tokens,
+            "cost_per_1k_cached_tokens": row.cost_per_1k_cached_tokens,
+        },
+    )
     await session.commit()
     return ProviderCostItem(kind=kind, provider=provider, model=req.model,
                             cost_per_min=row.cost_per_min,
@@ -195,6 +222,19 @@ async def get_voices(
 ) -> VoicesResponse:
     """Return the available voices for a provider (+ language for TTS)."""
     voices = list_voices(provider, language)
+    if not voices:
+        # Catalog lookup that resolved to nothing -- list_voices returns []
+        # both for a provider it doesn't know at all and for a real
+        # per-language provider given a language it has no roster for (see
+        # its own docstring); neither is an error (200, empty list), so this
+        # is the only trace of "was this provider/language just unsupported,
+        # or is the request malformed" anywhere in the stack. Cheap and rare
+        # (a dropdown-populating admin/tenant action, not per-turn) — no
+        # guard needed.
+        debug_event(
+            log, "catalog voices_lookup empty", provider=provider, language=language,
+            known_providers=supported_providers(),
+        )
     return VoicesResponse(
         provider=provider,
         language=language,

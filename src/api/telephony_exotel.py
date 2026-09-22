@@ -45,6 +45,7 @@ from src.pipeline.vad import (
     EndpointDetector,
     VADDetector,
 )
+from src.utils.logging import debug_event
 
 log = logging.getLogger(__name__)
 
@@ -154,11 +155,33 @@ class ExotelMediaBridge(OutcomeRecorderMixin):
             self._idle_silence_ms += self._vad.frame_ms
 
         if self._idle_silence_ms >= self._config.max_idle_silence_s * 1000:
+            # Fires at most once per call (guarded by _stopped) despite
+            # living inside the per-frame method.
+            debug_event(
+                log, "exotel media extended_silence_hangup",
+                stream_sid=self._stream_sid, idle_silence_ms=self._idle_silence_ms,
+                max_idle_silence_s=self._config.max_idle_silence_s,
+            )
             await self._agent.handle_extended_silence()
             self._stopped.set()
             return
 
-        if self._endpoint.feed(frame):
+        # Exotel inlines the capture loop instead of calling the shared
+        # accumulate_and_detect() helper Twilio uses (see vad.py / commit
+        # a8324c3), so the shared "turn dispatched" debug_event never fires
+        # for Exotel calls -- only EndpointDetector's own speech/silence
+        # transitions do (vad.py). Mirror accumulate_and_detect's own latch
+        # (utterance_reported, read BEFORE feed()) rather than logging on the
+        # return value alone: feed() returns True on every silent frame once
+        # the threshold is crossed, not just the first.
+        already_reported = self._endpoint.utterance_reported
+        endpoint_fired = self._endpoint.feed(frame)
+        if endpoint_fired and not already_reported:
+            debug_event(
+                log, "exotel media endpoint_fired",
+                stream_sid=self._stream_sid, captured_bytes=len(self._capture_buffer),
+            )
+        if endpoint_fired:
             await self._dispatch_utterance()
 
     async def _dispatch_utterance(self) -> None:
@@ -168,9 +191,14 @@ class ExotelMediaBridge(OutcomeRecorderMixin):
         outcome = await self._agent.handle_turn(captured, self._send_pcm)
         if outcome is not None:
             self._last_action = getattr(getattr(outcome, "response", None), "action", None)
-        if getattr(self._agent, "state", None) is not None and getattr(
+        is_terminal = getattr(self._agent, "state", None) is not None and getattr(
             self._agent.state, "is_terminal", False
-        ):
+        )
+        if is_terminal:
+            debug_event(
+                log, "exotel media call_terminal",
+                stream_sid=self._stream_sid, last_action=self._last_action,
+            )
             self._stopped.set()
 
     async def _send_pcm(self, pcm16: bytes) -> None:
@@ -179,6 +207,14 @@ class ExotelMediaBridge(OutcomeRecorderMixin):
         Paced at real-time: 320 bytes of PCM16 mono @ 8kHz = 20ms of audio.
         """
         if not pcm16 or self._stream_sid is None:
+            # Silently dropped reply audio -- same shape of failure the
+            # Twilio bridge's equivalent guard exists for: the customer just
+            # hears nothing.
+            debug_event(
+                log, "exotel media send_pcm dropped",
+                has_pcm=bool(pcm16), pcm_bytes=len(pcm16) if pcm16 else 0,
+                stream_sid=self._stream_sid,
+            )
             return
         if self._config.pcm_sample_rate != EXOTEL_SAMPLE_RATE:
             pcm8k, self._downsample_state = resample_pcm16(

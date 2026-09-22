@@ -228,23 +228,35 @@ done when every site in it has been classified — instrumented, or justified as
 control flow, or named as already covered by an existing log or a
 `chat_turn_metrics` field.
 
-Five packages are done, and they are the live request path: a chat or voice
-conversation can be followed from the inbound frame through retrieval,
-ranking, tool dispatch, the provider call and back out, with full request and
-response bodies. 40 of 182 files carry a `debug_event`. That count understates
-coverage slightly — `chatbot/tool_executor.py` is done and uses none, because
-every path there already logs with a discriminator — but not by much.
+58 of 182 files carry a `debug_event`. That count understates coverage a
+little — `chatbot/tool_executor.py` is done and uses none, because every path
+there already logs with a discriminator — but not by much.
 
-The largest remaining gap by far is the other 40 files of `api` (16,603
-lines): the CRM-facing endpoints, telephony webhooks, and the backoffice.
-`src/config_tenant.py` is the sharpest small one — 639 lines of tenant config
-resolution with no logging at any level, which is where "why is this tenant
-using the wrong provider" has to be answered.
+What is done is every path a live conversation touches, on both channels: the
+inbound webhook or websocket, tenant and provider config resolution, retrieval
+and ranking, tool dispatch, the provider call, the pipeline, and the reply
+going back out. A chat or voice turn can be followed end to end with full
+request and response bodies.
+
+What is left is mostly not on that path: the backoffice and reporting
+endpoints, dialogue/campaign machinery, `models`, `observability`, and
+`benchmarks`. The two worth doing next on operator value are `src/bootstrap.py`
+(1,301 lines, where wiring decisions are made once at startup and are invisible
+afterwards) and `src/api/dev_console.py` plus `external_chat.py`.
+
+The conventions this doc describes are enforced by
+`tests/unit/test_debug_event_call_sites.py`, which AST-walks every call site.
+Reserved-key collisions and flat event names both survived being written down
+here and restated in per-pass instructions, twice, before that test existed —
+a convention that depends on remembering is not a convention.
 
 | package | files | lines | status |
 |---|---|---|---|
 | `api` — chat request path (`chat.py`) | 1 | — | **done** |
-| `api` — the other 40 files | 40 | — | not started |
+| `api` — telephony webhooks (`telephony_hooks/twilio/exotel/stringee/crm`, `answer_paths`) | 6 | 1,923 | **done** |
+| `api` — live media bridges (`browser_bridge`, `live_bridge_base`, `telephony_live_bridge`, `telephony_stringee_bridge`, livekit ×3, `gemini_live_bridge`) | 8 | 2,717 | **done** |
+| `api` — tenant/CRM config (`tenants`, `crms`, `crm_kb`, `catalog`) | 4 | 2,877 | **done** |
+| `api` — the remaining 22 files | 22 | ~5,400 | not started |
 | `agents` — `chatbot.py` | 1 | 2,212 | **done** |
 | `agents` — `voicebot.py`, `state_machine.py`, `base.py` | 3 | 1,337 | **done** |
 | `chatbot` — `tool_executor.py` | 1 | — | **done** (needed nothing; every path already logs with a discriminator) |
@@ -264,7 +276,8 @@ using the wrong provider" has to be answered.
 | `utils` | 7 | 912 | not started |
 | `interfaces` | 8 | 449 | not started |
 | `benchmarks` | 11 | 2,472 | not started |
-| `src/` root — `bootstrap.py`, `main.py`, `config_tenant.py`, `config.py` | 7 | 3,436 | not started |
+| `src/` root — `config_tenant.py` | 1 | 639 | **done** |
+| `src/` root — `bootstrap.py`, `main.py`, `config.py`, the rest | 6 | 2,797 | not started |
 
 Tracked per file rather than per package where a pass covered only part of
 one: the first pass followed the chat request path across four packages rather

@@ -14,6 +14,7 @@ import logging
 
 from src.api.live_bridge_base import RECORD_TURN_SIGNAL, _BaseLiveBridge
 from src.interfaces.realtime import RealtimeConfig
+from src.utils.logging import debug_event
 
 log = logging.getLogger(__name__)
 
@@ -52,12 +53,17 @@ class GeminiLiveBridge(_BaseLiveBridge):
             try:
                 json.loads(message["text"])
             except (ValueError, TypeError):
-                pass
+                debug_event(log, "gemini live bridge hello parse failed",
+                            raw_text=message["text"][:200])
 
     async def _inbound_loop(self) -> None:
+        # Per-frame path (browser mic bytes arrive continuously while the call
+        # is live) — nothing is logged per iteration; only the two ways this
+        # loop ends below, each of which fires once per call.
         while not self._stopped:
             message = await self._ws.receive()
             if message.get("type") == "websocket.disconnect":
+                debug_event(log, "gemini live bridge inbound_loop ended", reason="disconnect")
                 break
             data = message.get("bytes")
             if data is not None:
@@ -71,6 +77,7 @@ class GeminiLiveBridge(_BaseLiveBridge):
                 except (ValueError, TypeError):
                     ctrl = {}
                 if ctrl.get("type") == "end":
+                    debug_event(log, "gemini live bridge inbound_loop ended", reason="client_end")
                     self._stopped = True
                     break
 
