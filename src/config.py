@@ -12,6 +12,7 @@ the result with ``@lru_cache`` to make it cheap to inject anywhere.
 
 from __future__ import annotations
 
+import logging
 import os
 from functools import lru_cache
 from pathlib import Path
@@ -20,6 +21,24 @@ from typing import Any, Optional
 import yaml
 from pydantic import BaseModel, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from src.utils.redact import redact_url
+
+# NB: this module's own load path (load_settings()/get_settings()) runs
+# BEFORE src.utils.logging.configure_logging() does -- src/main.py's lifespan
+# calls get_settings() (line ~524) one line above its configure_logging()
+# call, because the log level configure_logging needs is itself a field on
+# the Settings this loads. debug_event() is a no-op until the root logger is
+# past its default (unconfigured) level, so every debug_event added in this
+# module is dead code on that call path specifically -- it will not appear in
+# a real boot's logs no matter what VOX_LOG_LEVEL is set to. It still fires
+# under pytest (which sets the root level directly via --log-level, ahead of
+# and independently of configure_logging) and on any later get_settings()
+# call made after configure_logging has already run once (e.g.
+# reset_settings_cache() + get_settings() from a test or a future reload
+# path). Documented rather than "fixed": resequencing config/logging startup
+# is a real change with its own risk, not something to slip in here.
+log = logging.getLogger(__name__)
 
 
 # libpq/psql-only query params some managed Postgres providers (Neon, …)
@@ -63,10 +82,17 @@ def normalize_db_url(url: str) -> str:
     """
     from urllib.parse import urlencode, urlsplit, urlunsplit
 
+    from src.utils.logging import debug_event
+
+    original = url
+    scheme_rewritten = False
     if url.startswith("postgres://"):
         url = "postgresql://" + url[len("postgres://"):]
+        scheme_rewritten = True
     if url.startswith("postgresql://"):
         url = "postgresql+asyncpg://" + url[len("postgresql://"):]
+    sslmode_translated = None
+    channel_binding_stripped = False
     if "+asyncpg" in url.split("://", 1)[0] and ("sslmode=" in url or any(
             p in url for p in _LIBPQ_ONLY_PARAMS)):
         parts = urlsplit(url)
@@ -77,12 +103,23 @@ def normalize_db_url(url: str) -> str:
             if k == "sslmode":
                 ssl_val = v
             elif k in _LIBPQ_ONLY_PARAMS:
+                channel_binding_stripped = True
                 continue
             else:
                 out.append((k, v))
         if ssl_val and ssl_val != "disable":
             out.append(("ssl", ssl_val))
+        sslmode_translated = ssl_val
         url = urlunsplit(parts._replace(query=urlencode(out)))
+    # redact_url, never the raw url: this is the DB URL, which routinely
+    # embeds a password in userinfo -- see the module-level ordering note
+    # above for why this event won't reach a real boot's logs anyway.
+    debug_event(
+        log, "config db_url_normalize decision",
+        original_url=redact_url(original), normalized_url=redact_url(url),
+        scheme_rewritten=scheme_rewritten, sslmode_translated=sslmode_translated,
+        channel_binding_stripped=channel_binding_stripped,
+    )
     return url
 
 
@@ -425,16 +462,155 @@ def _apply_env_overrides(yaml_data: dict[str, Any], secrets: Secrets) -> dict[st
                 f"expected one of {sorted(_VALID_LOG_LEVELS)} -- ignoring, "
                 f"using configured default"
             )
+            # No debug_event for the invalid-value branch above: it is the
+            # exact value that decides whether DEBUG logging is even on, so a
+            # debug_event here could only ever fire on some LATER settings
+            # load, never the one that needed it. See the module-level
+            # ordering note near the top of this file.
+    from src.utils.logging import debug_event
+
+    debug_event(
+        log, "config env_override applied",
+        database_url_overridden=bool(secrets.DATABASE_URL),
+        db_schema_overridden=secrets.VOX_DB_SCHEMA,
+        redis_url_overridden=bool(secrets.REDIS_URL),
+        webhook_base_url_overridden=secrets.WEBHOOK_BASE_URL,
+        media_storage_access_key_overridden=bool(secrets.MEDIA_STORAGE_ACCESS_KEY),
+        media_storage_secret_key_overridden=bool(secrets.MEDIA_STORAGE_SECRET_KEY),
+        media_storage_bucket_overridden=secrets.MEDIA_STORAGE_BUCKET,
+        media_storage_endpoint_url_overridden=secrets.MEDIA_STORAGE_ENDPOINT_URL,
+        media_storage_region_overridden=secrets.MEDIA_STORAGE_REGION,
+        effective_log_level_override=yaml_data.get("app", {}).get("log_level"),
+    )
     return yaml_data
+
+
+def _ignored_yaml_keys(block: dict[str, Any], model_cls: type[BaseModel]) -> list[str]:
+    """Keys in ``block`` that ``model_cls`` has no field for.
+
+    Every sub-config here is a plain ``BaseModel`` with pydantic's default
+    ``extra="ignore"`` -- an unrecognized key (a typo, or a key that used to
+    be read and no longer is) is dropped with no error at any level. This is
+    exactly how ``config/default.yaml``'s ``pipeline.tts.model: bulbul:v3``
+    goes nowhere: ``TTSConfig`` has no ``model`` field. See ``load_settings``.
+    """
+    return sorted(set(block) - set(model_cls.model_fields))
+
+
+# Load-time diagnostics, kept so they can be logged once logging exists.
+#
+# `load_settings` runs BEFORE `configure_logging` on a real boot and cannot not
+# do: main.py's lifespan resolves settings precisely to learn the log level, and
+# then configures logging with it. So every debug_event below evaluates against
+# an unconfigured root logger and goes nowhere on a live server -- they fire
+# only under pytest, which sets the root level itself, or on a later reload.
+#
+# That would have made the unknown-key sweep useless exactly where it matters:
+# its whole job is to surface a dead config key like config/default.yaml's inert
+# `tts.model`, and it would have been silent on every production boot. So the
+# same payloads are stashed here and main.py emits them as one event
+# immediately after configure_logging. Kept as plain dicts rather than replayed
+# through debug_event with a computed name, which would defeat
+# tests/unit/test_debug_event_call_sites.py's literal-name rule.
+_PENDING_LOAD_DIAGNOSTICS: list[dict] = []
+
+
+def drain_load_diagnostics() -> list[dict]:
+    """Take the stashed load-time diagnostics, leaving none behind.
+
+    Drains rather than copies so a later reload cannot re-report a previous
+    load's findings as if they were current.
+    """
+    global _PENDING_LOAD_DIAGNOSTICS
+    pending, _PENDING_LOAD_DIAGNOSTICS = _PENDING_LOAD_DIAGNOSTICS, []
+    return pending
 
 
 def load_settings(config_path: Optional[str] = None) -> Settings:
     """Load YAML defaults + env secrets into a validated Settings object."""
+    from src.utils.logging import debug_event
+
+    _PENDING_LOAD_DIAGNOSTICS.clear()
+
     secrets = Secrets()
-    path = Path(config_path or os.environ.get("VOX_CONFIG_PATH") or secrets.VOX_CONFIG_PATH)
+    explicit_arg = config_path is not None
+    env_path = os.environ.get("VOX_CONFIG_PATH")
+    path = Path(config_path or env_path or secrets.VOX_CONFIG_PATH)
+    debug_event(
+        log, "config yaml_load decision",
+        config_filename=str(path),
+        source=("explicit_arg" if explicit_arg else "env_VOX_CONFIG_PATH" if env_path else "default"),
+    )
     yaml_data = _load_yaml(path)
+    debug_event(
+        log, "config yaml_load result",
+        config_filename=str(path), top_level_keys=sorted(yaml_data),
+    )
     yaml_data = _apply_env_overrides(yaml_data, secrets)
-    return Settings(**yaml_data, secrets=secrets)
+
+    # Unknown-key sweep: top level plus the pipeline sub-blocks, which is
+    # where config/default.yaml's own dead `tts.model` key lives. Cheap
+    # (a handful of dict/set diffs) and runs once per process boot via
+    # get_settings()'s @lru_cache, not per request -- no isEnabledFor guard
+    # needed (see docs/debug-logging.md's cost-when-off section).
+    top_level_ignored = sorted(set(yaml_data) - set(Settings.model_fields) - {"secrets"})
+    pipeline_block = yaml_data.get("pipeline") or {}
+    pipeline_nested_ignored = {
+        name: unknown
+        for name, cls in (
+            ("stt", STTConfig), ("llm", LLMConfig), ("tts", TTSConfig),
+            ("telephony", TelephonyConfig), ("vector_store", VectorStoreConfig),
+        )
+        if (unknown := _ignored_yaml_keys(pipeline_block.get(name) or {}, cls))
+    }
+    if top_level_ignored or pipeline_nested_ignored:
+        unknown_keys = {
+            "event": "config unknown_keys detected",
+            "config_filename": str(path),
+            "top_level_ignored": top_level_ignored,
+            "pipeline_nested_ignored": pipeline_nested_ignored,
+        }
+        _PENDING_LOAD_DIAGNOSTICS.append(unknown_keys)
+        debug_event(log, "config unknown_keys detected", **{
+            k: v for k, v in unknown_keys.items() if k != "event"
+        })
+
+    settings = Settings(**yaml_data, secrets=secrets)
+    _PENDING_LOAD_DIAGNOSTICS.append({
+        "event": "config settings_load resolved",
+        "config_filename": str(path),
+        "database_url": redact_url(settings.database.url),
+        "redis_url": redact_url(settings.redis.url),
+        "effective_log_level": settings.app.log_level,
+        "media_storage_configured": settings.media_storage is not None,
+        "loki_push_configured": bool(secrets.GRAFANA_LOKI_PUSH_URL),
+        "prometheus_push_configured": bool(secrets.GRAFANA_PROMETHEUS_PUSH_URL),
+    })
+    debug_event(
+        log, "config settings_load resolved",
+        config_filename=str(path),
+        database_url=redact_url(settings.database.url),
+        redis_url=redact_url(settings.redis.url),
+        effective_log_level=settings.app.log_level,
+        has_sarvam_key=bool(secrets.SARVAM_API_KEY),
+        has_groq_key=bool(secrets.GROQ_API_KEY),
+        has_gemini_key=bool(secrets.GEMINI_API_KEY),
+        has_deepgram_key=bool(secrets.DEEPGRAM_API_KEY),
+        has_elevenlabs_key=bool(secrets.ELEVENLABS_API_KEY),
+        has_anthropic_key=bool(secrets.ANTHROPIC_API_KEY),
+        has_azure_speech_key=bool(secrets.AZURE_SPEECH_KEY),
+        has_google_tts_key=bool(secrets.GOOGLE_TTS_API_KEY),
+        has_vllm_api_key=bool(secrets.VLLM_API_KEY),
+        has_indicf5_tts_url=bool(secrets.INDICF5_TTS_URL),
+        has_exotel_creds=bool(
+            secrets.EXOTEL_ACCOUNT_SID and secrets.EXOTEL_API_KEY and secrets.EXOTEL_API_TOKEN
+        ),
+        has_twilio_creds=bool(secrets.TWILIO_ACCOUNT_SID and secrets.TWILIO_AUTH_TOKEN),
+        media_storage_configured=settings.media_storage is not None,
+        loki_push_configured=bool(secrets.GRAFANA_LOKI_PUSH_URL),
+        prometheus_push_configured=bool(secrets.GRAFANA_PROMETHEUS_PUSH_URL),
+    )
+    return settings
 
 
 @lru_cache(maxsize=1)

@@ -56,6 +56,7 @@ from src.providers import (
     get_tts_provider,
     get_vector_store,
 )
+from src.utils.logging import debug_event
 
 log = logging.getLogger(__name__)
 
@@ -95,6 +96,10 @@ def build_crm_retriever(
     vs_cfg = dict((global_defaults or {}).get("vector_store", {}))
     provider = vs_cfg.get("provider", "faiss")
     if provider != "pgvector":
+        debug_event(
+            log, "bootstrap crm_retriever build_skipped", crm_id=crm_id,
+            reason="vector_store_provider_not_pgvector", provider_name=provider,
+        )
         return None
     vs_cfg["embedding_dim"] = vs_cfg.get("embedding_dim", 384)
     vs_cfg["crm_id"] = crm_id
@@ -110,6 +115,10 @@ def build_crm_retriever(
     except Exception:
         log.exception("build_crm_retriever: failed to build vector store", extra={"crm_id": crm_id})
         return None
+    debug_event(
+        log, "bootstrap crm_retriever build_result", crm_id=crm_id,
+        embedding_dim=vs_cfg["embedding_dim"],
+    )
     return HybridRetriever(
         embedder=GeminiEmbedder(dim=384),
         vector_store=vector_store,
@@ -143,11 +152,24 @@ def _crm_retriever_for(
     """Resolve this tenant's linked CRM's retriever, or None (no link / no
     registry / that CRM has no usable KB) — never an error."""
     if crm_retrievers is None:
+        debug_event(
+            log, "bootstrap crm_retriever_for skipped", tenant_id=tenant.id,
+            reason="no_registry",
+        )
         return None
     crm_id = getattr(tenant.settings, "crm_id", None)
     if not crm_id:
+        debug_event(
+            log, "bootstrap crm_retriever_for skipped", tenant_id=tenant.id,
+            reason="no_crm_id",
+        )
         return None
-    return crm_retrievers.get(crm_id)
+    retriever = crm_retrievers.get(crm_id)
+    debug_event(
+        log, "bootstrap crm_retriever_for result", tenant_id=tenant.id, crm_id=crm_id,
+        retriever_found=retriever is not None,
+    )
+    return retriever
 
 
 def _tenant_retriever_for(
@@ -163,14 +185,34 @@ def _tenant_retriever_for(
     chat already has.
     """
     if registry is None:
+        debug_event(
+            log, "bootstrap tenant_retriever_for skipped", tenant_id=tenant.id,
+            reason="no_registry",
+        )
         return None
-    return registry.retrievers.get(tenant)
+    retriever = registry.retrievers.get(tenant)
+    debug_event(
+        log, "bootstrap tenant_retriever_for result", tenant_id=tenant.id,
+        retriever_found=retriever is not None,
+    )
+    return retriever
 
 
 def build_provider_registry(
     global_defaults: dict, base_vector_path: Path = Path("data/faiss"),
 ) -> TenantProviders:
     """One ``TenantProviders`` per process; caches per-tenant clients."""
+    gd = global_defaults or {}
+    debug_event(
+        log, "bootstrap provider_registry built",
+        stt_provider=gd.get("stt", {}).get("provider"),
+        llm_provider=gd.get("llm", {}).get("provider"),
+        llm_model=gd.get("llm", {}).get("model"),
+        tts_provider=gd.get("tts", {}).get("provider"),
+        telephony_provider=gd.get("telephony", {}).get("provider"),
+        vector_store_provider=gd.get("vector_store", {}).get("provider"),
+        base_vector_path=str(base_vector_path),
+    )
     return TenantProviders(
         global_defaults=global_defaults,
         stt_factory=get_stt_provider,
@@ -209,30 +251,47 @@ def build_runtime_registry(providers: TenantProviders, base_session_store: Sessi
     def _dnd(tenant: TenantContext) -> TenantDnd:
         c = getattr(tenant.settings, "compliance", None)
         enabled = getattr(c, "dnd_check_enabled", None)
+        dnd_enabled = True if enabled is None else enabled
+        hours_start = getattr(c, "calling_hours_start", None) or "10:00"
+        hours_end = getattr(c, "calling_hours_end", None) or "19:00"
+        debug_event(
+            log, "bootstrap runtime_registry dnd_built", tenant_id=tenant.id,
+            dnd_enabled=dnd_enabled, configured_enabled=enabled,
+            hours_start=hours_start, hours_end=hours_end,
+        )
         return TenantDnd(
-            filter=DNDFilter(InMemoryDNDStore(), enabled=True if enabled is None else enabled),
-            hours=CallingHoursPolicy(
-                start=getattr(c, "calling_hours_start", None) or "10:00",
-                end=getattr(c, "calling_hours_end", None) or "19:00"))
+            filter=DNDFilter(InMemoryDNDStore(), enabled=dnd_enabled),
+            hours=CallingHoursPolicy(start=hours_start, end=hours_end))
 
     dnd_reg = _PerTenantRegistry(_dnd)
 
     def _scheduler(tenant: TenantContext) -> CallScheduler:
         d = dnd_reg.get(tenant)
         c = getattr(tenant.settings, "compliance", None)
+        max_retry_attempts = getattr(c, "max_retry_attempts", None) or 3
+        retry_interval_hours = getattr(c, "retry_interval_hours", None) or 2
+        max_concurrent_calls = tenant.settings.max_concurrent_calls or 10
+        debug_event(
+            log, "bootstrap runtime_registry scheduler_built", tenant_id=tenant.id,
+            max_retry_attempts=max_retry_attempts, retry_interval_hours=retry_interval_hours,
+            max_concurrent_calls=max_concurrent_calls,
+        )
         return CallScheduler(
             hours=d.hours, dnd_filter=d.filter,
             retry=RetryConfig(
-                max_retry_attempts=getattr(c, "max_retry_attempts", None) or 3,
-                retry_interval_hours=getattr(c, "retry_interval_hours", None) or 2),
-            rate_limit=RateLimitConfig(
-                max_concurrent_calls=tenant.settings.max_concurrent_calls or 10))
+                max_retry_attempts=max_retry_attempts,
+                retry_interval_hours=retry_interval_hours),
+            rate_limit=RateLimitConfig(max_concurrent_calls=max_concurrent_calls))
 
     def _retriever(tenant: TenantContext) -> HybridRetriever:
         # Semantic multilingual embeddings via Gemini (384-dim, matches the vector
         # store) — no torch/sentence-transformers, so the deploy image stays slim
         # and it reuses the platform GEMINI_API_KEY. The client is built lazily on
         # first ingest/query.
+        debug_event(
+            log, "bootstrap runtime_registry tenant_retriever_built", tenant_id=tenant.id,
+            embedding_dim=384,
+        )
         return HybridRetriever(
             embedder=GeminiEmbedder(dim=384),
             vector_store=providers.get_vector_store(tenant),
@@ -318,6 +377,11 @@ async def resolve_crm_tools(
     # as X-API-Key alongside whatever the existing token/auth_type produces).
     sr = tenant.secrets_resolved
     x_api_key = sr.get("crm:x_api_key")
+    debug_event(
+        log, "crm_tools resolve request", tenant_id=tenant.id,
+        crm_id=tenant.settings.crm_id, sessionmaker_available=sessionmaker is not None,
+        x_api_key_present=bool(x_api_key),
+    )
     if sessionmaker is not None:
         async with sessionmaker() as db:
             rows = (await db.execute(
@@ -340,22 +404,39 @@ async def resolve_crm_tools(
                         TenantSecret.name.in_(secret_names))
                 )).scalars().all()
                 secrets_by_name = {s.name: s.value_encrypted for s in sec_rows}
+            if log.isEnabledFor(logging.DEBUG):
+                debug_event(
+                    log, "crm_tools tenant_rows resolved", tenant_id=tenant.id,
+                    tool_names=[r.name for r in rows], count=len(rows),
+                )
             for r in rows:
+                schema = _crm_params_to_schema(r.parameters)
                 specs.append(ToolSpec(
-                    name=r.name, description=r.description,
-                    parameters=_crm_params_to_schema(r.parameters)))
+                    name=r.name, description=r.description, parameters=schema))
                 token = None
                 secret_name = (r.auth_config or {}).get("token_secret_name")
                 if secret_name and secret_name in secrets_by_name:
                     try:
                         token = crypto.decrypt(secrets_by_name[secret_name])
-                    except Exception:  # noqa: BLE001
+                    except Exception as exc:  # noqa: BLE001
                         token = None
+                        debug_event(
+                            log, "crm_tools tool token_decrypt_failed", tenant_id=tenant.id,
+                            tool_name=r.name, secret_name=secret_name,
+                            error_type=type(exc).__name__,
+                        )
                 execs[r.name] = {
                     "endpoint": r.endpoint, "method": r.method,
                     "parameters": r.parameters or {}, "auth_type": r.auth_type,
                     "token": token, "x_api_key": x_api_key,
                     "extra_headers": (r.auth_config or {}).get("extra_headers")}
+                if log.isEnabledFor(logging.DEBUG):
+                    debug_event(
+                        log, "crm_tools tool schema_built", tenant_id=tenant.id,
+                        tool_name=r.name, endpoint=r.endpoint, method=r.method,
+                        auth_type=r.auth_type, schema=schema,
+                        token_resolved=token is not None,
+                    )
 
     if specs:
         # The "operatorid" HEADER for these tools comes from each row's
@@ -389,11 +470,19 @@ async def resolve_crm_tools(
                 mismatched_headers, path_operator_id,
                 extra={"tenant_id": tenant.id},
             )
+        debug_event(
+            log, "crm_tools resolve result", tenant_id=tenant.id, source="tenant",
+            tool_names=[s.name for s in specs], count=len(specs),
+        )
         return specs, execs, "tenant"  # tenant-specific tools take precedence
 
     # ── CRM catalog (tenant linked to a Crm entity) ─────────────────────
     crm_id = tenant.settings.crm_id
     if not crm_id or sessionmaker is None:
+        debug_event(
+            log, "crm_tools resolve skipped", tenant_id=tenant.id,
+            reason="no_crm_id" if not crm_id else "no_sessionmaker", crm_id=crm_id,
+        )
         return [], {}, "none"
 
     from src.models.crm import Crm, CrmTool
@@ -401,12 +490,20 @@ async def resolve_crm_tools(
     async with sessionmaker() as db:
         crm = await db.get(Crm, crm_id)
         if crm is None:
+            debug_event(
+                log, "crm_tools resolve skipped", tenant_id=tenant.id,
+                reason="crm_not_found", crm_id=crm_id,
+            )
             return [], {}, "none"
         crm_tool_rows = (await db.execute(
             select(CrmTool).where(CrmTool.crm_id == crm_id)
         )).scalars().all()
 
     if not crm_tool_rows:
+        debug_event(
+            log, "crm_tools resolve skipped", tenant_id=tenant.id,
+            reason="crm_has_no_tools", crm_id=crm_id,
+        )
         return [], {}, "none"
 
     api_token = sr.get("crm:api_token")
@@ -439,15 +536,27 @@ async def resolve_crm_tools(
 
     for row in crm_tool_rows:
         endpoint = crm.base_url.rstrip("/") + row.endpoint
+        schema = _crm_params_to_schema(row.parameters)
         specs.append(ToolSpec(
-            name=row.name, description=row.description,
-            parameters=_crm_params_to_schema(row.parameters)))
+            name=row.name, description=row.description, parameters=schema))
         execs[row.name] = {
             "endpoint": endpoint, "method": row.method,
             "parameters": row.parameters or {}, "auth_type": crm.auth_type,
             "token": api_token, "x_api_key": x_api_key,
             "extra_headers": extra_headers,
         }
+        if log.isEnabledFor(logging.DEBUG):
+            debug_event(
+                log, "crm_tools tool schema_built", tenant_id=tenant.id, crm_id=crm_id,
+                tool_name=row.name, endpoint=endpoint, method=row.method,
+                auth_type=crm.auth_type, schema=schema, operator_id=operator_id,
+                token_resolved=api_token is not None,
+            )
+    debug_event(
+        log, "crm_tools resolve result", tenant_id=tenant.id, source="crm_catalog",
+        crm_id=crm_id, tool_names=[s.name for s in specs], count=len(specs),
+        operator_id=operator_id, x_api_key_present=bool(x_api_key),
+    )
     return specs, execs, "crm_catalog"
 
 
@@ -488,7 +597,11 @@ def make_chatbot_factory(registry, sessionmaker=None, crm_retrievers: "PerCrmRet
         ``source`` value since this cached path's callers only expect a
         2-tuple.
         """
-        specs, execs, _source = await resolve_crm_tools(tenant, sessionmaker)
+        specs, execs, source = await resolve_crm_tools(tenant, sessionmaker)
+        debug_event(
+            log, "chatbot_factory crm_tools cache_populated", tenant_id=tenant.id,
+            source=source, tool_names=[s.name for s in specs], tool_count=len(specs),
+        )
         return specs, execs
 
     # A tenant's registered CRM tools rarely change, but _load_crm_tools_uncached
@@ -543,6 +656,14 @@ def make_chatbot_factory(registry, sessionmaker=None, crm_retrievers: "PerCrmRet
             getattr(tenant.settings.crm, "operator_id", None) or tenant.id
         )
         _crm_context = {"operator_id": _operator_id, "user_id": user_id}
+        debug_event(
+            log, "chatbot_factory crm_context built", tenant_id=tenant.id,
+            session_id=bare_session_id, operator_id=_operator_id, user_id=user_id,
+            customer_id_source=(
+                "explicit" if customer_id is not _CUSTOMER_ID_UNSET
+                else "chat_session_lookup"
+            ),
+        )
 
         async def crm_executor(tc, *, timeout_s: float) -> dict:
             spec = crm_execs.get(tc.name)
@@ -580,6 +701,10 @@ def make_chatbot_factory(registry, sessionmaker=None, crm_retrievers: "PerCrmRet
             and sessionmaker is not None
         ):
             tool_specs.append(SUBMIT_DEPOSIT_VERIFICATION_TOOL_SPEC)
+            debug_event(
+                log, "chatbot_factory deposit_verification tool_registered",
+                tenant_id=tenant.id, webhook_url=dv_config.webhook_url,
+            )
 
             async def deposit_verification_executor(tc, *, timeout_s: float) -> dict:
                 # Lazy per-call lookup of the module-level media store injected
@@ -614,6 +739,23 @@ def make_chatbot_factory(registry, sessionmaker=None, crm_retrievers: "PerCrmRet
                     "webhook_secret_env": dv_config.webhook_secret_env,
                 },
             )
+        else:
+            # Every other reason the tool is not registered: not configured at
+            # all, configured but disabled, or enabled without a webhook_url.
+            # (The one remaining gap -- enabled+webhook_url+secret but no
+            # sessionmaker -- lands here too.) The log.warning above already
+            # covers the "enabled, has webhook_url, missing secret" case with
+            # its own message; this event carries every deciding value so the
+            # other combinations are just as diagnosable without a DB query.
+            debug_event(
+                log, "chatbot_factory deposit_verification tool_skipped",
+                tenant_id=tenant.id,
+                configured=dv_config is not None,
+                enabled=getattr(dv_config, "enabled", None),
+                webhook_url_set=bool(getattr(dv_config, "webhook_url", None)),
+                secret_resolved=bool(dv_secret),
+                sessionmaker_available=sessionmaker is not None,
+            )
 
         # Platform-level LLM identity (provider + model) — same global default
         # dict get_platform_llm() itself builds the client from — threaded
@@ -622,11 +764,26 @@ def make_chatbot_factory(registry, sessionmaker=None, crm_retrievers: "PerCrmRet
         # SimpleNamespace(get_platform_llm=...) without global_defaults.
         _llm_defaults = getattr(registry.providers, "global_defaults", {}).get("llm", {})
         platform_llm = registry.providers.get_platform_llm()
+        tenant_retriever = registry.retrievers.get(tenant)
+        crm_retriever = _crm_retriever_for(tenant, crm_retrievers)
+        cache_split_prompt = _prompt_cache_split_enabled(platform_llm)
+        debug_event(
+            log, "chatbot_factory agent assembled", tenant_id=tenant.id,
+            session_id=bare_session_id,
+            llm_provider=_llm_defaults.get("provider") or "",
+            llm_model=_llm_defaults.get("model") or "",
+            cache_split_prompt=cache_split_prompt,
+            tenant_retriever_present=tenant_retriever is not None,
+            crm_retriever_present=crm_retriever is not None,
+            tool_names=[s.name for s in tool_specs], tool_count=len(tool_specs),
+            deposit_verification_registered=deposit_verification_executor is not None,
+            prompt_pack=getattr(tenant.settings, "prompt_pack", None) or "generic",
+        )
         return ChatBotAgent(
             session=AgentSession(session_id=session_id),
             llm=platform_llm,
-            retriever=registry.retrievers.get(tenant),
-            crm_retriever=_crm_retriever_for(tenant, crm_retrievers),
+            retriever=tenant_retriever,
+            crm_retriever=crm_retriever,
             company_name=tenant.name,
             language_default=getattr(tenant.settings, "default_language", None) or "en",
             tenant_timezone=getattr(tenant.settings, "timezone", "Asia/Kolkata"),
@@ -636,7 +793,7 @@ def make_chatbot_factory(registry, sessionmaker=None, crm_retrievers: "PerCrmRet
             # _prompt_cache_split_enabled above) -- every other tenant/env
             # keeps composing the prompt exactly as before this parameter
             # existed.
-            cache_split_prompt=_prompt_cache_split_enabled(platform_llm),
+            cache_split_prompt=cache_split_prompt,
             store=registry.session_stores.get(tenant),
             enable_tools=True,
             crm_tools=tool_specs,
@@ -681,6 +838,10 @@ def _override_lead_data(override: dict | None) -> dict:
         data["name"] = name
     if gender:
         data["lead_gender"] = gender
+    debug_event(
+        log, "bootstrap lead_data override built",
+        lead_name=name or None, lead_gender=gender or None,
+    )
     return data
 
 
@@ -733,6 +894,11 @@ def _build_s2s_agent_and_config(
     allowed = getattr(rt, "allowed_voices", None)
     if allowed and voice not in allowed:
         voice = rt.voice
+    debug_event(
+        log, "bootstrap s2s_agent voice_resolved", tenant_id=tenant.id,
+        voice_override_requested=voice_override or None, configured_voice=rt.voice,
+        allowed_voices=allowed, resolved_voice=voice,
+    )
     # PLATFORM-level key (not per-tenant): pass None so GeminiLiveSession.connect
     # reads the platform GEMINI_API_KEY. Resolving a per-tenant
     # realtime key here is what crashed s2s calls — a placeholder/invalid tenant
@@ -742,6 +908,11 @@ def _build_s2s_agent_and_config(
         model=rt.model, voice=voice, language_code=rt.language_code,
         system_instruction=build_s2s_system_instruction(script, slots, lead_data, kb_context=kb_context),
         tools=[RECORD_TURN_SIGNAL])
+    debug_event(
+        log, "bootstrap s2s_agent config_built", tenant_id=tenant.id, session_id=session_id,
+        model_name=rt.model, voice=voice, language_code=rt.language_code,
+        kb_context_chars=len(kb_context) if kb_context else 0, api_key_source="platform",
+    )
 
     async def connect(cfg: RealtimeConfig):
         return await GeminiLiveSession.connect(cfg, api_key=key)
@@ -778,6 +949,15 @@ def _build_s2s_telephony_bridge(
     _wh_sec_env = getattr(tenant.settings, "events_webhook_secret_env", None)
     _wh_secret = (tenant.secret_optional(_wh_sec_env)
                   if _wh_sec_env and hasattr(tenant, "secret_optional") else None)
+    debug_event(
+        log, "bootstrap s2s_telephony_bridge transfer_webhook_resolved", tenant_id=tenant.id,
+        webhook_url=_wh_url,
+        source=(
+            "override" if transfer_webhook_url_override
+            else ("tenant_config" if _wh_url else "none")
+        ),
+        secret_env_configured=bool(_wh_sec_env), secret_resolved=bool(_wh_secret),
+    )
     return TelephonyLiveBridge(
         websocket=websocket, agent=agent, config=config, connect_session=connect, llm=llm,
         tts=tts, tenant_timezone=tenant_timezone, tenant_id=tenant.id,
@@ -792,7 +972,14 @@ async def _build_kb_context(crm_retriever, tenant_retriever) -> str:
     """Build a static KB context string from the CRM + tenant retrievers for voicebot."""
     from src.rag.context_builder import build_voicebot_kb_context
     retrievers = [r for r in [crm_retriever, tenant_retriever] if r is not None]
-    return await build_voicebot_kb_context(retrievers)
+    context = await build_voicebot_kb_context(retrievers)
+    debug_event(
+        log, "bootstrap kb_context assembled",
+        crm_retriever_present=crm_retriever is not None,
+        tenant_retriever_present=tenant_retriever is not None,
+        context_chars=len(context or ""),
+    )
+    return context
 
 
 def make_livekit_bridge_factory(
@@ -846,6 +1033,11 @@ def make_livekit_bridge_factory(
         if campaign_resolver is not None:
             lc = await campaign_resolver.resolve(tenant.id, campaign_id)
             cur_script, cur_slots = lc.script, lc.slots
+        debug_event(
+            log, "bootstrap livekit_bridge_factory campaign_resolved", tenant_id=tenant.id,
+            room_name=room_name, campaign_id=campaign_id,
+            campaign_resolver_used=campaign_resolver is not None,
+        )
 
         kb_ctx = await _build_kb_context(
             _crm_retriever_for(tenant, crm_retrievers), _tenant_retriever_for(tenant, registry))
@@ -906,6 +1098,7 @@ def make_bridge_factory(
         # Note: Twilio strips query strings from stream URLs, so the SID override
         # is the only way to pass campaign_id for outbound telephony calls.
         cur_script, cur_slots = script, slots
+        cid = None
         if campaign_resolver is not None:
             cid = (
                 (override or {}).get("campaign_id")
@@ -914,6 +1107,10 @@ def make_bridge_factory(
             )
             lc = await campaign_resolver.resolve(tenant.id, cid)
             cur_script, cur_slots = lc.script, lc.slots
+        debug_event(
+            log, "bootstrap bridge_factory campaign_resolved", tenant_id=tenant.id,
+            call_sid=call_sid, campaign_id=cid, campaign_resolver_used=campaign_resolver is not None,
+        )
         # Dev-console overrides: voice (caller/agent name, gender auto-derived from voice).
         voice_override = (override or {}).get("voice", "").strip()
         caller_name_override = (override or {}).get("caller_name", "").strip()
@@ -929,6 +1126,12 @@ def make_bridge_factory(
                 replacements["agent_name"] = caller_name_override
             if replacements:
                 cur_script = _dc_replace(cur_script, **replacements)
+        debug_event(
+            log, "bootstrap bridge_factory mode_resolved", tenant_id=tenant.id,
+            call_sid=call_sid, override_present=override is not None, mode=mode,
+            voice_override=voice_override or None, caller_name_override=caller_name_override or None,
+            resolved_tts_voice_id=tts_voice_id,
+        )
         # Speech-to-speech path: when the tenant is in s2s mode, drive Gemini Live
         # over the Twilio media stream instead of the STT->LLM->TTS cascade.
         kb_ctx = await _build_kb_context(
@@ -1083,10 +1286,15 @@ def make_exotel_bridge_factory(
         mode = (override or {}).get("mode") or getattr(
             tenant.settings.pipeline, "mode", "layered")
         cur_script, cur_slots = script, slots
+        cid = None
         if campaign_resolver is not None:
             cid = (getattr(websocket, "query_params", {}) or {}).get("campaign") or None
             lc = await campaign_resolver.resolve(tenant.id, cid)
             cur_script, cur_slots = lc.script, lc.slots
+        debug_event(
+            log, "bootstrap exotel_bridge_factory campaign_resolved", tenant_id=tenant.id,
+            campaign_id=cid, campaign_resolver_used=campaign_resolver is not None,
+        )
         voice_override = (override or {}).get("voice", "").strip()
         caller_name_override = (override or {}).get("caller_name", "").strip()
         tts_voice_id = voice_override or tenant.settings.pipeline.tts.voice_id
@@ -1101,6 +1309,12 @@ def make_exotel_bridge_factory(
                 replacements["agent_name"] = caller_name_override
             if replacements:
                 cur_script = _dc_replace(cur_script, **replacements)
+        debug_event(
+            log, "bootstrap exotel_bridge_factory mode_resolved", tenant_id=tenant.id,
+            override_present=override is not None, mode=mode,
+            voice_override=voice_override or None, caller_name_override=caller_name_override or None,
+            resolved_tts_voice_id=tts_voice_id,
+        )
         # S2S path: drive Gemini Live over the Exotel media stream (raw PCM16@8k,
         # snake_case stream_sid, no `clear` frame) when the tenant is in s2s mode.
         kb_ctx = await _build_kb_context(
@@ -1198,6 +1412,10 @@ def make_stringee_bridge_factory(
         if campaign_resolver is not None:
             lc = await campaign_resolver.resolve(tenant.id, None)
             cur_script, cur_slots = lc.script, lc.slots
+        debug_event(
+            log, "bootstrap stringee_bridge_factory campaign_resolved", tenant_id=tenant.id,
+            call_id=str(call_id), campaign_resolver_used=campaign_resolver is not None,
+        )
         stt = providers.get_stt(tenant)
         llm = providers.get_llm(tenant)
         tts = providers.get_tts(tenant)

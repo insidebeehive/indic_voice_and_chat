@@ -195,6 +195,32 @@ logging on the return value floods the moment a caller is slow to `reset()`.
 Both it and `turn_capture.accumulate_and_detect` latch instead. Ask of any
 hot-path event: does the condition GO true here, or is it merely true here?
 
+## Logging cannot observe its own configuration
+
+`load_settings` runs before `configure_logging` and always will: the lifespan
+resolves settings precisely to learn the log level, then configures logging
+with it. So every `debug_event` on the config load path evaluates against an
+unconfigured root logger and goes nowhere on a live server — while firing
+normally under pytest, which raises the root level itself. Instrumentation that
+looks healthy in tests and is silent in production is the worst of both.
+
+It was not academic: the unknown-key sweep exists to surface a dead config key
+like `config/default.yaml`'s inert `tts.model`, and it would have been silent
+on every boot — the one place it was worth having.
+
+The fix is not to reorder (that is circular) but to stash and replay:
+`load_settings` keeps its findings in `_PENDING_LOAD_DIAGNOSTICS`, and
+`main.py` emits them as one event immediately after `configure_logging`. The
+replay is a single literal-named event carrying the payloads, rather than a
+loop re-emitting each with a computed name — a computed name would defeat
+`test_debug_event_call_sites.py`'s literal-name rule, and the rule is worth
+more than the convenience.
+
+The general shape: **anything decided before the logger exists needs somewhere
+to wait.** Import-time work in `main.py` — router mounting, middleware, the
+dev-console token gate — has the same problem and is deliberately left
+uninstrumented rather than logging into the void.
+
 ## An event that misleads is worse than no event
 
 The `rag` pass added `rag context chunk_dropped_for_budget` to
@@ -276,8 +302,7 @@ a convention that depends on remembering is not a convention.
 | `utils` | 7 | 912 | not started |
 | `interfaces` | 8 | 449 | not started |
 | `benchmarks` | 11 | 2,472 | not started |
-| `src/` root — `config_tenant.py` | 1 | 639 | **done** |
-| `src/` root — `bootstrap.py`, `main.py`, `config.py`, the rest | 6 | 2,797 | not started |
+| `src/` root — all 7 files | 7 | 3,436 | **done** (`defaults.py`/`exceptions.py` are static data, nothing to classify) |
 
 Tracked per file rather than per package where a pass covered only part of
 one: the first pass followed the chat request path across four packages rather
