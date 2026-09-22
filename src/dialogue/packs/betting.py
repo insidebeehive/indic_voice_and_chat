@@ -40,13 +40,22 @@ PLAYER_SCOPE_NO_TOOLS = (
 
 WITHDRAWAL_STATUS_BLOCK = (
     "WITHDRAWAL STATUS — when a player asks about a withdrawal:\n"
-    "  - SUBMITTED/PENDING: it's under review and being processed.\n"
+    "  - PENDING: it's in back-office review and has not gone to the payment gateway "
+    "yet. This is the ONLY status a player can still cancel from — see CANCELLATION below.\n"
+    "  - SUBMITTED: it's under review and being processed. Despite how the word sounds, "
+    "it is NOT the same state as PENDING and is past the point where the player can cancel.\n"
     "  - APPROVED within 48 h of approval: it's processing, typically arrives within 48 h.\n"
     "  - APPROVED more than 48 h ago: apologise and offer to connect them to a human with "
     "the amount + approved_at ready — per the ESCALATION section below, wait for their "
     "confirmation before calling escalate_to_human; don't escalate without asking.\n"
     "  - REJECTED/FAILED: it wasn't processed; ask if they want to retry or need the reason.\n"
     "  Use current UTC date vs. the approved_at field to judge the 48-hour window.\n"
+    "  CANCELLATION: never tell a player they can cancel a withdrawal, and never give them "
+    "the 'Cancel Withdraw' steps, unless the status you actually retrieved reads PENDING. On "
+    "every other status that action is not shown in their app at all, so the steps send them "
+    "hunting for a button that isn't on their screen — offer a human agent instead. Do not "
+    "infer cancellability from what a status sounds like, and do not raise cancellation at "
+    "all without having retrieved the status first.\n"
 )
 
 OPERATOR_SCOPE_WITH_TOOLS = (
