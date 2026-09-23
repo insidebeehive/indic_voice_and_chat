@@ -50,6 +50,7 @@ from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
+from starlette.websockets import WebSocketState
 
 from src.agents.chatbot import (
     ChatBotAgent,
@@ -2440,7 +2441,7 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
                                 # actually recorded it (agent_message_id present) —
                                 # a persistence failure must not send a URL to a
                                 # message that was never written.
-                                await _send_reply(
+                                delivered = await _send_reply(
                                     websocket, session_id, result, tenant.id,
                                     audio_url=(
                                         f"/api/v1/chat/media/{persisted.agent_message_id}"
@@ -2448,7 +2449,16 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
                                         else None
                                     ),
                                     audio_mime=reply_media_mime if reply_media_url else None,
+                                    ticket_id=ticket_id,
                                 )
+                                if not delivered:
+                                    # Leave the connection loop entirely — see
+                                    # the identical comment on the
+                                    # text-message call site for why merely
+                                    # skipping escalation and continuing the
+                                    # loop would just crash on the next
+                                    # `websocket.receive_text()` instead.
+                                    break
                                 if result.escalation:
                                     if await _handle_escalation(websocket, session_id, tenant, row, result):
                                         if await _run_human_mode(websocket, session_id, tenant, ticket_id=ticket_id):
@@ -2584,7 +2594,16 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
                                                 source_media_url=(media_url or None),
                                                 ticket_id=ticket_id,
                                                 customer_message_id=customer_message_id)
-                            await _send_reply(websocket, session_id, result, tenant.id)
+                            delivered = await _send_reply(
+                                websocket, session_id, result, tenant.id, ticket_id=ticket_id)
+                            if not delivered:
+                                # Leave the connection loop entirely, not just
+                                # this branch — see the identical comment on
+                                # the text-message call site above for why
+                                # `continue`-ing back to the top's
+                                # `websocket.receive_text()` would immediately
+                                # crash again with a different RuntimeError.
+                                break
                             if result.escalation:
                                 if await _handle_escalation(websocket, session_id, tenant, row, result):
                                     if await _run_human_mode(websocket, session_id, tenant, ticket_id=ticket_id):
@@ -2617,16 +2636,39 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
                         await _handoff_store.redis.set(
                             f"chat_handoff:{token}", json.dumps(context), ex=600)
                         call_url = _voice_call_url(websocket, tenant.slug, token)
-                    await _send_reply(websocket, session_id, result, tenant.id, call_url=call_url)
+                    delivered = await _send_reply(
+                        websocket, session_id, result, tenant.id,
+                        call_url=call_url, ticket_id=ticket_id)
                     if result.response.action == "resolved":
                         # Agent confirmed the user has no more questions — close immediately
-                        # without waiting for the idle timeout.
+                        # without waiting for the idle timeout. `_end_session` and
+                        # `_send_close_webhook` are bookkeeping the customer's
+                        # reconnect (and the tenant's CRM) depend on, not socket
+                        # writes — they still run even when `delivered` is False.
+                        # Only the closing `ended` frame is guarded: with the
+                        # socket already gone it would just raise the same error
+                        # `_send_reply` already reported.
                         summary = await agent.summarize_session()
                         await _end_session(session_id, summary, ticket_id=ticket_id)
                         await _send_close_webhook(tenant, session_id, "ai", summary, ticket_id=ticket_id)
-                        await websocket.send_text(json.dumps({
-                            "type": "ended", "summary": summary, "reason": "resolved",
-                        }))
+                        if delivered:
+                            await websocket.send_text(json.dumps({
+                                "type": "ended", "summary": summary, "reason": "resolved",
+                            }))
+                        break
+                    if not delivered:
+                        # Not just "skip escalation" -- leave the connection
+                        # loop entirely. Starlette's WebSocket.receive_text()
+                        # gates on `application_state`, the SAME flag a dead
+                        # send leaves as DISCONNECTED, not on whether the
+                        # client has actually gone away -- so the very next
+                        # `websocket.receive_text()` at the top of this loop
+                        # would immediately raise its own RuntimeError
+                        # ('WebSocket is not connected. Need to call "accept"
+                        # first.'), a different message our narrow predicate
+                        # correctly does not swallow, right back into "chat
+                        # websocket crashed". Breaking here is what actually
+                        # avoids that, not the predicate.
                         break
                     if result.escalation:
                         if await _handle_escalation(websocket, session_id, tenant, row, result):
@@ -2695,13 +2737,53 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
 # --- Persistence helpers ------------------------------------------------
 
 
+# The exact, literal text of the one RuntimeError Starlette raises from
+# WebSocket.send() when the ASGI app tries to send on a connection that has
+# already reached WebSocketState.DISCONNECTED (starlette/websockets.py's
+# `send()`, the final `else` branch — confirmed against the installed
+# version in .venv). Anything else with the same type is a genuine bug
+# (bad frame shape, a `json.dumps` failure surfacing oddly, etc.) and must
+# keep propagating.
+_SOCKET_ALREADY_CLOSED_MESSAGE = 'Cannot call "send" once a close message has been sent.'
+
+
+def _is_dead_socket_send_error(websocket: WebSocket, exc: BaseException) -> bool:
+    """True only for "the customer's socket is already gone", never for a
+    bare ``RuntimeError``.
+
+    Deliberately narrow, on purpose: a blanket ``except RuntimeError`` here
+    would just as happily swallow a real bug in frame construction (a
+    non-serializable value reaching ``json.dumps``, e.g.) and report it as a
+    routine disconnect. Both the exact exception type + message AND the
+    socket's own ``application_state`` have to agree before a failed send is
+    treated as "could not deliver live, customer will get it on reconnect"
+    rather than "something is actually broken" — matching the two conditions
+    Starlette itself uses to signal a gone socket (this RuntimeError on the
+    send side, ``WebSocketDisconnect`` on the receive side)."""
+    return (
+        isinstance(exc, RuntimeError)
+        and str(exc) == _SOCKET_ALREADY_CLOSED_MESSAGE
+        and getattr(websocket, "application_state", None) is WebSocketState.DISCONNECTED
+    )
+
+
 async def _send_reply(
     websocket: WebSocket, session_id: str, result: ChatTurnResult, tenant_id: str,
     *, call_url: Optional[str] = None,
     audio_url: Optional[str] = None, audio_mime: Optional[str] = None,
-) -> None:
+    ticket_id: Optional[str] = None,
+) -> bool:
     """Send the agent's reply frame, plus an escalation/call_offer frame if the
     agent's tools fired one, and emit a signed chat.escalated tenant event.
+
+    Returns True if every frame reached the socket, False if the socket was
+    already gone. Both call sites (`_persist_turn` immediately precedes
+    every call here) have already written the reply to `chat_messages`
+    before this runs, so False is not data loss — it means "could not
+    deliver live; the customer gets it from history on reconnect". Callers
+    MUST check the return value and skip any further socket writes
+    (escalation frames, `_run_human_mode`, an `ended` frame, ...) once it is
+    False — those would just hit the same dead socket and raise.
 
     ``audio_url``/``audio_mime`` are the ONLY change on the wire for voice-note
     replies (see `_synthesize_reply_audio`) — deliberately added as optional
@@ -2738,19 +2820,40 @@ async def _send_reply(
                 audio_url=audio_url, audio_mime=audio_mime,
                 action=result.response.action,
                 text_chars=len(result.response.response_text or ""))
-    await websocket.send_text(json.dumps(frame))
+    frames = [frame]
     if result.escalation:
-        await websocket.send_text(json.dumps({
+        frames.append({
             "type": "escalation",
             "reason": result.escalation.get("reason", ""),
             "context_summary": result.escalation.get("summary", ""),
-        }))
+        })
     if result.call_offer:
-        await websocket.send_text(json.dumps({
+        frames.append({
             "type": "call_offer",
             "reason": result.call_offer.get("reason", ""),
             "call_url": call_url,  # WebSocket URL the browser connects to directly
-        }))
+        })
+    # Up to three frames go out here. The moment one of them finds the
+    # socket already gone, the rest would hit the exact same error -- stop
+    # rather than raising it two or three more times.
+    for wire_frame in frames:
+        try:
+            await websocket.send_text(json.dumps(wire_frame))
+        except RuntimeError as exc:
+            if not _is_dead_socket_send_error(websocket, exc):
+                raise
+            # WARNING, not ERROR: the reply is already persisted (every
+            # caller runs `_persist_turn` immediately before this) and the
+            # customer gets it from history on reconnect -- an operator
+            # reading this should not go looking for lost data.
+            log.warning(
+                "chat reply could not be delivered live — socket closed "
+                "mid-turn; reply is persisted and will reach the customer "
+                "on reconnect",
+                extra={"session_id": session_id, "ticket_id": ticket_id},
+            )
+            return False
+    return True
 
 
 async def _emit_escalation(tenant_id: str, session_id: str, result: ChatTurnResult) -> None:
