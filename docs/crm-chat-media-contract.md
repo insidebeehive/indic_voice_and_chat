@@ -225,12 +225,31 @@ delivered inline as base64 on the same frame:
   `"audio/wav"` and `audio_data` is WAV bytes instead. A consumer that
   hardcodes `audio/mpeg` (or a `.mp3` extension) breaks the moment that
   switch is made — always branch on `audio_mime`, never assume it.
-- **Size, for the normal MP3 path:** a typical ~12s reply is ~48 KB decoded
-  MP3, ~64 KB as the base64 string carried in `audio_data`. Worst case, at
-  the server's default reply-length cap (~25s of speech), is ~100 KB
-  decoded, ~134 KB as base64. The worst case comes from that reply-length
-  cap, not from a protocol limit — a practical bound, not a guarantee.
-  **Size a buffer or frame limit against 256 KB for the base64 string.**
+- WAV isn't only a deliberate operator choice: if the server's MP3 encoder
+  is unavailable in the running image, every reply falls back to WAV
+  automatically. This logs one warning per process, with no operator
+  action and no signal to a consumer beyond `audio_mime` itself — a
+  consumer cannot assume MP3 just because nobody switched formats on
+  purpose.
+- **Size, format-conditional** — `audio_data` is base64, and the ceiling
+  depends on `audio_mime`:
+  - MP3 (`audio_mime: "audio/mpeg"`): a typical ~12s reply is ~48 KB
+    decoded, ~64 KB as base64. Worst case, at the server's default
+    reply-length cap (~25s of speech), is ~100 KB decoded, ~134 KB as
+    base64. Size against 256 KB base64 for this path alone.
+  - WAV (`audio_mime: "audio/wav"`): uncompressed PCM16 runs ~32,000
+    bytes per second of speech. A typical ~12s reply is ~384 KB decoded,
+    ~500 KB as base64. Worst case, at the same reply-length cap (~25s),
+    is ~800 KB decoded, ~1.02 MiB as base64. Size against 1.5 MB base64
+    for this path.
+  - Both worst cases come from the server's reply-length cap, not a
+    protocol limit — a practical bound, not a guarantee.
+  - **A buffer or frame limit sized to cover both formats must use the
+    WAV figure — 1.5 MB base64.** A given frame's format isn't known
+    until `audio_mime` is read off it, so a consumer can't size for MP3
+    alone and assume it's covered. Sizing against the MP3 figure alone
+    drops or kills the connection on any WAV reply longer than about
+    6 seconds.
 - `audio_duration_ms` is the clip length in milliseconds, for a progress bar
   or scrubber — no need to read it out of the file yourself.
 - **Migration note:** the bytes behind `audio_url` are MP3 by default now —

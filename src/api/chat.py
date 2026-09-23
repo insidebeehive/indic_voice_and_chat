@@ -245,16 +245,24 @@ def _tts_max_reply_chars() -> int:
 
     The ~390 ceiling below is sized for the WAV fallback
     (``VOX_TTS_REPLY_FORMAT=wav``), the worse case of the two formats this
-    cap has to cover: at 16 kHz mono PCM16 (32,000 bytes/sec) and the slow
-    end of 12 chars/sec, 1_048_576 bytes is 1_048_576 * 12 / 32_000 = 393
-    characters of source text. Above that the WAV exceeds what
-    docs/crm-chat-media-contract.md documents, and a rejection at the widget
-    will look like a synthesis failure rather than an oversized clip. The
-    default MP3 encoding has roughly 8x that headroom (see the worst-case
-    math above `_TTS_MAX_REPLY_CHARS_DEFAULT`) — this cap is not raised
-    separately per format, so it stays sized for whichever format is worse.
-    An invalid or non-positive value falls back to the default rather than
-    disabling the cap, so a typo cannot silently start emitting
+    cap has to cover, against the STORED object's 1 MB limit
+    (docs/crm-chat-media-contract.md): at 16 kHz mono PCM16 (32,000
+    bytes/sec) and the slow end of 12 chars/sec, 1_048_576 bytes is
+    1_048_576 * 12 / 32_000 = 393 characters of source text. But the same
+    cap also sizes the base64 `audio_data` this reply carries INLINE on the
+    WS frame (see `_send_reply`), which is 4/3 larger again than the encoded
+    bytes it's derived from — at 390 chars that inline field alone is
+    roughly 1.4 MB on a single `message` frame, on top of whatever the
+    stored object costs. Raising this cap toward 390 believing the 1 MB
+    contract still bounds you is how you end up shipping a frame far past
+    anything docs/crm-chat-media-contract.md describes. The default MP3
+    encoding has roughly 8x the headroom of WAV on the stored side (see the
+    worst-case math above `_TTS_MAX_REPLY_CHARS_DEFAULT`; MP3 at 32 kbps is
+    ~4 KB/s of speech against WAV's ~32 KB/s) and the same 4/3 inline
+    penalty on top — this cap is not raised separately per format or per
+    consumer, so it stays sized for whichever combination is worse (WAV,
+    inline). An invalid or non-positive value falls back to the default
+    rather than disabling the cap, so a typo cannot silently start emitting
     multi-megabyte audio.
     """
     raw = os.environ.get("VOX_TTS_MAX_REPLY_CHARS", "").strip()
@@ -2555,9 +2563,10 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
                                     # our media storage succeeding. Encoded once, reused
                                     # for both the upload below and this inline copy —
                                     # never re-synthesized or re-encoded for the two
-                                    # destinations. See the comment on `_reply_has_audio`
-                                    # below for why `audio_url` alone needs the upload
-                                    # (and persistence) to succeed and this does not.
+                                    # destinations. See the comment on
+                                    # `_reply_audio_url_serveable` below for why
+                                    # `audio_url` alone needs the upload (and
+                                    # persistence) to succeed and this does not.
                                     reply_audio_data = base64.b64encode(reply_audio_bytes).decode()
                                     reply_audio_mime = reply_mime
                                     reply_audio_duration_ms = reply_duration_ms
@@ -2610,12 +2619,13 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
                                 # persistence gap must not throw that away. The whole
                                 # point of shipping an inline copy is that the CRM does
                                 # not depend on our media storage or DB succeeding.
-                                _reply_has_audio = bool(reply_media_url and persisted.agent_message_id is not None)
+                                _reply_audio_url_serveable = bool(
+                                    reply_media_url and persisted.agent_message_id is not None)
                                 delivered = await _send_reply(
                                     websocket, session_id, result, tenant.id,
                                     audio_url=(
                                         f"/api/v1/chat/media/{persisted.agent_message_id}"
-                                        if _reply_has_audio else None
+                                        if _reply_audio_url_serveable else None
                                     ),
                                     audio_mime=reply_audio_mime,
                                     audio_data=reply_audio_data,
@@ -3002,13 +3012,13 @@ async def _send_reply(
         "suggestions": result.response.suggested_followups,
         "action": result.response.action,
     }
-    if audio_data is not None:
+    if audio_data:
         frame["audio_data"] = audio_data
         if audio_duration_ms is not None:
             frame["audio_duration_ms"] = audio_duration_ms
     if audio_url:
         frame["audio_url"] = audio_url
-    if audio_mime is not None and (audio_url or audio_data is not None):
+    if audio_mime is not None and (audio_url or audio_data):
         frame["audio_mime"] = audio_mime
     # What actually went out on the wire, audio or not. This is the line that
     # separates "we sent no audio" from "we sent audio and the customer did

@@ -754,6 +754,80 @@ def test_pcm16_to_mp3_drops_trailing_odd_byte():
 
 
 @pytest.mark.asyncio
+async def test_lameenc_unavailable_falls_back_to_wav_reply(ws_ctx, monkeypatch):
+    """The guarded `lameenc` import (module level, see the try/except around
+    `import lameenc`) with `lameenc is None`, exercised end to end — a
+    DIFFERENT path from `test_mp3_encoder_failure_falls_back_to_text_only`
+    below, which covers the encoder RAISING, not the extension being absent.
+    With the default `VOX_TTS_REPLY_FORMAT=mp3`, a missing extension must
+    still deliver audio, just degraded to the pure-Python WAV encoder, not
+    dropped entirely."""
+    monkeypatch.setattr(chat_api, "lameenc", None)
+    sm, media_store, fake_agent = ws_ctx
+    fake_agent.handle_message = AsyncMock(
+        return_value=_FakeTurnResult(response=_FakeResp(response_text="answer", language="hi")))
+
+    raw_pcm = _make_pcm16(sample_rate=16000)
+    provider = _FakeTTSProvider(audio=raw_pcm, sample_rate=16000)
+    chat_api.set_tts_providers(_FakeTTSProviders(provider))
+
+    fake_tenant = _make_fake_tenant()
+    frames = _send_audio_and_collect(fake_tenant)
+    reply = frames[2]
+    assert reply["type"] == "message"
+    assert reply["audio_url"].startswith("/api/v1/chat/media/")
+    assert reply["audio_mime"] == "audio/wav"
+    assert isinstance(reply["audio_duration_ms"], int)
+    assert reply["audio_duration_ms"] > 0
+
+    reply_key, reply_mime, reply_bytes = media_store.uploaded[1]
+    assert reply_mime == "audio/wav"
+    with wave.open(io.BytesIO(reply_bytes), "rb") as wav_file:
+        assert wav_file.getnchannels() == 1
+        assert wav_file.getsampwidth() == 2  # PCM16
+        assert wav_file.getframerate() == 16000
+        frames_out = wav_file.readframes(wav_file.getnframes())
+    assert frames_out == raw_pcm
+    # The inline copy is the same degraded-format bytes as the upload.
+    assert base64.b64decode(reply["audio_data"]) == reply_bytes
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad_sample_rate", [0, None])
+async def test_invalid_sample_rate_from_provider_falls_back_to_text_only(ws_ctx, bad_sample_rate):
+    """The invalid-`sample_rate` guard: a provider returning `0` or `None`
+    would otherwise divide by it computing `duration_ms` a few lines later,
+    surfacing as a bare ZeroDivisionError/TypeError with no indication it was
+    a provider-data problem (see the guard's own comment in
+    `_synthesize_reply_audio_uncapped`). Must degrade the turn to text-only
+    with all four audio fields omitted, same as any other synthesis failure,
+    not break the turn."""
+    sm, media_store, fake_agent = ws_ctx
+    fake_agent.handle_message = AsyncMock(
+        return_value=_FakeTurnResult(response=_FakeResp(response_text="answer", language="hi")))
+
+    # Explicit audio bytes -- `_FakeTTSResult`'s own default PCM generator
+    # divides by `sample_rate` too, and would raise before the code under
+    # test ever saw the bad value.
+    raw_pcm = _make_pcm16(sample_rate=16000)
+    provider = _FakeTTSProvider(audio=raw_pcm, sample_rate=bad_sample_rate)
+    chat_api.set_tts_providers(_FakeTTSProviders(provider))
+
+    fake_tenant = _make_fake_tenant()
+    frames = _send_audio_and_collect(fake_tenant)
+    reply = frames[2]
+    assert reply["type"] == "message"
+    assert reply["text"] == "answer"
+    assert "audio_url" not in reply
+    assert "audio_mime" not in reply
+    assert "audio_data" not in reply
+    assert "audio_duration_ms" not in reply
+    assert provider.calls, "the provider was still called — it returned a bad sample_rate"
+    # Only the inbound recording was uploaded — no reply clip was produced.
+    assert len(media_store.uploaded) == 1
+
+
+@pytest.mark.asyncio
 async def test_mp3_encoder_failure_falls_back_to_text_only(ws_ctx):
     """A raise from the encoding step itself (a `lameenc` bug, a corrupt
     build, ...) must degrade exactly like a provider failure — text-only,

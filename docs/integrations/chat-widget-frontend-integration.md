@@ -229,12 +229,29 @@ all when:
 All audio fields are omitted entirely — never sent as `null` — on every
 turn that doesn't produce a clip, so a non-audio turn's frame is unchanged.
 
-**Size (normal MP3 path):** a typical ~12s reply is ~48 KB decoded, ~64 KB
-as the base64 string in `audio_data`. Worst case, at the server's default
-reply-length cap (~25s of speech), is ~100 KB decoded, ~134 KB as base64 —
-that ceiling comes from the reply-length cap, not a protocol limit, so
-treat it as a practical bound rather than a guarantee. Size a buffer
-against 256 KB for the base64 string.
+**Size, format-conditional** — `audio_data` is base64, and the ceiling
+depends on `audio_mime`:
+
+- MP3 (`audio_mime: "audio/mpeg"`): a typical ~12s reply is ~48 KB decoded,
+  ~64 KB as base64. Worst case, at the server's default reply-length cap
+  (~25s of speech), is ~100 KB decoded, ~134 KB as base64. Size against
+  256 KB base64 for this path alone.
+- WAV (`audio_mime: "audio/wav"`): uncompressed PCM16 runs ~32,000 bytes
+  per second of speech. A typical ~12s reply is ~384 KB decoded, ~500 KB
+  as base64. Worst case, at the same reply-length cap (~25s), is ~800 KB
+  decoded, ~1.02 MiB as base64. Size against 1.5 MB base64 for this path.
+
+Both worst cases come from the server's reply-length cap, not a protocol
+limit — a practical bound, not a guarantee. **A buffer sized to cover both
+formats must use the WAV figure, 1.5 MB base64** — a frame's format isn't
+known until `audio_mime` is read off it, so sizing against the MP3 figure
+alone drops or kills the connection on any WAV reply longer than about
+6 seconds.
+
+WAV isn't only a deliberate choice on the backend: if the server's MP3
+encoder is unavailable in the running image, every reply falls back to WAV
+automatically, with no operator action and no signal beyond `audio_mime`
+itself. Don't assume MP3 just because nobody switched formats on purpose.
 
 ```js
 function renderAgentMessage(msg) {
