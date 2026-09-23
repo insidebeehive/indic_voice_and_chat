@@ -186,14 +186,17 @@ Show a typing indicator. Remove it when the next `message` arrives.
 }
 ```
 
-A reply to a voice note carries two extra fields:
+A reply to a voice note carries extra fields, with the clip delivered inline
+as base64 on the same frame:
 
 ```json
 {
   "type": "message",
   "text": "आपका बैलेंस ₹1,200 है।",
   "audio_url": "https://css.example.com/proxy/media/104",
-  "audio_mime": "audio/wav",
+  "audio_data": "<raw base64 MP3>",
+  "audio_mime": "audio/mpeg",
+  "audio_duration_ms": 11840,
   "sources": [],
   "suggestions": [],
   "action": "none"
@@ -203,16 +206,45 @@ A reply to a voice note carries two extra fields:
 | Field | What to do |
 |---|---|
 | `text` | Render as chat bubble |
-| `audio_url` | **Present only on replies to a voice note.** Render an `<audio controls>` alongside the text bubble, `src` set to this value exactly (CSS/CS has already proxied it). Both fields are omitted — not sent as `null` — on every other turn, so test with `if (msg.audio_url)`. |
-| `audio_mime` | Content type of that clip, e.g. `audio/wav`. |
+| `audio_data` | Sent whenever synthesis succeeds for the turn — the reliable field, build against it. Raw standard base64 (padded, no `data:` prefix) of the synthesized clip. Build a data URL (`` `data:${msg.audio_mime};base64,${msg.audio_data}` ``) and use it as an `<audio>` element's `src`. Test with `if (msg.audio_data)`. |
+| `audio_url` | Sent only when the clip *also* uploaded to media storage and the message row persisted — can be absent even when `audio_data` is present on the same frame. Not a fallback for `audio_data` (nor the reverse). When present, already proxied by CSS/CS — use as-is. |
+| `audio_mime` | Authoritative content type of the clip — read it, never assume a format. Normally `audio/mpeg` (MP3); can be `audio/wav` if the reply format has been switched. |
+| `audio_duration_ms` | Clip length in milliseconds, for a progress bar or scrubber. |
 | `suggestions` | Show as quick-reply chips below the bubble |
 | `sources` | RAG references — omit from UI if unused |
 | `action` | Behaviour hint from the AI. `"none"` = no special UI change. Other values are reserved for future use — safe to ignore unknown values. |
 
+Audio fields ride on the `message` frame only for a synthesized reply to a
+voice-note turn, and even then are not guaranteed. No audio is produced at
+all when:
+
+- the tenant hasn't opted in — the chat-voice reply feature defaults to off
+  per tenant, and this is the dominant reason most turns carry no audio
+- the tenant has opted in, but there's no resolvable chat TTS provider
+  configured for it
+- the reply text is empty, or exceeds the server-side length cap
+- synthesis times out
+- the TTS provider returns an error
+
+All audio fields are omitted entirely — never sent as `null` — on every
+turn that doesn't produce a clip, so a non-audio turn's frame is unchanged.
+
+**Size (normal MP3 path):** a typical ~12s reply is ~48 KB decoded, ~64 KB
+as the base64 string in `audio_data`. Worst case, at the server's default
+reply-length cap (~25s of speech), is ~100 KB decoded, ~134 KB as base64 —
+that ceiling comes from the reply-length cap, not a protocol limit, so
+treat it as a practical bound rather than a guarantee. Size a buffer
+against 256 KB for the base64 string.
+
 ```js
 function renderAgentMessage(msg) {
   addBubble("agent", msg.text);
-  if (msg.audio_url) {
+  if (msg.audio_data) {
+    const audio = document.createElement("audio");
+    audio.controls = true;
+    audio.src = `data:${msg.audio_mime};base64,${msg.audio_data}`;
+    chatLog.appendChild(audio);
+  } else if (msg.audio_url) {
     const audio = document.createElement("audio");
     audio.controls = true;
     audio.src = msg.audio_url;   // already proxied — use as-is
@@ -222,9 +254,14 @@ function renderAgentMessage(msg) {
 }
 ```
 
+**Migration note:** the bytes behind `audio_url` are MP3 by default now —
+not WAV. `audio_mime` on the same frame (`audio/mpeg`) confirms it.
+Anything that hardcoded a `.wav` extension or assumed `audio/wav` for that
+URL needs updating on this release.
+
 The text is always sent, and is the full reply — the clip is a spoken rendering
-of the same words, not a substitute for them. A client that ignores
-`audio_url` therefore stays correct and simply renders a text-only reply, which
+of the same words, not a substitute for them. A client that ignores the audio
+fields therefore stays correct and simply renders a text-only reply, which
 is why the fields ride on `message` rather than arriving as a new frame type.
 The cost of that choice is that dropping them fails silently: the customer hears
 nothing and no error is raised anywhere.
@@ -489,7 +526,7 @@ Form fields: `file` (image/* or video/*), `text` (optional caption). CSS proxies
 - [ ] Image/video attach → base64 WS frame or multipart POST to CSS's `/api/chat/upload` endpoint
 - [ ] Mic button → record → `audio` frame → show local blob `<audio>` immediately
 - [ ] `audio_ack` → swap the pending `<audio>` element's `src` with `msg.media_url` (already proxied — use as-is)
-- [ ] `message` with `audio_url` → render an `<audio controls>` next to the text bubble (reply to a voice note; field absent on every other turn)
+- [ ] `message` with `audio_data` (fall back to `audio_url` if `audio_data` is absent) → render an `<audio controls>` next to the text bubble (reply to a voice note; both fields absent on every other turn)
 - [ ] Media URLs: use exactly as provided by CSS/CS — never construct platform paths or append `?session_id=`
 - [ ] `escalation` → show "Connecting to agent…"
 - [ ] `mode_change` mode=`awaiting_human` → "Waiting for an agent…"; mode=`human` → show agent name; mode=`bot` → re-enable composer and resume bot UX (CRM declined); mode=`voice_pending` → "Calling your number…"

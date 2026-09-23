@@ -225,11 +225,14 @@ def _send_audio_and_collect(fake_tenant, *, extra_frames_expected: int = 0):
 
 @pytest.mark.asyncio
 async def test_audio_turn_with_working_tts_gets_audio_reply(ws_ctx):
-    """Inbound audio -> reply `message` frame carries audio_url/audio_mime,
-    and the synthesized clip is persisted + retrievable via the media store —
-    AND is an actually-valid, actually-playable WAV file wrapping the exact
-    PCM16 bytes the provider returned. This is the test that would have
-    caught the shipped defect (headerless PCM served as `audio/mpeg`)."""
+    """Inbound audio -> reply `message` frame carries audio_url/audio_mime
+    PLUS an inline audio_data/audio_duration_ms, and the synthesized clip is
+    persisted + retrievable via the media store — AND is an actually-valid,
+    actually-decodable MP3 (the default `VOX_TTS_REPLY_FORMAT`), not
+    headerless PCM served under a lying mime. That mismatch is the original
+    shipped defect this suite guards against; this test now also pins that
+    the inline copy is the exact same encoded bytes as the uploaded one, not
+    a second, independently-encoded copy."""
     sm, media_store, fake_agent = ws_ctx
     fake_agent.handle_message = AsyncMock(
         return_value=_FakeTurnResult(response=_FakeResp(response_text="yahan hai", language="hi")))
@@ -246,23 +249,24 @@ async def test_audio_turn_with_working_tts_gets_audio_reply(ws_ctx):
     assert reply["type"] == "message"
     assert reply["text"] == "yahan hai"
     assert reply["audio_url"].startswith("/api/v1/chat/media/")
-    assert reply["audio_mime"] == "audio/wav"
+    assert reply["audio_mime"] == "audio/mpeg"
+
+    # The uploaded/advertised mime must match the ACTUAL bytes: decode the
+    # inline base64 and check it's a real MPEG frame (sync byte 0xFF, the
+    # next 3 bits all set), not an opaque blob the widget just has to trust.
+    audio_data = base64.b64decode(reply["audio_data"])
+    assert audio_data[0] == 0xFF
+    assert audio_data[1] & 0xE0 == 0xE0
+    assert isinstance(reply["audio_duration_ms"], int)
+    assert reply["audio_duration_ms"] > 0
 
     # Two uploads: the inbound recording, then the synthesized reply.
     assert len(media_store.uploaded) == 2
     reply_key, reply_mime, reply_bytes = media_store.uploaded[1]
-    assert reply_mime == "audio/wav"
-
-    # The uploaded/advertised mime must match the ACTUAL bytes: parse them
-    # back with the stdlib `wave` module (not a string/magic-number sniff) and
-    # check every parameter a player relies on, plus a full round-trip of the
-    # PCM frame data back to what the provider returned.
-    with wave.open(io.BytesIO(reply_bytes), "rb") as wav_file:
-        assert wav_file.getnchannels() == 1
-        assert wav_file.getsampwidth() == 2  # PCM16
-        assert wav_file.getframerate() == 16000
-        frames_out = wav_file.readframes(wav_file.getnframes())
-    assert frames_out == raw_pcm
+    assert reply_mime == "audio/mpeg"
+    # Encoded once, reused for both destinations — not re-encoded per
+    # destination (which could silently drift or double the CPU cost).
+    assert reply_bytes == audio_data
     assert provider.calls, "tts provider was never called"
 
     # Persisted on the AGENT's row, retrievable the same way inbound audio is.
@@ -272,9 +276,46 @@ async def test_audio_turn_with_working_tts_gets_audio_reply(ws_ctx):
         )).scalars().all()
     assert len(rows) == 1
     assert rows[0].media_url == reply_key
-    assert rows[0].media_mime == "audio/wav"
+    assert rows[0].media_mime == "audio/mpeg"
     assert rows[0].type == "audio"
     assert reply["audio_url"] == f"/api/v1/chat/media/{rows[0].id}"
+
+
+@pytest.mark.asyncio
+async def test_wav_format_env_still_produces_wav(ws_ctx, monkeypatch):
+    """VOX_TTS_REPLY_FORMAT=wav reverts to the original uncompressed path.
+    This is the `wave`-module round-trip verification that used to be the
+    default-path test above, kept as its own test so the MP3 switch can't
+    silently break the escape hatch for tenants/operators who need it (e.g.
+    to rule out an MP3-specific playback issue on a given CRM widget)."""
+    monkeypatch.setenv("VOX_TTS_REPLY_FORMAT", "wav")
+    sm, media_store, fake_agent = ws_ctx
+    fake_agent.handle_message = AsyncMock(
+        return_value=_FakeTurnResult(response=_FakeResp(response_text="yahan hai", language="hi")))
+
+    raw_pcm = _make_pcm16(sample_rate=16000)
+    provider = _FakeTTSProvider(audio=raw_pcm, sample_rate=16000)
+    chat_api.set_tts_providers(_FakeTTSProviders(provider))
+
+    fake_tenant = _make_fake_tenant()
+    frames = _send_audio_and_collect(fake_tenant)
+    reply = frames[2]
+    assert reply["audio_url"].startswith("/api/v1/chat/media/")
+    assert reply["audio_mime"] == "audio/wav"
+    assert isinstance(reply["audio_duration_ms"], int)
+    assert reply["audio_duration_ms"] > 0
+
+    reply_key, reply_mime, reply_bytes = media_store.uploaded[1]
+    assert reply_mime == "audio/wav"
+    with wave.open(io.BytesIO(reply_bytes), "rb") as wav_file:
+        assert wav_file.getnchannels() == 1
+        assert wav_file.getsampwidth() == 2  # PCM16
+        assert wav_file.getframerate() == 16000
+        frames_out = wav_file.readframes(wav_file.getnframes())
+    assert frames_out == raw_pcm
+
+    # The inline copy is format-agnostic too: same bytes as the upload.
+    assert base64.b64decode(reply["audio_data"]) == reply_bytes
 
 
 @pytest.mark.asyncio
@@ -303,6 +344,8 @@ async def test_text_turn_has_no_audio_fields(ws_ctx):
     assert reply["text"] == "hello back"
     assert "audio_url" not in reply
     assert "audio_mime" not in reply
+    assert "audio_data" not in reply
+    assert "audio_duration_ms" not in reply
     assert not provider.calls, "TTS must never be invoked for a text-in turn"
     assert len(media_store.uploaded) == 0
 
@@ -323,6 +366,8 @@ async def test_tts_provider_raises_falls_back_to_text_only(ws_ctx):
     assert reply["text"] == "answer"
     assert "audio_url" not in reply
     assert "audio_mime" not in reply
+    assert "audio_data" not in reply
+    assert "audio_duration_ms" not in reply
     # Only the inbound recording was uploaded — synthesis never produced bytes to store.
     assert len(media_store.uploaded) == 1
 
@@ -344,6 +389,8 @@ async def test_tts_timeout_falls_back_to_text_only(ws_ctx, monkeypatch):
     assert reply["text"] == "answer"
     assert "audio_url" not in reply
     assert "audio_mime" not in reply
+    assert "audio_data" not in reply
+    assert "audio_duration_ms" not in reply
     assert len(media_store.uploaded) == 1
 
 
@@ -362,6 +409,8 @@ async def test_tenant_with_no_tts_provider_configured_falls_back_to_text_only(ws
     assert reply["text"] == "answer"
     assert "audio_url" not in reply
     assert "audio_mime" not in reply
+    assert "audio_data" not in reply
+    assert "audio_duration_ms" not in reply
 
 
 @pytest.mark.asyncio
@@ -385,6 +434,8 @@ async def test_chat_tts_unavailable_returns_none_falls_back_to_text_only(ws_ctx)
     assert reply["text"] == "answer"
     assert "audio_url" not in reply
     assert "audio_mime" not in reply
+    assert "audio_data" not in reply
+    assert "audio_duration_ms" not in reply
     assert not provider.calls, "synthesis must not be attempted when get_chat_tts returns None"
     assert len(media_store.uploaded) == 1  # inbound recording only
     assert len(fake_providers.get_chat_tts_calls) == 1
@@ -406,6 +457,8 @@ async def test_no_tts_providers_wired_at_all_falls_back_to_text_only(ws_ctx, cap
     assert reply["type"] == "message"
     assert "audio_url" not in reply
     assert "audio_mime" not in reply
+    assert "audio_data" not in reply
+    assert "audio_duration_ms" not in reply
     wired_logs = [r for r in caplog.records if "no TTS provider registry wired" in r.message]
     assert len(wired_logs) == 1
     assert wired_logs[0].levelname == "DEBUG"
@@ -429,6 +482,8 @@ async def test_empty_reply_text_skips_synthesis(ws_ctx):
     reply = frames[2]
     assert reply["type"] == "message"
     assert "audio_url" not in reply
+    assert "audio_data" not in reply
+    assert "audio_duration_ms" not in reply
     assert not provider.calls, "synthesis must not be attempted for empty reply text"
 
 
@@ -455,6 +510,8 @@ async def test_over_cap_reply_text_skips_synthesis(ws_ctx, caplog):
     reply = frames[2]
     assert reply["type"] == "message"
     assert "audio_url" not in reply
+    assert "audio_data" not in reply
+    assert "audio_duration_ms" not in reply
     assert not provider.calls, "synthesis must not be attempted over the character cap"
 
     over_cap_logs = [r for r in caplog.records if "reply exceeds max length" in r.message]
@@ -522,9 +579,15 @@ async def test_normalize_for_tts_applied_with_tenant_pronunciation_overrides(ws_
 
 
 @pytest.mark.asyncio
-async def test_tts_upload_failure_falls_back_to_text_only(ws_ctx):
-    """A working TTS provider but a media-store upload failure for the
-    synthesized clip must still leave the turn's text reply intact."""
+async def test_tts_upload_failure_still_delivers_inline_audio(ws_ctx):
+    """Finding 1: a working TTS provider but a media-store upload failure for
+    the synthesized clip must still leave the turn's text reply intact AND
+    still deliver the inline audio -- the clip is already fully in hand in
+    memory (already paid for with a TTS call) by the time the upload runs, so
+    an S3 outage must not throw it away. Only `audio_url` is genuinely
+    dependent on the upload succeeding (there is no object to serve); the
+    inline `audio_data`/`audio_mime`/`audio_duration_ms` carry no such
+    dependency and must still reach the customer."""
     sm, media_store, fake_agent = ws_ctx
     fake_agent.handle_message = AsyncMock(
         return_value=_FakeTurnResult(response=_FakeResp(response_text="answer", language="hi")))
@@ -549,7 +612,43 @@ async def test_tts_upload_failure_falls_back_to_text_only(ws_ctx):
     assert reply["type"] == "message"
     assert reply["text"] == "answer"
     assert "audio_url" not in reply
-    assert "audio_mime" not in reply
+    assert reply["audio_mime"] == "audio/mpeg"
+    assert isinstance(reply["audio_data"], str) and reply["audio_data"]
+    assert isinstance(reply["audio_duration_ms"], int)
+    assert reply["audio_duration_ms"] > 0
+
+
+@pytest.mark.asyncio
+async def test_persistence_gap_still_delivers_inline_audio(ws_ctx):
+    """Finding 1's other uncovered arm: the upload succeeds, but `_persist_turn`
+    returns a `PersistedTurnIds()` with no `agent_message_id` (a missing
+    ChatSession row, or a swallowed DB error). `audio_url` requires a
+    persisted agent row to resolve `GET /chat/media/{id}` back to the
+    uploaded object, so it is correctly withheld -- but the inline
+    audio_data/audio_mime/audio_duration_ms depend on neither the upload nor
+    persistence and must still reach the customer."""
+    sm, media_store, fake_agent = ws_ctx
+    fake_agent.handle_message = AsyncMock(
+        return_value=_FakeTurnResult(response=_FakeResp(response_text="answer", language="hi")))
+
+    provider = _FakeTTSProvider()
+    chat_api.set_tts_providers(_FakeTTSProviders(provider))
+
+    fake_persisted = chat_api.PersistedTurnIds(customer_message_id=1, agent_message_id=None)
+    with patch.object(chat_api, "_persist_turn", AsyncMock(return_value=fake_persisted)):
+        fake_tenant = _make_fake_tenant()
+        frames = _send_audio_and_collect(fake_tenant)
+    reply = frames[2]
+    assert reply["type"] == "message"
+    assert reply["text"] == "answer"
+    assert "audio_url" not in reply
+    assert reply["audio_mime"] == "audio/mpeg"
+    assert isinstance(reply["audio_data"], str) and reply["audio_data"]
+    assert isinstance(reply["audio_duration_ms"], int)
+    assert reply["audio_duration_ms"] > 0
+    # The reply's own upload still ran and succeeded -- only the URL is
+    # withheld because there is no persisted row for it to resolve to.
+    assert len(media_store.uploaded) == 2
 
 
 @pytest.mark.asyncio
@@ -572,16 +671,21 @@ async def test_empty_audio_from_provider_falls_back_to_text_only(ws_ctx):
     assert reply["text"] == "answer"
     assert "audio_url" not in reply
     assert "audio_mime" not in reply
+    assert "audio_data" not in reply
+    assert "audio_duration_ms" not in reply
     assert provider.calls, "the provider was still called — it just returned nothing"
     # Only the inbound recording was uploaded — no zero-byte reply clip.
     assert len(media_store.uploaded) == 1
 
 
 @pytest.mark.asyncio
-async def test_odd_length_pcm_from_provider_still_produces_valid_wav(ws_ctx):
+async def test_odd_length_pcm_from_provider_still_produces_valid_audio(ws_ctx):
     """Finding 1: an odd PCM16 byte count (a truncated trailing sample) must
-    be handled — the trailing byte dropped — rather than silently producing a
-    WAV whose header/data chunk sizes describe a fractional frame."""
+    be handled — the trailing byte dropped — rather than crashing or
+    silently feeding a fractional sample to the encoder. Exercised here
+    against the default (MP3) path; `_pcm16_to_wav`'s own guard has its own
+    direct unit test below (`test_pcm16_to_wav_drops_trailing_odd_byte`),
+    and `_pcm16_to_mp3`'s equivalent has `test_pcm16_to_mp3_drops_trailing_odd_byte`."""
     sm, media_store, fake_agent = ws_ctx
     fake_agent.handle_message = AsyncMock(
         return_value=_FakeTurnResult(response=_FakeResp(response_text="answer", language="hi")))
@@ -596,17 +700,14 @@ async def test_odd_length_pcm_from_provider_still_produces_valid_wav(ws_ctx):
     reply = frames[2]
     assert reply["type"] == "message"
     assert reply["audio_url"].startswith("/api/v1/chat/media/")
-    assert reply["audio_mime"] == "audio/wav"
+    assert reply["audio_mime"] == "audio/mpeg"
 
     reply_key, reply_mime, reply_bytes = media_store.uploaded[1]
-    with wave.open(io.BytesIO(reply_bytes), "rb") as wav_file:
-        assert wav_file.getnchannels() == 1
-        assert wav_file.getsampwidth() == 2
-        assert wav_file.getframerate() == 16000
-        frames_out = wav_file.readframes(wav_file.getnframes())
-    # The dangling byte was dropped, not smuggled into the data chunk.
-    assert frames_out == even_pcm
-    assert len(frames_out) % 2 == 0
+    # Byte-identical to encoding the already-even PCM directly — proof the
+    # dangling byte was dropped before encoding, not smuggled in as a
+    # corrupt trailing frame (lame is deterministic for identical input).
+    assert reply_bytes == chat_api._pcm16_to_mp3(
+        even_pcm, 16000, chat_api._TTS_REPLY_MP3_BITRATE_KBPS)
 
 
 def test_pcm16_to_wav_round_trips_and_reports_expected_parameters():
@@ -630,3 +731,54 @@ def test_pcm16_to_wav_drops_trailing_odd_byte():
     wav_bytes = chat_api._pcm16_to_wav(pcm + b"\x01", 16000)
     with wave.open(io.BytesIO(wav_bytes), "rb") as wav_file:
         assert wav_file.readframes(wav_file.getnframes()) == pcm
+
+
+def test_pcm16_to_mp3_produces_a_decodable_mpeg_frame():
+    """Direct unit test of `_pcm16_to_mp3` (no WS/agent/media-store
+    machinery) — checks the actual encoded bytes start with a real MPEG
+    frame sync (0xFF + the next 3 bits all set), not just "some non-empty
+    bytes came back"."""
+    pcm = _make_pcm16(num_samples=1600, sample_rate=16000)  # 100ms @ 16kHz
+    mp3_bytes = chat_api._pcm16_to_mp3(pcm, 16000, chat_api._TTS_REPLY_MP3_BITRATE_KBPS)
+    assert len(mp3_bytes) > 0
+    assert mp3_bytes[0] == 0xFF
+    assert mp3_bytes[1] & 0xE0 == 0xE0
+
+
+def test_pcm16_to_mp3_drops_trailing_odd_byte():
+    pcm = _make_pcm16(num_samples=1600, sample_rate=16000)
+    with_dangling_byte = pcm + b"\x01"
+    kbps = chat_api._TTS_REPLY_MP3_BITRATE_KBPS
+    assert (chat_api._pcm16_to_mp3(with_dangling_byte, 16000, kbps)
+            == chat_api._pcm16_to_mp3(pcm, 16000, kbps))
+
+
+@pytest.mark.asyncio
+async def test_mp3_encoder_failure_falls_back_to_text_only(ws_ctx):
+    """A raise from the encoding step itself (a `lameenc` bug, a corrupt
+    build, ...) must degrade exactly like a provider failure — text-only,
+    turn intact — never surface as a broken turn. This is what proves the
+    `asyncio.to_thread` encode call (required so the ~192ms lame call never
+    blocks the event loop — see `_pcm16_to_mp3`'s docstring) is still inside
+    `_synthesize_reply_audio`'s try/except, not bypassing it."""
+    sm, media_store, fake_agent = ws_ctx
+    fake_agent.handle_message = AsyncMock(
+        return_value=_FakeTurnResult(response=_FakeResp(response_text="answer", language="hi")))
+
+    provider = _FakeTTSProvider()
+    chat_api.set_tts_providers(_FakeTTSProviders(provider))
+
+    fake_tenant = _make_fake_tenant()
+    with patch.object(chat_api, "_pcm16_to_mp3", side_effect=RuntimeError("lame blew up")):
+        frames = _send_audio_and_collect(fake_tenant)
+    reply = frames[2]
+    assert reply["type"] == "message"
+    assert reply["text"] == "answer"
+    assert "audio_url" not in reply
+    assert "audio_mime" not in reply
+    assert "audio_data" not in reply
+    assert "audio_duration_ms" not in reply
+    assert provider.calls, "the provider was still called — encoding is what failed"
+    # Only the inbound recording was uploaded — encoding never produced
+    # bytes for the reply to upload.
+    assert len(media_store.uploaded) == 1

@@ -42,6 +42,7 @@ dependencies = [
     "cryptography>=42.0",
     "aiobotocore>=2.7",
     "prometheus-client>=0.20",
+    "lameenc>=1.8",
 ]
 
 [project.optional-dependencies]

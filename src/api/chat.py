@@ -47,6 +47,16 @@ from fastapi import (
     WebSocketDisconnect,
 )
 from fastapi.responses import RedirectResponse
+try:
+    import lameenc
+except ImportError:  # pragma: no cover - exercised only when the native ext is missing
+    # MP3 encoding is a nicety on top of a nicety (voice-note replies are
+    # already optional — see `_synthesize_reply_audio`'s docstring). If this
+    # extension fails to load in a given runtime image, the whole chat
+    # module must still import and every text reply must still work; only
+    # the MP3 encode path degrades (see `_pcm16_to_mp3`'s caller, which
+    # falls back to WAV and logs it once).
+    lameenc = None
 from pydantic import BaseModel, Field
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -195,21 +205,27 @@ def _media_key(tenant_id: str, session_id: str, mime: str) -> str:
 # T&Cs) that are better read than listened to. Those still go out as text,
 # same as always; only the audio half is skipped.
 #
-# This cap is ALSO what keeps the uploaded/advertised WAV clip under the 1 MB
-# media size the CRM contract documents (docs/crm-chat-media-contract.md) —
-# every provider wired here is requested at 16 kHz mono PCM16 (see
-# `_synthesize_reply_audio_uncapped`'s `TTSConfig`, 32,000 bytes/sec), and the
-# chat layer wraps that raw PCM in a WAV container (see `_pcm16_to_wav`)
-# before upload, which is what actually gets served — never the mp3 the old
-# (wrong) mime claimed. Worst case, at the SLOW end of the 12-15 chars/sec
-# range (slow speech -> longest audio for a given character count):
+# This cap is ALSO what keeps the uploaded/advertised clip well under the
+# 1 MB media size the CRM contract documents
+# (docs/crm-chat-media-contract.md). The size math now depends on the reply's
+# encoded FORMAT (`VOX_TTS_REPLY_FORMAT`, see `_tts_reply_format` below), not
+# on the provider's input sample rate: every provider wired here is
+# requested at 16 kHz mono PCM16 (see `_synthesize_reply_audio_uncapped`'s
+# `TTSConfig`), but at the default MP3 encoding (`_pcm16_to_mp3`, 32 kbps
+# CBR) output size is just bitrate x duration — the input rate never enters
+# the calculation. Worst case, at the SLOW end of the 12-15 chars/sec range
+# (slow speech -> longest audio for a given character count) and 32 kbps
+# (4,000 bytes/sec):
 #   duration_s   = _TTS_MAX_REPLY_CHARS / 12
-#   worst_bytes  = duration_s * 32_000 + 44  (44-byte WAV header)
-# At the old 600-char cap that was 600/12*32_000+44 = 1_600_044 bytes (~1.53
-# MiB) — already over the 1 MB limit before this fix even wrapped the header
-# on. At 300 chars: 300/12*32_000+44 = 800_044 bytes (~781 KiB, ~76% of the
-# 1_048_576-byte limit) — comfortably under. Re-derive this if the cap, the
-# requested sample rate, or the cps estimate ever changes.
+#   worst_bytes  = duration_s * 4_000
+# At the 300-char default that's 300/12*4_000 = 100_000 bytes (~98 KiB) — a
+# fraction of the 1 MB limit, and about 8x smaller than the old WAV-only path
+# was at the same cap (32,000 bytes/sec uncompressed, plus a 44-byte header).
+# `VOX_TTS_REPLY_FORMAT=wav` reverts to that uncompressed math
+# (`duration_s * 32_000 + 44`) — at 300 chars that's still ~781 KiB,
+# comfortably under 1 MB, but leaves far less headroom than MP3 does if the
+# cap is ever raised. Re-derive this if the cap, the bitrate, or the cps
+# estimate ever changes.
 _TTS_MAX_REPLY_CHARS_DEFAULT = 300
 
 
@@ -227,13 +243,18 @@ def _tts_max_reply_chars() -> int:
     (src/providers/llm/gemini.py) and for the same reason: an operator
     changing it mid-investigation should not have to bounce the process.
 
-    Raising it past ~390 breaks the 1 MB media contract. At 16 kHz mono PCM16
-    (32,000 bytes/sec) and the slow end of 12 chars/sec, 1_048_576 bytes is
-    1_048_576 * 12 / 32_000 = 393 characters of source text. Above that the
-    WAV exceeds what docs/crm-chat-media-contract.md documents, and a rejection
-    at the widget will look like a synthesis failure rather than an oversized
-    clip. An invalid or non-positive value falls back to the default rather
-    than disabling the cap, so a typo cannot silently start emitting
+    The ~390 ceiling below is sized for the WAV fallback
+    (``VOX_TTS_REPLY_FORMAT=wav``), the worse case of the two formats this
+    cap has to cover: at 16 kHz mono PCM16 (32,000 bytes/sec) and the slow
+    end of 12 chars/sec, 1_048_576 bytes is 1_048_576 * 12 / 32_000 = 393
+    characters of source text. Above that the WAV exceeds what
+    docs/crm-chat-media-contract.md documents, and a rejection at the widget
+    will look like a synthesis failure rather than an oversized clip. The
+    default MP3 encoding has roughly 8x that headroom (see the worst-case
+    math above `_TTS_MAX_REPLY_CHARS_DEFAULT`) — this cap is not raised
+    separately per format, so it stays sized for whichever format is worse.
+    An invalid or non-positive value falls back to the default rather than
+    disabling the cap, so a typo cannot silently start emitting
     multi-megabyte audio.
     """
     raw = os.environ.get("VOX_TTS_MAX_REPLY_CHARS", "").strip()
@@ -244,6 +265,36 @@ def _tts_max_reply_chars() -> int:
     except ValueError:
         return _TTS_MAX_REPLY_CHARS_DEFAULT
     return value if value > 0 else _TTS_MAX_REPLY_CHARS_DEFAULT
+
+
+# Which container/codec a synthesized reply is encoded as. MP3 is the
+# default: same audio at roughly 1/8th the WAV size (see the worst-case math
+# above `_TTS_MAX_REPLY_CHARS_DEFAULT`), and the inline `audio_data` field
+# added on `_send_reply`'s frame (base64 of whatever this produces) makes the
+# size difference matter on the wire, not just in the media store.
+_TTS_REPLY_FORMAT_DEFAULT = "mp3"
+_TTS_REPLY_FORMATS = frozenset({"mp3", "wav"})
+# 32 kbps mono: intelligible speech quality, well above phone-call bitrates
+# (~8-13 kbps), at a size an operator can afford per reply — see the
+# worst-case math above `_TTS_MAX_REPLY_CHARS_DEFAULT`.
+_TTS_REPLY_MP3_BITRATE_KBPS = 32
+
+
+def _tts_reply_format() -> str:
+    """Which format a voice-note reply is encoded as, overridable with
+    ``VOX_TTS_REPLY_FORMAT`` ("mp3" default, or "wav").
+
+    Same read-live-not-bound-at-import convention as `_tts_max_reply_chars`
+    above, and for the same reason: an operator ruling out an MP3-specific
+    playback issue on a given CRM widget can fall back to WAV mid-incident
+    without a restart. An unrecognized value falls back to the default
+    rather than raising — same reasoning as `_tts_max_reply_chars`'s own
+    fallback: a typo in an env var must degrade to "normal behaviour",
+    never to a broken turn.
+    """
+    raw = os.environ.get("VOX_TTS_REPLY_FORMAT", "").strip().lower()
+    return raw if raw in _TTS_REPLY_FORMATS else _TTS_REPLY_FORMAT_DEFAULT
+
 
 # Ceiling on the TTS synthesis call itself. This is deliberately its own
 # timeout, NOT covered by `_TURN_TIMEOUT_S` above: synthesis runs AFTER
@@ -262,9 +313,10 @@ _TTS_SYNTH_TIMEOUT_S = 10.0
 
 async def _synthesize_reply_audio(
     tenant: TenantContext, text: str, language: str,
-) -> Optional[tuple[bytes, str]]:
-    """Synthesize a voice-note reply's audio. Returns (audio_bytes, mime) on
-    success, or ``None`` if synthesis should simply be skipped this turn.
+) -> Optional[tuple[bytes, str, int]]:
+    """Synthesize a voice-note reply's audio. Returns
+    (audio_bytes, mime, duration_ms) on success, or ``None`` if synthesis
+    should simply be skipped this turn.
 
     ``None`` covers every non-fatal reason, all handled identically here
     (log-and-skip) precisely because none of them should ever break the
@@ -340,7 +392,8 @@ async def _synthesize_reply_audio(
                     tenant_id=tenant.id, language=language,
                     reply_chars=len(text), max_chars=max_chars,
                     audio_bytes=len(result[0]) if result else 0,
-                    audio_mime=result[1] if result else None)
+                    audio_mime=result[1] if result else None,
+                    audio_duration_ms=result[2] if result else None)
         return result
     except asyncio.CancelledError:
         raise
@@ -390,9 +443,49 @@ def _pcm16_to_wav(pcm: bytes, sample_rate: int) -> bytes:
     return buf.getvalue()
 
 
+_mp3_encoder_unavailable_logged = False
+
+
+def _warn_mp3_encoder_unavailable_once() -> None:
+    """Log the `lameenc`-missing fallback exactly once per process, not once
+    per reply — an operator needs to see it during an incident, not have it
+    drown everything else once the extension is confirmed broken."""
+    global _mp3_encoder_unavailable_logged
+    if not _mp3_encoder_unavailable_logged:
+        log.warning("lameenc is not available; falling back to WAV for voice-note replies")
+        _mp3_encoder_unavailable_logged = True
+
+
+def _pcm16_to_mp3(pcm: bytes, sample_rate: int, bitrate_kbps: int) -> bytes:
+    """Encode headerless PCM16 mono samples to MP3 via `lameenc`.
+
+    Same odd-byte guard as `_pcm16_to_wav` and for the same reason: PCM16
+    mono is a 2-byte frame, and `lameenc` has no way to reject a fractional
+    trailing sample itself — it just encodes whatever bytes it's handed. The
+    guard has to live in both places since either one can be reached
+    depending on `_tts_reply_format`.
+
+    This is the CPU-bound step the caller (`_synthesize_reply_audio_uncapped`)
+    must run via `asyncio.to_thread` rather than inline — measured at ~192ms
+    for a 12s clip on this codebase's `lameenc` (1.8.4), which is long enough
+    to visibly stall every other connection's event-loop work if it ran
+    synchronously here.
+    """
+    if len(pcm) % 2:
+        log.warning("tts reply audio has an odd byte count (%d); dropping the "
+                    "trailing incomplete PCM16 sample", len(pcm))
+        pcm = pcm[:-1]
+    encoder = lameenc.Encoder()
+    encoder.set_bit_rate(bitrate_kbps)
+    encoder.set_in_sample_rate(sample_rate)
+    encoder.set_channels(1)
+    encoder.set_quality(2)  # 2 = high quality/slower; fine at this clip length
+    return bytes(encoder.encode(pcm) + encoder.flush())
+
+
 async def _synthesize_reply_audio_uncapped(
     tenant: TenantContext, text: str, language: str, tts: Any,
-) -> tuple[bytes, str]:
+) -> tuple[bytes, str, int]:
     """The actual synthesis call, unwrapped — split out so the timeout/except
     handling above has a single coroutine to bound. The TTS client is passed
     in by the caller, which owns the opt-in/resolution gate (`get_chat_tts`);
@@ -428,9 +521,13 @@ async def _synthesize_reply_audio_uncapped(
         # sarvam/indicf5 (the two providers that internally re-run
         # `normalize_for_tts`) apply them a second time — see the comment
         # above.
-        sample_rate=16000,  # pinned, not left to the TTSConfig default: the
-        # 1 MB worst-case-size math on `_TTS_MAX_REPLY_CHARS` assumes this
-        # exact rate. Re-derive that comment if this ever changes.
+        sample_rate=16000,  # pinned, not left to the TTSConfig default: MP3
+        # output size (bitrate x duration, see the comment above
+        # `_TTS_MAX_REPLY_CHARS_DEFAULT`) doesn't depend on this at all, but
+        # the WAV fallback (`VOX_TTS_REPLY_FORMAT=wav`) does — its worst-case
+        # math assumes this exact rate. Also keeps this in parity with the
+        # telephony bridge, which requests the same rate from these
+        # providers. Re-derive the WAV math above if this ever changes.
         output_format="pcm",  # documents reality, not intent: every provider
         # wired here ignores this field and returns raw PCM16 regardless of
         # what's requested (see `_pcm16_to_wav`'s docstring) — this chat
@@ -444,8 +541,52 @@ async def _synthesize_reply_audio_uncapped(
         # (`_synthesize_reply_audio`) already catches/logs/degrades any
         # exception from this function to a text-only reply.
         raise ValueError("tts provider returned empty audio")
-    wav_bytes = _pcm16_to_wav(result.audio, result.sample_rate)
-    return wav_bytes, "audio/wav"
+    pcm = result.audio
+    if not result.sample_rate:
+        # A provider returning 0/None here would otherwise raise inside the
+        # division below with nothing but a generic ZeroDivisionError/TypeError
+        # for whatever swallows it (the caller's blanket `except Exception`,
+        # see `_synthesize_reply_audio`) — that hides the actual cause behind
+        # a "synthesis failed" line with no indication it was ever a
+        # provider-data problem rather than a real synthesis failure. Raising
+        # with the bad value in the message makes it diagnosable from that
+        # same log line (which logs with `exc_info=True`) without a repro.
+        raise ValueError(f"tts provider returned invalid sample_rate: {result.sample_rate!r}")
+    # Computed from the PCM the provider actually returned, before encoding
+    # — `result.sample_rate` is what the provider used, not necessarily the
+    # 16000 requested above (see that field's own comment), and MP3 encoding
+    # doesn't preserve an exact "N samples in" -> "N ms out" relationship the
+    # way this direct division does.
+    duration_ms = round(len(pcm) / 2 / result.sample_rate * 1000)
+    reply_format = _tts_reply_format()
+    if reply_format == "mp3" and lameenc is None:
+        # The native extension failed to load in this runtime image (see the
+        # guarded import at module level). Voice-note replies are already a
+        # nicety on top of a nicety — degrade to the WAV encoder (pure
+        # Python, no extension) rather than raising and losing the clip
+        # entirely, or worse, taking the whole module down at import time.
+        _warn_mp3_encoder_unavailable_once()
+        reply_format = "wav"
+    if reply_format == "wav":
+        audio_bytes = _pcm16_to_wav(pcm, result.sample_rate)
+        mime = "audio/wav"
+    else:
+        # CPU-bound (~192ms for a 12s clip, see `_pcm16_to_mp3`'s docstring)
+        # — must not block the event loop while every other connection this
+        # process is serving waits on it. NOTE: this only keeps the ENCODE
+        # off the event loop; it does not make it obey `_TTS_SYNTH_TIMEOUT_S`.
+        # `asyncio.wait_for` around this whole function (see
+        # `_synthesize_reply_audio`) can only abandon AWAITING the thread's
+        # result on timeout — once `asyncio.to_thread` has handed the job to
+        # the default executor, cancelling the await does not cancel the
+        # thread itself. A slow encode keeps running and holding a
+        # thread-pool slot after the turn has already moved on to a
+        # text-only reply; the turn still degrades correctly, the encode's
+        # own CPU time just isn't actually bounded by that timeout.
+        audio_bytes = await asyncio.to_thread(
+            _pcm16_to_mp3, pcm, result.sample_rate, _TTS_REPLY_MP3_BITRATE_KBPS)
+        mime = "audio/mpeg"
+    return audio_bytes, mime, duration_ms
 
 
 # Ceiling on processing one chat turn (LLM + tools + RAG). Without it a hung
@@ -2400,18 +2541,37 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
                                 # of sitting in silence for _TTS_SYNTH_TIMEOUT_S.
                                 reply_media_mime: Optional[str] = None
                                 reply_media_url: Optional[str] = None
+                                reply_audio_data: Optional[str] = None
+                                reply_audio_mime: Optional[str] = None
+                                reply_audio_duration_ms: Optional[int] = None
                                 synthesized = await _synthesize_reply_audio(
                                     tenant, result.response.response_text, result.response.language)
-                                if synthesized is not None and _media_store is not None:
-                                    reply_audio_bytes, reply_mime = synthesized
-                                    reply_object_key = _media_key(tenant.id, session_id, reply_mime)
-                                    try:
-                                        await _media_store.upload(reply_audio_bytes, reply_object_key, reply_mime)
-                                        reply_media_mime, reply_media_url = reply_mime, reply_object_key
-                                    except Exception:  # noqa: BLE001 — same rule as synthesis itself: never break the turn
-                                        log.warning("tts reply audio upload failed; sending text-only reply",
-                                                    extra={"ticket_id": ticket_id, "session_id": session_id},
-                                                    exc_info=True)
+                                if synthesized is not None:
+                                    reply_audio_bytes, reply_mime, reply_duration_ms = synthesized
+                                    # Base64'd and noted immediately, BEFORE the upload
+                                    # below runs — this needs nothing but the bytes
+                                    # already in memory, and the whole point of shipping
+                                    # an inline copy is that the CRM does NOT depend on
+                                    # our media storage succeeding. Encoded once, reused
+                                    # for both the upload below and this inline copy —
+                                    # never re-synthesized or re-encoded for the two
+                                    # destinations. See the comment on `_reply_has_audio`
+                                    # below for why `audio_url` alone needs the upload
+                                    # (and persistence) to succeed and this does not.
+                                    reply_audio_data = base64.b64encode(reply_audio_bytes).decode()
+                                    reply_audio_mime = reply_mime
+                                    reply_audio_duration_ms = reply_duration_ms
+                                    if _media_store is not None:
+                                        reply_object_key = _media_key(tenant.id, session_id, reply_mime)
+                                        try:
+                                            await _media_store.upload(reply_audio_bytes, reply_object_key, reply_mime)
+                                            reply_media_mime, reply_media_url = reply_mime, reply_object_key
+                                        except Exception:  # noqa: BLE001 — same rule as synthesis itself: never break the turn
+                                            log.warning(
+                                                "tts reply audio upload failed; no audio_url, "
+                                                "inline audio_data still delivered",
+                                                extra={"ticket_id": ticket_id, "session_id": session_id},
+                                                exc_info=True)
                                 # Stop the keepalive now, before ANY customer-visible
                                 # frame goes out (audio_ack / the real reply) and
                                 # before any human-handoff escalation:
@@ -2437,18 +2597,29 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
                                         "type": "audio_ack",
                                         "media_url": f"/api/v1/chat/media/{persisted.customer_message_id}",
                                     }))
-                                # Only reference the reply's media URL if persistence
-                                # actually recorded it (agent_message_id present) —
-                                # a persistence failure must not send a URL to a
-                                # message that was never written.
+                                # audio_url genuinely needs BOTH the upload having
+                                # succeeded (so the object exists to serve) AND
+                                # persistence having recorded an agent_message_id (so
+                                # GET /chat/media/{id} has a row to resolve back to
+                                # that object key) -- reference it without either one
+                                # and the URL 404s forever. audio_data/audio_mime/
+                                # audio_duration_ms carry NO such dependency: the clip
+                                # is already fully in hand in memory by the time
+                                # synthesis returns (see above), and it was already
+                                # paid for with a TTS call -- an upload outage or a
+                                # persistence gap must not throw that away. The whole
+                                # point of shipping an inline copy is that the CRM does
+                                # not depend on our media storage or DB succeeding.
+                                _reply_has_audio = bool(reply_media_url and persisted.agent_message_id is not None)
                                 delivered = await _send_reply(
                                     websocket, session_id, result, tenant.id,
                                     audio_url=(
                                         f"/api/v1/chat/media/{persisted.agent_message_id}"
-                                        if reply_media_url and persisted.agent_message_id is not None
-                                        else None
+                                        if _reply_has_audio else None
                                     ),
-                                    audio_mime=reply_media_mime if reply_media_url else None,
+                                    audio_mime=reply_audio_mime,
+                                    audio_data=reply_audio_data,
+                                    audio_duration_ms=reply_audio_duration_ms,
                                     ticket_id=ticket_id,
                                 )
                                 if not delivered:
@@ -2771,6 +2942,7 @@ async def _send_reply(
     websocket: WebSocket, session_id: str, result: ChatTurnResult, tenant_id: str,
     *, call_url: Optional[str] = None,
     audio_url: Optional[str] = None, audio_mime: Optional[str] = None,
+    audio_data: Optional[str] = None, audio_duration_ms: Optional[int] = None,
     ticket_id: Optional[str] = None,
 ) -> bool:
     """Send the agent's reply frame, plus an escalation/call_offer frame if the
@@ -2799,7 +2971,29 @@ async def _send_reply(
     entirely (not sent as null) when there is no audio, so existing payload
     shape is byte-for-byte unchanged on every non-audio-reply turn — the
     common case by far, since only an inbound `audio` turn ever populates
-    these (see the WS loop's audio branch)."""
+    these (see the WS loop's audio branch).
+
+    ``audio_data``/``audio_duration_ms`` are the newer pair, added so a CRM
+    relay can play the clip without a second round trip to fetch
+    `audio_url` first. `audio_data` is the clip's raw bytes as standard
+    base64 (padded, no `data:` URI prefix — a relay decoding it wants the
+    bytes, not a scheme string to strip first) in whatever format
+    `audio_mime` names (`_tts_reply_format` picks mp3 or wav).
+
+    Deliberately NOT gated on the same condition as `audio_url`: the inline
+    clip is already fully in memory and already paid for with a TTS call by
+    the time the caller gets here, and depends on nothing but that — not on
+    the media-store upload succeeding, not on `_persist_turn` having
+    recorded an `agent_message_id`. The entire purpose of shipping the clip
+    inline is that the CRM does NOT depend on our media storage or DB
+    succeeding, so `audio_data`/`audio_duration_ms` are sent whenever the
+    caller has them, independent of `audio_url`. `audio_mime` rides along
+    with EITHER one — a client needs the mime to decode/play either the
+    inline bytes or a fetched `audio_url`, so it would be useless to gate it
+    on `audio_url` alone and omit it when only the inline copy went out.
+    All three are still omitted entirely (not sent as null) when there is no
+    audio at all, so existing payload shape is byte-for-byte unchanged on
+    every non-audio-reply turn."""
     frame = {
         "type": "message",
         "session_id": session_id,
@@ -2808,16 +3002,29 @@ async def _send_reply(
         "suggestions": result.response.suggested_followups,
         "action": result.response.action,
     }
+    if audio_data is not None:
+        frame["audio_data"] = audio_data
+        if audio_duration_ms is not None:
+            frame["audio_duration_ms"] = audio_duration_ms
     if audio_url:
         frame["audio_url"] = audio_url
+    if audio_mime is not None and (audio_url or audio_data is not None):
         frame["audio_mime"] = audio_mime
     # What actually went out on the wire, audio or not. This is the line that
     # separates "we sent no audio" from "we sent audio and the customer did
     # not hear it" -- the split the reply-frame layer is the only place that
-    # can answer, since synthesis succeeding does not prove the url shipped.
+    # can answer, since synthesis succeeding does not prove the url (or the
+    # inline copy) shipped. has_audio covers EITHER form of audio going out,
+    # not just the url, since the inline copy is now independently possible.
+    # audio_data itself is never logged (see this module's "never log audio
+    # bytes" rule) -- only its encoded length, which is diagnostic enough to
+    # tell "no inline copy went out" from "one did, some other size than
+    # expected" without putting a base64 blob in the logs.
     debug_event(log, "chat_reply_frame_sent",
-                session_id=session_id, has_audio=bool(audio_url),
+                session_id=session_id, has_audio=bool(audio_url or audio_data),
                 audio_url=audio_url, audio_mime=audio_mime,
+                audio_duration_ms=audio_duration_ms,
+                audio_data_b64_chars=(len(audio_data) if audio_data else 0),
                 action=result.response.action,
                 text_chars=len(result.response.response_text or ""))
     frames = [frame]

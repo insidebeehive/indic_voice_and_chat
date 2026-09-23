@@ -131,7 +131,7 @@ Accepted content types per frame type:
 | Frame | Shape | Meaning |
 |---|---|---|
 | `typing` | `{"type":"typing"}` | turn accepted, reply coming — sent once when a turn starts (treat as idempotent; any other frame clears it) |
-| `message` | `{"type":"message","session_id":...,"text":...,"sources":[...],"suggestions":[...],"action":...}` | the AI reply. May instead be an *interim* wait message — see below. May carry `audio_url`/`audio_mime` — see "Voice-note replies" below |
+| `message` | `{"type":"message","session_id":...,"text":...,"sources":[...],"suggestions":[...],"action":...}` | the AI reply. May instead be an *interim* wait message — see below. May carry `audio_data`/`audio_mime`/`audio_url`/`audio_duration_ms` — see "Voice-note replies" below |
 | `audio_ack` | `{"type":"audio_ack","media_url":"/api/v1/chat/media/<id>"}` | voice note stored; URL serves the recording for transcript UIs |
 | `escalation` | `{"type":"escalation","reason":...,"context_summary":...}` | conversation escalated to a human |
 | `call_offer` | `{"type":"call_offer","reason":...,"call_url":...}` | AI offered a voice call; `call_url` is the WS the browser dials |
@@ -158,7 +158,8 @@ flag to distinguish these from the real reply.
 ### Voice-note replies
 
 When the customer's turn was itself a voice note (`type:"audio"`), the AI's
-reply `message` frame MAY carry two additional optional fields:
+reply `message` frame MAY carry additional optional fields, with the audio
+delivered inline as base64 on the same frame:
 
 ```json
 {
@@ -169,40 +170,75 @@ reply `message` frame MAY carry two additional optional fields:
   "suggestions": [],
   "action": "none",
   "audio_url": "/api/v1/chat/media/<id>",
-  "audio_mime": "audio/wav"
+  "audio_data": "<raw base64 MP3>",
+  "audio_mime": "audio/mpeg",
+  "audio_duration_ms": 11840
 }
 ```
 
 - **`text` is always present and always the full answer**, exactly as on any
-  other turn. `audio_url`/`audio_mime` are additive fields on the existing
-  `message` frame, not a new frame type: a relay/widget that doesn't
-  recognize them ignores them (unknown JSON fields are safe to ignore) and
-  renders the text bubble exactly as before; an updated client also plays
-  the clip. A genuinely new frame type would need every existing
+  other turn — audio never replaces it. The audio fields are additive fields
+  on the existing `message` frame, not a new frame type: a relay/widget that
+  doesn't recognize them ignores them (unknown JSON fields are safe to
+  ignore) and renders the text bubble exactly as before; an updated client
+  also plays the clip. A genuinely new frame type would need every existing
   integration to add a case for it before it did anything at all — adding
   fields to a frame type they already handle needs no such rollout.
 - **Only inbound `audio` turns can produce these fields.** A `type:"message"`
   (text) turn never gets a synthesized reply — the AI mirrors whatever
   modality the customer used.
-- **Never guaranteed even on an audio turn.** The dominant reason is opt-in:
-  `pipeline.chat_voice.enabled` defaults to **false** per tenant, so most
-  tenants never synthesize a reply at all regardless of what the customer
-  sends — this is deliberate (TTS is billed per reply) and not a bug to
-  chase. When a tenant has opted in, synthesis is also skipped server-side
-  for an empty or unusually long reply, and best-effort everywhere else — no
-  resolvable chat TTS provider for the tenant (neither a chat-specific
-  override nor its call-cascade TTS), a synthesis timeout, or any provider
-  error all silently fall back to text-only. Treat `audio_url` as "sometimes
-  there," never as something to wait for.
-- `audio_url` is a `GET /api/v1/chat/media/{message_id}` link — same
-  endpoint and auth rules `audio_ack` already uses (302 to a short-lived
-  signed URL).
-- **`audio_mime` is always `audio/wav`** — the platform's TTS providers only
-  ever produce raw PCM16 mono, which the platform wraps in a WAV container
-  before upload so any standard `<audio>` element can play it directly (no
-  client-side transcode). The synthesized reply text is capped short enough
-  server-side that the resulting WAV file stays comfortably under the 1 MB
-  limit described above.
+- **Never guaranteed even on an audio turn.** No audio is produced at all
+  when any of the following apply:
+  - the tenant hasn't opted in — `pipeline.chat_voice.enabled` defaults to
+    **false** per tenant, and this is the dominant reason: TTS is billed
+    per reply, so most tenants never synthesize a reply regardless of what
+    the customer sends. Deliberate, not a bug to chase.
+  - the tenant has opted in, but there's no resolvable chat TTS provider
+    configured for it
+  - the reply text is empty, or exceeds the server-side length cap
+  - synthesis times out
+  - the TTS provider returns an error
+
+  Any of these falls back to text-only, silently. All audio fields are
+  omitted entirely when there's no clip — never sent as `null` — so a
+  non-audio turn's frame is byte-for-byte unchanged and a relay should test
+  with `if (msg.audio_data)`, never wait for it.
+- **`audio_data` is sent whenever synthesis succeeds**, independent of
+  media storage and independent of whether the message row has persisted
+  yet. It's raw, standard base64 of the MP3 bytes — padded, no `data:`
+  prefix, no line breaks. Decode and play directly; there's no network
+  round trip. This is the reliable field — build against it.
+- **`audio_url` is sent only when the clip also uploaded to media storage
+  and the message row persisted.** It is not a fallback for `audio_data`,
+  nor is `audio_data` a fallback for it — the two come from separate steps
+  (synthesis vs. storage + persistence), and the storage step can fail or
+  lag behind synthesis. So a frame can carry `audio_data` with `audio_url`
+  absent; it does not happen the other way around. When present, `audio_url`
+  works as before: `GET /api/v1/chat/media/{message_id}`, same endpoint and
+  auth rules `audio_ack` already uses (bearer token or `?session_id=`, 302
+  to a short-lived signed URL) — useful for a client that would rather
+  stream or store the clip than hold it in memory.
+- **`audio_mime` is authoritative — read it from the frame, never assume a
+  format.** The normal encoding is MPEG Layer III (MP3), mono, 16 kHz,
+  ~32 kbps, with `audio_mime: "audio/mpeg"`. Ops can switch the reply
+  format to WAV mid-incident; when that happens `audio_mime` is
+  `"audio/wav"` and `audio_data` is WAV bytes instead. A consumer that
+  hardcodes `audio/mpeg` (or a `.mp3` extension) breaks the moment that
+  switch is made — always branch on `audio_mime`, never assume it.
+- **Size, for the normal MP3 path:** a typical ~12s reply is ~48 KB decoded
+  MP3, ~64 KB as the base64 string carried in `audio_data`. Worst case, at
+  the server's default reply-length cap (~25s of speech), is ~100 KB
+  decoded, ~134 KB as base64. The worst case comes from that reply-length
+  cap, not from a protocol limit — a practical bound, not a guarantee.
+  **Size a buffer or frame limit against 256 KB for the base64 string.**
+- `audio_duration_ms` is the clip length in milliseconds, for a progress bar
+  or scrubber — no need to read it out of the file yourself.
+- **Migration note:** the bytes behind `audio_url` are MP3 by default now —
+  not WAV. `audio_mime` on the same frame (`audio/mpeg`) confirms it.
+  Anything that hardcoded a `.wav` extension or assumed `audio/wav` for
+  that URL needs updating on this release.
+- Storage and retention of the inline clip (`audio_data`) are the
+  consumer's own responsibility once delivered.
 
 An `error` frame never closes the socket. Treat it as per-message failure,
 not a connection failure. `reason` is machine-readable, for relays that want
