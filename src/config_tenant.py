@@ -507,6 +507,30 @@ class TenantWhatsAppConfig(BaseModel):
     token_env: Optional[str] = None
 
 
+_CHAT_IDLE_TIMEOUT_DEFAULT_S = 300
+
+
+def _default_chat_idle_timeout_seconds() -> int:
+    """Platform default for ``chat_idle_timeout_seconds``, from the
+    ``CHAT_IDLE_TIMEOUT_SECONDS`` env var. A tenant that sets its own value
+    in ``chat_support`` overrides this. Unset, non-integer or negative values
+    fall back to 300 rather than failing tenant load."""
+    raw = os.environ.get("CHAT_IDLE_TIMEOUT_SECONDS")
+    if raw is None or raw.strip() == "":
+        return _CHAT_IDLE_TIMEOUT_DEFAULT_S
+    try:
+        value = int(raw)
+    except ValueError:
+        log.warning("CHAT_IDLE_TIMEOUT_SECONDS=%r is not an integer; using %ds",
+                    raw, _CHAT_IDLE_TIMEOUT_DEFAULT_S)
+        return _CHAT_IDLE_TIMEOUT_DEFAULT_S
+    if value < 0:
+        log.warning("CHAT_IDLE_TIMEOUT_SECONDS=%d is negative; using %ds",
+                    value, _CHAT_IDLE_TIMEOUT_DEFAULT_S)
+        return _CHAT_IDLE_TIMEOUT_DEFAULT_S
+    return value
+
+
 class ChatSupportConfig(BaseModel):
     """BO (back-office) handover settings for the chat module."""
     support_timezone: str = "Asia/Kolkata"
@@ -514,8 +538,9 @@ class ChatSupportConfig(BaseModel):
     # Absent key = closed that day. Empty dict = check disabled (always available).
     support_hours: dict = Field(default_factory=dict)
     # Seconds of customer silence before the AI chat auto-closes and fires
-    # session_closed to the CRM. 0 disables the timeout entirely.
-    chat_idle_timeout_seconds: int = 300
+    # session_closed to the CRM. 0 disables the timeout entirely. Defaults to
+    # the CHAT_IDLE_TIMEOUT_SECONDS env var (300 when unset).
+    chat_idle_timeout_seconds: int = Field(default_factory=_default_chat_idle_timeout_seconds)
 
 
 class DepositVerificationConfig(BaseModel):

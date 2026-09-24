@@ -675,3 +675,40 @@ def test_chat_voice_survives_pipeline_config_round_trip() -> None:
     rebuilt = TenantPipelineConfig(**pc)
     assert rebuilt.chat_voice.enabled is True
     assert rebuilt.chat_voice.tts.provider == "google"
+
+
+# --- Chat idle timeout ----------------------------------------------------
+
+
+def test_chat_idle_timeout_defaults_to_300_without_env(monkeypatch) -> None:
+    from src.config_tenant import ChatSupportConfig
+    monkeypatch.delenv("CHAT_IDLE_TIMEOUT_SECONDS", raising=False)
+    assert ChatSupportConfig().chat_idle_timeout_seconds == 300
+
+
+def test_chat_idle_timeout_reads_env(monkeypatch) -> None:
+    from src.config_tenant import ChatSupportConfig
+    monkeypatch.setenv("CHAT_IDLE_TIMEOUT_SECONDS", "900")
+    assert ChatSupportConfig().chat_idle_timeout_seconds == 900
+
+
+def test_chat_idle_timeout_env_zero_disables(monkeypatch) -> None:
+    from src.config_tenant import ChatSupportConfig
+    monkeypatch.setenv("CHAT_IDLE_TIMEOUT_SECONDS", "0")
+    assert ChatSupportConfig().chat_idle_timeout_seconds == 0
+
+
+@pytest.mark.parametrize("raw", ["", "  ", "abc", "5m", "-60"])
+def test_chat_idle_timeout_bad_env_falls_back_to_300(monkeypatch, raw) -> None:
+    """A bad value must not fail tenant load: every tenant's config builds
+    a ChatSupportConfig, so raising here would take chat down platform-wide."""
+    from src.config_tenant import ChatSupportConfig
+    monkeypatch.setenv("CHAT_IDLE_TIMEOUT_SECONDS", raw)
+    assert ChatSupportConfig().chat_idle_timeout_seconds == 300
+
+
+def test_chat_idle_timeout_tenant_value_overrides_env(monkeypatch) -> None:
+    from src.config_tenant import ChatSupportConfig
+    monkeypatch.setenv("CHAT_IDLE_TIMEOUT_SECONDS", "900")
+    assert ChatSupportConfig(chat_idle_timeout_seconds=120).chat_idle_timeout_seconds == 120
+    assert ChatSupportConfig(**{"chat_idle_timeout_seconds": 0}).chat_idle_timeout_seconds == 0
