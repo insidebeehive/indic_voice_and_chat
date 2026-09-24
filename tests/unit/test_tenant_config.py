@@ -479,6 +479,53 @@ def test_validate_credentials_raises_when_webconsole_s2s_without_realtime() -> N
     assert "auth_token_env" not in str(exc.value)
 
 
+def test_validate_credentials_passes_none_provider_with_chat_voice() -> None:
+    """POST /tenants registers a tenant without telephony as provider="none".
+    Such a tenant enabling chat voice replies must not be rejected over
+    telephony credentials: "none" has no adapter, so there is nothing to fall
+    back to platform credentials from."""
+    from src.config_tenant import (
+        ChatVoiceConfig, TenantPipelineConfig, TenantTTSConfig, TenantTelephonyConfig,
+    )
+    t = TenantSettings(
+        id="t1", slug="t1", name="T1",
+        pipeline=TenantPipelineConfig(
+            telephony=TenantTelephonyConfig(provider="none"),
+            chat_voice=ChatVoiceConfig(enabled=True, tts=TenantTTSConfig(provider="google")),
+        ),
+    )
+    validate_credentials(t)
+
+
+def test_register_tenant_default_telephony_provider_is_credential_free() -> None:
+    """Whatever POST /tenants writes by default must pass the credential
+    check, or every tenant registered without telephony is locked out of
+    any later PATCH (which validates the whole prospective config)."""
+    from src.api.tenants import RegisterTenantRequest
+    from src.config_tenant import TenantPipelineConfig, TenantTelephonyConfig
+    default_provider = RegisterTenantRequest(name="X").telephony.provider
+    t = TenantSettings(
+        id="t1", slug="t1", name="T1",
+        pipeline=TenantPipelineConfig(
+            telephony=TenantTelephonyConfig(provider=default_provider),
+        ),
+    )
+    validate_credentials(t)
+
+
+def test_validate_credentials_still_raises_for_real_provider_without_creds() -> None:
+    """The exemption must not swallow real providers."""
+    from src.config_tenant import TenantPipelineConfig, TenantTelephonyConfig
+    t = TenantSettings(
+        id="t1", slug="t1", name="T1",
+        pipeline=TenantPipelineConfig(
+            telephony=TenantTelephonyConfig(provider="twilio"),
+        ),
+    )
+    with pytest.raises(TenantConfigError, match="account_sid_env"):
+        validate_credentials(t)
+
+
 # --- Chat voice replies --------------------------------------------------
 
 

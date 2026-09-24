@@ -210,7 +210,12 @@ class TelephonyCreds(BaseModel):
 # can still reach a real adapter with unset creds. Case-insensitive match
 # against provider, consistent with how src/api/calls.py and creds_for()
 # normalize the provider string.
-CREDENTIAL_FREE_TELEPHONY_PROVIDERS = frozenset({"webconsole"})
+#
+# "none" is what POST /tenants writes for a tenant registered without telephony
+# (RegisterTenantRequest's default in src/api/tenants.py). It is not in
+# TELEPHONY_PROVIDERS either, so building an adapter for it raises
+# UnknownProviderError rather than falling back to platform credentials.
+CREDENTIAL_FREE_TELEPHONY_PROVIDERS = frozenset({"webconsole", "none"})
 
 
 class TenantTelephonyConfig(BaseModel):
