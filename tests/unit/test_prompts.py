@@ -135,10 +135,24 @@ def test_chatbot_prompt_has_scope_guardrails() -> None:
     assert "OPERATOR/PLATFORM" in prompt
     # agent IS the support — should never defer to an external team.
     assert "YOU are the support" in prompt
-    # off-topic handling is still SCOPE item 4 (responds warmly, then redirects);
-    # DEPTH-MATCHING is a separate, added section reinforcing not overengaging on it.
+    # off-topic handling is SCOPE item 4 (declines, then redirects); DEPTH-MATCHING
+    # points standalone deliverables back to it rather than licensing a trimmed one.
     assert "DEPTH-MATCHING" in prompt
     assert "standalone deliverable outside your job" in prompt
+
+
+def test_chatbot_prompt_scope4_declines_off_topic_requests() -> None:
+    """SCOPE-4 declines content generation and general-knowledge requests.
+    Pins the three parts most likely to be softened later: the decline itself,
+    skipping tool calls for it (a KB round roughly doubles the turn's cost),
+    and the carve-out that keeps a customer in distress from being deflected."""
+    for pack in ("betting", "generic"):
+        prompt = build_chatbot_system_prompt(company_name="Acme", prompt_pack=pack)
+        assert "you are not a general assistant" in prompt
+        assert "without calling any tool" in prompt
+        assert "never deflected" in prompt
+        assert "quick general question" not in prompt
+        assert "is SCOPE-4: decline it there" in prompt
 
 
 def test_chatbot_prompt_operator_scope_branches_on_tool_registration() -> None:
