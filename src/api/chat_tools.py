@@ -13,7 +13,7 @@ chat_tools row, never returned by the API).
 from __future__ import annotations
 
 import logging
-from typing import Optional
+from typing import Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Path
 from pydantic import BaseModel, Field
@@ -81,9 +81,14 @@ class ResolvedToolInfo(BaseModel):
     auth_type: Optional[str]
     token_configured: bool  # never expose the actual token value
     x_api_key_configured: bool  # never expose the actual x_api_key value
+    kind: Literal["crm", "builtin", "deposit_verification"] = "crm"
 
 
 class ResolvedToolsResponse(BaseModel):
+    # source/crm_id describe the CRM tool source only ("tenant" chat_tools
+    # rows vs. the linked Crm's catalog) — they say nothing about whether
+    # builtin or deposit_verification tools are present; see each
+    # ResolvedToolInfo's own `kind` for that.
     source: str  # "tenant" | "crm_catalog" | "none"
     crm_id: Optional[str] = None  # set only when source == "crm_catalog"
     tools: list[ResolvedToolInfo]
@@ -172,39 +177,83 @@ async def list_tools(
 async def list_resolved_tools(
     tenant: TenantContext = Depends(current_tenant),
 ) -> ResolvedToolsResponse:
-    """The tools this tenant will ACTUALLY get on its next chat turn, computed
-    fresh from the DB/env (bypasses the in-process CRM-tools cache).
+    """The FULL set of tools this tenant will ACTUALLY get on its next chat
+    turn, computed fresh from the DB/env (bypasses the in-process CRM-tools
+    cache) — not just the CRM ones.
 
-    Unlike ``GET /tools`` — which only reads the tenant's own registered
-    ``chat_tools`` rows — this reflects the full resolution priority:
-    ``"tenant"`` (the tenant's own registered ``chat_tools`` rows) takes
-    precedence, then ``"crm_catalog"`` (the tenant's linked ``Crm`` entity's
-    DB-backed tool catalog, using the tenant's own ``crm:api_token``/
-    ``crm:x_api_key`` secrets for auth), then ``"none"`` if nothing resolves.
-    A tenant with zero DB rows can still be served the linked Crm's full
-    catalog, and that tenant would otherwise see an empty list from
-    ``GET /tools`` with no way to tell the crm_catalog path is active.
+    Returns, in the order the chatbot factory assembles them:
+
+    1. ``kind="builtin"`` — ``BUILTIN_TOOLS`` (search_knowledge_base,
+       escalate_to_human, offer_voice_call), unconditionally present on
+       every tenant's every chat turn (see src/agents/chatbot.py).
+    2. ``kind="crm"`` — this tenant's resolved CRM tools. Unlike
+       ``GET /tools`` — which only reads the tenant's own registered
+       ``chat_tools`` rows — this reflects the full resolution priority:
+       ``"tenant"`` (the tenant's own registered ``chat_tools`` rows) takes
+       precedence, then ``"crm_catalog"`` (the tenant's linked ``Crm``
+       entity's DB-backed tool catalog, using the tenant's own
+       ``crm:api_token``/``crm:x_api_key`` secrets for auth), then
+       ``"none"`` if nothing resolves. A tenant with zero DB rows can still
+       be served the linked Crm's full catalog, and that tenant would
+       otherwise see an empty list from ``GET /tools`` with no way to tell
+       the crm_catalog path is active. ``source``/``crm_id`` on the response
+       describe only this CRM resolution, not the builtin/DV tools below.
+    3. ``kind="deposit_verification"`` — the submit_deposit_verification
+       tool, present exactly when ``deposit_verification_registrable(tenant)``
+       resolves a secret AND a sessionmaker is available, mirroring the
+       chatbot factory's own registration gate (src/bootstrap.py).
     """
-    from src.bootstrap import resolve_crm_tools
+    from src.bootstrap import deposit_verification_registrable, resolve_crm_tools
+    from src.chatbot.tools import BUILTIN_TOOLS, SUBMIT_DEPOSIT_VERIFICATION_TOOL_SPEC
 
     sessionmaker = get_sessionmaker()
     specs, execs, source = await resolve_crm_tools(tenant, sessionmaker)
     crm_id = getattr(tenant.settings, "crm_id", None) if source == "crm_catalog" else None
-    return ResolvedToolsResponse(
-        source=source,
-        crm_id=crm_id,
-        tools=[
-            ResolvedToolInfo(
-                name=s.name,
-                description=s.description,
-                endpoint=execs[s.name]["endpoint"],
-                auth_type=execs[s.name]["auth_type"],
-                token_configured=bool(execs[s.name].get("token")),
-                x_api_key_configured=bool(execs[s.name].get("x_api_key")),
-            )
-            for s in specs
-        ],
+
+    tools: list[ResolvedToolInfo] = [
+        ResolvedToolInfo(
+            name=t.name,
+            description=t.description,
+            endpoint="",
+            auth_type=None,
+            token_configured=False,
+            x_api_key_configured=False,
+            kind="builtin",
+        )
+        for t in BUILTIN_TOOLS
+    ]
+    tools.extend(
+        ResolvedToolInfo(
+            name=s.name,
+            description=s.description,
+            endpoint=execs[s.name]["endpoint"],
+            auth_type=execs[s.name]["auth_type"],
+            token_configured=bool(execs[s.name].get("token")),
+            x_api_key_configured=bool(execs[s.name].get("x_api_key")),
+            kind="crm",
+        )
+        for s in specs
     )
+    dv_secret = deposit_verification_registrable(tenant)
+    if dv_secret and sessionmaker is not None:
+        dv_config = tenant.settings.deposit_verification
+        tools.append(ResolvedToolInfo(
+            name=SUBMIT_DEPOSIT_VERIFICATION_TOOL_SPEC.name,
+            description=SUBMIT_DEPOSIT_VERIFICATION_TOOL_SPEC.description,
+            endpoint=dv_config.webhook_url,
+            # Not bearer/api_key auth on the outbound tool call itself — this
+            # is the HMAC signing secret the inbound verdict callback is
+            # verified against (src/api/deposit_verification.py). "hmac"
+            # here lets callers (e.g. the backoffice UI) tell it apart from
+            # a CRM tool's bearer/api_key auth_type instead of guessing from
+            # `kind` alone.
+            auth_type="hmac",
+            token_configured=True,
+            x_api_key_configured=False,
+            kind="deposit_verification",
+        ))
+
+    return ResolvedToolsResponse(source=source, crm_id=crm_id, tools=tools)
 
 
 @router.delete("/tools/{tool_name}")

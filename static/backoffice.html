@@ -1343,29 +1343,47 @@ async function loadChat(id, slug) {
   const resolved = rr.ok ? rr.json : null;
   const resolvedTools = resolved ? (resolved.tools || []) : [];
   const resolvedSource = resolved ? resolved.source : null;
-
+  // BUILTIN_TOOLS are unconditionally present on every tenant, every turn —
+  // resolvedTools.length is never a meaningful "nothing active" signal
+  // anymore. source/crm_id (and this hint) describe the CRM resolution only,
+  // so "no tools" here means "no CRM tools". The hint below is the only
+  // place that says so — the table itself only shows "No tools active" in
+  // the (currently impossible, since BUILTIN_TOOLS are unconditional) case
+  // of an empty resolvedTools list, to avoid saying "no CRM tools" twice.
   const resolvedHint = !resolved
     ? "Could not load active tools."
     : resolvedSource === "tenant"
       ? "Using this tenant's own registered tools (below)."
       : resolvedSource === "crm_catalog"
         ? "Using the linked CRM's tool catalog — no tenant-specific tools registered."
-        : "No tools active — no tenant registration and no CRM linked (link a CRM in the CRM tab, or configure this tenant's own CRM credentials there).";
+        : "No CRM tools active — no tenant registration and no CRM linked (link a CRM in the CRM tab, or configure this tenant's own CRM credentials there).";
+
+  const kindLabel = (k) => k === "builtin" ? "builtin" : k === "deposit_verification" ? "deposit verification" : "CRM";
+  // DV's "auth" isn't on the outbound tool call — it's the HMAC secret the
+  // inbound verdict callback is verified against (src/api/deposit_verification.py).
+  // Labeling it plainly as "bearer"/"—" alongside CRM tools' real auth_type
+  // would make "Token configured" look like the same kind of check for both,
+  // when for DV it specifically means "the HMAC signing secret resolved".
+  const authTypeLabel = (t) => t.kind === "deposit_verification" ? "HMAC-signed webhook" : escT(t.auth_type || "—");
+  const tokenLabel = (t) => t.kind === "builtin" ? "—"
+    : t.kind === "deposit_verification" ? (t.token_configured ? "secret ✓" : "secret —")
+      : (t.token_configured ? "✓" : "—");
 
   const resolvedRows = resolvedTools.length
     ? resolvedTools.map(t => `<tr>
         <td>${escT(t.name)}</td>
-        <td style="max-width:22rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escAttr(t.endpoint)}">${escT(t.endpoint)}</td>
-        <td>${escT(t.auth_type || "—")}</td>
-        <td>${t.token_configured ? "✓" : "—"}</td>
+        <td>${escT(kindLabel(t.kind))}</td>
+        <td style="max-width:22rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escAttr(t.endpoint)}">${t.kind === "builtin" ? "—" : escT(t.endpoint || "—")}</td>
+        <td>${authTypeLabel(t)}</td>
+        <td>${tokenLabel(t)}</td>
       </tr>`).join("")
-    : `<tr><td colspan="4" class="hint">No tools active.</td></tr>`;
+    : `<tr><td colspan="5" class="hint">No tools active.</td></tr>`;
 
   $("pane_chat").innerHTML = `
     <h2>Active tools <small class="hint">(what this tenant actually gets right now)</small></h2>
     <div class="hint" style="margin-bottom:.4rem;">${escT(resolvedHint)}</div>
     <table style="margin-bottom:1.2rem;">
-      <thead><tr><th>Name</th><th>Endpoint</th><th>Auth type</th><th>Token configured</th></tr></thead>
+      <thead><tr><th>Name</th><th>Kind</th><th>Endpoint</th><th>Auth type</th><th>Token configured</th></tr></thead>
       <tbody id="ch_resolved_rows">${resolvedRows}</tbody>
     </table>
 

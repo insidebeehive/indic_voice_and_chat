@@ -11,6 +11,7 @@ served on its next chat turn.
 from __future__ import annotations
 
 import re
+from types import SimpleNamespace
 
 import pytest_asyncio
 from fastapi import FastAPI
@@ -22,9 +23,10 @@ from src.api.deps import get_db_session
 from src.auth import TenantContext, register_tenant_for_test
 from src.auth import secrets as crypto
 from src.auth.middleware import set_tenant_resolver
-from src.bootstrap import resolve_crm_tools
+from src.bootstrap import make_chatbot_factory, resolve_crm_tools
 from src.chatbot.catalog import ALL_TOOLS, OPERATOR_TOOLS, PLAYER_TOOLS
-from src.config_tenant import TenantSettings
+from src.chatbot.tools import SUBMIT_DEPOSIT_VERIFICATION
+from src.config_tenant import DepositVerificationConfig, TenantSettings
 from src.models.chat import ChatTool
 from src.models.database import Base
 from src.models.tenant import Tenant, TenantSecret
@@ -107,12 +109,175 @@ async def test_tenant_registered_tools_reported_as_source_tenant(ctx) -> None:
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["source"] == "tenant"
-    assert len(body["tools"]) == 1
-    t = body["tools"][0]
+    crm_tools = [t for t in body["tools"] if t["kind"] == "crm"]
+    assert len(crm_tools) == 1
+    t = crm_tools[0]
     assert t["name"] == "check_order_status"
     assert t["endpoint"] == _TOOL["endpoint"]
     assert t["auth_type"] == "bearer"
     assert t["token_configured"] is True
+
+
+async def test_builtin_tools_always_present_even_with_no_crm_source(ctx) -> None:
+    # Asserted against the literal name set, not BUILTIN_TOOLS itself — a
+    # comparison against a copy of the same source the endpoint reads from
+    # would pass even if both were wrong together (e.g. a tool silently
+    # dropped from BUILTIN_TOOLS). These three are unconditionally added by
+    # the chatbot factory (src/agents/chatbot.py) regardless of CRM
+    # resolution — the resolved endpoint must report them even when nothing
+    # else resolves (source == "none").
+    client, _sm = ctx
+    resp = await client.get("/chat/tools/resolved")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["source"] == "none"
+    builtin = [t for t in body["tools"] if t["kind"] == "builtin"]
+    assert {t["name"] for t in builtin} == {
+        "search_knowledge_base", "escalate_to_human", "offer_voice_call",
+    }
+    assert all(t["endpoint"] == "" for t in builtin)
+    assert all(t["auth_type"] is None for t in builtin)
+    assert all(t["token_configured"] is False for t in builtin)
+    assert all(t["x_api_key_configured"] is False for t in builtin)
+
+
+async def test_crm_tools_reported_with_kind_crm(ctx) -> None:
+    client, _sm = ctx
+    await client.post("/chat/tools", json={"tools": [_TOOL]})
+
+    resp = await client.get("/chat/tools/resolved")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    crm_tools = [t for t in body["tools"] if t["name"] == "check_order_status"]
+    assert len(crm_tools) == 1
+    assert crm_tools[0]["kind"] == "crm"
+
+
+_DV_WEBHOOK_URL = "https://vendor.example.com/verify"
+_DV_SECRET_ENV = "DV_WEBHOOK_SECRET"
+
+
+def _dv_config(**overrides) -> DepositVerificationConfig:
+    defaults = dict(
+        enabled=True, webhook_url=_DV_WEBHOOK_URL,
+        webhook_secret_env=_DV_SECRET_ENV, timeout_minutes=5,
+    )
+    defaults.update(overrides)
+    return DepositVerificationConfig(**defaults)
+
+
+async def test_deposit_verification_tool_present_when_registrable(ctx) -> None:
+    client, _sm = ctx
+    register_tenant_for_test(
+        TenantSettings(id="t1", slug="t1", name="T1", deposit_verification=_dv_config()),
+        plaintext_tokens=["test-token"], secrets={_DV_SECRET_ENV: "s3cr3t"},
+    )
+
+    resp = await client.get("/chat/tools/resolved")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    dv = [t for t in body["tools"] if t["kind"] == "deposit_verification"]
+    assert len(dv) == 1
+    assert dv[0]["name"] == SUBMIT_DEPOSIT_VERIFICATION
+    assert dv[0]["endpoint"] == _DV_WEBHOOK_URL
+    assert dv[0]["token_configured"] is True
+    assert dv[0]["x_api_key_configured"] is False
+
+
+async def test_deposit_verification_tool_absent_when_secret_unresolvable(ctx) -> None:
+    client, _sm = ctx
+    # webhook_secret_env is set but no such secret was ever provisioned for
+    # this tenant — mirrors the factory's own registration gate, which must
+    # never offer the LLM a flow whose verdict callback can't be verified.
+    register_tenant_for_test(
+        TenantSettings(id="t1", slug="t1", name="T1", deposit_verification=_dv_config()),
+        plaintext_tokens=["test-token"],
+    )
+
+    resp = await client.get("/chat/tools/resolved")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert not any(t["kind"] == "deposit_verification" for t in body["tools"])
+
+
+async def test_deposit_verification_tool_absent_when_disabled(ctx) -> None:
+    client, _sm = ctx
+    register_tenant_for_test(
+        TenantSettings(id="t1", slug="t1", name="T1",
+                        deposit_verification=_dv_config(enabled=False)),
+        plaintext_tokens=["test-token"], secrets={_DV_SECRET_ENV: "s3cr3t"},
+    )
+
+    resp = await client.get("/chat/tools/resolved")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert not any(t["kind"] == "deposit_verification" for t in body["tools"])
+
+
+async def test_deposit_verification_tool_absent_when_no_webhook_url(ctx) -> None:
+    # Enabled with a resolvable secret but no webhook_url — the callback has
+    # nowhere to be verified against a vendor for, so the tool must stay
+    # unregistered just like the disabled/unresolvable-secret cases.
+    client, _sm = ctx
+    register_tenant_for_test(
+        TenantSettings(id="t1", slug="t1", name="T1",
+                        deposit_verification=_dv_config(webhook_url=None)),
+        plaintext_tokens=["test-token"], secrets={_DV_SECRET_ENV: "s3cr3t"},
+    )
+
+    resp = await client.get("/chat/tools/resolved")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert not any(t["kind"] == "deposit_verification" for t in body["tools"])
+
+
+async def test_resolved_tools_ordered_builtin_then_crm_then_dv(ctx) -> None:
+    client, _sm = ctx
+    await client.post("/chat/tools", json={"tools": [_TOOL]})
+    register_tenant_for_test(
+        TenantSettings(id="t1", slug="t1", name="T1", deposit_verification=_dv_config()),
+        plaintext_tokens=["test-token"], secrets={_DV_SECRET_ENV: "s3cr3t"},
+    )
+
+    resp = await client.get("/chat/tools/resolved")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    kinds = [t["kind"] for t in body["tools"]]
+    assert kinds == ["builtin", "builtin", "builtin", "crm", "deposit_verification"]
+
+
+async def test_endpoint_and_factory_agree_on_non_builtin_tool_names(ctx) -> None:
+    # The endpoint must report exactly the non-builtin tools
+    # make_chatbot_factory would actually hand the LLM this turn — resolved
+    # independently here (by driving the factory itself, the same way
+    # tests/unit/test_deposit_verification_executor.py does), not by
+    # re-deriving the expected set from the endpoint's own code path, so a
+    # bug in the endpoint's assembly (wrong gate, missed tool, stale cache)
+    # would actually be caught instead of validated against itself.
+    client, sm = ctx
+    await client.post("/chat/tools", json={"tools": [_TOOL]})
+    tenant_ctx = register_tenant_for_test(
+        TenantSettings(id="t1", slug="t1", name="T1", deposit_verification=_dv_config()),
+        plaintext_tokens=["test-token"], secrets={_DV_SECRET_ENV: "s3cr3t"},
+    )
+
+    resp = await client.get("/chat/tools/resolved")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    endpoint_non_builtin = {t["name"] for t in body["tools"] if t["kind"] != "builtin"}
+
+    registry = SimpleNamespace(
+        providers=SimpleNamespace(get_llm=lambda t: object(), get_platform_llm=lambda: object()),
+        retrievers=SimpleNamespace(get=lambda t: object()),
+        session_stores=SimpleNamespace(get=lambda t: None),
+        crm_tools=None,
+    )
+    factory = make_chatbot_factory(registry, sm)
+    agent = await factory(tenant_ctx, "s1")
+    factory_non_builtin = {t.name for t in agent._crm_tools}
+
+    assert endpoint_non_builtin == factory_non_builtin
+    assert endpoint_non_builtin == {"check_order_status", SUBMIT_DEPOSIT_VERIFICATION}
 
 
 async def test_platform_fallback_ignores_configured_platform_token(ctx, monkeypatch) -> None:
@@ -133,8 +298,9 @@ async def test_platform_fallback_ignores_configured_platform_token(ctx, monkeypa
     body = resp.json()
     assert body["source"] == "crm_catalog"
     assert body["crm_id"] == "betstudio"
-    assert len(body["tools"]) == len(ALL_TOOLS)
-    assert {t["name"] for t in body["tools"]} == set(ALL_TOOLS)
+    crm_tools = [t for t in body["tools"] if t["kind"] == "crm"]
+    assert len(crm_tools) == len(ALL_TOOLS)
+    assert {t["name"] for t in crm_tools} == set(ALL_TOOLS)
     assert all(t["token_configured"] is False for t in body["tools"])
 
 
@@ -150,7 +316,8 @@ async def test_platform_fallback_without_token_reports_not_configured(ctx, monke
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["source"] == "crm_catalog"
-    assert len(body["tools"]) == len(ALL_TOOLS)
+    crm_tools = [t for t in body["tools"] if t["kind"] == "crm"]
+    assert len(crm_tools) == len(ALL_TOOLS)
     assert all(t["token_configured"] is False for t in body["tools"])
 
 
@@ -169,20 +336,25 @@ async def test_x_api_key_configured_reported_independently_of_token(ctx, monkeyp
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["source"] == "crm_catalog"
+    crm_tools = [t for t in body["tools"] if t["kind"] == "crm"]
+    assert len(crm_tools) == len(ALL_TOOLS)
     # token_configured stays False (no crm:api_token set) while
     # x_api_key_configured is True — the two are independent.
     assert all(t["token_configured"] is False for t in body["tools"])
-    assert all(t["x_api_key_configured"] is True for t in body["tools"])
+    assert all(t["x_api_key_configured"] is True for t in crm_tools)
 
 
 async def test_nothing_configured_gives_empty_none_source(ctx) -> None:
     client, _sm = ctx
-    # No chat_tools rows, no PLATFORM_CRM_* env, no tenant crm:* secrets.
+    # No chat_tools rows, no PLATFORM_CRM_* env, no tenant crm:* secrets —
+    # BUILTIN_TOOLS are still always present (see
+    # test_builtin_tools_always_present_even_with_no_crm_source), so "nothing
+    # configured" means no CRM tools, not an empty tools list.
     resp = await client.get("/chat/tools/resolved")
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["source"] == "none"
-    assert body["tools"] == []
+    assert [t for t in body["tools"] if t["kind"] == "crm"] == []
 
 
 async def test_resolved_endpoint_requires_auth(ctx) -> None:

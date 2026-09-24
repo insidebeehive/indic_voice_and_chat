@@ -560,6 +560,30 @@ async def resolve_crm_tools(
     return specs, execs, "crm_catalog"
 
 
+def deposit_verification_registrable(tenant: TenantContext) -> Optional[str]:
+    """Whether this tenant's deposit_verification tool would be registered by
+    ``make_chatbot_factory`` (ignoring the sessionmaker check, which the
+    factory applies separately) — and, if so, the resolved webhook secret.
+
+    Returns the secret string when dv_config is enabled, has a webhook_url,
+    AND the signing secret resolves; ``None`` otherwise (not configured,
+    disabled, no webhook_url, or an unresolvable secret).
+
+    A resolvable signing secret is REQUIRED, not optional: the inbound
+    verdict callback (src/api/deposit_verification.py) rejects any callback
+    it can't HMAC-verify with 401, and treats a missing secret as a
+    verification failure rather than "unsigned is fine". Registering the
+    tool without one would offer the LLM a flow whose verdict can never come
+    back — every request would sit pending until it timed out and escalated,
+    looking like an unresponsive vendor rather than the misconfiguration it
+    actually is.
+    """
+    dv_config = getattr(tenant.settings, "deposit_verification", None)
+    if dv_config is None or not dv_config.enabled or not dv_config.webhook_url:
+        return None
+    return tenant.secret_optional(dv_config.webhook_secret_env)
+
+
 def _prompt_cache_split_enabled(llm: object) -> bool:
     """True when the chat prompt should be split into a cacheable static body
     plus a per-turn tail folded into the user turn (see ChatBotAgent's
@@ -681,25 +705,12 @@ def make_chatbot_factory(registry, sessionmaker=None, crm_retrievers: "PerCrmRet
         tool_specs = list(crm_specs)
         dv_config = getattr(tenant.settings, "deposit_verification", None)
         deposit_verification_executor = None
-        # A resolvable signing secret is REQUIRED, not optional: the inbound
-        # verdict callback (src/api/deposit_verification.py) rejects any
-        # callback it can't HMAC-verify with 401, and treats a missing secret
-        # as a verification failure rather than "unsigned is fine". Registering
-        # the tool without one would offer the LLM a flow whose verdict can
-        # never come back — every request would sit pending until it timed out
-        # and escalated, looking like an unresponsive vendor rather than the
-        # misconfiguration it actually is.
-        dv_secret = (
-            tenant.secret_optional(dv_config.webhook_secret_env)
-            if dv_config is not None else None
-        )
-        if (
-            dv_config is not None
-            and dv_config.enabled
-            and dv_config.webhook_url
-            and dv_secret
-            and sessionmaker is not None
-        ):
+        # See deposit_verification_registrable's docstring for why a
+        # resolvable signing secret is REQUIRED, not optional, for
+        # registration. sessionmaker is checked here (not in the helper)
+        # since it's a factory-construction concern, not a per-tenant one.
+        dv_secret = deposit_verification_registrable(tenant)
+        if dv_secret and sessionmaker is not None:
             tool_specs.append(SUBMIT_DEPOSIT_VERIFICATION_TOOL_SPEC)
             debug_event(
                 log, "chatbot_factory deposit_verification tool_registered",
@@ -753,7 +764,15 @@ def make_chatbot_factory(registry, sessionmaker=None, crm_retrievers: "PerCrmRet
                 configured=dv_config is not None,
                 enabled=getattr(dv_config, "enabled", None),
                 webhook_url_set=bool(getattr(dv_config, "webhook_url", None)),
-                secret_resolved=bool(dv_secret),
+                # dv_secret (used to gate registration above) is None
+                # whenever dv_config is disabled or lacks a webhook_url, even
+                # if a secret IS provisioned — so it can't answer "did the
+                # secret resolve" on its own. Compute that independently here
+                # so this field keeps its original meaning regardless of why
+                # the tool was skipped.
+                secret_resolved=bool(
+                    dv_config is not None and tenant.secret_optional(dv_config.webhook_secret_env)
+                ),
                 sessionmaker_available=sessionmaker is not None,
             )
 

@@ -66,8 +66,9 @@ BUILTIN_TOOLS: list[ToolSpec] = [
 ]
 
 # Not in BUILTIN_TOOLS: only registered per-tenant, when the tenant has
-# deposit_verification enabled and a webhook_url configured (see
-# src/bootstrap.py's make_chatbot_factory).
+# deposit_verification enabled, a webhook_url configured and a resolvable
+# webhook signing secret (see src/bootstrap.py's
+# deposit_verification_registrable and make_chatbot_factory).
 #
 # order_id vs. external_transaction_id: nothing at runtime signals back "the
 # vendor rejected order_id" (the webhook ack is fire-and-forget — see

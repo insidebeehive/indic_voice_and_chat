@@ -133,11 +133,22 @@ CRM tools:
   `method`, `auth_type`, `auth_token`, `parameters{name:{type,description,source}}`).
   The token is stored **encrypted** in `tenant_secrets`, never returned.
 - `GET/DELETE /chat/tools[/{name}]`.
-- `GET /chat/tools/resolved` — the tools this tenant will ACTUALLY get on its
-  next chat turn, computed fresh (bypasses the CRM-tools cache): reflects the
-  linked-`Crm`-catalog path too (`source: "crm_catalog"`), not just this
+- `GET /chat/tools/resolved` — the FULL set of tools this tenant will
+  ACTUALLY get on its next chat turn, computed fresh (bypasses the
+  CRM-tools cache): builtin tools, CRM tools, and the deposit-verification
+  tool, in that order. Each entry's `kind` field is `"builtin"`,
+  `"crm"`, or `"deposit_verification"`. Builtin tools
+  (`search_knowledge_base`, `escalate_to_human`, `offer_voice_call`) are
+  unconditionally present on every tenant's every turn. CRM tools reflect
+  the linked-`Crm`-catalog path too (`source: "crm_catalog"`), not just this
   tenant's own registered `chat_tools` rows (which is all `GET /chat/tools`
-  sees).
+  sees) — `source`/`crm_id` on the response describe this CRM resolution
+  only, not whether builtin or deposit-verification tools are present. The
+  deposit-verification tool appears exactly when it would be registered by
+  the chatbot factory: DV enabled, a `webhook_url` set, its signing secret
+  resolvable, and a sessionmaker available; its entry reports
+  `auth_type: "hmac"` and `token_configured` reflecting that signing secret,
+  not a bearer/API-key token.
 - **Where the shared catalog lives:** a tenant that isn't running its own
   `chat_tools` gets its tools from the `Crm` entity it's linked to
   (`tenant.settings.crm_id` → `crms`/`crm_tools` DB rows) instead of a
