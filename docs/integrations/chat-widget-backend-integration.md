@@ -317,7 +317,7 @@ Configuring a signing secret (`events_webhook_secret_env`, set via `PATCH /tenan
 ```
 POST <your-events_webhook_url>
 Content-Type: application/json
-X-Signature: sha256=<hmac-hex>   (only if events_webhook_secret_env is configured)
+X-Signature: sha256=<hmac-hex>   (when the tenant's events_webhook_secret_env or the platform EVENTS_WEBHOOK_SECRET is set)
 ```
 
 Body always contains `"event"` plus event-specific fields.
