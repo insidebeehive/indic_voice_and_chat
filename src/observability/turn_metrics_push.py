@@ -57,6 +57,7 @@ from src.utils.redact import redact_url
 log = logging.getLogger(__name__)
 
 _JOB_NAME = "vox_turn_metrics"
+_push_skip_logged = False
 
 # Grouping key: the provider/mode combination a Grafana panel would slice
 # latency by. stt_provider/tts_provider are nullable on the model (e.g. a
@@ -233,10 +234,16 @@ async def aggregate_and_push_turn_metrics(
     a periodic background loop and must never affect a live call/turn.
     """
     if not push_url:
-        debug_event(
-            log, "metrics push skipped", job_name=_JOB_NAME,
-            reason="push_url_unset",
-        )
+        # Once per process, not per tick: this runs every push interval, so
+        # logging each skip buries real traffic under a line a minute that
+        # never changes until the process restarts with a push_url.
+        global _push_skip_logged
+        if not _push_skip_logged:
+            _push_skip_logged = True
+            debug_event(
+                log, "metrics push skipped", job_name=_JOB_NAME,
+                reason="push_url_unset", logged_once=True,
+            )
         return 0
 
     try:

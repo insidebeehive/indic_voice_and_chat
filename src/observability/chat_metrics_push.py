@@ -69,6 +69,7 @@ log = logging.getLogger(__name__)
 # sharing would be actively wrong (a Pushgateway PUT replaces the whole
 # job/group's prior state).
 _JOB_NAME = "vox_chat_turn_metrics"
+_push_skip_logged = False
 
 # Own instance, deliberately separate from turn_metrics_push.py's module-level
 # warner -- chat's push failures/recoveries must never silence or re-arm
@@ -269,10 +270,16 @@ async def aggregate_and_push_chat_metrics(
     in the window).
     """
     if not push_url:
-        debug_event(
-            log, "metrics push skipped", job_name=_JOB_NAME,
-            reason="push_url_unset",
-        )
+        # Once per process, not per tick: this runs every push interval, so
+        # logging each skip buries real traffic under a line a minute that
+        # never changes until the process restarts with a push_url.
+        global _push_skip_logged
+        if not _push_skip_logged:
+            _push_skip_logged = True
+            debug_event(
+                log, "metrics push skipped", job_name=_JOB_NAME,
+                reason="push_url_unset", logged_once=True,
+            )
         return 0
 
     try:
