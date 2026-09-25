@@ -935,3 +935,25 @@ def test_chatbot_prompt_before_you_send_precedes_schema() -> None:
     # near the top of the prompt, which is the placement it exists to rule
     # out -- recency is the whole mechanism here.
     assert prompt[start:schema].count("\n\n") == 1
+
+
+def test_chatbot_prompt_tool_use_asks_for_batched_lookups_with_real_cap() -> None:
+    """TOOL USE tells the model to batch independent lookups into one round
+    and states the round cap the agent actually enforces, so the sentence
+    can't drift from ChatBotAgent's max_tool_rounds."""
+    default = build_chatbot_system_prompt(company_name="Acme", prompt_pack="betting")
+    assert "Request every lookup you need for this reply in the same round" in default
+    assert "at most 3 rounds per reply" in default
+    five = build_chatbot_system_prompt(company_name="Acme", prompt_pack="betting", max_tool_rounds=5)
+    assert "at most 5 rounds per reply" in five
+    assert "at most 3 rounds" not in five
+    one = build_chatbot_system_prompt(company_name="Acme", prompt_pack="generic", max_tool_rounds=1)
+    assert "at most 1 round per reply" in one
+
+
+def test_chatbot_agent_passes_its_max_tool_rounds_to_the_prompt() -> None:
+    import inspect
+    from src.agents import chatbot as chatbot_mod
+    src = inspect.getsource(chatbot_mod)
+    # Both build_chatbot_system_prompt call sites (cache-split and plain).
+    assert src.count("max_tool_rounds=self._max_tool_rounds") == 2

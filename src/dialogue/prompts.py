@@ -743,8 +743,14 @@ def build_chatbot_system_prompt(
     tenant_timezone: str = "Asia/Kolkata",
     prompt_pack: str = "generic",
     include_variable_tail: bool = True,
+    max_tool_rounds: int = 3,
 ) -> str:
     """System prompt for the RAG-powered ChatBot agent (Phase 4).
+
+    ``max_tool_rounds`` is the tool-loop cap the agent actually enforces
+    (ChatBotAgent's ``max_tool_rounds``); TOOL USE states it so the model
+    batches independent lookups into one round instead of spending the cap
+    one tool at a time.
 
     ``include_variable_tail`` controls whether the per-turn variable tail
     (retrieved sources, current date/local-time, the per-turn language
@@ -906,7 +912,11 @@ def build_chatbot_system_prompt(
         + pack.CONSEQUENTIAL_ACTION_EXAMPLES
         + "), follow "
         "the DEPTH-MATCHING section below's ask-first sequencing instead of calling a tool "
-        "immediately."
+        "immediately. Request every lookup you need for this reply in the same round — e.g. a "
+        "question that needs the customer's account, their recent transactions and the "
+        f"knowledge base calls all three together, not one after another. You get at most {max_tool_rounds} "
+        f"round{'s' if max_tool_rounds != 1 else ''} per reply; spending them one tool at a "
+        "time leaves you unable to answer."
     )
 
     # ── Escalation ────────────────────────────────────────────────────────────

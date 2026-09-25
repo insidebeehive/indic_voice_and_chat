@@ -2312,6 +2312,7 @@ class ChatBotAgent(BaseAgent):
                 tenant_timezone=self._tenant_timezone,
                 prompt_pack=self._prompt_pack,
                 include_variable_tail=False,
+                max_tool_rounds=self._max_tool_rounds,
             )
             messages: list[LLMMessage] = [LLMMessage(role="system", content=system_prompt)]
             # Replay the last MAX_HISTORY_TURNS exchanges (system is rebuilt
@@ -2347,6 +2348,7 @@ class ChatBotAgent(BaseAgent):
             has_deposit_verification_tool=any(t.name == SUBMIT_DEPOSIT_VERIFICATION for t in self._crm_tools),
             tenant_timezone=self._tenant_timezone,
             prompt_pack=self._prompt_pack,
+            max_tool_rounds=self._max_tool_rounds,
         )
         messages: list[LLMMessage] = [LLMMessage(role="system", content=system_prompt)]
         # Replay the last MAX_HISTORY_TURNS exchanges (system is rebuilt each
