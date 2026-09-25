@@ -1208,3 +1208,113 @@ def test_turn_timeout_leaves_room_for_llm_overhead_beyond_the_tool_budget() -> N
     worst_case_tool_time_s = chatbot._TOOL_BUDGET_S + 2 * chatbot._KB_SEARCH_TIMEOUT_S
     assert worst_case_tool_time_s == 75.0
     assert chat_api._TURN_TIMEOUT_S - worst_case_tool_time_s == 15.0
+
+
+# --- Interim language follows the customer, not the session --------------
+
+
+def test_interim_language_for_follows_what_the_customer_writes() -> None:
+    f = chat_api._interim_language_for
+    assert f("मेरा पैसा नहीं आया", "en") == "hi"
+    assert f("mera deposit add nahi hua", "en") == "hinglish"
+    assert f("my withdrawal is not credited", "hi") == "en"
+    assert f("ஏன் இன்னும் வரவில்லை", "en") == "ta"
+    # No signal: keep what we had (a voice note has no text; "ok"/digits carry none).
+    assert f("", "hinglish") == "hinglish"
+    assert f("500", "hi") == "hi"
+    assert f("ok", "hinglish") == "hinglish"
+
+
+def test_interim_wait_text_has_a_roman_hinglish_pair() -> None:
+    first = chat_api._interim_wait_text("hinglish", 0)
+    second = chat_api._interim_wait_text("hinglish", 1)
+    assert first != second
+    for line in (first, second):
+        assert line.isascii() or all(ord(c) < 0x0900 or ord(c) > 0x097F for c in line)
+        assert "rahi hoon" not in line and "raha hoon" not in line  # no speaker gender
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("text, expected_key", [
+    ("mera deposit abhi tak nahi aaya", "hinglish"),
+    ("मेरा पैसा नहीं आया", "hi"),
+])
+async def test_interim_message_uses_customer_language_over_session_language(
+    ws_ctx, monkeypatch, text, expected_key,
+) -> None:
+    """The CRM creates sessions as "en"; a customer writing Hinglish or Hindi
+    must still get the holding message in their own language."""
+    sm, fake_agent = ws_ctx
+    await _add_session(sm, "sess_en", "en")
+    monkeypatch.setattr(chat_api, "_INTERIM_INTERVAL_S", 0.03)
+
+    async def _slow_handle(_text):
+        await asyncio.sleep(0.15)
+        return _FakeTurnResult()
+
+    fake_agent.handle_message = _slow_handle
+
+    patcher, client = _connect(_make_tenant())
+    try:
+        with client.websocket_connect("/api/v1/chat/ws/sess_en") as ws:
+            ws.send_text(json.dumps({"type": "message", "text": text}))
+            frame = json.loads(ws.receive_text())
+            while not (frame["type"] == "message" and frame.get("interim")):
+                frame = json.loads(ws.receive_text())
+            assert frame["text"] == chat_api._INTERIM_WAIT_MESSAGES[expected_key][0]
+    finally:
+        patcher.stop()
+
+
+def test_interim_language_keeps_marathi_and_assamese_sessions() -> None:
+    """Devanagari and the Bengali script are each shared by two languages;
+    a Marathi or Assamese session must not be switched to Hindi or Bengali."""
+    f = chat_api._interim_language_for
+    assert f("माझं खातं बंद झालं", "mr") == "mr"
+    assert f("আমাৰ টকা", "as") == "as"
+    # With no shared-script session language, the script still decides.
+    assert f("माझं खातं बंद झालं", "en") == "hi"
+    assert f("আমার টাকা", "en") == "bn"
+    # An "hi-IN"-style fallback is normalised before the comparison.
+    assert f("माझं खातं", "mr-IN") == "mr-IN"
+
+
+def test_has_language_signal() -> None:
+    f = chat_api._has_language_signal
+    assert f("माझं खातं बंद झालं")
+    assert f("mera deposit nahi aaya")
+    assert f("my withdrawal is not credited")
+    assert not f("ok")
+    assert not f("500")
+    assert not f("")
+
+
+@pytest.mark.asyncio
+async def test_reconnect_seed_keeps_marathi_session_language(ws_ctx, monkeypatch) -> None:
+    """The history seed must evaluate against the session's language, so a
+    Marathi session reconnecting after a Devanagari message stays Marathi."""
+    sm, fake_agent = ws_ctx
+    await _add_session(sm, "sess_mr", "mr")
+    monkeypatch.setattr(chat_api, "_INTERIM_INTERVAL_S", 0.03)
+    from types import SimpleNamespace
+    fake_agent.session = SimpleNamespace(turns=[
+        SimpleNamespace(role="user", content="माझं खातं बंद झालं"),
+        SimpleNamespace(role="assistant", content="..."),
+        SimpleNamespace(role="user", content="ok"),
+    ])
+
+    async def _slow_handle(_text):
+        await asyncio.sleep(0.15)
+        return _FakeTurnResult()
+
+    fake_agent.handle_message = _slow_handle
+    patcher, client = _connect(_make_tenant())
+    try:
+        with client.websocket_connect("/api/v1/chat/ws/sess_mr") as ws:
+            ws.send_text(json.dumps({"type": "message", "text": "500"}))
+            frame = json.loads(ws.receive_text())
+            while not (frame["type"] == "message" and frame.get("interim")):
+                frame = json.loads(ws.receive_text())
+            assert frame["text"] == chat_api._INTERIM_WAIT_MESSAGES["mr"][0]
+    finally:
+        patcher.stop()

@@ -66,6 +66,8 @@ from src.agents.chatbot import (
     ChatBotAgent,
     ChatTurnResult,
     MAX_HISTORY_TURNS,
+    _detect_script,
+    _latin_language_hint,
     truncate_previous_conversation,
 )
 from src.api.chat_cost import compute_chat_turn_cost
@@ -1451,7 +1453,53 @@ _INTERIM_WAIT_MESSAGES: dict[str, list[str]] = {
         "ইয়াত সাধাৰণতকৈ অলপ বেছি সময় লাগিছে — মই এতিয়াও ইয়াত কাম কৰি আছোঁ আৰু সোনকালে জনাম।",
         "আপোনাৰ ধৈৰ্যৰ বাবে ধন্যবাদ — মই এতিয়াও কাম কৰি আছোঁ, আৰু অলপ সময়।",
     ],
+    # Roman-script Hindi, for customers who write Hinglish: they'd otherwise
+    # get the Devanagari "hi" pair above. Same speaker-gender-neutral rule —
+    # "lag raha hai"/"ho raha hai" agree with time/jawab, not the speaker.
+    "hinglish": [
+        "Isme thoda zyada time lag raha hai — jawab taiyaar ho raha hai, bas thodi der mein milega.",
+        "Intezaar ke liye shukriya — jaankari abhi taiyaar ho rahi hai, bas thodi der aur.",
+    ],
 }
+
+# _detect_script's language names → _INTERIM_WAIT_MESSAGES keys. "Hindi" means
+# Devanagari and "Bengali" the Bengali script; see _SHARED_SCRIPT_PAIRS for the
+# languages that share them.
+_SCRIPT_NAME_TO_INTERIM_LANG = {
+    "Hindi": "hi", "Bengali": "bn", "Punjabi": "pa", "Gujarati": "gu", "Odia": "od",
+    "Tamil": "ta", "Telugu": "te", "Kannada": "kn", "Malayalam": "ml",
+}
+_SHARED_SCRIPT_PAIRS = {("hi", "mr"), ("bn", "as")}
+
+
+def _has_language_signal(text: str) -> bool:
+    """Whether *text* says anything about its language: an Indic script, or
+    enough Roman words to tell Hinglish from English. "ok" and digits don't."""
+    return (_detect_script(text or "") in _SCRIPT_NAME_TO_INTERIM_LANG
+            or _latin_language_hint(text or "") is not None)
+
+
+def _interim_language_for(text: str, fallback: str) -> str:
+    """The language to send "still working on it" messages in, from what the
+    customer actually wrote. The session's own ``language`` is whatever the CRM
+    passed at creation — usually "en", even for customers writing Hindi or
+    Hinglish — so it is only the fallback, kept when this message carries no
+    signal (a voice note, a bare "ok", digits)."""
+    name = _detect_script(text or "")
+    if name in _SCRIPT_NAME_TO_INTERIM_LANG:
+        detected = _SCRIPT_NAME_TO_INTERIM_LANG[name]
+        # A script shared by two languages can't tell them apart: Devanagari
+        # is Hindi or Marathi, the Bengali script is Bengali or Assamese. Keep
+        # the fallback when it is the other language on the same script.
+        if (detected, normalize_lang(fallback)) in _SHARED_SCRIPT_PAIRS:
+            return fallback
+        return detected
+    hint = _latin_language_hint(text or "")
+    if hint == "Hinglish":
+        return "hinglish"
+    if hint == "English":
+        return "en"
+    return fallback
 
 
 def _interim_wait_text(language: str, index: int) -> str:
@@ -1460,7 +1508,8 @@ def _interim_wait_text(language: str, index: int) -> str:
     ``index`` is how many interim messages this turn has already sent; past the
     last variant the final one repeats. Unmapped codes fall back to English,
     same as ``_greeting``."""
-    variants = _INTERIM_WAIT_MESSAGES.get(normalize_lang(language)) or _INTERIM_WAIT_MESSAGES["en"]
+    key = "hinglish" if language == "hinglish" else normalize_lang(language)
+    variants = _INTERIM_WAIT_MESSAGES.get(key) or _INTERIM_WAIT_MESSAGES["en"]
     return variants[min(index, len(variants) - 1)]
 
 
@@ -2285,6 +2334,21 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
         # mean session-wide, not per-connection.
         session_first_frame_pending = row.message_count == 0
 
+        # Language for this connection's "still working on it" messages:
+        # follows what the customer writes (see _interim_language_for),
+        # seeded from the last customer message in the restored history so a
+        # reconnect that opens with a voice note doesn't fall back to "en".
+        # Walks back past signal-less turns ("ok", digits) to the most recent
+        # one that says something about the language.
+        interim_lang = row.language
+        for _t in reversed(getattr(getattr(agent, "session", None), "turns", None) or []):
+            if (_t.role == "user" and isinstance(_t.content, str)
+                    and _has_language_signal(_t.content)):
+                # Evaluated against the session's own language so a Marathi
+                # or Assamese session keeps its language (_SHARED_SCRIPT_PAIRS).
+                interim_lang = _interim_language_for(_t.content, row.language)
+                break
+
         while True:
             ws_task = asyncio.ensure_future(websocket.receive_text())
             aq_task = asyncio.ensure_future(async_q.get())
@@ -2489,7 +2553,7 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
                         # tool call, so coverage can't start only at the turn.
                         _ka_stop = asyncio.Event()
                         _ka = asyncio.ensure_future(_interim_wait_keepalive(
-                            websocket, _ka_stop, session_id=session_id, language=row.language))
+                            websocket, _ka_stop, session_id=session_id, language=interim_lang))
                         try:
                             if audio_bytes is None:
                                 try:
@@ -2533,6 +2597,10 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
 
                             # If transcription succeeded, get AI response; else inform customer
                             if transcript:
+                                # The keepalive already running was started
+                                # before transcription; this updates the
+                                # language for the rest of the connection.
+                                interim_lang = _interim_language_for(transcript, interim_lang)
                                 result = await _run_turn(agent.handle_message(transcript))
                                 # Mirror the customer's modality: they sent a voice
                                 # note, so try to voice the reply back too — but
@@ -2686,6 +2754,7 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
                                 {"type": "error", "message": "image/video needs 'data' (base64) or 'media_url'"}))
                             continue
                         caption = (msg.get("text") or "").strip()
+                        interim_lang = _interim_language_for(caption, interim_lang)
                         await websocket.send_text(json.dumps({"type": "typing"}))
 
                         # Keepalive spans the whole pre-turn media window (fetch,
@@ -2694,7 +2763,7 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
                         # tool call, so coverage can't start only at the turn.
                         _ka_stop = asyncio.Event()
                         _ka = asyncio.ensure_future(_interim_wait_keepalive(
-                            websocket, _ka_stop, session_id=session_id, language=row.language))
+                            websocket, _ka_stop, session_id=session_id, language=interim_lang))
                         try:
                             fetched_bytes: Optional[bytes] = None
                             if media_url:
@@ -2799,9 +2868,10 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
                         continue
 
                     await websocket.send_text(json.dumps({"type": "typing"}))
+                    interim_lang = _interim_language_for(user_text, interim_lang)
                     result = await _run_turn_with_keepalive(
                         websocket, agent.handle_message(user_text),
-                        session_id=session_id, language=row.language)
+                        session_id=session_id, language=interim_lang)
                     await _persist_turn(session_id, user_text, result, ticket_id=ticket_id)
                     call_url: Optional[str] = None
                     if result.call_offer and _handoff_store is not None:
