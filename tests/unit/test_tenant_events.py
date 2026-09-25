@@ -218,6 +218,266 @@ async def test_deliver_swallows_poster_exception(monkeypatch):
     assert await te.deliver("https://crm/hook", {"x": 1}, None, http_post=poster) is False
 
 
+async def test_httpx_post_logs_exception_type_on_timeout(monkeypatch, caplog):
+    """str(httpx.ReadTimeout()) is empty, so the log line used to carry
+    `"error": ""` — indistinguishable from a connect-refused or any other
+    transport failure. error_type must name the actual exception class."""
+    import httpx
+
+    class _FakeClient:
+        def __init__(self, timeout=None):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc_info):
+            return False
+
+        async def post(self, url, content, headers):
+            raise httpx.ReadTimeout("")
+
+    monkeypatch.setattr(te.httpx, "AsyncClient", _FakeClient)
+
+    with caplog.at_level(logging.WARNING):
+        status = await te._httpx_post("https://crm/hook", b"{}", {})
+
+    assert status == -1
+    rec = next(r for r in caplog.records if r.message == "tenant event POST failed")
+    assert rec.error_type == "ReadTimeout"
+
+
+async def test_deliver_exhausted_retries_warning_includes_final_status(monkeypatch, caplog):
+    monkeypatch.setattr(te, "_BACKOFF_BASE_S", 0.0)
+
+    async def poster(url, raw, headers):
+        return 503
+
+    with caplog.at_level(logging.WARNING):
+        ok = await te.deliver("https://crm/hook", {"x": 1}, None, http_post=poster)
+
+    assert ok is False
+    rec = next(r for r in caplog.records if r.message == "tenant event delivery exhausted retries")
+    assert rec.final_status == 503
+
+
+# --- N6: deliver_detailed's stop_on_permanent is opt-in (default False) ----
+# and deliver() — used by call_store.py and chat_webhooks.py's in-line
+# session_closed attempt — must retry EXACTLY as it always has: the full
+# _MAX_ATTEMPTS budget, 4xx included. Only src/main.py's webhook_outbox loop
+# passes stop_on_permanent=True.
+
+
+async def test_deliver_detailed_default_retries_permanent_4xx_full_budget(monkeypatch):
+    """Default stop_on_permanent=False -- a permanent-class 4xx (401) still
+    retries the full budget, same as before this parameter existed."""
+    monkeypatch.setattr(te, "_BACKOFF_BASE_S", 0.0)
+    attempts = []
+
+    async def poster(url, raw, headers):
+        attempts.append(1)
+        return 401
+
+    result = await te.deliver_detailed("https://crm/hook", {"x": 1}, None, http_post=poster)
+
+    assert result.ok is False
+    assert result.final_status == 401
+    assert len(attempts) == te._MAX_ATTEMPTS
+    # .permanent still reflects the final status's class regardless of
+    # stop_on_permanent -- only the retry-loop's attempt count is gated by it.
+    assert result.permanent is True
+
+
+async def test_deliver_detailed_stop_on_permanent_true_stops_after_one_attempt(monkeypatch):
+    monkeypatch.setattr(te, "_BACKOFF_BASE_S", 0.0)
+    attempts = []
+
+    async def poster(url, raw, headers):
+        attempts.append(1)
+        return 401  # bad/expired signature -- will never succeed by retrying
+
+    result = await te.deliver_detailed(
+        "https://crm/hook", {"x": 1}, None, http_post=poster, stop_on_permanent=True,
+    )
+
+    assert result.ok is False
+    assert result.permanent is True
+    assert result.final_status == 401
+    assert len(attempts) == 1  # no further in-line retries
+
+
+@pytest.mark.parametrize("status", [400, 403, 404, 422, 500, 502, 503])
+async def test_deliver_detailed_permanent_flag_matches_status_class(monkeypatch, status):
+    """.permanent reflects the status class regardless of stop_on_permanent
+    (default False here) -- it always retries the full budget, but still
+    classifies the final status correctly."""
+    monkeypatch.setattr(te, "_BACKOFF_BASE_S", 0.0)
+
+    async def poster(url, raw, headers):
+        return status
+
+    result = await te.deliver_detailed("https://crm/hook", {"x": 1}, None, http_post=poster)
+
+    assert result.final_status == status
+    assert result.permanent == (400 <= status < 500)
+
+
+async def test_deliver_detailed_retries_5xx_full_budget(monkeypatch):
+    monkeypatch.setattr(te, "_BACKOFF_BASE_S", 0.0)
+    attempts = []
+
+    async def poster(url, raw, headers):
+        attempts.append(1)
+        return 503
+
+    result = await te.deliver_detailed(
+        "https://crm/hook", {"x": 1}, None, http_post=poster, stop_on_permanent=True,
+    )
+
+    assert result.ok is False
+    assert result.permanent is False
+    assert result.final_status == 503
+    assert len(attempts) == te._MAX_ATTEMPTS  # 5xx is never permanent, stop_on_permanent or not
+
+
+async def test_deliver_detailed_retries_timeout_full_budget(monkeypatch):
+    """A transport-level failure (final_status -1) is retried the full
+    budget too, same as a 5xx -- never treated as permanent, regardless of
+    stop_on_permanent."""
+    monkeypatch.setattr(te, "_BACKOFF_BASE_S", 0.0)
+    attempts = []
+
+    async def poster(url, raw, headers):
+        attempts.append(1)
+        raise RuntimeError("boom")
+
+    result = await te.deliver_detailed(
+        "https://crm/hook", {"x": 1}, None, http_post=poster, stop_on_permanent=True,
+    )
+
+    assert result.ok is False
+    assert result.permanent is False
+    assert result.final_status == -1
+    assert len(attempts) == te._MAX_ATTEMPTS
+
+
+@pytest.mark.parametrize("status", [408, 425, 429])
+async def test_deliver_detailed_retries_specific_retryable_4xx_codes(monkeypatch, status):
+    """408 (Request Timeout), 425 (Too Early), 429 (Too Many Requests) are
+    the exception to "4xx is permanent" -- conventionally transient, so they
+    retry the full budget even with stop_on_permanent=True."""
+    monkeypatch.setattr(te, "_BACKOFF_BASE_S", 0.0)
+    attempts = []
+
+    async def poster(url, raw, headers):
+        attempts.append(1)
+        return status
+
+    result = await te.deliver_detailed(
+        "https://crm/hook", {"x": 1}, None, http_post=poster, stop_on_permanent=True,
+    )
+
+    assert result.permanent is False
+    assert result.final_status == status
+    assert len(attempts) == te._MAX_ATTEMPTS
+
+
+async def test_deliver_bool_still_retries_permanent_4xx_full_budget_unchanged(monkeypatch):
+    """N6: deliver()'s existing callers (call_store.py etc.) must see
+    UNCHANGED behavior -- it never passes stop_on_permanent, so even a
+    permanent-class 4xx (404) still retries the full budget, exactly as
+    before stop_on_permanent existed."""
+    monkeypatch.setattr(te, "_BACKOFF_BASE_S", 0.0)
+    attempts = []
+
+    async def poster(url, raw, headers):
+        attempts.append(1)
+        return 404
+
+    ok = await te.deliver("https://crm/hook", {"x": 1}, None, http_post=poster)
+
+    assert ok is False
+    assert len(attempts) == te._MAX_ATTEMPTS
+
+
+async def test_deliver_detailed_logs_permanent_failure_warning_only_with_stop_on_permanent(
+    monkeypatch, caplog,
+):
+    monkeypatch.setattr(te, "_BACKOFF_BASE_S", 0.0)
+
+    async def poster(url, raw, headers):
+        return 401
+
+    with caplog.at_level(logging.WARNING):
+        await te.deliver_detailed(
+            "https://crm/hook", {"event": "session_closed"}, None, http_post=poster,
+            stop_on_permanent=True,
+        )
+
+    rec = next(
+        r for r in caplog.records
+        if r.message == "tenant event delivery permanent failure — not retrying"
+    )
+    assert rec.status == 401
+
+
+async def test_deliver_detailed_default_never_logs_permanent_failure_warning(monkeypatch, caplog):
+    """Without stop_on_permanent, a 4xx just exhausts the normal retry
+    budget and logs the normal "exhausted retries" warning -- never the
+    early-stop "permanent failure" one, since retries were never stopped
+    early."""
+    monkeypatch.setattr(te, "_BACKOFF_BASE_S", 0.0)
+
+    async def poster(url, raw, headers):
+        return 401
+
+    with caplog.at_level(logging.WARNING):
+        await te.deliver_detailed("https://crm/hook", {"event": "session_closed"}, None, http_post=poster)
+
+    assert not any(
+        r.message == "tenant event delivery permanent failure — not retrying"
+        for r in caplog.records
+    )
+    assert any(r.message == "tenant event delivery exhausted retries" for r in caplog.records)
+
+
+# --- L6: deliver_detailed's logs read whichever event-type-ish field the ----
+# envelope actually carries -- call-event envelopes use "event_type" (see
+# build_envelope), BO chat-lifecycle bodies use "event" (see
+# src.api.chat_webhooks.send_bo_webhook). Before this, BO deliveries' logs
+# always carried event_type=None since deliver() only ever read "event_type".
+
+
+async def test_deliver_detailed_logs_bo_body_event_key(monkeypatch, caplog):
+    monkeypatch.setattr(te, "_BACKOFF_BASE_S", 0.0)
+
+    async def poster(url, raw, headers):
+        return 503
+
+    with caplog.at_level(logging.WARNING):
+        await te.deliver_detailed(
+            "https://crm/hook", {"event": "session_closed", "session_id": "cs_1"}, None, http_post=poster,
+        )
+
+    rec = next(r for r in caplog.records if r.message == "tenant event delivery exhausted retries")
+    assert rec.event_type == "session_closed"
+
+
+async def test_deliver_detailed_logs_call_envelope_event_type_key(monkeypatch, caplog):
+    monkeypatch.setattr(te, "_BACKOFF_BASE_S", 0.0)
+
+    async def poster(url, raw, headers):
+        return 503
+
+    with caplog.at_level(logging.WARNING):
+        await te.deliver_detailed(
+            "https://crm/hook", {"event_type": "call.completed"}, None, http_post=poster,
+        )
+
+    rec = next(r for r in caplog.records if r.message == "tenant event delivery exhausted retries")
+    assert rec.event_type == "call.completed"
+
+
 # --- src.main._resolve_tenant_event_secret -----------------------------------
 # Both call sites (main.py's _notify_tenant_event closure and chat_webhooks'
 # send_bo_webhook) resolve a signing secret the same way — per-tenant secret

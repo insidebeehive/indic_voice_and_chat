@@ -16,6 +16,7 @@ from src.models.tenant import (
     TenantSecret,
 )
 from src.models.turn_metrics import TurnMetric
+from src.models.webhook_outbox import WebhookOutbox
 
 __all__ = [
     "Base",
@@ -41,6 +42,7 @@ __all__ = [
     "TenantSecret",
     "Turn",
     "TurnMetric",
+    "WebhookOutbox",
     "get_engine",
     "get_sessionmaker",
 ]

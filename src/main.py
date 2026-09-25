@@ -339,6 +339,520 @@ async def _prune_chat_turn_metrics_loop(retention_days: float) -> None:
         await asyncio.sleep(_CHAT_METRICS_PRUNE_INTERVAL_S)
 
 
+# How often the webhook-outbox retry loop wakes up to claim due rows. Kept
+# short (unlike the multi-hour metrics-prune interval) because the whole
+# point of this queue is to recover a session_closed delivery that missed its
+# original ~16s in-line budget as soon as reasonably possible, not hours
+# later.
+_WEBHOOK_OUTBOX_INTERVAL_S = 60
+
+# How many pending, due rows one pass claims at most. Small on purpose: this
+# queue only ever holds session_closed deliveries that already exhausted a
+# 3-attempt in-line budget -- an expected-rare, not bulk, workload. Also
+# bounds one pass's worst-case wall time against the lease below: at up to
+# _WEBHOOK_OUTBOX_PER_ROW_TIMEOUT_S per row, 10 rows is at most 450s --
+# comfortably inside _WEBHOOK_OUTBOX_LEASE_S with margin (see N1 below).
+_WEBHOOK_OUTBOX_CLAIM_BATCH = 10
+
+# Per-row delivery bound (N1): each row's _deliver_webhook_outbox_claim call
+# is wrapped in asyncio.wait_for(..., this). Without it, a single row that
+# hangs past httpx's own 5s-per-attempt timeout (e.g. stuck in tenant/URL
+# resolution, a wedged DB call) has no upper bound at all, and
+# _WEBHOOK_OUTBOX_CLAIM_BATCH rows' worth of such hangs could push one pass
+# past the lease window, at which point a DIFFERENT pod could re-claim and
+# double-send a row this pod is still (very slowly) working on.
+#
+# 10 rows (_WEBHOOK_OUTBOX_CLAIM_BATCH) x 45s = 450s < 600s lease
+# (_WEBHOOK_OUTBOX_LEASE_S below), a 150s / 25% margin. 45s itself is
+# generous headroom over the ~16.8s a normal delivery attempt can already
+# take (3 httpx attempts x 5s timeout + backoff) plus tenant/URL resolution.
+# On timeout, the row is treated as retryable (see _finalize_webhook_outbox_row)
+# -- never dead, since a timeout says nothing about whether the request
+# itself was bad.
+_WEBHOOK_OUTBOX_PER_ROW_TIMEOUT_S = 45
+
+# How long a claimed row is leased for (see _claim_webhook_outbox_rows):
+# next_attempt_at is pushed this far into the future the moment a row is
+# claimed, committed immediately, BEFORE any delivery attempt. That's what
+# makes a crash/cancelled pass (every rolling deploy cancels in-flight
+# background tasks -- see src/main.py's shutdown block) cheap: the row is
+# just not due again until the lease expires, at worst delaying it by one
+# lease window -- never a re-send of a row this same pass already finished
+# and committed as delivered (see run_webhook_outbox_once's docstring, H1/H2).
+# Must exceed a full batch's worst-case wall time (batch x per-row timeout,
+# see the two constants above) with margin.
+_WEBHOOK_OUTBOX_LEASE_S = 600  # 10 minutes
+
+# Backoff schedule (seconds) indexed by `attempts` (1-based) after a retry
+# fails: 1m, 2m, 5m, 15m, 30m, then hourly for every attempt beyond that --
+# matches the spec's "1m, 2m, 5m, 15m, 30m, then hourly" exactly. Used for
+# EVERY reschedule -- a retryable failure and a permanent failure that
+# hasn't yet hit the 3-strike cap (see _finalize_webhook_outbox_row) both
+# back off on this same schedule.
+_WEBHOOK_OUTBOX_BACKOFF_S = [60, 120, 300, 900, 1800, 3600]
+
+# A row still PENDING this long after it was first enqueued is retired
+# (`dead`, last_error="max_age") directly at claim time (N3 -- see
+# _claim_webhook_outbox_rows) rather than being claimed for yet another
+# delivery attempt. Age-based (not an attempts-count cap): the backoff
+# schedule above settles at hourly, so ~24h since creation is also roughly
+# "24 more attempts after settling" -- but age is what's actually being
+# bounded (how long a CRM ticket can plausibly stay incorrectly open), so
+# that's what's measured directly. Distinct from the permanent-failure
+# 3-strike rule below, which can retire a row much sooner than 24h.
+_WEBHOOK_OUTBOX_MAX_AGE_S = 24 * 3600
+
+# A row is given up as dead on a PERMANENT (non-retryable 4xx) delivery
+# outcome only once it has accumulated at least this many delivery attempts
+# AND the latest one was itself permanent (see _finalize_webhook_outbox_row).
+# Simplest-correct rule of the two considered ("N consecutive permanent
+# failures" needs a second counter this table doesn't have; "attempts >= N
+# with the latest outcome permanent" reuses the `attempts` column already
+# there) -- chosen specifically so a transient 403/404 during a brief CRM
+# deploy (permanent on attempt 1, succeeds or times out normally afterward)
+# never kills a row: it only takes hold after the row has already been
+# rescheduled with backoff twice (~1m + ~2m elapsed, see the backoff
+# schedule above) and is STILL seeing a permanent failure on its 3rd try.
+_WEBHOOK_OUTBOX_PERMANENT_DEAD_THRESHOLD = 3
+
+# How long a `delivered`/`dead` row is kept before being pruned (L3). These
+# terminal rows carry the full session_closed body -- transcript text and the
+# tenant's webhook URL -- and are no longer actionable once terminal, so
+# unlike the retry bookkeeping itself they must not accumulate indefinitely.
+_WEBHOOK_OUTBOX_PRUNE_RETENTION_DAYS = 7
+_WEBHOOK_OUTBOX_PRUNE_BATCH_SIZE = 500
+
+
+def _webhook_outbox_backoff_s(attempts: int) -> int:
+    """Backoff delay for the Nth failure (`attempts` is 1-based: the delay to
+    apply AFTER attempt number `attempts` has just failed). Clamped to the
+    schedule's last entry (hourly) once `attempts` runs past it."""
+    idx = min(max(attempts, 1), len(_WEBHOOK_OUTBOX_BACKOFF_S)) - 1
+    return _WEBHOOK_OUTBOX_BACKOFF_S[idx]
+
+
+async def _claim_webhook_outbox_rows(sessionmaker, *, now) -> list[dict]:
+    """Claim up to ``_WEBHOOK_OUTBOX_CLAIM_BATCH`` due ``pending`` rows in one
+    SHORT transaction (H2): ``SELECT ... FOR UPDATE SKIP LOCKED`` (Postgres
+    only -- SQLite, tests-only and always single-process, has no such clause
+    and needs none). For each due row:
+
+    - N3: if it's older than ``_WEBHOOK_OUTBOX_MAX_AGE_S`` since it was first
+      enqueued, retire it directly HERE -- ``status=dead``,
+      ``last_error="max_age"`` -- rather than claiming it for a delivery
+      attempt that would only be thrown away. This also means an over-age
+      row never occupies a claim-batch slot that could go to a still-viable
+      one.
+    - Otherwise, bump ``attempts`` and push ``next_attempt_at`` out by the
+      lease window.
+
+    Either way, commits immediately -- BEFORE any HTTP delivery is
+    attempted. That's the fix for an earlier design, which held one
+    ``FOR UPDATE SKIP LOCKED`` transaction open across an entire batch's
+    worth of httpx calls (up to ~7 minutes idle-in-transaction for a 25-row
+    batch) -- a real risk under ``idle_in_transaction_session_timeout`` or a
+    PgBouncer transaction-pooling proxy (this project's own
+    ``src/models/database.py`` already sets ``statement_cache_size=0``
+    specifically for PgBouncer compatibility).
+
+    Returns plain dicts (rows actually claimed for delivery only -- retired
+    over-age rows are NOT included), not live ORM rows bound to the now-
+    closed session that read them: ``id``, ``tenant_id``, ``session_id``,
+    ``event_type``, ``url``, ``body``, ``attempts`` (POST-bump -- the count
+    this delivery attempt about to run IS attempt number ``attempts``),
+    ``created_at``.
+    """
+    from datetime import timedelta
+
+    from sqlalchemy import select
+
+    from src.models.webhook_outbox import STATUS_DEAD, STATUS_PENDING, WebhookOutbox
+
+    async with sessionmaker() as db:
+        dialect_name = db.get_bind().dialect.name
+        stmt = (
+            select(WebhookOutbox)
+            .where(WebhookOutbox.status == STATUS_PENDING)
+            .where(WebhookOutbox.next_attempt_at <= now)
+            .order_by(WebhookOutbox.next_attempt_at)
+            .limit(_WEBHOOK_OUTBOX_CLAIM_BATCH)
+        )
+        if dialect_name != "sqlite":
+            stmt = stmt.with_for_update(skip_locked=True)
+        rows = (await db.execute(stmt)).scalars().all()
+        claimed: list[dict] = []
+        for row in rows:
+            age_s = (now - row.created_at).total_seconds() if row.created_at else 0.0
+            if age_s >= _WEBHOOK_OUTBOX_MAX_AGE_S:
+                row.status = STATUS_DEAD
+                row.last_error = "max_age"
+                log.warning(
+                    "webhook outbox row given up as dead (max age reached)",
+                    extra={
+                        "id": row.id, "tenant_id": row.tenant_id, "session_id": row.session_id,
+                        "event_type": row.event_type, "attempts": row.attempts,
+                    },
+                )
+                continue
+            row.attempts += 1
+            row.next_attempt_at = now + timedelta(seconds=_WEBHOOK_OUTBOX_LEASE_S)
+            claimed.append({
+                "id": row.id, "tenant_id": row.tenant_id, "session_id": row.session_id,
+                "event_type": row.event_type, "url": row.url, "body": row.body,
+                "attempts": row.attempts, "created_at": row.created_at,
+            })
+        await db.commit()
+    return claimed
+
+
+async def _deliver_webhook_outbox_claim(claim: dict, *, resolve_tenant, deliver_fn) -> tuple[str, Optional[str]]:
+    """Attempt one delivery for an already-claimed, already-leased row (a
+    dict from ``_claim_webhook_outbox_rows``). Runs entirely OUTSIDE any DB
+    transaction -- only network I/O plus, at most, a read-only tenant/URL
+    resolution (which opens and closes its own short-lived session).
+
+    Returns ``(outcome, error)`` where ``outcome`` is one of ``"delivered"``,
+    ``"permanent"`` (a non-retryable 4xx -- see
+    ``src.integration.tenant_events.DeliveryResult.permanent``, M2), or
+    ``"retryable"`` (anything else: 5xx, timeout/transport failure, a
+    retryable 4xx, tenant/URL resolution failure).
+
+    Re-resolves the tenant's CURRENT webhook URL + signing secret rather than
+    trusting the claim's own stored ``url`` (captured at enqueue time) or
+    re-using any signature: either can legitimately change between enqueue
+    and eventual delivery (a tenant rotating its secret, or moving/unsetting
+    its CRM webhook entirely). When re-resolution comes back with no URL at
+    all, this deliberately does NOT fall back to the claim's stored ``url``
+    -- that stored value could be stale/revoked from the tenant's own point
+    of view by now, and silently POSTing a customer transcript to a URL the
+    tenant no longer authorizes is a real data-exposure risk this loop must
+    not take. It's treated as retryable instead, in case this was only a
+    transient resolution hiccup (e.g. a DB blip).
+
+    Can itself raise (a resolver bug, an unexpected exception from
+    ``deliver_fn``) -- ``_finalize_webhook_outbox_row``'s own try/except is
+    the outermost safety net for that (H1); this function does not catch
+    broadly on purpose, so a genuine bug surfaces in that one row's
+    ``last_error`` rather than being silently absorbed here too.
+    """
+    import os
+
+    from src.integration.tenant_events import resolve_events_webhook_url
+    from src.models.database import get_sessionmaker
+
+    tenant = await resolve_tenant(claim["tenant_id"])
+    if tenant is None:
+        return "retryable", "tenant_unresolved"
+
+    settings = getattr(tenant, "settings", tenant)
+    url = await resolve_events_webhook_url(tenant, get_sessionmaker())
+    if not url:
+        return "retryable", "no_webhook_url_configured"
+
+    secret_env = getattr(settings, "events_webhook_secret_env", None)
+    secret = (
+        tenant.secret_optional(secret_env)
+        if secret_env and hasattr(tenant, "secret_optional") else None
+    )
+    if not secret:
+        secret = os.environ.get("EVENTS_WEBHOOK_SECRET") or None
+
+    result = await deliver_fn(url, claim["body"], secret)
+    if result.ok:
+        return "delivered", None
+    if getattr(result, "permanent", False):
+        return "permanent", f"http_{result.final_status}"
+    if result.final_status == -1:
+        return "retryable", "delivery_failed"
+    return "retryable", f"http_{result.final_status}"
+
+
+async def _finalize_webhook_outbox_row(
+    sessionmaker, claim: dict, *, resolve_tenant, deliver_fn, now_fn,
+) -> str:
+    """Deliver one claimed row (bounded, N1) and apply the result via a
+    single atomic ``UPDATE ... WHERE id=:id AND status='pending' AND
+    attempts=:claimed_attempts`` (H2 + N1 fencing).
+
+    N1 fencing: the ``attempts=:claimed_attempts`` clause means this UPDATE
+    only applies if the row's ``attempts`` is STILL exactly what this claim
+    bumped it to -- i.e. nothing else (another pod re-claiming after this
+    pass overran its lease, a retried finalize after a prior timeout) has
+    already claimed or finalized this row again in the meantime. Without it,
+    a slow/delayed finalize could clobber a NEWER claim's state with a
+    STALE result.
+
+    N1 bound: the delivery attempt itself is wrapped in
+    ``asyncio.wait_for(..., _WEBHOOK_OUTBOX_PER_ROW_TIMEOUT_S)`` so one
+    hung row can't let a whole pass run long enough to outlive the lease
+    (see that constant's own comment for the batch x per-row-timeout <
+    lease arithmetic). A timeout is treated as retryable, same as any other
+    exception (H1) -- it says nothing about whether the request itself was
+    bad, only that it took too long.
+
+    H1: wraps delivery (now including the wait_for above) in try/except so
+    ANY exception (a resolver bug, a custom ``deliver_fn`` raising, a
+    timeout) reschedules this one row rather than propagating out of
+    ``run_webhook_outbox_once`` and aborting the rest of the batch -- with
+    an earlier single-batch-commit design, one bad row used to roll back
+    every row already marked delivered earlier in the same pass.
+
+    N4: ``now`` is read fresh here (via ``now_fn()``), AFTER delivery
+    completes -- not the timestamp ``_claim_webhook_outbox_rows`` used to
+    decide which rows were due. Delivery can itself take up to
+    ``_WEBHOOK_OUTBOX_PER_ROW_TIMEOUT_S``, so reusing a pre-delivery
+    timestamp for ``delivered_at`` / the next backoff's ``next_attempt_at``
+    would silently understate how much time has actually passed.
+
+    Item 3 (permanent-4xx 3-strike rule): a ``"permanent"`` outcome only
+    marks the row dead once ``claim["attempts"] >=
+    _WEBHOOK_OUTBOX_PERMANENT_DEAD_THRESHOLD`` (3) -- otherwise it's
+    rescheduled with the SAME backoff schedule a retryable failure gets,
+    ``last_error`` still recording the permanent status (e.g. ``"http_401"``)
+    so it's visible either way. This is what keeps a transient 403/404
+    during a brief CRM deploy from killing a row on its first try.
+
+    Returns one of ``"delivered"``, ``"dead"`` (permanent x3, or an
+    exception/timeout on an already-old-enough row is NOT how a row goes
+    dead here -- see N3, that's now handled entirely at claim time),
+    ``"rescheduled"``, or ``"skipped"`` (the N1 fence didn't match -- someone
+    else already finalized or re-claimed this row) -- for the caller's own
+    logging.
+    """
+    from datetime import timedelta
+
+    from sqlalchemy import update as sa_update
+
+    from src.models.webhook_outbox import STATUS_DEAD, STATUS_DELIVERED, STATUS_PENDING, WebhookOutbox
+
+    try:
+        outcome, error = await asyncio.wait_for(
+            _deliver_webhook_outbox_claim(claim, resolve_tenant=resolve_tenant, deliver_fn=deliver_fn),
+            timeout=_WEBHOOK_OUTBOX_PER_ROW_TIMEOUT_S,
+        )
+    except Exception as e:  # noqa: BLE001 - H1/N1: one bad or slow row must never abort the batch
+        outcome, error = "retryable", type(e).__name__
+
+    now = now_fn()  # N4: fresh clock read, taken AFTER delivery completed
+
+    # N1 fencing on every branch below: only apply if attempts is still
+    # exactly what THIS claim bumped it to.
+    fence = (
+        WebhookOutbox.id == claim["id"],
+        WebhookOutbox.status == STATUS_PENDING,
+        WebhookOutbox.attempts == claim["attempts"],
+    )
+
+    if outcome == "delivered":
+        stmt = (
+            sa_update(WebhookOutbox).where(*fence)
+            .values(status=STATUS_DELIVERED, delivered_at=now, last_error=None)
+        )
+        result_label = "delivered"
+    elif outcome == "permanent" and claim["attempts"] >= _WEBHOOK_OUTBOX_PERMANENT_DEAD_THRESHOLD:
+        stmt = sa_update(WebhookOutbox).where(*fence).values(status=STATUS_DEAD, last_error=error)
+        result_label = "dead"
+        log.warning(
+            "webhook outbox row given up as dead (permanent failure, 3rd+ attempt)",
+            extra={
+                "id": claim["id"], "tenant_id": claim["tenant_id"], "session_id": claim["session_id"],
+                "event_type": claim["event_type"], "attempts": claim["attempts"], "last_error": error,
+            },
+        )
+    else:  # "retryable", or "permanent" but not yet at the 3-strike threshold
+        next_at = now + timedelta(seconds=_webhook_outbox_backoff_s(claim["attempts"]))
+        stmt = (
+            sa_update(WebhookOutbox).where(*fence)
+            .values(next_attempt_at=next_at, last_error=error)
+        )
+        result_label = "rescheduled"
+
+    async with sessionmaker() as db:
+        result = await db.execute(stmt)
+        await db.commit()
+        applied = (result.rowcount or 0) > 0
+
+    if result_label == "delivered" and applied:
+        log.info(
+            "webhook outbox row delivered",
+            extra={
+                "id": claim["id"], "tenant_id": claim["tenant_id"], "session_id": claim["session_id"],
+                "event_type": claim["event_type"], "attempts": claim["attempts"],
+            },
+        )
+    return result_label if applied else "skipped"
+
+
+async def _default_webhook_outbox_deliver_fn(url: str, body: dict, secret: Optional[str]):
+    """The outbox's default ``deliver_fn``: ``deliver_detailed`` with
+    ``stop_on_permanent=True`` (N6) -- opt-in fast-fail-within-one-attempt
+    behavior used ONLY here, never by ``deliver()``/the in-line
+    ``session_closed`` path (see ``deliver_detailed``'s own docstring)."""
+    from src.integration.tenant_events import deliver_detailed
+    return await deliver_detailed(url, body, secret, stop_on_permanent=True)
+
+
+def _webhook_outbox_now():
+    """The real, naive-UTC clock reading used by default wherever this
+    module needs "now" for the outbox (N4: called fresh at finalize time,
+    not reused from claim time) -- overridable via ``now``/``now_fn``
+    parameters for tests."""
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+async def run_webhook_outbox_once(
+    sessionmaker, *, resolve_tenant=None, deliver_fn=None, now=None, now_fn=None,
+) -> int:
+    """One pass of the webhook-outbox retry loop: claim due ``pending`` rows
+    (``_claim_webhook_outbox_rows``, a short transaction, evaluated against
+    ``now``), then deliver + finalize each OUTSIDE any transaction, one row
+    at a time (``_finalize_webhook_outbox_row``, N4: each finalize reads its
+    OWN fresh "now" via ``now_fn``, not this function's ``now``). Returns the
+    number of rows claimed (and thus processed) this pass -- a row retired
+    directly at claim time for being over-age (N3) is NOT included, since no
+    delivery was attempted for it.
+
+    Pure logic, deliberately separate from ``_webhook_outbox_loop`` below
+    (mirrors ``prune_chat_turn_metrics`` vs. ``_prune_chat_turn_metrics_loop``,
+    and ``reap_stale_calls`` vs. ``_reap_stale_calls_loop``) so this is
+    directly unit-testable without fighting an infinite loop.
+
+    Multi-pod safety (H2 + N1): claiming uses ``SELECT ... FOR UPDATE SKIP
+    LOCKED`` on Postgres, but that transaction is held only long enough to
+    retire over-age rows / bump ``attempts``+``next_attempt_at`` and commit
+    -- never across the actual HTTP delivery (which is itself bounded by
+    ``_WEBHOOK_OUTBOX_PER_ROW_TIMEOUT_S`` per row, N1, so a whole pass can't
+    run long enough to outlive the lease). The lease (``next_attempt_at``
+    pushed ``_WEBHOOK_OUTBOX_LEASE_S`` into the future at claim time) is what
+    keeps two pods from double-sending the same row even after that short
+    transaction's lock is released. Each row's eventual outcome is then
+    applied via one atomic, FENCED (N1: ``attempts=:claimed_attempts``, not
+    just ``id``+``status``) ``UPDATE`` (see ``_finalize_webhook_outbox_row``),
+    so a row another pod already re-claimed/finalized in the meantime is a
+    safe no-op here rather than clobbering newer state with a stale result.
+
+    ``resolve_tenant`` defaults to ``src.auth.middleware.tenant_from_id``;
+    ``deliver_fn`` defaults to ``_default_webhook_outbox_deliver_fn`` (N6:
+    ``deliver_detailed`` with ``stop_on_permanent=True`` -- opt-in, only
+    here); ``now_fn`` defaults to ``_webhook_outbox_now`` -- all three
+    overridable so tests never need a real tenant resolver, network call, or
+    wall clock.
+    """
+    if resolve_tenant is None:
+        from src.auth.middleware import tenant_from_id
+        resolve_tenant = tenant_from_id
+    if deliver_fn is None:
+        deliver_fn = _default_webhook_outbox_deliver_fn
+    if now_fn is None:
+        now_fn = _webhook_outbox_now
+
+    claim_now = now if now is not None else now_fn()
+
+    claims = await _claim_webhook_outbox_rows(sessionmaker, now=claim_now)
+    for claim in claims:
+        # H1: _finalize_webhook_outbox_row's own try/except means a bad row
+        # here can never raise out of this loop and abort rows not yet
+        # processed, nor undo rows already finalized earlier in this same
+        # pass (each is its own committed transaction, not a shared one).
+        await _finalize_webhook_outbox_row(
+            sessionmaker, claim, resolve_tenant=resolve_tenant, deliver_fn=deliver_fn, now_fn=now_fn,
+        )
+    return len(claims)
+
+
+async def prune_webhook_outbox(
+    sessionmaker, retention_days: float = _WEBHOOK_OUTBOX_PRUNE_RETENTION_DAYS,
+) -> int:
+    """Delete ``webhook_outbox`` rows in a terminal state (``delivered`` /
+    ``dead``) older than ``retention_days`` (L3). Terminal rows carry the
+    full session_closed body -- transcript text and the tenant's webhook URL
+    -- and are no longer actionable once terminal, so unlike the retry
+    bookkeeping itself they must not accumulate indefinitely. Rows still
+    ``pending`` are never touched here regardless of age -- the 24h dead-cap
+    in ``run_webhook_outbox_once``/``_finalize_webhook_outbox_row`` is what
+    retires those.
+
+    Same DB-clock-vs-Python-clock + batched-delete approach as
+    ``prune_chat_turn_metrics`` above -- see that function's own comments for
+    the full reasoning (SQLite gets a Python cutoff since it has no separate
+    server clock; Postgres evaluates the cutoff fresh each batch against the
+    DB server's own clock).
+    """
+    from sqlalchemy import delete, func, select
+
+    from src.models.webhook_outbox import STATUS_DEAD, STATUS_DELIVERED, WebhookOutbox
+
+    async with sessionmaker() as probe:
+        dialect_name = probe.get_bind().dialect.name
+    if dialect_name == "sqlite":
+        from datetime import datetime, timedelta
+        cutoff = datetime.utcnow() - timedelta(days=retention_days)
+    else:
+        cutoff = func.now() - func.make_interval(0, 0, 0, 0, 0, 0, retention_days * 86400.0)
+
+    total_deleted = 0
+    while True:
+        async with sessionmaker() as s:
+            ids = (await s.execute(
+                select(WebhookOutbox.id)
+                .where(WebhookOutbox.status.in_([STATUS_DELIVERED, STATUS_DEAD]))
+                .where(WebhookOutbox.created_at < cutoff)
+                .order_by(WebhookOutbox.created_at)
+                .limit(_WEBHOOK_OUTBOX_PRUNE_BATCH_SIZE)
+            )).scalars().all()
+            if not ids:
+                break
+            await s.execute(delete(WebhookOutbox).where(WebhookOutbox.id.in_(ids)))
+            await s.commit()
+        total_deleted += len(ids)
+        if len(ids) < _WEBHOOK_OUTBOX_PRUNE_BATCH_SIZE:
+            break  # last (partial) batch -- nothing older left to prune this pass
+    return total_deleted
+
+
+def webhook_outbox_enabled() -> bool:
+    """``WEBHOOK_OUTBOX_ENABLED`` kill switch for the retry loop, read on every
+    pass so flipping it needs no restart. Unset means on; 0/false/no/off
+    pauses retries (e.g. if the CRM objects to repeated session_closed)."""
+    raw = os.environ.get("WEBHOOK_OUTBOX_ENABLED", "")
+    return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
+async def _webhook_outbox_loop() -> None:
+    """Periodically retry ``session_closed`` webhook deliveries that
+    exhausted their in-line budget (see ``src/models/webhook_outbox.py``),
+    then prune old terminal rows (L3). Runs once at startup, then every
+    ``_WEBHOOK_OUTBOX_INTERVAL_S``. Never dies, same one-try/except-per-
+    iteration convention as every other background loop in this module --
+    two separate try/excepts so a prune failure never skips next pass's
+    retry attempt (and vice versa)."""
+    sm = get_sessionmaker()
+    paused_logged = False
+    while True:
+        if not webhook_outbox_enabled():
+            # Kill switch: retries stop, rows stay pending (and still age out
+            # via max_age), the in-line first attempt is unaffected.
+            if not paused_logged:
+                log.warning("webhook outbox retries paused (WEBHOOK_OUTBOX_ENABLED is off)")
+                paused_logged = True
+        else:
+            paused_logged = False
+            try:
+                n = await run_webhook_outbox_once(sm)
+                if n:
+                    log.info("webhook outbox pass processed rows", extra={"count": n})
+            except Exception:  # noqa: BLE001 - the outbox loop must never die (CancelledError still propagates)
+                log.exception("webhook outbox pass failed")
+        try:
+            n_pruned = await prune_webhook_outbox(sm)
+            if n_pruned:
+                log.info("pruned old webhook outbox rows", extra={"count": n_pruned})
+        except Exception:  # noqa: BLE001 - same never-dies convention
+            log.exception("webhook outbox prune failed")
+        await asyncio.sleep(_WEBHOOK_OUTBOX_INTERVAL_S)
+
+
 async def _seed_crm_kb(
     crm_retrievers: "PerCrmRetrieverRegistry",
     sessionmaker,
@@ -884,6 +1398,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     chat_metrics_prune_task = asyncio.create_task(_prune_chat_turn_metrics_loop(
         settings.secrets.CHAT_METRICS_RETENTION_DAYS,
     ))
+    webhook_outbox_task = asyncio.create_task(_webhook_outbox_loop())
 
     try:
         yield
@@ -893,12 +1408,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         kb_seed_task.cancel()
         metrics_push_task.cancel()
         chat_metrics_prune_task.cancel()
-        # None of the four are awaited after cancel() -- a task that ignores
+        webhook_outbox_task.cancel()
+        # None of the five are awaited after cancel() -- a task that ignores
         # or is slow to honor cancellation would leave this event as the only
         # trace that teardown even asked it to stop.
         debug_event(
             log, "shutdown background_tasks cancel_requested",
-            tasks=["reap_stale_calls", "seed_crm_kb", "push_turn_metrics", "prune_chat_turn_metrics"],
+            tasks=["reap_stale_calls", "seed_crm_kb", "push_turn_metrics",
+                   "prune_chat_turn_metrics", "webhook_outbox"],
         )
         telephony_hooks.set_bridge_factory(None)
         telephony_hooks.set_exotel_bridge_factory(None)

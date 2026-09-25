@@ -3894,7 +3894,7 @@ async def _run_human_mode(
                         "session_id": session_id,
                         "mode_at_close": "human",
                         "summary": summary,
-                    })
+                    }, enqueue_on_failure=True)
                     await bq.put(None)
                     await websocket.send_text(json.dumps({"type": "ended"}))
                     break
@@ -3949,7 +3949,7 @@ async def _send_close_webhook(
             "mode_at_close": mode_at_close,
             "summary": summary,
             "transcript": transcript,
-        })
+        }, enqueue_on_failure=True)
     except Exception:  # noqa: BLE001
         log.exception("session_closed webhook failed", extra={
             "ticket_id": ticket_id, "session_id": session_id})

@@ -25,6 +25,7 @@ import hmac
 import json
 import logging
 import uuid
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Awaitable, Callable, Optional
 
@@ -41,6 +42,16 @@ HTTPPoster = Callable[[str, bytes, dict], Awaitable[int]]
 _TIMEOUT_S = 5.0
 _MAX_ATTEMPTS = 3
 _BACKOFF_BASE_S = 0.3  # 0.3, 0.6, 1.2 ...
+
+# 4xx codes that mean "try again later" rather than "this will never work" --
+# every OTHER 4xx (400, 401, 403, 404, ...) is classified PERMANENT on the
+# DeliveryResult (see deliver_detailed below), though whether that
+# classification actually cuts a delivery's retries short is a separate,
+# opt-in choice (``stop_on_permanent``) — only src/main.py's webhook_outbox
+# loop uses it, and even there a row isn't given up on until 3 delivery
+# attempts have accumulated (see _finalize_webhook_outbox_row's "3-strike"
+# rule) — a transient 403/404 during a brief CRM deploy must not kill a row.
+_RETRYABLE_4XX = frozenset({408, 425, 429})
 
 
 def channel_label(agent_type: Optional[str]) -> str:
@@ -127,7 +138,14 @@ async def _httpx_post(url: str, raw: bytes, headers: dict) -> int:
             resp = await client.post(url, content=raw, headers=headers)
             return resp.status_code
         except httpx.HTTPError as e:  # noqa: BLE001 - a delivery error must not raise
-            log.warning("tenant event POST failed", extra={"url": url, "error": str(e)})
+            # error_type alongside error: str(httpx.ReadTimeout) (and several
+            # other httpx exceptions) is "" -- without error_type, a timeout
+            # and a connect-refused both log as `"error": ""`, indistinguishable
+            # from each other or from "nothing was even attempted".
+            log.warning(
+                "tenant event POST failed",
+                extra={"url": url, "error": str(e), "error_type": type(e).__name__},
+            )
             return -1
 
 
@@ -193,21 +211,71 @@ async def resolve_events_webhook_url(tenant, sessionmaker) -> Optional[str]:
     return url
 
 
-async def deliver(
+@dataclass(frozen=True)
+class DeliveryResult:
+    """Full outcome of a ``deliver_detailed`` call — ``deliver`` below
+    collapses this to just ``.ok`` for callers that never needed more.
+
+    ``final_status`` is the last HTTP status code received, or ``-1`` if the
+    last attempt was a transport-level failure (see ``_httpx_post``'s own
+    ``error_type`` log for which exception). ``permanent`` is True when a
+    non-retryable 4xx (see ``_RETRYABLE_4XX``) stopped retries early — a
+    caller that persists failures (e.g. ``src/main.py``'s webhook_outbox
+    loop) should NOT keep retrying a permanent failure the way it would a
+    transient 5xx/timeout.
+    """
+
+    ok: bool
+    final_status: int
+    permanent: bool = False
+
+
+def _envelope_event_type(envelope: dict[str, Any]) -> Optional[str]:
+    """The event-type-ish field to log, whichever this envelope actually
+    carries: call-event envelopes (``build_envelope`` above) use
+    ``event_type``; BO chat-lifecycle bodies (``src.api.chat_webhooks.
+    send_bo_webhook``) use ``event``. Logging only ever read ``event_type``,
+    so a BO delivery's logs always carried ``event_type=None``."""
+    return envelope.get("event_type") or envelope.get("event")
+
+
+async def deliver_detailed(
     url: str,
     envelope: dict[str, Any],
     secret: Optional[str] = None,
     *,
     http_post: Optional[HTTPPoster] = None,
-) -> bool:
-    """POST a signed envelope to ``url`` with bounded retry. Returns True on a
-    2xx within the retry budget. Never raises."""
+    stop_on_permanent: bool = False,
+) -> DeliveryResult:
+    """POST a signed envelope to ``url`` with bounded retry, returning full
+    delivery detail (``DeliveryResult``) rather than collapsing to a bool —
+    see ``deliver`` below for the bool-only convenience wrapper most callers
+    still use. Never raises.
+
+    ``stop_on_permanent`` (default False): when True, a non-retryable 4xx
+    (anything but 408/425/429 — see ``_RETRYABLE_4XX``) stops retrying after
+    just ONE attempt instead of exhausting ``_MAX_ATTEMPTS`` — that status
+    means the request itself is wrong (bad payload, expired signature,
+    unknown endpoint), and repeating it verbatim can only ever get the same
+    answer. This is opt-in and used ONLY by ``src/main.py``'s webhook_outbox
+    loop, which needs a fast within-one-attempt signal to feed its own
+    cross-attempt 3-strike dead rule. Every other caller — including
+    ``deliver`` below, and so ``src/api/call_store.py``'s call-event
+    webhooks and ``src/api/chat_webhooks.py``'s in-line ``session_closed``
+    attempt — gets the default ``False``, i.e. the SAME unconditional
+    retry-``_MAX_ATTEMPTS``-times-regardless-of-status behavior this
+    function has always had. ``DeliveryResult.permanent`` on the final
+    result still reflects whether the LAST status was a non-retryable 4xx
+    either way — only the retry-loop's own attempt count is gated by this
+    flag, not the classification itself.
+    """
     raw = json.dumps(envelope, separators=(",", ":")).encode("utf-8")
     headers = {"Content-Type": "application/json"}
     if secret:
         headers["X-Signature"] = sign_body(secret, raw)
     poster = http_post or _httpx_post
-    event_type = envelope.get("event_type")
+    event_type = _envelope_event_type(envelope)
+    status = -1
     for attempt in range(_MAX_ATTEMPTS):
         debug_event(
             log, "tenant_events deliver request",
@@ -229,9 +297,44 @@ async def deliver(
             attempt=attempt + 1, status=status,
         )
         if 200 <= status < 300:
-            return True
+            return DeliveryResult(ok=True, final_status=status)
+        is_permanent = 400 <= status < 500 and status not in _RETRYABLE_4XX
+        if is_permanent and stop_on_permanent:
+            log.warning(
+                "tenant event delivery permanent failure — not retrying",
+                extra={"url": url, "event_type": event_type, "status": status},
+            )
+            return DeliveryResult(ok=False, final_status=status, permanent=True)
         if attempt < _MAX_ATTEMPTS - 1:
             await asyncio.sleep(_BACKOFF_BASE_S * (2**attempt))
-    log.warning("tenant event delivery exhausted retries",
-                extra={"url": url, "event_type": envelope.get("event_type")})
-    return False
+    final_permanent = 400 <= status < 500 and status not in _RETRYABLE_4XX
+    log.warning(
+        "tenant event delivery exhausted retries",
+        # final_status: -1 means the last attempt was a transport-level
+        # failure (see _httpx_post's own error_type log for which exception);
+        # any other value is the last non-2xx HTTP status code received.
+        extra={"url": url, "event_type": event_type, "final_status": status},
+    )
+    return DeliveryResult(ok=False, final_status=status, permanent=final_permanent)
+
+
+async def deliver(
+    url: str,
+    envelope: dict[str, Any],
+    secret: Optional[str] = None,
+    *,
+    http_post: Optional[HTTPPoster] = None,
+) -> bool:
+    """POST a signed envelope to ``url`` with bounded retry. Returns True on a
+    2xx within the retry budget. Never raises. Retries the full
+    ``_MAX_ATTEMPTS`` budget regardless of status code (4xx included) —
+    unconditionally, this wrapper never passes ``stop_on_permanent``.
+
+    Thin bool-only wrapper around ``deliver_detailed`` — kept as-is for
+    existing callers (``src/api/call_store.py``'s call-event webhooks,
+    ``src/api/chat_webhooks.py``'s inline attempt) that only ever needed
+    success/failure, not the full ``DeliveryResult``, and whose behavior
+    must not change just because ``deliver_detailed`` gained an opt-in
+    fast-fail mode for the durable outbox queue."""
+    result = await deliver_detailed(url, envelope, secret, http_post=http_post)
+    return result.ok
