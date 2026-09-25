@@ -135,6 +135,18 @@ class OpenAICompatLLMAdapter(ILLMProvider):
                 "function": {"name": t.name, "description": t.description,
                              "parameters": t.parameters},
             } for t in config.tools]
+            if config.tool_mode == "none":
+                # OpenAI-compatible (vLLM) equivalent of Gemini's
+                # tool_config mode=NONE — forbids a NEW tool call this
+                # request while keeping the declarations on it (see
+                # chatbot.py's forced final-answer call/retry, which sends
+                # tools with tool_mode="none" specifically so a model that
+                # still wants to call a tool is forced to answer in text
+                # instead — silently ignoring tool_mode here would let it
+                # start another tool round chatbot.py never reads
+                # (_handle_with_tools only looks at result.text on that
+                # call), producing an empty reply and a needless escalation).
+                kwargs["tool_choice"] = "none"
         elif config.response_format == "json":
             kwargs["response_format"] = {"type": "json_object"}
         return kwargs

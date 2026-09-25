@@ -338,6 +338,16 @@ class GeminiLLMAdapter(ILLMProvider):
             # Gemini rejects response_mime_type=application/json together with
             # tools, so JSON format is suppressed for tool turns (the agent does a
             # separate no-tools JSON finalize turn).
+            if config.tool_mode == "none":
+                # Forbid a NEW tool call this round while keeping the tool
+                # declarations themselves on the request (chatbot.py's forced
+                # final-answer call after max_tool_rounds: the history already
+                # contains function_call/function_response turns from this
+                # tool set, and dropping the declarations entirely risks
+                # confusing the model about those prior turns). See
+                # generate() below for the explicit-cache interaction this
+                # creates — cached_content can't be combined with tool_config.
+                cfg["tool_config"] = {"function_calling_config": {"mode": "NONE"}}
         elif config.response_format == "json":
             cfg["response_mime_type"] = "application/json"
         return cfg
@@ -642,15 +652,41 @@ class GeminiLLMAdapter(ILLMProvider):
             cache_name, cache_key = self._cache_lookup_and_arm(
                 model, system, gen_config.get("tools"),
             )
+            if cache_name and gen_config.get("tool_config"):
+                # Same restriction as system_instruction/tools below —
+                # "CachedContent can not be used with GenerateContent request
+                # setting system_instruction, tools or tool_config" — applies
+                # to tool_config too. google-genai's CreateCachedContentConfig
+                # DOES accept a tool_config (as of 2.2.0) — _create_cache
+                # above just never passes one, since building AND arming a
+                # second, NONE-mode cache variant purely for this rare
+                # forced-final-answer call (see tool_mode="none" in
+                # chatbot.py) would roughly double cache storage/creation
+                # traffic for a call that isn't the hot path. Skipping the
+                # cache here instead is a deliberate tradeoff, not a
+                # technical impossibility. Silently dropping tool_config to
+                # keep the cache, though, would defeat the whole point of
+                # tool_mode="none" (the model could still call a tool we
+                # explicitly forbade) — so this call goes uncached instead.
+                # The lookup above (_cache_lookup_and_arm) already ran and
+                # updated sightings/last_used/creation-scheduling normally —
+                # only the DECISION to use cache_name on THIS request is
+                # skipped, so the registry stays consistent and a later call
+                # without tool_config can still hit the cache.
+                debug_event(log, "gemini cache skipped: tool_config incompatible",
+                            model=model, cache_key=cache_key)
+                cache_name = None
 
         if cache_name:
             # A request carrying `cached_content` must not ALSO carry
-            # `system_instruction`/`tools` — verified live against the
-            # Developer API this session: combining them 400s with
-            # "CachedContent can not be used with GenerateContent request
-            # setting system_instruction, tools or tool_config." Whatever the
-            # cache holds is implicitly part of the prompt already.
-            gen = {k: v for k, v in gen_config.items() if k != "tools"}
+            # `system_instruction`/`tools`/`tool_config` — verified live
+            # against the Developer API this session: combining them 400s
+            # with "CachedContent can not be used with GenerateContent
+            # request setting system_instruction, tools or tool_config."
+            # Whatever the cache holds is implicitly part of the prompt
+            # already. (tool_config is additionally excluded above, before
+            # this branch is even reached, whenever it's set — see there.)
+            gen = {k: v for k, v in gen_config.items() if k not in ("tools", "tool_config")}
             gen["cached_content"] = cache_name
         else:
             # Fresh copy (mirroring the cache-hit branch above), not an alias

@@ -60,6 +60,25 @@ class LLMConfig:
     # Function-calling tools. When set, the JSON response-format is suppressed
     # (Gemini rejects response_mime_type=application/json together with tools).
     tools: Optional[list[ToolSpec]] = None
+    # Provider-side control over whether the model MAY call a tool this turn,
+    # independent of whether ``tools`` is populated. "auto" (or None, the
+    # default) lets the model choose freely — unchanged behavior. "none"
+    # keeps ``tools`` declared (so the model still sees their schemas/results
+    # already in history — dropping the declaration for a call whose history
+    # contains prior function calls/results can confuse or break some
+    # providers) but forbids emitting a new one, forcing a plain text answer.
+    # ANY adapter that sends ``tools`` on the wire MUST honour "none" — a
+    # caller sets it specifically to force a plain-text answer (e.g.
+    # chatbot.py's forced final-answer call/retry after max_tool_rounds), and
+    # an adapter that silently ignores it lets the model start another tool
+    # round the caller never reads, producing an empty reply instead. Current
+    # adapters: GeminiLLMAdapter maps it to tool_config mode=NONE
+    # (_build_config, src/providers/llm/gemini.py); OpenAICompatLLMAdapter
+    # (vLLM) maps it to tool_choice="none" (_request_kwargs,
+    # src/providers/llm/openai_compat.py). anthropic_claude.py and groq.py
+    # never read config.tools at all (no tool-calling support yet), so they
+    # have nothing to honour and ignore this harmlessly by construction.
+    tool_mode: Optional[str] = None
 
 
 @dataclass

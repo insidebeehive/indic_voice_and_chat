@@ -17,6 +17,7 @@ from src.chatbot.media import prepare_multimodal_content
 from src.interfaces.llm import (
     ContentPart,
     ILLMProvider,
+    LLMConfig,
     LLMMessage,
     LLMResult,
     ToolCall,
@@ -206,6 +207,130 @@ async def test_escalate_tool_sets_action_and_escalation(retriever) -> None:
 
 
 @pytest.mark.asyncio
+async def test_tool_requested_escalation_preserved_when_final_answer_also_unusable(
+    retriever,
+) -> None:
+    """The model calls escalate_to_human (a real, model-requested hand-off)
+    but the final-answer synthesis call still comes back empty — triggering
+    _escalate_if_still_unusable's own automatic hand-off too. The dict on
+    ChatTurnResult.escalation must stay the model's own reason/summary, not
+    get clobbered by the generic no_usable_response one (see
+    _unusable_escalation_dict's caller in _handle_with_tools)."""
+    llm = ScriptedLLM([
+        LLMResult(text="", finish_reason="tool_calls", tool_calls=[
+            ToolCall(id="t1", name="escalate_to_human",
+                     arguments={"reason": "angry", "summary": "refund dispute"})]),
+        LLMResult(text="", finish_reason="stop"),  # final synthesis: empty
+        LLMResult(text="", finish_reason="stop"),  # retry: also empty
+    ])
+    agent = _agent(llm, retriever)
+    result = await agent.handle_message("I want a refund now")
+    assert result.response.action == "escalate"
+    assert result.escalation == {"reason": "angry", "summary": "refund dispute"}
+
+
+@pytest.mark.asyncio
+async def test_unusable_after_retry_sets_escalation_dict(retriever) -> None:
+    """Two generations in a row producing nothing usable (no tool call, no
+    parseable text) must populate ChatTurnResult.escalation — not just
+    response.action — so src/api/chat.py's handoff actually fires (it keys
+    off result.escalation being truthy, not the response text)."""
+    llm = ScriptedLLM([
+        LLMResult(text="", finish_reason="stop"),  # first round: no tool calls, empty text
+        LLMResult(text="", finish_reason="stop"),  # unusable-response retry: also empty
+    ])
+    agent = _agent(llm, retriever)
+    result = await agent.handle_message("where is my ₹19,600 withdrawal?")
+    assert result.response.action == "escalate"
+    assert result.escalation == {
+        "reason": "no_usable_response",
+        "summary": "where is my ₹19,600 withdrawal?",
+    }
+    # The customer-facing text is the fixed handoff line, not a canned
+    # "rephrase?" fallback (which the customer can't act on — the retry
+    # already tried again) and not raw parser internals.
+    assert result.response.response_text == chatbot_mod._UNUSABLE_ESCALATION_TEXT
+    assert "connect you to a support agent" in result.response.response_text
+
+
+@pytest.mark.asyncio
+async def test_rounds_exhausted_forced_call_is_answerable(retriever, monkeypatch) -> None:
+    """The forced final-answer call issued when max_tool_rounds is exhausted
+    (and the unusable-response retry after it, if it fires) must: keep tools
+    declared with tool_mode="none" (not tools=None — the history already has
+    function_call/function_response turns from this tool set), pass the
+    agent's configured model explicitly, and carry the fixed forced-answer
+    instruction as a role="user" message."""
+    async def crm_exec(tc: ToolCall, *, timeout_s: float = 0.0) -> dict:
+        return {"balance": 500}
+
+    crm_tools = [ToolSpec(name="get_balance", description="get balance",
+                          parameters={"type": "object", "properties": {}})]
+    llm = ScriptedLLM([
+        LLMResult(text="", finish_reason="tool_calls", tool_calls=[
+            ToolCall(id="t1", name="get_balance", arguments={})]),
+        LLMResult(text="", finish_reason="tool_calls", tool_calls=[
+            ToolCall(id="t2", name="get_balance", arguments={})]),
+        LLMResult(text="final answer", finish_reason="stop"),
+    ])
+    agent = _agent(
+        llm, retriever, crm_tools=crm_tools, crm_executor=crm_exec, max_tool_rounds=2,
+        llm_config=LLMConfig(model="gemini-3.5-flash", max_tokens=2048),
+    )
+    result = await agent.handle_message("balance please")
+
+    forced_messages, forced_cfg = llm.calls[2]
+    assert forced_cfg.model == "gemini-3.5-flash"
+    assert forced_cfg.tool_mode == "none"
+    assert forced_cfg.tools  # populated, not None/empty
+    assert any(
+        m.role == "user" and chatbot_mod._FORCED_FINAL_ANSWER_INSTRUCTION in (m.content or "")
+        for m in forced_messages
+    )
+    assert result.response.response_text == "final answer"
+
+
+@pytest.mark.asyncio
+async def test_forced_call_and_retry_both_fire_instruction_appears_once(
+    retriever,
+) -> None:
+    """When the rounds-exhausted forced call ITSELF comes back unusable
+    (empty), the unusable-response retry fires next -- reusing the SAME
+    `messages` list the forced call already appended
+    _FORCED_FINAL_ANSWER_INSTRUCTION to. The retry must not append it (or
+    the non-exhausted variant) a second time."""
+    async def crm_exec(tc: ToolCall, *, timeout_s: float = 0.0) -> dict:
+        return {"balance": 500}
+
+    crm_tools = [ToolSpec(name="get_balance", description="get balance",
+                          parameters={"type": "object", "properties": {}})]
+    llm = ScriptedLLM([
+        LLMResult(text="", finish_reason="tool_calls", tool_calls=[
+            ToolCall(id="t1", name="get_balance", arguments={})]),
+        LLMResult(text="", finish_reason="tool_calls", tool_calls=[
+            ToolCall(id="t2", name="get_balance", arguments={})]),
+        LLMResult(text="", finish_reason="stop"),  # forced final answer: empty -> unusable
+        LLMResult(text="Your balance is 500.", finish_reason="stop"),  # retry succeeds
+    ])
+    agent = _agent(llm, retriever, crm_tools=crm_tools, crm_executor=crm_exec, max_tool_rounds=2)
+    result = await agent.handle_message("balance please")
+
+    assert len(llm.calls) == 4  # 2 tool rounds + forced call + retry
+    retry_messages, retry_cfg = llm.calls[3]
+    assert retry_cfg.tool_mode == "none"
+    occurrences = sum(
+        1 for m in retry_messages
+        if m.role == "user" and chatbot_mod._FORCED_FINAL_ANSWER_INSTRUCTION in (m.content or "")
+    )
+    assert occurrences == 1
+    assert not any(
+        m.role == "user" and chatbot_mod._UNUSABLE_RETRY_ANSWER_INSTRUCTION in (m.content or "")
+        for m in retry_messages
+    )
+    assert result.response.response_text == "Your balance is 500."
+
+
+@pytest.mark.asyncio
 async def test_offer_call_tool_sets_call_offer(retriever) -> None:
     llm = ScriptedLLM([
         LLMResult(text="", finish_reason="tool_calls", tool_calls=[
@@ -374,9 +499,27 @@ async def test_tool_loop_retries_once_when_final_answer_is_empty(retriever) -> N
     assert len(llm.calls) == 3  # tool round + empty final + one retry
     # The retry reused the completed tool-call history, not a fresh tool round.
     assert any(m.role == "tool" and m.name == "get_matka_bids" for m in llm.calls[2][0])
-    # The retry's LLMConfig has no tools — it cannot start another tool round,
-    # only synthesize a final plain-text answer from the completed history.
-    assert llm.calls[2][1].tools is None
+    # The retry's LLMConfig keeps tools declared (messages already contain
+    # function_call/function_response turns from them) but forces tool_mode
+    # "none" — it cannot start another tool round, only synthesize a final
+    # plain-text answer from the completed history.
+    assert llm.calls[2][1].tools is not None
+    assert llm.calls[2][1].tool_mode == "none"
+    # Rounds were NOT exhausted here (round 1 ended normally with no tool
+    # calls at all) -- the retry must get the variant instruction that
+    # doesn't claim lookups were used/tool results exist above, not
+    # _FORCED_FINAL_ANSWER_INSTRUCTION (that one is reserved for the
+    # rounds-exhausted `else` branch -- see test_rounds_exhausted_forced_call_
+    # is_answerable and test_forced_call_and_retry_both_fire_instruction_
+    # appears_once for that case).
+    assert any(
+        m.role == "user" and chatbot_mod._UNUSABLE_RETRY_ANSWER_INSTRUCTION in (m.content or "")
+        for m in llm.calls[2][0]
+    )
+    assert not any(
+        m.role == "user" and "used all the lookups" in (m.content or "")
+        for m in llm.calls[2][0]
+    )
 
 
 # --- Per-turn cumulative tool budget (Fix 1) -----------------------------

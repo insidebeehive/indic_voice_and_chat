@@ -725,6 +725,52 @@ async def test_generate_with_tools_omits_json_mime() -> None:
 
 
 @pytest.mark.asyncio
+async def test_tool_mode_none_with_tools_forces_function_calling_mode_none() -> None:
+    from src.interfaces.llm import ToolSpec
+    client = _make_client(generate_return=_response("ok"))
+    adapter = GeminiLLMAdapter({"client": client})
+    await adapter.generate(
+        [LLMMessage(role="user", content="hi")],
+        LLMConfig(response_format="text",
+                  tools=[ToolSpec("t", "d", {"type": "object"})], tool_mode="none"))
+    cfg = client.aio.models.generate_content.await_args.kwargs["config"]
+    assert cfg["tool_config"] == {"function_calling_config": {"mode": "NONE"}}
+    # The declarations themselves must stay on the request — tool_mode="none"
+    # forbids a NEW call, it doesn't un-declare the tools the model's prior
+    # function_call/function_response history refers to.
+    assert "tools" in cfg
+
+
+@pytest.mark.asyncio
+async def test_tool_mode_none_without_tools_is_a_noop() -> None:
+    # tool_config only ever makes sense alongside a tools declaration —
+    # _build_config's tool_mode branch lives inside `if config.tools:`.
+    client = _make_client(generate_return=_response("ok"))
+    adapter = GeminiLLMAdapter({"client": client})
+    await adapter.generate(
+        [LLMMessage(role="user", content="hi")],
+        LLMConfig(response_format="text", tools=None, tool_mode="none"))
+    cfg = client.aio.models.generate_content.await_args.kwargs["config"]
+    assert "tool_config" not in cfg
+    assert "tools" not in cfg
+
+
+@pytest.mark.asyncio
+async def test_tool_mode_auto_or_default_omits_tool_config() -> None:
+    from src.interfaces.llm import ToolSpec
+    client = _make_client(generate_return=_response("ok"))
+    adapter = GeminiLLMAdapter({"client": client})
+    tools = [ToolSpec("t", "d", {"type": "object"})]
+    for tool_mode in (None, "auto"):
+        await adapter.generate(
+            [LLMMessage(role="user", content="hi")],
+            LLMConfig(response_format="text", tools=tools, tool_mode=tool_mode))
+        cfg = client.aio.models.generate_content.await_args.kwargs["config"]
+        assert "tool_config" not in cfg
+        assert "tools" in cfg
+
+
+@pytest.mark.asyncio
 async def test_thought_signature_round_trips_through_tool_loop() -> None:
     # Gemini 3.x attaches thought_signature to function-call parts and 400s
     # ("missing a thought_signature") if the replayed call omits it. Caught
@@ -905,6 +951,61 @@ async def test_hit_passes_cached_content_and_omits_system_and_tools(monkeypatch)
     assert cfg.get("cached_content") == "cachedContents/fake123"
     assert "system_instruction" not in cfg
     assert "tools" not in cfg
+
+
+@pytest.mark.asyncio
+async def test_tool_mode_none_call_skips_cache_but_keeps_registry(monkeypatch) -> None:
+    """A request needing tool_config (tool_mode="none") must never combine it
+    with cached_content -- the Developer API 400s on "CachedContent can not
+    be used with GenerateContent request setting system_instruction, tools or
+    tool_config". google-genai's CreateCachedContentConfig can technically
+    accept a tool_config, but arming a second, NONE-mode cache variant purely
+    for this rare forced-final-answer call would roughly double cache
+    storage/creation traffic for a call that isn't the hot path -- so this
+    call deliberately falls back to an uncached, full request
+    (system_instruction + tools + tool_config) rather than either building a
+    second cache or silently dropping tool_config (which would let the model
+    call a tool we explicitly told it not to). The registry itself keeps
+    tracking sightings/arming normally -- only the decision to USE cache_name
+    on this one request is skipped -- so a LATER call without tool_config can
+    still hit the already-armed cache."""
+    from src.interfaces.llm import ToolSpec
+    monkeypatch.setenv("GEMINI_EXPLICIT_CACHE", "1")
+    client = _make_client(generate_return=_response("ok"))
+    adapter = GeminiLLMAdapter({"client": client})
+    tools = [ToolSpec(name="search_kb", description="search the KB",
+                       parameters={"type": "object", "properties": {}})]
+    config = LLMConfig(tools=tools)
+
+    await adapter.generate(_msgs(_BIG_SYSTEM), config)  # sighting 1
+    await adapter.generate(_msgs(_BIG_SYSTEM), config)  # sighting 2 -> schedules creation
+    await asyncio.gather(*gemini_module._inflight_cache_tasks)
+
+    # Only one registry key is ever produced in this test (one model/system/
+    # tools combination), so grab its entry directly rather than
+    # reconstructing the tools-as-dicts shape _cache_key expects.
+    assert len(adapter._cache_entries) == 1
+    entry = next(iter(adapter._cache_entries.values()))
+    sightings_before = entry.sightings
+
+    # Would normally be a hit (sighting 3) -- but this call also needs
+    # tool_config, so it must bypass the cache instead of dropping it.
+    forced_config = LLMConfig(tools=tools, tool_mode="none")
+    await adapter.generate(_msgs(_BIG_SYSTEM), forced_config)
+
+    cfg = client.aio.models.generate_content.await_args.kwargs["config"]
+    assert "cached_content" not in cfg
+    assert cfg["system_instruction"] == _BIG_SYSTEM
+    assert cfg["tools"]
+    assert cfg["tool_config"] == {"function_calling_config": {"mode": "NONE"}}
+
+    # The registry keeps tracking normally -- sighting 3's own lookup still
+    # incremented `sightings`, only the decision to USE this cache was
+    # skipped -- and a later call WITHOUT tool_config still hits it.
+    assert entry.sightings == sightings_before + 1
+    await adapter.generate(_msgs(_BIG_SYSTEM), config)
+    cfg2 = client.aio.models.generate_content.await_args.kwargs["config"]
+    assert cfg2.get("cached_content") == "cachedContents/fake123"
 
 
 @pytest.mark.asyncio

@@ -40,6 +40,39 @@ async def test_emit_escalation_sends_signed_chat_event() -> None:
 
 
 @pytest.mark.asyncio
+async def test_unusable_response_escalation_reaches_the_handoff_path() -> None:
+    """Before the chatbot.py fix, an unusable-response hand-off (two
+    generations in a row with nothing usable) set response.action="escalate"
+    but left ChatTurnResult.escalation as None, so this API-level dispatch
+    never fired and no chat.escalated event, and no human handoff, ever
+    happened (production evidence: 105/1187 replies were the canned
+    _UNUSABLE_ESCALATION_TEXT line, none followed by a human agent). This
+    proves the API layer treats that escalation dict (reason=
+    "no_usable_response", built by _unusable_escalation_dict in chatbot.py)
+    exactly like any other -- the fix is enough on its own, no API-side
+    change needed."""
+    captured: list[dict] = []
+
+    async def _notifier(env: dict) -> None:
+        captured.append(env)
+
+    set_tenant_event_notifier(_notifier)
+    try:
+        await chat._emit_escalation(
+            "t1", "cs_1",
+            _result({"reason": "no_usable_response",
+                     "summary": "where is my withdrawal?"}))
+    finally:
+        set_tenant_event_notifier(None)
+
+    assert len(captured) == 1
+    env = captured[0]
+    assert env["event_type"] == "chat.escalated"
+    assert env["data"] == {
+        "reason": "no_usable_response", "summary": "where is my withdrawal?"}
+
+
+@pytest.mark.asyncio
 async def test_no_escalation_emits_nothing() -> None:
     captured: list[dict] = []
 

@@ -122,6 +122,52 @@ async def test_generate_with_tools_passes_openai_tools_and_omits_json() -> None:
 
 
 @pytest.mark.asyncio
+async def test_tool_mode_none_maps_to_tool_choice_none() -> None:
+    # chatbot.py's forced final-answer call/retry sends tools with
+    # tool_mode="none" specifically to forbid a NEW tool call while keeping
+    # the declarations on the request (history already has function_call/
+    # function_response turns from them). This adapter must honour that the
+    # same way GeminiAdapter does via tool_config mode=NONE — otherwise a
+    # vLLM-backed model could start another tool round chatbot.py never
+    # reads on that call (it only looks at result.text there), producing an
+    # empty reply and a needless escalation.
+    client = _make_client(return_value=_response("ok"))
+    adapter = OpenAICompatLLMAdapter({"client": client})
+    tools = [ToolSpec(name="search_kb", description="search",
+                      parameters={"type": "object", "properties": {}})]
+    await adapter.generate([LLMMessage(role="user", content="hi")],
+                           LLMConfig(response_format="text", tools=tools, tool_mode="none"))
+    kwargs = client.chat.completions.create.await_args.kwargs
+    assert kwargs["tool_choice"] == "none"
+    assert kwargs["tools"]  # declarations stay on the request
+
+
+@pytest.mark.asyncio
+async def test_tool_mode_none_without_tools_is_a_noop() -> None:
+    client = _make_client(return_value=_response("ok"))
+    adapter = OpenAICompatLLMAdapter({"client": client})
+    await adapter.generate([LLMMessage(role="user", content="hi")],
+                           LLMConfig(response_format="text", tools=None, tool_mode="none"))
+    kwargs = client.chat.completions.create.await_args.kwargs
+    assert "tool_choice" not in kwargs
+    assert "tools" not in kwargs
+
+
+@pytest.mark.asyncio
+async def test_tool_mode_auto_or_default_omits_tool_choice() -> None:
+    client = _make_client(return_value=_response("ok"))
+    adapter = OpenAICompatLLMAdapter({"client": client})
+    tools = [ToolSpec(name="search_kb", description="search",
+                      parameters={"type": "object", "properties": {}})]
+    for tool_mode in (None, "auto"):
+        await adapter.generate([LLMMessage(role="user", content="hi")],
+                               LLMConfig(response_format="text", tools=tools, tool_mode=tool_mode))
+        kwargs = client.chat.completions.create.await_args.kwargs
+        assert "tool_choice" not in kwargs
+        assert kwargs["tools"]
+
+
+@pytest.mark.asyncio
 async def test_generate_extracts_tool_calls() -> None:
     client = _make_client(return_value=_response(
         None, finish="tool_calls",

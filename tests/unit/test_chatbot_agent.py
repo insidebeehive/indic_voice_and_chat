@@ -221,6 +221,14 @@ async def test_single_shot_falls_back_gracefully_when_retry_also_fails(retriever
     result = await agent.handle_message("Tell me about Plan B")
     assert result.response.parse_error == "empty response"
     assert len(llm.calls) == 2  # the original call + exactly one retry, then give up
+    # Two generations in a row with nothing usable hands off to a human —
+    # ChatTurnResult.escalation must be populated (src/api/chat.py's handoff
+    # keys off it being truthy), not just response.action.
+    assert result.response.action == "escalate"
+    assert result.escalation == {
+        "reason": "no_usable_response",
+        "summary": "Tell me about Plan B",
+    }
 
 
 @pytest.mark.asyncio

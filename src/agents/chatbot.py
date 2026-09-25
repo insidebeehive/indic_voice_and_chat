@@ -107,6 +107,39 @@ _UNUSABLE_ESCALATION_TEXT = (
     "support agent who can help."
 )
 
+# Reason code on the escalation dict _escalate_if_still_unusable's callers
+# build — distinguishes this automatic hand-off from one the model itself
+# requested via the escalate_to_human tool (whose reason/summary are the
+# model's own free text — see ESCALATE in _dispatch_tool).
+_UNUSABLE_ESCALATION_REASON = "no_usable_response"
+
+# Appended as a role="user" message immediately before the forced plain-
+# answer call issued when max_tool_rounds is exhausted — see
+# _handle_with_tools' `else` branch. Explicitly claims lookups were used and
+# tool results exist above, which is only true in that branch (the loop ran
+# out of rounds while the model still wanted another tool call). A code
+# constant, not a prompt-file edit — mirrors how _build_failure_directive's
+# messages are appended.
+_FORCED_FINAL_ANSWER_INSTRUCTION = (
+    "You have used all the lookups allowed for this turn. Answer the "
+    "customer now using only the tool results above, in the reply format "
+    "the system prompt specifies. If something they asked about is still "
+    "missing, say so plainly and offer to connect them to a human."
+)
+
+# Appended instead of _FORCED_FINAL_ANSWER_INSTRUCTION when the unusable-
+# response retry fires WITHOUT the rounds-exhausted branch having run first
+# (e.g. round 1 returned an empty/unparseable response with no tool call at
+# all) — that case may have no tool results, and no lookups may have been
+# used this turn, so the "used all the lookups"/"tool results above" wording
+# would be false. Deliberately never both appended (see
+# forced_answer_instruction_appended in _handle_with_tools).
+_UNUSABLE_RETRY_ANSWER_INSTRUCTION = (
+    "Answer the customer now, in the reply format the system prompt "
+    "specifies. If you can't answer what they asked, say so plainly and "
+    "offer to connect them to a human."
+)
+
 # Cap on the bumped max_tokens used for a retry attempted after a finish_reason
 # of "length" (truncation) — see _retry_if_unusable. Keeps a runaway retry from
 # ballooning cost/latency even for a tenant configured with an already-large
@@ -389,6 +422,23 @@ def _build_failure_directive(labels: list[str], escalate: bool) -> str:
             "still must confirm before you actually escalate)."
         )
     return "\n".join(lines)
+
+
+def _unusable_escalation_dict(query_text: str) -> dict:
+    """Escalation dict for a hand-off ``_escalate_if_still_unusable`` fires,
+    in the same shape the ``escalate_to_human`` TOOL produces (see the
+    ESCALATE branch of ``_dispatch_tool``) — src/api/chat.py's handoff path
+    keys off ``ChatTurnResult.escalation`` being non-None regardless of which
+    of the two populated it, so this must match that shape exactly.
+
+    ``summary`` uses the customer's own last message rather than an LLM call:
+    the model has already failed twice this turn (original attempt + retry),
+    so spending a THIRD call just to phrase a handoff summary buys the
+    customer nothing — they're being handed to a human either way.
+    """
+    text = (query_text or "").strip()
+    summary = text[:300] if text else "Customer message the assistant could not answer."
+    return {"reason": _UNUSABLE_ESCALATION_REASON, "summary": summary}
 
 # Unicode block boundaries for common Indic scripts.
 _SCRIPT_RANGES: list[tuple[int, int, str]] = [
@@ -1143,7 +1193,13 @@ class ChatBotAgent(BaseAgent):
                 response = parse_chatbot_response(retried_result.text)
         # Two generations in a row with nothing usable: hand off rather than
         # telling the customer to rephrase, which cannot help them.
-        response, _escalated_unusable = self._escalate_if_still_unusable(response)
+        response, escalated_unusable = self._escalate_if_still_unusable(response)
+        # This path has no tool-requested escalation to preserve (the
+        # escalate_to_human tool only exists on the tools path), so there's
+        # nothing to guard against overwriting here.
+        escalation: dict | None = (
+            _unusable_escalation_dict(query_text) if escalated_unusable else None
+        )
         # 5. Guard. apply_hallucination_guard runs first so its own
         # confidence == "high" gate sees the model's ORIGINAL confidence, not
         # one already downgraded by apply_pii_guard -- apply_pii_guard runs
@@ -1259,6 +1315,7 @@ class ChatBotAgent(BaseAgent):
         await self._emit_turn_metric(metrics)
         return ChatTurnResult(
             response=response, retrieved=retrieved, rag_context_chars=len(rag.text),
+            escalation=escalation,
             input_tokens=in_tok, output_tokens=out_tok,
             llm_provider=self._llm_provider, llm_model=self._llm_model,
             metrics=metrics)
@@ -1290,6 +1347,11 @@ class ChatBotAgent(BaseAgent):
         # whatever value the prior round left it at.)
         directive_fired_this_turn = False
         directive_escalated_this_turn = False
+        # Set when the rounds-exhausted forced final call (below) has already
+        # appended _FORCED_FINAL_ANSWER_INSTRUCTION to `messages` — lets the
+        # later unusable-response retry (also a forced-answer call) skip
+        # re-appending it, rather than sending it twice in the same request.
+        forced_answer_instruction_appended = False
         # Cumulative tool time spent so far THIS TURN — persists across both
         # rounds (initialized here, outside the round loop below), which is
         # what makes _TOOL_BUDGET_S a per-turn budget rather than a per-round
@@ -1544,10 +1606,14 @@ class ChatBotAgent(BaseAgent):
                     log, "chatbot tool_round exhausted", max_rounds=self._max_tool_rounds,
                     last_round_tool_calls=[t.name for t in result.tool_calls],
                 )
+            messages.append(LLMMessage(role="user", content=_FORCED_FINAL_ANSWER_INSTRUCTION))
+            forced_answer_instruction_appended = True
             llm_start = time.perf_counter()
             result = await self._llm.generate(
-                messages, LLMConfig(temperature=cfg.temperature, max_tokens=cfg.max_tokens,
-                                    response_format="text"))
+                messages, LLMConfig(
+                    model=self._llm_config.model, temperature=cfg.temperature,
+                    max_tokens=cfg.max_tokens, response_format="text",
+                    tools=tools, tool_mode="none"))
             llm_ms_list.append((time.perf_counter() - llm_start) * 1000)
             _forced_in, _forced_out, _forced_cached = _usage_tokens(result)
             in_tok += _forced_in
@@ -1601,15 +1667,30 @@ class ChatBotAgent(BaseAgent):
             # once before falling back. The tool rounds already completed and
             # are reflected in ``messages`` (tool-call + tool-result turns
             # appended), so this only re-attempts the final answer synthesis,
-            # not the whole tool loop. tools=None explicitly — the retry can't
-            # start another tool round, only synthesize a final plain answer.
+            # not the whole tool loop. tools stays populated (not None) with
+            # tool_mode="none": the retry can't start another tool round, but
+            # ``messages`` contains function_call/function_response turns from
+            # this same tool set, and dropping the declarations entirely on a
+            # follow-up call risks confusing the model about its own history.
             retry_cfg = LLMConfig(
                 model=self._llm_config.model,
                 temperature=self._llm_config.temperature,
                 max_tokens=self._llm_config.max_tokens,
                 response_format="text",
-                tools=None,
+                tools=tools,
+                tool_mode="none",
             )
+            # Only append an instruction if the rounds-exhausted branch above
+            # didn't already put one in `messages` — never send it twice in
+            # the same request. Reaching here with forced_answer_instruction_
+            # appended still False means rounds_exhausted's branch did NOT
+            # run (that's the only place that flag is set), so this retry may
+            # have no tool results/lookups to point to — use the variant that
+            # doesn't claim otherwise.
+            if not forced_answer_instruction_appended:
+                messages.append(
+                    LLMMessage(role="user", content=_UNUSABLE_RETRY_ANSWER_INSTRUCTION))
+                forced_answer_instruction_appended = True
             retry_fired = True
             retried, retry_ms = await self._retry_if_unusable(
                 result.finish_reason, messages, retry_cfg,
@@ -1657,6 +1738,11 @@ class ChatBotAgent(BaseAgent):
         # escalate keeps its own wording rather than being overwritten by the
         # generic handoff line.
         response, escalated_unusable = self._escalate_if_still_unusable(response)
+        # Only build the automatic hand-off dict when the model didn't
+        # already request one via the escalate_to_human tool this turn —
+        # `escalation` set above (tool dispatch) keeps its own reason/summary.
+        if escalated_unusable and not escalation:
+            escalation = _unusable_escalation_dict(query_text)
         if escalation:
             response.action = "escalate"
         # Only guard fully when the agent actually retrieved (search_knowledge_base
