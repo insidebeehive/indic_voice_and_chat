@@ -894,9 +894,22 @@ async def escalating_app(tmp_faiss_index: str, fake_redis, tmp_path):
     await engine.dispose()
 
 
-def test_claim_session_and_agent_ws(escalating_app: FastAPI) -> None:
-    """Full BO handover: customer WS escalates → claim → agent-ws history + reply."""
+def test_claim_session_and_agent_ws(escalating_app: FastAPI, monkeypatch) -> None:
+    """Full BO handover: customer WS escalates → claim → agent-ws history + reply.
+
+    ``escalating_app``'s tenant has no ``events_webhook_url``, so the real
+    ``send_bo_webhook`` returns False and the escalation reverts to the bot
+    before reaching awaiting_human. Stubbed to acknowledge, as in
+    ``_escalate_and_decline`` below: this test is about the handover, not the
+    webhook."""
     from starlette.websockets import WebSocketDisconnect
+
+    from src.api import chat_webhooks
+
+    async def _fake_send_bo_webhook(tenant, event_type, payload, **kwargs):
+        return True
+
+    monkeypatch.setattr(chat_webhooks, "send_bo_webhook", _fake_send_bo_webhook)
 
     client = TestClient(escalating_app)
     sid = _create_session(client)
