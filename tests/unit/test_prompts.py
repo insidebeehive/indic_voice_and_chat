@@ -968,3 +968,14 @@ def test_chatbot_prompt_escalation_never_promises_an_outcome() -> None:
         assert "who will guide them on this" in prompt
         assert "Never promise what the human will do or how quickly" in prompt
         assert "offer help and guidance, not an outcome" in prompt
+
+
+def test_chatbot_prompt_no_trailing_question_or_later_update_promise() -> None:
+    """Production reply: answered a withdrawal status, then asked "Kya aap iska
+    status check karna chahte hain?" and promised "aapko inform kar diya
+    jayega", though nothing sends withdrawal updates."""
+    for pack in ("betting", "generic"):
+        prompt = build_chatbot_system_prompt(company_name="Acme", prompt_pack=pack)
+        assert "Do not end a reply that already answers the question" in prompt
+        assert "Ask a question only when you need the answer to proceed" in prompt
+        assert "never promise to notify or update them later" in prompt
