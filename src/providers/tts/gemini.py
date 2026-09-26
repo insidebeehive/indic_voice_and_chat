@@ -94,8 +94,8 @@ class GeminiTTSAdapter(ITTSProvider):
             resp.raise_for_status()
 
         data = resp.json()
-        inline = data["candidates"][0]["content"]["parts"][0]["inlineData"]
-        raw_pcm24 = base64.b64decode(inline["data"])   # raw PCM16 at 24 kHz
+        raw_pcm24 = base64.b64decode(
+            _inline_audio_b64(data, model=model_used, text_chars=len(text)))  # PCM16 at 24 kHz
 
         target_rate = config.sample_rate or 16000
         if target_rate != _NATIVE_RATE:
@@ -123,6 +123,52 @@ class GeminiTTSAdapter(ITTSProvider):
 
     def get_available_voices(self, language: str) -> list[dict]:
         return list(_VOICES)
+
+
+class GeminiTTSNoAudioError(RuntimeError):
+    """Gemini answered 200 but returned no audio (blocked prompt, a candidate
+    with no content, or a stop before any audio). The message names why."""
+
+
+def _inline_audio_b64(data: dict, *, model: str, text_chars: int) -> str:
+    """The base64 audio from a generateContent response, or raise
+    GeminiTTSNoAudioError naming why there is none.
+
+    A 200 can still carry no audio: the prompt blocked (promptFeedback
+    .blockReason), no candidates, or a candidate whose finishReason (SAFETY,
+    OTHER, MAX_TOKENS, ...) came with no `content`. Indexing straight into
+    candidates[0].content.parts[0].inlineData turned all of those into a bare
+    KeyError: 'content' with the reason thrown away.
+    """
+    candidates = data.get("candidates") or []
+    cand = candidates[0] if candidates else {}
+    parts = ((cand.get("content") or {}).get("parts")) or []
+    for part in parts:
+        inline = part.get("inlineData") or part.get("inline_data")
+        if inline and inline.get("data"):
+            return inline["data"]
+    feedback = data.get("promptFeedback") or {}
+    flagged = [
+        r.get("category") for r in (cand.get("safetyRatings") or feedback.get("safetyRatings") or [])
+        if r.get("blocked") or r.get("probability") in ("HIGH", "MEDIUM")
+    ]
+    reason = {
+        "model": model,
+        "finish_reason": cand.get("finishReason"),
+        "finish_message": cand.get("finishMessage"),
+        "block_reason": feedback.get("blockReason"),
+        "flagged_safety": flagged,
+        "candidates": len(candidates),
+        "part_kinds": sorted({k for part in parts for k in part}),
+        "text_chars": text_chars,
+    }
+    # Customer text stays out of this WARNING (length only); the DEBUG
+    # "gemini tts request" event already carries the full body.
+    log.warning("gemini tts returned no audio", extra=reason)
+    raise GeminiTTSNoAudioError(
+        "Gemini TTS returned no audio: "
+        + ", ".join(f"{k}={v}" for k, v in reason.items() if v not in (None, [], ""))
+    )
 
 
 def _resample(pcm: bytes, in_rate: int, out_rate: int) -> bytes:
