@@ -1513,6 +1513,102 @@ def _interim_wait_text(language: str, index: int) -> str:
     return variants[min(index, len(variants) - 1)]
 
 
+# Four fixed customer-facing messages sent outside the LLM turn loop, at
+# points where there's no live model turn to localize the reply for:
+# reverting to bot mode (CRM declined the handoff, or no claim within
+# _AWAIT_HUMAN_TIMEOUT_S), the two _handle_escalation outcomes (support
+# hours closed / handoff webhook failed), and the idle-timeout farewell.
+# Same "en"/"hi"/"hinglish" set and English-fallback convention as
+# _interim_wait_text/_greeting above -- other languages aren't covered here
+# and fall back to English. "escalation_unavailable" keeps the `{next_slot}`
+# placeholder from the English original; next_slot is an English-ish string
+# (e.g. "tomorrow at 10:00") interpolated as-is, same as the English.
+#
+# Same speaker-gender-neutral requirement as _INTERIM_WAIT_MESSAGES above:
+# these all originally speak in first person ("I'm sorry", "I'll close this
+# chat"), so Hindi/Hinglish use passive/impersonal phrasing or the
+# subjunctive ("रखूँ", matching _GREETINGS' "करूँ") instead of a
+# speaker-gendered continuous/habitual form.
+_FIXED_MESSAGES: dict[str, dict[str, str]] = {
+    "revert_to_bot": {
+        "en": "Looks like no one is available at this time but am happy to help you again.",
+        "hi": "लगता है कि अभी कोई उपलब्ध नहीं है, पर आपकी दोबारा मदद करने में खुशी होगी।",
+        "hinglish": "Lagta hai abhi koi available nahin hai, lekin aapki dobara madad karne mein khushi hogi.",
+    },
+    "escalation_unavailable": {
+        "en": ("Our support team is currently unavailable. They will be available {next_slot} "
+               "and will assist you then. Please stay in this chat and we will connect you as "
+               "soon as they come online."),
+        "hi": ("हमारी सपोर्ट टीम अभी उपलब्ध नहीं है। वे {next_slot} उपलब्ध होंगे और तब आपकी सहायता "
+               "करेंगे। कृपया इसी चैट में बने रहें, टीम के ऑनलाइन आते ही आपको जोड़ दिया जाएगा।"),
+        "hinglish": ("Hamari support team abhi available nahin hai. Wo {next_slot} available "
+                     "honge aur tab aapki help karenge. Please isi chat mein bane rahein, "
+                     "team ke online aate hi aapko connect kar diya jaayega."),
+    },
+    "escalation_failed": {
+        "en": ("I'm sorry, I wasn't able to connect you to a human agent right now. "
+               "Let me continue helping you — what would you like to know?"),
+        "hi": ("माफ़ कीजिए, अभी आपको किसी सपोर्ट टीम सदस्य से नहीं जोड़ा जा सका। "
+               "आपकी मदद आगे भी की जा सकती है — बताइए, आप क्या जानना चाहेंगे?"),
+        "hinglish": ("Maaf kijiye, abhi aapko kisi support team member se nahin joda ja saka. "
+                     "Aapki madad aage bhi ki ja sakti hai — bataiye, aap kya jaanna chahenge?"),
+    },
+    "idle_farewell": {
+        "en": ("It looks like you've stepped away. I'll close this chat now — "
+               "feel free to start a new conversation anytime!"),
+        "hi": ("लगता है कि आप कुछ समय से चैट पर नहीं हैं। यह चैट अभी बंद की जा रही है — "
+               "जब चाहें, नई बातचीत शुरू करें!"),
+        "hinglish": ("Lagta hai aap kuch samay se chat par nahin hain. Yeh chat abhi band ki ja "
+                     "rahi hai — jab chahein, nayi baatcheet shuru karein!"),
+    },
+}
+
+
+def _fixed_text(key: str, language: str) -> str:
+    """One of the four ``_FIXED_MESSAGES`` above, in ``language``. Same
+    "hinglish" special-case and English-fallback-for-unmapped-codes behaviour
+    as ``_interim_wait_text``."""
+    variants = _FIXED_MESSAGES[key]
+    lang_key = "hinglish" if language == "hinglish" else normalize_lang(language)
+    return variants.get(lang_key) or variants["en"]
+
+
+_CUSTOMER_LANGUAGE_LOOKBACK = 10  # how many recent customer messages to scan
+
+
+async def _customer_language_for_session(session_id: str, fallback: str) -> str:
+    """The language to send a fixed customer-facing message in, resolved from
+    this session's own chat history -- for call sites that only have a
+    ``session_id``/``fallback`` language in hand, not a live per-connection
+    ``interim_lang`` like the main WS loop keeps (see that loop's own comment
+    above its ``interim_lang`` seed, which this mirrors against fresh rows
+    instead of the in-memory ``agent.session.turns``).
+
+    Reads up to ``_CUSTOMER_LANGUAGE_LOOKBACK`` of the session's most recent
+    customer messages (newest first) and returns ``_interim_language_for`` for
+    the first one that carries a language signal (``_has_language_signal`` --
+    "ok"/digits/voice notes don't). Falls back to ``fallback`` (meant to be the
+    session row's own ``language``) when no message carries a signal, the
+    session has no customer messages, or the DB read itself fails -- this must
+    never raise, and stays cheap (a single LIMITed query)."""
+    try:
+        async with _sm()() as db:
+            rows = (await db.execute(
+                select(ChatMessage.content)
+                .where(ChatMessage.session_id == session_id, ChatMessage.role == "customer")
+                .order_by(ChatMessage.id.desc())
+                .limit(_CUSTOMER_LANGUAGE_LOOKBACK)
+            )).scalars().all()
+    except Exception:  # noqa: BLE001 — must never raise; caller falls back
+        log.debug("customer language lookup failed; using fallback",
+                  extra={"session_id": session_id}, exc_info=True)
+        return fallback
+    for content in rows:
+        if isinstance(content, str) and _has_language_signal(content):
+            return _interim_language_for(content, fallback)
+    return fallback
+
+
 # --- Schemas ------------------------------------------------------------
 
 
@@ -2366,10 +2462,7 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
             if not done:
                 # Customer silent for idle_timeout seconds — close gracefully and
                 # fire session_closed so the CRM can auto-close the ticket.
-                farewell = (
-                    "It looks like you've stepped away. I'll close this chat now — "
-                    "feel free to start a new conversation anytime!"
-                )
+                farewell = _fixed_text("idle_farewell", interim_lang)
                 await websocket.send_text(json.dumps({
                     "type": "message", "session_id": session_id,
                     "text": farewell, "sources": [], "suggestions": [], "action": "end",
@@ -3625,10 +3718,10 @@ async def _handle_escalation(
     outcome = await _escalate_session(tenant, session_id, row, reason, summary)
 
     if not outcome.ok:
+        lang = await _customer_language_for_session(session_id, row.language)
         await websocket.send_text(json.dumps({
             "type": "message",
-            "text": ("I'm sorry, I wasn't able to connect you to a human agent right now. "
-                     "Let me continue helping you — what would you like to know?"),
+            "text": _fixed_text("escalation_failed", lang),
             "sources": [], "suggestions": [], "action": "continue",
         }))
         return False
@@ -3640,13 +3733,10 @@ async def _handle_escalation(
     # webhook round trip could disagree with the first across a
     # support-hours boundary.
     if not outcome.available and outcome.next_slot:
+        lang = await _customer_language_for_session(session_id, row.language)
         await websocket.send_text(json.dumps({
             "type": "message",
-            "text": (
-                f"Our support team is currently unavailable. "
-                f"They will be available {outcome.next_slot} and will assist you then. "
-                "Please stay in this chat and we will connect you as soon as they come online."
-            ),
+            "text": _fixed_text("escalation_unavailable", lang).format(next_slot=outcome.next_slot),
             "sources": [], "suggestions": [], "action": "wait",
         }))
 
@@ -3844,9 +3934,11 @@ CHAT_IDLE_TIMEOUT_S = 300.0  # close AI-mode chat if customer silent for 5 min
 
 async def _revert_to_bot(websocket: WebSocket, session_id: str) -> None:
     """Revert session to bot mode and notify the customer. Used on decline and timeout."""
+    fallback_language = "en"
     async with _sm()() as db:
         r = await db.get(ChatSession, session_id)
         if r:
+            fallback_language = r.language
             r.mode = "bot"
             await db.commit()
         else:
@@ -3855,10 +3947,11 @@ async def _revert_to_bot(websocket: WebSocket, session_id: str) -> None:
             # though the row that would record that never got updated.
             log.debug("revert to bot skipped DB update: chat session row missing",
                       extra={"session_id": session_id})
+    lang = await _customer_language_for_session(session_id, fallback_language)
     await websocket.send_text(json.dumps({"type": "mode_change", "mode": "bot"}))
     await websocket.send_text(json.dumps({
         "type": "message",
-        "text": "Looks like no one is available at this time but am happy to help you again.",
+        "text": _fixed_text("revert_to_bot", lang),
         "sources": [], "suggestions": [], "action": "continue",
     }))
 

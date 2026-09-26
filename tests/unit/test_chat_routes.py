@@ -963,6 +963,78 @@ def test_claim_session_and_agent_ws(escalating_app: FastAPI) -> None:
     chat._customer_queues.pop(sid, None)
 
 
+def _escalate_and_decline(escalating_app: FastAPI, customer_text: str, monkeypatch) -> dict:
+    """Trigger escalation via the customer WS with ``customer_text``, then have
+    the CRM decline the handoff (POST /decline) while the SAME customer WS
+    connection is still open -- after a successful escalation the connection
+    falls straight into ``_run_human_mode``'s wait loop (see the
+    `if await _handle_escalation(...): if await _run_human_mode(...)` chain in
+    chat.py), so it's this same connection, not a reconnect, that receives the
+    revert-to-bot frames. Returns the "message" frame following the decline's
+    "mode_change" -> "bot" frame.
+
+    ``escalating_app``'s tenant has no ``events_webhook_url`` configured, so
+    the real ``send_bo_webhook`` would return False (no URL -- see its own
+    docstring) and the escalation would never reach awaiting_human at all;
+    stub it to acknowledge so this test can reach the decline step it's
+    actually about."""
+    from starlette.websockets import WebSocketDisconnect
+
+    from src.api import chat_webhooks
+
+    async def _fake_send_bo_webhook(tenant, event_type, payload, **kwargs):
+        return True
+
+    monkeypatch.setattr(chat_webhooks, "send_bo_webhook", _fake_send_bo_webhook)
+
+    client = TestClient(escalating_app)
+    sid = _create_session(client)
+
+    with client.websocket_connect(f"/chat/ws/{sid}") as ws:
+        ws.send_text(json.dumps({"type": "message", "text": customer_text}))
+        frames = []
+        for _ in range(4):
+            try:
+                frames.append(json.loads(ws.receive_text()))
+            except WebSocketDisconnect:  # pragma: no cover
+                break
+        types = [f["type"] for f in frames]
+        assert "mode_change" in types, f"expected mode_change, got: {types}"
+
+        r = client.post(f"/chat/sessions/{sid}/decline", headers=HEADERS)
+        assert r.status_code == 200, r.text
+        assert r.json() == {"status": "declined"}
+
+        mode_change = json.loads(ws.receive_text())
+        assert mode_change == {"type": "mode_change", "mode": "bot"}
+        revert_message = json.loads(ws.receive_text())
+
+    chat._bo_queues.pop(sid, None)
+    chat._customer_queues.pop(sid, None)
+    return revert_message
+
+
+def test_decline_reverts_to_bot_in_hindi_for_devanagari_conversation(
+    escalating_app: FastAPI, monkeypatch,
+) -> None:
+    """CRM decline after a Devanagari customer message -> revert-to-bot text
+    is localized to Hindi, not left in English."""
+    revert_message = _escalate_and_decline(escalating_app, "मुझे रिफंड चाहिए", monkeypatch)
+    assert revert_message["type"] == "message"
+    assert revert_message["action"] == "continue"
+    assert revert_message["text"] == chat._FIXED_MESSAGES["revert_to_bot"]["hi"]
+
+
+def test_decline_reverts_to_bot_in_hinglish_for_hinglish_conversation(
+    escalating_app: FastAPI, monkeypatch,
+) -> None:
+    """Same decline flow, but the customer wrote Hinglish -> Hinglish revert
+    text, not Hindi or English."""
+    revert_message = _escalate_and_decline(escalating_app, "mujhe refund chahiye please", monkeypatch)
+    assert revert_message["type"] == "message"
+    assert revert_message["text"] == chat._FIXED_MESSAGES["revert_to_bot"]["hinglish"]
+
+
 def test_agent_ws_invalid_token_closes(app: FastAPI) -> None:
     """WS closes with 'invalid token' when token is wrong (no DB access needed)."""
     from starlette.websockets import WebSocketDisconnect
