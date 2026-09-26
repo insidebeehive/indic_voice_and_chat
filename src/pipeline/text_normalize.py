@@ -466,6 +466,83 @@ def _warn_if_untransliterated(text: str, language: str) -> None:
         )
 
 
+# --- URLs ------------------------------------------------------------------
+
+# A URL spoken aloud is noise ("h t t p s colon slash slash …"), nobody can tap
+# it in a voice note, and the written reply already carries the clickable link.
+# So URLs are replaced with the word "website" in the text's own script. The
+# written reply is never touched — this only runs on TTS-bound text.
+_URL_RE = re.compile(
+    r"(?:https?://|www\.)[^\s<>\"']+"
+    r"|\b[a-z0-9][a-z0-9-]*(?:\.[a-z0-9-]+)*\.(?:com|in|net|org|io|app|co|me|info|online|live|club|xyz)"
+    r"(?:/[^\s<>\"']*)?(?![a-z0-9])",
+    re.IGNORECASE,
+)
+# Trailing sentence punctuation is part of the sentence, not the URL.
+_URL_TRAILING_PUNCT = ".,!?;:)]}'\"।"
+
+# "website" per script; picked from the script the surrounding text is in.
+_URL_PLACEHOLDER_BY_SCRIPT: dict[str, str] = {
+    "hi": "वेबसाइट",     # Devanagari (Hindi, Marathi, …)
+    "bn": "ওয়েবসাইট",
+    "gu": "વેબસાઇટ",
+    "pa": "ਵੈੱਬਸਾਈਟ",
+    "od": "ୱେବସାଇଟ",
+    "ta": "இணையதளம்",
+    "te": "వెబ్‌సైట్",
+    "kn": "ವೆಬ್‌ಸೈಟ್",
+    "ml": "വെബ്സൈറ്റ്",
+}
+_URL_PLACEHOLDER_LATIN = "website"
+
+
+def _url_placeholder(text: str, language: str | None) -> str:
+    """The "website" word for this text: the native script that dominates its
+    non-Latin letters, else Latin. Deliberately by script, not by *language*:
+    a Hinglish reply arrives as language "hi" but is written in Latin letters,
+    and the placeholder has to match what the voice is actually reading."""
+    counts: dict[str, int] = {}
+    for ch in text:
+        cp = ord(ch)
+        for key, (lo, hi) in _SCRIPT_RANGES.items():
+            if lo <= cp <= hi:
+                counts[key] = counts.get(key, 0) + 1
+                break
+    if counts:
+        return _URL_PLACEHOLDER_BY_SCRIPT.get(max(counts, key=counts.get), _URL_PLACEHOLDER_LATIN)
+    return _URL_PLACEHOLDER_LATIN
+
+
+def replace_urls_for_tts(text: str, language: str | None = None) -> str:
+    """Replace every URL (with or without http/www, or a bare domain like
+    rama567.com) with "website" in the text's script. When that word already
+    comes right before the URL ("हमारी वेबसाइट https://…"), the URL is dropped
+    instead, so it isn't said twice. Trailing punctuation stays put."""
+    if not text or not _URL_RE.search(text):
+        return text
+    placeholder = _url_placeholder(text, language)
+
+    def _sub(m: re.Match) -> str:
+        url = m.group(0)
+        tail = ""
+        while url and url[-1] in _URL_TRAILING_PUNCT:
+            tail = url[-1] + tail
+            url = url[:-1]
+        before = text[:m.start()].rstrip()
+        if before.lower().endswith(placeholder.lower()):
+            return tail
+        return placeholder + tail
+
+    out = _URL_RE.sub(_sub, text)
+    # Collapse the double space a dropped URL leaves behind, and any space it
+    # left before punctuation.
+    out = re.sub(r"[ \t]{2,}", " ", out)
+    out = re.sub(r" ([.,!?;:।])", r"\1", out)
+    debug_event(log, "tts urls_replaced", placeholder=placeholder,
+                urls=[m.group(0) for m in _URL_RE.finditer(text)])
+    return out.strip()
+
+
 def normalize_for_tts(
     text: str, language: str | None = None, extra: dict[str, str] | None = None
 ) -> str:
@@ -488,6 +565,7 @@ def normalize_for_tts(
     """
     if not text:
         return text
+    text = replace_urls_for_tts(text, language)
     base = (language or "").strip().lower().split("-")[0]
     if base and base not in DEVANAGARI_LANGS:
         _warn_if_untransliterated(text, base)
