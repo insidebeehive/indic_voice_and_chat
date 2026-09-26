@@ -957,3 +957,14 @@ def test_chatbot_agent_passes_its_max_tool_rounds_to_the_prompt() -> None:
     src = inspect.getsource(chatbot_mod)
     # Both build_chatbot_system_prompt call sites (cache-split and plain).
     assert src.count("max_tool_rounds=self._max_tool_rounds") == 2
+
+
+def test_chatbot_prompt_escalation_never_promises_an_outcome() -> None:
+    """The handoff line must not promise what the human will do or how fast:
+    production replies promised "they'll update your number right away" and
+    "stay on the line for a minute", including at night with no one there."""
+    for pack in ("betting", "generic"):
+        prompt = build_chatbot_system_prompt(company_name="Acme", prompt_pack=pack)
+        assert "who will guide them on this" in prompt
+        assert "Never promise what the human will do or how quickly" in prompt
+        assert "offer help and guidance, not an outcome" in prompt

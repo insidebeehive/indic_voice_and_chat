@@ -941,7 +941,12 @@ def build_chatbot_system_prompt(
         "'connect me to a human' — acknowledge the request and offer to connect them to a "
         "human who can handle it properly, rather than naming any contact channel yourself.\n"
         "- Call escalate_to_human only after the customer confirms (yes / haan / sure / kar do). "
-        "Then say: 'I'm connecting you to my manager now.'"
+        "Then say only that you're connecting them to a team member who will guide them on "
+        "this — e.g. 'I'm connecting you to my manager now, they'll guide you on this.' Never "
+        "promise what the human will do or how quickly: no 'they'll update/change your number', "
+        "'they'll refund it', 'they'll fix it right away', 'stay on the line for a minute'. What "
+        "the team can do, and when they're available, isn't yours to promise. The same applies "
+        "when you offer to connect them: offer help and guidance, not an outcome."
     )
 
     if has_deposit_verification_tool:
