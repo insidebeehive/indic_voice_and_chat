@@ -318,7 +318,26 @@ def _tts_reply_format() -> str:
 # the customer at most one extra "still working on it" bubble, never several
 # back-to-back ones, and on timeout the turn falls back to text-only rather
 # than making the customer wait longer for audio nobody asked to wait for.
-_TTS_SYNTH_TIMEOUT_S = 10.0
+def _env_seconds(name: str, default: float, lo: float, hi: float) -> float:
+    """Seconds from env var *name*, read once at import. Unset, non-numeric or
+    outside [lo, hi] falls back to *default* with a warning — never raises, so
+    a bad value can't stop the app starting."""
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        log.warning("%s=%r is not a number; using %ss", name, raw, default)
+        return default
+    if not lo <= value <= hi:
+        log.warning("%s=%s is outside %s-%ss; using %ss", name, value, lo, hi, default)
+        return default
+    return value
+
+
+# CHAT_TTS_TIMEOUT_SECONDS overrides it (1-30s).
+_TTS_SYNTH_TIMEOUT_S = _env_seconds("CHAT_TTS_TIMEOUT_SECONDS", 10.0, 1.0, 30.0)
 
 
 async def _synthesize_reply_audio(
@@ -628,7 +647,11 @@ async def _run_turn(coro: Awaitable):
 # `typing` frame, send a real, visible "still working on it" chat message
 # every _INTERIM_INTERVAL_S (docs/crm-chat-media-contract.md) — no new frame
 # type, it's an ordinary `message` frame tagged `"interim": true`.
-_INTERIM_INTERVAL_S = 15.0
+#
+# CHAT_INTERIM_INTERVAL_SECONDS overrides it, within 5-60s. There is no "off":
+# these messages are what keep the relay from closing the socket mid-turn, and
+# its idle threshold isn't known, so a long gap risks exactly that.
+_INTERIM_INTERVAL_S = _env_seconds("CHAT_INTERIM_INTERVAL_SECONDS", 15.0, 5.0, 60.0)
 # Grace for an in-flight interim send to finish once the turn is done, before
 # cancelling it outright. Bounded so a wedged socket can never delay a reply.
 _KEEPALIVE_DRAIN_S = 1.0

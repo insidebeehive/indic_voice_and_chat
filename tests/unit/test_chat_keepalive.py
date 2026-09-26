@@ -1318,3 +1318,47 @@ async def test_reconnect_seed_keeps_marathi_session_language(ws_ctx, monkeypatch
             assert frame["text"] == chat_api._INTERIM_WAIT_MESSAGES["mr"][0]
     finally:
         patcher.stop()
+
+
+# --- CHAT_INTERIM_INTERVAL_SECONDS / CHAT_TTS_TIMEOUT_SECONDS -------------
+
+
+@pytest.mark.parametrize("raw, expected", [
+    (None, 15.0), ("", 15.0), ("20", 20.0), ("7.5", 7.5), ("5", 5.0), ("60", 60.0),
+    ("0", 15.0), ("4", 15.0), ("61", 15.0), ("abc", 15.0), ("-10", 15.0),
+])
+def test_env_seconds_interim_interval_bounds(monkeypatch, raw, expected) -> None:
+    """No "off" and no huge gap: the interim messages keep the CRM relay from
+    closing a silent socket mid-turn."""
+    if raw is None:
+        monkeypatch.delenv("CHAT_INTERIM_INTERVAL_SECONDS", raising=False)
+    else:
+        monkeypatch.setenv("CHAT_INTERIM_INTERVAL_SECONDS", raw)
+    assert chat_api._env_seconds("CHAT_INTERIM_INTERVAL_SECONDS", 15.0, 5.0, 60.0) == expected
+
+
+@pytest.mark.parametrize("raw, expected", [
+    (None, 10.0), ("5", 5.0), ("1", 1.0), ("30", 30.0), ("0", 10.0), ("31", 10.0), ("x", 10.0),
+])
+def test_env_seconds_tts_timeout_bounds(monkeypatch, raw, expected) -> None:
+    if raw is None:
+        monkeypatch.delenv("CHAT_TTS_TIMEOUT_SECONDS", raising=False)
+    else:
+        monkeypatch.setenv("CHAT_TTS_TIMEOUT_SECONDS", raw)
+    assert chat_api._env_seconds("CHAT_TTS_TIMEOUT_SECONDS", 10.0, 1.0, 30.0) == expected
+
+
+def test_interval_and_tts_timeout_are_read_from_env_at_import() -> None:
+    """Checked in a fresh interpreter: reloading src.api.chat inside this
+    process would leave other tests holding stale module objects."""
+    import os
+    import subprocess
+    import sys
+    env = {**os.environ, "CHAT_INTERIM_INTERVAL_SECONDS": "20", "CHAT_TTS_TIMEOUT_SECONDS": "5"}
+    out = subprocess.run(
+        [sys.executable, "-c",
+         "import src.api.chat as c; print(c._INTERIM_INTERVAL_S, c._TTS_SYNTH_TIMEOUT_S)"],
+        env=env, capture_output=True, text=True, timeout=120,
+    )
+    assert out.returncode == 0, out.stderr[-2000:]
+    assert out.stdout.strip().splitlines()[-1] == "20.0 5.0"
