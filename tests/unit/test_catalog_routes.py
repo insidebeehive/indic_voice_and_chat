@@ -15,6 +15,7 @@ from src.auth.middleware import set_admin_tokens, set_tenant_resolver
 from src.config_tenant import TenantSettings
 from src.models.database import Base
 from src.models.tenant import ProviderCost
+from src.providers.tts.elevenlabs import _PRESET_VOICES, ElevenLabsTTSAdapter
 
 TENANT_HEADERS = {"Authorization": "Bearer tenant-token"}
 ADMIN_HEADERS = {"Authorization": "Bearer admin-token"}
@@ -50,6 +51,19 @@ async def client():
     set_tenant_resolver(None)
     set_admin_tokens([])
     await engine.dispose()
+
+
+@pytest.fixture(autouse=True)
+def _reset_elevenlabs_live_cache():
+    # catalog._elevenlabs_live_cache is a single module-level dict (one
+    # platform-wide ElevenLabs account, see its own comment) -- without a
+    # reset, whichever test runs first to populate it would leak its roster
+    # (real or mocked) into every test that runs after it within the TTL.
+    catalog._elevenlabs_live_cache["voices"] = None
+    catalog._elevenlabs_live_cache["fetched_at"] = 0.0
+    yield
+    catalog._elevenlabs_live_cache["voices"] = None
+    catalog._elevenlabs_live_cache["fetched_at"] = 0.0
 
 
 async def test_list_providers_returns_catalog(client: AsyncClient) -> None:
@@ -290,6 +304,116 @@ async def test_list_providers_admin_token_allowed(client: AsyncClient) -> None:
     assert (await client.get("/providers", headers=ADMIN_HEADERS)).status_code == 200
 
 
+def _mock_live_roster(monkeypatch, voices=None, raise_exc=None):
+    """Monkeypatch the adapter's own live fetch (no real network) so
+    ``_live_elevenlabs_voices`` -- which constructs its own
+    ``ElevenLabsTTSAdapter`` instance internally -- picks it up regardless of
+    instance."""
+    live = voices if voices is not None else [
+        {"voice_id": "cloned-abc123", "name": "Tenant Custom Voice",
+         "gender": "female", "category": "cloned"},
+        {"voice_id": "21m00Tcm4TlvDq8ikWAM", "name": "Rachel",
+         "gender": "female", "category": "premade"},
+    ]
+
+    def _get_available_voices(self, language):
+        if raise_exc is not None:
+            raise raise_exc
+        return list(live)
+
+    monkeypatch.setattr(ElevenLabsTTSAdapter, "get_available_voices", _get_available_voices)
+    return live
+
+
+async def test_get_voices_elevenlabs_presets_have_names(client: AsyncClient) -> None:
+    # Static catalog (no admin/live fetch involved) -- VoiceItem.name must be
+    # populated for ElevenLabs' presets, which is the whole point of carrying
+    # `name` through _normalize.
+    resp = await client.get(
+        "/voices", params={"provider": "elevenlabs"}, headers=TENANT_HEADERS
+    )
+    assert resp.status_code == 200
+    voices = resp.json()["voices"]
+    assert {"Rachel", "Domi", "Bella"} <= {v["name"] for v in voices}
+
+
+async def test_get_voices_elevenlabs_anonymous_gets_presets_only(
+    client: AsyncClient, monkeypatch
+) -> None:
+    # Anonymous caller must never see the live roster -- it's the only thing
+    # standing between "public reference data" and leaking every tenant's
+    # cloned voice names to anyone. A live roster IS available (mocked); the
+    # anonymous caller still must not get its custom voice.
+    _mock_live_roster(monkeypatch)
+    resp = await client.get("/voices", params={"provider": "elevenlabs"})
+    assert resp.status_code == 200
+    voices = resp.json()["voices"]
+    assert {v["voice_id"] for v in voices} == {v["voice_id"] for v in _PRESET_VOICES}
+    assert "cloned-abc123" not in {v["voice_id"] for v in voices}
+
+
+async def test_get_voices_elevenlabs_tenant_token_gets_presets_only(
+    client: AsyncClient, monkeypatch
+) -> None:
+    # A non-admin tenant bearer token is not sufficient either -- only a
+    # platform-admin token unlocks the live roster.
+    _mock_live_roster(monkeypatch)
+    resp = await client.get(
+        "/voices", params={"provider": "elevenlabs"}, headers=TENANT_HEADERS
+    )
+    assert resp.status_code == 200
+    voice_ids = {v["voice_id"] for v in resp.json()["voices"]}
+    assert voice_ids == {v["voice_id"] for v in _PRESET_VOICES}
+    assert "cloned-abc123" not in voice_ids
+
+
+async def test_get_voices_elevenlabs_admin_gets_live_roster(
+    client: AsyncClient, monkeypatch
+) -> None:
+    live = _mock_live_roster(monkeypatch)
+    resp = await client.get(
+        "/voices", params={"provider": "elevenlabs"}, headers=ADMIN_HEADERS
+    )
+    assert resp.status_code == 200
+    voices = resp.json()["voices"]
+    assert {v["voice_id"] for v in voices} == {v["voice_id"] for v in live}
+    custom = next(v for v in voices if v["voice_id"] == "cloned-abc123")
+    assert custom["name"] == "Tenant Custom Voice"
+    assert custom["category"] == "cloned"
+
+
+async def test_get_voices_elevenlabs_live_fetch_failure_falls_back_to_presets(
+    client: AsyncClient, monkeypatch
+) -> None:
+    _mock_live_roster(monkeypatch, raise_exc=RuntimeError("boom"))
+    resp = await client.get(
+        "/voices", params={"provider": "elevenlabs"}, headers=ADMIN_HEADERS
+    )
+    assert resp.status_code == 200
+    voice_ids = {v["voice_id"] for v in resp.json()["voices"]}
+    assert voice_ids == {v["voice_id"] for v in _PRESET_VOICES}
+
+
+async def test_get_voices_elevenlabs_admin_live_roster_cached_within_ttl(
+    client: AsyncClient, monkeypatch
+) -> None:
+    calls = {"n": 0}
+
+    def _get_available_voices(self, language):
+        calls["n"] += 1
+        return [{"voice_id": "cloned-xyz", "name": "Fresh Clone",
+                  "gender": "male", "category": "cloned"}]
+
+    monkeypatch.setattr(ElevenLabsTTSAdapter, "get_available_voices", _get_available_voices)
+
+    r1 = await client.get("/voices", params={"provider": "elevenlabs"}, headers=ADMIN_HEADERS)
+    r2 = await client.get("/voices", params={"provider": "elevenlabs"}, headers=ADMIN_HEADERS)
+    assert r1.status_code == 200 and r2.status_code == 200
+    assert r1.json()["voices"] == r2.json()["voices"]
+    # Second call within the TTL must be served from cache, not refetched.
+    assert calls["n"] == 1
+
+
 async def test_models_public(client: AsyncClient) -> None:
     resp = await client.get("/models")          # no auth — public reference data
     assert resp.status_code == 200
@@ -300,3 +424,41 @@ async def test_models_public(client: AsyncClient) -> None:
     assert any("lite" in m for m in models["llm"]["gemini"])
     assert "sarvam" in models["tts"]
     assert "gemini_live" in models["s2s"]
+
+
+async def test_get_voices_elevenlabs_cached_live_roster_never_reaches_anonymous(
+    client: AsyncClient, monkeypatch
+) -> None:
+    """Fill the cache as admin, then ask anonymously: still presets only. The
+    property most likely to break if the cache is ever consulted before the
+    admin check."""
+    _mock_live_roster(monkeypatch)
+    admin = await client.get("/voices", params={"provider": "elevenlabs"}, headers=ADMIN_HEADERS)
+    assert any(v["voice_id"] == "cloned-abc123" for v in admin.json()["voices"])
+    assert admin.headers.get("cache-control") == "private, no-store"
+    for headers in ({}, {"Authorization": "Bearer "}, {"Authorization": "bearer not-an-admin"}):
+        anon = await client.get("/voices", params={"provider": "elevenlabs"}, headers=headers)
+        ids = {v["voice_id"] for v in anon.json()["voices"]}
+        assert ids == {v["voice_id"] for v in _PRESET_VOICES}, headers
+        assert "cloned-abc123" not in ids
+
+
+async def test_get_voices_elevenlabs_failed_fetch_is_not_cached(
+    client: AsyncClient, monkeypatch
+) -> None:
+    """A failed fetch (the adapter returns presets, which carry no category)
+    must not be cached, or one blip hides cloned voices for the whole TTL."""
+    state = {"fail": True}
+
+    def _get_available_voices(self, language):
+        if state["fail"]:
+            return list(_PRESET_VOICES)
+        return [{"voice_id": "cloned-late", "name": "Late Clone", "gender": "female",
+                 "category": "cloned"}]
+
+    monkeypatch.setattr(ElevenLabsTTSAdapter, "get_available_voices", _get_available_voices)
+    r1 = await client.get("/voices", params={"provider": "elevenlabs"}, headers=ADMIN_HEADERS)
+    assert "cloned-late" not in {v["voice_id"] for v in r1.json()["voices"]}
+    state["fail"] = False
+    r2 = await client.get("/voices", params={"provider": "elevenlabs"}, headers=ADMIN_HEADERS)
+    assert "cloned-late" in {v["voice_id"] for v in r2.json()["voices"]}

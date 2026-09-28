@@ -3,7 +3,9 @@
 - ``GET  /api/v1/providers``                  — list every provider + cost/min
 - ``PUT  /api/v1/providers/{kind}/{provider}`` — admin: maintain a rate
 - ``GET  /api/v1/voices?provider=&language=``  — static voice roster (public
-  reference data, same class as ``/models`` — no auth dependency)
+  reference data, same class as ``/models`` — no auth dependency); for
+  provider=elevenlabs a caller presenting a valid platform-admin bearer token
+  instead gets the live account roster (names + cloned/custom voices)
 
 The cost catalog is the single source of truth read by ``GET /providers`` and the
 per-call cost calculation; ``PUT`` upserts so rates can be kept current as vendor
@@ -12,16 +14,19 @@ pricing changes.
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
+from typing import Any
 
-from fastapi import APIRouter, Depends, Query, Request
+from fastapi import APIRouter, Depends, Query, Request, Response
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import get_db_session
 from src.auth import TenantContext
-from src.auth.middleware import optional_tenant, require_admin
+from src.auth.middleware import is_admin_token, optional_tenant, require_admin
 from src.models.tenant import ProviderCost
 from src.providers.model_catalog import list_models
 from src.providers.voice_catalog import list_voices, supported_providers
@@ -86,12 +91,79 @@ class UpdateProviderCostRequest(BaseModel):
 class VoiceItem(BaseModel):
     voice_id: str
     gender: str | None = None
+    # Only populated where the roster carries it: ElevenLabs presets (static
+    # catalog) and ElevenLabs' live account roster (admin-only, below). Every
+    # other provider's roster has no name, just a voice_id.
+    name: str | None = None
+    # Live-roster-only ("premade" / "cloned" / "generated" / ...) — never set
+    # by the static catalog (see list_voices/_normalize, voice_catalog.py).
+    category: str | None = None
 
 
 class VoicesResponse(BaseModel):
     provider: str
     language: str
     voices: list[VoiceItem]
+
+
+def _caller_is_platform_admin(request: Request) -> bool:
+    """Non-raising admin check for a route that must stay usable by anonymous
+    and tenant callers alike (``/voices`` has no ``Depends`` auth at all —
+    see the module docstring). Deliberately NOT ``require_admin``, which
+    raises 401/403 for anyone else; this only ever gates which *roster* the
+    same 200 response carries.
+    """
+    auth = request.headers.get("authorization") or request.headers.get("Authorization")
+    if not auth or not auth.lower().startswith("bearer "):
+        return False
+    return is_admin_token(auth.split(" ", 1)[1].strip())
+
+
+# In-process cache for ElevenLabs' live account roster (admin callers only —
+# see get_voices below). One platform-wide ElevenLabs account backs every
+# tenant's cloned voices, so this is a single global entry, not per-tenant.
+# ~5 minutes: long enough that an admin paging through the voice picker
+# doesn't trigger a live `GET /v1/voices` on every request, short enough that
+# a voice cloned/renamed in the ElevenLabs dashboard shows up soon after.
+_ELEVENLABS_LIVE_CACHE_TTL_S = 300.0
+_elevenlabs_live_cache: dict[str, Any] = {"voices": None, "fetched_at": 0.0}
+
+
+async def _live_elevenlabs_voices() -> list[dict]:
+    """The platform ElevenLabs account's actual voice roster (names, gender,
+    category; cloned/custom voices included), cached for
+    ``_ELEVENLABS_LIVE_CACHE_TTL_S``.
+
+    ``ElevenLabsTTSAdapter.get_available_voices`` is synchronous httpx, so it
+    runs off the event loop via ``asyncio.to_thread``. It already falls back
+    to the static preset list on any failure (no key configured, network
+    error, non-2xx) -- see its own docstring/implementation -- so a raise out
+    of the thread here is not expected, but is still caught defensively
+    rather than turning into a 500 for what is reference data. The API key
+    itself is never logged, here or in the adapter.
+    """
+    now = time.monotonic()
+    cached = _elevenlabs_live_cache
+    if cached["voices"] is not None and (now - cached["fetched_at"]) < _ELEVENLABS_LIVE_CACHE_TTL_S:
+        return cached["voices"]
+    from src.providers import TTS_PROVIDERS  # local import: same lazy pattern as dev_console's /dev/tts-voices
+
+    adapter = TTS_PROVIDERS["elevenlabs"]({})  # {} -> picks up ELEVENLABS_API_KEY env var; ctor never raises on a missing key
+    try:
+        voices = await asyncio.to_thread(adapter.get_available_voices, "")
+    except Exception:
+        log.warning("catalog: elevenlabs live voice fetch raised unexpectedly, falling back to presets")
+        from src.providers.tts.elevenlabs import _PRESET_VOICES
+        voices = list(_PRESET_VOICES)
+    # Cache only a real account roster. The adapter hides a failed fetch by
+    # returning its preset list, whose entries carry no "category" (every
+    # voice from the live API does), so a failure isn't cached: otherwise one
+    # transient ElevenLabs/network error would hide cloned voices from admins
+    # for the whole TTL.
+    if any("category" in v for v in voices):
+        cached["voices"] = voices
+        cached["fetched_at"] = now
+    return voices
 
 
 # --- Routes -------------------------------------------------------------
@@ -211,6 +283,8 @@ async def get_models() -> ModelsResponse:
 
 @router.get("/voices", response_model=VoicesResponse)
 async def get_voices(
+    request: Request,
+    response: Response,
     provider: str = Query(
         ...,
         description=(
@@ -220,8 +294,24 @@ async def get_voices(
     ),
     language: str = Query("hi-IN", description="BCP-47 language tag (TTS only)"),
 ) -> VoicesResponse:
-    """Return the available voices for a provider (+ language for TTS)."""
+    """Return the available voices for a provider (+ language for TTS).
+
+    ElevenLabs is a special case: the static catalog only has the 8 preset
+    voices (below), never a tenant's cloned/custom ones -- fetching those
+    needs a live call against the single platform-wide ElevenLabs account.
+    This route has no auth dependency at all (public reference data, e.g. for
+    the pre-login Register page), so that live roster -- which would leak
+    every tenant's custom voice names to anyone -- is only ever returned to a
+    caller presenting a valid platform-admin bearer token; everyone else
+    (anonymous or a tenant token) keeps getting the static preset list,
+    unchanged.
+    """
     voices = list_voices(provider, language)
+    if (provider or "").strip().lower() == "elevenlabs" and _caller_is_platform_admin(request):
+        voices = await _live_elevenlabs_voices()
+        # The body now depends on who asked; keep any cache from reusing it.
+        response.headers["Cache-Control"] = "private, no-store"
+        response.headers["Vary"] = "Authorization"
     if not voices:
         # Catalog lookup that resolved to nothing -- list_voices returns []
         # both for a provider it doesn't know at all and for a real

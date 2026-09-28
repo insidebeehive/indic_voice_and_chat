@@ -24,7 +24,11 @@ voices) requires a live API call to fetch — see
 ``ElevenLabsTTSAdapter.get_available_voices``. This catalog exposes only its
 static ``_PRESET_VOICES`` fallback (8 built-in voices), the same list the
 adapter itself falls back to when keyless. Cloned/custom voices are
-intentionally NOT visible here.
+intentionally NOT visible here; ``GET /api/v1/voices`` (src/api/catalog.py)
+fetches that live roster directly from the adapter, bypassing this module
+entirely, and only for a caller it has verified is a platform admin — this
+catalog has no notion of "admin" and must stay that way, since it is also
+read by callers (e.g. the pre-login Register page) that are never admin.
 
 Language handling: Azure, Google, Sarvam, and IndicF5 rosters are
 per-language; Gemini and ElevenLabs are language-independent (one flat list
@@ -99,14 +103,21 @@ _GEMINI_LIVE_VOICES = [
 
 def _normalize(entries: list[dict]) -> list[dict]:
     """Project a roster entry down to the shape ``VoiceItem`` (src/api/catalog.py)
-    declares: ``{"voice_id": str, "gender": str}``. Some adapters' rosters carry
-    extra fields (elevenlabs' preset list has ``name``; the gemini_live catalog
-    has ``style``) — those extra fields are meaningless per-provider noise to a
-    UI dropdown built generically off this catalog, and ``VoiceItem`` would drop
-    them silently anyway. Normalizing here keeps ``list_voices``'s own return
-    value uniform for any caller, not just the ones going through the API route.
+    declares: ``{"voice_id": str, "gender": str, "name": str | None}``. ``name``
+    is carried through when the roster has one (elevenlabs' preset list does);
+    other extra fields (the gemini_live catalog's ``style``) are still meaningless
+    per-provider noise to a UI dropdown built generically off this catalog, and
+    ``VoiceItem`` would drop them silently anyway. Normalizing here keeps
+    ``list_voices``'s own return value uniform for any caller, not just the ones
+    going through the API route.
     """
-    return [{"voice_id": v["voice_id"], "gender": v.get("gender", "")} for v in entries]
+    out = []
+    for v in entries:
+        item = {"voice_id": v["voice_id"], "gender": v.get("gender", "")}
+        if v.get("name"):
+            item["name"] = v["name"]
+        out.append(item)
+    return out
 
 
 # Per-language TTS rosters: provider -> {language: [voices]}.

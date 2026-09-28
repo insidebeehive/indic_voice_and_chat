@@ -730,8 +730,19 @@ async function refreshVoiceOptions(kind) {
     voices.forEach(v => {
       // Gender in the label, not just the id: the voicebot prompt selects
       // gendered Hindi/Marathi forms off the roster's gender field, so a
-      // gender flip from picking the wrong voice_id is a content bug.
-      const label = v.gender ? `${v.voice_id} (${v.gender})` : v.voice_id;
+      // gender flip from picking the wrong voice_id is a content bug. Name
+      // (when the roster has one — ElevenLabs presets and, for an admin, its
+      // live account roster) takes the place of the voice_id, which is
+      // otherwise the only human-legible part of the option; the option's
+      // `value` stays the voice_id either way. A non-"premade" category
+      // (cloned/generated/professional — admin-only live roster) is called
+      // out too, since those are the tenant-specific voices this picker
+      // wouldn't otherwise be able to tell apart from the stock presets.
+      // With a name, a short id suffix keeps two same-named voices (e.g. two
+      // tenants' clones) distinguishable.
+      const base = v.name && v.name !== v.voice_id ? `${v.name} [${v.voice_id.slice(0, 6)}]` : v.voice_id;
+      const label = (v.gender ? `${base} (${v.gender})` : base) +
+        (v.category && v.category !== "premade" ? ` · ${v.category}` : "");
       opts.push(`<option value="${escAttr(v.voice_id)}">${escT(label)}</option>`);
     });
   }
