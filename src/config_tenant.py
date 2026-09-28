@@ -149,6 +149,18 @@ class TenantTTSConfig(BaseModel):
     voice_id: Optional[str] = None
     speed: Optional[float] = None
     api_key_env: Optional[str] = None
+    # Cloned-voice tuning knobs. ElevenLabs-specific (ElevenLabsTTSAdapter reads
+    # them and builds `voice_settings`; see src/providers/tts/elevenlabs.py) but
+    # declared on this generic TTS block rather than a provider-specific one, same
+    # as `voice_id`/`speed` above — every other provider adapter simply ignores
+    # them. None (the default) means "use the adapter's own default", never a
+    # literal null sent to the provider API — merge_provider_config only copies
+    # non-None tenant fields onto the global default, so an unset field here
+    # never overrides anything.
+    stability: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    similarity_boost: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    style: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    use_speaker_boost: Optional[bool] = None
 
 
 class ChatVoiceConfig(BaseModel):

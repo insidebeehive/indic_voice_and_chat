@@ -2104,3 +2104,127 @@ async def test_register_s2s_mode(ctx) -> None:
     # Realtime always resolves its key from the platform master env var at
     # runtime (never per-tenant), so register_tenant leaves api_key_env unset.
     assert new_ctx.settings.pipeline.realtime.api_key_env is None
+
+
+# --- ElevenLabs cloned-voice tuning (stability/similarity_boost/style/
+# use_speaker_boost) round-trips through PATCH -----------------------------
+
+
+async def test_register_tenant_accepts_voice_tuning_fields(ctx) -> None:
+    client, resolver, _ = ctx
+    body = _body(slug="acme", tts={
+        "provider": "elevenlabs", "model": "eleven_multilingual_v2",
+        "voice_id": "cloned-1", "stability": 0.8, "similarity_boost": 0.3,
+        "style": 0.2, "use_speaker_boost": True,
+    })
+    resp = await client.post("/tenants", json=body, headers=ADMIN_HEADERS)
+    assert resp.status_code == 201, resp.text
+
+    ctx1 = await resolver.resolve_by_slug("acme")
+    tts = ctx1.settings.pipeline.tts
+    assert tts.stability == 0.8
+    assert tts.similarity_boost == 0.3
+    assert tts.style == 0.2
+    assert tts.use_speaker_boost is True
+
+
+async def test_register_tenant_rejects_out_of_range_voice_tuning(ctx) -> None:
+    client, _, _ = ctx
+    body = _body(slug="acme", tts={"provider": "elevenlabs", "stability": 1.5})
+    resp = await client.post("/tenants", json=body, headers=ADMIN_HEADERS)
+    assert resp.status_code == 422, resp.text
+
+
+async def test_pipeline_patch_rejects_out_of_range_voice_tuning(ctx) -> None:
+    client, resolver, _ = ctx
+    tid = (await client.post(
+        "/tenants", json=_body(slug="acme"), headers=ADMIN_HEADERS)).json()["tenant_id"]
+
+    resp = await client.patch(
+        f"/tenants/{tid}",
+        json={"pipeline": {"tts": {"provider": "elevenlabs", "similarity_boost": -0.1}}},
+        headers=ADMIN_HEADERS)
+    assert resp.status_code == 422, resp.text
+
+    ctx1 = await resolver.resolve_by_slug("acme")
+    assert ctx1.settings.pipeline.tts.provider == "sarvam"   # rejected -> untouched
+
+
+async def test_pipeline_patch_sets_voice_tuning_and_get_returns_them(ctx) -> None:
+    client, resolver, _ = ctx
+    tid = (await client.post(
+        "/tenants", json=_body(slug="acme", mode="layered"), headers=ADMIN_HEADERS)).json()["tenant_id"]
+
+    resp = await client.patch(
+        f"/tenants/{tid}",
+        json={"pipeline": {"tts": {
+            "provider": "elevenlabs", "stability": 0.9, "similarity_boost": 0.4,
+            "style": 0.1, "use_speaker_boost": False,
+        }}},
+        headers=ADMIN_HEADERS)
+    assert resp.status_code == 200, resp.text
+
+    get_resp = await client.get("/tenants", headers=ADMIN_HEADERS)
+    t = next(x for x in get_resp.json()["tenants"] if x["slug"] == "acme")
+    assert t["tts"]["stability"] == 0.9
+    assert t["tts"]["similarity_boost"] == 0.4
+    assert t["tts"]["style"] == 0.1
+    assert t["tts"]["use_speaker_boost"] is False
+
+
+async def test_pipeline_patch_voice_tuning_partial_update_keeps_the_rest(ctx) -> None:
+    """Setting just `stability` on a second PATCH must not wipe the
+    similarity_boost/style/use_speaker_boost a prior PATCH set — same
+    partial-override guarantee as voice_id/speed."""
+    client, resolver, _ = ctx
+    tid = (await client.post(
+        "/tenants", json=_body(slug="acme", mode="layered"), headers=ADMIN_HEADERS)).json()["tenant_id"]
+
+    await client.patch(
+        f"/tenants/{tid}",
+        json={"pipeline": {"tts": {
+            "provider": "elevenlabs", "stability": 0.9, "similarity_boost": 0.4,
+            "style": 0.1, "use_speaker_boost": True,
+        }}},
+        headers=ADMIN_HEADERS)
+
+    resp = await client.patch(
+        f"/tenants/{tid}",
+        json={"pipeline": {"tts": {"stability": 0.2}}},
+        headers=ADMIN_HEADERS)
+    assert resp.status_code == 200, resp.text
+
+    ctx1 = await resolver.resolve_by_slug("acme")
+    tts = ctx1.settings.pipeline.tts
+    assert tts.stability == 0.2               # the field this PATCH touched
+    assert tts.similarity_boost == 0.4         # untouched
+    assert tts.style == 0.1                    # untouched
+    assert tts.use_speaker_boost is True        # untouched
+
+
+async def test_pipeline_patch_chat_voice_tts_voice_tuning(ctx) -> None:
+    """The same fields on chat_voice.tts (the chat voice-note override, not
+    the call cascade) — round-trips through ChatVoiceInfo.effective_*."""
+    client, resolver, _ = ctx
+    tid = (await client.post(
+        "/tenants", json=_body(slug="acme", mode="layered"), headers=ADMIN_HEADERS)).json()["tenant_id"]
+
+    resp = await client.patch(
+        f"/tenants/{tid}",
+        json={"pipeline": {"chat_voice": {
+            "enabled": True,
+            "tts": {"provider": "elevenlabs", "voice_id": "cloned-cv",
+                     "stability": 0.6, "use_speaker_boost": True},
+        }}},
+        headers=ADMIN_HEADERS)
+    assert resp.status_code == 200, resp.text
+
+    get_resp = await client.get("/tenants", headers=ADMIN_HEADERS)
+    t = next(x for x in get_resp.json()["tenants"] if x["slug"] == "acme")
+    assert t["chat_voice"]["source"] == "own"
+    assert t["chat_voice"]["effective_stability"] == 0.6
+    assert t["chat_voice"]["effective_use_speaker_boost"] is True
+    assert t["chat_voice"]["effective_similarity_boost"] is None   # never set
+
+    ctx1 = await resolver.resolve_by_slug("acme")
+    assert ctx1.settings.pipeline.chat_voice.tts.stability == 0.6

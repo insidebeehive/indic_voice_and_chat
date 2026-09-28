@@ -3,11 +3,13 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from src.config_tenant import (
     MissingEnvError,
     TenantConfigError,
     TenantSettings,
+    TenantTTSConfig,
     discover_tenant_slugs,
     load_all_tenants,
     load_tenant,
@@ -712,3 +714,59 @@ def test_chat_idle_timeout_tenant_value_overrides_env(monkeypatch) -> None:
     monkeypatch.setenv("CHAT_IDLE_TIMEOUT_SECONDS", "900")
     assert ChatSupportConfig(chat_idle_timeout_seconds=120).chat_idle_timeout_seconds == 120
     assert ChatSupportConfig(**{"chat_idle_timeout_seconds": 0}).chat_idle_timeout_seconds == 0
+
+
+# --- TenantTTSConfig ElevenLabs voice tuning (stability/similarity_boost/
+# style/use_speaker_boost) --------------------------------------------------
+
+
+def test_tenant_tts_config_voice_tuning_defaults_to_none() -> None:
+    cfg = TenantTTSConfig(provider="elevenlabs")
+    assert cfg.stability is None
+    assert cfg.similarity_boost is None
+    assert cfg.style is None
+    assert cfg.use_speaker_boost is None
+
+
+@pytest.mark.parametrize("field", ["stability", "similarity_boost", "style"])
+@pytest.mark.parametrize("bad", [1.5, -0.1])
+def test_tenant_tts_config_rejects_out_of_range_voice_tuning(field, bad) -> None:
+    with pytest.raises(ValidationError):
+        TenantTTSConfig(**{field: bad})
+
+
+@pytest.mark.parametrize("field", ["stability", "similarity_boost", "style"])
+@pytest.mark.parametrize("good", [0.0, 0.5, 1.0])
+def test_tenant_tts_config_accepts_in_range_voice_tuning(field, good) -> None:
+    cfg = TenantTTSConfig(**{field: good})
+    assert getattr(cfg, field) == good
+
+
+def test_tenant_tts_config_use_speaker_boost_accepts_bool() -> None:
+    assert TenantTTSConfig(use_speaker_boost=True).use_speaker_boost is True
+    assert TenantTTSConfig(use_speaker_boost=False).use_speaker_boost is False
+
+
+def test_merge_provider_config_carries_voice_tuning_fields_when_set() -> None:
+    """merge_provider_config is generic over TenantTTSConfig's fields (it
+    iterates model_dump()) — no special-casing was needed to make the new
+    fields reach the adapter config dict, but this pins that they actually
+    do, for both being-set and being-left-unset."""
+    tenant = TenantTTSConfig(provider="elevenlabs", stability=0.9, use_speaker_boost=True)
+    merged = merge_provider_config(tenant, {"provider": "sarvam", "voice_id": "meera"})
+    assert merged["stability"] == 0.9
+    assert merged["use_speaker_boost"] is True
+    # untouched fields never appear as an explicit None override
+    assert "similarity_boost" not in merged
+    assert "style" not in merged
+    assert merged["provider"] == "elevenlabs"          # tenant override won
+    assert merged["voice_id"] == "meera"                # platform default fell through
+
+
+def test_merge_provider_config_omits_unset_voice_tuning_fields() -> None:
+    tenant = TenantTTSConfig(provider="elevenlabs")
+    merged = merge_provider_config(tenant, {})
+    assert "stability" not in merged
+    assert "similarity_boost" not in merged
+    assert "style" not in merged
+    assert "use_speaker_boost" not in merged

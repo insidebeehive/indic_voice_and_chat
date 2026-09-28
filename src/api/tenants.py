@@ -71,6 +71,17 @@ class LayerChoice(BaseModel):
     language: Optional[str] = None
     voice_id: Optional[str] = None  # tts only
     speed: Optional[float] = None   # tts only
+    # ElevenLabs cloned-voice tuning — tts only, ignored by every other
+    # provider adapter. Bounded here (not just on TenantTTSConfig) so a bad
+    # value is rejected by FastAPI's own request-body validation with a 422
+    # before register_tenant ever constructs TenantTTSConfig — that
+    # construction isn't wrapped in a try/except ValidationError the way
+    # update_tenant's pipeline block is, so an unbounded value here would
+    # otherwise surface as a 500, not a 422.
+    stability: Optional[float] = Field(default=None, ge=0.0, le=1.0)          # tts only
+    similarity_boost: Optional[float] = Field(default=None, ge=0.0, le=1.0)   # tts only
+    style: Optional[float] = Field(default=None, ge=0.0, le=1.0)              # tts only
+    use_speaker_boost: Optional[bool] = None                                  # tts only
 
 
 class RealtimeChoice(BaseModel):
@@ -225,6 +236,10 @@ async def register_tenant(
             language=req.tts.language if req.tts else None,
             voice_id=req.tts.voice_id if req.tts else None,
             speed=req.tts.speed if req.tts else None,
+            stability=req.tts.stability if req.tts else None,
+            similarity_boost=req.tts.similarity_boost if req.tts else None,
+            style=req.tts.style if req.tts else None,
+            use_speaker_boost=req.tts.use_speaker_boost if req.tts else None,
         ),
         realtime=TenantRealtimeConfig(
             provider=req.realtime.provider,
@@ -406,14 +421,26 @@ class LayerUpdateIn(BaseModel):
     chat_voice.tts. Every field is optional — an admin can flip just
     ``provider`` (e.g. swap TTS vendor) without re-stating ``model``, or
     just ``model`` without re-stating ``provider``. ``voice_id``/``speed``
-    are TTS-only; harmless no-ops when applied to stt/llm (see
-    _merge_layer_fields, which restricts which of these actually get
-    written per layer so an stt/llm config never picks up TTS-only keys)."""
+    (and the ElevenLabs tuning fields below) are TTS-only; harmless no-ops
+    when applied to stt/llm (see _merge_layer_fields, which restricts which
+    of these actually get written per layer so an stt/llm config never picks
+    up TTS-only keys).
+
+    stability/similarity_boost/style/use_speaker_boost are ElevenLabs
+    cloned-voice tuning (TenantTTSConfig, src/config_tenant.py); like
+    voice_id/speed there is no way to clear one of these back to "unset"
+    through this PATCH once set — only overwrite with a new value. Editing
+    the tenant's YAML/row directly is the only way back to None, same as
+    voice_id/speed today."""
     provider: Optional[str] = None
     model: Optional[str] = None
     language: Optional[str] = None
     voice_id: Optional[str] = None  # tts only
     speed: Optional[float] = None   # tts only
+    stability: Optional[float] = Field(default=None, ge=0.0, le=1.0)          # tts only
+    similarity_boost: Optional[float] = Field(default=None, ge=0.0, le=1.0)   # tts only
+    style: Optional[float] = Field(default=None, ge=0.0, le=1.0)              # tts only
+    use_speaker_boost: Optional[bool] = None                                  # tts only
 
 
 class RealtimeUpdateIn(BaseModel):
@@ -508,7 +535,10 @@ class UpdateTenantResponse(BaseModel):
 # when TenantPipelineConfig(**pc) reconstructs each sub-config.
 _STT_UPDATE_FIELDS = ("provider", "model", "language")
 _LLM_UPDATE_FIELDS = ("provider", "model")
-_TTS_UPDATE_FIELDS = ("provider", "model", "language", "voice_id", "speed")
+_TTS_UPDATE_FIELDS = (
+    "provider", "model", "language", "voice_id", "speed",
+    "stability", "similarity_boost", "style", "use_speaker_boost",
+)
 
 
 def _merge_layer_fields(cfg: dict, upd: "LayerUpdateIn", fields: tuple[str, ...]) -> dict:
@@ -519,7 +549,8 @@ def _merge_layer_fields(cfg: dict, upd: "LayerUpdateIn", fields: tuple[str, ...]
     instead of TelephonyUpdateIn's flatter set of fields."""
     out = dict(cfg)
     ignored: list[str] = []
-    for f in ("provider", "model", "language", "voice_id", "speed"):
+    for f in ("provider", "model", "language", "voice_id", "speed",
+              "stability", "similarity_boost", "style", "use_speaker_boost"):
         v = getattr(upd, f, None)
         if v is None:
             continue
@@ -1218,6 +1249,14 @@ class LayerInfo(BaseModel):
     # the realtime layer stores these under different config keys.
     language: Optional[str] = None
     voice_id: Optional[str] = None
+    # ElevenLabs cloned-voice tuning (TenantTTSConfig, src/config_tenant.py) —
+    # RAW stored override like voice_id above, not merged against a platform
+    # default (config/default.yaml never sets these; only tenants do). Always
+    # None for stt/llm/realtime since those config blocks don't have them.
+    stability: Optional[float] = None
+    similarity_boost: Optional[float] = None
+    style: Optional[float] = None
+    use_speaker_boost: Optional[bool] = None
     # Additive (Task: backoffice "(current: —)" fix). `provider`/`model` above
     # are the RAW stored override — None on a tenant that never set this
     # layer, which is exactly the "—" that made 3 of 6 live tenants look
@@ -1274,6 +1313,14 @@ class ChatVoiceInfo(BaseModel):
     # one picker only.
     effective_language: Optional[str] = None
     effective_voice_id: Optional[str] = None
+    # ElevenLabs cloned-voice tuning off the SAME resolved TenantTTSConfig as
+    # effective_voice_id above (whichever of chat_voice.tts/pipeline.tts
+    # `source` names) — not merged against a platform default, same reasoning
+    # as effective_language/effective_voice_id.
+    effective_stability: Optional[float] = None
+    effective_similarity_boost: Optional[float] = None
+    effective_style: Optional[float] = None
+    effective_use_speaker_boost: Optional[bool] = None
     # "own": pipeline.chat_voice.tts declares a provider — this tenant
     #   configured chat voice-note replies separately from its call cascade.
     # "cascade": chat_voice.tts is empty; resolve_chat_tts_config fell back to
@@ -1409,6 +1456,10 @@ def _layer(pc: dict, key: str, global_defaults: dict[str, dict]) -> LayerInfo:
     return LayerInfo(
         provider=d.get("provider"), model=d.get("model"),
         language=language, voice_id=voice_id,
+        # Raw, tts/chat_voice.tts-only — d.get() is simply None for
+        # stt/llm/realtime, whose config blocks never carry these keys.
+        stability=d.get("stability"), similarity_boost=d.get("similarity_boost"),
+        style=d.get("style"), use_speaker_boost=d.get("use_speaker_boost"),
         effective_provider=merged.get("provider"), effective_model=merged.get("model"),
         provider_source=_source("provider"), model_source=_source("model"),
     )
@@ -1441,6 +1492,10 @@ def _chat_voice_info(pc: dict) -> ChatVoiceInfo:
         effective_model=resolved.model if resolved else None,
         effective_language=resolved.language if resolved else None,
         effective_voice_id=resolved.voice_id if resolved else None,
+        effective_stability=resolved.stability if resolved else None,
+        effective_similarity_boost=resolved.similarity_boost if resolved else None,
+        effective_style=resolved.style if resolved else None,
+        effective_use_speaker_boost=resolved.use_speaker_boost if resolved else None,
         source=source,
     )
 

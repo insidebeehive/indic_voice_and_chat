@@ -287,6 +287,58 @@ def test_get_chat_tts_ignores_chat_block_without_provider(tmp_path, env) -> None
     assert calls["tts"][0]["voice_id"] == "meera"  # not "anushka"
 
 
+# --- ElevenLabs cloned-voice tuning reaches the adapter config -----------
+# stability/similarity_boost/style/use_speaker_boost (TenantTTSConfig,
+# src/config_tenant.py) for BOTH pipeline.tts (get_tts, the call cascade)
+# and chat_voice.tts (get_chat_tts, chat voice-note replies) — including
+# chat_voice's fallback to pipeline.tts when chat_voice.tts itself is empty.
+
+
+def test_get_tts_delivers_voice_tuning_fields_to_adapter_config(tmp_path, env) -> None:
+    providers, calls = _providers(tmp_path)
+    t = _tenant("acme")
+    t.settings.pipeline.tts = TenantTTSConfig(
+        provider="elevenlabs", voice_id="cloned-1",
+        stability=0.9, similarity_boost=0.2, style=0.4, use_speaker_boost=True,
+    )
+    providers.get_tts(t)
+    cfg = calls["tts"][0]
+    assert cfg["stability"] == 0.9
+    assert cfg["similarity_boost"] == 0.2
+    assert cfg["style"] == 0.4
+    assert cfg["use_speaker_boost"] is True
+
+
+def test_get_chat_tts_delivers_voice_tuning_fields_via_chat_voice_override(tmp_path, env) -> None:
+    providers, calls = _providers(tmp_path)
+    t = _chat_tenant(
+        enabled=True,
+        chat_tts=TenantTTSConfig(provider="elevenlabs", voice_id="cloned-2",
+                                  stability=0.7, use_speaker_boost=False),
+        pipeline_tts=TenantTTSConfig(provider="sarvam", voice_id="meera"),
+    )
+    providers.get_chat_tts(t)
+    cfg = calls["tts"][0]
+    assert cfg["stability"] == 0.7
+    assert cfg["use_speaker_boost"] is False
+    # untouched tuning fields never surface as an explicit None
+    assert "similarity_boost" not in cfg
+    assert "style" not in cfg
+
+
+def test_get_chat_tts_delivers_voice_tuning_fields_via_pipeline_tts_fallback(tmp_path, env) -> None:
+    providers, calls = _providers(tmp_path)
+    t = _chat_tenant(
+        enabled=True, chat_tts=None,
+        pipeline_tts=TenantTTSConfig(provider="elevenlabs", voice_id="cloned-3",
+                                      stability=0.15, style=0.6),
+    )
+    providers.get_chat_tts(t)
+    cfg = calls["tts"][0]
+    assert cfg["stability"] == 0.15
+    assert cfg["style"] == 0.6
+
+
 def test_s2s_tenant_with_no_chat_tts_never_hits_platform_default(tmp_path, env) -> None:
     """Regression guard: an s2s tenant with no TTS config of its own must NOT
     silently fall through to `global_defaults["tts"]` and get billed for chat

@@ -8,12 +8,23 @@ Recommended models:
   eleven_multilingual_v2 — best multilingual quality (Hindi, etc.)
 
 Configuration keys:
-  api_key   : ElevenLabs API key (falls back to ELEVENLABS_API_KEY env var)
-  model     : model ID (default: eleven_flash_v2_5)
-  voice_id  : default voice ID — preset or cloned (default: Rachel)
+  api_key            : ElevenLabs API key (falls back to ELEVENLABS_API_KEY env var)
+  model              : model ID (default: eleven_flash_v2_5)
+  voice_id           : default voice ID — preset or cloned (default: Rachel)
+  stability          : voice_settings.stability (0.0-1.0, default 0.5)
+  similarity_boost   : voice_settings.similarity_boost (0.0-1.0, default 0.75)
+  style              : voice_settings.style (0.0-1.0) — omitted unless set
+  use_speaker_boost  : voice_settings.use_speaker_boost (bool) — omitted unless set
 
 The voice_id in TTSConfig overrides the adapter-level default per call,
 so different tenants or campaigns can use different cloned voices.
+
+stability/similarity_boost/style/use_speaker_boost tune a cloned voice and
+come from the tenant's TTS config (TenantTTSConfig, src/config_tenant.py) —
+not from TTSConfig, since they're per-tenant/per-voice, not per-call. Unset
+(None) fields fall back to the adapter defaults below (stability 0.5,
+similarity_boost 0.75); style/use_speaker_boost are only sent when the
+tenant configured them, matching the ElevenLabs API's own optional fields.
 """
 
 from __future__ import annotations
@@ -50,6 +61,35 @@ _PRESET_VOICES: list[dict] = [
 _DEFAULT_TIMEOUT_S = 10.0
 _TTS_ATTEMPTS = 2
 
+_DEFAULT_STABILITY = 0.5
+_DEFAULT_SIMILARITY_BOOST = 0.75
+
+
+def _build_voice_settings(config: dict[str, Any]) -> dict[str, Any]:
+    """voice_settings body for both synthesize() and synthesize_stream().
+
+    stability/similarity_boost always default to the values ElevenLabs
+    recommends for a generic voice (and this adapter has always sent) — a
+    tenant's configured value overlays that default, never removes the key.
+    style/use_speaker_boost have no historical default (this adapter never
+    sent them before): they're included only when the tenant configured
+    them, so an unconfigured tenant's request body is byte-identical to
+    before this per-tenant tuning existed.
+    """
+    settings: dict[str, Any] = {
+        "stability": _DEFAULT_STABILITY,
+        "similarity_boost": _DEFAULT_SIMILARITY_BOOST,
+    }
+    if config.get("stability") is not None:
+        settings["stability"] = config["stability"]
+    if config.get("similarity_boost") is not None:
+        settings["similarity_boost"] = config["similarity_boost"]
+    if config.get("style") is not None:
+        settings["style"] = config["style"]
+    if config.get("use_speaker_boost") is not None:
+        settings["use_speaker_boost"] = config["use_speaker_boost"]
+    return settings
+
 
 def _pcm_output_format(sample_rate: int) -> str:
     """Map a sample rate to the ElevenLabs pcm_<rate> output format string."""
@@ -66,6 +106,10 @@ class ElevenLabsTTSAdapter(ITTSProvider):
         self._model = config.get("model") or DEFAULT_MODEL
         self._default_voice_id = config.get("voice_id") or DEFAULT_VOICE_ID
         self._timeout = float(config.get("timeout", _DEFAULT_TIMEOUT_S))
+        # Built once per adapter instance (one per tenant/layer, see
+        # TenantProviders in src/auth/registry.py) — the same dict is reused by
+        # synthesize() and synthesize_stream() rather than each re-deriving it.
+        self._voice_settings = _build_voice_settings(config)
 
     def _headers(self) -> dict[str, str]:
         return {
@@ -91,10 +135,7 @@ class ElevenLabsTTSAdapter(ITTSProvider):
         body = {
             "text": text,
             "model_id": self._model,
-            "voice_settings": {
-                "stability": 0.5,
-                "similarity_boost": 0.75,
-            },
+            "voice_settings": self._voice_settings,
         }
         timeout = httpx.Timeout(self._timeout, connect=min(self._timeout, 5.0))
         audio: bytes | None = None
@@ -160,7 +201,7 @@ class ElevenLabsTTSAdapter(ITTSProvider):
             body = {
                 "text": segment,
                 "model_id": self._model,
-                "voice_settings": {"stability": 0.5, "similarity_boost": 0.75},
+                "voice_settings": self._voice_settings,
             }
             debug_event(log, "elevenlabs tts stream request", url=url, body=body)
             total_bytes = 0

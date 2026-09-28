@@ -657,6 +657,37 @@ function voicePickerHtml(kind, label, currentVoiceId) {
     <div id="p_${kind}_voice_msg" class="hint" style="flex-basis:100%;"></div>`;
 }
 
+// ElevenLabs-only cloned-voice tuning (TenantTTSConfig.stability/
+// similarity_boost/style/use_speaker_boost, src/config_tenant.py) — shown for
+// every provider (not gated on the provider select, which the operator may
+// not have touched yet) with a hint that other providers ignore it, matching
+// this page's existing style for provider-specific fields. `cur` is the
+// current raw value object ({stability, similarity_boost, style,
+// use_speaker_boost}) or null; blank inputs mean "leave unchanged" same as
+// every other pipeline field on this tab.
+function voiceTuningHtml(kind, cur) {
+  const c = cur || {};
+  const shown = (v) => (v === null || v === undefined) ? "—" : escT(String(v));
+  return `
+    <div class="hint" style="flex-basis:100%;margin-top:.3rem;">ElevenLabs only — ignored by every other TTS provider</div>
+    <label>Stability <small class="hint">(current: ${shown(c.stability)})</small>
+      <input id="p_${kind}_stability" type="number" min="0" max="1" step="0.05" placeholder="0.0 - 1.0, blank = leave unchanged" />
+    </label>
+    <label>Similarity boost <small class="hint">(current: ${shown(c.similarity_boost)})</small>
+      <input id="p_${kind}_similarity_boost" type="number" min="0" max="1" step="0.05" placeholder="0.0 - 1.0, blank = leave unchanged" />
+    </label>
+    <label>Style <small class="hint">(current: ${shown(c.style)})</small>
+      <input id="p_${kind}_style" type="number" min="0" max="1" step="0.05" placeholder="0.0 - 1.0, blank = leave unchanged" />
+    </label>
+    <label>Speaker boost <small class="hint">(current: ${shown(c.use_speaker_boost)})</small>
+      <select id="p_${kind}_use_speaker_boost">
+        <option value="">— leave unchanged —</option>
+        <option value="true">on</option>
+        <option value="false">off</option>
+      </select>
+    </label>`;
+}
+
 async function refreshVoiceOptions(kind) {
   const ids = voicePickerFieldIds(kind);
   const select = $(ids.select);
@@ -782,6 +813,10 @@ function chatVoiceHtml(id, cv) {
       <label>Chat TTS language <input id="p_cv_tts_language" placeholder="blank = leave unchanged" onchange="refreshVoiceOptions('cv_tts')" /></label>
       <label>Chat TTS speed <input id="p_cv_tts_speed" type="number" step="0.05" placeholder="blank = leave unchanged" /></label>
       ${voicePickerHtml("cv_tts", "Chat TTS", cv ? cv.effective_voice_id : null)}
+      ${voiceTuningHtml("cv_tts", cv ? {
+        stability: cv.effective_stability, similarity_boost: cv.effective_similarity_boost,
+        style: cv.effective_style, use_speaker_boost: cv.effective_use_speaker_boost,
+      } : null)}
     </div>`;
 }
 
@@ -833,7 +868,8 @@ async function loadPipeline(id) {
     ${pipeLayerHtml("tts", "TTS (call)", tts, `
       <label>TTS language <input id="p_tts_language" placeholder="blank = leave unchanged" onchange="refreshVoiceOptions('tts')" /></label>
       <label>TTS speed <input id="p_tts_speed" type="number" step="0.05" placeholder="blank = leave unchanged" /></label>
-      ${voicePickerHtml("tts", "TTS", tts.voice_id)}`)}
+      ${voicePickerHtml("tts", "TTS", tts.voice_id)}
+      ${voiceTuningHtml("tts", tts)}`)}
     <h2 style="margin-top:1rem;">Realtime (S2S mode)</h2>
     ${pipeLayerHtml("realtime", "Realtime", realtime, `
       <label>Realtime language_code <input id="p_realtime_language_code" placeholder="blank = leave unchanged" onchange="refreshVoiceOptions('realtime')" /></label>
@@ -860,6 +896,14 @@ function formatApiError(json) {
   return (json && json.error) || "unknown error";
 }
 
+// ElevenLabs cloned-voice tuning fields shared by both TTS-bearing layers
+// (call tts + chat_voice.tts) — see voiceTuningHtml. stability/
+// similarity_boost/style are numbers; use_speaker_boost is a tri-state
+// select ("" = leave unchanged, "true"/"false" otherwise), same convention
+// as p_cv_enabled below.
+const VOICE_TUNING_FIELDS = ["stability", "similarity_boost", "style", "use_speaker_boost"];
+const VOICE_TUNING_NUMERIC_FIELDS = new Set(["speed", "stability", "similarity_boost", "style"]);
+
 async function savePipeline(id) {
   const v = (x) => { const el = $(x); return el ? (el.value || "").trim() : ""; };
   const layer = (kind, fields) => {
@@ -870,7 +914,10 @@ async function savePipeline(id) {
     if (model) obj.model = model;
     for (const f of fields) {
       const val = v(`p_${kind}_${f}`);
-      if (val) obj[f] = f === "speed" ? Number(val) : val;
+      if (!val) continue;
+      if (f === "use_speaker_boost") obj[f] = val === "true";
+      else if (VOICE_TUNING_NUMERIC_FIELDS.has(f)) obj[f] = Number(val);
+      else obj[f] = val;
     }
     return Object.keys(obj).length ? obj : null;
   };
@@ -888,7 +935,7 @@ async function savePipeline(id) {
   // a plain input, so they're merged in separately from `layer()`'s `fields`
   // list — but must still be checked, since a bare voice pick with provider
   // and language both left unchanged should still produce a non-null layer.
-  const tts = layer("tts", ["language", "speed"]) || {};
+  const tts = layer("tts", ["language", "speed", ...VOICE_TUNING_FIELDS]) || {};
   const ttsVoice = voiceFieldValue("tts");
   if (ttsVoice) tts.voice_id = ttsVoice;
   if (Object.keys(tts).length) pipeline.tts = tts;
@@ -899,7 +946,7 @@ async function savePipeline(id) {
   if (Object.keys(realtime).length) pipeline.realtime = realtime;
 
   const cvEnabled = v("p_cv_enabled");
-  const cvTts = layer("cv_tts", ["language", "speed"]) || {};
+  const cvTts = layer("cv_tts", ["language", "speed", ...VOICE_TUNING_FIELDS]) || {};
   const cvVoice = voiceFieldValue("cv_tts");
   if (cvVoice) cvTts.voice_id = cvVoice;
   const chatVoice = {};
