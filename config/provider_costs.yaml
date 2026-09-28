@@ -45,6 +45,16 @@ tts:
     "bulbul:v2": 0.015
     "bulbul:v3": 0.018
     "bulbul:v3-beta": 0.018
+  elevenlabs:
+    # Character-priced upstream; modeled per minute of spoken audio at
+    # ~850 characters/min. ROUGH placeholders, not quoted prices — ElevenLabs
+    # rates depend on the plan and on the model (Flash/Turbo use fewer credits
+    # per character than Multilingual v2). Replace with the rate from our plan
+    # (Admin console → cost catalog, or PUT /api/v1/providers/tts/elevenlabs).
+    eleven_flash_v2_5: 0.08
+    eleven_turbo_v2_5: 0.08
+    eleven_multilingual_v2: 0.15
+    eleven_v3: 0.15
   indicf5:
     # Self-hosted on RunPod — no per-request provider fee; this figure should
     # reflect amortized pod cost per audio-minute (adjust to actual pod rate).
