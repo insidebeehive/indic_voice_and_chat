@@ -76,7 +76,10 @@ dev_router = APIRouter(                                       # mounted at app r
     dependencies=[Depends(require_admin)],
 )
 
-# Factory: (websocket, tenant) -> BrowserVoiceBridge. Set during lifespan.
+# Factory: (websocket, tenant, allow_overrides=...) -> BrowserVoiceBridge. Set
+# during lifespan. `allow_overrides` is a keyword-only bool the Callable type
+# below can't express positionally; see make_browser_bridge_factory's inner
+# `factory` for the actual signature.
 BrowserBridgeFactory = Callable[[WebSocket, TenantContext], BrowserVoiceBridge]
 _browser_bridge_factory: Optional[BrowserBridgeFactory] = None
 
@@ -96,17 +99,30 @@ def get_browser_bridge_factory() -> Optional["BrowserBridgeFactory"]:
     return _browser_bridge_factory
 
 
-async def run_browser_voice(websocket: WebSocket, tenant: TenantContext) -> None:
+async def run_browser_voice(
+    websocket: WebSocket, tenant: TenantContext, *, allow_overrides: bool = False,
+) -> None:
     """Build + run a browser voice session for an already-accepted websocket.
     Shared by the dev console (/dev/voice) and the chat→voice handoff
-    (/chat/voice)."""
+    (/chat/voice).
+
+    ``allow_overrides`` gates whether the bridge factory honours the dev
+    console's query-param overrides (?stt=/?llm=/?tts=/?voice=/?caller_name=
+    /?gender=/?lead_name=/?lead_gender=/?campaign=) -- see
+    ``make_browser_bridge_factory``. Defaults to False so any NEW caller of
+    this function is safe by default; only the admin-gated ``/dev/voice``
+    path (``dev_voice_ws`` below) opts in. The public, always-on
+    ``/chat/voice`` (src/api/chat.py's ``chat_voice_ws``) must never let a
+    customer's query string pick which provider/model the call runs on --
+    that would let them build clients on the platform's own keys.
+    """
     if _browser_bridge_factory is None:
         from src.utils.logging import debug_event
         debug_event(log, "dev_console browser_bridge factory_unset", tenant_slug=tenant.slug)
         await websocket.close(code=1011, reason="browser bridge factory unset")
         return
     try:
-        bridge = await _browser_bridge_factory(websocket, tenant)
+        bridge = await _browser_bridge_factory(websocket, tenant, allow_overrides=allow_overrides)
     except Exception as e:  # noqa: BLE001 - e.g. no campaign configured, or a provider override failed to construct
         log.warning("browser voice bridge build failed: %s", e)
         # WebSocket close reasons are capped at 123 UTF-8 bytes (RFC 6455) —
@@ -669,7 +685,14 @@ async def dev_voice_ws(websocket: WebSocket) -> None:
         log.warning("dev console tenant resolution failed: %s", e)
         await websocket.close(code=1008, reason="unknown tenant")
         return
-    await run_browser_voice(websocket, tenant)
+    # This WS route (dev_voice_ws) sits under ws_router's require_admin_ws
+    # dependency -- an admin token is required (?token=) before the socket is
+    # even accepted (the page shell itself, dev_page_router, is open, but it
+    # ships no data and its own fetches carry the operator's admin token; the
+    # REST data/action routes are dev_router's require_admin). Only THIS
+    # gated WS path may apply the dev console's provider/voice/campaign
+    # query-param overrides.
+    await run_browser_voice(websocket, tenant, allow_overrides=True)
 
 
 @ws_router.websocket("/voice-live")
@@ -777,12 +800,49 @@ def make_browser_bridge_factory(
     (``?handoff=<token>``) — that path has no campaign context and replaces the
     script with a support-mode one regardless, so resolving one first would only
     add a failure point for tenants with no active campaign.
+
+    The returned ``factory`` takes a keyword-only ``allow_overrides`` (default
+    False). Only when True does it read any of the dev-console query-param
+    overrides -- ``stt``, ``llm``, ``tts``, ``voice``, ``caller_name``,
+    ``gender``, ``lead_name``, ``lead_gender``, ``campaign``. This factory is
+    shared by two entry points with very different trust levels: the
+    admin-gated ``/dev/voice`` (``dev_voice_ws``, passes True) and the public,
+    always-on chat->voice handoff ``/chat/voice`` (``chat_voice_ws``, passes
+    False) -- a customer must not be able to append ``?tts=elevenlabs`` to a
+    public WS URL and build clients on the platform's own provider keys.
+    ``handoff`` and the tenant resolution (done by the caller before this
+    factory runs) are NOT overrides in this sense and are always honoured.
     """
 
-    async def factory(websocket: WebSocket, tenant: TenantContext) -> BrowserVoiceBridge:
+    async def factory(
+        websocket: WebSocket, tenant: TenantContext, *, allow_overrides: bool = False,
+    ) -> BrowserVoiceBridge:
         import uuid
 
         query_params = getattr(websocket, "query_params", {}) or {}
+        # Dev-console-only overrides (see the "allow_overrides" note above).
+        # When not allowed, `_qp` reads as if none of these params were ever
+        # sent -- the tenant's configured provider stack runs unmodified --
+        # and every NAME (never a value) that was actually present gets
+        # logged so a stray/attempted override is visible without ever
+        # recording what a customer tried to set it to.
+        _OVERRIDE_PARAMS = (
+            "stt", "llm", "tts", "voice", "caller_name", "gender",
+            "lead_name", "lead_gender", "campaign",
+        )
+        if allow_overrides:
+            def _qp(name: str, default: str = "") -> str:
+                return query_params.get(name, default)
+        else:
+            _ignored = [p for p in _OVERRIDE_PARAMS if query_params.get(p)]
+            if _ignored:
+                from src.utils.logging import debug_event
+                debug_event(log, "dev_console browser_bridge overrides_ignored",
+                            reason="allow_overrides_false", ignored_params=_ignored,
+                            tenant_slug=tenant.slug)
+
+            def _qp(name: str, default: str = "") -> str:
+                return default
         # Chat->voice handoff calls (?handoff=<token>) carry no campaign context
         # at all — and further down, once the handoff blob loads, the campaign
         # script/slots get thrown away entirely and replaced with a support-mode
@@ -797,7 +857,7 @@ def make_browser_bridge_factory(
 
         cur_script, cur_slots = script, slots
         if campaign_resolver is not None and not is_handoff_call:
-            lc = await campaign_resolver.resolve(tenant.id, query_params.get("campaign") or None)
+            lc = await campaign_resolver.resolve(tenant.id, _qp("campaign") or None)
             cur_script, cur_slots = lc.script, lc.slots
 
         from src.providers import (
@@ -805,9 +865,9 @@ def make_browser_bridge_factory(
             get_llm_provider, get_stt_provider, get_streaming_stt_provider, get_tts_provider,
         )
 
-        stt_sel = (query_params.get("stt") or "").strip().lower()
-        llm_sel = (query_params.get("llm") or "").strip().lower()
-        tts_sel = (query_params.get("tts") or "").strip().lower()
+        stt_sel = (_qp("stt") or "").strip().lower()
+        llm_sel = (_qp("llm") or "").strip().lower()
+        tts_sel = (_qp("tts") or "").strip().lower()
 
         # STT override — deepgram is streaming; sarvam/groq are batch. An
         # explicit override that fails to construct (missing key/URL) raises —
@@ -866,7 +926,7 @@ def make_browser_bridge_factory(
         # Voice: ?voice= overrides the configured default (validated against the
         # TTS provider's roster), so the console's Voice dropdown applies in
         # layered mode just like it does for S2S.
-        sel_voice = (query_params.get("voice") or "").strip()
+        sel_voice = (_qp("voice") or "").strip()
         if sel_voice:
             try:
                 roster = {v.get("voice_id") for v in tts.get_available_voices(tts_language)}
@@ -898,7 +958,7 @@ def make_browser_bridge_factory(
         )
         engine = PipelineEngine(stt, llm, tts, pipeline_cfg)
         # Apply caller_name + voice-derived gender to script before building agent.
-        caller_name_override = (query_params.get("caller_name") or "").strip()
+        caller_name_override = (_qp("caller_name") or "").strip()
         if sel_voice or caller_name_override:
             from dataclasses import replace as _dc_replace
             from src.providers.voice_catalog import gender_from_voice_id
@@ -907,7 +967,7 @@ def make_browser_bridge_factory(
             if not derived_gender:
                 # Frontend sends &gender= from the selected voice option's data-gender;
                 # covers providers absent from the static catalog (e.g. ElevenLabs).
-                derived_gender = (query_params.get("gender") or "").strip().lower()
+                derived_gender = (_qp("gender") or "").strip().lower()
             if derived_gender:
                 replacements["gender"] = derived_gender
             if caller_name_override:
@@ -916,8 +976,8 @@ def make_browser_bridge_factory(
                 cur_script = _dc_replace(cur_script, **replacements)
 
         session_id = f"web_{uuid.uuid4().hex[:12]}"
-        lead_name = (query_params.get("lead_name") or "").strip()
-        lead_gender = (query_params.get("lead_gender") or "").strip()
+        lead_name = (_qp("lead_name") or "").strip()
+        lead_gender = (_qp("lead_gender") or "").strip()
         lead_data: dict = {}
         if lead_name:
             lead_data["lead_name"] = lead_name

@@ -8,6 +8,7 @@ import pytest
 
 from src.api.dev_console import make_browser_bridge_factory
 from src.bootstrap import make_bridge_factory, make_exotel_bridge_factory
+from src.defaults import DEFAULT_DEMO_SCRIPT
 from src.dialogue.slots import SlotSchema
 
 
@@ -44,9 +45,11 @@ async def test_browser_factory_passes_slots_into_agent() -> None:
 
 
 async def test_browser_factory_threads_lead_name_from_query() -> None:
+    """lead_name is a dev-console override (Fix 2: /chat/voice must not honour
+    it), so this test exercises the admin-gated allow_overrides=True path."""
     ws = SimpleNamespace(query_params={"lead_name": "Raju"})
     factory = make_browser_bridge_factory(_providers(), slots=SlotSchema())
-    bridge = await factory(websocket=ws, tenant=_tenant())
+    bridge = await factory(websocket=ws, tenant=_tenant(), allow_overrides=True)
     # The page-supplied lead name reaches the agent session (for the opening + prompt).
     assert bridge._agent.session.lead_data.get("lead_name") == "Raju"
 
@@ -146,11 +149,12 @@ async def test_browser_factory_skips_campaign_resolution_for_chat_handoff(fake_r
 
 
 async def test_browser_factory_raises_when_llm_override_fails(monkeypatch) -> None:
+    """?llm= is a dev-console override -- only reached with allow_overrides=True."""
     monkeypatch.delenv("VLLM_BASE_URL", raising=False)
     ws = SimpleNamespace(query_params={"llm": "vllm"})
     factory = make_browser_bridge_factory(_providers(), slots=SlotSchema())
     with pytest.raises(ValueError, match="VLLM_BASE_URL"):
-        await factory(websocket=ws, tenant=_tenant())
+        await factory(websocket=ws, tenant=_tenant(), allow_overrides=True)
 
 
 async def test_browser_factory_raises_when_tts_override_fails(monkeypatch) -> None:
@@ -158,7 +162,7 @@ async def test_browser_factory_raises_when_tts_override_fails(monkeypatch) -> No
     ws = SimpleNamespace(query_params={"tts": "indicf5"})
     factory = make_browser_bridge_factory(_providers(), slots=SlotSchema())
     with pytest.raises(ValueError, match="INDICF5_TTS_URL"):
-        await factory(websocket=ws, tenant=_tenant())
+        await factory(websocket=ws, tenant=_tenant(), allow_overrides=True)
 
 
 async def test_browser_factory_raises_when_batch_stt_override_fails(monkeypatch) -> None:
@@ -166,7 +170,7 @@ async def test_browser_factory_raises_when_batch_stt_override_fails(monkeypatch)
     ws = SimpleNamespace(query_params={"stt": "groq"})
     factory = make_browser_bridge_factory(_providers(), slots=SlotSchema())
     with pytest.raises(ValueError, match="GROQ_API_KEY"):
-        await factory(websocket=ws, tenant=_tenant())
+        await factory(websocket=ws, tenant=_tenant(), allow_overrides=True)
 
 
 async def test_browser_factory_raises_when_streaming_stt_override_fails(monkeypatch) -> None:
@@ -174,7 +178,7 @@ async def test_browser_factory_raises_when_streaming_stt_override_fails(monkeypa
     ws = SimpleNamespace(query_params={"stt": "deepgram"})
     factory = make_browser_bridge_factory(_providers(), slots=SlotSchema())
     with pytest.raises(ValueError, match="DEEPGRAM_API_KEY"):
-        await factory(websocket=ws, tenant=_tenant())
+        await factory(websocket=ws, tenant=_tenant(), allow_overrides=True)
 
 
 async def test_bridge_factory_merges_crm_and_tenant_kb_tiers() -> None:
@@ -299,7 +303,7 @@ async def test_browser_factory_resolves_campaign_per_call() -> None:
 
     ws = SimpleNamespace(query_params={"campaign": "camp_9"})
     factory = make_browser_bridge_factory(_providers(), campaign_resolver=_Resolver())
-    bridge = await factory(websocket=ws, tenant=_tenant())
+    bridge = await factory(websocket=ws, tenant=_tenant(), allow_overrides=True)
     # The agent uses the DB-resolved campaign, and the ?campaign= id was passed through.
     assert seen["args"] == ("t1", "camp_9")
     assert bridge._agent.slots.schema is resolved.slots
@@ -368,7 +372,7 @@ async def test_handoff_call_with_tts_override_ignores_chat_call_tts() -> None:
         "get_chat_call_tts must not be called when ?tts= overrides"))
     ws = SimpleNamespace(query_params={"handoff": "tok1", "tts": "sarvam"})
     factory = make_browser_bridge_factory(providers, slots=SlotSchema())
-    bridge = await factory(websocket=ws, tenant=_tenant())
+    bridge = await factory(websocket=ws, tenant=_tenant(), allow_overrides=True)
     from src.providers.tts.sarvam import SarvamTTSAdapter
     assert isinstance(bridge._agent._engine._tts, SarvamTTSAdapter)
     providers.get_chat_call_tts.assert_not_called()
@@ -413,7 +417,7 @@ async def test_handoff_call_voice_override_wins_over_chat_call_tts_resolution() 
         tts=SimpleNamespace(provider="elevenlabs", model=None, language="en-IN", voice_id="chat-voice-1"),
     )
     factory = make_browser_bridge_factory(providers, slots=SlotSchema())
-    bridge = await factory(websocket=ws, tenant=tenant)
+    bridge = await factory(websocket=ws, tenant=tenant, allow_overrides=True)
     assert bridge._agent._engine._tts is fake_tts
     assert bridge._agent._engine._config.tts.voice_id == "override-voice"
 
@@ -442,3 +446,113 @@ async def test_handoff_call_missing_chat_tts_language_falls_back_to_pipeline_lan
     bridge = await factory(websocket=ws, tenant=tenant)
     assert bridge._agent._engine._tts is chat_sentinel
     assert bridge._agent._engine._config.tts.language == "ta-IN"
+
+
+# --- Fix 2: /chat/voice must not accept provider/voice overrides ----------
+#
+# The public, always-on /chat/voice route (src/api/chat.py's chat_voice_ws)
+# calls run_browser_voice(..., allow_overrides=False) -- the default -- so it
+# reaches this SAME factory as /dev/voice but with overrides switched off.
+# Only ?tenant (resolved before this factory ever runs) and ?handoff stay
+# honoured; every dev-console override param below must be ignored.
+
+
+def test_browser_factory_allow_overrides_defaults_to_false() -> None:
+    """Any NEW caller of the factory that forgets to pass allow_overrides
+    must be safe by default -- pins the parameter's default, not just its
+    current callers' behaviour."""
+    import inspect
+
+    factory = make_browser_bridge_factory(_providers(), slots=SlotSchema())
+    assert inspect.signature(factory).parameters["allow_overrides"].default is False
+
+
+async def test_browser_factory_ignores_stt_llm_tts_overrides_by_default() -> None:
+    """?stt=/?llm=/?tts= must NOT build a client from the raw query param when
+    allow_overrides is left at its default (False, the /chat/voice posture) --
+    the tenant's own configured providers are used instead."""
+    stt_sentinel, llm_sentinel, tts_sentinel = Mock(), Mock(), Mock()
+    providers = _providers()
+    providers.get_stt = lambda t: stt_sentinel
+    providers.get_llm = lambda t: llm_sentinel
+    providers.get_tts = lambda t: tts_sentinel
+    # These overrides would otherwise raise (missing keys/URLs) or build a
+    # different adapter entirely -- if any of them were honoured, this factory
+    # call would either construct a different client than the sentinels below
+    # or raise, so a passing assertion here is a real behavioural check, not
+    # just an unreached-code guard.
+    ws = SimpleNamespace(query_params={"stt": "deepgram", "llm": "vllm", "tts": "elevenlabs"})
+    factory = make_browser_bridge_factory(providers, slots=SlotSchema())
+    bridge = await factory(websocket=ws, tenant=_tenant())  # allow_overrides defaults to False
+    assert bridge._agent._engine._tts is tts_sentinel
+    assert bridge._llm is llm_sentinel
+
+
+async def test_browser_factory_ignores_voice_caller_name_gender_lead_overrides_by_default() -> None:
+    ws = SimpleNamespace(query_params={
+        "voice": "some-other-voice", "caller_name": "Not The Agent",
+        "gender": "female", "lead_name": "Attacker Name", "lead_gender": "male",
+    })
+    tenant = _tenant()
+    factory = make_browser_bridge_factory(_providers(), slots=SlotSchema())
+    bridge = await factory(websocket=ws, tenant=tenant)
+    # tts_voice stayed the tenant's configured (None) voice -- never validated
+    # against a roster or applied, because sel_voice never left "".
+    assert bridge._agent._engine._config.tts.voice_id is None
+    assert "lead_name" not in bridge._agent.session.lead_data
+    assert "lead_gender" not in bridge._agent.session.lead_data
+    # caller_name/gender feed VoiceBotScript replacements -- unreached, so the
+    # script the agent was built with is the untouched closure default.
+    assert bridge._agent._script is DEFAULT_DEMO_SCRIPT
+
+
+async def test_browser_factory_ignores_campaign_override_by_default() -> None:
+    from src.dialogue.campaign_loader import LoadedCampaign
+    from src.dialogue.prompts import VoiceBotScript
+
+    seen = {}
+
+    class _Resolver:
+        async def resolve(self, tenant_id, campaign_id=None):
+            seen["campaign_id"] = campaign_id
+            return LoadedCampaign(
+                VoiceBotScript.from_campaign_yaml({"name": "FromDB", "company": "Acme"}),
+                SlotSchema.from_campaign_yaml({"db_slot": {"type": "string"}}))
+
+    ws = SimpleNamespace(query_params={"campaign": "camp_9"})
+    factory = make_browser_bridge_factory(_providers(), campaign_resolver=_Resolver())
+    await factory(websocket=ws, tenant=_tenant())  # allow_overrides defaults to False
+    # The resolver still runs (a non-handoff call always resolves SOME
+    # campaign) but never sees the query string's campaign id.
+    assert seen["campaign_id"] is None
+
+
+async def test_browser_factory_logs_ignored_override_param_names_not_values(caplog) -> None:
+    """debug_event must record which override params were present, never what
+    a caller tried to set them to."""
+    import logging
+
+    ws = SimpleNamespace(query_params={"tts": "elevenlabs", "voice": "some-voice-id"})
+    factory = make_browser_bridge_factory(_providers(), slots=SlotSchema())
+    with caplog.at_level(logging.DEBUG, logger="src.api.dev_console"):
+        await factory(websocket=ws, tenant=_tenant())
+    matches = [r for r in caplog.records
+               if r.getMessage() == "dev_console browser_bridge overrides_ignored"]
+    assert len(matches) == 1
+    record = matches[0]
+    assert sorted(record.ignored_params) == ["tts", "voice"]
+    assert record.reason == "allow_overrides_false"
+    logged = repr(record.__dict__)
+    assert "elevenlabs" not in logged
+    assert "some-voice-id" not in logged
+
+
+async def test_browser_factory_honours_stt_llm_tts_overrides_when_allowed() -> None:
+    """The admin-gated /dev/voice posture (allow_overrides=True) is unchanged:
+    overrides still build the requested provider, not the tenant's own."""
+    from src.providers.tts.sarvam import SarvamTTSAdapter
+
+    ws = SimpleNamespace(query_params={"tts": "sarvam"})
+    factory = make_browser_bridge_factory(_providers(), slots=SlotSchema())
+    bridge = await factory(websocket=ws, tenant=_tenant(), allow_overrides=True)
+    assert isinstance(bridge._agent._engine._tts, SarvamTTSAdapter)

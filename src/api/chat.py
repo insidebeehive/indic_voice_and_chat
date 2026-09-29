@@ -1985,7 +1985,12 @@ async def chat_voice_ws(websocket: WebSocket) -> None:
     if chat_session_id:
         _active_voice_ws[chat_session_id] = websocket
     try:
-        await run_browser_voice(websocket, tenant)
+        # allow_overrides=False (explicit, matches the default): this route is
+        # public and always-on -- a customer must not be able to append
+        # ?tts=/?stt=/?llm=/?voice=/etc. to build clients on the platform's own
+        # provider keys. Only ?tenant and ?handoff are honoured here; see
+        # run_browser_voice / make_browser_bridge_factory's allow_overrides docs.
+        await run_browser_voice(websocket, tenant, allow_overrides=False)
     finally:
         _active_voice_ws.pop(chat_session_id, None)
 
