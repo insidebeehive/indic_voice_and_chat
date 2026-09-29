@@ -218,6 +218,24 @@ async def register_tenant(
     if existing is not None:
         raise HTTPException(status_code=409, detail=f"tenant slug {slug!r} already exists")
 
+    # B3: mode defaults to "s2s" (RegisterTenantRequest.mode) and `realtime`
+    # is optional, so a caller that never sends `realtime` used to register
+    # fine and only crash on the first call — _build_s2s_agent_and_config
+    # (src/bootstrap.py) dereferences `pipeline.realtime.voice` with no None
+    # check. Reject that combination here instead of at first-call, using
+    # the SAME rule validate_credentials applies at PATCH-time
+    # (src/config_tenant.py: "pipeline.realtime (provider) — required when
+    # pipeline.mode == 's2s'"). Deliberately NOT calling validate_credentials
+    # itself: that function also enforces telephony-credential gaps, which
+    # register_tenant has never checked and is out of scope to start
+    # enforcing here — so the s2s/realtime condition is checked directly
+    # instead of reusing the function wholesale.
+    if req.mode == "s2s" and not (req.realtime and req.realtime.provider):
+        raise HTTPException(
+            status_code=422,
+            detail="pipeline.realtime (provider) is required when mode == 's2s'",
+        )
+
     tenant_id = f"t_{uuid.uuid4().hex[:16]}"
 
     # Telephony secrets keyed by synthetic names that pipeline_config references;
@@ -1773,6 +1791,15 @@ async def get_chat_config(
             "api_token":  "..." if sr.get("crm:api_token") else "",
             "x_api_key": "..." if sr.get("crm:x_api_key") else "",
             "operator_id": ctx.settings.crm.operator_id or "",
+        },
+        # V2 (backoffice audit): read-only — there is no UpdateTenantRequest
+        # field for chat_support, so this is surfaced but not editable here.
+        # An empty support_hours means "always available" (src/chatbot/
+        # support_hours.py) — escalations are offered to the customer 24x7,
+        # which is silently wrong for a tenant that never configured hours.
+        "chat_support": {
+            "support_hours": ctx.settings.chat_support.support_hours,
+            "support_timezone": ctx.settings.chat_support.support_timezone,
         },
     }
 

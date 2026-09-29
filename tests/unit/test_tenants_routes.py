@@ -85,6 +85,18 @@ def _body(**over):
         },
     }
     base.update(over)
+    # register_tenant (B3) now 422s an effective mode="s2s" tenant with no
+    # realtime.provider — RegisterTenantRequest.mode still defaults to
+    # "s2s" (test_list_tenants_shows_mode_and_models asserts that default),
+    # so every caller here that leaves `mode` at its default and doesn't
+    # supply its own `realtime` needs one to keep registering successfully.
+    # A caller that overrides `mode` to "layered", or supplies its own
+    # `realtime`, is left exactly as it asked (e.g.
+    # test_list_tenants_realtime_unset_for_layered_tenant_is_not_platform_default
+    # relies on `mode="layered"` staying realtime-free).
+    if base.get("mode", "s2s") == "s2s" and "realtime" not in base:
+        base["realtime"] = {"provider": "gemini_live", "model": "gemini-3.1-flash-live-preview",
+                             "voice": "Aoede", "language_code": "hi-IN"}
     return base
 
 
@@ -1183,6 +1195,21 @@ async def test_crm_x_api_key_not_set_reports_empty_string(ctx) -> None:
     assert cfg["crm"]["x_api_key"] == ""
 
 
+async def test_chat_config_reports_chat_support_hours(ctx) -> None:
+    """V2 (backoffice audit): chat_support.support_hours has no PATCH route
+    (no UpdateTenantRequest field), so a freshly registered tenant's
+    default -- empty support_hours, meaning "always available" per
+    src/chatbot/support_hours.py -- must still be readable somewhere the
+    backoffice can show it. GET .../chat-config is where the Chat tab
+    already loads its non-secret config from."""
+    client, _, _ = ctx
+    tid = (await client.post(
+        "/tenants", json=_body(slug="acme"), headers=ADMIN_HEADERS)).json()["tenant_id"]
+    cfg = (await client.get(f"/tenants/{tid}/chat-config", headers=ADMIN_HEADERS)).json()
+    assert cfg["chat_support"]["support_hours"] == {}
+    assert cfg["chat_support"]["support_timezone"] == "Asia/Kolkata"
+
+
 async def _stored_secret(sm, tenant_id: str, name: str) -> str | None:
     """Decrypt one tenant_secrets row, or None if the row does not exist —
     the same select-then-crypto.decrypt shape used inline above, factored out
@@ -2223,6 +2250,33 @@ async def test_pipeline_update_requires_admin(ctx) -> None:
     resp = await client.patch(
         f"/tenants/{tid}", json={"pipeline": {"tts": {"provider": "elevenlabs"}}})
     assert resp.status_code == 401
+
+
+async def test_register_s2s_without_realtime_rejected(ctx) -> None:
+    """B3: mode="s2s" with no `realtime.provider` used to register fine and
+    only crash on the first call — `_build_s2s_agent_and_config`
+    (src/bootstrap.py) dereferences `pipeline.realtime.voice` with no None
+    check. Reject it at register time instead, with the same rule
+    validate_credentials applies at PATCH-time."""
+    client, _, _ = ctx
+    body = _body(mode="s2s")
+    body.pop("realtime", None)
+    resp = await client.post("/tenants", json=body, headers=ADMIN_HEADERS)
+    assert resp.status_code == 422, resp.text
+    assert "pipeline.realtime" in resp.json()["detail"]
+
+
+async def test_register_default_mode_without_realtime_rejected(ctx) -> None:
+    """`mode` defaults to "s2s" (RegisterTenantRequest.mode) when the field
+    is omitted entirely — the same 422 must fire even though the caller
+    never named "s2s" explicitly."""
+    client, _, _ = ctx
+    body = _body()
+    body.pop("realtime", None)
+    assert "mode" not in body   # relying on the default, not stating it
+    resp = await client.post("/tenants", json=body, headers=ADMIN_HEADERS)
+    assert resp.status_code == 422, resp.text
+    assert "pipeline.realtime" in resp.json()["detail"]
 
 
 async def test_register_s2s_mode(ctx) -> None:

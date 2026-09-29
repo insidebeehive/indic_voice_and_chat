@@ -886,7 +886,8 @@ async function loadPipeline(id) {
       <h2>Call pipeline (layered mode)</h2>
       ${pipeLayerHtml("stt", "STT", stt, `
         <label>STT language <input id="p_stt_language" placeholder="blank = leave unchanged" /></label>`)}
-      ${pipeLayerHtml("llm", "LLM", llm)}
+      ${pipeLayerHtml("llm", "LLM", llm, `
+        <div class="hint" style="flex-basis:100%;">Used for voice calls only — chat replies use the platform model.</div>`)}
       ${pipeLayerHtml("tts", "TTS (call)", tts, `
         <label>TTS language <input id="p_tts_language" placeholder="blank = leave unchanged" onchange="refreshVoiceOptions('tts')" /></label>
         <label>TTS speed <input id="p_tts_speed" type="number" step="0.05" placeholder="blank = leave unchanged" /></label>
@@ -1452,6 +1453,25 @@ async function loadCRM(id, slug) {
 
 // --- Chat tab ------------------------------------------------------------
 
+// V2 (backoffice audit): read-only display of chat_support.support_hours
+// (src/config_tenant.py ChatSupportConfig, surfaced by GET .../chat-config).
+// There is no UpdateTenantRequest field for chat_support, so this is
+// deliberately not an editor (see the chat_support comment in get_chat_config).
+// Empty support_hours means "always available" (src/chatbot/support_hours.py)
+// — a back-office escalation is offered to the customer at any hour, which is
+// silently wrong for a tenant that simply never set hours.
+function supportHoursHtml(cs) {
+  const hours = (cs && cs.support_hours) || {};
+  const tz = (cs && cs.support_timezone) || "Asia/Kolkata";
+  const days = Object.keys(hours);
+  if (!days.length) {
+    return `<b>No support hours set</b> (timezone: ${escT(tz)}) — handoffs are offered 24×7; ` +
+      `set hours so night-time customers are told when the team is back.`;
+  }
+  const rows = days.map(d => `${escT(d)}: ${escT(hours[d])}`).join(", ");
+  return `${rows} <span class="hint">(timezone: ${escT(tz)})</span>`;
+}
+
 async function loadChat(id, slug) {
   const [tr, cr, rr] = await Promise.all([
     apiTenant("GET", "/api/v1/chat/tools", null, slug),
@@ -1525,6 +1545,9 @@ async function loadChat(id, slug) {
       <thead><tr><th>Name</th><th>Endpoint</th><th>Auth type</th><th>Token set</th><th></th></tr></thead>
       <tbody id="ch_toolrows">${toolRows}</tbody>
     </table>
+
+    <h2 style="margin-top:1.2rem;">Support hours <small class="hint">(back-office handoff availability — read-only)</small></h2>
+    <div class="hint" style="margin-bottom:1.2rem;">${cr.ok ? supportHoursHtml(cfg.chat_support) : "Could not load support hours."}</div>
 
     <h2 style="margin-top:1.2rem;">Chatwoot integration</h2>
     <div class="hint" style="margin-bottom:.5rem;">

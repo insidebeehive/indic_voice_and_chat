@@ -325,6 +325,62 @@ async def test_reload_collision_on_phone_number_logs_error_with_both_tenant_ids(
     assert await r.resolve_by_slug("second") is not None
 
 
+@pytest.mark.asyncio
+async def test_reload_warns_on_s2s_tenant_with_no_realtime_provider(sm, caplog):
+    """B3: register_tenant/update_tenant now reject a mode='s2s' tenant with
+    no pipeline.realtime.provider going forward (src/api/tenants.py), but a
+    row already stored in that state -- e.g. registered before that fix --
+    must not load silently: _build_s2s_agent_and_config (src/bootstrap.py)
+    dereferences pipeline.realtime.voice with no None check and crashes on
+    the tenant's first call. This pins the load-time WARNING that surfaces
+    it instead (not a raise -- one bad tenant must not take the whole
+    resolver down)."""
+    async with sm() as s:
+        s.add(Tenant(
+            id="t_broken", slug="broken-s2s", name="Broken S2S", status="active",
+            timezone="Asia/Kolkata", default_language="hi", mode="s2s",
+            max_concurrent_calls=1,
+            pipeline_config={"mode": "s2s"}))   # no `realtime` key at all
+        await s.commit()
+
+    r = DbTenantResolver(sm)
+    with caplog.at_level("WARNING", logger="src.auth.db_resolver"):
+        assert await r.reload() == 1
+
+    warnings = [rec for rec in caplog.records if rec.levelname == "WARNING"]
+    matches = [rec for rec in warnings if getattr(rec, "tenant_id", None) == "t_broken"]
+    assert len(matches) == 1, "expected exactly one WARNING for the broken s2s tenant"
+    assert matches[0].tenant_slug == "broken-s2s"
+    assert "s2s" in matches[0].message or "s2s" in matches[0].getMessage()
+
+    # Still loads -- a bad tenant's config doesn't take the resolver down.
+    ctx = await r.resolve_by_slug("broken-s2s")
+    assert ctx is not None
+    assert ctx.settings.pipeline.mode == "s2s"
+    assert ctx.settings.pipeline.realtime is None
+
+
+@pytest.mark.asyncio
+async def test_reload_no_warning_for_s2s_tenant_with_realtime_provider(sm, caplog):
+    """The new warning must not false-positive on a correctly configured s2s
+    tenant."""
+    async with sm() as s:
+        s.add(Tenant(
+            id="t_ok", slug="ok-s2s", name="OK S2S", status="active",
+            timezone="Asia/Kolkata", default_language="hi", mode="s2s",
+            max_concurrent_calls=1,
+            pipeline_config={"mode": "s2s",
+                              "realtime": {"provider": "gemini_live", "voice": "Aoede"}}))
+        await s.commit()
+
+    r = DbTenantResolver(sm)
+    with caplog.at_level("WARNING", logger="src.auth.db_resolver"):
+        assert await r.reload() == 1
+
+    warnings = [rec for rec in caplog.records if rec.levelname == "WARNING"]
+    assert not any(getattr(rec, "tenant_id", None) == "t_ok" for rec in warnings)
+
+
 def test_secret_optional_tenant_then_env_then_none(monkeypatch):
     """Optional secrets (e.g. webhook signing) resolve from the decrypted per-tenant
     secrets first, then process env, and return None (NOT raise) when unset."""

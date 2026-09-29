@@ -137,6 +137,27 @@ def tenant_context_from_row(
     # denormalized/fallback-cascaded from several sources above, and a tenant
     # silently landing on the wrong one is exactly the "resolves to the wrong
     # row" incident class this file exists to make diagnosable.
+    # B3 (register-tenant audit): a tenant stored with pipeline.mode="s2s"
+    # and no pipeline.realtime.provider crashes on its first call --
+    # _build_s2s_agent_and_config (src/bootstrap.py) dereferences
+    # pipeline.realtime.voice with no None check. register_tenant/
+    # update_tenant now reject this combination going forward
+    # (src/api/tenants.py), but a row already in this state -- registered
+    # before that fix, or hand-edited -- would otherwise load here with no
+    # trace and only surface as a call-time crash. WARNING, not a raise:
+    # failing the whole resolver load over one bad tenant would take every
+    # tenant down, not just this one (same reasoning as
+    # _log_reload_collision above).
+    if pipeline.mode == "s2s" and not (pipeline.realtime and pipeline.realtime.provider):
+        log.warning(
+            "tenant %s (%s) is stored with pipeline.mode='s2s' and no "
+            "pipeline.realtime.provider -- its calls will crash; fix via "
+            "PATCH /api/v1/tenants/%s (pipeline.realtime.provider) or "
+            "switch it to mode='layered'",
+            tenant.slug, tenant.id, tenant.id,
+            extra={"tenant_id": tenant.id, "tenant_slug": tenant.slug},
+        )
+
     from src.utils.logging import debug_event
     debug_event(
         log, "tenant_resolver context_from_row built",
