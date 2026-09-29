@@ -584,6 +584,12 @@ function onPipeProviderChange(kind) {
 // selection/reload.
 let PIPE_CURRENT = {};
 
+// The tenant's stored mode (t.mode), set fresh by loadPipeline() on every
+// tenant selection/reload — onPipeModeChange() needs this to pick the
+// initial effective mode (before the operator has touched #p_mode) since
+// it's a separate function from loadPipeline and can't read `t` directly.
+let PIPE_TENANT_MODE = "";
+
 // voice roster cache: "<provider>|<language>" -> voices array, so flipping
 // back and forth between two languages/providers for the same layer — or
 // across the three pickers sharing a provider — doesn't re-fetch the
@@ -793,12 +799,14 @@ function pipeLayerHtml(kind, label, current, extraHtml) {
 function chatVoiceHtml(id, cv) {
   const providers = Object.keys(MODELS.tts || {});
   return `
-    <h2 style="margin-top:1.2rem;">Chat voice replies</h2>
+    <h2 style="margin-top:1.2rem;">Chat voice replies/call</h2>
     <div class="hint" style="margin-bottom:.5rem;">
       Voice-note replies in the <b>chat</b> channel — a separate setting from the call TTS above.
       A tenant can run S2S for calls and still need a TTS here for chat voice notes. If left unset,
       chat voice falls back to the call TTS (pipeline.tts); if enabled with neither set, saving is
-      rejected. <br /><small class="hint">current: ${escT(chatVoiceHint(cv))}</small>
+      rejected. The same TTS is also used when the bot offers the customer a voice call from chat;
+      if unset here, that offered call falls back to the call TTS above.
+      <br /><small class="hint">current: ${escT(chatVoiceHint(cv))}</small>
     </div>
     <div class="creds" style="gap:.6rem;flex-wrap:wrap;">
       <label>Enabled <small class="hint">(current: ${cv && cv.enabled ? "enabled" : "disabled"})</small>
@@ -855,6 +863,7 @@ async function loadPipeline(id) {
       language: (chatVoice && chatVoice.effective_language) || tts.language || "",
     },
   };
+  PIPE_TENANT_MODE = t.mode || "";
   $("pane_pipe").innerHTML = `
     <div class="hint" style="margin-bottom:.6rem;">
       Change this tenant's mode and provider/model choices. PATCHes <code>/api/v1/tenants/${id}</code>
@@ -865,26 +874,31 @@ async function loadPipeline(id) {
     <h2>Mode</h2>
     <div class="creds" style="gap:.6rem;margin-bottom:.5rem;">
       <label>Mode <small class="hint">(current: ${escT(t.mode || "—")})</small>
-        <select id="p_mode">
+        <select id="p_mode" onchange="onPipeModeChange()">
           <option value="">— leave unchanged —</option>
           <option value="layered">layered</option>
           <option value="s2s">s2s</option>
         </select>
       </label>
+      <small class="hint">Only the settings for the effective mode are shown below — the other mode's aren't deleted, just hidden.</small>
     </div>
-    <h2>Call pipeline (layered mode)</h2>
-    ${pipeLayerHtml("stt", "STT", stt, `
-      <label>STT language <input id="p_stt_language" placeholder="blank = leave unchanged" /></label>`)}
-    ${pipeLayerHtml("llm", "LLM", llm)}
-    ${pipeLayerHtml("tts", "TTS (call)", tts, `
-      <label>TTS language <input id="p_tts_language" placeholder="blank = leave unchanged" onchange="refreshVoiceOptions('tts')" /></label>
-      <label>TTS speed <input id="p_tts_speed" type="number" step="0.05" placeholder="blank = leave unchanged" /></label>
-      ${voicePickerHtml("tts", "TTS", tts.voice_id)}
-      ${voiceTuningHtml("tts", tts)}`)}
-    <h2 style="margin-top:1rem;">Realtime (S2S mode)</h2>
-    ${pipeLayerHtml("realtime", "Realtime", realtime, `
-      <label>Realtime language_code <input id="p_realtime_language_code" placeholder="blank = leave unchanged" onchange="refreshVoiceOptions('realtime')" /></label>
-      ${voicePickerHtml("realtime", "Realtime", realtime.voice_id)}`)}
+    <div id="pane_pipe_layered">
+      <h2>Call pipeline (layered mode)</h2>
+      ${pipeLayerHtml("stt", "STT", stt, `
+        <label>STT language <input id="p_stt_language" placeholder="blank = leave unchanged" /></label>`)}
+      ${pipeLayerHtml("llm", "LLM", llm)}
+      ${pipeLayerHtml("tts", "TTS (call)", tts, `
+        <label>TTS language <input id="p_tts_language" placeholder="blank = leave unchanged" onchange="refreshVoiceOptions('tts')" /></label>
+        <label>TTS speed <input id="p_tts_speed" type="number" step="0.05" placeholder="blank = leave unchanged" /></label>
+        ${voicePickerHtml("tts", "TTS", tts.voice_id)}
+        ${voiceTuningHtml("tts", tts)}`)}
+    </div>
+    <div id="pane_pipe_s2s">
+      <h2 style="margin-top:1rem;">Realtime (S2S mode)</h2>
+      ${pipeLayerHtml("realtime", "Realtime", realtime, `
+        <label>Realtime language_code <input id="p_realtime_language_code" placeholder="blank = leave unchanged" onchange="refreshVoiceOptions('realtime')" /></label>
+        ${voicePickerHtml("realtime", "Realtime", realtime.voice_id)}`)}
+    </div>
     ${chatVoiceHtml(id, chatVoice)}
     <div style="margin-top:1rem;">
       <button id="p_save_btn" onclick="savePipeline('${id}')">Save pipeline</button>
@@ -897,6 +911,29 @@ async function loadPipeline(id) {
   refreshVoiceOptions("tts");
   refreshVoiceOptions("realtime");
   refreshVoiceOptions("cv_tts");
+  onPipeModeChange();   // set initial pane visibility from the tenant's stored mode
+}
+
+// Shows only the pane matching the effective mode (the #p_mode dropdown's
+// current pick, or — before the operator touches it — the tenant's stored
+// mode) and hides the other. The hidden pane's inputs are untouched and
+// still get sent by savePipeline() if filled in, same as before this toggle
+// existed — hiding is display-only. Called on #p_mode's onchange and once
+// right after loadPipeline() renders, to set correct initial visibility.
+function onPipeModeChange() {
+  const chosen = ($("p_mode") || {}).value || "";
+  const effective = chosen || PIPE_TENANT_MODE || "";
+  const layered = $("pane_pipe_layered");
+  const s2s = $("pane_pipe_s2s");
+  if (!effective) {
+    // Neither the dropdown nor the tenant's stored mode is known — show both
+    // rather than guessing which one the operator needs.
+    if (layered) layered.hidden = false;
+    if (s2s) s2s.hidden = false;
+    return;
+  }
+  if (layered) layered.hidden = effective !== "layered";
+  if (s2s) s2s.hidden = effective !== "s2s";
 }
 
 function formatApiError(json) {
