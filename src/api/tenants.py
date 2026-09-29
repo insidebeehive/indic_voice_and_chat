@@ -2201,12 +2201,15 @@ async def tenant_chat_analytics(
         total_stt_cost=round(float(stt_cost_sum or 0.0), 6),
         media_cost_turns=int(media_turn_count or 0),
         media_cost_since=media_since,
-        embedding_cost=round(embedding_search_cost + embedding_ingest_cost, 6),
-        embedding_search_cost=round(embedding_search_cost, 6),
-        embedding_ingest_cost=round(embedding_ingest_cost, 6),
+        # 9 dp, not the 6 dp used elsewhere above -- matches
+        # compute_embedding_cost's own rounding: a single search-query embed
+        # batch costs on the order of 1e-6 USD, which 6 dp would round to 0.
+        embedding_cost=round(embedding_search_cost + embedding_ingest_cost, 9),
+        embedding_search_cost=round(embedding_search_cost, 9),
+        embedding_ingest_cost=round(embedding_ingest_cost, 9),
         embedding_usage_rows=embedding_usage_rows,
         embedding_data_since=embedding_data_since,
-        shared_crm_embedding_cost=round(shared_crm_embedding_cost, 6),
+        shared_crm_embedding_cost=round(shared_crm_embedding_cost, 9),
         shared_crm_embedding_rows=shared_crm_embedding_rows,
     )
 

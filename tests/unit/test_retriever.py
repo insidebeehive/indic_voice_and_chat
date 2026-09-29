@@ -1310,6 +1310,87 @@ async def test_search_spawn_drops_over_cap_without_recording(
 
 
 @pytest.mark.asyncio
+async def test_search_spawn_cap_warning_rearms_only_once_backlog_drains_to_half(
+    store: FAISSAdapter, monkeypatch, caplog,
+) -> None:
+    """The cap-reached warning must re-arm only once in-flight drops to half
+    the cap or below (review fix), not on every successful spawn -- otherwise
+    sustained saturation (in-flight bouncing at/near the cap) logs about once
+    per completed task.
+
+    Sequence, with the cap patched down to 4 (half = 2) so it's cheap to
+    drive by hand: saturate to the cap and drop several over-cap spawns
+    (exactly one warning) -> drain to just below the cap and spawn
+    successfully (no re-arm, since in-flight is still above half) -> drain to
+    exactly half and spawn/saturate/drop again (a second warning, since the
+    successful spawn at <= half re-armed it).
+    """
+    monkeypatch.setattr(retriever_module, "_EMBEDDING_USAGE_MAX_INFLIGHT", 4)
+    recorder = _HangingEmbeddingUsageRecorder()  # spawned tasks never complete on their own
+    retriever = HybridRetriever(
+        embedder=HashEmbedder(dim=64), vector_store=store,
+        config=RetrievalConfig(strategy="dense", top_k=3),
+        record_embedding_usage=recorder,
+    )
+
+    def _spawn_and_capture_new_task() -> asyncio.Task:
+        before = set(retriever_module._embedding_usage_tasks)
+        retriever._spawn_embedding_usage("search", 1)
+        added = retriever_module._embedding_usage_tasks - before
+        assert len(added) == 1, "expected exactly one new in-flight task"
+        return next(iter(added))
+
+    async def _cancel_and_reap(task: asyncio.Task) -> None:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await task
+        await asyncio.sleep(0)  # let the done-callback discard it from the set
+
+    tasks: list[asyncio.Task] = []
+    try:
+        with caplog.at_level("WARNING", logger="src.rag.retriever"):
+            # Saturate to the cap (4 successful spawns, none of them over cap).
+            for _ in range(4):
+                tasks.append(_spawn_and_capture_new_task())
+            assert len(retriever_module._embedding_usage_tasks) == 4
+
+            # Drop several over-cap spawns -- exactly one warning.
+            for _ in range(3):
+                retriever._spawn_embedding_usage("search", 1)
+            cap_msgs = [r.message for r in caplog.records if "in-flight cap" in r.message]
+            assert len(cap_msgs) == 1
+            assert retriever_module._embedding_usage_cap_warned is True
+
+            # Drain to just below the cap (3 in flight, cap=4, half=2) and
+            # spawn successfully -- must NOT re-arm (3 > half).
+            await _cancel_and_reap(tasks.pop())
+            assert len(retriever_module._embedding_usage_tasks) == 3
+            tasks.append(_spawn_and_capture_new_task())  # back to 4 in flight
+            assert retriever_module._embedding_usage_cap_warned is True, \
+                "must not re-arm until in-flight drops to <= half the cap"
+
+            # Drain down to exactly half (2 in flight) and spawn -- THIS
+            # spawn re-arms (2 <= half).
+            await _cancel_and_reap(tasks.pop())
+            await _cancel_and_reap(tasks.pop())
+            assert len(retriever_module._embedding_usage_tasks) == 2
+            tasks.append(_spawn_and_capture_new_task())  # 3 in flight; re-armed
+            assert retriever_module._embedding_usage_cap_warned is False
+
+            # Saturate back to the cap, then exceed it again -- a second,
+            # distinct warning must be logged now that it's re-armed.
+            tasks.append(_spawn_and_capture_new_task())  # 4 in flight == cap
+            retriever._spawn_embedding_usage("search", 1)  # dropped, over cap
+            cap_msgs = [r.message for r in caplog.records if "in-flight cap" in r.message]
+            assert len(cap_msgs) == 2
+    finally:
+        for t in tasks:
+            await _cancel_and_reap(t)
+        retriever_module._embedding_usage_tasks.clear()
+        retriever_module._embedding_usage_cap_warned = False  # don't leak into later tests
+
+
+@pytest.mark.asyncio
 async def test_drain_embedding_usage_tasks_timeout_returns_even_if_task_hangs() -> None:
     """Production shutdown (src/main.py) drains with a timeout before
     dispose_engine() -- it must return promptly even if a write is still
@@ -1329,3 +1410,43 @@ async def test_drain_embedding_usage_tasks_timeout_returns_even_if_task_hangs() 
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError, Exception):
             await task
+
+
+@pytest.mark.asyncio
+async def test_drain_embedding_usage_tasks_timeout_logs_accurate_pending_count(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The timeout log line must count tasks that were actually still pending
+    when the wait timed out (before they're cancelled/awaited), not tasks
+    still not-done afterwards -- by the time cancellation has been awaited,
+    every task is done, so counting post-cancellation always reports 0."""
+    async def _never_finishes() -> None:
+        await asyncio.sleep(10)
+
+    async def _finishes_quickly() -> None:
+        await asyncio.sleep(0)
+
+    hanging = [asyncio.ensure_future(_never_finishes()) for _ in range(2)]
+    quick = asyncio.ensure_future(_finishes_quickly())
+    tasks = [*hanging, quick]
+    for t in tasks:
+        retriever_module._embedding_usage_tasks.add(t)
+        t.add_done_callback(retriever_module._embedding_usage_tasks.discard)
+    try:
+        with caplog.at_level("WARNING", logger="src.rag.retriever"):
+            await asyncio.wait_for(drain_embedding_usage_tasks(timeout=0.2), timeout=2.0)
+
+        timeout_msgs = [
+            r.message for r in caplog.records if "drain_embedding_usage_tasks" in r.message
+        ]
+        assert len(timeout_msgs) == 1
+        assert "cancelled 2 still-pending embedding usage write(s) out of 3 in flight" in (
+            timeout_msgs[0]
+        )
+        assert all(t.cancelled() for t in hanging)
+    finally:
+        for t in tasks:
+            t.cancel()
+        for t in tasks:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await t

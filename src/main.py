@@ -379,19 +379,24 @@ async def _prune_chat_turn_metrics_loop(retention_days: float) -> None:
     3, §11.2) and ``prune_embedding_usage`` (same retention window, same
     mechanism -- see that function's own docstring for why it rides this loop
     rather than getting a second one). Best-effort like every other
-    background loop here: never dies, one try/except per iteration. Runs once
-    at startup, then every ``_CHAT_METRICS_PRUNE_INTERVAL_S``."""
+    background loop here: never dies. Each prune gets its own try/except so a
+    failure in one (e.g. a chat_turn_metrics-specific issue) doesn't skip the
+    other -- they're independent tables with nothing tying their success
+    together. Runs once at startup, then every ``_CHAT_METRICS_PRUNE_INTERVAL_S``."""
     sm = get_sessionmaker()
     while True:
         try:
             n = await prune_chat_turn_metrics(sm, retention_days)
             if n:
                 log.info("pruned old chat turn metrics", extra={"count": n})
+        except Exception:  # noqa: BLE001 - the prune loop must never die (CancelledError still propagates)
+            log.exception("chat-turn-metrics prune failed")
+        try:
             n_embed = await prune_embedding_usage(sm, retention_days)
             if n_embed:
                 log.info("pruned old embedding usage rows", extra={"count": n_embed})
         except Exception:  # noqa: BLE001 - the prune loop must never die (CancelledError still propagates)
-            log.exception("chat-turn-metrics/embedding-usage prune failed")
+            log.exception("embedding-usage prune failed")
         await asyncio.sleep(_CHAT_METRICS_PRUNE_INTERVAL_S)
 
 

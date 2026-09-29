@@ -89,7 +89,8 @@ _embedding_usage_tasks: "set[asyncio.Task]" = set()
 _EMBEDDING_USAGE_MAX_INFLIGHT = 200
 
 # Rate-limits the cap-reached warning to one per overload episode, re-arming
-# once the backlog drains back under the cap -- same idiom as
+# once the backlog drains back to at most half the cap
+# (_EMBEDDING_USAGE_MAX_INFLIGHT // 2) -- same idiom as
 # src/observability/turn_metrics_push.py's _PushFailureWarner ("warn once per
 # outage, a success re-arms it").
 _embedding_usage_cap_warned = False
@@ -101,25 +102,32 @@ async def drain_embedding_usage_tasks(timeout: Optional[float] = None) -> None:
     Production use (see src/main.py's shutdown): pass a ``timeout`` so a
     stuck/hanging write can't stall shutdown past it -- this never raises,
     even on timeout, since a KB-cost row is never worth delaying process
-    exit for. Test use (the retriever test suite): call with no timeout to
+    exit for. On timeout, the still-pending writes are cancelled and awaited
+    (that's what makes it return promptly, once cancellation has actually
+    unwound them) rather than left running, so those cost rows are lost, not
+    deferred. Test use (the retriever test suite): call with no timeout to
     simply wait for whatever is in flight to finish.
     """
     if not _embedding_usage_tasks:
         return
     tasks = list(_embedding_usage_tasks)
-    gather = asyncio.gather(*tasks, return_exceptions=True)
     try:
         if timeout is not None:
-            await asyncio.wait_for(gather, timeout=timeout)
+            done, pending = await asyncio.wait(tasks, timeout=timeout)
+            if pending:
+                for task in pending:
+                    task.cancel()
+                # Await the cancelled tasks so they actually finish unwinding
+                # before we return -- otherwise they'd keep running detached
+                # from any caller after this function returns.
+                await asyncio.gather(*pending, return_exceptions=True)
+                log.warning(
+                    "drain_embedding_usage_tasks: timed out after %.1fs; cancelled "
+                    "%d still-pending embedding usage write(s) out of %d in flight",
+                    timeout, len(pending), len(tasks),
+                )
         else:
-            await gather
-    except asyncio.TimeoutError:
-        log.warning(
-            "drain_embedding_usage_tasks: timed out after %.1fs waiting for "
-            "%d in-flight embedding usage write(s); leaving them to finish "
-            "in the background",
-            timeout, len(tasks),
-        )
+            await asyncio.gather(*tasks, return_exceptions=True)
     except Exception:  # noqa: BLE001 - draining must never raise into shutdown
         log.warning("drain_embedding_usage_tasks failed; continuing", exc_info=True)
 
@@ -416,7 +424,11 @@ class HybridRetriever:
                     _EMBEDDING_USAGE_MAX_INFLIGHT, purpose,
                 )
             return
-        _embedding_usage_cap_warned = False
+        # Re-arm only once the backlog has actually drained, not on every
+        # successful spawn -- otherwise sustained saturation (in-flight
+        # bouncing at/near the cap) logs about once per completed task.
+        if _embedding_usage_cap_warned and len(_embedding_usage_tasks) <= _EMBEDDING_USAGE_MAX_INFLIGHT // 2:
+            _embedding_usage_cap_warned = False
         try:
             task = asyncio.ensure_future(self._emit_embedding_usage(purpose, input_chars))
             _embedding_usage_tasks.add(task)

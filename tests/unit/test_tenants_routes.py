@@ -1322,6 +1322,30 @@ async def test_chat_analytics_embedding_cost_scoped_and_split(ctx) -> None:
     assert ca_other["embedding_usage_rows"] == 1
 
 
+async def test_chat_analytics_embedding_cost_survives_9dp_rounding(ctx) -> None:
+    """embedding_cost/embedding_search_cost/embedding_ingest_cost round to
+    9dp, matching compute_embedding_cost's own precision (src/api/chat_cost.py)
+    -- not the 6dp used by total_cost/total_tts_cost/etc elsewhere in this
+    response. A single search-query embed batch costs on the order of 1e-6
+    USD, which 6dp rounds to 0.0, silently erasing real spend."""
+    client, _, sm = ctx
+    tid = (await client.post("/tenants", json=_body(slug="acme"), headers=ADMIN_HEADERS)).json()["tenant_id"]
+
+    from src.models.embedding_usage import EmbeddingUsage
+
+    async with sm() as s:
+        s.add(EmbeddingUsage(
+            tenant_id=tid, purpose="search", provider="gemini", model="text-embedding-004",
+            input_chars=40, tokens=10, cost=1.23e-7,
+        ))
+        await s.commit()
+
+    ca = (await client.get(f"/tenants/{tid}/chat-analytics", headers=ADMIN_HEADERS)).json()
+    assert ca["embedding_search_cost"] == pytest.approx(1.23e-7)
+    assert ca["embedding_cost"] == pytest.approx(1.23e-7)
+    assert ca["embedding_ingest_cost"] == 0.0
+
+
 async def test_chat_analytics_shared_crm_embedding_cost_is_crm_wide_not_tenant_total(ctx) -> None:
     """shared_crm_embedding_cost sums the LINKED CRM's crm-scoped rows across
     every tenant on that CRM -- not just this one -- and must never be

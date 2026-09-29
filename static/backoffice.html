@@ -116,6 +116,19 @@ function saveCreds() {
 }
 const base = () => ($("baseUrl").value.trim() || window.location.origin).replace(/\/$/, "");
 const fmt = (c) => "$" + (Number(c) || 0).toFixed(4);
+// KB embedding costs are tiny (one search is ~1e-6 USD) -- fmt's 4dp prints
+// $0.0000 for nearly every real value. Below fmt's smallest visible amount,
+// show enough significant digits to be readable instead (e.g. $0.00000123);
+// at or above it, fall back to fmt so ordinary-sized costs render as usual.
+const fmtEmbed = (c) => {
+  const n = Number(c) || 0;
+  // Below toFixed(9)'s smallest representable amount, a positive value would
+  // round to "0.000000000" and print as the misleading "$0.0" -- indicate
+  // it's a real, nonzero amount too small to show at this precision instead.
+  if (n > 0 && n < 1e-9) return "<$0.000000001";
+  if (n > 0 && n < 0.0001) return "$" + n.toFixed(9).replace(/0+$/, "").replace(/\.$/, ".0");
+  return fmt(n);
+};
 const mins = (ms) => ((Number(ms) || 0) / 60000).toFixed(1);
 
 async function api(path) {
@@ -338,20 +351,25 @@ async function loadAnalytics(id) {
   // voice-note boxes above are gated on media_cost_turns, so a tenant with
   // no embedding_usage rows yet (predates migration 0029, or has never
   // triggered an embed call) reads as "no data yet" rather than "$0.0000".
+  // Uses fmtEmbed, not fmt: a single search embed costs ~1e-6 USD, which
+  // fmt's 4dp would print as a flat, indistinguishable "$0.0000".
   const kbEmbedHtml = ca && ca.embedding_usage_rows > 0
-    ? `${fmt(ca.embedding_cost)} <span class="hint">(search ${fmt(ca.embedding_search_cost)} / ingest ${fmt(ca.embedding_ingest_cost)}, ` +
+    ? `${fmtEmbed(ca.embedding_cost)} <span class="hint">(search ${fmtEmbed(ca.embedding_search_cost)} / ingest ${fmtEmbed(ca.embedding_ingest_cost)}, ` +
       `${ca.embedding_usage_rows} row${ca.embedding_usage_rows === 1 ? "" : "s"}` +
       (ca.embedding_data_since ? ` since ${escT(String(ca.embedding_data_since).slice(0, 10))}` : "") + `)</span>`
     : `<span class="hint">no KB embedding cost data yet</span>`;
 
-  // Shared CRM KB cost -- only rendered when non-zero. This is the linked
-  // CRM's shared-KB cost across ALL tenants registered under it, not this
-  // tenant's own attributable share -- see
-  // ChatAnalytics.shared_crm_embedding_cost's own comment in
-  // src/api/tenants.py. Never added into kbEmbedHtml, Total cost, or any
-  // other per-tenant total on this page.
-  const sharedCrmEmbedHtml = ca && ca.shared_crm_embedding_cost > 0
-    ? `${fmt(ca.shared_crm_embedding_cost)} <span class="hint">(${ca.shared_crm_embedding_rows} row${ca.shared_crm_embedding_rows === 1 ? "" : "s"}` +
+  // Shared CRM KB cost -- only rendered when there are rows, not when cost is
+  // non-zero: cost alone can round to 0 at display precision (or genuinely be
+  // 0 for a CRM whose shared KB has only ever been searched, never ingested,
+  // against a free-tier model) even though rows exist, which would wrongly
+  // hide a real (if tiny) figure. This is the linked CRM's shared-KB cost
+  // across ALL tenants registered under it, not this tenant's own
+  // attributable share -- see ChatAnalytics.shared_crm_embedding_cost's own
+  // comment in src/api/tenants.py. Never added into kbEmbedHtml, Total cost,
+  // or any other per-tenant total on this page.
+  const sharedCrmEmbedHtml = ca && ca.shared_crm_embedding_rows > 0
+    ? `${fmtEmbed(ca.shared_crm_embedding_cost)} <span class="hint">(${ca.shared_crm_embedding_rows} row${ca.shared_crm_embedding_rows === 1 ? "" : "s"}` +
       ` — the linked CRM's shared KB, summed across ALL of its tenants, not this tenant alone)</span>`
     : "";
 
@@ -423,6 +441,8 @@ async function loadAnalytics(id) {
     </div>
     <div class="hint" style="margin:.3rem 0 .5rem;">KB embedding cost (ingest + query-time search) is tracked
       separately from Total cost (est.) above and is NOT included in it -- total_cost is chat-message cost only.
+      It is sourced from the embedding_usage table, which is pruned on the same schedule as chat turn metrics, so
+      it only covers the trailing ~90 days of retained rows.
       ${sharedCrmEmbedHtml ? "The shared CRM KB figure covers every tenant on that CRM, not this tenant alone, and is informational only." : ""}</div>` : "";
 
   const winLabel = CHAT_WINDOW_H === 168 ? "7d" : CHAT_WINDOW_H + "h";

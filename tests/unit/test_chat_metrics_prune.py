@@ -219,3 +219,34 @@ async def test_prune_chat_turn_metrics_loop_prunes_both_tables(sessionmaker, mon
     async with sessionmaker() as db:
         assert (await db.execute(select(ChatTurnMetric))).scalars().all() == []
         assert (await db.execute(select(EmbeddingUsage))).scalars().all() == []
+
+
+async def test_prune_chat_turn_metrics_loop_embedding_prune_survives_chat_prune_failure(
+    sessionmaker, monkeypatch,
+) -> None:
+    """The two prunes must each have their own try/except (review fix): a
+    chat_turn_metrics-specific failure must not skip the embedding_usage
+    prune riding the same loop iteration. Before this fix they shared one
+    try/except, so an exception from prune_chat_turn_metrics would abort the
+    iteration before prune_embedding_usage ever ran."""
+    monkeypatch.setattr(main, "get_sessionmaker", lambda: sessionmaker)
+    now = datetime.utcnow()
+    await _seed_embedding_usage(sessionmaker, created_at=now - timedelta(days=RETENTION_DAYS + 1))
+
+    async def _boom(*_args, **_kwargs):
+        raise RuntimeError("chat_turn_metrics prune exploded")
+
+    monkeypatch.setattr(main, "prune_chat_turn_metrics", _boom)
+
+    async def _sleep_then_stop(_seconds):
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(main.asyncio, "sleep", _sleep_then_stop)
+
+    with pytest.raises(asyncio.CancelledError):
+        await main._prune_chat_turn_metrics_loop(RETENTION_DAYS)
+
+    # The embedding_usage prune still ran and deleted the old row despite the
+    # chat_turn_metrics prune raising first in the same iteration.
+    async with sessionmaker() as db:
+        assert (await db.execute(select(EmbeddingUsage))).scalars().all() == []

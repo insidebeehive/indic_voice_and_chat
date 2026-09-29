@@ -143,7 +143,13 @@ async def test_backoffice_chat_analytics_shows_kb_embedding_cost() -> None:
     voice-note boxes above are gated on media_cost_turns -- so a tenant with
     no embedding_usage rows reads as "no data yet", not a misleading
     "$0.0000". It must also state explicitly that this cost is NOT included
-    in Total cost (est.), unlike the voice-note TTS/STT breakdown above."""
+    in Total cost (est.), unlike the voice-note TTS/STT breakdown above.
+
+    Embedding costs are tiny (~1e-6 USD for one search), so the box must use
+    fmtEmbed -- not fmt, whose 4dp would flatten every real value to
+    "$0.0000" -- and the shared-CRM box must be gated on row count, not cost,
+    since a real, non-zero row count can still display as a zero-looking
+    cost at low precision."""
     transport = ASGITransport(app=_app())
     async with AsyncClient(transport=transport, base_url="http://test") as c:
         resp = await c.get("/admin/tenants")
@@ -157,23 +163,31 @@ async def test_backoffice_chat_analytics_shows_kb_embedding_cost() -> None:
     assert "ca.shared_crm_embedding_cost" in body
     assert "ca.shared_crm_embedding_rows" in body
 
+    # fmtEmbed exists and is small-amount-aware (falls back to fmt at/above
+    # its threshold, shows significant digits below it).
+    assert "const fmtEmbed = (c) => {" in body
+
     import re
     assert re.search(
-        r"ca\.embedding_usage_rows\s*>\s*0\s*\?\s*`\$\{fmt\(ca\.embedding_cost\)\}.*?"
+        r"ca\.embedding_usage_rows\s*>\s*0\s*\?\s*`\$\{fmtEmbed\(ca\.embedding_cost\)\}.*?"
         r":\s*`<span[^`]*no KB embedding cost data yet</span>`",
         body, re.S,
     ), "KB embedding cost must be gated on embedding_usage_rows, with an explicit no-data fallback"
 
-    # Shared CRM KB box is gated on a non-zero shared figure.
+    # Shared CRM KB box is gated on row count, not cost (see docstring above).
     assert re.search(
-        r"ca\.shared_crm_embedding_cost\s*>\s*0\s*\?\s*`\$\{fmt\(ca\.shared_crm_embedding_cost\)\}",
+        r"ca\.shared_crm_embedding_rows\s*>\s*0\s*\?\s*`\$\{fmtEmbed\(ca\.shared_crm_embedding_cost\)\}",
         body, re.S,
-    ), "Shared CRM KB cost must be gated on shared_crm_embedding_cost being non-zero"
+    ), "Shared CRM KB cost must be gated on shared_crm_embedding_rows being non-zero, not cost"
     assert "all tenants" in body.lower() or "ALL of its tenants" in body
 
     # NOT included in Total cost -- stated explicitly, unlike the voice-note
     # breakdown, which IS included.
     assert "NOT included in it" in body
+
+    # Coverage hint states the retained window, matching the voice-note
+    # media-cost hint's phrasing ("trailing ~90 days of retained turns").
+    assert "trailing ~90 days of retained rows" in body
 
 
 @pytest.mark.asyncio
