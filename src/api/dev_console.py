@@ -38,7 +38,7 @@ from src.api.call_store import insert_call
 # bootstrap import here would reintroduce the cycle fixed for
 # LiveKitModeNotSupported (see src.exceptions / src.defaults docstrings).
 from src.defaults import DEFAULT_DEMO_SCRIPT
-from src.config_tenant import platform_webhook_base_url
+from src.config_tenant import platform_webhook_base_url, resolve_chat_tts_config
 from src.models.database import get_sessionmaker
 from src.models.turn_metrics import record_turn_metric
 from src.dialogue.prompts import VoiceBotScript, build_s2s_system_instruction
@@ -825,13 +825,47 @@ def make_browser_bridge_factory(
             _stream_override = _build_stream_provider(tenant)
 
         llm = get_llm_provider({"provider": llm_sel}) if llm_sel in LLM_PROVIDERS else providers.get_llm(tenant)
-        tts = get_tts_provider({"provider": tts_sel}) if tts_sel in TTS_PROVIDERS else providers.get_tts(tenant)
 
-        tts_language = tenant.settings.pipeline.tts.language or "hi-IN"
+        # TTS source, in priority order:
+        #   1. explicit ?tts= override (dev console) — always wins, handoff or not.
+        #   2. a chat->voice handoff call — speak in the SAME voice chat already
+        #      configured for voice-note replies (pipeline.chat_voice.tts, or its
+        #      pipeline.tts fallback), not the call cascade's pipeline.tts. This is
+        #      deliberately independent of chat_voice.enabled: that flag only gates
+        #      whether chat TEXT replies get an audio attachment, and must not also
+        #      silence the voice offered on a handoff call (see
+        #      TenantProviders.get_chat_call_tts's docstring).
+        #   3. else (non-handoff, or handoff with nothing resolvable) — the call
+        #      cascade's tts, unchanged.
+        if tts_sel in TTS_PROVIDERS:
+            tts = get_tts_provider({"provider": tts_sel})
+            tts_language = tenant.settings.pipeline.tts.language or "hi-IN"
+            tts_voice = tenant.settings.pipeline.tts.voice_id
+            if is_handoff_call:
+                from src.utils.logging import debug_event
+                debug_event(log, "dev_console browser_bridge handoff_tts_source",
+                            source="override", tts_provider=tts_sel)
+        elif is_handoff_call and (chat_call_tts := providers.get_chat_call_tts(tenant)) is not None:
+            from src.utils.logging import debug_event
+            tts = chat_call_tts
+            resolved = resolve_chat_tts_config(tenant.settings.pipeline)
+            tts_language = resolved.language or tenant.settings.pipeline.tts.language or "hi-IN"
+            tts_voice = resolved.voice_id
+            debug_event(log, "dev_console browser_bridge handoff_tts_source",
+                        source="chat_voice", tts_provider=resolved.provider)
+        else:
+            tts = providers.get_tts(tenant)
+            tts_language = tenant.settings.pipeline.tts.language or "hi-IN"
+            tts_voice = tenant.settings.pipeline.tts.voice_id
+            if is_handoff_call:
+                from src.utils.logging import debug_event
+                debug_event(log, "dev_console browser_bridge handoff_tts_source",
+                            source="pipeline_tts_fallback",
+                            tts_provider=getattr(tenant.settings.pipeline.tts, "provider", None) or None)
+
         # Voice: ?voice= overrides the configured default (validated against the
         # TTS provider's roster), so the console's Voice dropdown applies in
         # layered mode just like it does for S2S.
-        tts_voice = tenant.settings.pipeline.tts.voice_id
         sel_voice = (query_params.get("voice") or "").strip()
         if sel_voice:
             try:

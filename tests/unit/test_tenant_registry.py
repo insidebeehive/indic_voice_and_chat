@@ -436,3 +436,116 @@ def test_get_chat_tts_logs_debug_when_enabled_but_unresolvable(tmp_path, env, ca
     # tests together pin that the log line actually discriminates the reason,
     # not just that "some" DEBUG line appears either way.
     assert not any("chat_voice.enabled is false" in r.message for r in caplog.records)
+
+
+# --- chat CALL TTS (handoff calls) ---------------------------------------
+#
+# get_chat_call_tts backs the voice OFFERED from a chat handoff -- it must
+# resolve the same effective TTS chat voice-note replies use
+# (resolve_chat_tts_config: chat_voice.tts XOR pipeline.tts), but unlike
+# get_chat_tts it must NOT gate on chat_voice.enabled: that flag only
+# controls whether chat TEXT replies get an audio attachment, an unrelated
+# feature from whether a handoff call speaks in the configured voice.
+
+
+def test_get_chat_call_tts_ignores_enabled_false(tmp_path, env) -> None:
+    providers, calls = _providers(tmp_path)
+    t = _chat_tenant(enabled=False, chat_tts=TenantTTSConfig(provider="elevenlabs", voice_id="v1"))
+    result = providers.get_chat_call_tts(t)
+    assert result is not None
+    assert calls["tts"][0]["provider"] == "elevenlabs"
+
+
+def test_get_chat_call_tts_uses_chat_voice_tts_over_pipeline_tts(tmp_path, env) -> None:
+    providers, calls = _providers(tmp_path)
+    t = _chat_tenant(
+        enabled=True,
+        chat_tts=TenantTTSConfig(provider="google", voice_id="en-IN-Wavenet-D"),
+        pipeline_tts=TenantTTSConfig(provider="sarvam", voice_id="meera"),
+    )
+    result = providers.get_chat_call_tts(t)
+    assert result is not None
+    assert calls["tts"][0]["provider"] == "google"
+    assert calls["tts"][0]["voice_id"] == "en-IN-Wavenet-D"
+    assert calls["tts"][0]["language"] == "hi-IN"  # global default survived
+    assert "api_key" not in calls["tts"][0]
+
+
+def test_get_chat_call_tts_falls_back_to_pipeline_tts_when_chat_block_empty(tmp_path, env) -> None:
+    providers, calls = _providers(tmp_path)
+    t = _chat_tenant(
+        enabled=True, chat_tts=None,
+        pipeline_tts=TenantTTSConfig(provider="sarvam", voice_id="meera"),
+    )
+    providers.get_chat_call_tts(t)
+    assert calls["tts"][0]["provider"] == "sarvam"
+    assert calls["tts"][0]["voice_id"] == "meera"
+    assert len(calls["tts"]) == 1
+
+
+def test_get_chat_call_tts_returns_none_when_nothing_resolvable(tmp_path, env) -> None:
+    providers, calls = _providers(tmp_path)
+    for enabled in (True, False):
+        t = _chat_tenant(enabled=enabled, chat_tts=TenantTTSConfig(), pipeline_tts=TenantTTSConfig())
+        assert providers.get_chat_call_tts(t) is None
+    assert calls["tts"] == []
+    assert not any(k[1] == "chat_call_tts" for k in providers._cache)
+
+
+def test_get_chat_call_tts_delivers_voice_tuning_fields_via_chat_voice_override(tmp_path, env) -> None:
+    providers, calls = _providers(tmp_path)
+    t = _chat_tenant(
+        enabled=True,
+        chat_tts=TenantTTSConfig(provider="elevenlabs", voice_id="cloned-2",
+                                  stability=0.7, use_speaker_boost=False),
+        pipeline_tts=TenantTTSConfig(provider="sarvam", voice_id="meera"),
+    )
+    providers.get_chat_call_tts(t)
+    cfg = calls["tts"][0]
+    assert cfg["stability"] == 0.7
+    assert cfg["use_speaker_boost"] is False
+    assert "similarity_boost" not in cfg
+    assert "style" not in cfg
+
+
+def test_get_chat_call_tts_delivers_voice_tuning_fields_via_pipeline_tts_fallback(tmp_path, env) -> None:
+    providers, calls = _providers(tmp_path)
+    t = _chat_tenant(
+        enabled=True, chat_tts=None,
+        pipeline_tts=TenantTTSConfig(provider="elevenlabs", voice_id="cloned-3",
+                                      stability=0.15, style=0.6),
+    )
+    providers.get_chat_call_tts(t)
+    cfg = calls["tts"][0]
+    assert cfg["stability"] == 0.15
+    assert cfg["style"] == 0.6
+
+
+def test_chat_call_tts_cached_under_a_key_distinct_from_tts_and_chat_tts(tmp_path, env) -> None:
+    providers, calls = _providers(tmp_path)
+    t = _chat_tenant(enabled=True, pipeline_tts=TenantTTSConfig(provider="sarvam", voice_id="meera"))
+    call_client_1 = providers.get_tts(t)
+    chat_client_1 = providers.get_chat_tts(t)
+    chat_call_client_1 = providers.get_chat_call_tts(t)
+    call_client_2 = providers.get_tts(t)
+    chat_client_2 = providers.get_chat_tts(t)
+    chat_call_client_2 = providers.get_chat_call_tts(t)
+    assert len(calls["tts"]) == 3  # three builds total, caching works for each layer
+    assert call_client_1 is call_client_2
+    assert chat_client_1 is chat_client_2
+    assert chat_call_client_1 is chat_call_client_2
+    assert call_client_1 is not chat_client_1
+    assert call_client_1 is not chat_call_client_1
+    assert chat_client_1 is not chat_call_client_1
+    assert (t.id, "tts") in providers._cache
+    assert (t.id, "chat_tts") in providers._cache
+    assert (t.id, "chat_call_tts") in providers._cache
+
+
+def test_evict_drops_chat_call_tts_cache(tmp_path, env) -> None:
+    providers, calls = _providers(tmp_path)
+    t = _chat_tenant(enabled=True, pipeline_tts=TenantTTSConfig(provider="sarvam", voice_id="meera"))
+    providers.get_chat_call_tts(t)
+    providers.evict(t.id)
+    providers.get_chat_call_tts(t)
+    assert len(calls["tts"]) == 2

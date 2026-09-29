@@ -3,9 +3,10 @@
 The framework holds these singletons per tenant for the life of the process:
 
 - ``TenantProviders``  cached STT/LLM/TTS/telephony/vector-store client per
-  tenant, plus a separate chat-voice-note TTS cache entry (``get_chat_tts``) —
-  chat's effective TTS config resolves independently of the voice-call
-  cascade's ``pipeline.tts`` (see ``resolve_chat_tts_config``)
+  tenant, plus two separate chat-TTS cache entries -- ``get_chat_tts`` for
+  chat voice-note replies and ``get_chat_call_tts`` for a voice call offered
+  from a chat handoff -- chat's effective TTS config resolves independently
+  of the voice-call cascade's ``pipeline.tts`` (see ``resolve_chat_tts_config``)
 - ``RetrieverRegistry``  one HybridRetriever per tenant (FAISS dir + BM25 index)
 - ``DNDRegistry``  one DND filter + calling-hours policy per tenant
 - ``WebhookRegistry``  one WebhookManager per tenant
@@ -146,6 +147,45 @@ class TenantProviders:
         # here; the adapter reads its own platform env var. The global default
         # LAYER is still "tts" — there is no separate platform chat-TTS default
         # (and adding one would re-create the silent fallback).
+        merged = merge_provider_config(tenant_tts, self.global_defaults.get("tts", {}))
+        client = self.tts_factory(merged)
+        self._cache[key] = client
+        return client
+
+    def get_chat_call_tts(self, tenant: TenantContext) -> Optional[Any]:
+        """TTS client for a voice CALL offered from a chat handoff, or None
+        when nothing resolves.
+
+        This is deliberately NOT gated on ``chat_voice.enabled``: that flag
+        controls whether chat TEXT replies get an audio attachment bolted on
+        — an unrelated feature. A handoff call is a voice call regardless of
+        whether text replies also carry audio, so a tenant with
+        ``chat_voice.enabled=False`` but a configured ``chat_voice.tts`` still
+        wants the handoff call to speak in that voice, not silently fall back
+        to the call cascade's ``pipeline.tts``.
+
+        Same "cost nothing when unconfigured" rule as ``get_chat_tts``:
+        returns None before touching the cache or calling the factory when
+        ``resolve_chat_tts_config`` finds neither ``chat_voice.tts`` nor
+        ``pipeline.tts`` — the caller falls back to ``get_tts`` +
+        ``pipeline.tts`` in that case.
+
+        Cached under ``(tenant.id, "chat_call_tts")`` -- distinct from both
+        ``"tts"`` (the call cascade) and ``"chat_tts"`` (chat text-reply
+        voice-note TTS): three independently-configurable TTS surfaces, three
+        cache keys.
+        """
+        tenant_tts = resolve_chat_tts_config(tenant.settings.pipeline)
+        if tenant_tts is None:
+            log.debug("chat call tts skipped: no chat_voice.tts or pipeline.tts provider resolves",
+                      extra={"tenant_id": tenant.id})
+            return None
+        key = (tenant.id, "chat_call_tts")
+        if key in self._cache:
+            return self._cache[key]
+        from src.utils.logging import debug_event
+        debug_event(log, "registry provider_client build_triggered", layer="chat_call_tts",
+                    tenant_id=tenant.id)
         merged = merge_provider_config(tenant_tts, self.global_defaults.get("tts", {}))
         client = self.tts_factory(merged)
         self._cache[key] = client

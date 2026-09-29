@@ -22,6 +22,7 @@ def test_all_factories_accept_slots_param_defaulting_empty() -> None:
 def _providers() -> SimpleNamespace:
     return SimpleNamespace(
         get_stt=lambda t: Mock(), get_llm=lambda t: Mock(), get_tts=lambda t: Mock(),
+        get_chat_call_tts=lambda t: None,
     )
 
 
@@ -303,3 +304,141 @@ async def test_browser_factory_resolves_campaign_per_call() -> None:
     assert seen["args"] == ("t1", "camp_9")
     assert bridge._agent.slots.schema is resolved.slots
     assert bridge._agent._script is resolved.script
+
+
+async def test_handoff_call_uses_chat_call_tts_when_resolved() -> None:
+    """A chat->voice handoff call must speak in the chat voice-reply TTS
+    (``providers.get_chat_call_tts``), not the call cascade's ``get_tts``,
+    when the registry resolves one. Also proves tts_language/tts_voice come
+    from ``resolve_chat_tts_config`` (the real function — not mocked), i.e.
+    from ``pipeline.chat_voice.tts``, not ``pipeline.tts``."""
+    chat_sentinel = Mock()
+    providers = _providers()
+    providers.get_chat_call_tts = lambda t: chat_sentinel
+    ws = SimpleNamespace(query_params={"handoff": "tok1"})
+    tenant = _tenant()
+    tenant.settings.pipeline.tts.provider = None
+    tenant.settings.pipeline.chat_voice = SimpleNamespace(
+        enabled=False,  # must be ignored entirely for handoff calls
+        tts=SimpleNamespace(provider="elevenlabs", model=None, language="en-IN", voice_id="chat-voice-1"),
+    )
+    factory = make_browser_bridge_factory(providers, slots=SlotSchema())
+    bridge = await factory(websocket=ws, tenant=tenant)
+    assert bridge._agent._engine._tts is chat_sentinel
+    assert bridge._agent._engine._config.tts.language == "en-IN"
+    assert bridge._agent._engine._config.tts.voice_id == "chat-voice-1"
+
+
+async def test_handoff_call_falls_back_to_pipeline_tts_when_chat_call_tts_none() -> None:
+    """When get_chat_call_tts resolves nothing (e.g. an s2s-only tenant with a
+    layered handoff), the handoff call keeps today's fallback: pipeline.tts's
+    client, language and voice_id."""
+    pipeline_sentinel = Mock()
+    providers = _providers()
+    providers.get_tts = lambda t: pipeline_sentinel
+    providers.get_chat_call_tts = lambda t: None
+    ws = SimpleNamespace(query_params={"handoff": "tok1"})
+    tenant = _tenant()
+    tenant.settings.pipeline.tts = SimpleNamespace(language="hi-IN", voice_id="pipeline-voice")
+    factory = make_browser_bridge_factory(providers, slots=SlotSchema())
+    bridge = await factory(websocket=ws, tenant=tenant)
+    assert bridge._agent._engine._tts is pipeline_sentinel
+    assert bridge._agent._engine._config.tts.language == "hi-IN"
+    assert bridge._agent._engine._config.tts.voice_id == "pipeline-voice"
+
+
+async def test_non_handoff_call_never_calls_get_chat_call_tts() -> None:
+    """Non-handoff (dev console) calls must be provably untouched by this
+    change: get_chat_call_tts must not even be invoked."""
+    providers = _providers()
+    providers.get_chat_call_tts = Mock(side_effect=AssertionError(
+        "get_chat_call_tts must not be called for a non-handoff call"))
+    factory = make_browser_bridge_factory(providers, slots=SlotSchema())
+    bridge = await factory(websocket=object(), tenant=_tenant())
+    assert bridge._agent._engine._tts is not None
+    providers.get_chat_call_tts.assert_not_called()
+
+
+async def test_handoff_call_with_tts_override_ignores_chat_call_tts() -> None:
+    """An explicit ?tts= override on a handoff call still wins via the normal
+    override path (get_tts_provider) — get_chat_call_tts must not be
+    consulted at all in that branch."""
+    providers = _providers()
+    providers.get_chat_call_tts = Mock(side_effect=AssertionError(
+        "get_chat_call_tts must not be called when ?tts= overrides"))
+    ws = SimpleNamespace(query_params={"handoff": "tok1", "tts": "sarvam"})
+    factory = make_browser_bridge_factory(providers, slots=SlotSchema())
+    bridge = await factory(websocket=ws, tenant=_tenant())
+    from src.providers.tts.sarvam import SarvamTTSAdapter
+    assert isinstance(bridge._agent._engine._tts, SarvamTTSAdapter)
+    providers.get_chat_call_tts.assert_not_called()
+
+
+async def test_non_handoff_call_does_not_emit_handoff_tts_source_debug_event(caplog) -> None:
+    """Non-handoff (dev console) calls must not emit the
+    "dev_console browser_bridge handoff_tts_source" debug event at all — all
+    three tts-selection branches only fire it `if is_handoff_call`. Checked
+    directly against the log records (not just the get_chat_call_tts spy in
+    test_non_handoff_call_never_calls_get_chat_call_tts above), so a future
+    branch that emits the event unconditionally would be caught even if it
+    didn't also call get_chat_call_tts."""
+    import logging
+
+    factory = make_browser_bridge_factory(_providers(), slots=SlotSchema())
+    with caplog.at_level(logging.DEBUG, logger="src.api.dev_console"):
+        await factory(websocket=object(), tenant=_tenant())
+    assert not any(
+        r.getMessage() == "dev_console browser_bridge handoff_tts_source"
+        for r in caplog.records
+    )
+
+
+async def test_handoff_call_voice_override_wins_over_chat_call_tts_resolution() -> None:
+    """A dev-console ?voice= override on a handoff call that resolves via
+    get_chat_call_tts must still win over resolve_chat_tts_config's own
+    voice_id — the override roster check runs against `tts` (== the chat
+    call TTS client here) regardless of which branch selected it."""
+    class _FakeChatTTS:
+        def get_available_voices(self, language):
+            return [{"voice_id": "chat-voice-1"}, {"voice_id": "override-voice"}]
+
+    fake_tts = _FakeChatTTS()
+    providers = _providers()
+    providers.get_chat_call_tts = lambda t: fake_tts
+    ws = SimpleNamespace(query_params={"handoff": "tok1", "voice": "override-voice"})
+    tenant = _tenant()
+    tenant.settings.pipeline.tts.provider = None  # pipeline.tts.provider unset -- forces chat_voice.tts path
+    tenant.settings.pipeline.chat_voice = SimpleNamespace(
+        enabled=False,  # must be ignored entirely for handoff calls
+        tts=SimpleNamespace(provider="elevenlabs", model=None, language="en-IN", voice_id="chat-voice-1"),
+    )
+    factory = make_browser_bridge_factory(providers, slots=SlotSchema())
+    bridge = await factory(websocket=ws, tenant=tenant)
+    assert bridge._agent._engine._tts is fake_tts
+    assert bridge._agent._engine._config.tts.voice_id == "override-voice"
+
+
+async def test_handoff_call_missing_chat_tts_language_falls_back_to_pipeline_language() -> None:
+    """Fix 1: the language cascade for a handoff call resolved via
+    get_chat_call_tts must be resolved.language or pipeline.tts.language or
+    "hi-IN" -- NOT resolved.language or "hi-IN" (which skips the pipeline
+    cascade's language entirely). Exercises resolve_chat_tts_config for real
+    (chat_voice.tts declares a provider but no language, so it resolves with
+    language=None), proving the code path in dev_console.py actually falls
+    through to tenant.settings.pipeline.tts.language, not just a mock's
+    canned return value."""
+    chat_sentinel = Mock()
+    providers = _providers()
+    providers.get_chat_call_tts = lambda t: chat_sentinel
+    ws = SimpleNamespace(query_params={"handoff": "tok1"})
+    tenant = _tenant()
+    tenant.settings.pipeline.tts.provider = None
+    tenant.settings.pipeline.tts.language = "ta-IN"
+    tenant.settings.pipeline.chat_voice = SimpleNamespace(
+        enabled=False,
+        tts=SimpleNamespace(provider="elevenlabs", model=None, language=None, voice_id="chat-voice-1"),
+    )
+    factory = make_browser_bridge_factory(providers, slots=SlotSchema())
+    bridge = await factory(websocket=ws, tenant=tenant)
+    assert bridge._agent._engine._tts is chat_sentinel
+    assert bridge._agent._engine._config.tts.language == "ta-IN"
