@@ -443,31 +443,38 @@ async def resolve_crm_tools(
         # auth_config.extra_headers, written by POST /chat/tools/from-catalog
         # from req.operator_id (src/api/chat_tools.py:285-286). The PATH
         # operator_id substituted into these same tools' endpoints at call
-        # time comes from a different knob entirely: tenant.settings.crm
-        # .operator_id, falling back to tenant.id — see make_chatbot_factory's
-        # factory() closure below (_operator_id / _crm_context). A tenant can
-        # set one of these without the other, and per the CRM's shipped
-        # contract the guard 403s BEFORE auth whenever the path operator_id
-        # doesn't match the "operatorid" header — so a disagreement here means
-        # every operator-scoped tool call for this tenant fails that way,
+        # time normally comes from a different knob: tenant.settings.crm
+        # .operator_id — see make_chatbot_factory's factory() closure below
+        # (_operator_id / _crm_context) — but per the C1/W1 follow-up,
+        # crm_executor there now falls back to THIS ROW'S OWN header value
+        # for the path when crm.operator_id is unset (so path and header
+        # never disagree in that case; an unresolved path placeholder is
+        # rejected outright by tool_executor.execute_crm_tool instead of
+        # being sent literally). A real mismatch is therefore only possible
+        # when crm.operator_id IS configured but disagrees with a row's
+        # baked-in header — per the CRM's shipped contract the guard 403s
+        # BEFORE auth whenever the path operator_id doesn't match the
+        # "operatorid" header, so that disagreement means every
+        # operator-scoped tool call for this tenant fails that way,
         # indistinguishable from a bad/missing credential unless it's logged.
-        path_operator_id = getattr(tenant.settings.crm, "operator_id", None) or tenant.id
+        configured_operator_id = getattr(tenant.settings.crm, "operator_id", None)
         mismatched_headers = sorted({
             header_operator_id
             for r in rows
             if (header_operator_id := ((r.auth_config or {}).get("extra_headers") or {}).get("operatorid")) is not None
-            and header_operator_id != path_operator_id
+            and configured_operator_id
+            and header_operator_id != configured_operator_id
         })
         if mismatched_headers:
             log.warning(
                 "crm tool resolution: tenant-registered tool(s) carry an "
                 "'operatorid' header (%s, from auth_config.extra_headers) that "
-                "disagrees with the path operator_id (%s, from "
-                "tenant.settings.crm.operator_id or tenant.id) substituted into "
-                "the same tools' endpoints at call time — per the CRM's shipped "
-                "contract this 403s every operator-scoped tool call for this "
-                "tenant before auth is even checked",
-                mismatched_headers, path_operator_id,
+                "disagrees with tenant.settings.crm.operator_id (%s) "
+                "substituted into the same tools' endpoints at call time — "
+                "per the CRM's shipped contract this 403s every "
+                "operator-scoped tool call for this tenant before auth is "
+                "even checked",
+                mismatched_headers, configured_operator_id,
                 extra={"tenant_id": tenant.id},
             )
         debug_event(
@@ -506,32 +513,36 @@ async def resolve_crm_tools(
         )
         return [], {}, "none"
 
-    api_token = sr.get("crm:api_token")
-    # Same operator_id resolution as the crm_executor closure in
-    # make_chatbot_factory below: the CRM's operator identifier for this
-    # tenant, falling back to the tenant's own id. Every crm-catalog tool
-    # must carry this as the "operatorid" header — previously hardcoded
-    # to None here, so the old platform-fallback path never sent it at all
-    # (only the tenant-registered chat_tools branch did, via auth_config).
+    # C1/W1: every crm-catalog tool needs the CRM's real operator uuid, both
+    # as the "operatorid" header below AND (for several catalog tools) as a
+    # {operator_id} path segment resolved from the per-session crm_context at
+    # call time (see make_chatbot_factory's _operator_id below) — tenant.id is
+    # an internal platform id, not a registered operator uuid, and Per CRM PR
+    # #3963's shipped contract the guard 403s a mismatched/invalid operatorid
+    # before auth is even checked. Previously this fell back to tenant.id and
+    # still registered the full catalog, so every call for such a tenant 403'd
+    # in a way that read exactly like a bad/missing credential. Now: no
+    # crm.operator_id configured -> register ZERO crm-catalog tools (logged
+    # once here) rather than hand the LLM tools guaranteed to fail.
     configured_operator_id = getattr(tenant.settings.crm, "operator_id", None)
-    operator_id = configured_operator_id or tenant.id
     if not configured_operator_id:
-        # Per CRM PR #3963's shipped contract, the CRM guard 403s a request
-        # whenever the path's operator_id doesn't match this "operatorid"
-        # header — before auth is even checked. tenant.id is an internal
-        # platform id, not the CRM's registered operator uuid, so a tenant
-        # left on this fallback will have every crm-catalog call rejected as
-        # a 403, which reads exactly like a bad/missing credential and is
-        # not: it's this tenant.settings.crm.operator_id gap. Logged here
-        # (once per tool resolution) so that's diagnosable from logs instead
-        # of guessed at from a bare 403.
         log.warning(
-            "crm tool resolution: no crm.operator_id configured for tenant, "
-            "falling back to tenant.id as the 'operatorid' header/path value — "
-            "this will 403 against a CRM that validates operatorid against a "
-            "real registered operator uuid",
-            extra={"tenant_id": tenant.id},
+            "crm tool resolution: no crm.operator_id configured for tenant — "
+            "registering ZERO crm_catalog tools (tenant.id is not a real "
+            "operator uuid to send as the 'operatorid' header/path value; "
+            "every operator-scoped call would 403 under the CRM's shipped "
+            "guard) — configure tenant.settings.crm.operator_id to enable "
+            "these tools",
+            extra={"tenant_id": tenant.id, "crm_id": crm_id},
         )
+        debug_event(
+            log, "crm_tools resolve skipped", tenant_id=tenant.id,
+            reason="no_operator_id_configured", crm_id=crm_id,
+        )
+        return [], {}, "none"
+
+    api_token = sr.get("crm:api_token")
+    operator_id = configured_operator_id
     extra_headers = {"operatorid": operator_id}
 
     for row in crm_tool_rows:
@@ -672,13 +683,19 @@ def make_chatbot_factory(registry, sessionmaker=None, crm_retrievers: "PerCrmRet
 
         crm_specs, crm_execs = await _load_crm_tools(tenant)
 
-        # operator_id = the CRM's operator identifier for this tenant. Set via
-        # crm_operator_id at tenant registration; falls back to tenant.id.
+        # operator_id = the CRM's operator identifier for this tenant, from
+        # tenant.settings.crm.operator_id. C1/W1: deliberately NOT falling
+        # back to tenant.id — tenant.id is an internal platform id, not the
+        # CRM's registered operator uuid, and a tool parameter declared
+        # source="session" (e.g. a {operator_id} path segment) that pulled
+        # tenant.id from here would 403 exactly like a bad credential. None
+        # when unconfigured; resolve_crm_tools already registers zero
+        # crm_catalog tools in that case, so this only still matters for a
+        # tenant-registered tool that happens to declare its own
+        # source="session" operator_id parameter.
         # user_id = the logged-in player's ID passed at chat session creation.
         # CRM tool parameters declared with source="session" pull from this dict.
-        _operator_id = (
-            getattr(tenant.settings.crm, "operator_id", None) or tenant.id
-        )
+        _operator_id = getattr(tenant.settings.crm, "operator_id", None)
         _crm_context = {"operator_id": _operator_id, "user_id": user_id}
         debug_event(
             log, "chatbot_factory crm_context built", tenant_id=tenant.id,
@@ -693,10 +710,26 @@ def make_chatbot_factory(registry, sessionmaker=None, crm_retrievers: "PerCrmRet
             spec = crm_execs.get(tc.name)
             if spec is None:
                 return {"error": f"unknown tool {tc.name}"}
+            # Follow-up to C1/W1: a tenant-registered tool's (chat_tools row,
+            # resolve_crm_tools source="tenant") "operatorid" header comes
+            # from auth_config.extra_headers, baked in at registration time
+            # (POST /chat/tools/from-catalog's own req.operator_id) —
+            # independent of tenant.settings.crm.operator_id. When the
+            # session-level _crm_context has no operator_id (crm.operator_id
+            # unset), fall back to that row's own header value for the
+            # {operator_id} PATH placeholder too, so path and header agree
+            # instead of the path staying an unresolved "{operator_id}"
+            # (which execute_crm_tool now rejects outright rather than
+            # sending literally).
+            tool_context = _crm_context
+            if not tool_context.get("operator_id"):
+                row_operator_id = (spec.get("extra_headers") or {}).get("operatorid")
+                if row_operator_id:
+                    tool_context = {**tool_context, "operator_id": row_operator_id}
             return await execute_crm_tool(
                 endpoint=spec["endpoint"], method=spec["method"],
                 parameters=spec["parameters"], auth_type=spec["auth_type"],
-                token=spec["token"], args=tc.arguments or {}, context=_crm_context,
+                token=spec["token"], args=tc.arguments or {}, context=tool_context,
                 x_api_key=spec.get("x_api_key"),
                 extra_headers=spec.get("extra_headers"),
                 session_id=bare_session_id, ticket_id=ticket_id,
@@ -804,7 +837,13 @@ def make_chatbot_factory(registry, sessionmaker=None, crm_retrievers: "PerCrmRet
             retriever=tenant_retriever,
             crm_retriever=crm_retriever,
             company_name=tenant.name,
-            language_default=getattr(tenant.settings, "default_language", None) or "en",
+            # B8: was `or "en"` here vs `or "hi"` in src/api/external_chat.py --
+            # two different fallbacks for the same tenant field, and
+            # TenantSettings.default_language's own model default is "hi", not
+            # "en". Aligned on "hi" everywhere so a chat session starts in the
+            # tenant's actual configured (or modeled-default) language
+            # regardless of which code path created it.
+            language_default=getattr(tenant.settings, "default_language", None) or "hi",
             tenant_timezone=getattr(tenant.settings, "timezone", "Asia/Kolkata"),
             prompt_pack=getattr(tenant.settings, "prompt_pack", None) or "generic",
             # Ships dark: only True when the platform LLM is actually the
@@ -938,12 +977,21 @@ def _build_s2s_agent_and_config(
 
     log.info("s2s agent+config built", extra={
         "tenant": tenant.slug, "session_id": session_id, "voice": voice, "model": rt.model})
-    tts = providers.get_tts(tenant)
+    # D3: TTS here is ONLY used for the transfer-hold failure apology (Gemini
+    # Live itself speaks the actual conversation) -- providers.get_tts(tenant)
+    # falls back to the platform TTS default (Sarvam) whenever the tenant has
+    # no pipeline.tts configured, which used to make an s2s tenant's transfer
+    # apology speak in a platform voice that's never otherwise been heard on
+    # this tenant's calls. get_chat_call_tts resolves chat_voice.tts else
+    # pipeline.tts, None if neither -- and _play_transfer_failure_apology
+    # already no-ops on tts=None, so an s2s tenant with nothing configured
+    # simply skips the apology instead of borrowing the platform default.
+    tts = providers.get_chat_call_tts(tenant)
     tenant_timezone = getattr(tenant.settings, "timezone", "Asia/Kolkata")
     return agent, config, connect, llm, tts, tenant_timezone
 
 
-def _build_s2s_telephony_bridge(
+async def _build_s2s_telephony_bridge(
     providers: TenantProviders, tenant: TenantContext, script: VoiceBotScript,
     slots: SlotSchema, websocket: WebSocket, session_store: SessionStore | None,
     *, encoding: str, sid_field: str, supports_clear: bool,
@@ -955,6 +1003,8 @@ def _build_s2s_telephony_bridge(
     whose tenant has pipeline.mode == 's2s'. Mirrors the cascade agent assembly
     but returns the S2S bridge; reuses the dev-console S2S wiring shape."""
     from src.api.telephony_live_bridge import TelephonyLiveBridge
+    from src.integration.tenant_events import resolve_events_webhook_url, sanitize_tenant_secret_env
+    from src.models.database import get_sessionmaker
 
     agent, config, connect, llm, tts, tenant_timezone = _build_s2s_agent_and_config(
         providers, tenant, script, slots, session_store,
@@ -964,16 +1014,46 @@ def _build_s2s_telephony_bridge(
         "tenant": tenant.slug, "voice": config.voice, "model": config.model, "encoding": encoding})
     # Transfer-hold: TTS for failure apology; webhook so CS learns to look for a human.
     # A per-call override (e.g. bridge console) takes priority over tenant config.
-    _wh_url = transfer_webhook_url_override or getattr(tenant.settings, "events_webhook_url", None)
-    _wh_sec_env = getattr(tenant.settings, "events_webhook_secret_env", None)
+    # B7: resolve via resolve_events_webhook_url like every other event path
+    # (explicit tenant events_webhook_url, else the linked CRM's template with
+    # crm.operator_id substituted, else None) instead of only ever reading the
+    # tenant's explicit events_webhook_url directly -- a tenant relying on the
+    # CRM template (no explicit events_webhook_url of its own) used to get no
+    # transfer webhook at all here even though every other event type for the
+    # same tenant resolved one.
+    if transfer_webhook_url_override:
+        _wh_url = transfer_webhook_url_override
+    else:
+        try:
+            _wh_url = await resolve_events_webhook_url(tenant, get_sessionmaker())
+        except Exception as exc:  # noqa: BLE001 - a DB blip here must never fail call setup
+            log.warning(
+                "s2s transfer webhook URL resolution failed — treating as "
+                "unconfigured (no transfer webhook this call); the bridge "
+                "itself still builds and the call still proceeds",
+                extra={"tenant_id": tenant.id, "exc_type": type(exc).__name__},
+            )
+            _wh_url = None
+    # Tenant's own secret ONLY -- no platform-level EVENTS_WEBHOOK_SECRET
+    # fallback (W2): a shared key would let any tenant forge a signed
+    # transfer-webhook event toward another tenant's receiver.
+    _wh_sec_env = sanitize_tenant_secret_env(
+        getattr(tenant.settings, "events_webhook_secret_env", None), tenant_id=tenant.id)
     _wh_secret = (tenant.secret_optional(_wh_sec_env)
                   if _wh_sec_env and hasattr(tenant, "secret_optional") else None)
+    if _wh_url and not _wh_secret:
+        log.warning(
+            "s2s transfer webhook sending UNSIGNED (no events_webhook_secret_env "
+            "configured or resolvable for this tenant — there is no "
+            "platform-level signing key fallback)",
+            extra={"tenant_id": tenant.id},
+        )
     debug_event(
         log, "bootstrap s2s_telephony_bridge transfer_webhook_resolved", tenant_id=tenant.id,
         webhook_url=_wh_url,
         source=(
             "override" if transfer_webhook_url_override
-            else ("tenant_config" if _wh_url else "none")
+            else ("resolved" if _wh_url else "none")
         ),
         secret_env_configured=bool(_wh_sec_env), secret_resolved=bool(_wh_secret),
     )
@@ -1156,7 +1236,7 @@ def make_bridge_factory(
         kb_ctx = await _build_kb_context(
             _crm_retriever_for(tenant, crm_retrievers), _tenant_retriever_for(tenant, registry))
         if mode == "s2s":
-            return _build_s2s_telephony_bridge(
+            return await _build_s2s_telephony_bridge(
                 providers, tenant, cur_script, cur_slots, websocket, session_store,
                 encoding="mulaw", sid_field="streamSid", supports_clear=True,
                 call_sid_field="callSid", voice_override=voice_override or None,
@@ -1183,7 +1263,18 @@ def make_bridge_factory(
         pipeline_cfg = PipelineConfig(
             stt=STTConfig(language=tenant.settings.pipeline.stt.language or "hi-IN"),
             llm=LLMConfig(
-                temperature=tenant.settings.pipeline.llm.temperature or 0.5,
+                # B6: explicit is-None check for temperature only -- `or 0.5`
+                # silently replaced an intentional temperature=0.0 (a valid,
+                # falsy value) with the default, so a tenant tuned for fully
+                # deterministic output got temperature=0.5 on every call.
+                # max_tokens keeps its `or 256` fallback: unlike temperature,
+                # 0 is not a valid max_tokens for groq/gemini (an explicit 0
+                # there is a misconfiguration, not a deliberate choice), so
+                # falling back on it is correct, not a bug.
+                temperature=(
+                    tenant.settings.pipeline.llm.temperature
+                    if tenant.settings.pipeline.llm.temperature is not None else 0.5
+                ),
                 max_tokens=tenant.settings.pipeline.llm.max_tokens or 256,
                 response_format=tenant.settings.pipeline.llm.response_format or "json",
             ),
@@ -1339,7 +1430,7 @@ def make_exotel_bridge_factory(
         kb_ctx = await _build_kb_context(
             _crm_retriever_for(tenant, crm_retrievers), _tenant_retriever_for(tenant, registry))
         if mode == "s2s":
-            return _build_s2s_telephony_bridge(
+            return await _build_s2s_telephony_bridge(
                 providers, tenant, cur_script, cur_slots, websocket, session_store,
                 encoding="pcm", sid_field="stream_sid", supports_clear=False,
                 call_sid_field="call_sid", voice_override=voice_override or None,
@@ -1360,7 +1451,18 @@ def make_exotel_bridge_factory(
         pipeline_cfg = PipelineConfig(
             stt=STTConfig(language=tenant.settings.pipeline.stt.language or "hi-IN"),
             llm=LLMConfig(
-                temperature=tenant.settings.pipeline.llm.temperature or 0.5,
+                # B6: explicit is-None check for temperature only -- `or 0.5`
+                # silently replaced an intentional temperature=0.0 (a valid,
+                # falsy value) with the default, so a tenant tuned for fully
+                # deterministic output got temperature=0.5 on every call.
+                # max_tokens keeps its `or 256` fallback: unlike temperature,
+                # 0 is not a valid max_tokens for groq/gemini (an explicit 0
+                # there is a misconfiguration, not a deliberate choice), so
+                # falling back on it is correct, not a bug.
+                temperature=(
+                    tenant.settings.pipeline.llm.temperature
+                    if tenant.settings.pipeline.llm.temperature is not None else 0.5
+                ),
                 max_tokens=tenant.settings.pipeline.llm.max_tokens or 256,
                 response_format=tenant.settings.pipeline.llm.response_format or "json",
             ),
@@ -1442,7 +1544,18 @@ def make_stringee_bridge_factory(
         pipeline_cfg = PipelineConfig(
             stt=STTConfig(language=tenant.settings.pipeline.stt.language or "hi-IN"),
             llm=LLMConfig(
-                temperature=tenant.settings.pipeline.llm.temperature or 0.5,
+                # B6: explicit is-None check for temperature only -- `or 0.5`
+                # silently replaced an intentional temperature=0.0 (a valid,
+                # falsy value) with the default, so a tenant tuned for fully
+                # deterministic output got temperature=0.5 on every call.
+                # max_tokens keeps its `or 256` fallback: unlike temperature,
+                # 0 is not a valid max_tokens for groq/gemini (an explicit 0
+                # there is a misconfiguration, not a deliberate choice), so
+                # falling back on it is correct, not a bug.
+                temperature=(
+                    tenant.settings.pipeline.llm.temperature
+                    if tenant.settings.pipeline.llm.temperature is not None else 0.5
+                ),
                 max_tokens=tenant.settings.pipeline.llm.max_tokens or 256,
                 response_format=tenant.settings.pipeline.llm.response_format or "json",
             ),

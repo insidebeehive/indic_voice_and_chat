@@ -106,8 +106,12 @@ async def test_platform_token_ignored_even_when_configured(monkeypatch) -> None:
     try:
         registry = _registry()
         factory = make_chatbot_factory(registry, sm)
+        # crm.operator_id must be configured or resolve_crm_tools now
+        # registers zero crm_catalog tools (C1/W1) -- set it here since this
+        # test's actual subject is the token fallback, not operator_id.
         tenant = TenantContext(
-            settings=TenantSettings(id="t1", slug="t1", name="T1", crm_id="betstudio"),
+            settings=TenantSettings(id="t1", slug="t1", name="T1", crm_id="betstudio",
+                                    crm=TenantCRMConfig(operator_id="op-123")),
             secrets_resolved={},
         )
         agent = await factory(tenant, "s1")
@@ -132,8 +136,10 @@ async def test_tenant_own_token_wins_over_platform(monkeypatch) -> None:
     try:
         registry = _registry()
         factory = make_chatbot_factory(registry, sm)
+        # crm.operator_id required (C1/W1) -- see comment above.
         tenant = TenantContext(
-            settings=TenantSettings(id="t1", slug="t1", name="T1", crm_id="betstudio"),
+            settings=TenantSettings(id="t1", slug="t1", name="T1", crm_id="betstudio",
+                                    crm=TenantCRMConfig(operator_id="op-123")),
             secrets_resolved={"crm:api_token": "tenant-own-token"},
         )
         agent = await factory(tenant, "s1")
@@ -186,12 +192,59 @@ async def test_tenant_registered_tools_take_precedence_over_platform_fallback(mo
 
 async def test_tenant_registered_branch_warns_on_header_path_operator_id_mismatch(monkeypatch, caplog) -> None:
     # A tenant registered via POST /chat/tools/from-catalog with a real
-    # operator_id (written into this tool's auth_config.extra_headers) but no
-    # tenant.settings.crm.operator_id: the header "operatorid" sent on every
-    # call and the path operator_id substituted into the same call
-    # (tenant.settings.crm.operator_id or tenant.id, i.e. "t1" here) diverge.
-    # Per the CRM's shipped contract this 403s before auth is even checked --
-    # must be logged so it's diagnosable instead of read as a bad credential.
+    # operator_id (written into this tool's auth_config.extra_headers) but a
+    # DIFFERENT tenant.settings.crm.operator_id configured: the header
+    # "operatorid" sent on every call and the path operator_id substituted
+    # into the same call diverge. Per the CRM's shipped contract this 403s
+    # before auth is even checked -- must be logged so it's diagnosable
+    # instead of read as a bad credential.
+    #
+    # Follow-up to C1/W1: this mismatch is only detectable/meaningful when
+    # crm.operator_id IS actually configured -- when it's unset, crm_executor
+    # now falls back to each row's OWN header value for the path too, so
+    # path and header can never disagree in that case (see the negative test
+    # below and test_no_operator_id_configured_falls_back_to_row_header_for_path).
+    import logging
+
+    _clean_platform_env(monkeypatch)
+
+    engine, sm = await _make_sessionmaker()
+    try:
+        async with sm() as s:
+            s.add(ChatTool(
+                tenant_id="t1", name="check_order_status", description="check order",
+                endpoint="https://crm/api/orders/{order_id}", method="GET", auth_type="bearer",
+                auth_config={"extra_headers": {"operatorid": "real-operator-uuid"}},
+                parameters={"order_id": {"type": "string", "source": "llm"}}))
+            await s.commit()
+
+        registry = _registry()
+        factory = make_chatbot_factory(registry, sm)
+        tenant = TenantContext(
+            settings=TenantSettings(id="t1", slug="t1", name="T1",
+                                    crm=TenantCRMConfig(operator_id="configured-operator-id")),
+            secrets_resolved={},
+        )
+        with caplog.at_level(logging.WARNING, logger="src.bootstrap"):
+            await factory(tenant, "s1")
+
+        warnings = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and "operatorid" in r.getMessage()
+        ]
+        assert len(warnings) == 1
+        assert warnings[0].__dict__.get("tenant_id") == "t1"
+        assert "real-operator-uuid" in warnings[0].getMessage()
+        assert "configured-operator-id" in warnings[0].getMessage()
+    finally:
+        await engine.dispose()
+
+
+async def test_tenant_registered_branch_no_warning_when_no_operator_id_configured(monkeypatch, caplog) -> None:
+    # Negative case: crm.operator_id is unset entirely -- the mismatch check
+    # doesn't even apply (crm_executor falls back to each row's own header
+    # for the path instead of a tenant.id guess), so no warning fires no
+    # matter what the row's header value is.
     import logging
 
     _clean_platform_env(monkeypatch)
@@ -219,30 +272,43 @@ async def test_tenant_registered_branch_warns_on_header_path_operator_id_mismatc
             r for r in caplog.records
             if r.levelno == logging.WARNING and "operatorid" in r.getMessage()
         ]
-        assert len(warnings) == 1
-        assert warnings[0].__dict__.get("tenant_id") == "t1"
-        assert "real-operator-uuid" in warnings[0].getMessage()
-        assert "t1" in warnings[0].getMessage()
+        assert warnings == []
     finally:
         await engine.dispose()
 
 
-async def test_tenant_registered_branch_no_warning_when_header_matches_path(monkeypatch, caplog) -> None:
-    # Negative case: header operatorid and path operator_id agree (both
-    # "t1", the tenant.id fallback since crm.operator_id isn't configured
-    # here either) -> no mismatch warning should fire.
-    import logging
-
+async def test_no_operator_id_configured_falls_back_to_row_header_for_path(monkeypatch) -> None:
+    # Follow-up to C1/W1: when crm.operator_id is unset, a tenant-registered
+    # tool whose endpoint template declares a session-sourced {operator_id}
+    # path segment must still resolve it -- from the row's OWN "operatorid"
+    # header (baked in at registration time via POST /chat/tools/from-catalog),
+    # not tenant.id (removed) and not a literal unresolved "{operator_id}".
     _clean_platform_env(monkeypatch)
+
+    captured = {}
+
+    async def _fake_execute_crm_tool(*, endpoint, method, parameters, auth_type,
+                                       token, args, context, **kwargs):
+        captured["endpoint"] = endpoint
+        captured["context"] = context
+        return {"ok": True}
+
+    monkeypatch.setattr(
+        "src.chatbot.tool_executor.execute_crm_tool", _fake_execute_crm_tool,
+    )
 
     engine, sm = await _make_sessionmaker()
     try:
         async with sm() as s:
             s.add(ChatTool(
-                tenant_id="t1", name="check_order_status", description="check order",
-                endpoint="https://crm/api/orders/{order_id}", method="GET", auth_type="bearer",
-                auth_config={"extra_headers": {"operatorid": "t1"}},
-                parameters={"order_id": {"type": "string", "source": "llm"}}))
+                tenant_id="t1", name="get_bet_limit", description="bet limit",
+                endpoint="https://crm/api/operators/{operator_id}/players/{user_id}/bet-limit",
+                method="GET", auth_type="bearer",
+                auth_config={"extra_headers": {"operatorid": "row-operator-uuid"}},
+                parameters={
+                    "operator_id": {"type": "string", "source": "session"},
+                    "user_id": {"type": "string", "source": "session"},
+                }))
             await s.commit()
 
         registry = _registry()
@@ -251,14 +317,14 @@ async def test_tenant_registered_branch_no_warning_when_header_matches_path(monk
             settings=TenantSettings(id="t1", slug="t1", name="T1"),
             secrets_resolved={},
         )
-        with caplog.at_level(logging.WARNING, logger="src.bootstrap"):
-            await factory(tenant, "s1")
+        agent = await factory(tenant, "s1", customer_id="player-1")
 
-        warnings = [
-            r for r in caplog.records
-            if r.levelno == logging.WARNING and "operatorid" in r.getMessage()
-        ]
-        assert warnings == []
+        from src.interfaces.llm import ToolCall
+        result = await agent._crm_executor(
+            ToolCall(id="tc1", name="get_bet_limit", arguments={}), timeout_s=5.0)
+
+        assert result == {"ok": True}
+        assert captured["context"]["operator_id"] == "row-operator-uuid"
     finally:
         await engine.dispose()
 
@@ -273,8 +339,11 @@ async def test_x_api_key_secret_populated_for_every_platform_catalog_tool(monkey
     try:
         registry = _registry()
         factory = make_chatbot_factory(registry, sm)
+        # crm.operator_id required (C1/W1) -- see comment on
+        # test_platform_token_ignored_even_when_configured above.
         tenant = TenantContext(
-            settings=TenantSettings(id="t1", slug="t1", name="T1", crm_id="betstudio"),
+            settings=TenantSettings(id="t1", slug="t1", name="T1", crm_id="betstudio",
+                                    crm=TenantCRMConfig(operator_id="op-123")),
             secrets_resolved={"crm:x_api_key": "the-x-api-key"},
         )
         agent = await factory(tenant, "s1")
@@ -313,10 +382,14 @@ async def test_extra_headers_carries_operator_id_from_tenant_crm_config(monkeypa
         await engine.dispose()
 
 
-async def test_extra_headers_falls_back_to_tenant_id_when_no_operator_id_configured(monkeypatch) -> None:
-    # Same regression as above, but for the "no crm.operator_id configured"
-    # case -> falls back to the tenant id, matching what crm_executor already
-    # does elsewhere in this file.
+async def test_no_operator_id_configured_registers_zero_crm_catalog_tools(monkeypatch) -> None:
+    # C1/W1 (was test_extra_headers_falls_back_to_tenant_id_when_no_operator_id_
+    # configured, which pinned the OLD behavior: falling back to tenant.id as
+    # the "operatorid" header/path value). tenant.id is not a real CRM
+    # operator uuid, so every such call used to 403 under the CRM's shipped
+    # guard -- now resolve_crm_tools registers zero crm_catalog tools instead
+    # of handing the LLM tools guaranteed to fail, and the chatbot must still
+    # build fine with an empty crm tool list.
     _clean_platform_env(monkeypatch)
 
     engine, sm = await _make_sessionmaker_with_crm()
@@ -328,21 +401,17 @@ async def test_extra_headers_falls_back_to_tenant_id_when_no_operator_id_configu
             secrets_resolved={},
         )
         agent = await factory(tenant, "s1")
-        assert len(agent._crm_tools) == len(ALL_TOOLS)
-        for name in ALL_TOOLS:
-            exec_spec = registry.crm_tools._items["t1"][1][name]
-            assert exec_spec["extra_headers"] == {"operatorid": "t1"}
+        assert agent._crm_tools == []
     finally:
         await engine.dispose()
 
 
 async def test_operator_id_fallback_logs_a_warning_naming_the_consequence(monkeypatch, caplog) -> None:
-    # Against CRM PR #3963's shipped guard, a tenant on this fallback sends
-    # tenant.id (not a real registered operator uuid) as "operatorid" on
-    # every crm-catalog call, which the CRM 403s before even checking
-    # credentials -- indistinguishable from a bad/missing key unless this is
-    # logged. Behavior is unchanged (still tenant.id, per the test above);
-    # this only pins that the gap is now diagnosable from logs.
+    # Against CRM PR #3963's shipped guard, tenant.id is not a real
+    # registered operator uuid -- a tenant with no crm.operator_id configured
+    # now gets zero crm_catalog tools (see the test above) rather than tools
+    # guaranteed to 403, but that's still a real gap worth surfacing in logs
+    # rather than a silently-empty tool list.
     import logging
 
     _clean_platform_env(monkeypatch)
@@ -356,8 +425,9 @@ async def test_operator_id_fallback_logs_a_warning_naming_the_consequence(monkey
             secrets_resolved={},
         )
         with caplog.at_level(logging.WARNING, logger="src.bootstrap"):
-            await factory(tenant, "s1")
+            agent = await factory(tenant, "s1")
 
+        assert agent._crm_tools == []
         warnings = [
             r for r in caplog.records
             if r.levelno == logging.WARNING and "operatorid" in r.getMessage()
@@ -400,9 +470,9 @@ async def test_operator_id_configured_does_not_log_the_fallback_warning(monkeypa
 
 async def test_no_platform_token_and_no_tenant_secret_gives_none_token(monkeypatch) -> None:
     # Scenario 4: nothing configured at all (no chat_tools rows, no crm:*
-    # secrets) but the tenant is linked to a Crm entity (so the crm_catalog
-    # branch activates and returns tools) -> token is None, matching today's
-    # existing "nothing configured" behavior.
+    # secrets) but the tenant is linked to a Crm entity AND has crm.operator_id
+    # configured (required per C1/W1, else zero tools) -> token is None,
+    # matching today's existing "nothing configured" behavior.
     _clean_platform_env(monkeypatch)
 
     engine, sm = await _make_sessionmaker_with_crm()
@@ -410,7 +480,8 @@ async def test_no_platform_token_and_no_tenant_secret_gives_none_token(monkeypat
         registry = _registry()
         factory = make_chatbot_factory(registry, sm)
         tenant = TenantContext(
-            settings=TenantSettings(id="t1", slug="t1", name="T1", crm_id="betstudio"),
+            settings=TenantSettings(id="t1", slug="t1", name="T1", crm_id="betstudio",
+                                    crm=TenantCRMConfig(operator_id="op-123")),
             secrets_resolved={},
         )
         agent = await factory(tenant, "s1")
@@ -475,3 +546,46 @@ async def test_crm_linked_tenant_with_no_sessionmaker_degrades_to_none() -> None
     specs, execs, source = await resolve_crm_tools(tenant, None)
 
     assert (specs, execs, source) == ([], {}, "none")
+
+
+# --- B8: chat default language follows tenant.settings.default_language -----
+
+async def test_chatbot_factory_uses_tenant_default_language(monkeypatch) -> None:
+    # B8: was `or "en"` here vs `or "hi"` in src/api/external_chat.py -- two
+    # different fallbacks for the same tenant field. A tenant with an explicit
+    # default_language must get exactly that language, not a hardcoded "en".
+    _clean_platform_env(monkeypatch)
+
+    engine, sm = await _make_sessionmaker()
+    try:
+        registry = _registry()
+        factory = make_chatbot_factory(registry, sm)
+        tenant = TenantContext(
+            settings=TenantSettings(id="t1", slug="t1", name="T1", default_language="ta"),
+            secrets_resolved={},
+        )
+        agent = await factory(tenant, "s1")
+        assert agent._language == "ta"
+    finally:
+        await engine.dispose()
+
+
+async def test_chatbot_factory_defaults_to_hi_matching_model_default(monkeypatch) -> None:
+    # TenantSettings.default_language's own model default is "hi" -- a tenant
+    # that never set it explicitly (bare TenantSettings still carries "hi") or
+    # a settings-like stub missing the attribute entirely must land on "hi",
+    # not the "en" this used to fall back to.
+    _clean_platform_env(monkeypatch)
+
+    engine, sm = await _make_sessionmaker()
+    try:
+        registry = _registry()
+        factory = make_chatbot_factory(registry, sm)
+        tenant = TenantContext(
+            settings=TenantSettings(id="t1", slug="t1", name="T1"),
+            secrets_resolved={},
+        )
+        agent = await factory(tenant, "s1")
+        assert agent._language == "hi"
+    finally:
+        await engine.dispose()

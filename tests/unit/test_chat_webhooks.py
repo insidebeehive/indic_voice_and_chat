@@ -40,10 +40,19 @@ async def test_send_bo_webhook_logs_warning_when_unsigned(monkeypatch, caplog):
     )
 
 
-async def test_send_bo_webhook_no_warning_when_signed(monkeypatch, caplog):
+async def test_send_bo_webhook_platform_secret_never_used_even_when_set(monkeypatch, caplog):
+    # W2: EVENTS_WEBHOOK_SECRET is no longer a fallback signing key. A tenant
+    # with no events_webhook_secret_env (or one that doesn't resolve) always
+    # sends UNSIGNED + WARNING now, regardless of this env var. (Was
+    # test_send_bo_webhook_no_warning_when_signed, which pinned the removed
+    # platform-fallback behavior.)
     monkeypatch.setenv("EVENTS_WEBHOOK_SECRET", "platform-secret")
 
+    seen_secret = object()
+
     async def fake_deliver(url, body, secret):
+        nonlocal seen_secret
+        seen_secret = secret
         return True
 
     monkeypatch.setattr(chat_webhooks, "deliver", fake_deliver)
@@ -54,7 +63,75 @@ async def test_send_bo_webhook_no_warning_when_signed(monkeypatch, caplog):
         ok = await chat_webhooks.send_bo_webhook(tenant, "session_started", {})
 
     assert ok is True
+    assert seen_secret is None
+    assert any(
+        r.levelno == logging.WARNING and "UNSIGNED" in r.message
+        for r in caplog.records
+    )
+
+
+async def test_send_bo_webhook_tenant_secret_wins_even_with_platform_env_set(monkeypatch, caplog):
+    # The tenant's own secret still resolves and signs normally when
+    # EVENTS_WEBHOOK_SECRET also happens to be set -- it's just never
+    # consulted either way.
+    monkeypatch.setenv("EVENTS_WEBHOOK_SECRET", "platform-secret")
+
+    seen_secret = object()
+
+    async def fake_deliver(url, body, secret):
+        nonlocal seen_secret
+        seen_secret = secret
+        return True
+
+    monkeypatch.setattr(chat_webhooks, "deliver", fake_deliver)
+
+    tenant = _Tenant(events_webhook_secret_env="TENANT_SECRET_ENV", secret="tenant-own-secret")
+
+    with caplog.at_level(logging.WARNING):
+        ok = await chat_webhooks.send_bo_webhook(tenant, "session_started", {})
+
+    assert ok is True
+    assert seen_secret == "tenant-own-secret"
     assert not any(
+        r.levelno == logging.WARNING and "UNSIGNED" in r.message
+        for r in caplog.records
+    )
+
+
+async def test_send_bo_webhook_blocks_secret_env_literally_named_platform_var(monkeypatch, caplog):
+    # A tenant whose events_webhook_secret_env is literally
+    # "EVENTS_WEBHOOK_SECRET" (stale config, or a copy-paste mistake) must
+    # not resolve the platform env var through secret_optional's own
+    # os.environ fallback -- sent unsigned + WARNING instead, same as if the
+    # field were unset entirely.
+    monkeypatch.setenv("EVENTS_WEBHOOK_SECRET", "platform-secret")
+
+    seen_secret = object()
+
+    async def fake_deliver(url, body, secret):
+        nonlocal seen_secret
+        seen_secret = secret
+        return True
+
+    monkeypatch.setattr(chat_webhooks, "deliver", fake_deliver)
+
+    class _RealisticTenant(_Tenant):
+        # Mirrors TenantContext.secret_optional's real os.environ fallback
+        # (unlike _Tenant's own stub above, which ignores env_var entirely)
+        # -- needed so this test can actually distinguish "the guard blocked
+        # it" from "the fake never would have resolved it anyway".
+        def secret_optional(self, env_var):
+            import os
+            return os.environ.get(env_var)
+
+    tenant = _RealisticTenant(events_webhook_secret_env="EVENTS_WEBHOOK_SECRET")
+
+    with caplog.at_level(logging.WARNING):
+        ok = await chat_webhooks.send_bo_webhook(tenant, "session_started", {})
+
+    assert ok is True
+    assert seen_secret is None  # guard must prevent this from becoming "platform-secret"
+    assert any(
         r.levelno == logging.WARNING and "UNSIGNED" in r.message
         for r in caplog.records
     )

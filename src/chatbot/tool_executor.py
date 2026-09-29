@@ -54,6 +54,18 @@ _PATH_VALUE_DANGEROUS_RE = re.compile(r"[/\\?#]|\.\.")
 # accepted.
 _PATH_VALUE_EMPTY_OR_ALL_DOTS_RE = re.compile(r"^\.*$")
 
+# Detects a `{name}` placeholder still present in the endpoint AFTER the
+# substitution loop below has run. Normally that loop replaces every
+# placeholder the row's `parameters` dict declares a value for; one surviving
+# here means a declared source="session" (or "llm") param resolved to None
+# (e.g. a catalog tool's {operator_id} when the per-session crm_context has no
+# operator_id — see C1/W1, src/bootstrap.py's factory no longer fabricates a
+# tenant.id fallback there) and was therefore skipped by the `v is not None`
+# guard in that loop. Sending the request with a literal, percent-encoded
+# "{operator_id}" path segment would be silently wrong (a guaranteed 404/403
+# at the CRM) rather than loudly rejected here.
+_UNRESOLVED_PATH_PLACEHOLDER_RE = re.compile(r"\{(\w+)\}")
+
 # Placeholder substituted for any internal-id-shaped value this module
 # redacts (by key, in _redact_internal_ids, or by UUID pattern, in both
 # _redact_internal_ids and _redact_url). Shared as a constant — rather than
@@ -282,6 +294,12 @@ async def execute_crm_tool(
                 return _reject_invalid_path_param(k)
             url = url.replace(placeholder, encoded)
             path_used.add(k)
+    # A `{name}` placeholder that survives the loop above means its resolved
+    # value was None (e.g. no operator_id in session context) -- reject
+    # rather than send a literal placeholder in the request path.
+    _unresolved = _UNRESOLVED_PATH_PLACEHOLDER_RE.search(url)
+    if _unresolved:
+        return _reject_invalid_path_param(_unresolved.group(1))
     rest = {k: v for k, v in values.items() if k not in path_used and v is not None}
 
     headers: dict = dict(extra_headers or {})

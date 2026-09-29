@@ -38,7 +38,7 @@ import asyncio
 import logging
 from typing import Any
 
-from src.integration.tenant_events import deliver, resolve_events_webhook_url
+from src.integration.tenant_events import deliver, resolve_events_webhook_url, sanitize_tenant_secret_env
 from src.models.database import get_sessionmaker
 from src.models.webhook_outbox import enqueue_webhook_outbox
 from src.utils.logging import debug_event
@@ -82,15 +82,19 @@ async def send_bo_webhook(
                 tenant_id=tenant_id, reason="no_webhook_url_configured",
             )
         return False
-    secret_env = getattr(settings, "events_webhook_secret_env", None)
+    # Tenant's own secret ONLY -- no platform-level EVENTS_WEBHOOK_SECRET
+    # fallback (removed, see W2): a shared HMAC key would let any tenant
+    # without their own secret forge signed events toward another tenant's
+    # BO webhook receiver. Absent -> sent unsigned, same as it always was for
+    # a tenant with no secret at all.
+    secret_env = sanitize_tenant_secret_env(
+        getattr(settings, "events_webhook_secret_env", None), tenant_id=tenant_id)
     secret = tenant.secret_optional(secret_env) if secret_env and hasattr(tenant, "secret_optional") else None
     if not secret:
-        import os
-        secret = os.environ.get("EVENTS_WEBHOOK_SECRET") or None
-    if not secret:
         log.warning(
-            "bo webhook sending UNSIGNED (no events_webhook_secret_env or "
-            "platform EVENTS_WEBHOOK_SECRET configured) — configure a webhook secret; "
+            "bo webhook sending UNSIGNED (no events_webhook_secret_env configured "
+            "or resolvable for this tenant — there is no platform-level signing "
+            "key fallback) — configure a per-tenant webhook secret; "
             "see docs/integrations/chat-widget-backend-integration.md#4-webhook-events",
             extra={"event_type": event_type},
         )

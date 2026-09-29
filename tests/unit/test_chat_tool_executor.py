@@ -750,6 +750,32 @@ async def test_path_traversal_in_llm_param_is_rejected_without_http_call() -> No
 
 
 @pytest.mark.asyncio
+async def test_unresolved_path_placeholder_is_rejected_without_http_call() -> None:
+    # Follow-up to C1/W1: a session-sourced {operator_id} that resolves to
+    # None (e.g. no operator_id in the session context) must not be sent as a
+    # literal, percent-encoded "{operator_id}" path segment -- reject before
+    # any HTTP call, same as the other invalid-path-value cases above.
+    client = _FakeClient({"ok": True})
+    out = await execute_crm_tool(
+        endpoint="https://crm.example.com/operators/{operator_id}/players/{user_id}/bet-limit",
+        method="GET",
+        parameters={
+            "operator_id": {"type": "string", "source": "session"},
+            "user_id": {"type": "string", "source": "session"},
+        },
+        auth_type=None, token=None,
+        args={},
+        context={"user_id": "u1"},  # no operator_id in context at all
+        http_client=client,
+    )
+    assert out == {
+        "error": "One of the request parameters had an invalid value.",
+        "failure": "invalid_parameter",
+    }
+    assert client.calls == []
+
+
+@pytest.mark.asyncio
 async def test_query_and_fragment_chars_in_llm_param_are_rejected() -> None:
     client = _FakeClient({"ok": True})
     for bad_value in ("foo?admin=true", "foo#frag"):

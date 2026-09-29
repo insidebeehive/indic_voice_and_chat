@@ -139,26 +139,34 @@ async def _resolve_tenant_event_secret(
 ) -> Optional[str]:
     """Resolve the outbound tenant-event webhook signing secret.
 
-    Per-tenant DECRYPTED secret first (so it can be stored per-tenant like the
-    telephony keys), falling back to the platform-level ``EVENTS_WEBHOOK_SECRET``
-    env var. Never raises — a missing secret just means the event is sent
-    unsigned, but that's a real security gap for the tenant's CRM (it can't
-    verify the event genuinely came from us), so we log a loud warning rather
-    than sending silently unsigned.
+    Per-tenant DECRYPTED secret ONLY (so it can be stored per-tenant like the
+    telephony keys) — never raises. A tenant with no ``events_webhook_secret_env``
+    configured (or whose configured secret doesn't resolve) gets its events sent
+    UNSIGNED; that's a real security gap for the tenant's CRM (it can't verify
+    the event genuinely came from us), so we log a loud warning rather than
+    sending silently unsigned.
+
+    Deliberately NOT falling back to a shared platform-level
+    ``EVENTS_WEBHOOK_SECRET`` env var (removed — see W2): one HMAC key shared
+    across every tenant without their own secret let any tenant who learned it
+    forge signed events toward another tenant's receiver. There is no
+    platform-wide substitute for a tenant's own signing secret; "unsigned +
+    WARNING" is the only fallback now, same as when both are absent today.
     """
+    from src.integration.tenant_events import sanitize_tenant_secret_env
+    secret_env = sanitize_tenant_secret_env(secret_env, tenant_id=tenant_id)
+
     secret = None
     if secret_env:
         ctx = None
         if resolver is not None and settings is not None and hasattr(resolver, "resolve_by_slug"):
             ctx = await resolver.resolve_by_slug(settings.slug)
         secret = ctx.secret_optional(secret_env) if ctx else os.environ.get(secret_env)
-    # Fall back to platform-level signing key when no per-tenant secret is set.
-    if not secret:
-        secret = os.environ.get("EVENTS_WEBHOOK_SECRET") or None
     if not secret:
         log.warning(
-            "tenant event webhook sending UNSIGNED (no events_webhook_secret_env or "
-            "platform EVENTS_WEBHOOK_SECRET configured) — configure a webhook secret; "
+            "tenant event webhook sending UNSIGNED (no events_webhook_secret_env "
+            "configured or resolvable for this tenant — there is no platform-level "
+            "signing key fallback) — configure a per-tenant webhook secret; "
             "see docs/integrations/chat-widget-backend-integration.md#4-webhook-events",
             extra={"tenant_id": tenant_id, "event_type": event_type},
         )
@@ -535,9 +543,7 @@ async def _deliver_webhook_outbox_claim(claim: dict, *, resolve_tenant, deliver_
     broadly on purpose, so a genuine bug surfaces in that one row's
     ``last_error`` rather than being silently absorbed here too.
     """
-    import os
-
-    from src.integration.tenant_events import resolve_events_webhook_url
+    from src.integration.tenant_events import resolve_events_webhook_url, sanitize_tenant_secret_env
     from src.models.database import get_sessionmaker
 
     tenant = await resolve_tenant(claim["tenant_id"])
@@ -549,13 +555,17 @@ async def _deliver_webhook_outbox_claim(claim: dict, *, resolve_tenant, deliver_
     if not url:
         return "retryable", "no_webhook_url_configured"
 
-    secret_env = getattr(settings, "events_webhook_secret_env", None)
+    # Tenant's own secret ONLY -- no platform-level EVENTS_WEBHOOK_SECRET
+    # fallback (removed, see W2 / _resolve_tenant_event_secret's docstring): a
+    # shared signing key would let any tenant without their own secret forge
+    # signed events toward another tenant's receiver. Absent -> unsigned, same
+    # as the in-line send that originally enqueued this row.
+    secret_env = sanitize_tenant_secret_env(
+        getattr(settings, "events_webhook_secret_env", None), tenant_id=claim["tenant_id"])
     secret = (
         tenant.secret_optional(secret_env)
         if secret_env and hasattr(tenant, "secret_optional") else None
     )
-    if not secret:
-        secret = os.environ.get("EVENTS_WEBHOOK_SECRET") or None
 
     result = await deliver_fn(url, claim["body"], secret)
     if result.ok:
@@ -1086,6 +1096,26 @@ async def _seed_crm_kb(
             log.warning("Pruned stale CRM KB doc(s) for crm_id=%s: %s", crm_id, pruned_ids)
 
 
+def _warn_if_platform_webhook_secret_still_set() -> None:
+    """W2: the platform-level EVENTS_WEBHOOK_SECRET fallback was removed --
+    every tenant now signs outbound webhooks with its own
+    events_webhook_secret_env only, or sends unsigned (see
+    _resolve_tenant_event_secret's docstring for why: a shared key let any
+    tenant without their own secret forge signed events toward another
+    tenant's receiver). If an operator still has this env var set, it's now
+    silently ignored everywhere it used to be read as a fallback -- warn once,
+    at boot, so that's discoverable instead of a config nobody remembers
+    setting quietly doing nothing."""
+    if os.environ.get("EVENTS_WEBHOOK_SECRET"):
+        log.warning(
+            "EVENTS_WEBHOOK_SECRET is set but IGNORED: the platform-level "
+            "webhook-signing fallback was removed (W2) -- each tenant now "
+            "signs with its own events_webhook_secret_env only, or sends "
+            "unsigned. Remove this env var or migrate its value into each "
+            "tenant's own webhook secret."
+        )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings: Settings = get_settings()
@@ -1096,6 +1126,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         service_name=settings.app.name,
     )
     log.info("startup", extra={"app": settings.app.name, "version": settings.app.version})
+    _warn_if_platform_webhook_secret_still_set()
 
     # get_settings() above had to run FIRST -- it is where the log level comes
     # from -- so everything load_settings() decided was decided while the root

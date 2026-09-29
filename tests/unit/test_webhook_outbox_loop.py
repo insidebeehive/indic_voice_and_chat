@@ -21,6 +21,7 @@ deterministic instead of racing the real wall clock.
 from __future__ import annotations
 
 import asyncio
+import os
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 
@@ -207,6 +208,100 @@ async def test_does_not_fall_back_to_stored_url_when_current_resolution_is_empty
     row = await _get_row(sessionmaker)
     assert row.status == STATUS_PENDING
     assert row.last_error == "no_webhook_url_configured"
+
+
+async def test_never_falls_back_to_platform_secret_even_when_set(sessionmaker, monkeypatch):
+    """W2: the webhook-outbox retry re-signs with the tenant's CURRENT secret
+    at delivery time -- it must never fall back to a platform-level
+    EVENTS_WEBHOOK_SECRET env var, even when one happens to be set. A tenant
+    with no events_webhook_secret_env (the _TENANT fixture) always delivers
+    unsigned (secret=None)."""
+    monkeypatch.setenv("EVENTS_WEBHOOK_SECRET", "platform-secret")
+    now = datetime(2026, 1, 1, 12, 0, 0)
+    await _seed_row(sessionmaker, next_attempt_at=now - timedelta(seconds=5))
+
+    seen_secrets = []
+
+    async def deliver_capture(url, body, secret):
+        seen_secrets.append(secret)
+        return DeliveryResult(ok=True, final_status=200)
+
+    n = await main.run_webhook_outbox_once(
+        sessionmaker, resolve_tenant=_resolve_tenant_ok,
+        deliver_fn=deliver_capture, now=now, now_fn=lambda: now,
+    )
+
+    assert n == 1
+    assert seen_secrets == [None]
+
+
+async def test_uses_tenants_own_secret_even_with_platform_env_set(sessionmaker, monkeypatch):
+    """A tenant WITH its own events_webhook_secret_env still signs with it,
+    unaffected by whether EVENTS_WEBHOOK_SECRET also happens to be set."""
+    monkeypatch.setenv("EVENTS_WEBHOOK_SECRET", "platform-secret")
+    now = datetime(2026, 1, 1, 12, 0, 0)
+    await _seed_row(sessionmaker, next_attempt_at=now - timedelta(seconds=5))
+
+    tenant_with_secret = SimpleNamespace(
+        id="t1",
+        events_webhook_url="https://crm.example/hook",
+        events_webhook_secret_env="TENANT_SECRET_ENV",
+        secret_optional=lambda env_var: "tenant-own-secret",
+    )
+
+    async def resolve_tenant_with_secret(tenant_id):
+        return tenant_with_secret
+
+    seen_secrets = []
+
+    async def deliver_capture(url, body, secret):
+        seen_secrets.append(secret)
+        return DeliveryResult(ok=True, final_status=200)
+
+    n = await main.run_webhook_outbox_once(
+        sessionmaker, resolve_tenant=resolve_tenant_with_secret,
+        deliver_fn=deliver_capture, now=now, now_fn=lambda: now,
+    )
+
+    assert n == 1
+    assert seen_secrets == ["tenant-own-secret"]
+
+
+async def test_blocks_secret_env_literally_named_platform_var(sessionmaker, monkeypatch):
+    """A tenant whose events_webhook_secret_env is literally
+    "EVENTS_WEBHOOK_SECRET" must not resolve the platform env var through
+    secret_optional's own os.environ fallback."""
+    monkeypatch.setenv("EVENTS_WEBHOOK_SECRET", "platform-secret")
+    now = datetime(2026, 1, 1, 12, 0, 0)
+    await _seed_row(sessionmaker, next_attempt_at=now - timedelta(seconds=5))
+
+    # Mirrors TenantContext.secret_optional's real os.environ fallback --
+    # unlike _TENANT's own stub, which always returns None regardless of
+    # env_var -- so this test can actually distinguish "the guard blocked
+    # it" from "the fake never would have resolved it anyway".
+    tenant_with_platform_name = SimpleNamespace(
+        id="t1",
+        events_webhook_url="https://crm.example/hook",
+        events_webhook_secret_env="EVENTS_WEBHOOK_SECRET",
+        secret_optional=lambda env_var: os.environ.get(env_var),
+    )
+
+    async def resolve_tenant_with_platform_name(tenant_id):
+        return tenant_with_platform_name
+
+    seen_secrets = []
+
+    async def deliver_capture(url, body, secret):
+        seen_secrets.append(secret)
+        return DeliveryResult(ok=True, final_status=200)
+
+    n = await main.run_webhook_outbox_once(
+        sessionmaker, resolve_tenant=resolve_tenant_with_platform_name,
+        deliver_fn=deliver_capture, now=now, now_fn=lambda: now,
+    )
+
+    assert n == 1
+    assert seen_secrets == [None]
 
 
 # --- H1: one bad row must never abort the batch or roll back rows already

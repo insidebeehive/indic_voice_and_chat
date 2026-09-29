@@ -149,14 +149,56 @@ async def _httpx_post(url: str, raw: bytes, headers: dict) -> int:
             return -1
 
 
+# The removed platform-wide fallback env var name (W2). Kept as a literal
+# here (not imported from src.config) so this module has no dependency on
+# Settings just to name the one string it needs to compare against.
+_PLATFORM_SECRET_ENV_NAME = "EVENTS_WEBHOOK_SECRET"
+
+
+def sanitize_tenant_secret_env(secret_env: Optional[str], *, tenant_id=None) -> Optional[str]:
+    """Guard used by every signing-secret resolver this module's callers
+    changed for W2 (src.main, src.api.chat_webhooks, src.bootstrap).
+
+    ``TenantContext.secret_optional``/``secret`` fall back to
+    ``os.environ.get(secret_env)`` whenever no per-tenant
+    ``secrets_resolved`` entry exists under that exact name. If a tenant's
+    ``events_webhook_secret_env`` is literally ``"EVENTS_WEBHOOK_SECRET"``
+    (a stale value from before the platform fallback was removed, or a
+    copy-paste mistake), that env-fallback would silently resolve the
+    platform-wide secret and re-introduce the exact cross-tenant forgery
+    risk W2 removed — one shared key would sign as if it were this tenant's
+    own. Treat that name as unset (never call secret_optional with it) and
+    warn once, rather than let it through and stay unsigned. Any other name
+    passes through unchanged.
+    """
+    if secret_env == _PLATFORM_SECRET_ENV_NAME:
+        log.warning(
+            "tenant events_webhook_secret_env is literally 'EVENTS_WEBHOOK_SECRET' "
+            "— treating as unset rather than resolving the platform-wide env var "
+            "via the os.environ fallback (that would re-introduce a shared signing "
+            "key across tenants); configure a tenant-specific secret name instead",
+            extra={"tenant_id": tenant_id},
+        )
+        return None
+    return secret_env
+
+
 async def resolve_events_webhook_url(tenant, sessionmaker) -> Optional[str]:
     """The URL to POST tenant lifecycle events to.
 
     Priority: the tenant's own explicit ``events_webhook_url`` (an escape
     hatch for a tenant needing a different shape than its CRM's default),
     else the tenant's linked CRM's ``events_webhook_url_template`` with
-    ``{operator_id}`` substituted from the tenant's own operator_id, else
-    None (no webhook configured at all).
+    ``{operator_id}`` substituted from the tenant's own ``crm.operator_id``,
+    else None (no webhook configured at all).
+
+    ``crm.operator_id`` is REQUIRED for the CRM-template branch (see C1/W1):
+    ``tenant.id`` is an internal platform id, not the CRM's registered
+    operator uuid, so substituting it used to send events to a URL the CRM
+    would reject. When no ``crm.operator_id`` is configured, this returns
+    None (same as "no webhook configured") rather than guessing -- an
+    explicit ``events_webhook_url`` still works without operator_id, since
+    that branch never substitutes anything.
 
     ``tenant`` may be a ``TenantContext`` (real call sites) or a bare
     ``TenantSettings``-like object exposing the same attributes directly
@@ -198,11 +240,25 @@ async def resolve_events_webhook_url(tenant, sessionmaker) -> Optional[str]:
         return None
 
     crm_config = getattr(settings, "crm", None)
-    operator_id = (
-        getattr(crm_config, "operator_id", None)
-        or getattr(settings, "id", None)
-        or getattr(tenant, "id", None)
-    )
+    operator_id = getattr(crm_config, "operator_id", None)
+    if not operator_id:
+        # C1/W1: tenant.id is not a real CRM operator uuid -- substituting it
+        # used to produce a URL the CRM's shipped guard would 403 on every
+        # delivery. Refuse instead of guessing; an explicit events_webhook_url
+        # (handled above) still works without operator_id.
+        log.warning(
+            "tenant event webhook: CRM template found for tenant but no "
+            "crm.operator_id configured — not resolving a CRM-template events "
+            "URL (tenant.id is not a real operator uuid); configure "
+            "crm.operator_id or set an explicit events_webhook_url",
+            extra={"tenant_id": getattr(tenant, "id", None) or getattr(settings, "id", None),
+                   "crm_id": crm_id},
+        )
+        debug_event(
+            log, "tenant_events url_resolve skipped",
+            reason="no_operator_id_configured", crm_id=crm_id,
+        )
+        return None
     url = crm.events_webhook_url_template.replace("{operator_id}", operator_id)
     debug_event(
         log, "tenant_events url_resolve resolved",

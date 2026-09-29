@@ -445,7 +445,7 @@ async def test_consume_events_commits_turn_and_slots():
     assert agent.state.state is State.LISTENING
 
 
-def test_bootstrap_builds_s2s_telephony_bridge():
+async def test_bootstrap_builds_s2s_telephony_bridge():
     """The bootstrap factory helper returns a TelephonyLiveBridge wired for the
     provider's encoding/sid when the tenant is in s2s mode."""
     from types import SimpleNamespace
@@ -460,9 +460,9 @@ def test_bootstrap_builds_s2s_telephony_bridge():
                                  timezone="Asia/Kolkata"),
         secret=lambda env: "fake-key", secret_optional=lambda env: "fake-key")
     providers = SimpleNamespace(get_stt=lambda t: None, get_llm=lambda t: object(),
-                                get_tts=lambda t: None)
+                                get_tts=lambda t: None, get_chat_call_tts=lambda t: None)
 
-    bridge = _build_s2s_telephony_bridge(
+    bridge = await _build_s2s_telephony_bridge(
         providers, tenant, VoiceBotScript(agent_name="A", agent_role="s", company_name="X"),
         SlotSchema(), websocket=object(), session_store=None,
         encoding="mulaw", sid_field="streamSid", supports_clear=True)
@@ -476,7 +476,7 @@ def test_bootstrap_builds_s2s_telephony_bridge():
     assert bridge._tenant_id == "t1"
 
 
-def test_build_s2s_telephony_bridge_applies_voice_and_lead_override():
+async def test_build_s2s_telephony_bridge_applies_voice_and_lead_override():
     """A dev-console override threads voice + lead_name + the provider's
     call_sid field into the S2S telephony bridge."""
     from types import SimpleNamespace
@@ -491,9 +491,9 @@ def test_build_s2s_telephony_bridge_applies_voice_and_lead_override():
                                  timezone="Asia/Kolkata"),
         secret=lambda env: "fake-key", secret_optional=lambda env: "fake-key")
     providers = SimpleNamespace(get_stt=lambda t: None, get_llm=lambda t: object(),
-                                get_tts=lambda t: None)
+                                get_tts=lambda t: None, get_chat_call_tts=lambda t: None)
 
-    bridge = _build_s2s_telephony_bridge(
+    bridge = await _build_s2s_telephony_bridge(
         providers, tenant, VoiceBotScript(agent_name="A", agent_role="s", company_name="X"),
         SlotSchema(), websocket=object(), session_store=None,
         encoding="pcm", sid_field="stream_sid", supports_clear=False,
@@ -503,7 +503,7 @@ def test_build_s2s_telephony_bridge_applies_voice_and_lead_override():
     assert bridge._agent.session.lead_data.get("lead_name") == "Raju"
 
 
-def test_build_s2s_telephony_bridge_rejects_disallowed_voice():
+async def test_build_s2s_telephony_bridge_rejects_disallowed_voice():
     from types import SimpleNamespace
 
     from src.bootstrap import _build_s2s_telephony_bridge
@@ -516,13 +516,284 @@ def test_build_s2s_telephony_bridge_rejects_disallowed_voice():
                                  timezone="Asia/Kolkata"),
         secret=lambda env: "k", secret_optional=lambda env: "k")
     providers = SimpleNamespace(get_stt=lambda t: None, get_llm=lambda t: object(),
-                                get_tts=lambda t: None)
-    bridge = _build_s2s_telephony_bridge(
+                                get_tts=lambda t: None, get_chat_call_tts=lambda t: None)
+    bridge = await _build_s2s_telephony_bridge(
         providers, tenant, VoiceBotScript(agent_name="A", agent_role="s", company_name="X"),
         SlotSchema(), websocket=object(), session_store=None,
         encoding="mulaw", sid_field="streamSid", supports_clear=True,
         voice_override="Charon")                   # not in allowed_voices
     assert bridge._config.voice == "Aoede"         # falls back to config default
+
+
+# --- D3: transfer-hold apology TTS uses chat-call TTS, not the platform default
+
+async def test_s2s_agent_tts_uses_chat_call_tts_not_platform_default():
+    """The transfer-hold apology TTS (bridge._tts) must come from
+    providers.get_chat_call_tts (chat_voice.tts else pipeline.tts), never
+    providers.get_tts's platform-default fallback -- an s2s tenant with no
+    pipeline.tts configured must not have its apology speak in a platform
+    voice it never otherwise uses."""
+    from types import SimpleNamespace
+
+    from src.bootstrap import _build_s2s_telephony_bridge
+
+    rt = SimpleNamespace(model="m", voice="Aoede", language_code="hi-IN", api_key_env="K")
+    tenant = SimpleNamespace(
+        id="t1", slug="dev",
+        settings=SimpleNamespace(pipeline=SimpleNamespace(mode="s2s", realtime=rt),
+                                 timezone="Asia/Kolkata"),
+        secret=lambda env: "k", secret_optional=lambda env: "k")
+    _chat_call_tts = object()
+    _platform_tts = object()
+    providers = SimpleNamespace(
+        get_stt=lambda t: None, get_llm=lambda t: object(),
+        get_tts=lambda t: _platform_tts,            # must NOT be used here
+        get_chat_call_tts=lambda t: _chat_call_tts)  # must be used
+
+    bridge = await _build_s2s_telephony_bridge(
+        providers, tenant, VoiceBotScript(agent_name="A", agent_role="s", company_name="X"),
+        SlotSchema(), websocket=object(), session_store=None,
+        encoding="mulaw", sid_field="streamSid", supports_clear=True)
+
+    assert bridge._tts is _chat_call_tts
+    assert bridge._tts is not _platform_tts
+
+
+async def test_s2s_agent_tts_is_none_when_chat_call_tts_unresolved():
+    """When get_chat_call_tts resolves nothing (no chat_voice.tts AND no
+    pipeline.tts), the apology TTS must be None (skip the apology) rather
+    than falling back to providers.get_tts's platform default."""
+    from types import SimpleNamespace
+
+    from src.bootstrap import _build_s2s_telephony_bridge
+
+    rt = SimpleNamespace(model="m", voice="Aoede", language_code="hi-IN", api_key_env="K")
+    tenant = SimpleNamespace(
+        id="t1", slug="dev",
+        settings=SimpleNamespace(pipeline=SimpleNamespace(mode="s2s", realtime=rt),
+                                 timezone="Asia/Kolkata"),
+        secret=lambda env: "k", secret_optional=lambda env: "k")
+    providers = SimpleNamespace(
+        get_stt=lambda t: None, get_llm=lambda t: object(),
+        get_tts=lambda t: object(),   # platform default exists but must be ignored
+        get_chat_call_tts=lambda t: None)
+
+    bridge = await _build_s2s_telephony_bridge(
+        providers, tenant, VoiceBotScript(agent_name="A", agent_role="s", company_name="X"),
+        SlotSchema(), websocket=object(), session_store=None,
+        encoding="mulaw", sid_field="streamSid", supports_clear=True)
+
+    assert bridge._tts is None
+
+
+# --- B7: s2s transfer webhook resolves via resolve_events_webhook_url (CRM
+#     template), not just the tenant's explicit events_webhook_url -----------
+
+async def test_s2s_transfer_webhook_resolves_via_crm_template(monkeypatch):
+    from types import SimpleNamespace
+
+    from src.bootstrap import _build_s2s_telephony_bridge
+
+    async def _fake_resolve_url(tenant, sessionmaker):
+        return "https://crm.example.com/webhooks/softphone-events/op-123"
+
+    monkeypatch.setattr(
+        "src.integration.tenant_events.resolve_events_webhook_url", _fake_resolve_url,
+    )
+
+    rt = SimpleNamespace(model="m", voice="Aoede", language_code="hi-IN", api_key_env="K")
+    tenant = SimpleNamespace(
+        id="t1", slug="dev",
+        settings=SimpleNamespace(
+            pipeline=SimpleNamespace(mode="s2s", realtime=rt),
+            timezone="Asia/Kolkata",
+            # No explicit events_webhook_url -- only reachable via the CRM
+            # template, which is exactly what resolve_events_webhook_url
+            # (faked above) stands in for.
+            events_webhook_secret_env=None,
+        ),
+        secret=lambda env: "k", secret_optional=lambda env: None)
+    providers = SimpleNamespace(get_stt=lambda t: None, get_llm=lambda t: object(),
+                                get_tts=lambda t: None, get_chat_call_tts=lambda t: None)
+
+    bridge = await _build_s2s_telephony_bridge(
+        providers, tenant, VoiceBotScript(agent_name="A", agent_role="s", company_name="X"),
+        SlotSchema(), websocket=object(), session_store=None,
+        encoding="mulaw", sid_field="streamSid", supports_clear=True)
+
+    assert bridge._transfer_webhook_url == "https://crm.example.com/webhooks/softphone-events/op-123"
+    assert bridge._transfer_webhook_secret is None  # no tenant secret configured -> unsigned
+
+
+async def test_s2s_transfer_webhook_signs_with_tenant_secret_only(monkeypatch, caplog):
+    """W2: no platform EVENTS_WEBHOOK_SECRET fallback for the transfer
+    webhook either -- a tenant with no events_webhook_secret_env sends
+    unsigned + WARNING even if the env var happens to be set."""
+    import logging
+    from types import SimpleNamespace
+
+    from src.bootstrap import _build_s2s_telephony_bridge
+
+    monkeypatch.setenv("EVENTS_WEBHOOK_SECRET", "platform-secret")
+
+    async def _fake_resolve_url(tenant, sessionmaker):
+        return "https://crm.example.com/webhooks/softphone-events/op-123"
+
+    monkeypatch.setattr(
+        "src.integration.tenant_events.resolve_events_webhook_url", _fake_resolve_url,
+    )
+
+    rt = SimpleNamespace(model="m", voice="Aoede", language_code="hi-IN", api_key_env="K")
+    tenant = SimpleNamespace(
+        id="t1", slug="dev",
+        settings=SimpleNamespace(
+            pipeline=SimpleNamespace(mode="s2s", realtime=rt),
+            timezone="Asia/Kolkata", events_webhook_secret_env=None,
+        ),
+        secret=lambda env: "k", secret_optional=lambda env: None)
+    providers = SimpleNamespace(get_stt=lambda t: None, get_llm=lambda t: object(),
+                                get_tts=lambda t: None, get_chat_call_tts=lambda t: None)
+
+    with caplog.at_level(logging.WARNING, logger="src.bootstrap"):
+        bridge = await _build_s2s_telephony_bridge(
+            providers, tenant, VoiceBotScript(agent_name="A", agent_role="s", company_name="X"),
+            SlotSchema(), websocket=object(), session_store=None,
+            encoding="mulaw", sid_field="streamSid", supports_clear=True)
+
+    assert bridge._transfer_webhook_secret is None
+    assert any(
+        r.levelno == logging.WARNING and "UNSIGNED" in r.message
+        for r in caplog.records
+    )
+
+
+async def test_s2s_transfer_webhook_db_error_treated_as_unconfigured(monkeypatch, caplog):
+    """A DB blip inside resolve_events_webhook_url (e.g. a connection error
+    resolving the tenant's CRM link) must not fail call setup -- log a
+    WARNING, treat the transfer webhook as unconfigured (None), and let the
+    bridge build and the call proceed normally."""
+    import logging
+    from types import SimpleNamespace
+
+    from src.bootstrap import _build_s2s_telephony_bridge
+
+    async def _raising_resolve_url(tenant, sessionmaker):
+        raise RuntimeError("connection to server was lost")
+
+    monkeypatch.setattr(
+        "src.integration.tenant_events.resolve_events_webhook_url", _raising_resolve_url,
+    )
+
+    rt = SimpleNamespace(model="m", voice="Aoede", language_code="hi-IN", api_key_env="K")
+    tenant = SimpleNamespace(
+        id="t1", slug="dev",
+        settings=SimpleNamespace(
+            pipeline=SimpleNamespace(mode="s2s", realtime=rt),
+            timezone="Asia/Kolkata", events_webhook_secret_env=None,
+        ),
+        secret=lambda env: "k", secret_optional=lambda env: None)
+    providers = SimpleNamespace(get_stt=lambda t: None, get_llm=lambda t: object(),
+                                get_tts=lambda t: None, get_chat_call_tts=lambda t: None)
+
+    with caplog.at_level(logging.WARNING, logger="src.bootstrap"):
+        bridge = await _build_s2s_telephony_bridge(
+            providers, tenant, VoiceBotScript(agent_name="A", agent_role="s", company_name="X"),
+            SlotSchema(), websocket=object(), session_store=None,
+            encoding="mulaw", sid_field="streamSid", supports_clear=True)
+
+    assert isinstance(bridge, TelephonyLiveBridge)  # call setup still succeeds
+    assert bridge._transfer_webhook_url is None
+    assert any(
+        r.levelno == logging.WARNING and "resolution failed" in r.message
+        for r in caplog.records
+    )
+
+
+async def test_s2s_transfer_webhook_override_skips_resolution_entirely(monkeypatch):
+    """A per-call override must short-circuit before resolve_events_webhook_url
+    is ever called -- confirms the try/except added for the DB-error case
+    doesn't change the override's existing precedence."""
+    from types import SimpleNamespace
+
+    from src.bootstrap import _build_s2s_telephony_bridge
+
+    called = []
+
+    async def _tracking_resolve_url(tenant, sessionmaker):
+        called.append(True)
+        return "https://should-not-be-used.example.com/hook"
+
+    monkeypatch.setattr(
+        "src.integration.tenant_events.resolve_events_webhook_url", _tracking_resolve_url,
+    )
+
+    rt = SimpleNamespace(model="m", voice="Aoede", language_code="hi-IN", api_key_env="K")
+    tenant = SimpleNamespace(
+        id="t1", slug="dev",
+        settings=SimpleNamespace(
+            pipeline=SimpleNamespace(mode="s2s", realtime=rt),
+            timezone="Asia/Kolkata", events_webhook_secret_env=None,
+        ),
+        secret=lambda env: "k", secret_optional=lambda env: None)
+    providers = SimpleNamespace(get_stt=lambda t: None, get_llm=lambda t: object(),
+                                get_tts=lambda t: None, get_chat_call_tts=lambda t: None)
+
+    bridge = await _build_s2s_telephony_bridge(
+        providers, tenant, VoiceBotScript(agent_name="A", agent_role="s", company_name="X"),
+        SlotSchema(), websocket=object(), session_store=None,
+        encoding="mulaw", sid_field="streamSid", supports_clear=True,
+        transfer_webhook_url_override="https://override.example.com/hook")
+
+    assert bridge._transfer_webhook_url == "https://override.example.com/hook"
+    assert called == []
+
+
+async def test_s2s_transfer_webhook_blocks_secret_env_literally_named_platform_var(monkeypatch, caplog):
+    """A tenant whose events_webhook_secret_env is literally
+    "EVENTS_WEBHOOK_SECRET" must not resolve the platform env var through
+    secret_optional's own os.environ fallback for the transfer webhook
+    either."""
+    import logging
+    import os
+    from types import SimpleNamespace
+
+    from src.bootstrap import _build_s2s_telephony_bridge
+
+    monkeypatch.setenv("EVENTS_WEBHOOK_SECRET", "platform-secret")
+
+    async def _fake_resolve_url(tenant, sessionmaker):
+        return "https://crm.example.com/webhooks/softphone-events/op-123"
+
+    monkeypatch.setattr(
+        "src.integration.tenant_events.resolve_events_webhook_url", _fake_resolve_url,
+    )
+
+    rt = SimpleNamespace(model="m", voice="Aoede", language_code="hi-IN", api_key_env="K")
+    tenant = SimpleNamespace(
+        id="t1", slug="dev",
+        settings=SimpleNamespace(
+            pipeline=SimpleNamespace(mode="s2s", realtime=rt),
+            timezone="Asia/Kolkata", events_webhook_secret_env="EVENTS_WEBHOOK_SECRET",
+        ),
+        secret=lambda env: "k",
+        # Mirrors TenantContext.secret_optional's real os.environ fallback --
+        # needed so this test can distinguish "the guard blocked it" from
+        # "the fake never would have resolved it anyway".
+        secret_optional=lambda env: os.environ.get(env))
+    providers = SimpleNamespace(get_stt=lambda t: None, get_llm=lambda t: object(),
+                                get_tts=lambda t: None, get_chat_call_tts=lambda t: None)
+
+    with caplog.at_level(logging.WARNING, logger="src.bootstrap"):
+        bridge = await _build_s2s_telephony_bridge(
+            providers, tenant, VoiceBotScript(agent_name="A", agent_role="s", company_name="X"),
+            SlotSchema(), websocket=object(), session_store=None,
+            encoding="mulaw", sid_field="streamSid", supports_clear=True)
+
+    assert bridge._transfer_webhook_secret is None
+    assert any(
+        r.levelno == logging.WARNING and "UNSIGNED" in r.message
+        for r in caplog.records
+    )
 
 
 # --- Phase 3: LiveKit bridge factory (_build_s2s_agent_and_config split) ----
@@ -545,10 +816,10 @@ def _livekit_providers():
     from types import SimpleNamespace
     _llm, _tts = object(), object()
     return SimpleNamespace(get_stt=lambda t: None, get_llm=lambda t: _llm,
-                           get_tts=lambda t: _tts)
+                           get_tts=lambda t: _tts, get_chat_call_tts=lambda t: _tts)
 
 
-def test_build_s2s_agent_and_config_matches_telephony_bridge_behavior():
+async def test_build_s2s_agent_and_config_matches_telephony_bridge_behavior():
     """Regression guard for the refactor: _build_s2s_agent_and_config must produce
     the exact same agent/config/llm/tts/timezone the (still-passing) telephony
     bridge tests above observe on the TelephonyLiveBridge it wraps."""
@@ -563,7 +834,7 @@ def test_build_s2s_agent_and_config_matches_telephony_bridge_behavior():
         providers, tenant, script, slots, None,
         voice_override="Kore", lead_data={"lead_name": "Raju"})
 
-    bridge = _build_s2s_telephony_bridge(
+    bridge = await _build_s2s_telephony_bridge(
         providers, tenant, script, slots, websocket=object(), session_store=None,
         encoding="pcm", sid_field="stream_sid", supports_clear=False,
         call_sid_field="call_sid", voice_override="Kore", lead_data={"lead_name": "Raju"})

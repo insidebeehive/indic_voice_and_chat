@@ -60,20 +60,17 @@ Required env vars:
                        the command line still wins over whatever settings
                        would otherwise resolve to.
     VOX_SECRET_KEY     Fernet key used to decrypt this tenant's rows in
-                       tenant_secrets (src/auth/secrets.py). Only per-tenant
-                       TELEPHONY secrets live there — the webhook signing
-                       secret is normally the platform-wide
-                       EVENTS_WEBHOOK_SECRET env var instead — but
-                       tenant_context_from_row decrypts every declared secret
-                       for the tenant regardless of kind, so leaving this
-                       unset means those rows fail to decrypt (logged, not
-                       fatal) rather than actually being needed for the
+                       tenant_secrets (src/auth/secrets.py), including the
+                       tenant's own webhook signing secret when
+                       ``events_webhook_secret_env`` names one (see W2:
+                       there is no platform-wide EVENTS_WEBHOOK_SECRET
+                       fallback — a tenant with no secret of its own has
+                       this resend sent unsigned, same as the live app).
+                       tenant_context_from_row decrypts every declared
+                       secret for the tenant regardless of kind, so leaving
+                       this unset means those rows fail to decrypt (logged,
+                       not fatal) rather than actually being needed for the
                        webhook call itself.
-    EVENTS_WEBHOOK_SECRET (optional)
-                       Platform-wide fallback HMAC signing secret, used when
-                       the tenant has no per-tenant
-                       ``events_webhook_secret_env`` configured. Same var the
-                       live app uses.
 
 Usage:
     # Dry run (default) — prints what would be sent, sends nothing.

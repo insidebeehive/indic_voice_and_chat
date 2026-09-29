@@ -91,6 +91,14 @@ class ResolvedToolsResponse(BaseModel):
     # ResolvedToolInfo's own `kind` for that.
     source: str  # "tenant" | "crm_catalog" | "none"
     crm_id: Optional[str] = None  # set only when source == "crm_catalog"
+    # Set only when source == "none" AND there's a specific, actionable
+    # reason worth surfacing (currently just "no_operator_id_configured" —
+    # see C1/W1: a tenant linked to a Crm entity but with no
+    # tenant.settings.crm.operator_id configured gets zero CRM tools rather
+    # than tools guaranteed to 403). None for every other "none" case (no CRM
+    # linked at all, or crm_id set but the CRM/catalog itself is empty) —
+    # there's nothing more specific to say there.
+    reason: Optional[str] = None
     tools: list[ResolvedToolInfo]
 
 
@@ -209,6 +217,16 @@ async def list_resolved_tools(
     sessionmaker = get_sessionmaker()
     specs, execs, source = await resolve_crm_tools(tenant, sessionmaker)
     crm_id = getattr(tenant.settings, "crm_id", None) if source == "crm_catalog" else None
+    # C1/W1 follow-up: a tenant linked to a Crm entity (crm_id set) but with
+    # no crm.operator_id configured is the one "none" case with something
+    # specific and actionable to say -- resolve_crm_tools itself already
+    # logs this as a WARNING, but the backoffice has no log access, so surface
+    # it here too.
+    reason: Optional[str] = None
+    if source == "none" and getattr(tenant.settings, "crm_id", None):
+        configured_operator_id = getattr(getattr(tenant.settings, "crm", None), "operator_id", None)
+        if not configured_operator_id:
+            reason = "no_operator_id_configured"
 
     tools: list[ResolvedToolInfo] = [
         ResolvedToolInfo(
@@ -253,7 +271,7 @@ async def list_resolved_tools(
             kind="deposit_verification",
         ))
 
-    return ResolvedToolsResponse(source=source, crm_id=crm_id, tools=tools)
+    return ResolvedToolsResponse(source=source, crm_id=crm_id, reason=reason, tools=tools)
 
 
 @router.delete("/tools/{tool_name}")

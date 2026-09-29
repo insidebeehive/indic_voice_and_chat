@@ -480,10 +480,12 @@ async def test_deliver_detailed_logs_call_envelope_event_type_key(monkeypatch, c
 
 # --- src.main._resolve_tenant_event_secret -----------------------------------
 # Both call sites (main.py's _notify_tenant_event closure and chat_webhooks'
-# send_bo_webhook) resolve a signing secret the same way — per-tenant secret
-# first, else platform EVENTS_WEBHOOK_SECRET, else None — and must WARN loudly
-# (never block delivery) when no secret resolves at all, since an unsigned
-# webhook means the tenant's CRM can't verify events are really from us.
+# send_bo_webhook) resolve a signing secret the same way — the tenant's own
+# secret ONLY, no platform-level EVENTS_WEBHOOK_SECRET fallback (removed, see
+# W2: a shared key would let any tenant without their own secret forge signed
+# events toward another tenant's receiver) — and must WARN loudly (never block
+# delivery) when no secret resolves at all, since an unsigned webhook means
+# the tenant's CRM can't verify events are really from us.
 
 
 async def test_resolve_tenant_event_secret_logs_warning_when_unsigned(monkeypatch, caplog):
@@ -504,7 +506,12 @@ async def test_resolve_tenant_event_secret_logs_warning_when_unsigned(monkeypatc
     )
 
 
-async def test_resolve_tenant_event_secret_no_warning_when_signed(monkeypatch, caplog):
+async def test_resolve_tenant_event_secret_platform_env_var_never_used_even_when_set(monkeypatch, caplog):
+    # W2: EVENTS_WEBHOOK_SECRET being set in the environment must NOT be used
+    # as a fallback signing key anymore — a tenant with no secret_env (or one
+    # that doesn't resolve) always gets UNSIGNED + WARNING now, regardless of
+    # this env var. (Was test_resolve_tenant_event_secret_no_warning_when_signed,
+    # which pinned the removed platform-fallback behavior.)
     from src import main as main_module
 
     monkeypatch.setenv("EVENTS_WEBHOOK_SECRET", "platform-secret")
@@ -515,7 +522,36 @@ async def test_resolve_tenant_event_secret_no_warning_when_signed(monkeypatch, c
             settings, None, None, tenant_id="t_acme", event_type="call.completed",
         )
 
-    assert secret == "platform-secret"
+    assert secret is None
+    assert any(
+        r.levelno == logging.WARNING and "UNSIGNED" in r.message
+        for r in caplog.records
+    )
+
+
+async def test_resolve_tenant_event_secret_per_tenant_secret_wins_even_with_platform_env_set(monkeypatch, caplog):
+    # The tenant's own secret still resolves normally when EVENTS_WEBHOOK_SECRET
+    # also happens to be set — it's just never consulted either way.
+    from src import main as main_module
+
+    monkeypatch.setenv("EVENTS_WEBHOOK_SECRET", "platform-secret")
+    settings = SimpleNamespace(slug="acme")
+
+    class _Ctx:
+        def secret_optional(self, env_var):
+            return "tenant-secret"
+
+    class _Resolver:
+        async def resolve_by_slug(self, slug):
+            return _Ctx()
+
+    with caplog.at_level(logging.WARNING, logger="src.main"):
+        secret = await main_module._resolve_tenant_event_secret(
+            settings, "TENANT_WEBHOOK_SECRET", _Resolver(),
+            tenant_id="t_acme", event_type="call.completed",
+        )
+
+    assert secret == "tenant-secret"
     assert not any(
         r.levelno == logging.WARNING and "UNSIGNED" in r.message
         for r in caplog.records
@@ -544,6 +580,94 @@ async def test_resolve_tenant_event_secret_per_tenant_secret_no_warning(monkeypa
 
     assert secret == "tenant-secret"
     assert not any(
+        r.levelno == logging.WARNING and "UNSIGNED" in r.message
+        for r in caplog.records
+    )
+
+
+# --- src.main._warn_if_platform_webhook_secret_still_set ---------------------
+# W2: a one-time startup WARNING when an operator still has EVENTS_WEBHOOK_SECRET
+# set, since it's now silently ignored everywhere it used to be a fallback.
+
+
+def test_warns_at_startup_when_platform_secret_still_set(monkeypatch, caplog):
+    import logging
+
+    from src import main as main_module
+
+    monkeypatch.setenv("EVENTS_WEBHOOK_SECRET", "platform-secret")
+
+    with caplog.at_level(logging.WARNING, logger="src.main"):
+        main_module._warn_if_platform_webhook_secret_still_set()
+
+    assert any(
+        r.levelno == logging.WARNING and "EVENTS_WEBHOOK_SECRET" in r.message
+        and "IGNORED" in r.message
+        for r in caplog.records
+    )
+
+
+def test_no_startup_warning_when_platform_secret_unset(monkeypatch, caplog):
+    import logging
+
+    from src import main as main_module
+
+    monkeypatch.delenv("EVENTS_WEBHOOK_SECRET", raising=False)
+
+    with caplog.at_level(logging.WARNING, logger="src.main"):
+        main_module._warn_if_platform_webhook_secret_still_set()
+
+    assert not any("EVENTS_WEBHOOK_SECRET" in r.message for r in caplog.records)
+
+
+# --- src.integration.tenant_events.sanitize_tenant_secret_env ----------------
+# A tenant's events_webhook_secret_env literally named "EVENTS_WEBHOOK_SECRET"
+# must not be allowed through to secret_optional() -- that would resolve the
+# platform-wide env var via its own os.environ fallback and re-introduce the
+# shared-key forgery risk W2 removed.
+
+
+def test_sanitize_tenant_secret_env_blocks_the_platform_name(caplog):
+    import logging
+
+    from src.integration.tenant_events import sanitize_tenant_secret_env
+
+    with caplog.at_level(logging.WARNING, logger="src.integration.tenant_events"):
+        result = sanitize_tenant_secret_env("EVENTS_WEBHOOK_SECRET", tenant_id="t1")
+
+    assert result is None
+    assert any(
+        r.levelno == logging.WARNING and "EVENTS_WEBHOOK_SECRET" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+def test_sanitize_tenant_secret_env_passes_through_other_names():
+    from src.integration.tenant_events import sanitize_tenant_secret_env
+
+    assert sanitize_tenant_secret_env("TENANT_ACME_WEBHOOK_SECRET") == "TENANT_ACME_WEBHOOK_SECRET"
+    assert sanitize_tenant_secret_env(None) is None
+
+
+async def test_resolve_tenant_event_secret_blocks_platform_env_var_name(monkeypatch, caplog):
+    # A tenant configured (by mistake, or a stale pre-W2 value) with
+    # events_webhook_secret_env="EVENTS_WEBHOOK_SECRET" must NOT resolve the
+    # platform env var through secret_optional's own os.environ fallback.
+    import logging
+
+    from src import main as main_module
+
+    monkeypatch.setenv("EVENTS_WEBHOOK_SECRET", "platform-secret")
+    settings = SimpleNamespace(slug="acme")
+
+    with caplog.at_level(logging.WARNING, logger="src.main"):
+        secret = await main_module._resolve_tenant_event_secret(
+            settings, "EVENTS_WEBHOOK_SECRET", None,
+            tenant_id="t_acme", event_type="call.completed",
+        )
+
+    assert secret is None
+    assert any(
         r.levelno == logging.WARNING and "UNSIGNED" in r.message
         for r in caplog.records
     )
@@ -606,6 +730,49 @@ async def test_resolve_events_webhook_url_uses_crm_template_with_operator_id(sm_
         crm=TenantCRMConfig(operator_id="ab858a8c-7ad4-47d2-a0b7-05ee93f8f134")))
     url = await resolve_events_webhook_url(tenant, sm_with_crm_seed)
     assert url == "https://bostage.betstudio.io/webhooks/crm/softphone-events/ab858a8c-7ad4-47d2-a0b7-05ee93f8f134"
+
+
+async def test_resolve_events_webhook_url_none_when_crm_linked_but_no_operator_id(sm_with_crm_seed, caplog):
+    # C1/W1: tenant.id is not a real CRM operator uuid -- a tenant linked to a
+    # Crm entity (with a real events_webhook_url_template) but no
+    # crm.operator_id configured must get None (the existing "no webhook
+    # configured" outcome), same as if no CRM were linked at all, rather than
+    # a URL built from tenant.id that the CRM would reject.
+    import logging
+
+    from src.auth.context import TenantContext
+    from src.config_tenant import TenantSettings
+    from src.integration.tenant_events import resolve_events_webhook_url
+    from src.models.crm import Crm
+
+    async with sm_with_crm_seed() as db:
+        crm = await db.get(Crm, "betstudio")
+        crm.events_webhook_url_template = "https://bostage.betstudio.io/webhooks/crm/softphone-events/{operator_id}"
+        await db.commit()
+
+    tenant = TenantContext(settings=TenantSettings(id="t1", slug="t1", name="T1", crm_id="betstudio"))
+    with caplog.at_level(logging.WARNING, logger="src.integration.tenant_events"):
+        url = await resolve_events_webhook_url(tenant, sm_with_crm_seed)
+
+    assert url is None
+    assert any(
+        r.levelno == logging.WARNING and "operator_id" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+async def test_resolve_events_webhook_url_explicit_override_works_without_operator_id():
+    # An explicit tenant events_webhook_url is an escape hatch that never
+    # substitutes anything -- it must keep working with no crm.operator_id.
+    from src.auth.context import TenantContext
+    from src.config_tenant import TenantSettings
+    from src.integration.tenant_events import resolve_events_webhook_url
+
+    tenant = TenantContext(settings=TenantSettings(
+        id="t1", slug="t1", name="T1", crm_id="betstudio",
+        events_webhook_url="https://explicit.example.com/hook"))
+    url = await resolve_events_webhook_url(tenant, sessionmaker=None)
+    assert url == "https://explicit.example.com/hook"
 
 
 async def test_resolve_events_webhook_url_none_when_nothing_configured():

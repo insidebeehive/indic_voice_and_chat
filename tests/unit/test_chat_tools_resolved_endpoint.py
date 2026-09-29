@@ -26,7 +26,7 @@ from src.auth.middleware import set_tenant_resolver
 from src.bootstrap import make_chatbot_factory, resolve_crm_tools
 from src.chatbot.catalog import ALL_TOOLS, OPERATOR_TOOLS, PLAYER_TOOLS
 from src.chatbot.tools import SUBMIT_DEPOSIT_VERIFICATION
-from src.config_tenant import DepositVerificationConfig, TenantSettings
+from src.config_tenant import DepositVerificationConfig, TenantCRMConfig, TenantSettings
 from src.models.chat import ChatTool
 from src.models.database import Base
 from src.models.tenant import Tenant, TenantSecret
@@ -290,8 +290,13 @@ async def test_platform_fallback_ignores_configured_platform_token(ctx, monkeypa
     monkeypatch.setenv("PLATFORM_CRM_BASE_URL", "https://platform-crm.example.com")
     monkeypatch.setenv("PLATFORM_CRM_API_TOKEN", "platform-token-abc")
     await _seed_crm(sm)
-    register_tenant_for_test(TenantSettings(id="t1", slug="t1", name="T1", crm_id="betstudio"),
-                              plaintext_tokens=["test-token"])
+    # crm.operator_id required (C1/W1) or resolve_crm_tools registers zero
+    # crm_catalog tools -- this test's subject is the token fallback, not
+    # operator_id, so it's set here just to keep the catalog non-empty.
+    register_tenant_for_test(
+        TenantSettings(id="t1", slug="t1", name="T1", crm_id="betstudio",
+                       crm=TenantCRMConfig(operator_id="op-123")),
+        plaintext_tokens=["test-token"])
 
     resp = await client.get("/chat/tools/resolved")
     assert resp.status_code == 200, resp.text
@@ -309,8 +314,11 @@ async def test_platform_fallback_without_token_reports_not_configured(ctx, monke
     monkeypatch.setenv("PLATFORM_CRM_BASE_URL", "https://platform-crm.example.com")
     # No PLATFORM_CRM_API_TOKEN set (and no crm:api_token tenant secret).
     await _seed_crm(sm)
-    register_tenant_for_test(TenantSettings(id="t1", slug="t1", name="T1", crm_id="betstudio"),
-                              plaintext_tokens=["test-token"])
+    # crm.operator_id required (C1/W1) -- see comment above.
+    register_tenant_for_test(
+        TenantSettings(id="t1", slug="t1", name="T1", crm_id="betstudio",
+                       crm=TenantCRMConfig(operator_id="op-123")),
+        plaintext_tokens=["test-token"])
 
     resp = await client.get("/chat/tools/resolved")
     assert resp.status_code == 200, resp.text
@@ -328,8 +336,11 @@ async def test_x_api_key_configured_reported_independently_of_token(ctx, monkeyp
     # The in-memory test resolver doesn't re-read TenantSecret rows, so seed
     # the tenant's secrets_resolved directly (same pattern as the other
     # crm_catalog tests that construct TenantContext with secrets_resolved).
-    fresh_ctx = register_tenant_for_test(TenantSettings(id="t1", slug="t1", name="T1", crm_id="betstudio"),
-                                          plaintext_tokens=["test-token"])
+    # crm.operator_id required (C1/W1) -- see comment above.
+    fresh_ctx = register_tenant_for_test(
+        TenantSettings(id="t1", slug="t1", name="T1", crm_id="betstudio",
+                       crm=TenantCRMConfig(operator_id="op-123")),
+        plaintext_tokens=["test-token"])
     fresh_ctx.secrets_resolved["crm:x_api_key"] = "the-x-api-key"
 
     resp = await client.get("/chat/tools/resolved")
@@ -342,6 +353,38 @@ async def test_x_api_key_configured_reported_independently_of_token(ctx, monkeyp
     # x_api_key_configured is True — the two are independent.
     assert all(t["token_configured"] is False for t in body["tools"])
     assert all(t["x_api_key_configured"] is True for t in crm_tools)
+
+
+async def test_crm_linked_without_operator_id_reports_none_source(ctx, monkeypatch) -> None:
+    # C1/W1: a tenant linked to a Crm entity but with no crm.operator_id
+    # configured must get zero crm_catalog tools -- tenant.id is not a real
+    # operator uuid, and substituting it used to 403 every operator-scoped
+    # call. source collapses to "none" (same as no CRM link at all) rather
+    # than reporting a catalog the tenant can never actually call.
+    client, sm = ctx
+    _clean_platform_env(monkeypatch)
+    await _seed_crm(sm)
+    register_tenant_for_test(TenantSettings(id="t1", slug="t1", name="T1", crm_id="betstudio"),
+                              plaintext_tokens=["test-token"])
+
+    resp = await client.get("/chat/tools/resolved")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["source"] == "none"
+    assert body["reason"] == "no_operator_id_configured"
+    assert not any(t["kind"] == "crm" for t in body["tools"])
+
+
+async def test_nothing_configured_gives_no_reason(ctx) -> None:
+    # No CRM linked at all -- "none" is the ordinary/unremarkable case, not
+    # something the missing-operator_id reason should try to explain.
+    client, _sm = ctx
+
+    resp = await client.get("/chat/tools/resolved")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["source"] == "none"
+    assert body["reason"] is None
 
 
 async def test_nothing_configured_gives_empty_none_source(ctx) -> None:

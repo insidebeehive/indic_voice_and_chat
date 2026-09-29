@@ -1430,8 +1430,8 @@ async function loadCRM(id, slug) {
       Where this tenant's chat and call events go (session started/closed, escalation,
       call events), and the tenant-specific secret they're signed with
       (<code>X-Signature: sha256=…</code>). Leave the URL blank to use the linked CRM's
-      default; a tenant with no secret here falls back to the platform
-      <code>EVENTS_WEBHOOK_SECRET</code>, or is sent unsigned.
+      default; a tenant with no secret here has its events sent <b>unsigned</b> — there
+      is no shared/platform fallback key.
     </div>
     <div class="creds" style="gap:.6rem;flex-wrap:wrap;">
       <label>URL override
@@ -1495,6 +1495,7 @@ async function loadChat(id, slug) {
   const resolved = rr.ok ? rr.json : null;
   const resolvedTools = resolved ? (resolved.tools || []) : [];
   const resolvedSource = resolved ? resolved.source : null;
+  const resolvedReason = resolved ? resolved.reason : null;
   // BUILTIN_TOOLS are unconditionally present on every tenant, every turn —
   // resolvedTools.length is never a meaningful "nothing active" signal
   // anymore. source/crm_id (and this hint) describe the CRM resolution only,
@@ -1502,13 +1503,21 @@ async function loadChat(id, slug) {
   // place that says so — the table itself only shows "No tools active" in
   // the (currently impossible, since BUILTIN_TOOLS are unconditional) case
   // of an empty resolvedTools list, to avoid saying "no CRM tools" twice.
+  // reason ("no_operator_id_configured" — see C1/W1) singles out the one
+  // "none" case with something specific and actionable to say: a CRM IS
+  // linked, but tenant.settings.crm.operator_id isn't configured, so zero
+  // tools were registered rather than tools guaranteed to 403.
   const resolvedHint = !resolved
     ? "Could not load active tools."
     : resolvedSource === "tenant"
       ? "Using this tenant's own registered tools (below)."
       : resolvedSource === "crm_catalog"
         ? "Using the linked CRM's tool catalog — no tenant-specific tools registered."
-        : "No CRM tools active — no tenant registration and no CRM linked (link a CRM in the CRM tab, or configure this tenant's own CRM credentials there).";
+        : resolvedReason === "no_operator_id_configured"
+          ? "No CRM tools active — this tenant is linked to a CRM but has no Operator ID " +
+            "configured (CRM tab), so its catalog tools were withheld rather than register " +
+            "tools that would fail every call. Set the Operator ID to enable them."
+          : "No CRM tools active — no tenant registration and no CRM linked (link a CRM in the CRM tab, or configure this tenant's own CRM credentials there).";
 
   const kindLabel = (k) => k === "builtin" ? "builtin" : k === "deposit_verification" ? "deposit verification" : "CRM";
   // DV's "auth" isn't on the outbound tool call — it's the HMAC secret the

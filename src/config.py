@@ -357,7 +357,15 @@ class Secrets(BaseSettings):
 
     # Misc
     WEBHOOK_BASE_URL: Optional[str] = None
-    EVENTS_WEBHOOK_SECRET: Optional[str] = None  # platform-level HMAC signing key for outbound webhooks
+    # REMOVED / IGNORED (W2): used to be a platform-wide fallback HMAC signing
+    # key for outbound webhooks when a tenant had none of its own -- that
+    # fallback let any tenant without a secret forge signed events toward
+    # another tenant's receiver, so it's no longer read anywhere as a
+    # fallback. Field kept only so a still-set value is detectable: src/main.py
+    # logs a one-time startup WARNING if this is non-empty. Signing is always
+    # the tenant's own events_webhook_secret_env now; none configured -> sent
+    # unsigned.
+    EVENTS_WEBHOOK_SECRET: Optional[str] = None
     VOX_CONFIG_PATH: str = "config/default.yaml"
     VOX_LOG_LEVEL: Optional[str] = None
 
