@@ -104,6 +104,18 @@ class ElevenLabsTTSAdapter(ITTSProvider):
         # works without a key (used by /dev/tts-voices for the voice dropdown).
         self._api_key = config.get("api_key") or os.environ.get("ELEVENLABS_API_KEY") or ""
         self._model = config.get("model") or DEFAULT_MODEL
+        # Runtime safety net for already-stored bad data: a tenant row written
+        # before the PATCH-merge fix (src/api/tenants.py's _merge_layer_fields)
+        # can still carry a stale model from a PREVIOUS provider (e.g. Sarvam's
+        # "bulbul:v3") after switching `provider` to elevenlabs -- every real
+        # ElevenLabs model id starts with "eleven_" (see the module docstring's
+        # Recommended models), so anything else is provably not one, not a
+        # false positive on some valid-but-uncatalogued id.
+        if not self._model.startswith("eleven_"):
+            log.warning("elevenlabs tts: configured model %r doesn't look like an "
+                        "ElevenLabs model id (expected an eleven_* id) -- falling "
+                        "back to the adapter default", self._model)
+            self._model = DEFAULT_MODEL
         self._default_voice_id = config.get("voice_id") or DEFAULT_VOICE_ID
         self._timeout = float(config.get("timeout", _DEFAULT_TIMEOUT_S))
         # Built once per adapter instance (one per tenant/layer, see

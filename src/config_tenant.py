@@ -847,6 +847,39 @@ def load_all_tenants(tenant_dir: Optional[Path] = None) -> dict[str, TenantSetti
 # --- Merge with global defaults ----------------------------------------
 
 
+# Fields that only make sense for the SPECIFIC provider that set them — a
+# model id, voice id, or voice-cloning knob from one provider's config block
+# sent verbatim to a different provider's adapter is either meaningless or a
+# hard error (e.g. a Sarvam `model: bulbul:v3` handed to
+# ElevenLabsTTSAdapter as `model_id` -> ElevenLabs 4xx). Keyed by the
+# tenant-layer model's class name (`type(tenant_layer).__name__`) rather than
+# a "layer" string so this stays correct regardless of which dict key the
+# caller merges under (registry.py's `_config_for` derives the layer name
+# from `pipeline.<layer>`, but chat/call TTS merge a `TenantTTSConfig`
+# straight against `global_defaults["tts"]` under the layer name "tts" too —
+# same model class either way). Everything NOT listed here is treated as
+# provider-agnostic and keeps inheriting from the platform default on a
+# provider switch: language/sample_rate/confidence_threshold/temperature/
+# max_tokens/response_format/speed/timeout-shaped fields apply the same way
+# regardless of which provider is running.
+_PROVIDER_SPECIFIC_FIELDS: dict[str, frozenset[str]] = {
+    "TenantSTTConfig": frozenset({"model"}),
+    "TenantStreamingSTTConfig": frozenset({"model"}),
+    "TenantLLMConfig": frozenset({"model"}),
+    "TenantTTSConfig": frozenset({
+        "model", "voice_id",
+        # Cloned-voice tuning knobs -- documented on TenantTTSConfig above as
+        # "ElevenLabs-specific ... every other provider adapter simply
+        # ignores them". Harmless today (no other provider reads them and
+        # config/default.yaml never sets them) but dropping them on a
+        # provider switch matches the documented ownership rather than
+        # relying on every future adapter to keep ignoring unknown keys.
+        "stability", "similarity_boost", "style", "use_speaker_boost",
+    }),
+    "TenantRealtimeConfig": frozenset({"model", "voice", "allowed_voices"}),
+}
+
+
 def merge_provider_config(
     tenant_layer: BaseModel,
     global_layer: dict[str, Any],
@@ -856,10 +889,32 @@ def merge_provider_config(
 
     Only non-None tenant fields override globals — that's the "partial
     override" semantics promised in the plan.
+
+    Cross-provider inheritance guard: when the tenant layer names a
+    ``provider`` that differs (case-insensitively) from ``global_layer``'s
+    own ``provider``, the platform default's provider-SPECIFIC fields (see
+    ``_PROVIDER_SPECIFIC_FIELDS``) are dropped from the merge before the
+    tenant's own fields are overlaid -- a tenant that switches provider but
+    doesn't set its own ``model``/``voice_id``/etc. must fall through to
+    that NEW provider's adapter-level default, never to the OLD (platform
+    default) provider's value. When the tenant sets no provider, or the same
+    provider as the default, nothing changes here -- ordinary inheritance.
     """
     out = dict(global_layer)
     overridden: list[str] = []
     discarded_env_refs: list[str] = []
+    dropped_provider_specific: list[str] = []
+    tenant_provider = getattr(tenant_layer, "provider", None)
+    default_provider = global_layer.get("provider")
+    if (
+        tenant_provider and default_provider
+        and str(tenant_provider).strip().lower() != str(default_provider).strip().lower()
+    ):
+        specific_fields = _PROVIDER_SPECIFIC_FIELDS.get(type(tenant_layer).__name__, frozenset())
+        for field_name in specific_fields:
+            if field_name in out:
+                del out[field_name]
+                dropped_provider_specific.append(field_name)
     for k, v in tenant_layer.model_dump().items():
         if k.endswith("_env"):
             # *_env fields are credential REFERENCES (an env var name), not
@@ -899,6 +954,7 @@ def merge_provider_config(
             tenant_overridden_values={k: out[k] for k in overridden},
             platform_default_fields=[k for k in out if k not in overridden and k != "api_key"],
             discarded_env_ref_fields=discarded_env_refs,
+            dropped_provider_specific_fields=dropped_provider_specific,
             api_key_set=api_key is not None,
         )
     return out

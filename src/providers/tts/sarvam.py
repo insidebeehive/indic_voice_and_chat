@@ -121,6 +121,15 @@ LANGUAGE_VOICES: dict[str, list[dict]] = {
 class SarvamTTSAdapter(ITTSProvider):
     def __init__(self, config: dict[str, Any]) -> None:
         self._model = config.get("model") or DEFAULT_MODEL
+        # Symmetric safety net to ElevenLabsTTSAdapter's: a tenant row written
+        # before the PATCH-merge fix can carry a stale model from a PREVIOUS
+        # TTS provider (e.g. ElevenLabs' "eleven_flash_v2_5") after switching
+        # `provider` back to sarvam. Every Sarvam TTS model is "bulbul:vN".
+        if not self._model.startswith("bulbul"):
+            log.warning("sarvam tts: configured model %r doesn't look like a "
+                        "Sarvam TTS model id (expected a bulbul* id) -- falling "
+                        "back to the adapter default", self._model)
+            self._model = DEFAULT_MODEL
         self._api_key = config.get("api_key") or os.environ.get("SARVAM_API_KEY")
         self._base_url = config.get("base_url", SARVAM_BASE_URL)
         self._timeout = config.get("timeout", _DEFAULT_TIMEOUT_S)

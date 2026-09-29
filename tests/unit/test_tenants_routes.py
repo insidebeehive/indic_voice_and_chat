@@ -689,18 +689,44 @@ async def test_list_tenants_partial_layer_override_merges_per_field(ctx) -> None
     layer, so this must resolve to the tenant's provider but the platform's
     model, with each field's source reported independently. A whole-layer
     merge (picking the tenant's dict wholesale whenever ANY field is set)
-    would instead return model=None here and fail the second assertion."""
+    would instead return model=None here and fail the second assertion.
+
+    Same provider as the platform default (gemini) so the cross-provider
+    inheritance guard (Fix 1, config_tenant.merge_provider_config) does not
+    apply here — see the next test for the mismatched-provider case, where
+    per-field merging must NOT reach across providers for `model`."""
     client, _, _ = ctx
     body = _body(slug="partial-override", mode="layered",
-                 llm={"provider": "groq"})   # model deliberately omitted
+                 llm={"provider": "gemini"})   # model deliberately omitted
     await client.post("/tenants", json=body, headers=ADMIN_HEADERS)
     resp = await client.get("/tenants", headers=ADMIN_HEADERS)
     t = next(x for x in resp.json()["tenants"] if x["slug"] == "partial-override")
 
-    assert t["llm"]["effective_provider"] == "groq"
+    assert t["llm"]["effective_provider"] == "gemini"
     assert t["llm"]["provider_source"] == "tenant"
     assert t["llm"]["effective_model"] == "gemini-3.5-flash"   # inherited
     assert t["llm"]["model_source"] == "platform_default"
+
+
+async def test_list_tenants_cross_provider_override_does_not_leak_default_model(ctx) -> None:
+    """Fix 1: a tenant that switches provider (groq, vs. the platform
+    default's gemini) and leaves `model` unset must NOT show the platform
+    default's `model` as inherited -- gemini-3.5-flash is meaningless (and
+    for TTS, actively rejected) as a different provider's model id. This is
+    the backoffice-visible half of the same production incident described in
+    config_tenant.merge_provider_config's docstring (there for TTS:
+    elevenlabs inheriting Sarvam's bulbul:v3)."""
+    client, _, _ = ctx
+    body = _body(slug="cross-provider", mode="layered",
+                 llm={"provider": "groq"})   # model deliberately omitted, different provider
+    await client.post("/tenants", json=body, headers=ADMIN_HEADERS)
+    resp = await client.get("/tenants", headers=ADMIN_HEADERS)
+    t = next(x for x in resp.json()["tenants"] if x["slug"] == "cross-provider")
+
+    assert t["llm"]["effective_provider"] == "groq"
+    assert t["llm"]["provider_source"] == "tenant"
+    assert t["llm"]["effective_model"] is None       # NOT the platform default's gemini model
+    assert t["llm"]["model_source"] == "unset"
 
 
 async def test_list_tenants_realtime_unset_for_layered_tenant_is_not_platform_default(ctx) -> None:
@@ -1919,10 +1945,17 @@ async def ctx_with_providers(monkeypatch):
 
 
 async def test_pipeline_update_tts_provider_partial_override_pins_rest(ctx) -> None:
-    """Changing pipeline.tts.provider alone must leave mode and every other
-    layer (stt/llm/tts's own model+voice_id/telephony) untouched — the same
-    partial-override guarantee TelephonyUpdateIn already gives, extended to
-    the pipeline block."""
+    """Changing pipeline.tts.provider alone must leave mode and every OTHER
+    layer (llm/stt/telephony) untouched — the same partial-override guarantee
+    TelephonyUpdateIn already gives, extended to the pipeline block.
+
+    Within the tts layer itself, this is the exact production incident
+    (Round 2 fix, _merge_layer_fields in src/api/tenants.py): the tenant was
+    registered sarvam/bulbul:v3/anushka; switching `provider` to elevenlabs
+    with the model/voice picker left on "unchanged" must NOT keep serving
+    Sarvam's stale `model`/`voice_id` to the new ElevenLabs adapter -- both
+    are provider-specific and get cleared, while `language` (generic) is
+    still pinned/untouched like every other layer."""
     client, resolver, _ = ctx
     tid = (await client.post(
         "/tenants", json=_body(slug="acme", mode="layered"), headers=ADMIN_HEADERS)).json()["tenant_id"]
@@ -1935,7 +1968,7 @@ async def test_pipeline_update_tts_provider_partial_override_pins_rest(ctx) -> N
     body = resp.json()
     assert body["pipeline_mode"] == "layered"
     assert body["tts_provider"] == "elevenlabs"
-    assert body["tts_model"] == "bulbul:v3"          # untouched
+    assert body["tts_model"] is None                 # cleared -- was Sarvam's bulbul:v3
     assert body["llm_provider"] == "gemini"          # untouched
     assert body["stt_provider"] == "groq"            # untouched
     assert body["telephony_provider"] == "twilio"    # untouched
@@ -1944,12 +1977,114 @@ async def test_pipeline_update_tts_provider_partial_override_pins_rest(ctx) -> N
     p = ctx2.settings.pipeline
     assert p.mode == "layered"
     assert p.tts.provider == "elevenlabs"
-    assert p.tts.model == "bulbul:v3"
-    assert p.tts.voice_id == "anushka"
-    assert p.tts.language == "hi-IN"
+    assert p.tts.model is None                       # cleared, not the stale bulbul:v3
+    assert p.tts.voice_id is None                     # cleared, not the stale sarvam "anushka"
+    assert p.tts.language == "hi-IN"                  # generic field: still pinned/untouched
     assert p.llm.provider == "gemini" and p.llm.model == "gemini-2.5-flash-lite"
     assert p.stt.provider == "groq" and p.stt.model == "whisper-large-v3"
     assert p.telephony.provider == "twilio"
+
+
+async def test_pipeline_update_tts_provider_switch_with_explicit_model_keeps_it(ctx) -> None:
+    """The other half: a PATCH that switches provider AND states its own
+    model/voice_id for the new provider must keep exactly what it set --
+    the cross-provider clear only drops fields the PATCH left unstated."""
+    client, resolver, _ = ctx
+    tid = (await client.post(
+        "/tenants", json=_body(slug="acme", mode="layered"), headers=ADMIN_HEADERS)).json()["tenant_id"]
+
+    resp = await client.patch(
+        f"/tenants/{tid}",
+        json={"pipeline": {"tts": {
+            "provider": "elevenlabs", "model": "eleven_multilingual_v2",
+            "voice_id": "21m00Tcm4TlvDq8ikWAM",
+        }}},
+        headers=ADMIN_HEADERS)
+    assert resp.status_code == 200, resp.text
+
+    ctx2 = await resolver.resolve_by_slug("acme")
+    p = ctx2.settings.pipeline
+    assert p.tts.provider == "elevenlabs"
+    assert p.tts.model == "eleven_multilingual_v2"
+    assert p.tts.voice_id == "21m00Tcm4TlvDq8ikWAM"
+
+
+async def test_pipeline_update_tts_same_provider_keeps_stored_model(ctx) -> None:
+    """A same-provider PATCH (e.g. tweaking language only) must NOT trigger
+    the cross-provider clear -- the stored model/voice_id survive untouched,
+    same as before this fix for the matching-provider case."""
+    client, resolver, _ = ctx
+    tid = (await client.post(
+        "/tenants", json=_body(slug="acme", mode="layered"), headers=ADMIN_HEADERS)).json()["tenant_id"]
+
+    resp = await client.patch(
+        f"/tenants/{tid}",
+        json={"pipeline": {"tts": {"provider": "sarvam", "language": "ta-IN"}}},
+        headers=ADMIN_HEADERS)
+    assert resp.status_code == 200, resp.text
+
+    ctx2 = await resolver.resolve_by_slug("acme")
+    p = ctx2.settings.pipeline
+    assert p.tts.provider == "sarvam"
+    assert p.tts.model == "bulbul:v3"
+    assert p.tts.voice_id == "anushka"
+    assert p.tts.language == "ta-IN"
+
+
+async def test_pipeline_update_chat_voice_tts_provider_switch_clears_stale_model(ctx) -> None:
+    """Same cross-provider clear for pipeline.chat_voice.tts -- the chat
+    voice-note reply TTS block goes through the same _merge_layer_fields
+    call (src/api/tenants.py) as the call-cascade tts block above."""
+    client, resolver, _ = ctx
+    tid = (await client.post(
+        "/tenants", json=_body(slug="acme", mode="layered"), headers=ADMIN_HEADERS)).json()["tenant_id"]
+
+    patch1 = await client.patch(
+        f"/tenants/{tid}",
+        json={"pipeline": {"chat_voice": {
+            "enabled": True,
+            "tts": {"provider": "sarvam", "model": "bulbul:v3", "voice_id": "meera"},
+        }}},
+        headers=ADMIN_HEADERS)
+    assert patch1.status_code == 200, patch1.text
+
+    patch2 = await client.patch(
+        f"/tenants/{tid}",
+        json={"pipeline": {"chat_voice": {"tts": {"provider": "elevenlabs"}}}},
+        headers=ADMIN_HEADERS)
+    assert patch2.status_code == 200, patch2.text
+
+    ctx2 = await resolver.resolve_by_slug("acme")
+    cv = ctx2.settings.pipeline.chat_voice
+    assert cv.tts.provider == "elevenlabs"
+    assert cv.tts.model is None
+    assert cv.tts.voice_id is None
+
+
+async def test_pipeline_update_llm_and_stt_provider_switch_clears_stale_model(ctx) -> None:
+    """The same _merge_layer_fields cross-provider clear generalizes to llm
+    and stt (both registered with an explicit model, per _body's defaults:
+    gemini/gemini-2.5-flash-lite, groq/whisper-large-v3) -- provider-only
+    switches on either must drop the stale model from the OLD provider."""
+    client, resolver, _ = ctx
+    tid = (await client.post(
+        "/tenants", json=_body(slug="acme", mode="layered"), headers=ADMIN_HEADERS)).json()["tenant_id"]
+
+    resp = await client.patch(
+        f"/tenants/{tid}",
+        json={"pipeline": {
+            "llm": {"provider": "groq"},
+            "stt": {"provider": "sarvam"},
+        }},
+        headers=ADMIN_HEADERS)
+    assert resp.status_code == 200, resp.text
+
+    ctx2 = await resolver.resolve_by_slug("acme")
+    p = ctx2.settings.pipeline
+    assert p.llm.provider == "groq"
+    assert p.llm.model is None            # cleared, not gemini's stale gemini-2.5-flash-lite
+    assert p.stt.provider == "sarvam"
+    assert p.stt.model is None            # cleared, not groq's stale whisper-large-v3
 
 
 async def test_pipeline_switch_to_s2s_without_realtime_rejected(ctx) -> None:

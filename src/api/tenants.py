@@ -45,6 +45,17 @@ from src.config_tenant import (
     resolve_chat_tts_config,
     validate_credentials,
 )
+# Single-sourced with merge_provider_config's own cross-provider guard
+# (config_tenant.py): which fields are specific to ONE provider and must not
+# survive a PATCH that switches `provider` without re-stating them. Reused
+# here for the OTHER half of the same leak -- merge_provider_config guards
+# the platform-default overlay, but the tenant's own STORED layer (this
+# module's PATCH-merge, _merge_layer_fields below) is where the real
+# production incident actually lived: a stale `model`/`voice_id` from the
+# tenant's previous provider, written by an earlier PATCH, survives a
+# provider-only PATCH indefinitely and gets handed straight to the new
+# provider's adapter.
+from src.config_tenant import _PROVIDER_SPECIFIC_FIELDS
 from src.config_tenant import TenantLLMConfig as _LLM
 from src.dialogue.campaign_loader import parse_campaign_yaml
 from src.models.campaign import Campaign
@@ -541,12 +552,26 @@ _TTS_UPDATE_FIELDS = (
 )
 
 
-def _merge_layer_fields(cfg: dict, upd: "LayerUpdateIn", fields: tuple[str, ...]) -> dict:
+def _merge_layer_fields(
+    cfg: dict, upd: "LayerUpdateIn", fields: tuple[str, ...],
+    provider_specific: frozenset[str] = frozenset(),
+) -> dict:
     """Partial-override merge for one pipeline layer (stt/llm/tts/chat_voice.tts):
     only the fields the admin actually set overwrite the stored value, so an
     admin changing just ``tts.provider`` does not wipe ``tts.voice_id`` —
     same shape as the telephony block's merge below, just for a single dict
-    instead of TelephonyUpdateIn's flatter set of fields."""
+    instead of TelephonyUpdateIn's flatter set of fields.
+
+    ``provider_specific`` (from ``config_tenant._PROVIDER_SPECIFIC_FIELDS``,
+    keyed by the matching ``TenantXConfig`` class) is the cross-provider leak
+    this merge must NOT reproduce: a PATCH that changes ``provider`` to a
+    DIFFERENT one (case/whitespace-insensitive) and does not itself re-state
+    a provider-specific field (``model``/``voice_id``/the ElevenLabs tuning
+    knobs) clears that field from the stored layer instead of leaving it —
+    e.g. sarvam's ``model: bulbul:v3`` stale in a tenant's TTS block after an
+    admin flips ``provider`` to ``elevenlabs`` with the model picker left on
+    "unchanged". A same-provider PATCH, or one that re-states the field
+    itself, is unaffected."""
     out = dict(cfg)
     ignored: list[str] = []
     for f in ("provider", "model", "language", "voice_id", "speed",
@@ -569,6 +594,29 @@ def _merge_layer_fields(cfg: dict, upd: "LayerUpdateIn", fields: tuple[str, ...]
             log, "tenants pipeline_layer_update field_discarded",
             fields_not_applicable_to_layer=ignored, layer_fields=list(fields),
         )
+    new_provider = getattr(upd, "provider", None)
+    old_provider = cfg.get("provider")   # pre-merge, from the ORIGINAL stored cfg
+    if (
+        new_provider and old_provider
+        and str(new_provider).strip().lower() != str(old_provider).strip().lower()
+    ):
+        cleared: list[str] = []
+        for field_name in provider_specific:
+            # Only clear a field this layer actually stores (`fields`) and
+            # that THIS PATCH did not itself set -- a PATCH that switches
+            # provider AND states its own model keeps that model.
+            if (
+                field_name in fields
+                and getattr(upd, field_name, None) is None
+                and field_name in out
+            ):
+                del out[field_name]
+                cleared.append(field_name)
+        if cleared:
+            debug_event(
+                log, "tenants pipeline_layer_update provider_specific_field_cleared",
+                cleared_fields=cleared, old_provider=old_provider, new_provider=new_provider,
+            )
     return out
 
 
@@ -860,17 +908,48 @@ async def update_tenant(
         if pl.mode is not None:
             pc["mode"] = pl.mode
         if pl.stt is not None:
-            pc["stt"] = _merge_layer_fields(pc.get("stt") or {}, pl.stt, _STT_UPDATE_FIELDS)
+            pc["stt"] = _merge_layer_fields(
+                pc.get("stt") or {}, pl.stt, _STT_UPDATE_FIELDS,
+                provider_specific=_PROVIDER_SPECIFIC_FIELDS["TenantSTTConfig"])
         if pl.llm is not None:
-            pc["llm"] = _merge_layer_fields(pc.get("llm") or {}, pl.llm, _LLM_UPDATE_FIELDS)
+            pc["llm"] = _merge_layer_fields(
+                pc.get("llm") or {}, pl.llm, _LLM_UPDATE_FIELDS,
+                provider_specific=_PROVIDER_SPECIFIC_FIELDS["TenantLLMConfig"])
         if pl.tts is not None:
-            pc["tts"] = _merge_layer_fields(pc.get("tts") or {}, pl.tts, _TTS_UPDATE_FIELDS)
+            pc["tts"] = _merge_layer_fields(
+                pc.get("tts") or {}, pl.tts, _TTS_UPDATE_FIELDS,
+                provider_specific=_PROVIDER_SPECIFIC_FIELDS["TenantTTSConfig"])
         if pl.realtime is not None:
             realtime_cfg = dict(pc.get("realtime") or {})
+            old_realtime_provider = (pc.get("realtime") or {}).get("provider")
             for f in ("provider", "model", "voice", "language_code"):
                 v = getattr(pl.realtime, f)
                 if v is not None:
                     realtime_cfg[f] = v
+            new_realtime_provider = pl.realtime.provider
+            if (
+                new_realtime_provider and old_realtime_provider
+                and str(new_realtime_provider).strip().lower()
+                != str(old_realtime_provider).strip().lower()
+            ):
+                # Same cross-provider clear as _merge_layer_fields, inlined
+                # here since the realtime block is a plain dict merge, not a
+                # _merge_layer_fields call (RealtimeUpdateIn has no voice_id/
+                # speed/tuning fields, so it never routed through that path).
+                cleared = []
+                for field_name in _PROVIDER_SPECIFIC_FIELDS["TenantRealtimeConfig"]:
+                    if (
+                        getattr(pl.realtime, field_name, None) is None
+                        and field_name in realtime_cfg
+                    ):
+                        del realtime_cfg[field_name]
+                        cleared.append(field_name)
+                if cleared:
+                    debug_event(
+                        log, "tenants pipeline_layer_update provider_specific_field_cleared",
+                        layer="realtime", cleared_fields=cleared,
+                        old_provider=old_realtime_provider, new_provider=new_realtime_provider,
+                    )
             pc["realtime"] = realtime_cfg
         if pl.chat_voice is not None:
             cv_cfg = dict(pc.get("chat_voice") or {})
@@ -878,7 +957,8 @@ async def update_tenant(
                 cv_cfg["enabled"] = pl.chat_voice.enabled
             if pl.chat_voice.tts is not None:
                 cv_cfg["tts"] = _merge_layer_fields(
-                    cv_cfg.get("tts") or {}, pl.chat_voice.tts, _TTS_UPDATE_FIELDS)
+                    cv_cfg.get("tts") or {}, pl.chat_voice.tts, _TTS_UPDATE_FIELDS,
+                    provider_specific=_PROVIDER_SPECIFIC_FIELDS["TenantTTSConfig"])
             pc["chat_voice"] = cv_cfg
 
         # Validate the RESULT, not the request: build the TenantSettings this

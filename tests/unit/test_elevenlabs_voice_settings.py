@@ -108,3 +108,25 @@ def test_build_voice_settings_ignores_none_values() -> None:
     settings = el._build_voice_settings({"stability": None, "similarity_boost": None,
                                           "style": None, "use_speaker_boost": None})
     assert settings == {"stability": 0.5, "similarity_boost": 0.75}
+
+
+def test_falls_back_to_default_model_for_foreign_model_id(caplog) -> None:
+    """Runtime safety net for a tenant row written before the PATCH-merge fix
+    (src/api/tenants.py's _merge_layer_fields): a stored `model` left over
+    from a PREVIOUS provider (Sarvam's "bulbul:v3") must not reach the
+    ElevenLabs API verbatim -- it warns (model name only) and falls back to
+    DEFAULT_MODEL. This is the exact production incident (ElevenLabs
+    rejecting a Sarvam model_id with a 4xx) surfacing as a WARNING instead."""
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger="src.providers.tts.elevenlabs"):
+        adapter = el.ElevenLabsTTSAdapter({"api_key": "k", "model": "bulbul:v3"})
+    assert adapter._model == el.DEFAULT_MODEL
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "bulbul:v3" in warnings[0].getMessage()
+
+
+def test_keeps_a_real_eleven_model() -> None:
+    adapter = el.ElevenLabsTTSAdapter({"api_key": "k", "model": "eleven_turbo_v2_5"})
+    assert adapter._model == "eleven_turbo_v2_5"

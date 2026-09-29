@@ -194,10 +194,14 @@ def test_platform_webhook_base_url_reads_settings(monkeypatch) -> None:
 
 
 def test_merge_provider_config_overrides_only_set_fields() -> None:
+    """Same provider as the default (sarvam == sarvam) -- the cross-provider
+    inheritance guard (Fix 1) does not apply, so `model` still falls through
+    unchanged. See test_merge_provider_config_drops_default_model_and_voice_on_tts_provider_switch
+    below for the mismatched-provider case."""
     from src.config_tenant import TenantSTTConfig
 
     tenant = TenantSTTConfig(provider="sarvam", api_key_env="X")
-    global_layer = {"provider": "default", "language": "hi-IN", "model": "saaras:v2"}
+    global_layer = {"provider": "sarvam", "language": "hi-IN", "model": "saaras:v2"}
     merged = merge_provider_config(tenant, global_layer, api_key="resolved-key")
     assert merged["provider"] == "sarvam"
     assert merged["language"] == "hi-IN"
@@ -760,7 +764,95 @@ def test_merge_provider_config_carries_voice_tuning_fields_when_set() -> None:
     assert "similarity_boost" not in merged
     assert "style" not in merged
     assert merged["provider"] == "elevenlabs"          # tenant override won
-    assert merged["voice_id"] == "meera"                # platform default fell through
+    # Cross-provider inheritance guard (Fix 1): the platform default's
+    # Sarvam voice_id must NOT leak into an ElevenLabs tenant's config —
+    # sending a Sarvam speaker id to ElevenLabs as voice_id is meaningless
+    # at best and a 4xx at worst. The adapter's own default voice applies.
+    assert "voice_id" not in merged
+
+
+def test_merge_provider_config_drops_default_model_and_voice_on_tts_provider_switch() -> None:
+    """Unit-level pin on merge_provider_config's cross-provider guard itself,
+    with a hand-built `global_layer` that includes a `model` key.
+
+    NOT a reproduction of the production incident: production's actual
+    `global_defaults["tts"]` (src/main.py, built from
+    `settings.pipeline.tts.model_dump()`) never carries a `model` key at all
+    -- `src.config.TTSConfig` (the PLATFORM-level pipeline config, distinct
+    from this module's `TenantTTSConfig`) declares no `model` field, so
+    config/default.yaml's `pipeline.tts.model: bulbul:v3` is silently dropped
+    by pydantic before it ever reaches this function as a real caller. The
+    real incident's leak source is a TENANT's own stored, PATCH-merged TTS
+    block keeping a stale `model`/`voice_id` from before a provider switch
+    (`_merge_layer_fields`, src/api/tenants.py) -- that overlay input has its
+    own guard and its own tests (test_tenants_routes.py).
+
+    This test still matters: it's the only place pinning that
+    merge_provider_config's OWN guard works correctly should any caller ever
+    pass a `model`-bearing global_layer (a future platform-level TTS model
+    default, or a synthetic config in another test)."""
+    tenant = TenantTTSConfig(provider="elevenlabs")
+    global_layer = {"provider": "sarvam", "model": "bulbul:v3", "language": "hi-IN",
+                     "voice_id": None, "speed": 1.0}
+    merged = merge_provider_config(tenant, global_layer)
+    assert merged["provider"] == "elevenlabs"
+    assert "model" not in merged
+    assert "voice_id" not in merged
+    # Generic fields still inherit across the provider switch.
+    assert merged["language"] == "hi-IN"
+    assert merged["speed"] == 1.0
+
+
+def test_merge_provider_config_same_provider_still_inherits_model() -> None:
+    """No provider switch (tenant names the SAME provider as the default,
+    case-insensitively) -> unchanged behaviour, the default model still
+    falls through."""
+    tenant = TenantTTSConfig(provider="Sarvam")
+    global_layer = {"provider": "sarvam", "model": "bulbul:v3", "voice_id": "meera"}
+    merged = merge_provider_config(tenant, global_layer)
+    assert merged["model"] == "bulbul:v3"
+    assert merged["voice_id"] == "meera"
+
+
+def test_merge_provider_config_no_tenant_provider_still_inherits() -> None:
+    """Tenant sets no provider at all -> ordinary full inheritance, same as
+    before this fix (there's no "switch" to detect)."""
+    from src.config_tenant import TenantSTTConfig
+
+    tenant = TenantSTTConfig()
+    global_layer = {"provider": "sarvam", "model": "saaras:v3", "language": "hi-IN"}
+    merged = merge_provider_config(tenant, global_layer)
+    assert merged["provider"] == "sarvam"
+    assert merged["model"] == "saaras:v3"
+    assert merged["language"] == "hi-IN"
+
+
+def test_merge_provider_config_llm_provider_switch_drops_default_model() -> None:
+    from src.config_tenant import TenantLLMConfig
+
+    tenant = TenantLLMConfig(provider="groq")
+    global_layer = {"provider": "gemini", "model": "gemini-3.5-flash",
+                     "temperature": 0.7, "max_tokens": 512, "response_format": "json"}
+    merged = merge_provider_config(tenant, global_layer)
+    assert merged["provider"] == "groq"
+    assert "model" not in merged
+    # Generic sampling/format params still inherit.
+    assert merged["temperature"] == 0.7
+    assert merged["max_tokens"] == 512
+    assert merged["response_format"] == "json"
+
+
+def test_merge_provider_config_stt_provider_switch_drops_default_model_keeps_generic() -> None:
+    from src.config_tenant import TenantSTTConfig
+
+    tenant = TenantSTTConfig(provider="deepgram")
+    global_layer = {"provider": "sarvam", "model": "saaras:v3", "language": "hi-IN",
+                     "confidence_threshold": 0.6}
+    merged = merge_provider_config(tenant, global_layer)
+    assert merged["provider"] == "deepgram"
+    assert "model" not in merged
+    assert merged["language"] == "hi-IN"
+    assert merged["confidence_threshold"] == 0.6
 
 
 def test_merge_provider_config_omits_unset_voice_tuning_fields() -> None:

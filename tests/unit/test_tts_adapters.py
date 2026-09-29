@@ -193,6 +193,29 @@ def test_default_model_and_speaker_are_v3_valid() -> None:
     assert DEFAULT_SPEAKER in {v["voice_id"] for v in _BULBUL_V3_SPEAKERS}
 
 
+def test_sarvam_falls_back_to_default_model_for_foreign_model_id(caplog) -> None:
+    """Runtime safety net for a tenant row written before the PATCH-merge fix
+    (src/api/tenants.py's _merge_layer_fields): a stored `model` left over
+    from a PREVIOUS provider (e.g. ElevenLabs' "eleven_flash_v2_5") must not
+    reach the Sarvam API verbatim -- it warns (model name only) and falls
+    back to the adapter's own default."""
+    import logging
+
+    from src.providers.tts.sarvam import DEFAULT_MODEL
+
+    with caplog.at_level(logging.WARNING, logger="src.providers.tts.sarvam"):
+        adapter = SarvamTTSAdapter({"api_key": "k", "model": "eleven_flash_v2_5"})
+    assert adapter._model == DEFAULT_MODEL
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "eleven_flash_v2_5" in warnings[0].getMessage()
+
+
+def test_sarvam_keeps_a_real_bulbul_model() -> None:
+    adapter = SarvamTTSAdapter({"api_key": "k", "model": "bulbul:v2"})
+    assert adapter._model == "bulbul:v2"
+
+
 @pytest.mark.asyncio
 async def test_constructor_requires_api_key(monkeypatch) -> None:
     monkeypatch.delenv("SARVAM_API_KEY", raising=False)
