@@ -131,3 +131,24 @@ llm_token_rates:
     # roughly in line with published mid-tier (sonnet-class) per-token
     # pricing.
     "": {input_per_1k: 0.003, output_per_1k: 0.015}
+
+# KB embeddings (GeminiEmbedder, src/rag/embeddings.py) are billed per INPUT token, but
+# the Gemini Developer API's embed_content response carries no token count (token_count /
+# billable_character_count are Vertex-only fields), so billed tokens are ESTIMATED from
+# input characters (src/api/chat_cost.py's _EMBED_CHARS_PER_TOKEN). Seeded onto the
+# (kind="embedding", provider, model) provider_costs row's cost_per_1k_input_tokens by
+# seed_provider_costs. Units: USD per 1,000 input tokens.
+embedding_token_rates:
+  gemini:
+    # ROUGH placeholder, not a quoted price -- $0.15 / 1M input tokens is
+    # gemini-embedding-001's paid-tier rate as last known, not re-confirmed against the
+    # live Gemini pricing page for this entry, and the token count it multiplies is
+    # itself a chars/4 estimate (see above). Replace with the verified rate by editing
+    # this YAML, not via PUT /api/v1/providers -- seed_provider_costs (src/auth/seed.py)
+    # re-upserts embedding_token_rates from this file on every boot, so a rate changed
+    # only through the API is silently reverted at the next restart.
+    gemini-embedding-001: {input_per_1k: 0.00015}
+    # Provider-level fallback (model="") so swapping the embedding model doesn't
+    # silently zero out embedding cost; mirrors gemini-embedding-001 until the new
+    # model gets its own row.
+    "": {input_per_1k: 0.00015}

@@ -196,21 +196,27 @@ async def patch_telephony_outbound_from(sessionmaker) -> None:
 
 async def seed_provider_costs(sessionmaker, path: Path = _PROVIDER_COSTS_YAML) -> int:
     """Insert any provider_costs rows from the YAML that don't exist yet, and
-    upsert the per-token LLM rates (``llm_token_rates``) onto their matching row.
+    upsert the per-token LLM rates (``llm_token_rates``) and per-token KB
+    embedding rates (``embedding_token_rates``) onto their matching rows.
 
     The per-minute rows (e.g. rates an admin updated via the API) are left
     untouched — we only add missing (kind, provider, model) rows. The
-    per-token rates are always upserted from YAML (a separate, smaller rate
-    catalog with no admin-edit history to protect yet — see
-    ``PUT /api/v1/providers`` for the live-editable path going forward).
-    Returns the number of NEW rows inserted (per-minute + per-token combined).
+    per-token rates (LLM and embedding alike) are always upserted from YAML
+    (separate, smaller rate catalogs with no admin-edit history to protect
+    yet — see ``PUT /api/v1/providers`` for the live-editable path going
+    forward). Returns the number of NEW rows inserted (per-minute + per-token
+    LLM + per-token embedding, combined).
     """
     if not path.exists():
         return 0
     data = yaml.safe_load(path.read_text()) or {}
-    # Not a `kind`, so it's excluded from the per-minute loop below and
-    # handled by its own pass.
+    # Neither is a `kind`, so both are excluded from the per-minute loop
+    # below and handled by their own pass. embedding_token_rates MUST be
+    # popped here too -- without it, the per-minute loop would iterate it as
+    # if "embedding_token_rates" were itself a `kind` and crash trying to
+    # read {provider: {model: rate}} as {provider: cost}.
     token_rates = data.pop("llm_token_rates", None) or {}
+    embedding_rates = data.pop("embedding_token_rates", None) or {}
     inserted = 0
     async with sessionmaker() as session:
         for kind, providers in data.items():
@@ -260,6 +266,20 @@ async def seed_provider_costs(sessionmaker, path: Path = _PROVIDER_COSTS_YAML) -
                     # to "unconfigured" every restart.
                     if cached_rate is not None:
                         row.cost_per_1k_cached_tokens = cached_rate
+
+        for provider, models in embedding_rates.items():
+            for model, rates in (models or {}).items():
+                in_rate = float((rates or {}).get("input_per_1k", 0.0))
+                row = await session.get(ProviderCost, ("embedding", provider, model))
+                if row is None:
+                    session.add(ProviderCost(
+                        kind="embedding", provider=provider, model=model,
+                        cost_per_min=0.0,
+                        cost_per_1k_input_tokens=in_rate,
+                        cost_per_1k_output_tokens=0.0))
+                    inserted += 1
+                else:
+                    row.cost_per_1k_input_tokens = in_rate
 
         await session.commit()
     if inserted:

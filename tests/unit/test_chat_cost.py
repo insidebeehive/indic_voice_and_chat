@@ -6,6 +6,7 @@ import logging
 
 import pytest
 import pytest_asyncio
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from src.api import chat_cost
@@ -13,7 +14,10 @@ from src.api.chat_cost import (
     compute_chat_stt_cost,
     compute_chat_tts_cost,
     compute_chat_turn_cost,
+    compute_embedding_cost,
+    embedding_token_rate,
     minute_rate,
+    reset_embedding_rate_cache,
     token_rates,
 )
 from src.auth.seed import seed_provider_costs
@@ -31,10 +35,16 @@ def _reset_warned_rate_misses():
     one-warning-per-process budget, and a later test asserting the warning
     fired for that same combo would silently see zero log records — the same
     footgun test_turn_metrics_push.py's _reset_module_push_failure_warner
-    fixture exists to avoid for _PushFailureWarner."""
+    fixture exists to avoid for _PushFailureWarner.
+
+    Also resets the embedding-rate cache (``reset_embedding_rate_cache``) for
+    the same reason -- a rate cached by an earlier test against the same
+    (provider, model) key would otherwise leak into a later one."""
     chat_cost._warned_rate_misses.clear()
+    reset_embedding_rate_cache()
     yield
     chat_cost._warned_rate_misses.clear()
+    reset_embedding_rate_cache()
 
 
 @pytest_asyncio.fixture
@@ -240,6 +250,24 @@ async def test_token_rates_real_yaml_seeds_gemini_3_5_flash_cached_rate(real_see
     assert out_rate > 0.0
     assert cached_rate is not None
     assert 0.0 < cached_rate < in_rate  # a cache hit must be cheaper than a fresh token
+
+
+async def test_seed_provider_costs_real_yaml_seeds_embedding_rate_no_stray_kind(real_seeded_sm):
+    """The real config/provider_costs.yaml's embedding_token_rates block must
+    land on a (kind="embedding", provider="gemini", model="gemini-embedding-001")
+    ProviderCost row -- and, critically, must NOT create a stray row with
+    kind == "embedding_token_rates" (that would mean seed_provider_costs'
+    .pop() for this key is missing/broken, and the per-minute loop is instead
+    misreading the nested {model: {input_per_1k: ...}} dict as {model: cost})."""
+    async with real_seeded_sm() as s:
+        row = await s.get(ProviderCost, ("embedding", "gemini", "gemini-embedding-001"))
+        assert row is not None
+        assert row.cost_per_1k_input_tokens == pytest.approx(0.00015)
+
+        stray = (
+            await s.execute(select(ProviderCost).where(ProviderCost.kind == "embedding_token_rates"))
+        ).scalars().all()
+        assert stray == []
 
 
 async def test_compute_chat_turn_cost_warns_when_rate_resolves_to_zero(sm, caplog):
@@ -482,3 +510,172 @@ async def test_compute_chat_stt_cost_no_tokens_no_duration_warns_unpriced(media_
 async def test_compute_chat_stt_cost_no_provider_returns_zero(media_sm):
     async with media_sm() as s:
         assert await compute_chat_stt_cost(s, provider="", model="x", audio_ms=1000) == 0.0
+
+
+# --- KB embedding cost: embedding_token_rate / compute_embedding_cost
+# (Phase 2 of the chat-cost-widening plan) -----------------------------------
+
+
+@pytest_asyncio.fixture
+async def embedding_sm():
+    """Separate fixture (not `sm`/`media_sm` above) so kind="embedding" rows
+    don't collide with the llm/tts/stt rows those fixtures build their own
+    expectations on."""
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:", future=True)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    async with maker() as s:
+        s.add_all([
+            ProviderCost(kind="embedding", provider="gemini", model="gemini-embedding-001",
+                         cost_per_1k_input_tokens=0.00015),
+            ProviderCost(kind="embedding", provider="gemini", model="",
+                         cost_per_1k_input_tokens=0.0002),
+            # Zero-rated row -- must fall back to $0 + a "zero_rated" warning,
+            # same as the llm/tts-kind rows above.
+            ProviderCost(kind="embedding", provider="freeembed", model="model-a",
+                         cost_per_1k_input_tokens=0.0),
+        ])
+        await s.commit()
+    yield maker
+    await engine.dispose()
+
+
+async def test_embedding_token_rate_exact_row(embedding_sm):
+    async with embedding_sm() as s:
+        rate = await embedding_token_rate(s, "gemini", "gemini-embedding-001")
+    assert rate == pytest.approx(0.00015)
+
+
+async def test_embedding_token_rate_falls_back_to_provider_level(embedding_sm, caplog):
+    with caplog.at_level(logging.DEBUG, logger="src.api.chat_cost"):
+        async with embedding_sm() as s:
+            rate = await embedding_token_rate(s, "gemini", "gemini-embedding-002")
+    assert rate == pytest.approx(0.0002)
+    debug_records = [r for r in caplog.records if r.levelno == logging.DEBUG]
+    assert any(
+        "embedding_token_rate resolved" in r.getMessage() and getattr(r, "used_fallback", None) is True
+        for r in debug_records
+    )
+
+
+async def test_embedding_token_rate_unknown_provider_returns_zero_and_warns_once(embedding_sm, caplog):
+    with caplog.at_level(logging.WARNING):
+        async with embedding_sm() as s:
+            rate1 = await embedding_token_rate(s, "ghostprovider", "ghost-model")
+            rate2 = await embedding_token_rate(s, "ghostprovider", "ghost-model")
+    assert rate1 == 0.0 and rate2 == 0.0
+    assert len(caplog.records) == 1
+    assert "kind=embedding" in caplog.records[0].message
+    assert "provider=ghostprovider" in caplog.records[0].message
+
+
+async def test_embedding_token_rate_zero_rated_row_returns_zero_and_warns(embedding_sm, caplog):
+    with caplog.at_level(logging.WARNING):
+        async with embedding_sm() as s:
+            rate = await embedding_token_rate(s, "freeembed", "model-a")
+    assert rate == 0.0
+    assert any("prices" in r.message and "cost_per_1k_input_tokens" in r.message for r in caplog.records)
+
+
+async def test_embedding_token_rate_caches_within_ttl(embedding_sm):
+    """A second call within the TTL must not re-read the row -- proven by
+    mutating the row directly (bypassing the cache-populating helper) between
+    calls and asserting the second call still returns the FIRST rate."""
+    async with embedding_sm() as s:
+        rate1 = await embedding_token_rate(s, "gemini", "gemini-embedding-001")
+    assert rate1 == pytest.approx(0.00015)
+
+    async with embedding_sm() as s:
+        row = await s.get(ProviderCost, ("embedding", "gemini", "gemini-embedding-001"))
+        row.cost_per_1k_input_tokens = 0.999
+        await s.commit()
+
+    async with embedding_sm() as s:
+        rate2 = await embedding_token_rate(s, "gemini", "gemini-embedding-001")
+    assert rate2 == pytest.approx(0.00015)  # cache hit -- not the mutated 0.999
+
+
+async def test_embedding_token_rate_cache_expires_after_ttl(embedding_sm, monkeypatch):
+    fake_now = [1000.0]
+    monkeypatch.setattr(chat_cost.time, "monotonic", lambda: fake_now[0])
+
+    async with embedding_sm() as s:
+        rate1 = await embedding_token_rate(s, "gemini", "gemini-embedding-001")
+    assert rate1 == pytest.approx(0.00015)
+
+    async with embedding_sm() as s:
+        row = await s.get(ProviderCost, ("embedding", "gemini", "gemini-embedding-001"))
+        row.cost_per_1k_input_tokens = 0.999
+        await s.commit()
+
+    fake_now[0] += chat_cost._EMBEDDING_RATE_CACHE_TTL_S + 1.0
+    async with embedding_sm() as s:
+        rate2 = await embedding_token_rate(s, "gemini", "gemini-embedding-001")
+    assert rate2 == pytest.approx(0.999)  # cache expired -- fresh lookup sees the mutation
+
+
+async def test_reset_embedding_rate_cache_clears_cached_rate(embedding_sm):
+    async with embedding_sm() as s:
+        await embedding_token_rate(s, "gemini", "gemini-embedding-001")
+    assert ("gemini", "gemini-embedding-001") in chat_cost._embedding_rate_cache
+
+    reset_embedding_rate_cache()
+
+    assert chat_cost._embedding_rate_cache == {}
+
+
+async def test_compute_embedding_cost_from_chars_matches_expected_math(embedding_sm):
+    async with embedding_sm() as s:
+        # 4000 chars / 4 chars-per-token = 1000 tokens exactly.
+        cost = await compute_embedding_cost(
+            s, provider="gemini", model="gemini-embedding-001", input_chars=4000,
+        )
+    assert cost == pytest.approx(0.00015 * 1000 / 1000.0, abs=1e-9)
+
+
+async def test_compute_embedding_cost_ceils_partial_token(embedding_sm):
+    async with embedding_sm() as s:
+        # 5 chars / 4 = 1.25 -> ceil to 2 billed tokens, not 1.
+        cost = await compute_embedding_cost(
+            s, provider="gemini", model="gemini-embedding-001", input_chars=5,
+        )
+    assert cost == pytest.approx(0.00015 * 2 / 1000.0, abs=1e-9)
+
+
+async def test_compute_embedding_cost_zero_chars_returns_zero(embedding_sm):
+    async with embedding_sm() as s:
+        assert await compute_embedding_cost(
+            s, provider="gemini", model="gemini-embedding-001", input_chars=0,
+        ) == 0.0
+
+
+async def test_compute_embedding_cost_no_provider_returns_zero(embedding_sm):
+    async with embedding_sm() as s:
+        assert await compute_embedding_cost(
+            s, provider="", model="gemini-embedding-001", input_chars=4000,
+        ) == 0.0
+
+
+async def test_compute_embedding_cost_explicit_tokens_override_chars(embedding_sm):
+    async with embedding_sm() as s:
+        # If chars-based estimation were used instead, 4000/4 = 1000 tokens --
+        # a different (and larger) number than the explicit 10 passed here.
+        cost = await compute_embedding_cost(
+            s, provider="gemini", model="gemini-embedding-001", input_chars=4000, tokens=10,
+        )
+    assert cost == pytest.approx(0.00015 * 10 / 1000.0, abs=1e-9)
+
+
+async def test_compute_embedding_cost_small_batch_pins_nonzero_at_9dp(embedding_sm):
+    """A single search-query embed batch (a handful of characters) costs on
+    the order of 1e-6 USD -- this must round to a nonzero figure at the 9dp
+    this function uses, not collapse to 0.0 the way the 6dp used elsewhere in
+    this module would."""
+    async with embedding_sm() as s:
+        # 40 chars / 4 = 10 tokens -> 0.00015 * 10 / 1000 = 0.0000015
+        cost = await compute_embedding_cost(
+            s, provider="gemini", model="gemini-embedding-001", input_chars=40,
+        )
+    assert cost > 0.0
+    assert cost == pytest.approx(0.0000015, abs=1e-12)

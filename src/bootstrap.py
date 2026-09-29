@@ -75,6 +75,27 @@ from src.defaults import DEFAULT_DEMO_SCRIPT  # noqa: E402
 # --- Per-tenant runtime builders ---------------------------------------
 
 
+def _embedding_usage_recorder(*, tenant_id: Optional[str], crm_id: Optional[str], embedder):
+    """Build a ``HybridRetriever``-shaped ``record_embedding_usage`` callback
+    (``(purpose, input_chars) -> awaitable``, see ``src/rag/retriever.py``'s
+    ``EmbeddingUsageRecorder``) bound to one retriever's scope (tenant-KB or
+    CRM-KB, never both) and embedder instance.
+
+    Lazy import of ``record_embedding_usage`` mirrors ``build_crm_retriever``/
+    ``_retriever`` below's own lazy imports — keeps this module importable
+    without eagerly pulling in the DB layer.
+    """
+    from src.models.embedding_usage import record_embedding_usage
+
+    async def _record(purpose: str, input_chars: int):
+        return await record_embedding_usage(
+            tenant_id=tenant_id, crm_id=crm_id, purpose=purpose,
+            provider="gemini", model=getattr(embedder, "model_name", "") or "",
+            input_chars=input_chars,
+        )
+    return _record
+
+
 def build_crm_retriever(
     crm_id: str,
     global_defaults: dict | None = None,
@@ -119,10 +140,14 @@ def build_crm_retriever(
         log, "bootstrap crm_retriever build_result", crm_id=crm_id,
         embedding_dim=vs_cfg["embedding_dim"],
     )
+    embedder = GeminiEmbedder(dim=384)
     return HybridRetriever(
-        embedder=GeminiEmbedder(dim=384),
+        embedder=embedder,
         vector_store=vector_store,
         config=retrieval_config,
+        record_embedding_usage=_embedding_usage_recorder(
+            tenant_id=None, crm_id=crm_id, embedder=embedder,
+        ),
     )
 
 
@@ -292,10 +317,18 @@ def build_runtime_registry(providers: TenantProviders, base_session_store: Sessi
             log, "bootstrap runtime_registry tenant_retriever_built", tenant_id=tenant.id,
             embedding_dim=384,
         )
+        embedder = GeminiEmbedder(dim=384)
         return HybridRetriever(
-            embedder=GeminiEmbedder(dim=384),
+            embedder=embedder,
             vector_store=providers.get_vector_store(tenant),
-            config=retrieval_config_from_settings(get_settings().rag.retrieval))
+            config=retrieval_config_from_settings(get_settings().rag.retrieval),
+            # tenant_id set / crm_id None -- deliberately NOT
+            # tenant.settings.crm_id: a non-NULL crm_id there means "this
+            # tenant is also linked to the CRM KB tier", a SEPARATE retriever
+            # instance built by build_crm_retriever above with its own scope.
+            record_embedding_usage=_embedding_usage_recorder(
+                tenant_id=tenant.id, crm_id=None, embedder=embedder,
+            ))
 
     def _session_store(tenant: TenantContext) -> SessionStore:
         return SessionStore(redis=base_session_store.redis,

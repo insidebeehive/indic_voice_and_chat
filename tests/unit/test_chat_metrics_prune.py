@@ -8,8 +8,10 @@ that way, same as reap_stale_calls vs. _reap_stale_calls_loop).
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta
 
+import pytest
 import pytest_asyncio
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -17,6 +19,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 import src.main as main
 from src.models.chat_turn_metrics import ChatToolMetricRow, ChatTurnMetric
 from src.models.database import Base
+from src.models.embedding_usage import EmbeddingUsage
 from src.models.tenant import Tenant
 
 RETENTION_DAYS = 90
@@ -128,3 +131,91 @@ async def test_prune_deletes_in_bounded_batches(sessionmaker, monkeypatch) -> No
     assert call_count == 4
     async with sessionmaker() as db:
         assert (await db.execute(select(ChatTurnMetric))).scalars().all() == []
+
+
+# --- prune_embedding_usage: same retention window, same batched-delete
+# mechanism as prune_chat_turn_metrics above (review fix #5) -----------------
+
+
+async def _seed_embedding_usage(sessionmaker, *, created_at: datetime, tenant_id: str = "dev") -> int:
+    async with sessionmaker() as db:
+        row = EmbeddingUsage(
+            tenant_id=tenant_id, purpose="search", provider="gemini",
+            model="gemini-embedding-001", input_chars=20, cost=0.0000001,
+            created_at=created_at,
+        )
+        db.add(row)
+        await db.commit()
+        return row.id
+
+
+async def test_prune_embedding_usage_deletes_rows_older_than_window_keeps_newer(sessionmaker) -> None:
+    now = datetime.utcnow()
+    old_id = await _seed_embedding_usage(sessionmaker, created_at=now - timedelta(days=RETENTION_DAYS + 1))
+    new_id = await _seed_embedding_usage(sessionmaker, created_at=now - timedelta(days=RETENTION_DAYS - 1))
+
+    n = await main.prune_embedding_usage(sessionmaker, RETENTION_DAYS)
+
+    assert n == 1
+    async with sessionmaker() as db:
+        remaining_ids = set((await db.execute(select(EmbeddingUsage.id))).scalars().all())
+    assert remaining_ids == {new_id}
+    assert old_id not in remaining_ids
+
+
+async def test_prune_embedding_usage_noop_when_nothing_is_old_enough(sessionmaker) -> None:
+    await _seed_embedding_usage(sessionmaker, created_at=datetime.utcnow())
+
+    n = await main.prune_embedding_usage(sessionmaker, RETENTION_DAYS)
+
+    assert n == 0
+    async with sessionmaker() as db:
+        assert (await db.execute(select(EmbeddingUsage))).scalars().all()
+
+
+async def test_prune_embedding_usage_deletes_in_bounded_batches(sessionmaker, monkeypatch) -> None:
+    """25 old rows with a batch size of 10 must take 3 round trips (10+10+5),
+    same batching proof as prune_chat_turn_metrics's own test above."""
+    monkeypatch.setattr(main, "_CHAT_METRICS_PRUNE_BATCH_SIZE", 10)
+
+    now = datetime.utcnow()
+    old_created_at = now - timedelta(days=RETENTION_DAYS + 1)
+    for _ in range(25):
+        await _seed_embedding_usage(sessionmaker, created_at=old_created_at)
+
+    call_count = 0
+    real_sessionmaker_call = sessionmaker.__call__
+
+    class _CountingSessionmaker:
+        def __call__(self):
+            nonlocal call_count
+            call_count += 1
+            return real_sessionmaker_call()
+
+    n = await main.prune_embedding_usage(_CountingSessionmaker(), RETENTION_DAYS)
+
+    assert n == 25
+    assert call_count == 4  # 1 dialect probe + 3 batches (10 + 10 + 5)
+    async with sessionmaker() as db:
+        assert (await db.execute(select(EmbeddingUsage))).scalars().all() == []
+
+
+async def test_prune_chat_turn_metrics_loop_prunes_both_tables(sessionmaker, monkeypatch) -> None:
+    """_prune_chat_turn_metrics_loop rides both prunes on the same loop
+    iteration -- no separate embedding_usage loop/task (review fix #5)."""
+    monkeypatch.setattr(main, "get_sessionmaker", lambda: sessionmaker)
+    now = datetime.utcnow()
+    await _seed_turn(sessionmaker, created_at=now - timedelta(days=RETENTION_DAYS + 1))
+    await _seed_embedding_usage(sessionmaker, created_at=now - timedelta(days=RETENTION_DAYS + 1))
+
+    async def _sleep_then_stop(_seconds):
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(main.asyncio, "sleep", _sleep_then_stop)
+
+    with pytest.raises(asyncio.CancelledError):
+        await main._prune_chat_turn_metrics_loop(RETENTION_DAYS)
+
+    async with sessionmaker() as db:
+        assert (await db.execute(select(ChatTurnMetric))).scalars().all() == []
+        assert (await db.execute(select(EmbeddingUsage))).scalars().all() == []

@@ -40,7 +40,7 @@ import asyncio
 import logging
 import math
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Awaitable, Callable, Optional
 
 from rank_bm25 import BM25Okapi
 
@@ -63,6 +63,65 @@ if TYPE_CHECKING:
     from src.config import RetrievalSettings
 
 log = logging.getLogger(__name__)
+
+# (purpose, input_chars) -> awaitable; purpose is "ingest" | "search". Should never raise —
+# the retriever wraps every call regardless, so a broken recorder can't break ingest/search.
+EmbeddingUsageRecorder = Callable[[str, int], Awaitable[object]]
+
+# Ceiling on the injected record_embedding_usage callback's own wall-clock
+# time -- same idiom and same value as src/agents/chatbot.py's
+# _RECORD_METRIC_TIMEOUT_S: the callback never raises internally, but has no
+# timeout of its own, and an unbounded write here could otherwise stall the
+# ingest path's inline await (see index() below) or pile up on the search
+# path's fire-and-forget task (see _EMBEDDING_USAGE_MAX_INFLIGHT below).
+_EMBEDDING_USAGE_TIMEOUT_S = 2.0
+
+# Search-path usage writes run fire-and-forget in the background; hold references until
+# done (same idiom as src/api/chat.py's _webhook_tasks) or the event loop may garbage
+# collect them mid-flight.
+_embedding_usage_tasks: "set[asyncio.Task]" = set()
+
+# Cap on tasks in flight at once. Each task is already bounded by
+# _EMBEDDING_USAGE_TIMEOUT_S, so reaching this many in flight means the
+# recorder is backing up faster than it drains (e.g. an unreachable DB) --
+# past this point a new search-path write is dropped rather than spawned, so
+# a KB-search storm can't grow this set without bound.
+_EMBEDDING_USAGE_MAX_INFLIGHT = 200
+
+# Rate-limits the cap-reached warning to one per overload episode, re-arming
+# once the backlog drains back under the cap -- same idiom as
+# src/observability/turn_metrics_push.py's _PushFailureWarner ("warn once per
+# outage, a success re-arms it").
+_embedding_usage_cap_warned = False
+
+
+async def drain_embedding_usage_tasks(timeout: Optional[float] = None) -> None:
+    """Await any in-flight background embedding-usage writes.
+
+    Production use (see src/main.py's shutdown): pass a ``timeout`` so a
+    stuck/hanging write can't stall shutdown past it -- this never raises,
+    even on timeout, since a KB-cost row is never worth delaying process
+    exit for. Test use (the retriever test suite): call with no timeout to
+    simply wait for whatever is in flight to finish.
+    """
+    if not _embedding_usage_tasks:
+        return
+    tasks = list(_embedding_usage_tasks)
+    gather = asyncio.gather(*tasks, return_exceptions=True)
+    try:
+        if timeout is not None:
+            await asyncio.wait_for(gather, timeout=timeout)
+        else:
+            await gather
+    except asyncio.TimeoutError:
+        log.warning(
+            "drain_embedding_usage_tasks: timed out after %.1fs waiting for "
+            "%d in-flight embedding usage write(s); leaving them to finish "
+            "in the background",
+            timeout, len(tasks),
+        )
+    except Exception:  # noqa: BLE001 - draining must never raise into shutdown
+        log.warning("drain_embedding_usage_tasks failed; continuing", exc_info=True)
 
 
 @dataclass
@@ -293,11 +352,20 @@ class HybridRetriever:
         vector_store: IVectorStore,
         bm25: Optional[BM25Index] = None,
         config: Optional[RetrievalConfig] = None,
+        *,
+        record_embedding_usage: Optional[EmbeddingUsageRecorder] = None,
     ) -> None:
         self._embedder = embedder
         self._dense = vector_store
         self._bm25 = bm25 if bm25 is not None else BM25Index()
         self._config = config or RetrievalConfig()
+        # Optional cost-tracking hook (src/bootstrap.py's
+        # _embedding_usage_recorder). None (the default) means "don't track" --
+        # every existing test/CLI construction of HybridRetriever that doesn't
+        # pass this keyword is unaffected. See _emit_embedding_usage/
+        # _spawn_embedding_usage below for the two call shapes (awaited inline
+        # on the ingest path, fire-and-forget on the search path).
+        self._record_embedding_usage = record_embedding_usage
         # Lazy self-heal bookkeeping for search() -- see _ensure_sparse_hydrated.
         # Attempted (not "succeeded"): set True even on failure or a
         # zero-chunk result, so we never retry per-query.
@@ -314,6 +382,48 @@ class HybridRetriever:
     def config(self) -> RetrievalConfig:
         return self._config
 
+    async def _emit_embedding_usage(self, purpose: str, input_chars: int) -> None:
+        # Bounded by _EMBEDDING_USAGE_TIMEOUT_S -- covers both call shapes:
+        # awaited inline on the ingest path (index() below) and awaited
+        # inside a spawned task on the fire-and-forget search path
+        # (_spawn_embedding_usage below). A timeout is just another failure
+        # mode of the recorder here, so it's swallowed/logged the same way as
+        # any other exception -- same posture as chatbot.py's _emit_turn_metric.
+        if self._record_embedding_usage is None:
+            return
+        try:
+            await asyncio.wait_for(
+                self._record_embedding_usage(purpose, input_chars),
+                timeout=_EMBEDDING_USAGE_TIMEOUT_S,
+            )
+        except Exception:
+            log.warning("embedding usage recorder raised; continuing", exc_info=True)
+
+    def _spawn_embedding_usage(self, purpose: str, input_chars: int) -> None:
+        if self._record_embedding_usage is None:
+            return
+        global _embedding_usage_cap_warned
+        if len(_embedding_usage_tasks) >= _EMBEDDING_USAGE_MAX_INFLIGHT:
+            # Backlog is not draining fast enough to keep up with search
+            # volume -- drop this one record rather than let the in-flight
+            # set grow without bound. See _EMBEDDING_USAGE_MAX_INFLIGHT.
+            if not _embedding_usage_cap_warned:
+                _embedding_usage_cap_warned = True
+                log.warning(
+                    "embedding usage in-flight cap (%d) reached; dropping "
+                    "this %s usage record (further warnings suppressed "
+                    "until the backlog drains)",
+                    _EMBEDDING_USAGE_MAX_INFLIGHT, purpose,
+                )
+            return
+        _embedding_usage_cap_warned = False
+        try:
+            task = asyncio.ensure_future(self._emit_embedding_usage(purpose, input_chars))
+            _embedding_usage_tasks.add(task)
+            task.add_done_callback(_embedding_usage_tasks.discard)
+        except Exception:
+            log.warning("could not schedule embedding usage write; continuing", exc_info=True)
+
     async def index(self, chunks: list[Document]) -> int:
         """Embed the chunks (if needed) and dual-write into FAISS + BM25."""
         if not chunks:
@@ -323,11 +433,15 @@ class HybridRetriever:
         # Embedders are sync (Gemini REST call); run in a thread to avoid blocking the event loop.
         missing = [c for c in chunks if c.embedding is None]
         if missing:
-            vectors = await asyncio.to_thread(
-                self._embedder.embed_documents, [c.content for c in missing]
-            )
+            texts = [c.content for c in missing]
+            vectors = await asyncio.to_thread(self._embedder.embed_documents, texts)
             for c, v in zip(missing, vectors):
                 c.embedding = v
+            # Only reached once the embed call above has actually succeeded --
+            # a failed/raised embed call must not write a cost row for tokens
+            # never billed. Awaited inline: ingest is off the hot path, and
+            # this guarantees the row lands before the caller continues.
+            await self._emit_embedding_usage("ingest", sum(len(t) for t in texts))
 
         # Dual-write. BM25 first so a FAISS failure doesn't leave us with
         # half-indexed state we can't roll back. (Both are still in-memory.)
@@ -615,6 +729,9 @@ class HybridRetriever:
         # On a single-worker deployment a blocking call here freezes every
         # concurrent session, not just this one.
         q_vec = await asyncio.to_thread(self._embedder.embed_query, query)
+        # Fire-and-forget: runs on every chat turn's KB search. An inline DB write here would
+        # inflate kb_search_ms and could be cancelled by the turn's own wait_for timeout.
+        self._spawn_embedding_usage("search", len(query))
         results = await self._dense.search(q_vec, top_k=k, filters=filters)
         if log.isEnabledFor(logging.DEBUG):
             debug_event(log, "retriever dense_search response", query=query, top_k=k,

@@ -1964,6 +1964,44 @@ class ChatAnalytics(BaseModel):
     total_stt_cost: float = 0.0
     media_cost_turns: int = 0
     media_cost_since: Optional[datetime] = None
+    # --- KB embedding cost (ingest + search) -------------------------------
+    # Sourced from embedding_usage (migration 0029), scoped to this tenant's
+    # own rows (tenant_id == tenant_id) — one row per embed batch, covering
+    # both KB ingest (HybridRetriever.index()) and query-time dense search
+    # (HybridRetriever._dense_search()). This is a SEPARATE spend from
+    # total_cost above, never folded into it: total_cost is chat-message
+    # (LLM token) cost only, sourced from chat_messages, and embedding calls
+    # never write a chat_messages row. Report the two side by side; never
+    # add embedding_cost into total_cost or vice versa.
+    #
+    # embedding_usage_rows/embedding_data_since exist for the same reason
+    # cache_metrics_turns/cache_metrics_since do above — to tell "0 spend so
+    # far" apart from "no embedding_usage data at all" (tenant predates
+    # migration 0029, or has never triggered an embed call).
+    embedding_cost: float = 0.0
+    embedding_search_cost: float = 0.0
+    embedding_ingest_cost: float = 0.0
+    embedding_usage_rows: int = 0
+    embedding_data_since: Optional[datetime] = None
+    # --- shared CRM KB embedding cost (informational only) ------------------
+    # Set only when this tenant is linked to a CRM (Tenant.crm_id). Sums that
+    # CRM's own crm-scoped embedding_usage rows (crm_id == this tenant's
+    # crm_id, per the tenant_id-XOR-crm_id scoping rule documented on
+    # EmbeddingUsage) — i.e. the CRM's SHARED knowledge base, which every
+    # tenant registered under that CRM searches against and contributes
+    # ingest/search rows to.
+    #
+    # This is the CRM's cost across ALL its tenants, NOT this tenant's own
+    # attributable share of it, and it is reported purely for visibility. It
+    # is NEVER included in embedding_cost above, in total_cost, or in any
+    # other per-tenant total on this endpoint — folding it in would silently
+    # attribute other tenants' embedding spend to this one. Stays 0.0/0 when
+    # the tenant has no linked CRM (Tenant.crm_id is None) or that CRM has no
+    # embedding_usage rows yet — those two cases are not distinguished by
+    # this field alone; the caller already knows whether the tenant has a
+    # linked CRM from the tenant's own record.
+    shared_crm_embedding_cost: float = 0.0
+    shared_crm_embedding_rows: int = 0
 
 
 @router.get("/{tenant_id}/chat-analytics", response_model=ChatAnalytics)
@@ -1975,7 +2013,8 @@ async def tenant_chat_analytics(
     """Chat session analytics for one tenant."""
     from src.models.chat import ChatMessage, ChatSession
     from src.models.chat_turn_metrics import ChatTurnMetric
-    await _require_tenant(session, tenant_id)
+    from src.models.embedding_usage import EmbeddingUsage
+    t = await _require_tenant(session, tenant_id)
 
     rows = (await session.execute(
         select(ChatSession.status, ChatSession.mode,
@@ -2096,6 +2135,49 @@ async def tenant_chat_analytics(
         )
     )).one()
 
+    # KB embedding cost (migration 0029) — tenant's own rows only, grouped by
+    # purpose (ingest/search) so the UI can show the split as well as the
+    # total. One small GROUP BY (at most 2 groups) rather than two separate
+    # aggregate queries.
+    embed_rows = (await session.execute(
+        select(
+            EmbeddingUsage.purpose, func.sum(EmbeddingUsage.cost),
+            func.count(), func.min(EmbeddingUsage.created_at),
+        )
+        .where(EmbeddingUsage.tenant_id == tenant_id)
+        .group_by(EmbeddingUsage.purpose)
+    )).all()
+
+    embedding_search_cost = 0.0
+    embedding_ingest_cost = 0.0
+    embedding_usage_rows = 0
+    embedding_data_since: Optional[datetime] = None
+    for purpose, cost_sum, row_ct, since in embed_rows:
+        cost_sum = float(cost_sum or 0.0)
+        row_ct = int(row_ct or 0)
+        if purpose == "search":
+            embedding_search_cost += cost_sum
+        elif purpose == "ingest":
+            embedding_ingest_cost += cost_sum
+        embedding_usage_rows += row_ct
+        if since is not None and (embedding_data_since is None or since < embedding_data_since):
+            embedding_data_since = since
+
+    # Shared CRM KB embedding cost — only when this tenant is linked to a
+    # CRM (Tenant.crm_id). Scoped to crm_id, deliberately NOT tenant_id: this
+    # sums the CRM's shared-KB rows across every tenant on that CRM, not just
+    # this one — see the field's own docstring on ChatAnalytics above for why
+    # it is reported separately and never folded into any tenant total.
+    shared_crm_embedding_cost = 0.0
+    shared_crm_embedding_rows = 0
+    if t.crm_id:
+        crm_cost_sum, crm_row_count = (await session.execute(
+            select(func.sum(EmbeddingUsage.cost), func.count())
+            .where(EmbeddingUsage.crm_id == t.crm_id)
+        )).one()
+        shared_crm_embedding_cost = float(crm_cost_sum or 0.0)
+        shared_crm_embedding_rows = int(crm_row_count or 0)
+
     return ChatAnalytics(
         tenant_id=tenant_id,
         total_sessions=n,
@@ -2119,6 +2201,13 @@ async def tenant_chat_analytics(
         total_stt_cost=round(float(stt_cost_sum or 0.0), 6),
         media_cost_turns=int(media_turn_count or 0),
         media_cost_since=media_since,
+        embedding_cost=round(embedding_search_cost + embedding_ingest_cost, 6),
+        embedding_search_cost=round(embedding_search_cost, 6),
+        embedding_ingest_cost=round(embedding_ingest_cost, 6),
+        embedding_usage_rows=embedding_usage_rows,
+        embedding_data_since=embedding_data_since,
+        shared_crm_embedding_cost=round(shared_crm_embedding_cost, 6),
+        shared_crm_embedding_rows=shared_crm_embedding_rows,
     )
 
 

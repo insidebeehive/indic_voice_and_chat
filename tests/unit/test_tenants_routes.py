@@ -1267,6 +1267,155 @@ async def test_chat_analytics_media_cost_zero_when_no_data(ctx) -> None:
     assert ca["media_cost_since"] is None
 
 
+async def test_chat_analytics_embedding_cost_scoped_and_split(ctx) -> None:
+    """embedding_cost/embedding_search_cost/embedding_ingest_cost (migration
+    0029, embedding_usage) must sum only THIS tenant's own rows, split by
+    purpose -- tenant B's rows and the CRM's shared rows must never leak
+    into tenant A's own figures, and embedding_cost must equal the sum of
+    the search/ingest split."""
+    client, _, sm = ctx
+    tid = (await client.post("/tenants", json=_body(slug="acme"), headers=ADMIN_HEADERS)).json()["tenant_id"]
+    other_body = _body(slug="other")
+    other_body["telephony"]["from_number"] = "+15705255680"
+    other_body["telephony"]["phone_numbers"] = ["+15705255680"]
+    other_tid = (await client.post("/tenants", json=other_body, headers=ADMIN_HEADERS)).json()["tenant_id"]
+
+    from src.models.embedding_usage import EmbeddingUsage
+
+    async with sm() as s:
+        # Tenant A: one ingest row, two search rows.
+        s.add(EmbeddingUsage(
+            tenant_id=tid, purpose="ingest", provider="gemini", model="text-embedding-004",
+            input_chars=1000, tokens=250, cost=0.001,
+            created_at=datetime(2026, 9, 10, 8, 0, 0),
+        ))
+        s.add(EmbeddingUsage(
+            tenant_id=tid, purpose="search", provider="gemini", model="text-embedding-004",
+            input_chars=40, tokens=10, cost=0.0001,
+            created_at=datetime(2026, 9, 12, 8, 0, 0),
+        ))
+        s.add(EmbeddingUsage(
+            tenant_id=tid, purpose="search", provider="gemini", model="text-embedding-004",
+            input_chars=60, tokens=15, cost=0.00015,
+            created_at=datetime(2026, 9, 14, 8, 0, 0),
+        ))
+        # Tenant B's own row -- must never leak into A's totals.
+        s.add(EmbeddingUsage(
+            tenant_id=other_tid, purpose="ingest", provider="gemini", model="text-embedding-004",
+            input_chars=5000, tokens=1250, cost=99.0,
+        ))
+        await s.commit()
+
+    ca = (await client.get(f"/tenants/{tid}/chat-analytics", headers=ADMIN_HEADERS)).json()
+    assert ca["embedding_ingest_cost"] == pytest.approx(0.001)
+    assert ca["embedding_search_cost"] == pytest.approx(0.0001 + 0.00015)
+    assert ca["embedding_cost"] == pytest.approx(0.001 + 0.0001 + 0.00015)
+    assert ca["embedding_usage_rows"] == 3
+    assert ca["embedding_data_since"].startswith("2026-09-10")
+    # No linked CRM -- shared figure stays at zero, not leaking tenant B's cost.
+    assert ca["shared_crm_embedding_cost"] == 0.0
+    assert ca["shared_crm_embedding_rows"] == 0
+
+    ca_other = (await client.get(f"/tenants/{other_tid}/chat-analytics", headers=ADMIN_HEADERS)).json()
+    assert ca_other["embedding_ingest_cost"] == pytest.approx(99.0)
+    assert ca_other["embedding_search_cost"] == 0.0
+    assert ca_other["embedding_usage_rows"] == 1
+
+
+async def test_chat_analytics_shared_crm_embedding_cost_is_crm_wide_not_tenant_total(ctx) -> None:
+    """shared_crm_embedding_cost sums the LINKED CRM's crm-scoped rows across
+    every tenant on that CRM -- not just this one -- and must never be
+    folded into embedding_cost or total_cost. A second tenant sharing the
+    same CRM sees the identical shared figure; an unrelated tenant sees
+    none of it."""
+    client, _, sm = ctx
+    from src.models.crm import Crm
+
+    async with sm() as s:
+        s.add(Crm(id="betstudio", name="BetStudio", base_url="https://crm.example.com"))
+        await s.commit()
+
+    tid_a = (await client.post(
+        "/tenants", json=_body(slug="acme", crm_id="betstudio"), headers=ADMIN_HEADERS,
+    )).json()["tenant_id"]
+    body_b = _body(slug="beta", crm_id="betstudio")
+    body_b["telephony"]["from_number"] = "+15705255680"
+    body_b["telephony"]["phone_numbers"] = ["+15705255680"]
+    tid_b = (await client.post("/tenants", json=body_b, headers=ADMIN_HEADERS)).json()["tenant_id"]
+
+    body_unrelated = _body(slug="gamma")
+    body_unrelated["telephony"]["from_number"] = "+15705255681"
+    body_unrelated["telephony"]["phone_numbers"] = ["+15705255681"]
+    tid_unrelated = (await client.post(
+        "/tenants", json=body_unrelated, headers=ADMIN_HEADERS,
+    )).json()["tenant_id"]
+
+    from src.models.embedding_usage import EmbeddingUsage
+
+    async with sm() as s:
+        # CRM-scoped shared-KB rows (crm_id set, tenant_id NULL) -- written
+        # once for the CRM's shared KB, not once per tenant that uses it.
+        s.add(EmbeddingUsage(
+            crm_id="betstudio", purpose="ingest", provider="gemini", model="text-embedding-004",
+            input_chars=2000, tokens=500, cost=0.02,
+            created_at=datetime(2026, 9, 5, 9, 0, 0),
+        ))
+        s.add(EmbeddingUsage(
+            crm_id="betstudio", purpose="search", provider="gemini", model="text-embedding-004",
+            input_chars=80, tokens=20, cost=0.0002,
+            created_at=datetime(2026, 9, 20, 9, 0, 0),
+        ))
+        # Tenant A's own KB row -- must stay out of the shared figure.
+        s.add(EmbeddingUsage(
+            tenant_id=tid_a, purpose="search", provider="gemini", model="text-embedding-004",
+            input_chars=30, tokens=8, cost=0.00005,
+        ))
+        await s.commit()
+
+    ca_a = (await client.get(f"/tenants/{tid_a}/chat-analytics", headers=ADMIN_HEADERS)).json()
+    ca_b = (await client.get(f"/tenants/{tid_b}/chat-analytics", headers=ADMIN_HEADERS)).json()
+    ca_unrelated = (await client.get(f"/tenants/{tid_unrelated}/chat-analytics", headers=ADMIN_HEADERS)).json()
+
+    expected_shared = pytest.approx(0.02 + 0.0002)
+    assert ca_a["shared_crm_embedding_cost"] == expected_shared
+    assert ca_a["shared_crm_embedding_rows"] == 2
+    # Same CRM -> identical shared figure for tenant B, even though B wrote
+    # none of those rows itself.
+    assert ca_b["shared_crm_embedding_cost"] == expected_shared
+    assert ca_b["shared_crm_embedding_rows"] == 2
+    # Not linked to any CRM -> sees none of it.
+    assert ca_unrelated["shared_crm_embedding_cost"] == 0.0
+    assert ca_unrelated["shared_crm_embedding_rows"] == 0
+
+    # Never folded into the tenant's own embedding_cost or total_cost.
+    assert ca_a["embedding_cost"] == pytest.approx(0.00005)
+    assert ca_a["embedding_search_cost"] == pytest.approx(0.00005)
+    assert ca_a["embedding_ingest_cost"] == 0.0
+    assert ca_a["total_cost"] == 0.0
+
+
+async def test_chat_analytics_embedding_cost_zero_when_no_data(ctx) -> None:
+    """No embedding_usage rows for this tenant -- must report 0.0/0, not
+    raise, and embedding_data_since must stay None."""
+    client, _, sm = ctx
+    tid = (await client.post("/tenants", json=_body(slug="acme"), headers=ADMIN_HEADERS)).json()["tenant_id"]
+
+    from src.models.chat import ChatSession
+
+    async with sm() as s:
+        s.add(ChatSession(id="s1", tenant_id=tid, status="ended", message_count=1))
+        await s.commit()
+
+    ca = (await client.get(f"/tenants/{tid}/chat-analytics", headers=ADMIN_HEADERS)).json()
+    assert ca["embedding_cost"] == 0.0
+    assert ca["embedding_search_cost"] == 0.0
+    assert ca["embedding_ingest_cost"] == 0.0
+    assert ca["embedding_usage_rows"] == 0
+    assert ca["embedding_data_since"] is None
+    assert ca["shared_crm_embedding_cost"] == 0.0
+    assert ca["shared_crm_embedding_rows"] == 0
+
+
 async def test_tenant_analytics_unknown_404(ctx) -> None:
     client, _, _ = ctx
     assert (await client.get("/tenants/nope/analytics", headers=ADMIN_HEADERS)).status_code == 404

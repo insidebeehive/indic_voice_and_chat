@@ -329,6 +329,32 @@ async function loadAnalytics(id) {
       (ca.media_cost_since ? ` since ${escT(String(ca.media_cost_since).slice(0, 10))}` : "") + `)</span>`
     : `<span class="hint">no voice-note media cost data yet</span>`;
 
+  // KB embedding cost (migration 0029, embedding_usage) -- a SEPARATE spend
+  // from Total cost (est.) above, never folded into it: total_cost is
+  // chat-message (LLM token) cost only, sourced from chat_messages, while
+  // embedding calls (KB ingest + query-time search) never write a
+  // chat_messages row. See ChatAnalytics.embedding_cost's own comment in
+  // src/api/tenants.py. Gated on embedding_usage_rows the same way the
+  // voice-note boxes above are gated on media_cost_turns, so a tenant with
+  // no embedding_usage rows yet (predates migration 0029, or has never
+  // triggered an embed call) reads as "no data yet" rather than "$0.0000".
+  const kbEmbedHtml = ca && ca.embedding_usage_rows > 0
+    ? `${fmt(ca.embedding_cost)} <span class="hint">(search ${fmt(ca.embedding_search_cost)} / ingest ${fmt(ca.embedding_ingest_cost)}, ` +
+      `${ca.embedding_usage_rows} row${ca.embedding_usage_rows === 1 ? "" : "s"}` +
+      (ca.embedding_data_since ? ` since ${escT(String(ca.embedding_data_since).slice(0, 10))}` : "") + `)</span>`
+    : `<span class="hint">no KB embedding cost data yet</span>`;
+
+  // Shared CRM KB cost -- only rendered when non-zero. This is the linked
+  // CRM's shared-KB cost across ALL tenants registered under it, not this
+  // tenant's own attributable share -- see
+  // ChatAnalytics.shared_crm_embedding_cost's own comment in
+  // src/api/tenants.py. Never added into kbEmbedHtml, Total cost, or any
+  // other per-tenant total on this page.
+  const sharedCrmEmbedHtml = ca && ca.shared_crm_embedding_cost > 0
+    ? `${fmt(ca.shared_crm_embedding_cost)} <span class="hint">(${ca.shared_crm_embedding_rows} row${ca.shared_crm_embedding_rows === 1 ? "" : "s"}` +
+      ` — the linked CRM's shared KB, summed across ALL of its tenants, not this tenant alone)</span>`
+    : "";
+
   const modelRows = ca && ca.by_model && ca.by_model.length
     ? `<div class="metrics-wrap"><table class="metrics">
         <thead><tr><th>Provider</th><th>Model</th><th class="n">Messages</th><th class="n">Input tokens</th>
@@ -389,7 +415,15 @@ async function loadAnalytics(id) {
       already included in Total cost (est.) — they are a breakdown, not an addition — and are sourced from that same
       chat turn metrics table, so they only cover the trailing ~90 days of retained turns.</div>
     <h3 style="margin:1rem 0 .5rem;font-size:.85rem;color:#cbd5e1;">By model</h3>
-    ${modelRows}` : "";
+    ${modelRows}
+    <h2 style="margin:1.4rem 0 .6rem;">KB embedding cost</h2>
+    <div class="stats">
+      ${statBox("KB embeddings", kbEmbedHtml)}
+      ${sharedCrmEmbedHtml ? statBox("Shared CRM KB (all tenants)", sharedCrmEmbedHtml) : ""}
+    </div>
+    <div class="hint" style="margin:.3rem 0 .5rem;">KB embedding cost (ingest + query-time search) is tracked
+      separately from Total cost (est.) above and is NOT included in it -- total_cost is chat-message cost only.
+      ${sharedCrmEmbedHtml ? "The shared CRM KB figure covers every tenant on that CRM, not this tenant alone, and is informational only." : ""}</div>` : "";
 
   const winLabel = CHAT_WINDOW_H === 168 ? "7d" : CHAT_WINDOW_H + "h";
 

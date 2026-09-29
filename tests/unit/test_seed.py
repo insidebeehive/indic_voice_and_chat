@@ -187,6 +187,66 @@ async def test_seed_provider_costs_cached_per_1k_is_optional_and_preserved(sm, t
 
 
 @pytest.mark.asyncio
+async def test_seed_provider_costs_upserts_embedding_token_rates(sm, tmp_path):
+    """``embedding_token_rates`` is not a `kind` either (same reasoning as
+    ``llm_token_rates`` above) — it must be excluded from the per-minute loop
+    and instead upsert cost_per_1k_input_tokens onto the matching
+    (kind='embedding', provider, model) row."""
+    costs_yaml = tmp_path / "costs.yaml"
+    costs_yaml.write_text(textwrap.dedent("""
+        embedding_token_rates:
+          gemini:
+            gemini-embedding-001: {input_per_1k: 0.00015}
+            "": {input_per_1k: 0.00015}
+    """))
+
+    assert await seed_provider_costs(sm, costs_yaml) == 2
+    async with sm() as s:
+        row = await s.get(ProviderCost, ("embedding", "gemini", "gemini-embedding-001"))
+        assert row is not None
+        assert row.cost_per_min == 0.0  # never in the per-minute YAML
+        assert row.cost_per_1k_input_tokens == pytest.approx(0.00015)
+
+        fallback = await s.get(ProviderCost, ("embedding", "gemini", ""))
+        assert fallback is not None
+        assert fallback.cost_per_1k_input_tokens == pytest.approx(0.00015)
+
+    # An admin edits the rate after seeding — re-seeding UPSERTS (unlike the
+    # per-minute pass): the YAML value wins, and re-seeding must not duplicate
+    # rows.
+    async with sm() as s:
+        row = await s.get(ProviderCost, ("embedding", "gemini", "gemini-embedding-001"))
+        row.cost_per_1k_input_tokens = 0.99
+        await s.commit()
+    assert await seed_provider_costs(sm, costs_yaml) == 0     # no new rows
+    async with sm() as s:
+        row = await s.get(ProviderCost, ("embedding", "gemini", "gemini-embedding-001"))
+        assert row.cost_per_1k_input_tokens == pytest.approx(0.00015)  # reset from YAML
+
+
+@pytest.mark.asyncio
+async def test_seed_provider_costs_embedding_token_rates_does_not_crash_per_minute_loop(sm, tmp_path):
+    """Sanity check for the .pop() regression this guards against: a YAML with
+    BOTH a per-minute block and embedding_token_rates must seed cleanly with
+    no crash and no stray kind=="embedding_token_rates" row."""
+    costs_yaml = tmp_path / "costs.yaml"
+    costs_yaml.write_text(textwrap.dedent("""
+        telephony: {twilio: 0.014}
+        embedding_token_rates:
+          gemini:
+            gemini-embedding-001: {input_per_1k: 0.00015}
+    """))
+
+    assert await seed_provider_costs(sm, costs_yaml) == 2
+    async with sm() as s:
+        from sqlalchemy import select
+        stray = (
+            await s.execute(select(ProviderCost).where(ProviderCost.kind == "embedding_token_rates"))
+        ).scalars().all()
+        assert stray == []
+
+
+@pytest.mark.asyncio
 async def test_seed_provider_costs_real_yaml_seeds_llm_token_fallback_row(sm):
     """The real config/provider_costs.yaml must seed a provider-level ("")
     fallback row for llm_token_rates/gemini, not just the exact-model row —

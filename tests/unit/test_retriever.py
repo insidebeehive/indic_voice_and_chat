@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from typing import Optional
 
 import pytest
 
+import src.rag.retriever as retriever_module
 from src.interfaces.vector_store import Document, SearchResult
 from src.providers.vector_store.faiss_store import FAISSAdapter
 from src.rag.embeddings import HashEmbedder
@@ -16,6 +18,7 @@ from src.rag.retriever import (
     _fuse,
     _fuse_rrf,
     _minmax,
+    drain_embedding_usage_tasks,
     retrieval_config_from_settings,
     validate_retrieval_config,
 )
@@ -988,3 +991,341 @@ async def test_lazy_hydration_concurrent_first_searches_enumerate_once() -> None
     )
     assert results_a and results_b
     assert store.list_calls == 1
+
+
+# --- Embedding usage cost-tracking hook (chat-cost-widening plan, Phase 2) --
+
+
+class _FakeEmbeddingUsageRecorder:
+    """Fake async ``record_embedding_usage``-shaped callback -- appends every
+    ``(purpose, input_chars)`` call it receives."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, int]] = []
+
+    async def __call__(self, purpose: str, input_chars: int) -> None:
+        self.calls.append((purpose, input_chars))
+
+
+class _RaisingEmbeddingUsageRecorder:
+    async def __call__(self, purpose: str, input_chars: int) -> None:
+        raise RuntimeError("recorder boom")
+
+
+class _HangingEmbeddingUsageRecorder:
+    """Never resolves until ``release`` is set -- proves a search-path
+    recorder that hangs does not block search() itself."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, int]] = []
+        self.release = asyncio.Event()
+
+    async def __call__(self, purpose: str, input_chars: int) -> None:
+        self.calls.append((purpose, input_chars))
+        await self.release.wait()
+
+
+class _RaisingEmbedder:
+    """Wraps HashEmbedder but raises on embed_documents -- proves a failed
+    embed call propagates unchanged and never triggers a usage-recorder call."""
+
+    def __init__(self, inner: HashEmbedder) -> None:
+        self._inner = inner
+        self.model_name = inner.model_name
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        raise RuntimeError("embed boom")
+
+    def embed_query(self, text: str) -> list[float]:
+        return self._inner.embed_query(text)
+
+
+class _RaisingQueryEmbedder:
+    """Wraps HashEmbedder but raises on embed_query -- proves a failed query
+    embed propagates unchanged and never triggers a search-path usage-
+    recorder call (mirrors _RaisingEmbedder's ingest-path counterpart)."""
+
+    def __init__(self, inner: HashEmbedder) -> None:
+        self._inner = inner
+        self.model_name = inner.model_name
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        return self._inner.embed_documents(texts)
+
+    def embed_query(self, text: str) -> list[float]:
+        raise RuntimeError("embed_query boom")
+
+
+@pytest.mark.asyncio
+async def test_index_emits_one_ingest_call_summing_content_lengths(store: FAISSAdapter) -> None:
+    recorder = _FakeEmbeddingUsageRecorder()
+    retriever = HybridRetriever(
+        embedder=HashEmbedder(dim=64), vector_store=store,
+        record_embedding_usage=recorder,
+    )
+    docs = [
+        Document(id="a", content="plan b unlimited data"),
+        Document(id="b", content="cooking recipes"),
+        Document(id="c", content="third chunk of content"),
+    ]
+    expected_chars = sum(len(d.content) for d in docs)
+
+    await retriever.index(docs)
+
+    assert recorder.calls == [("ingest", expected_chars)]
+
+
+@pytest.mark.asyncio
+async def test_index_pre_embedded_chunks_produce_no_ingest_call(store: FAISSAdapter) -> None:
+    recorder = _FakeEmbeddingUsageRecorder()
+    retriever = HybridRetriever(
+        embedder=HashEmbedder(dim=64), vector_store=store,
+        record_embedding_usage=recorder,
+    )
+    pre_embedded = Document(id="a", content="already has an embedding", embedding=[0.0] * 64)
+
+    await retriever.index([pre_embedded])
+
+    assert recorder.calls == []
+
+
+@pytest.mark.asyncio
+async def test_search_emits_one_search_call_with_query_length(store: FAISSAdapter) -> None:
+    recorder = _FakeEmbeddingUsageRecorder()
+    retriever = HybridRetriever(
+        embedder=HashEmbedder(dim=64), vector_store=store,
+        config=RetrievalConfig(strategy="dense", top_k=3),
+        record_embedding_usage=recorder,
+    )
+    await retriever.index([Document(id="a", content="plan b unlimited data")])
+    recorder.calls.clear()  # drop the ingest-path call index() itself made
+
+    query = "unlimited data plan"
+    await retriever.search(query)
+    await drain_embedding_usage_tasks()  # search-path recording is fire-and-forget
+
+    assert recorder.calls == [("search", len(query))]
+
+
+@pytest.mark.asyncio
+async def test_index_recorder_that_raises_does_not_break_index(store: FAISSAdapter, caplog) -> None:
+    retriever = HybridRetriever(
+        embedder=HashEmbedder(dim=64), vector_store=store,
+        record_embedding_usage=_RaisingEmbeddingUsageRecorder(),
+    )
+    with caplog.at_level("WARNING", logger="src.rag.retriever"):
+        n = await retriever.index([Document(id="a", content="plan b unlimited data")])
+
+    assert n == 1  # index() still succeeded despite the recorder raising
+    assert any("embedding usage recorder raised" in r.message for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_index_recorder_timeout_does_not_stall_index(
+    store: FAISSAdapter, monkeypatch, caplog,
+) -> None:
+    """The ingest path awaits _emit_embedding_usage inline (index() above) --
+    it must be bounded by the SAME _EMBEDDING_USAGE_TIMEOUT_S as the
+    fire-and-forget search path, so an unreachable DB behind
+    record_embedding_usage can't stall index() indefinitely (review fix #4)."""
+    monkeypatch.setattr(retriever_module, "_EMBEDDING_USAGE_TIMEOUT_S", 0.05)
+    recorder = _HangingEmbeddingUsageRecorder()  # this test never releases it
+    retriever = HybridRetriever(
+        embedder=HashEmbedder(dim=64), vector_store=store,
+        record_embedding_usage=recorder,
+    )
+
+    with caplog.at_level("WARNING", logger="src.rag.retriever"):
+        # Proof is the outer wait_for: if the inline await weren't bounded,
+        # this would hang until recorder.release is ever set (never, here).
+        n = await asyncio.wait_for(
+            retriever.index([Document(id="a", content="plan b unlimited data")]),
+            timeout=2.0,
+        )
+
+    assert n == 1
+    assert any("embedding usage recorder raised" in r.message for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_search_recorder_that_raises_does_not_break_search(store: FAISSAdapter, caplog) -> None:
+    retriever = HybridRetriever(
+        embedder=HashEmbedder(dim=64), vector_store=store,
+        config=RetrievalConfig(strategy="dense", top_k=3),
+        record_embedding_usage=_RaisingEmbeddingUsageRecorder(),
+    )
+    await retriever.index([Document(id="a", content="plan b unlimited data")])
+
+    with caplog.at_level("WARNING", logger="src.rag.retriever"):
+        results = await retriever.search("unlimited data plan")
+        await drain_embedding_usage_tasks()
+
+    assert results  # search still returned results despite the recorder raising
+    assert any("embedding usage recorder raised" in r.message for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_search_recorder_that_hangs_does_not_block_search(store: FAISSAdapter) -> None:
+    recorder = _HangingEmbeddingUsageRecorder()
+    retriever = HybridRetriever(
+        embedder=HashEmbedder(dim=64), vector_store=store,
+        config=RetrievalConfig(strategy="dense", top_k=3),
+        record_embedding_usage=recorder,
+    )
+    # Pre-embedded so index() skips the embed call entirely and never invokes
+    # the (awaited-inline) ingest-path recorder -- this test is only about
+    # the fire-and-forget SEARCH path not blocking on a hanging recorder;
+    # calling the same hanging recorder inline on the ingest path would just
+    # hang index() itself, before search() is ever reached.
+    await retriever.index([
+        Document(id="a", content="plan b unlimited data", embedding=[0.0] * 64),
+    ])
+
+    # search() must return promptly even though the recorder it spawned is
+    # still hanging -- proven by wrapping the call in a tight wait_for. (Not
+    # asserting recorder.calls here: whether the spawned task has even run
+    # its first line yet by this point is a scheduling detail, not something
+    # this test should depend on -- the promise is that search() itself
+    # doesn't wait on it, not that the task starts synchronously.)
+    results = await asyncio.wait_for(retriever.search("unlimited data plan"), timeout=2.0)
+    assert results
+
+    # Release the hang and drain -- the background task must still be able
+    # to complete and record its call once unblocked.
+    recorder.release.set()
+    await drain_embedding_usage_tasks()
+    assert recorder.calls == [("search", len("unlimited data plan"))]
+
+
+@pytest.mark.asyncio
+async def test_index_embedder_raises_propagates_and_recorder_never_called(store: FAISSAdapter) -> None:
+    recorder = _FakeEmbeddingUsageRecorder()
+    retriever = HybridRetriever(
+        embedder=_RaisingEmbedder(HashEmbedder(dim=64)), vector_store=store,
+        record_embedding_usage=recorder,
+    )
+
+    with pytest.raises(RuntimeError, match="embed boom"):
+        await retriever.index([Document(id="a", content="plan b unlimited data")])
+
+    assert recorder.calls == []
+
+
+@pytest.mark.asyncio
+async def test_record_embedding_usage_none_is_a_noop(store: FAISSAdapter) -> None:
+    """The default -- no recorder passed -- must not error and must not
+    schedule anything."""
+    retriever = HybridRetriever(embedder=HashEmbedder(dim=64), vector_store=store)
+
+    await retriever.index([Document(id="a", content="plan b unlimited data")])
+    results = await retriever.search("plan b")
+    await drain_embedding_usage_tasks()
+
+    assert results is not None
+
+
+@pytest.mark.asyncio
+async def test_search_embed_query_raises_and_recorder_never_called(store: FAISSAdapter) -> None:
+    """embed_query is awaited (via asyncio.to_thread) BEFORE
+    _spawn_embedding_usage is ever called (see _dense_search) -- a raised
+    embed_query must propagate and never spawn/record a search usage row."""
+    recorder = _FakeEmbeddingUsageRecorder()
+    retriever = HybridRetriever(
+        embedder=_RaisingQueryEmbedder(HashEmbedder(dim=64)), vector_store=store,
+        config=RetrievalConfig(strategy="dense", top_k=3),
+        record_embedding_usage=recorder,
+    )
+    # Pre-embedded so index() never calls embed_documents (which this fake
+    # doesn't raise on anyway) -- isolates the assertion to the search path.
+    await retriever.index([
+        Document(id="a", content="plan b unlimited data", embedding=[0.0] * 64),
+    ])
+
+    with pytest.raises(RuntimeError, match="embed_query boom"):
+        await retriever.search("unlimited data plan")
+    await drain_embedding_usage_tasks()
+
+    assert recorder.calls == []
+
+
+# --- Embedding usage: timeout + in-flight cap on the fire-and-forget
+# search-path task (review fix) ----------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_search_recorder_timeout_lets_the_task_finish_and_warns(
+    store: FAISSAdapter, monkeypatch, caplog,
+) -> None:
+    """A recorder that hangs forever must not hang the spawned task forever
+    too -- _emit_embedding_usage bounds it with _EMBEDDING_USAGE_TIMEOUT_S,
+    same idiom as chatbot.py's _RECORD_METRIC_TIMEOUT_S."""
+    monkeypatch.setattr(retriever_module, "_EMBEDDING_USAGE_TIMEOUT_S", 0.05)
+    recorder = _HangingEmbeddingUsageRecorder()  # this test never releases it
+    retriever = HybridRetriever(
+        embedder=HashEmbedder(dim=64), vector_store=store,
+        config=RetrievalConfig(strategy="dense", top_k=3),
+        record_embedding_usage=recorder,
+    )
+    await retriever.index([
+        Document(id="a", content="plan b unlimited data", embedding=[0.0] * 64),
+    ])
+
+    with caplog.at_level("WARNING", logger="src.rag.retriever"):
+        await retriever.search("unlimited data plan")
+        # Must return well within the timeout, not hang until recorder.release
+        # is ever set (never, in this test).
+        await asyncio.wait_for(drain_embedding_usage_tasks(), timeout=2.0)
+
+    assert any("embedding usage recorder raised" in r.message for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_search_spawn_drops_over_cap_without_recording(
+    store: FAISSAdapter, monkeypatch, caplog,
+) -> None:
+    """Once _EMBEDDING_USAGE_MAX_INFLIGHT tasks are already in flight, a new
+    search-path spawn must be dropped (never scheduled, never recorded), not
+    queued up unbounded."""
+    monkeypatch.setattr(retriever_module, "_EMBEDDING_USAGE_MAX_INFLIGHT", 1)
+    recorder = _FakeEmbeddingUsageRecorder()
+    retriever = HybridRetriever(
+        embedder=HashEmbedder(dim=64), vector_store=store,
+        config=RetrievalConfig(strategy="dense", top_k=3),
+        record_embedding_usage=recorder,
+    )
+
+    # A bare, never-completing future stands in for "already at the cap" --
+    # it never resolves on its own within this test.
+    blocker: asyncio.Future = asyncio.get_event_loop().create_future()
+    retriever_module._embedding_usage_tasks.add(blocker)
+    try:
+        with caplog.at_level("WARNING", logger="src.rag.retriever"):
+            retriever._spawn_embedding_usage("search", 5)
+        assert recorder.calls == []  # dropped, never actually spawned/recorded
+        assert any("in-flight cap" in r.message for r in caplog.records)
+    finally:
+        retriever_module._embedding_usage_tasks.discard(blocker)
+        blocker.cancel()
+        retriever_module._embedding_usage_cap_warned = False  # don't leak into later tests
+
+
+@pytest.mark.asyncio
+async def test_drain_embedding_usage_tasks_timeout_returns_even_if_task_hangs() -> None:
+    """Production shutdown (src/main.py) drains with a timeout before
+    dispose_engine() -- it must return promptly even if a write is still
+    stuck, not block shutdown indefinitely."""
+    async def _never_finishes() -> None:
+        await asyncio.sleep(10)
+
+    task = asyncio.ensure_future(_never_finishes())
+    retriever_module._embedding_usage_tasks.add(task)
+    task.add_done_callback(retriever_module._embedding_usage_tasks.discard)
+    try:
+        # The outer wait_for is the actual proof: if drain_embedding_usage_tasks
+        # didn't honor its own timeout, this would hang until the 10s sleep
+        # above completes and blow well past the 2s ceiling here.
+        await asyncio.wait_for(drain_embedding_usage_tasks(timeout=0.05), timeout=2.0)
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await task

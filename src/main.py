@@ -88,6 +88,7 @@ from src.config_tenant import TenantSettings
 from src.dialogue.campaign_resolver import DbCampaignResolver
 from src.dialogue.context import SessionStore
 from src.models.database import dispose_engine, ensure_schema, get_engine, get_sessionmaker
+from src.rag.retriever import drain_embedding_usage_tasks
 from src.utils.client_ip import ClientIPMiddleware
 from src.utils.logging import configure_logging, debug_event, get_logger
 from src.utils.redact import redact_url
@@ -331,19 +332,66 @@ async def prune_chat_turn_metrics(sessionmaker, retention_days: float) -> int:
     return total_deleted
 
 
+async def prune_embedding_usage(sessionmaker, retention_days: float) -> int:
+    """Delete ``embedding_usage`` rows older than ``retention_days``,
+    returning the number deleted. Same retention window and same batched-
+    delete mechanism as ``prune_chat_turn_metrics`` above (deliberately
+    reusing its shape rather than a second prune loop/schedule) -- KB-search
+    volume makes this table grow unbounded exactly like ``chat_turn_metrics``
+    does, for the same reason.
+
+    No CASCADE children to worry about here (unlike chat_turn_metrics's
+    chat_tool_metrics) -- embedding_usage has no child table.
+    """
+    from sqlalchemy import delete, func, select
+
+    from src.models.embedding_usage import EmbeddingUsage
+
+    async with sessionmaker() as probe:
+        dialect_name = probe.get_bind().dialect.name
+    if dialect_name == "sqlite":
+        from datetime import datetime, timedelta
+        cutoff = datetime.utcnow() - timedelta(days=retention_days)
+    else:
+        cutoff = func.now() - func.make_interval(0, 0, 0, 0, 0, 0, retention_days * 86400.0)
+
+    total_deleted = 0
+    while True:
+        async with sessionmaker() as s:
+            ids = (await s.execute(
+                select(EmbeddingUsage.id)
+                .where(EmbeddingUsage.created_at < cutoff)
+                .order_by(EmbeddingUsage.created_at)
+                .limit(_CHAT_METRICS_PRUNE_BATCH_SIZE)
+            )).scalars().all()
+            if not ids:
+                break
+            await s.execute(delete(EmbeddingUsage).where(EmbeddingUsage.id.in_(ids)))
+            await s.commit()
+        total_deleted += len(ids)
+        if len(ids) < _CHAT_METRICS_PRUNE_BATCH_SIZE:
+            break  # last (partial) batch -- nothing older left to prune this pass
+    return total_deleted
+
+
 async def _prune_chat_turn_metrics_loop(retention_days: float) -> None:
     """Periodically run ``prune_chat_turn_metrics`` (turn-metrics plan, Phase
-    3, §11.2). Best-effort like every other background loop here: never dies,
-    one try/except per iteration. Runs once at startup, then every
-    ``_CHAT_METRICS_PRUNE_INTERVAL_S``."""
+    3, §11.2) and ``prune_embedding_usage`` (same retention window, same
+    mechanism -- see that function's own docstring for why it rides this loop
+    rather than getting a second one). Best-effort like every other
+    background loop here: never dies, one try/except per iteration. Runs once
+    at startup, then every ``_CHAT_METRICS_PRUNE_INTERVAL_S``."""
     sm = get_sessionmaker()
     while True:
         try:
             n = await prune_chat_turn_metrics(sm, retention_days)
             if n:
                 log.info("pruned old chat turn metrics", extra={"count": n})
+            n_embed = await prune_embedding_usage(sm, retention_days)
+            if n_embed:
+                log.info("pruned old embedding usage rows", extra={"count": n_embed})
         except Exception:  # noqa: BLE001 - the prune loop must never die (CancelledError still propagates)
-            log.exception("chat-turn-metrics prune failed")
+            log.exception("chat-turn-metrics/embedding-usage prune failed")
         await asyncio.sleep(_CHAT_METRICS_PRUNE_INTERVAL_S)
 
 
@@ -1116,6 +1164,16 @@ def _warn_if_platform_webhook_secret_still_set() -> None:
         )
 
 
+# Shutdown bound on draining in-flight embedding-usage writes (KB search/
+# ingest cost rows, src/rag/retriever.py) before dispose_engine() tears the
+# DB pool down under them. Each individual write is already bounded by that
+# module's own _EMBEDDING_USAGE_TIMEOUT_S (2s); this is a shutdown-wide
+# ceiling on top of that, in case many are in flight at once -- a KB-cost row
+# is never worth delaying process exit for, so drain_embedding_usage_tasks
+# never raises even if this elapses.
+_EMBEDDING_USAGE_DRAIN_TIMEOUT_S = 5.0
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings: Settings = get_settings()
@@ -1466,6 +1524,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         set_call_outcome_persister(None)
         set_tenant_event_notifier(None)
         await redis_client.aclose()
+        # Before dispose_engine() tears down the pool: let any in-flight
+        # embedding-usage writes (search/ingest KB-cost rows) finish, bounded
+        # so a stuck one can't delay shutdown -- see
+        # _EMBEDDING_USAGE_DRAIN_TIMEOUT_S above. Unlike _webhook_tasks (left
+        # alone per the review that asked for this), these are cheap,
+        # best-effort cost rows -- draining them briefly is worth it, not
+        # worth blocking shutdown over.
+        await drain_embedding_usage_tasks(timeout=_EMBEDDING_USAGE_DRAIN_TIMEOUT_S)
         await dispose_engine()
         set_tenant_resolver(None)
 

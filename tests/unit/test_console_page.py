@@ -137,6 +137,46 @@ async def test_backoffice_chat_analytics_shows_voice_note_media_cost_breakdown()
 
 
 @pytest.mark.asyncio
+async def test_backoffice_chat_analytics_shows_kb_embedding_cost() -> None:
+    """The KB embedding cost box (embedding_usage / migration 0029) must be
+    wired into loadAnalytics, gated on embedding_usage_rows the same way the
+    voice-note boxes above are gated on media_cost_turns -- so a tenant with
+    no embedding_usage rows reads as "no data yet", not a misleading
+    "$0.0000". It must also state explicitly that this cost is NOT included
+    in Total cost (est.), unlike the voice-note TTS/STT breakdown above."""
+    transport = ASGITransport(app=_app())
+    async with AsyncClient(transport=transport, base_url="http://test") as c:
+        resp = await c.get("/admin/tenants")
+    body = resp.text
+
+    assert "ca.embedding_cost" in body
+    assert "ca.embedding_search_cost" in body
+    assert "ca.embedding_ingest_cost" in body
+    assert "ca.embedding_usage_rows" in body
+    assert "ca.embedding_data_since" in body
+    assert "ca.shared_crm_embedding_cost" in body
+    assert "ca.shared_crm_embedding_rows" in body
+
+    import re
+    assert re.search(
+        r"ca\.embedding_usage_rows\s*>\s*0\s*\?\s*`\$\{fmt\(ca\.embedding_cost\)\}.*?"
+        r":\s*`<span[^`]*no KB embedding cost data yet</span>`",
+        body, re.S,
+    ), "KB embedding cost must be gated on embedding_usage_rows, with an explicit no-data fallback"
+
+    # Shared CRM KB box is gated on a non-zero shared figure.
+    assert re.search(
+        r"ca\.shared_crm_embedding_cost\s*>\s*0\s*\?\s*`\$\{fmt\(ca\.shared_crm_embedding_cost\)\}",
+        body, re.S,
+    ), "Shared CRM KB cost must be gated on shared_crm_embedding_cost being non-zero"
+    assert "all tenants" in body.lower() or "ALL of its tenants" in body
+
+    # NOT included in Total cost -- stated explicitly, unlike the voice-note
+    # breakdown, which IS included.
+    assert "NOT included in it" in body
+
+
+@pytest.mark.asyncio
 async def test_backoffice_voice_pickers_replace_free_text() -> None:
     """The three voice fields (chat TTS, call TTS, realtime) must be
     catalog-backed <select> pickers, not free-text inputs an operator has to

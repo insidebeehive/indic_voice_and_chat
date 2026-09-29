@@ -19,6 +19,8 @@ actually applies to a cache hit.
 from __future__ import annotations
 
 import logging
+import math
+import time
 from typing import Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -283,3 +285,135 @@ async def compute_chat_stt_cost(
         )
     debug_event(log, "chat_cost stt unpriced", provider=provider, model=model)
     return 0.0
+
+
+# --- KB embedding cost (Phase 2 of the chat-cost-widening plan) ------------
+#
+# Gemini's Developer API embed_content is billed per INPUT token, but its
+# response reports no token count (token_count/billable_character_count are
+# Vertex-only fields -- see GeminiEmbedder in src/rag/embeddings.py), so
+# billed tokens are ESTIMATED from input characters. Google's own rule of
+# thumb for Gemini models is ~4 chars/token; Devanagari/Hinglish text likely
+# tokenizes denser than that, so this estimate can UNDER-count for Hindi
+# content.
+_EMBED_CHARS_PER_TOKEN = 4.0
+
+# In-process cache for embedding_token_rate, keyed by (provider, model). A KB
+# search calls embedding_token_rate on every turn (via compute_embedding_cost
+# -> record_embedding_usage) -- caching avoids re-running 1-2 ProviderCost
+# lookups per search on the hot path. Short TTL rather than "forever" so a
+# rate change (the YAML re-seed on boot per config/provider_costs.yaml, or a
+# direct DB edit) is picked up within a bounded window without a restart.
+_EMBEDDING_RATE_CACHE_TTL_S = 300.0
+_embedding_rate_cache: dict[tuple[str, str], tuple[float, float]] = {}
+
+
+def reset_embedding_rate_cache() -> None:
+    """Test helper: clear the in-process embedding-rate cache
+    (``_embedding_rate_cache`` above). Same footgun as ``_warned_rate_misses``
+    (see ``_reset_warned_rate_misses`` in tests/unit/test_chat_cost.py) --
+    without clearing this between tests, a rate cached by an earlier test
+    against the same (provider, model) key would leak into a later one for up
+    to ``_EMBEDDING_RATE_CACHE_TTL_S``. Any fixture that seeds or changes a
+    ``kind="embedding"`` ``ProviderCost`` row should call this.
+    """
+    _embedding_rate_cache.clear()
+
+
+async def embedding_token_rate(session: AsyncSession, provider: str, model: str) -> float:
+    """``cost_per_1k_input_tokens`` for ``(kind="embedding", provider, model)``;
+    falls back to the provider-level ("") row, same pattern as ``token_rates``
+    and ``minute_rate`` above.
+
+    Cached in-process for ``_EMBEDDING_RATE_CACHE_TTL_S`` seconds per
+    ``(provider, model)`` -- a cache hit skips the DB lookup (and the
+    debug/warning logic below) entirely. See ``reset_embedding_rate_cache``.
+    """
+    cache_key = (provider, model)
+    cached = _embedding_rate_cache.get(cache_key)
+    now = time.monotonic()
+    if cached is not None and cached[1] > now:
+        return cached[0]
+    row = await session.get(ProviderCost, ("embedding", provider, model or ""))
+    used_fallback = False
+    if model and (row is None or not row.cost_per_1k_input_tokens):
+        fallback = await session.get(ProviderCost, ("embedding", provider, ""))
+        if fallback is not None:
+            row = fallback
+            used_fallback = True
+    if log.isEnabledFor(logging.DEBUG):
+        debug_event(
+            log, "chat_cost embedding_token_rate resolved",
+            provider=provider, model=model, used_fallback=used_fallback,
+            row_found=row is not None,
+            rate=row.cost_per_1k_input_tokens if row is not None else None,
+        )
+    if row is None:
+        # No catalog row at all for this (provider, model) -- neither the
+        # exact-model row nor its provider-level fallback -- so every token
+        # in this embed batch bills at $0.0. Same shape and same reason as
+        # token_rates'/minute_rate's own miss warning.
+        key = ("embedding", provider, model)
+        if key not in _warned_rate_misses:
+            _warned_rate_misses.add(key)
+            log.warning(
+                "no ProviderCost row for kind=embedding provider=%s model=%s "
+                "(nor its provider-level fallback) -- billing this embedding "
+                "batch at $0.0 until a row is added (further warnings for "
+                "this combination suppressed for this process)",
+                provider, model,
+            )
+        rate = 0.0
+    elif not row.cost_per_1k_input_tokens:
+        # A row exists and prices this at nothing -- a legitimate state (a
+        # genuinely free model) and an equally plausible mistake: the column
+        # is NOT NULL with a 0.0 default, so a row added without its rate
+        # looks identical to one priced at zero on purpose. Deduped per
+        # combination like the miss above, because it would otherwise fire on
+        # every embed call for the lifetime of the row.
+        key = ("embedding", provider, model, "zero_rated")
+        if key not in _warned_rate_misses:
+            _warned_rate_misses.add(key)
+            log.warning(
+                "ProviderCost row for kind=embedding provider=%s model=%s "
+                "prices cost_per_1k_input_tokens at $0.0 -- correct only if "
+                "this model is genuinely free; otherwise the row was added "
+                "without its rate (further warnings for this combination "
+                "suppressed for this process)",
+                provider, model,
+            )
+        rate = 0.0
+    else:
+        rate = row.cost_per_1k_input_tokens
+    _embedding_rate_cache[cache_key] = (rate, now + _EMBEDDING_RATE_CACHE_TTL_S)
+    return rate
+
+
+async def compute_embedding_cost(
+    session: AsyncSession,
+    *,
+    provider: str,
+    model: str,
+    input_chars: int,
+    tokens: Optional[int] = None,
+) -> float:
+    """Platform-billed cost for one KB-embedding batch (ingest or search).
+
+    Prefers a real reported token count; else estimates billed tokens from
+    ``input_chars`` at ``_EMBED_CHARS_PER_TOKEN``. Returns 0.0 when there is
+    nothing to price (no provider, and neither a token count nor a positive
+    char count).
+    """
+    if not provider:
+        return 0.0
+    if tokens is not None and tokens > 0:
+        billed = tokens
+    elif input_chars and input_chars > 0:
+        billed = math.ceil(input_chars / _EMBED_CHARS_PER_TOKEN)
+    else:
+        return 0.0
+    rate = await embedding_token_rate(session, provider, model)
+    # 9 dp here, not the 6 dp used elsewhere in this module: a single
+    # search-query embed batch costs on the order of 1e-6 USD, which 6 dp
+    # would round to 0 or distort by a large relative amount.
+    return round(billed / 1000.0 * rate, 9)
