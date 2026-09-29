@@ -17,6 +17,11 @@ TIER1_GENERAL = (
     "the grounding rule in DATA RULE above.\n"
 )
 
+# Bare topic list (no numbering/framing) — for callers outside the chat SCOPE
+# section, e.g. the chat->voice handoff support-call directive in
+# src/api/dev_console.py, which has no "DATA RULE above" to refer back to.
+SUPPORT_TOPICS = "registration, account setup, billing, general features, security, tech help"
+
 PLAYER_SCOPE_WITH_TOOLS = (
     "2. ACCOUNT-SPECIFIC (account status, billing, profile info): "
     "call the relevant tool — it already has the customer's IDs, so never ask the customer "

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import io
 import json
 import logging
@@ -30,7 +31,7 @@ import uuid
 import wave
 from dataclasses import dataclass, field
 from types import SimpleNamespace
-from typing import Any, Awaitable, Callable, NamedTuple, NoReturn, Optional
+from typing import Any, Awaitable, Callable, Literal, NamedTuple, NoReturn, Optional
 
 from fastapi import (
     APIRouter,
@@ -1640,6 +1641,15 @@ class CreateSessionRequest(BaseModel):
     customer_name: Optional[str] = None
     language: Optional[str] = None
     metadata: dict = Field(default_factory=dict)
+    # Optional CRM-supplied bot persona identity -- distinct from ClaimRequest's
+    # `agent_name` (the HUMAN agent's name on handover). Carried into a
+    # chat->voice handoff's support script (see request_call / the in-chat
+    # call-offer path and dev_console.py's handoff script builder) so the
+    # voice call can introduce itself the way the CRM's own chat bot does,
+    # instead of a generic "the customer-support agent" fallback.
+    # Goes into the voice agent's system prompt: one short line only.
+    bot_name: Optional[str] = Field(default=None, max_length=64, pattern=r"^[^\r\n]*$")
+    bot_gender: Optional[Literal["female", "male"]] = None
 
 
 class CreateSessionResponse(BaseModel):
@@ -1719,10 +1729,19 @@ async def create_session(
         or getattr(tenant.settings, "default_language", None)
         or "hi"
     )
+    # bot_name/bot_gender ride alongside the caller's own metadata rather than
+    # a dedicated column -- no migration needed, and the handoff-blob writers
+    # (request_call / the in-chat call-offer path) read them back the same
+    # way as any other extra_data key.
+    extra_data = dict(req.metadata or {})
+    if req.bot_name:
+        extra_data["bot_name"] = req.bot_name
+    if req.bot_gender:
+        extra_data["bot_gender"] = req.bot_gender
     session.add(ChatSession(
         id=session_id, tenant_id=tenant.id,
         customer_id=req.user_id, customer_name=req.customer_name,
-        language=language, status="active", extra_data=req.metadata or {},
+        language=language, status="active", extra_data=extra_data,
     ))
     await session.commit()
     from src.api.chat_webhooks import send_bo_webhook
@@ -1932,12 +1951,17 @@ async def request_call(
     summary = await agent.summarize_session()
 
     token = uuid.uuid4().hex
+    row_extra = row.extra_data or {}
     context = {
         "chat_session_id": session_id,
+        "tenant_id": tenant.id,
+        "tenant_slug": tenant.slug,
         "customer_name": row.customer_name,
         "customer_id": row.customer_id,
         "language": row.language,
         "chat_summary": summary,
+        "bot_name": row_extra.get("bot_name"),
+        "bot_gender": row_extra.get("bot_gender"),
     }
     await _handoff_store.redis.set(
         f"chat_handoff:{token}", json.dumps(context), ex=600)  # 10-min TTL
@@ -1945,12 +1969,164 @@ async def request_call(
         call_url=_voice_call_url(request, tenant.slug, token), call_id=token)
 
 
+async def _claim_chat_handoff(websocket: WebSocket, tenant: TenantContext) -> Optional[dict]:
+    """Resolve + validate the ``?handoff=`` token for a ``/chat/voice``
+    connection, or close ``websocket`` with a policy close code and return
+    None.
+
+    A valid token is REQUIRED on this route (unlike the dev console's
+    ``?handoff=``, which is optional/best-effort — see
+    ``make_browser_bridge_factory``'s own redis lookup, still used when this
+    function hands it a pre-resolved context). Missing/unknown/expired/
+    wrong-tenant all close the socket before any bridge is built — none of
+    them may fall through to a demo/sales session.
+
+    The token is NOT single-use (operator decision): it stays valid for its
+    full Redis TTL (10 min, set at issue time), so a dropped connection can
+    reconnect with the same token. Only one LIVE session per token at a time
+    is enforced separately, by the caller, via the
+    ``chat_handoff_live:{token}`` lock (``_acquire_handoff_live_lock``).
+    """
+    handoff_token = (websocket.query_params.get("handoff") or "").strip()
+    if not handoff_token:
+        log_denied(logging.WARNING, "voice ws handoff token missing",
+                   event="auth_rejected", reason="voice_ws_handoff_token_missing",
+                   route=websocket.url.path, tenant=tenant.slug, tenant_id=tenant.id)
+        await websocket.close(code=4401, reason="handoff token required")
+        return None
+    if _handoff_store is None:
+        log_denied(logging.ERROR, "voice ws handoff store unset",
+                   event="auth_rejected", reason="voice_ws_handoff_store_unset",
+                   route=websocket.url.path, tenant=tenant.slug, tenant_id=tenant.id)
+        await websocket.close(code=1011, reason="chat voice handoff not initialized")
+        return None
+    try:
+        raw = await _handoff_store.redis.get(f"chat_handoff:{handoff_token}")
+    except Exception:  # noqa: BLE001
+        log_denied(logging.WARNING, "voice ws handoff token lookup failed",
+                   event="auth_rejected", reason="voice_ws_handoff_lookup_failed",
+                   route=websocket.url.path, tenant=tenant.slug, tenant_id=tenant.id,
+                   token_fp=token_fingerprint(handoff_token), exc_info=True)
+        await websocket.close(code=1011, reason="handoff token lookup failed")
+        return None
+    if not raw:
+        # Covers unknown and expired (Redis TTL already reaped it) alike --
+        # both are indistinguishable here and both must be rejected the same
+        # way.
+        log_denied(logging.WARNING, "voice ws handoff token invalid",
+                   event="auth_rejected", reason="voice_ws_handoff_token_invalid",
+                   route=websocket.url.path, tenant=tenant.slug, tenant_id=tenant.id,
+                   token_fp=token_fingerprint(handoff_token))
+        await websocket.close(code=4401, reason="invalid or expired handoff token")
+        return None
+    try:
+        handoff_ctx = json.loads(raw)
+    except Exception:  # noqa: BLE001
+        log_denied(logging.WARNING, "voice ws handoff token payload invalid",
+                   event="auth_rejected", reason="voice_ws_handoff_payload_invalid",
+                   route=websocket.url.path, tenant=tenant.slug, tenant_id=tenant.id,
+                   token_fp=token_fingerprint(handoff_token), exc_info=True)
+        await websocket.close(code=4401, reason="invalid handoff token payload")
+        return None
+    ctx_tenant_id = handoff_ctx.get("tenant_id")
+    ctx_tenant_slug = handoff_ctx.get("tenant_slug")
+    if not ((ctx_tenant_id and ctx_tenant_id == tenant.id)
+            or (ctx_tenant_slug and ctx_tenant_slug == tenant.slug)):
+        # Also rejects a token blob with no tenant binding at all (issued
+        # before this field existed) -- can't verify it, so it's treated the
+        # same as a mismatch rather than trusted.
+        log_denied(logging.WARNING, "voice ws handoff token tenant mismatch",
+                   event="auth_rejected", reason="voice_ws_handoff_tenant_mismatch",
+                   route=websocket.url.path, tenant=tenant.slug, tenant_id=tenant.id,
+                   token_fp=token_fingerprint(handoff_token),
+                   handoff_tenant_id=ctx_tenant_id, handoff_tenant_slug=ctx_tenant_slug)
+        await websocket.close(code=4403, reason="handoff token issued for a different tenant")
+        return None
+    from src.utils.logging import debug_event
+    debug_event(log, "chat voice_ws handoff resolved",
+                tenant=tenant.slug, tenant_id=tenant.id,
+                token_fp=token_fingerprint(handoff_token),
+                chat_session_id=handoff_ctx.get("chat_session_id"),
+                has_chat_summary=bool(handoff_ctx.get("chat_summary")))
+    return handoff_ctx
+
+
+# One live /chat/voice session per handoff token at a time (operator decision:
+# the token itself stays valid for its full 10-min TTL and a reconnect is
+# allowed once the previous session ends -- this lock only blocks a SECOND,
+# CONCURRENT session on the same token). TTL + periodic renewal so a crashed
+# pod's lock self-expires instead of jamming the token for the rest of its
+# life.
+_HANDOFF_LIVE_LOCK_TTL_S = 90
+_HANDOFF_LIVE_LOCK_RENEW_INTERVAL_S = 30
+
+
+def _handoff_live_lock_key(handoff_token: str) -> str:
+    return f"chat_handoff_live:{handoff_token}"
+
+
+async def _acquire_handoff_live_lock(handoff_token: str) -> Optional[str]:
+    """Try to become the single live session for ``handoff_token``.
+
+    Returns an opaque per-attempt instance id (pass it to
+    ``_release_handoff_live_lock``) on success, or None if another session
+    already holds the lock. ``_handoff_store`` unset is treated as "can't
+    verify, refuse" -- same posture as ``_claim_chat_handoff``.
+    """
+    if _handoff_store is None:
+        return None
+    instance_id = uuid.uuid4().hex
+    acquired = await _handoff_store.redis.set(
+        _handoff_live_lock_key(handoff_token), instance_id,
+        nx=True, ex=_HANDOFF_LIVE_LOCK_TTL_S)
+    return instance_id if acquired else None
+
+
+async def _renew_handoff_live_lock(handoff_token: str) -> None:
+    """Background loop for the lifetime of the call: refreshes the lock's TTL
+    so it doesn't expire out from under a still-live session. Cancelled by
+    the caller's ``finally`` when the call ends -- CancelledError is the
+    expected/normal exit here, not an error."""
+    key = _handoff_live_lock_key(handoff_token)
+    try:
+        while True:
+            await asyncio.sleep(_HANDOFF_LIVE_LOCK_RENEW_INTERVAL_S)
+            try:
+                if _handoff_store is not None:
+                    await _handoff_store.redis.expire(key, _HANDOFF_LIVE_LOCK_TTL_S)
+            except Exception:  # noqa: BLE001 -- a missed renewal must not crash the call
+                log.warning("chat voice_ws handoff live-lock renewal failed", exc_info=True)
+    except asyncio.CancelledError:
+        pass
+
+
+async def _release_handoff_live_lock(handoff_token: str, instance_id: str) -> None:
+    """Compare-and-delete: only clears the lock if it's still ours. Without
+    this check, a lock that already expired (renewal starved past the TTL)
+    and was re-acquired by a newer session could be deleted out from under
+    that newer session by this stale one's own cleanup."""
+    if _handoff_store is None:
+        return
+    key = _handoff_live_lock_key(handoff_token)
+    try:
+        current = await _handoff_store.redis.get(key)
+        if isinstance(current, bytes):
+            current = current.decode()
+        if current == instance_id:
+            await _handoff_store.redis.delete(key)
+    except Exception:  # noqa: BLE001 -- release must never raise out of a finally
+        log.warning("chat voice_ws handoff live-lock release failed", exc_info=True)
+
+
 @router.websocket("/voice")
 async def chat_voice_ws(websocket: WebSocket) -> None:
     """Always-on browser-voice WS for the chat→voice handoff. Reuses the dev
     console's browser bridge (un-gated). Tenant from ?tenant; handoff context
-    from ?handoff (resolved by the bridge factory). The dev console's own
-    /dev/voice stays behind VOX_DEV_CONSOLE."""
+    from ?handoff, resolved by ``_claim_chat_handoff`` and exclusivity (one
+    live session per token) enforced by ``_acquire_handoff_live_lock`` before
+    any bridge is built. The dev console's own /dev/voice stays behind
+    VOX_DEV_CONSOLE and keeps its own (optional, non-destructive) handoff
+    lookup in ``make_browser_bridge_factory`` — unaffected by this route."""
     from src.api.dev_console import run_browser_voice
     from src.auth.middleware import tenant_from_slug
 
@@ -1966,32 +2142,53 @@ async def chat_voice_ws(websocket: WebSocket) -> None:
         await websocket.close(code=1008, reason="unknown tenant")
         return
 
-    # Resolve chat_session_id from the handoff token so we can register this WS.
-    # If the chat session ends while the call is live, _end_session will close us.
-    chat_session_id: Optional[str] = None
+    if tenant.settings.status != "active":
+        log_denied(logging.WARNING, "voice ws tenant suspended",
+                   event="auth_rejected", reason="voice_ws_tenant_suspended",
+                   route=websocket.url.path, tenant=tenant.slug, tenant_id=tenant.id)
+        await websocket.close(code=4403, reason="tenant suspended")
+        return
+
+    handoff_ctx = await _claim_chat_handoff(websocket, tenant)
+    if handoff_ctx is None:
+        return  # _claim_chat_handoff already closed the socket with a policy code.
+
     handoff_token = (websocket.query_params.get("handoff") or "").strip()
-    if handoff_token and _handoff_store is not None:
-        try:
-            raw = await _handoff_store.redis.get(f"chat_handoff:{handoff_token}")
-            if raw:
-                chat_session_id = json.loads(raw).get("chat_session_id")
-        except Exception:  # noqa: BLE001
-            # This voice WS never gets registered in _active_voice_ws, so a
-            # later _end_session for the originating chat session won't close
-            # it -- the call just keeps running past the chat's own end.
-            log.debug("chat voice handoff token resolution failed; call won't be "
-                      "linked to its originating chat session",
-                      extra={"tenant": tenant.slug if tenant else None}, exc_info=True)
+    try:
+        lock_instance_id = await _acquire_handoff_live_lock(handoff_token)
+    except Exception:  # noqa: BLE001 - a redis fault must close cleanly, not raise out of the WS
+        log.exception("voice ws handoff live-lock acquire failed",
+                      extra={"tenant_id": tenant.id})
+        await websocket.close(code=1011, reason="handoff lock unavailable")
+        return
+    if lock_instance_id is None:
+        log_denied(logging.WARNING, "voice ws handoff already live",
+                   event="auth_rejected", reason="voice_ws_handoff_already_live",
+                   route=websocket.url.path, tenant=tenant.slug, tenant_id=tenant.id,
+                   token_fp=token_fingerprint(handoff_token))
+        await websocket.close(code=4409, reason="handoff call already in progress")
+        return
+
+    # Register this WS under its originating chat session so _end_session can
+    # close it if the chat session ends while the call is live.
+    chat_session_id: Optional[str] = handoff_ctx.get("chat_session_id")
     if chat_session_id:
         _active_voice_ws[chat_session_id] = websocket
+    renew_task = asyncio.ensure_future(_renew_handoff_live_lock(handoff_token))
     try:
         # allow_overrides=False (explicit, matches the default): this route is
         # public and always-on -- a customer must not be able to append
         # ?tts=/?stt=/?llm=/?voice=/etc. to build clients on the platform's own
         # provider keys. Only ?tenant and ?handoff are honoured here; see
         # run_browser_voice / make_browser_bridge_factory's allow_overrides docs.
-        await run_browser_voice(websocket, tenant, allow_overrides=False)
+        # handoff_ctx is passed through already-resolved -- run_browser_voice
+        # must NOT re-resolve the token from the query string.
+        await run_browser_voice(websocket, tenant, allow_overrides=False, handoff_ctx=handoff_ctx)
     finally:
+        renew_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await renew_task
+        await _release_handoff_live_lock(handoff_token, lock_instance_id)
         _active_voice_ws.pop(chat_session_id, None)
 
 
@@ -2998,12 +3195,17 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
                     if result.call_offer and _handoff_store is not None:
                         summary = await agent.summarize_session()
                         token = uuid.uuid4().hex
+                        row_extra = row.extra_data or {}
                         context = {
                             "chat_session_id": session_id,
+                            "tenant_id": tenant.id,
+                            "tenant_slug": tenant.slug,
                             "customer_name": row.customer_name,
                             "customer_id": row.customer_id,
                             "language": row.language,
                             "chat_summary": summary,
+                            "bot_name": row_extra.get("bot_name"),
+                            "bot_gender": row_extra.get("bot_gender"),
                         }
                         await _handoff_store.redis.set(
                             f"chat_handoff:{token}", json.dumps(context), ex=600)

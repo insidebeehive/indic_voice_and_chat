@@ -16,6 +16,14 @@ TIER1_GENERAL = (
     "knowledge, subject to the grounding rule in DATA RULE above.\n"
 )
 
+# Bare topic list (no numbering/framing) — for callers outside the chat SCOPE
+# section, e.g. the chat->voice handoff support-call directive in
+# src/api/dev_console.py, which has no "DATA RULE above" to refer back to.
+SUPPORT_TOPICS = (
+    "registration, KYC, wallet, deposits, withdrawals, games, bonuses, "
+    "responsible gaming, security, tech help"
+)
+
 PLAYER_SCOPE_WITH_TOOLS = (
     "2. PLAYER-SPECIFIC (balance, transactions, bets, bonuses, KYC, deposit account): "
     "call the relevant tool — it already has the player's IDs, so never ask the customer "

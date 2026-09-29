@@ -33,7 +33,11 @@ def _tenant() -> SimpleNamespace:
         llm=SimpleNamespace(temperature=0.5, max_tokens=256, response_format="json"),
         tts=SimpleNamespace(language="hi-IN", voice_id=None),
     )
-    return SimpleNamespace(slug="dev", id="t1", settings=SimpleNamespace(pipeline=pipeline))
+    return SimpleNamespace(
+        slug="dev", id="t1",
+        settings=SimpleNamespace(
+            pipeline=pipeline, name="Acme", default_language="hi", prompt_pack="generic"),
+    )
 
 
 async def test_browser_factory_passes_slots_into_agent() -> None:
@@ -104,6 +108,36 @@ async def test_s2s_factory_tolerates_missing_tenant_realtime_key() -> None:
     assert isinstance(bridge, TelephonyLiveBridge)
 
 
+async def test_cascade_pipeline_config_preserves_temperature_zero() -> None:
+    """B6: `temperature or 0.5` used to silently replace an intentional
+    temperature=0.0 (deterministic output) with 0.5, since 0.0 is falsy.
+    make_bridge_factory's cascade (non-s2s) pipeline_cfg must use an explicit
+    is-None check for temperature. max_tokens keeps its `or 256` fallback
+    (unlike temperature, 0 is not a valid max_tokens for groq/gemini -- an
+    explicit 0 there is a misconfiguration, not a deliberate choice)."""
+    from src.api import dev_call_control
+
+    pipeline = SimpleNamespace(
+        stt=SimpleNamespace(language="hi-IN"),
+        llm=SimpleNamespace(temperature=0.0, max_tokens=0, response_format="json"),
+        tts=SimpleNamespace(language="hi-IN", voice_id=None),
+        mode="layered",
+    )
+    tenant = SimpleNamespace(
+        slug="dev", id="t1",
+        settings=SimpleNamespace(pipeline=pipeline, timezone="Asia/Kolkata"),
+        secret=lambda env: "k", secret_optional=lambda env: None,
+    )
+
+    dev_call_control.pop_override("dev")  # ensure no stale override from another test
+    factory = make_bridge_factory(_providers())
+    bridge = await factory(websocket=object(), tenant=tenant)
+
+    cfg = bridge._agent._engine._config
+    assert cfg.llm.temperature == 0.0
+    assert cfg.llm.max_tokens == 256  # 0 falls back, unlike temperature
+
+
 async def test_browser_factory_loads_chat_handoff(fake_redis) -> None:
     import json
 
@@ -146,6 +180,211 @@ async def test_browser_factory_skips_campaign_resolution_for_chat_handoff(fake_r
     ld = bridge._agent.session.lead_data
     assert ld["name"] == "Raju"
     assert ld["chat_summary"] == "asked about Plan B"
+
+
+async def test_handoff_call_script_built_from_tenant_not_demo_script(fake_redis) -> None:
+    """Build item 2 (P1/B2): the handoff support script's identity must come
+    from the TENANT, never DEFAULT_DEMO_SCRIPT (company='Vox Demo',
+    agent_name='Priya') -- previously `cur_script` was still the closure's
+    DEFAULT_DEMO_SCRIPT because campaign resolution (which would normally
+    replace it) is skipped for handoff calls."""
+    import json
+
+    await fake_redis.set("chat_handoff:tok1", json.dumps({
+        "customer_name": "Raju", "chat_summary": "asked about billing", "customer_id": "cust1"}))
+    tenant = _tenant()
+    tenant.settings.name = "Acme Telecom"
+    factory = make_browser_bridge_factory(
+        _providers(), handoff_store=SimpleNamespace(redis=fake_redis))
+    ws = SimpleNamespace(query_params={"handoff": "tok1"})
+    bridge = await factory(websocket=ws, tenant=tenant)
+    script = bridge._agent._script
+    assert script.company_name == "Acme Telecom"
+    assert script.company_name != DEFAULT_DEMO_SCRIPT.company_name
+    assert script.agent_name != DEFAULT_DEMO_SCRIPT.agent_name  # never "Priya"
+
+
+async def test_handoff_call_agent_gender_derived_from_chat_call_voice(fake_redis) -> None:
+    """F6: the handoff script must carry the gender of the voice the call
+    actually speaks in, so Hindi verb forms match -- previously no gender was
+    ever set on a handoff script (the ?voice=/?gender= derivation block only
+    runs when allow_overrides lets sel_voice/caller_name_override be set,
+    which /chat/voice never does)."""
+    import json
+
+    await fake_redis.set("chat_handoff:tok1", json.dumps({
+        "customer_name": "Raju", "chat_summary": "asked about billing"}))
+    tenant = _tenant()
+    tenant.settings.pipeline.tts.voice_id = "aditya"  # male, per voice_catalog.py
+    factory = make_browser_bridge_factory(
+        _providers(), handoff_store=SimpleNamespace(redis=fake_redis))
+    ws = SimpleNamespace(query_params={"handoff": "tok1"})
+    bridge = await factory(websocket=ws, tenant=tenant)
+    assert bridge._agent._script.gender == "male"
+
+
+async def test_handoff_call_generic_pack_scope_directive_has_no_betting_words(fake_redis) -> None:
+    """Build item 3 (B9): the handoff scope directive must be built from the
+    tenant's prompt pack (TIER1_GENERAL), not a hard-coded betting-vertical
+    topic list -- a generic-pack tenant's directive must carry none of the
+    gambling vocabulary. Banned-word list mirrors
+    test_prompts.py::test_chatbot_prompt_generic_pack_has_no_gambling_vocabulary."""
+    import json
+
+    await fake_redis.set("chat_handoff:tok1", json.dumps({
+        "customer_name": "Raju", "chat_summary": "asked about billing"}))
+    tenant = _tenant()  # prompt_pack="generic" by default
+    factory = make_browser_bridge_factory(
+        _providers(), handoff_store=SimpleNamespace(redis=fake_redis))
+    ws = SimpleNamespace(query_params={"handoff": "tok1"})
+    bridge = await factory(websocket=ws, tenant=tenant)
+    directives = bridge._agent._extra_directives or []
+    text = " ".join(directives).lower()
+    for banned in (
+        "kyc", "deposit", "withdraw", "self-exclu", "casino",
+        "matka", "bonus", "responsible gaming", "betting works",
+    ):
+        assert banned not in text, f"found banned term {banned!r} in generic handoff directive"
+
+
+async def test_handoff_call_betting_pack_scope_directive_keeps_betting_topics(fake_redis) -> None:
+    """Complements the generic-pack test above: a betting-pack tenant's
+    directive still names its own vertical's topics (via TIER1_GENERAL), so
+    the pack-reuse didn't just silently drop all topic detail."""
+    import json
+
+    await fake_redis.set("chat_handoff:tok1", json.dumps({
+        "customer_name": "Raju", "chat_summary": "asked about billing"}))
+    tenant = _tenant()
+    tenant.settings.prompt_pack = "betting"
+    factory = make_browser_bridge_factory(
+        _providers(), handoff_store=SimpleNamespace(redis=fake_redis))
+    ws = SimpleNamespace(query_params={"handoff": "tok1"})
+    bridge = await factory(websocket=ws, tenant=tenant)
+    directives = bridge._agent._extra_directives or []
+    text = " ".join(directives).lower()
+    assert "kyc" in text
+    assert "responsible gaming" in text
+
+
+async def test_handoff_scope_directive_exact_wording_generic(fake_redis) -> None:
+    """Round 2 item 1: the operator-approved sentence, verbatim, for the
+    generic pack -- reads from SUPPORT_TOPICS, not the TIER1_GENERAL splice
+    (which referenced "1." and "DATA RULE above", neither of which exist in
+    the voice prompt)."""
+    import json
+
+    from src.dialogue.packs import generic as generic_pack
+
+    await fake_redis.set("chat_handoff:tok1", json.dumps({
+        "customer_name": "Raju", "chat_summary": "asked about billing"}))
+    tenant = _tenant()
+    tenant.settings.name = "Acme"
+    factory = make_browser_bridge_factory(
+        _providers(), handoff_store=SimpleNamespace(redis=fake_redis))
+    ws = SimpleNamespace(query_params={"handoff": "tok1"})
+    bridge = await factory(websocket=ws, tenant=tenant)
+    directives = bridge._agent._extra_directives or []
+    text = " ".join(directives)
+    expected = (
+        "SCOPE — SUPPORT CALL: You are customer support for Acme, "
+        f"NOT a sales agent. Help only with Acme topics: {generic_pack.SUPPORT_TOPICS}. "
+    )
+    assert expected in text
+    assert "DATA RULE" not in text
+    assert "1. GENERAL" not in text
+
+
+async def test_handoff_scope_directive_exact_wording_betting(fake_redis) -> None:
+    """Same sentence, betting pack -- SUPPORT_TOPICS swaps in the betting
+    vertical's topic list."""
+    import json
+
+    from src.dialogue.packs import betting as betting_pack
+
+    await fake_redis.set("chat_handoff:tok1", json.dumps({
+        "customer_name": "Raju", "chat_summary": "asked about billing"}))
+    tenant = _tenant()
+    tenant.settings.name = "Acme"
+    tenant.settings.prompt_pack = "betting"
+    factory = make_browser_bridge_factory(
+        _providers(), handoff_store=SimpleNamespace(redis=fake_redis))
+    ws = SimpleNamespace(query_params={"handoff": "tok1"})
+    bridge = await factory(websocket=ws, tenant=tenant)
+    directives = bridge._agent._extra_directives or []
+    text = " ".join(directives)
+    expected = (
+        "SCOPE — SUPPORT CALL: You are customer support for Acme, "
+        f"NOT a sales agent. Help only with Acme topics: {betting_pack.SUPPORT_TOPICS}. "
+    )
+    assert expected in text
+    assert "DATA RULE" not in text
+    assert "1. GENERAL" not in text
+
+
+async def test_handoff_call_bot_name_and_gender_from_crm_reach_script(fake_redis) -> None:
+    """Round 2 item 2: CRM-supplied bot_name/bot_gender (carried in the
+    handoff blob written by chat.py's request_call / in-chat call-offer path)
+    must reach the handoff script's identity, taking priority over the
+    call's TTS-voice-derived gender."""
+    import json
+
+    await fake_redis.set("chat_handoff:tok1", json.dumps({
+        "customer_name": "Raju", "chat_summary": "asked about billing",
+        "bot_name": "Meera", "bot_gender": "male",
+    }))
+    tenant = _tenant()
+    tenant.settings.name = "Acme"
+    tenant.settings.pipeline.tts.voice_id = "priya"  # female, per voice_catalog.py -- must lose to bot_gender
+    factory = make_browser_bridge_factory(
+        _providers(), handoff_store=SimpleNamespace(redis=fake_redis))
+    ws = SimpleNamespace(query_params={"handoff": "tok1"})
+    bridge = await factory(websocket=ws, tenant=tenant)
+    script = bridge._agent._script
+    assert script.agent_name == "Meera"
+    assert script.agent_role == "customer support agent"
+    assert script.gender == "male"
+
+
+async def test_handoff_call_no_bot_name_falls_back_to_neutral_identity(fake_redis) -> None:
+    """No CRM bot_name -> the neutral nameless fallback identity (see the
+    dev_console.py comment on this block and the report for the rendered
+    sentence, pending a small prompts.py change for the fully-natural
+    no-name case)."""
+    import json
+
+    await fake_redis.set("chat_handoff:tok1", json.dumps({
+        "customer_name": "Raju", "chat_summary": "asked about billing"}))
+    tenant = _tenant()
+    tenant.settings.name = "Acme"
+    factory = make_browser_bridge_factory(
+        _providers(), handoff_store=SimpleNamespace(redis=fake_redis))
+    ws = SimpleNamespace(query_params={"handoff": "tok1"})
+    bridge = await factory(websocket=ws, tenant=tenant)
+    script = bridge._agent._script
+    assert script.agent_name == "the customer-support agent"
+    assert script.agent_role == ""
+    from src.dialogue.prompts import build_voicebot_system_prompt
+    from src.dialogue.slots import SlotSchema
+    prompt = build_voicebot_system_prompt(script, SlotSchema())
+    assert "You are the customer-support agent at Acme. You are on a phone call with a customer." in prompt
+    assert ", a  at" not in prompt and "with a lead" not in prompt
+
+
+async def test_handoff_call_gender_chain_falls_back_to_female(fake_redis) -> None:
+    """No bot_gender and no derivable TTS-voice gender -> "female", matching
+    the chat prompt's own "You are female" default."""
+    import json
+
+    await fake_redis.set("chat_handoff:tok1", json.dumps({
+        "customer_name": "Raju", "chat_summary": "asked about billing"}))
+    tenant = _tenant()
+    tenant.settings.pipeline.tts.voice_id = None  # nothing to derive a gender from
+    factory = make_browser_bridge_factory(
+        _providers(), handoff_store=SimpleNamespace(redis=fake_redis))
+    ws = SimpleNamespace(query_params={"handoff": "tok1"})
+    bridge = await factory(websocket=ws, tenant=tenant)
+    assert bridge._agent._script.gender == "female"
 
 
 async def test_browser_factory_raises_when_llm_override_fails(monkeypatch) -> None:

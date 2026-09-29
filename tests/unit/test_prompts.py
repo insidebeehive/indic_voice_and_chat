@@ -979,3 +979,20 @@ def test_chatbot_prompt_no_trailing_question_or_later_update_promise() -> None:
         assert "Do not end a reply that already answers the question" in prompt
         assert "Ask a question only when you need the answer to proceed" in prompt
         assert "never promise to notify or update them later" in prompt
+
+
+def test_voicebot_identity_line_with_and_without_role_and_counterpart() -> None:
+    """A campaign script (role set, default counterpart) renders exactly as
+    before; a nameless handoff script (no role, counterpart "customer") reads
+    as a sentence."""
+    from src.dialogue.slots import SlotSchema
+    campaign = VoiceBotScript(agent_name="Priya", agent_role="Customer Engagement Specialist",
+                              company_name="Acme")
+    p1 = build_voicebot_system_prompt(campaign, SlotSchema())
+    assert ("You are Priya, a Customer Engagement Specialist at Acme. You are on a phone call "
+            "with a lead. Speak naturally as a human would on a call.") in p1
+    handoff = VoiceBotScript(agent_name="the customer-support agent", agent_role="",
+                             company_name="Acme", counterpart="customer")
+    p2 = build_voicebot_system_prompt(handoff, SlotSchema())
+    assert ("You are the customer-support agent at Acme. You are on a phone call with a "
+            "customer. Speak naturally as a human would on a call.") in p2

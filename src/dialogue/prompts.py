@@ -200,6 +200,9 @@ class VoiceBotScript:
     conversation_style: str = ""
     max_turns: int = 0
     pronunciations: dict[str, str] = field(default_factory=dict)
+    # Who is on the other end of the call. "lead" for outbound campaigns; the
+    # chat→voice support handoff sets "customer".
+    counterpart: str = "lead"
 
     @classmethod
     def from_campaign_yaml(cls, script: dict[str, Any]) -> "VoiceBotScript":
@@ -308,9 +311,18 @@ def build_voicebot_system_prompt(
     parts.append(f"Current date (UTC): {datetime.now(UTC).strftime('%Y-%m-%d')}.")
 
     # Identity + persona.
-    parts.append(
+    # ", a {role}" only when there is a role: a nameless handoff agent reads
+    # "You are the customer-support agent at {company}." rather than
+    # "…agent, a  at {company}."
+    identity = (
         f"You are {script.agent_name}, a {script.agent_role} at {script.company_name}. "
-        f"You are on a phone call with a lead. Speak naturally as a human would on a call."
+        if script.agent_role else
+        f"You are {script.agent_name} at {script.company_name}. "
+    )
+    parts.append(
+        identity
+        + f"You are on a phone call with a {script.counterpart or 'lead'}. "
+        "Speak naturally as a human would on a call."
     )
     if script.personality:
         parts.append(f"Your personality: {script.personality}.")

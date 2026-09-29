@@ -69,11 +69,22 @@ Content-Type: application/json
   "user_id": "player-42",       // your CRM player ID — stored with the session for correlation
   "customer_name": "Rahul",      // personalises the AI greeting
   "language": "hi",              // default "hi"; pass "en" for English
+  "bot_name": "Meera",            // optional — your bot's persona name, used if the chat is later
+                                   // handed off to a voice call (see "Chat → Voice handoff" below)
+  "bot_gender": "female",         // optional — "female" or "male"; also used for that handoff
   "metadata": {                  // optional — any key/value you want stored
     "crm_ticket_id": "TKT-9001"
   }
 }
 ```
+
+`bot_name` / `bot_gender` are optional and independent of `metadata`. They describe the AI persona's
+own identity (distinct from a human agent's name, which `POST /sessions/{id}/claim` supplies
+separately on handover to a human). If the customer is later handed off to a voice call
+(`POST /chat/{session_id}/call`), the voice agent introduces itself using `bot_name` when given;
+without it, the call falls back to a neutral, nameless introduction. `bot_gender`, when given, sets
+the voice agent's grammatical gender directly; otherwise it's inferred from the TTS voice the call
+actually speaks in, falling back to female.
 
 **Response (201):**
 
@@ -310,14 +321,14 @@ For `websocket` and `webrtc`, forwarding the frame as-is is the right call — C
 
 Configure your `events_webhook_url` on your tenant. We POST all lifecycle events there.
 
-Configuring a signing secret (`events_webhook_secret_env`, set via `PATCH /tenants/{id}` or at registration) is strongly recommended — an unsigned webhook lets anyone who guesses or observes your `events_webhook_url` send you fake lifecycle events. If no secret is configured, we still deliver the webhook (unsigned) and log a warning on our side; we do not withhold delivery.
+Configuring a signing secret (`events_webhook_secret_env`, set via `PATCH /tenants/{id}` or at registration) is strongly recommended — an unsigned webhook lets anyone who guesses or observes your `events_webhook_url` send you fake lifecycle events. If no secret is configured, we still deliver the webhook (unsigned) and log a warning on our side; we do not withhold delivery. There is no platform-wide fallback key: signing is always your own tenant secret, never a shared one, so a signed request is a real guarantee it came from us for your tenant specifically.
 
 ### Request format
 
 ```
 POST <your-events_webhook_url>
 Content-Type: application/json
-X-Signature: sha256=<hmac-hex>   (when the tenant's events_webhook_secret_env or the platform EVENTS_WEBHOOK_SECRET is set)
+X-Signature: sha256=<hmac-hex>   (when your tenant's events_webhook_secret_env is set)
 ```
 
 Body always contains `"event"` plus event-specific fields.

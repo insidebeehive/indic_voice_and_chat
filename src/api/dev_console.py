@@ -41,7 +41,7 @@ from src.defaults import DEFAULT_DEMO_SCRIPT
 from src.config_tenant import platform_webhook_base_url, resolve_chat_tts_config
 from src.models.database import get_sessionmaker
 from src.models.turn_metrics import record_turn_metric
-from src.dialogue.prompts import VoiceBotScript, build_s2s_system_instruction
+from src.dialogue.prompts import PACKS, VoiceBotScript, build_s2s_system_instruction
 from src.dialogue.slots import SlotSchema
 from src.interfaces.realtime import RealtimeConfig
 from src.providers.realtime.gemini_live import GeminiLiveSession
@@ -76,10 +76,10 @@ dev_router = APIRouter(                                       # mounted at app r
     dependencies=[Depends(require_admin)],
 )
 
-# Factory: (websocket, tenant, allow_overrides=...) -> BrowserVoiceBridge. Set
-# during lifespan. `allow_overrides` is a keyword-only bool the Callable type
-# below can't express positionally; see make_browser_bridge_factory's inner
-# `factory` for the actual signature.
+# Factory: (websocket, tenant, allow_overrides=..., handoff_ctx=...) -> BrowserVoiceBridge.
+# Set during lifespan. `allow_overrides`/`handoff_ctx` are keyword-only args the
+# Callable type below can't express positionally; see make_browser_bridge_factory's
+# inner `factory` for the actual signature.
 BrowserBridgeFactory = Callable[[WebSocket, TenantContext], BrowserVoiceBridge]
 _browser_bridge_factory: Optional[BrowserBridgeFactory] = None
 
@@ -101,6 +101,7 @@ def get_browser_bridge_factory() -> Optional["BrowserBridgeFactory"]:
 
 async def run_browser_voice(
     websocket: WebSocket, tenant: TenantContext, *, allow_overrides: bool = False,
+    handoff_ctx: Optional[dict] = None,
 ) -> None:
     """Build + run a browser voice session for an already-accepted websocket.
     Shared by the dev console (/dev/voice) and the chat→voice handoff
@@ -115,6 +116,15 @@ async def run_browser_voice(
     ``/chat/voice`` (src/api/chat.py's ``chat_voice_ws``) must never let a
     customer's query string pick which provider/model the call runs on --
     that would let them build clients on the platform's own keys.
+
+    ``handoff_ctx``, when given, is an already-resolved handoff blob (on the
+    ``/chat/voice`` path: resolved by ``chat.py``'s ``_claim_chat_handoff``,
+    which does NOT consume the token -- it stays valid for its Redis TTL, see
+    that function's docstring) -- ``make_browser_bridge_factory`` uses it
+    as-is instead of re-reading ``?handoff=`` from Redis itself. The dev
+    console's own ``/dev/voice`` passes None (its default) and keeps the old
+    best-effort, non-destructive lookup, since its ``?handoff=`` is optional
+    and reusable for iteration.
     """
     if _browser_bridge_factory is None:
         from src.utils.logging import debug_event
@@ -122,7 +132,8 @@ async def run_browser_voice(
         await websocket.close(code=1011, reason="browser bridge factory unset")
         return
     try:
-        bridge = await _browser_bridge_factory(websocket, tenant, allow_overrides=allow_overrides)
+        bridge = await _browser_bridge_factory(
+            websocket, tenant, allow_overrides=allow_overrides, handoff_ctx=handoff_ctx)
     except Exception as e:  # noqa: BLE001 - e.g. no campaign configured, or a provider override failed to construct
         log.warning("browser voice bridge build failed: %s", e)
         # WebSocket close reasons are capped at 123 UTF-8 bytes (RFC 6455) —
@@ -816,6 +827,7 @@ def make_browser_bridge_factory(
 
     async def factory(
         websocket: WebSocket, tenant: TenantContext, *, allow_overrides: bool = False,
+        handoff_ctx: Optional[dict] = None,
     ) -> BrowserVoiceBridge:
         import uuid
 
@@ -986,9 +998,14 @@ def make_browser_bridge_factory(
             lead_data["lead_gender"] = lead_gender
         # Chat→voice handoff: a ?handoff=<token> resolves a short-lived Redis blob
         # (chat summary + customer context) so the voice agent continues the chat.
+        # /chat/voice hands this factory an ALREADY resolved `handoff_ctx`
+        # (chat.py's `_claim_chat_handoff` -- the token itself is NOT consumed,
+        # only validated), so this must not re-fetch it. Only when
+        # `handoff_ctx` arrives as None (the dev console's /dev/voice, which never
+        # passes one) does this fall back to its own best-effort, non-destructive
+        # lookup -- kept so an admin can re-test the same handoff token repeatedly.
         handoff_token = (query_params.get("handoff") or "").strip()
-        handoff_ctx: dict | None = None
-        if handoff_token and handoff_store is not None:
+        if handoff_ctx is None and handoff_token and handoff_store is not None:
             from src.auth.audit import token_fingerprint
             from src.utils.logging import debug_event
             try:
@@ -996,17 +1013,9 @@ def make_browser_bridge_factory(
                 raw = await handoff_store.redis.get(f"chat_handoff:{handoff_token}")
                 if raw:
                     handoff_ctx = _json.loads(raw)
-                    name = (handoff_ctx.get("customer_name") or "").strip()
-                    if name:
-                        lead_data["name"] = name
-                        lead_data.setdefault("lead_name", name)
-                    if handoff_ctx.get("chat_summary"):
-                        lead_data["chat_summary"] = handoff_ctx["chat_summary"]
-                    if handoff_ctx.get("customer_id"):
-                        lead_data["customer_id"] = handoff_ctx["customer_id"]
                     debug_event(log, "dev_console chat_handoff resolved",
                                 token_fp=token_fingerprint(handoff_token),
-                                customer_name=name or None,
+                                customer_name=(handoff_ctx.get("customer_name") or None),
                                 customer_id=handoff_ctx.get("customer_id"),
                                 has_chat_summary=bool(handoff_ctx.get("chat_summary")),
                                 language=handoff_ctx.get("language"))
@@ -1021,23 +1030,64 @@ def make_browser_bridge_factory(
                 log.warning("chat handoff context load failed",
                             extra={"token_fp": token_fingerprint(handoff_token)})
 
+        if handoff_ctx is not None:
+            name = (handoff_ctx.get("customer_name") or "").strip()
+            if name:
+                lead_data["name"] = name
+                lead_data.setdefault("lead_name", name)
+            if handoff_ctx.get("chat_summary"):
+                lead_data["chat_summary"] = handoff_ctx["chat_summary"]
+            if handoff_ctx.get("customer_id"):
+                lead_data["customer_id"] = handoff_ctx["customer_id"]
+
         # When a valid handoff is present, replace the campaign script with a
-        # support-mode script. Campaign objective/opening/slots are irrelevant here.
+        # support-mode script built from the TENANT -- never DEFAULT_DEMO_SCRIPT
+        # (company="Vox Demo", agent_name="Priya"). Identity priority:
+        #   name:   CRM-supplied handoff_ctx["bot_name"] (set at /chat/sessions
+        #           creation, see CreateSessionRequest.bot_name) -> else a
+        #           neutral nameless fallback (no per-tenant persona name
+        #           otherwise exists to reuse).
+        #   gender: handoff_ctx["bot_gender"] -> the gender of the voice this
+        #           call actually speaks in (`tts_voice`, resolved above --
+        #           NOT `sel_voice`, which is always empty here since
+        #           /chat/voice always passes allow_overrides=False) -> "female"
+        #           (matches the chat prompt's own "You are female" default).
+        # Campaign objective/opening/slots are irrelevant to a support call.
         extra_directives: list[str] | None = None
         if handoff_ctx is not None:
-            lang = (handoff_ctx.get("language") or cur_script.language_default or "hi")
+            lang = (
+                handoff_ctx.get("language")
+                or getattr(tenant.settings, "default_language", None)
+                or "hi"
+            )
+            from src.providers.voice_catalog import gender_from_voice_id as _gender_from_voice_id
+            handoff_gender = _gender_from_voice_id(tts_voice) if tts_voice else ""
+            bot_name = (handoff_ctx.get("bot_name") or "").strip()
+            bot_gender = (handoff_ctx.get("bot_gender") or "").strip().lower()
+            if bot_name:
+                handoff_agent_name = bot_name
+                handoff_agent_role = "customer support agent"
+            else:
+                # No name from the CRM: stay nameless rather than invent one.
+                # With no role, build_voicebot_system_prompt renders
+                # "You are the customer-support agent at {company}."
+                handoff_agent_name = "the customer-support agent"
+                handoff_agent_role = ""
             cur_script = VoiceBotScript(
-                agent_name=cur_script.agent_name,
-                agent_role="Customer Support",
-                company_name=cur_script.company_name,
+                agent_name=handoff_agent_name,
+                agent_role=handoff_agent_role,
+                company_name=tenant.settings.name,
                 language_default=lang,
+                gender=(bot_gender or handoff_gender or "female"),
+                counterpart="customer",
             )
             cur_slots = SlotSchema()
+            _handoff_pack = PACKS.get(
+                getattr(tenant.settings, "prompt_pack", "generic") or "generic", PACKS["generic"])
             _scope_directive = (
                 f"SCOPE — SUPPORT CALL: You are customer support for {cur_script.company_name}, "
-                "NOT a sales agent. Only help with platform topics: registration, KYC, wallet, "
-                "deposits, withdrawals, casino games, sports betting (including exposure), "
-                "Matka/lottery, bonuses, account security, and technical issues. "
+                f"NOT a sales agent. Help only with {cur_script.company_name} topics: "
+                f"{_handoff_pack.SUPPORT_TOPICS}. "
                 "Use the knowledge base to answer platform questions. "
                 "For topics completely unrelated to this platform, give one brief "
                 "warm acknowledgement ('That's a bit outside what I can help with here') "
