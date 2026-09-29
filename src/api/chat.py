@@ -72,7 +72,7 @@ from src.agents.chatbot import (
     _latin_language_hint,
     truncate_previous_conversation,
 )
-from src.api.chat_cost import compute_chat_turn_cost
+from src.api.chat_cost import compute_chat_stt_cost, compute_chat_tts_cost, compute_chat_turn_cost
 from src.config_tenant import resolve_chat_tts_config
 from src.interfaces.media_storage import IMediaStorage
 from src.api.deps import get_db_session
@@ -83,7 +83,7 @@ from src.dialogue.language import normalize_lang, to_bcp47
 from src.interfaces.llm import LLMMessage, is_llm_spending_cap_error
 from src.interfaces.tts import TTSConfig
 from src.models.chat import ChatMessage, ChatSession
-from src.models.chat_turn_metrics import record_chat_turn_metric
+from src.models.chat_turn_metrics import ChatTurnMetric, record_chat_turn_metric
 from src.pipeline.text_normalize import normalize_for_tts
 import src.utils.http_fetch as http_fetch
 from src.utils.http_fetch import MAX_FETCH_BYTES as _MAX_MEDIA_FETCH_BYTES
@@ -342,21 +342,92 @@ def _env_seconds(name: str, default: float, lo: float, hi: float) -> float:
 _TTS_SYNTH_TIMEOUT_S = _env_seconds("CHAT_TTS_TIMEOUT_SECONDS", 10.0, 1.0, 30.0)
 
 
+class _ReplyTTSUsage(NamedTuple):
+    """Provider/model identity + duration for a voice-note reply's TTS
+    synthesis, for src/api/chat_cost.py's compute_chat_tts_cost. Returned by
+    `_synthesize_reply_audio` alongside (or instead of, on a failed/timed-out
+    synthesis) the audio itself -- see that function's docstring."""
+
+    provider: str
+    model: str
+    audio_ms: int
+    # True when the provider WAS invoked but synthesis did not complete
+    # (timeout/raise) -- audio_ms is then 0 and the true cost is unknown, so
+    # the caller must bill this leg at $0 rather than guess.
+    billed_unknown: bool
+
+
+class _InboundSTTUsage(NamedTuple):
+    """Provider/model identity + usage for an inbound voice-note's STT
+    transcription, for src/api/chat_cost.py's compute_chat_stt_cost."""
+
+    provider: str
+    model: str
+    audio_ms: Optional[int]
+    input_tokens: int
+    output_tokens: int
+    cached_tokens: int
+
+
+class _VoiceNoteMediaCost(NamedTuple):
+    """Computed platform-paid cost for one turn's voice-note TTS reply and/or
+    inbound STT transcription. Either field is None when there was nothing
+    to price (see `_price_voice_note_media`); never raises, so an
+    uncomputable cost becomes 0.0, never a missing turn."""
+
+    tts_cost: Optional[float] = None
+    stt_cost: Optional[float] = None
+
+
+def _chat_tts_identity(tenant: TenantContext, tts: Any) -> tuple[str, str]:
+    """Best-effort (provider, model) identity for the chat TTS adapter
+    already resolved for this tenant (`_tts_providers.get_chat_tts`), for
+    cost lookups in src/api/chat_cost.py. Never raises -- an identity lookup
+    failure must not break a voice-note reply that already succeeded.
+
+    Provider comes from the tenant's resolved chat TTS config
+    (`resolve_chat_tts_config`); model prefers the adapter's own `_model`
+    attribute (set on sarvam/elevenlabs/gemini adapters to the actual model
+    used) since that reflects the adapter's real default even when the
+    config itself left it unset, falling back to the config's `.model` for
+    adapters with no such attribute (azure/google/indicf5), else "".
+    """
+    try:
+        cfg = resolve_chat_tts_config(tenant.settings.pipeline)
+        provider = cfg.provider if isinstance(cfg.provider, str) else ""
+        adapter_model = getattr(tts, "_model", None)
+        if isinstance(adapter_model, str) and adapter_model:
+            model = adapter_model
+        elif isinstance(cfg.model, str) and cfg.model:
+            model = cfg.model
+        else:
+            model = ""
+        return provider, model
+    except Exception:  # noqa: BLE001 - identity is diagnostic/billing metadata only
+        return "", ""
+
+
 async def _synthesize_reply_audio(
     tenant: TenantContext, text: str, language: str,
-) -> Optional[tuple[bytes, str, int]]:
-    """Synthesize a voice-note reply's audio. Returns
-    (audio_bytes, mime, duration_ms) on success, or ``None`` if synthesis
-    should simply be skipped this turn.
+) -> tuple[Optional[tuple[bytes, str, int]], Optional[_ReplyTTSUsage]]:
+    """Synthesize a voice-note reply's audio. Returns a
+    ``(audio_result, usage)`` pair: ``audio_result`` is
+    ``(audio_bytes, mime, duration_ms)`` on success or ``None`` if synthesis
+    should simply be skipped/failed this turn; ``usage`` is a
+    `_ReplyTTSUsage` for src/api/chat_cost.py's TTS cost lookup whenever the
+    provider was actually invoked (populated even when `audio_result` is
+    `None` due to a timeout/failure -- see `billed_unknown` below), or
+    `None` when TTS was never attempted at all (disabled/no provider/
+    empty or over-cap text).
 
-    ``None`` covers every non-fatal reason, all handled identically here
-    (log-and-skip) precisely because none of them should ever break the
-    turn — the text reply already went out (or is about to): empty/over-cap
-    text (see `_TTS_MAX_REPLY_CHARS`), no TTS provider registry wired at all
-    (`set_tts_providers` never called — fine, most deployments/tests don't
-    need chat audio replies), the tenant has not enabled
-    `pipeline.chat_voice.enabled`, neither `pipeline.chat_voice.tts` nor
-    `pipeline.tts` resolves a provider (`TenantProviders.get_chat_tts`
+    ``audio_result=None`` covers every non-fatal reason, all handled
+    identically here (log-and-skip) precisely because none of them should
+    ever break the turn — the text reply already went out (or is about to):
+    empty/over-cap text (see `_TTS_MAX_REPLY_CHARS`), no TTS provider
+    registry wired at all (`set_tts_providers` never called — fine, most
+    deployments/tests don't need chat audio replies), the tenant has not
+    enabled `pipeline.chat_voice.enabled`, neither `pipeline.chat_voice.tts`
+    nor `pipeline.tts` resolves a provider (`TenantProviders.get_chat_tts`
     returns `None` — no warning logged, this is the expected shape for most
     tenants), a synthesis timeout (`_TTS_SYNTH_TIMEOUT_S`), or any other
     provider exception (bad credentials, provider outage, ...). Only a
@@ -381,7 +452,7 @@ async def _synthesize_reply_audio(
         # speak. DEBUG only -- see the module-wide "uniform DEBUG" policy
         # this file's skip-instrumentation follows (no level promotion).
         log.debug("tts reply skipped: empty reply text", extra={"tenant_id": tenant.id})
-        return None
+        return None, None
     max_chars = _tts_max_reply_chars()
     if len(text) > max_chars:
         # This is the exact condition that produced a tenant-reported "voice
@@ -393,14 +464,19 @@ async def _synthesize_reply_audio(
         log.debug("tts reply skipped: reply exceeds max length for synthesis",
                   extra={"tenant_id": tenant.id, "reply_chars": len(text),
                          "max_chars": max_chars})
-        return None
+        return None, None
     if _tts_providers is None:
         # Process-level, not tenant-specific: no TenantProviders registry was
         # ever wired via set_tts_providers (most unit tests; a deployment
         # that never turns chat voice replies on anywhere).
         log.debug("tts reply skipped: no TTS provider registry wired for this process",
                   extra={"tenant_id": tenant.id})
-        return None
+        return None, None
+    # Set once the provider has actually been resolved (below) -- distinguishes
+    # "TTS never invoked" (identity stays None; nothing to bill or flag) from
+    # "provider was invoked but synthesis didn't complete" (identity set, but
+    # the try block below raised/timed out before a usable result came back).
+    identity: Optional[tuple[str, str]] = None
     try:
         # None = this tenant hasn't opted into chat voice replies, or has no
         # resolvable chat TTS config. Not a failure: no provider was built and
@@ -408,7 +484,8 @@ async def _synthesize_reply_audio(
         # DEBUG (see src/auth/registry.py) -- no need to duplicate that here.
         tts = _tts_providers.get_chat_tts(tenant)
         if tts is None:
-            return None
+            return None, None
+        identity = _chat_tts_identity(tenant, tts)
         result = await asyncio.wait_for(
             _synthesize_reply_audio_uncapped(tenant, text, language, tts),
             timeout=_TTS_SYNTH_TIMEOUT_S,
@@ -424,11 +501,12 @@ async def _synthesize_reply_audio(
                     reply_chars=len(text), max_chars=max_chars,
                     audio_bytes=len(result[0]) if result else 0,
                     audio_mime=result[1] if result else None,
-                    audio_duration_ms=result[2] if result else None)
-        return result
+                    audio_duration_ms=result[2] if result else None,
+                    tts_provider=identity[0], tts_model=identity[1])
+        return result, _ReplyTTSUsage(identity[0], identity[1], int(result[2]), False)
     except asyncio.CancelledError:
         raise
-    except Exception:  # noqa: BLE001 — audio is a nicety, the text reply is not
+    except Exception as exc:  # noqa: BLE001 — audio is a nicety, the text reply is not
         # Provider name is read purely for this log line's diagnostic value
         # (a config lookup, not a client build) -- it does not change what
         # gets returned. "configured but the provider raised" is exactly the
@@ -437,7 +515,23 @@ async def _synthesize_reply_audio(
         log.warning("tts reply synthesis failed; sending text-only reply",
                     extra={"tenant_id": tenant.id, "language": language,
                            "tts_provider": _provider}, exc_info=True)
-        return None
+        if identity is not None:
+            # The provider WAS actually invoked (identity was resolved before
+            # the timeout/raise) -- some providers still bill for a request
+            # that never returned usable audio, so this is recorded as a
+            # known-unknown (audio_ms=0, cost billed as $0 by the caller) with
+            # provider/model still populated, rather than silently dropped
+            # like the "never attempted" cases above.
+            log.warning(
+                "tts reply synthesis did not complete after the provider was "
+                "called; recording tts_audio_ms=0 tts_cost=0 -- the provider "
+                "may still bill for this request",
+                extra={"tenant_id": tenant.id, "tts_provider": identity[0],
+                       "tts_model": identity[1],
+                       "timed_out": isinstance(exc, asyncio.TimeoutError)},
+            )
+            return None, _ReplyTTSUsage(identity[0], identity[1], 0, True)
+        return None, None
 
 
 def _pcm16_to_wav(pcm: bytes, sample_rate: int) -> bytes:
@@ -618,6 +712,145 @@ async def _synthesize_reply_audio_uncapped(
             _pcm16_to_mp3, pcm, result.sample_rate, _TTS_REPLY_MP3_BITRATE_KBPS)
         mime = "audio/mpeg"
     return audio_bytes, mime, duration_ms
+
+
+def _inbound_audio_duration_ms(audio_bytes: bytes, mime: str) -> Optional[int]:
+    """Best-effort duration, in ms, of an inbound voice-note recording, for
+    src/api/chat_cost.py's STT-by-audio-minute fallback pricing.
+
+    Only WAV is decodable here (stdlib `wave`, no extra dependency): mp3/ogg/
+    other compressed formats a customer's device might actually send need a
+    real audio decoder library, which is not installed for this process --
+    those durations are genuinely unknown, an accepted gap, not a bug. Any
+    failure (unsupported mime, malformed/truncated audio, zero framerate)
+    returns ``None`` rather than raising -- an unpriceable duration must
+    degrade the STT cost estimate, never a live turn.
+    """
+    if mime not in ("audio/wav", "audio/x-wav", "audio/wave"):
+        return None
+    try:
+        with wave.open(io.BytesIO(audio_bytes)) as w:
+            framerate = w.getframerate()
+            if not framerate:
+                return None
+            return round(w.getnframes() / framerate * 1000)
+    except Exception:  # noqa: BLE001 - an unpriceable duration, not a turn failure
+        return None
+
+
+def _stt_usage_from_transcript(
+    transcript: Any, *, agent: Any, transcriber: Any, audio_bytes: bytes, mime: str,
+) -> _InboundSTTUsage:
+    """Build the `_InboundSTTUsage` for an inbound voice-note's transcription,
+    for src/api/chat_cost.py's `compute_chat_stt_cost`.
+
+    ``transcript`` is whatever the transcriber returned -- a `TranscriptText`
+    (src/interfaces/llm.py) when Gemini reported usage, or a plain `str` for
+    every other transcriber/path, in which case `.usage`/`.model` are simply
+    absent and this falls back to identity-only + audio-duration pricing.
+    """
+    usage = getattr(transcript, "usage", None)
+    usage = usage if isinstance(usage, dict) else {}
+    provider = getattr(agent, "_llm_provider", "")
+    provider = provider if isinstance(provider, str) else ""
+    model = getattr(transcript, "model", None)
+    if not (isinstance(model, str) and model):
+        model = getattr(transcriber, "_default_model", None)
+        model = model if isinstance(model, str) and model else ""
+    return _InboundSTTUsage(
+        provider=provider,
+        model=model,
+        audio_ms=_inbound_audio_duration_ms(audio_bytes, mime),
+        input_tokens=int(usage.get("prompt_tokens") or 0),
+        output_tokens=int(usage.get("completion_tokens") or 0),
+        cached_tokens=int(usage.get("cached_tokens") or 0),
+    )
+
+
+async def _price_voice_note_media(
+    tts_usage: Optional[_ReplyTTSUsage], stt_usage: Optional[_InboundSTTUsage],
+    *, session_id: str, ticket_id: Optional[str],
+) -> _VoiceNoteMediaCost:
+    """Compute this turn's platform-paid voice-note TTS/STT cost from the
+    usage `_synthesize_reply_audio`/`_stt_usage_from_transcript` collected.
+    Never raises -- a cost-computation failure must not affect a live turn or
+    its reply; any leg whose cost didn't compute cleanly comes back as 0.0
+    rather than leaving the turn's persistence blocked on it.
+
+    Runs on its own isolated DB session (matching `_persist_turn`'s existing
+    LLM-cost block) so a failure here can never poison a transaction some
+    other in-flight write is staged on.
+    """
+    if tts_usage is None and stt_usage is None:
+        return _VoiceNoteMediaCost()
+    tts_cost: Optional[float] = None
+    stt_cost: Optional[float] = None
+    try:
+        async with _sm()() as cost_db:
+            if tts_usage is not None:
+                tts_cost = 0.0 if tts_usage.billed_unknown else await compute_chat_tts_cost(
+                    cost_db, provider=tts_usage.provider, model=tts_usage.model,
+                    audio_ms=tts_usage.audio_ms,
+                )
+            if stt_usage is not None:
+                stt_cost = await compute_chat_stt_cost(
+                    cost_db, provider=stt_usage.provider, model=stt_usage.model,
+                    audio_ms=stt_usage.audio_ms, input_tokens=stt_usage.input_tokens,
+                    output_tokens=stt_usage.output_tokens, cached_tokens=stt_usage.cached_tokens,
+                )
+    except Exception:  # noqa: BLE001 — never let cost bookkeeping break a live turn
+        log.exception("voice-note media cost computation failed",
+                       extra={"ticket_id": ticket_id, "session_id": session_id})
+    debug_event(log, "chat voice_note_media_cost", session_id=session_id, ticket_id=ticket_id,
+                tts_cost=tts_cost, stt_cost=stt_cost)
+    return _VoiceNoteMediaCost(tts_cost=tts_cost, stt_cost=stt_cost)
+
+
+async def _record_turn_media_metrics(
+    result: ChatTurnResult, tts_usage: Optional[_ReplyTTSUsage],
+    stt_usage: Optional[_InboundSTTUsage], cost: _VoiceNoteMediaCost,
+    *, session_id: str, ticket_id: Optional[str],
+) -> None:
+    """UPDATE this turn's already-written ``chat_turn_metrics`` row (id =
+    ``result.metric_row_id``, written before TTS/STT ran -- see
+    ``ChatBotAgent._emit_turn_metric``) with the voice-note TTS/STT cost
+    fields computed by `_price_voice_note_media`. Never raises -- best-effort,
+    same contract as ``record_chat_turn_metric`` itself.
+    """
+    turn_id = getattr(result, "metric_row_id", None)
+    if not isinstance(turn_id, int) or isinstance(turn_id, bool) or (tts_usage is None and stt_usage is None):
+        debug_event(log, "chat voice_note_media_metrics skipped",
+                    session_id=session_id, ticket_id=ticket_id, turn_id=turn_id,
+                    has_tts_usage=tts_usage is not None, has_stt_usage=stt_usage is not None)
+        return
+    values: dict[str, Any] = {}
+    # Note: a `cost.tts_cost`/`cost.stt_cost` of 0.0 here is ambiguous -- it's
+    # written the same whether `_price_voice_note_media` priced a genuinely
+    # free computation or caught an exception and gave up on a real
+    # audio_ms > 0 usage; the two are only distinguishable via its "voice-note
+    # media cost computation failed" log line. Accepted, not fixed here.
+    if tts_usage is not None:
+        values["tts_provider"] = tts_usage.provider
+        values["tts_model"] = tts_usage.model
+        values["tts_audio_ms"] = tts_usage.audio_ms
+        values["tts_cost"] = cost.tts_cost or 0.0
+    if stt_usage is not None:
+        values["stt_audio_ms"] = stt_usage.audio_ms
+        values["stt_cost"] = cost.stt_cost or 0.0
+    async def _update_and_commit() -> None:
+        async with _sm()() as db:
+            await db.execute(update(ChatTurnMetric).where(ChatTurnMetric.id == turn_id).values(**values))
+            await db.commit()
+
+    try:
+        # Bounds the whole session (execute + commit), not just the execute --
+        # a stalled commit is just as capable of delaying the next WS message
+        # as a stalled execute.
+        await asyncio.wait_for(_update_and_commit(), timeout=_WS_FAILURE_RECORD_TIMEOUT_S)
+    except Exception:  # noqa: BLE001 — never let metrics bookkeeping break a live turn
+        log.warning("recording voice-note media cost on chat_turn_metrics failed",
+                    exc_info=True, extra={"ticket_id": ticket_id, "session_id": session_id,
+                                          "turn_id": turn_id})
 
 
 # Ceiling on processing one chat turn (LLM + tools + RAG). Without it a hung
@@ -2963,6 +3196,12 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
                             object_key = _media_key(tenant.id, session_id, mime)
                             # Upload to S3 and transcribe in parallel
                             transcript = ""
+                            # Set below when a transcriber actually ran, regardless of
+                            # whether it came back with usable text -- see
+                            # `_stt_usage_from_transcript`'s docstring. Stays None (no
+                            # STT cost to record) when there's no transcriber, or the
+                            # gather below raises before it returns.
+                            stt_usage: Optional[_InboundSTTUsage] = None
                             try:
                                 upload_coro = _media_store.upload(audio_bytes, object_key, mime.split(";")[0])
                                 _transcriber = getattr(agent, "_llm", None) or getattr(agent, "llm", None)
@@ -2971,6 +3210,24 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
                                         _transcriber.transcribe_audio(audio_bytes, mime.split(";")[0]),
                                         upload_coro,
                                     )
+                                    # transcript may be a TranscriptText
+                                    # (src/interfaces/llm.py) carrying provider usage for
+                                    # STT cost -- captured here, before stripping it back
+                                    # to a plain str so the subclass never reaches the DB
+                                    # or the agent below. Isolated in its own try/except
+                                    # (separate from the outer one) so a bug in this cost
+                                    # bookkeeping can never turn a transcription that
+                                    # actually succeeded into a customer-facing "Could
+                                    # not save voice message" error.
+                                    try:
+                                        stt_usage = _stt_usage_from_transcript(
+                                            transcript, agent=agent, transcriber=_transcriber,
+                                            audio_bytes=audio_bytes, mime=mime.split(";")[0])
+                                    except Exception:  # noqa: BLE001 — never let cost bookkeeping fail voice-note delivery
+                                        log.warning("stt usage extraction failed", exc_info=True, extra={
+                                            "ticket_id": ticket_id, "session_id": session_id})
+                                        stt_usage = None
+                                    transcript = str(transcript) if transcript else ""
                                 else:
                                     await upload_coro
                             except Exception:
@@ -3006,7 +3263,7 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
                                 reply_audio_data: Optional[str] = None
                                 reply_audio_mime: Optional[str] = None
                                 reply_audio_duration_ms: Optional[int] = None
-                                synthesized = await _synthesize_reply_audio(
+                                synthesized, tts_usage = await _synthesize_reply_audio(
                                     tenant, result.response.response_text, result.response.language)
                                 if synthesized is not None:
                                     reply_audio_bytes, reply_mime, reply_duration_ms = synthesized
@@ -3035,6 +3292,24 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
                                                 "inline audio_data still delivered",
                                                 extra={"ticket_id": ticket_id, "session_id": session_id},
                                                 exc_info=True)
+                                # Platform-paid voice-note TTS (this reply) + STT
+                                # (the inbound note, above) cost, priced now that both
+                                # legs' usage is known -- before persistence, so it can
+                                # ride the same _persist_turn call as the LLM token
+                                # cost, and before stopping the keepalive since a slow
+                                # rate lookup is exactly the kind of extra post-turn
+                                # processing time the keepalive exists to cover.
+                                try:
+                                    media_cost = await asyncio.wait_for(
+                                        _price_voice_note_media(
+                                            tts_usage, stt_usage, session_id=session_id, ticket_id=ticket_id),
+                                        timeout=_WS_FAILURE_RECORD_TIMEOUT_S,
+                                    )
+                                except asyncio.TimeoutError:
+                                    log.warning(
+                                        "voice-note media cost computation timed out",
+                                        extra={"ticket_id": ticket_id, "session_id": session_id})
+                                    media_cost = _VoiceNoteMediaCost()
                                 # Stop the keepalive now, before ANY customer-visible
                                 # frame goes out (audio_ack / the real reply) and
                                 # before any human-handoff escalation:
@@ -3054,6 +3329,7 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
                                     source_media_url=(audio_media_url or None),
                                     ticket_id=ticket_id,
                                     reply_media_mime=reply_media_mime, reply_media_url=reply_media_url,
+                                    tts_cost=media_cost.tts_cost or 0.0, stt_cost=media_cost.stt_cost or 0.0,
                                 )
                                 if persisted.customer_message_id is not None:
                                     await websocket.send_text(json.dumps({
@@ -3086,6 +3362,14 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
                                     audio_duration_ms=reply_audio_duration_ms,
                                     ticket_id=ticket_id,
                                 )
+                                # Attach the voice-note media cost to the
+                                # chat_turn_metrics row this turn already wrote (see
+                                # ChatTurnResult.metric_row_id) -- after the reply has
+                                # been sent, so a slow/stalled UPDATE can never delay
+                                # the customer-visible reply itself.
+                                await _record_turn_media_metrics(
+                                    result, tts_usage, stt_usage, media_cost,
+                                    session_id=session_id, ticket_id=ticket_id)
                                 if not delivered:
                                     # Leave the connection loop entirely — see
                                     # the identical comment on the
@@ -3104,6 +3388,17 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
                                 # below are the last customer-visible frames for
                                 # this branch, no interim message must arrive after.
                                 await _stop_keepalive(_ka, _ka_stop)
+                                # STT-only cost: no agent message / turn ran on this
+                                # branch, so there's no chat_turn_metrics row to attach
+                                # it to -- billed onto the session's running cost only
+                                # (accepted gap: undercounts ChatAnalytics' voice-note
+                                # STT breakdown, which is sourced from chat_turn_metrics
+                                # only). If the transcribe gather itself raised
+                                # (handled above, "Could not save voice message"),
+                                # stt_usage stays None and this leg's cost is lost
+                                # entirely -- also accepted, same section of the plan.
+                                media_cost = await _price_voice_note_media(
+                                    None, stt_usage, session_id=session_id, ticket_id=ticket_id)
                                 async with _sm()() as db:
                                     r = await db.get(ChatSession, session_id)
                                     if r:
@@ -3113,6 +3408,8 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
                                         )
                                         db.add(audio_msg)
                                         r.message_count = (r.message_count or 0) + 1
+                                        if media_cost.stt_cost:
+                                            r.cost = (r.cost or 0.0) + media_cost.stt_cost
                                         await db.flush()
                                         msg_id = audio_msg.id
                                         await db.commit()
@@ -3683,6 +3980,7 @@ async def _persist_turn(
     ticket_id: Optional[str] = None,
     reply_media_mime: Optional[str] = None, reply_media_url: Optional[str] = None,
     customer_message_id: Optional[int] = None,
+    tts_cost: float = 0.0, stt_cost: float = 0.0,
 ) -> PersistedTurnIds:
     """Append the customer + agent messages to chat_messages and bump the count.
 
@@ -3710,6 +4008,14 @@ async def _persist_turn(
     working unchanged whether the customer row was written here or earlier.
     ``user_text``/``user_type``/``media_mime``/``media_url``/``source_media_url``
     are then ignored — they describe a customer row this call does not create.
+
+    ``tts_cost``/``stt_cost`` are the platform-paid voice-note media costs for
+    this turn (see src/api/chat_cost.py's ``compute_chat_tts_cost``/
+    ``compute_chat_stt_cost``), already computed by the caller before this
+    call (voice-note TTS/STT pricing needs the synthesized audio's actual
+    duration / the transcription's usage, neither of which this function has
+    access to). Purely additive on top of the existing LLM token cost below —
+    every other call site passes neither and sees no behaviour change.
 
     Returns a ``PersistedTurnIds`` (both fields ``None`` on error or missing
     session)."""
@@ -3803,6 +4109,27 @@ async def _persist_turn(
                 except Exception:  # noqa: BLE001 — never let cost bookkeeping break persistence
                     log.exception("chat turn cost computation failed", extra={
                         "ticket_id": ticket_id, "session_id": session_id})
+            # Platform-paid voice-note TTS/STT cost, additive on top of the
+            # LLM token cost above -- already computed by the caller (see this
+            # function's docstring), so this is just bookkeeping, never a
+            # provider/DB call, and needs no isolated session of its own.
+            media_cost = (tts_cost or 0.0) + (stt_cost or 0.0)
+            if media_cost > 0:
+                agent_msg.cost = round((agent_msg.cost or 0.0) + media_cost, 6)
+                row.cost = (row.cost or 0.0) + media_cost
+                # The LLM cost block above is what normally sets
+                # input_tokens/output_tokens; when it was skipped (no
+                # llm_provider, zero tokens, or the cost lookup raised) they're
+                # still None here, and ChatAnalytics.total_cost
+                # (src/api/tenants.py's tenant_chat_analytics) filters on
+                # `input_tokens IS NOT NULL`, which would silently drop this
+                # row's cost from the sum even though it's now non-zero.
+                # Stamp 0/0 (never real token data) so the row lands in the
+                # "unknown"/0-token bucket and is counted.
+                if agent_msg.input_tokens is None:
+                    agent_msg.input_tokens = 0
+                if agent_msg.output_tokens is None:
+                    agent_msg.output_tokens = 0
             await db.flush()
             # Already known (and already committed by the caller) when
             # pre-persisted; only a fresh customer_msg has an id to read here.

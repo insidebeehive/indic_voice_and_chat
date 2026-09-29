@@ -31,7 +31,9 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from src.api import chat as chat_api
 from src.models.chat import ChatMessage, ChatSession
+from src.models.chat_turn_metrics import ChatTurnMetric
 from src.models.database import Base
+from src.models.tenant import ProviderCost
 
 
 def _make_pcm16(num_samples: int = 400, *, sample_rate: int = 16000) -> bytes:
@@ -81,6 +83,11 @@ class _FakeTurnResult:
     llm_provider: str = ""
     llm_model: str = ""
     metrics: object = None
+    # id of a pre-seeded chat_turn_metrics row (real ChatBotAgent instances
+    # populate this via _emit_turn_metric; this fake stands in for the whole
+    # agent, so tests that want to observe _record_turn_media_metrics's
+    # UPDATE set this to a row they inserted themselves).
+    metric_row_id: Optional[int] = None
 
 
 class _FakeTTSResult:
@@ -151,7 +158,7 @@ class _FakeTTSProviders:
         return self.provider
 
 
-def _make_fake_tenant(*, pronunciation_overrides=None):
+def _make_fake_tenant(*, pronunciation_overrides=None, tts_provider=None, tts_model=None):
     tenant = MagicMock()
     tenant.id = "t1"
     tenant.slug = "demo"
@@ -161,6 +168,16 @@ def _make_fake_tenant(*, pronunciation_overrides=None):
     # MagicMock — unlike most attributes here this one is real production
     # code, not mocked away.
     tenant.settings.pronunciation_overrides = pronunciation_overrides
+    # For cost tests: `resolve_chat_tts_config` (real production code, not
+    # mocked) reads `pipeline.chat_voice.tts.provider` truthily -- any
+    # MagicMock passes that check -- and returns the whole sub-object, so
+    # setting real strings here is what makes `_chat_tts_identity`
+    # (src/api/chat.py) resolve a real (provider, model) instead of "" via
+    # its isinstance(..., str) guard against a bare MagicMock attribute.
+    if tts_provider is not None:
+        tenant.settings.pipeline.chat_voice.tts.provider = tts_provider
+    if tts_model is not None:
+        tenant.settings.pipeline.chat_voice.tts.model = tts_model
     return tenant
 
 
@@ -201,25 +218,46 @@ async def ws_ctx():
     await engine.dispose()
 
 
-def _send_audio_and_collect(fake_tenant, *, extra_frames_expected: int = 0):
+def _send_audio_and_collect(
+    fake_tenant, *, extra_frames_expected: int = 0,
+    audio_bytes: bytes = b"fake_audio_data", mime: str = "audio/webm;codecs=opus",
+    settle: bool = False,
+):
     """Connects, sends one base64 audio frame, and returns the parsed frames
-    up to and including the `message` reply (typing, audio_ack, message)."""
+    up to and including the `message` reply (typing, audio_ack, message).
+
+    ``settle=True`` sends one more trivial text message (and waits for ITS
+    typing+reply) before closing the socket. Needed only by tests that read
+    DB state written AFTER the reply is sent -- `_record_turn_media_metrics`
+    (src/api/chat.py) deliberately runs post-reply, so TestClient's
+    websocket_connect exiting immediately after the reply frame can cancel
+    that still-in-flight write. On the shared-StaticPool sqlite `:memory:`
+    engine these tests use, that cancellation can tear down the pool's one
+    live connection and silently reset the whole in-memory DB for the rest
+    of the test (a "no such table" error from an unrelated later query is
+    the symptom). Sending one more message and waiting for its reply forces
+    the connection handler back to a `receive()` point, which is only
+    reached once every prior await of the previous turn — media
+    pricing/persistence/metrics UPDATE included — has completed."""
     import src.auth.middleware as mw
 
     with patch.object(mw, "tenant_from_id", AsyncMock(return_value=fake_tenant)):
         app = FastAPI()
         app.include_router(chat_api.router, prefix="/api/v1")
         client = TestClient(app)
-        audio_bytes = b"fake_audio_data"
         encoded = base64.b64encode(audio_bytes).decode()
         frames = []
         with client.websocket_connect("/api/v1/chat/ws/sess1") as ws:
             ws.send_text(json.dumps({
-                "type": "audio", "data": encoded, "mime": "audio/webm;codecs=opus",
+                "type": "audio", "data": encoded, "mime": mime,
             }))
             # typing, audio_ack, message (the reply) — always in this order.
             for _ in range(3 + extra_frames_expected):
                 frames.append(json.loads(ws.receive_text()))
+            if settle:
+                ws.send_text(json.dumps({"type": "message", "text": "settle"}))
+                ws.receive_text()  # typing
+                ws.receive_text()  # reply
         return frames
 
 
@@ -856,3 +894,270 @@ async def test_mp3_encoder_failure_falls_back_to_text_only(ws_ctx):
     # Only the inbound recording was uploaded — encoding never produced
     # bytes for the reply to upload.
     assert len(media_store.uploaded) == 1
+
+
+# --- Voice-note TTS/STT platform-paid cost (Phase 1 of the chat-cost-
+# widening plan) --------------------------------------------------------
+
+
+def _make_wav_bytes(*, num_samples: int = 32000, sample_rate: int = 16000) -> bytes:
+    """A real, decodable WAV clip (stdlib `wave`) with a KNOWN duration, for
+    `_inbound_audio_duration_ms`'s STT-audio-minute-fallback tests below.
+    32000 samples @ 16kHz = exactly 2000ms."""
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(sample_rate)
+        w.writeframes(_make_pcm16(num_samples, sample_rate=sample_rate))
+    return buf.getvalue()
+
+
+async def _seed_provider_costs(sm, rows: list[ProviderCost]) -> None:
+    async with sm() as db:
+        db.add_all(rows)
+        await db.commit()
+
+
+async def _seed_chat_turn_metric_row(sm) -> int:
+    """A minimal pre-existing chat_turn_metrics row, standing in for the one
+    a real ChatBotAgent._emit_turn_metric would already have written before
+    TTS/STT ran (see ChatTurnResult.metric_row_id). Tests set
+    `_FakeTurnResult.metric_row_id` to this id so they can observe
+    `_record_turn_media_metrics`'s UPDATE."""
+    async with sm() as db:
+        row = ChatTurnMetric(
+            tenant_id="t1", session_id="sess1", path="single_shot",
+            llm_provider="gemini", llm_model="gemini-3.5-flash", action="reply",
+        )
+        db.add(row)
+        await db.flush()
+        row_id = row.id
+        await db.commit()
+    return row_id
+
+
+@pytest.mark.asyncio
+async def test_tts_cost_flows_into_message_session_and_metrics_row(ws_ctx):
+    """A successful voice-note reply's TTS cost must land on the agent's
+    ChatMessage.cost, the ChatSession's running .cost, AND the tts_* columns
+    of the chat_turn_metrics row this turn wrote."""
+    sm, media_store, fake_agent = ws_ctx
+    await _seed_provider_costs(sm, [
+        ProviderCost(kind="tts", provider="sarvam", model="bulbul:v3", cost_per_min=0.006),
+    ])
+    turn_id = await _seed_chat_turn_metric_row(sm)
+    fake_agent.handle_message = AsyncMock(
+        return_value=_FakeTurnResult(
+            response=_FakeResp(response_text="yahan hai", language="hi"),
+            metric_row_id=turn_id,
+        ))
+
+    raw_pcm = _make_pcm16(sample_rate=16000)  # 400 samples @16kHz = 25ms
+    provider = _FakeTTSProvider(audio=raw_pcm, sample_rate=16000)
+    chat_api.set_tts_providers(_FakeTTSProviders(provider))
+
+    fake_tenant = _make_fake_tenant(tts_provider="sarvam", tts_model="bulbul:v3")
+    frames = _send_audio_and_collect(fake_tenant, settle=True)
+    reply = frames[2]
+    assert reply["type"] == "message"
+    # 400 samples @ 16kHz = 400 / 16000 = 0.025s = 25ms -- pinned as a literal
+    # (not just derived from itself below) so a regression in the
+    # duration computation can't pass by having expected_cost drift with it.
+    assert reply["audio_duration_ms"] == 25
+    expected_cost = round(0.006 * reply["audio_duration_ms"] / 60_000.0, 6)
+    assert expected_cost > 0
+
+    async with sm() as db:
+        # .scalars().first(), ordered by id, not .scalar_one() -- the
+        # settle=True round trip (see _send_audio_and_collect) writes a
+        # SECOND agent ChatMessage row (its own trivial text reply); the
+        # audio turn under test always inserts first.
+        agent_row = (await db.execute(
+            select(ChatMessage).where(ChatMessage.session_id == "sess1", ChatMessage.role == "agent")
+            .order_by(ChatMessage.id)
+        )).scalars().first()
+        session_row = await db.get(ChatSession, "sess1")
+        metric_row = await db.get(ChatTurnMetric, turn_id)
+
+    assert agent_row.cost == pytest.approx(expected_cost)
+    assert session_row.cost == pytest.approx(expected_cost)
+    assert metric_row.tts_provider == "sarvam"
+    assert metric_row.tts_model == "bulbul:v3"
+    assert metric_row.tts_audio_ms == reply["audio_duration_ms"]
+    assert metric_row.tts_cost == pytest.approx(expected_cost)
+    # The fake agent's own transcriber ran too (real inbound voice notes
+    # always get transcribed alongside a TTS reply) -- it just has no
+    # resolvable provider identity (a bare MagicMock agent has no
+    # _llm_provider str), and the mime sent isn't WAV, so STT priced to $0
+    # with an unknown duration rather than staying untouched/NULL.
+    assert metric_row.stt_audio_ms is None
+    assert metric_row.stt_cost == 0.0
+
+
+@pytest.mark.asyncio
+async def test_tts_timeout_records_zero_audio_ms_zero_cost_and_warns(ws_ctx, monkeypatch, caplog):
+    """A TTS call that times out after the provider was invoked must leave
+    tts_audio_ms=0 and tts_cost=0.0 on the metrics row (NOT NULL -- see
+    migration 0028's "billed unknown" semantics), with provider/model still
+    recorded, and must log the "may still bill" warning."""
+    sm, media_store, fake_agent = ws_ctx
+    await _seed_provider_costs(sm, [
+        ProviderCost(kind="tts", provider="sarvam", model="bulbul:v3", cost_per_min=0.006),
+    ])
+    turn_id = await _seed_chat_turn_metric_row(sm)
+    fake_agent.handle_message = AsyncMock(
+        return_value=_FakeTurnResult(
+            response=_FakeResp(response_text="answer", language="hi"),
+            metric_row_id=turn_id,
+        ))
+
+    monkeypatch.setattr(chat_api, "_TTS_SYNTH_TIMEOUT_S", 0.05)
+    provider = _FakeTTSProvider(hang_s=5.0)
+    chat_api.set_tts_providers(_FakeTTSProviders(provider))
+
+    fake_tenant = _make_fake_tenant(tts_provider="sarvam", tts_model="bulbul:v3")
+    with caplog.at_level("WARNING", logger="src.api.chat"):
+        frames = _send_audio_and_collect(fake_tenant, settle=True)
+    reply = frames[2]
+    assert reply["type"] == "message"
+    assert "audio_url" not in reply  # text-only reply, as before
+
+    async with sm() as db:
+        # .scalars().first(), ordered by id, not .scalar_one() -- the
+        # settle=True round trip (see _send_audio_and_collect) writes a
+        # SECOND agent ChatMessage row (its own trivial text reply); the
+        # audio turn under test always inserts first.
+        agent_row = (await db.execute(
+            select(ChatMessage).where(ChatMessage.session_id == "sess1", ChatMessage.role == "agent")
+            .order_by(ChatMessage.id)
+        )).scalars().first()
+        session_row = await db.get(ChatSession, "sess1")
+        metric_row = await db.get(ChatTurnMetric, turn_id)
+
+    assert (agent_row.cost or 0.0) == 0.0
+    assert (session_row.cost or 0.0) == 0.0
+    assert metric_row.tts_provider == "sarvam"
+    assert metric_row.tts_model == "bulbul:v3"
+    assert metric_row.tts_audio_ms == 0
+    assert metric_row.tts_cost == 0.0
+    assert any("may still bill" in rec.message for rec in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_tts_disabled_leaves_tts_fields_null_on_metrics_row(ws_ctx):
+    """No TTS provider registry wired at all -- TTS was never attempted, so
+    the metrics row's tts_* columns must stay NULL (not 0), distinguishing
+    "never ran" from the timeout case above."""
+    sm, media_store, fake_agent = ws_ctx
+    turn_id = await _seed_chat_turn_metric_row(sm)
+    fake_agent.handle_message = AsyncMock(
+        return_value=_FakeTurnResult(
+            response=_FakeResp(response_text="answer", language="hi"),
+            metric_row_id=turn_id,
+        ))
+    # ws_ctx never called chat_api.set_tts_providers -- _tts_providers is None.
+
+    fake_tenant = _make_fake_tenant()
+    frames = _send_audio_and_collect(fake_tenant, settle=True)
+    assert frames[2]["type"] == "message"
+
+    async with sm() as db:
+        metric_row = await db.get(ChatTurnMetric, turn_id)
+    assert metric_row.tts_provider is None
+    assert metric_row.tts_model is None
+    assert metric_row.tts_audio_ms is None
+    assert metric_row.tts_cost is None
+
+
+@pytest.mark.asyncio
+async def test_stt_cost_from_token_usage_flows_into_cost_and_metrics_row(ws_ctx):
+    """When the transcriber reports token usage (Gemini's TranscriptText —
+    src/interfaces/llm.py), STT cost must be computed via the per-token path
+    and land on chat_messages.cost / chat_sessions.cost / the metrics row."""
+    sm, media_store, fake_agent = ws_ctx
+    await _seed_provider_costs(sm, [
+        ProviderCost(kind="llm", provider="gemini", model="gemini-3.5-flash",
+                     cost_per_1k_input_tokens=0.0003, cost_per_1k_output_tokens=0.0025),
+    ])
+    turn_id = await _seed_chat_turn_metric_row(sm)
+    fake_agent.handle_message = AsyncMock(
+        return_value=_FakeTurnResult(
+            response=_FakeResp(response_text="answer", language="hi"),
+            metric_row_id=turn_id,
+        ))
+    fake_agent._llm_provider = "gemini"
+
+    from src.interfaces.llm import TranscriptText
+    transcript = TranscriptText(
+        "hello there", usage={"prompt_tokens": 1000, "completion_tokens": 0}, model="gemini-3.5-flash")
+    fake_agent.llm.transcribe_audio = AsyncMock(return_value=transcript)
+
+    # No TTS provider configured -- isolates this test to the STT leg only.
+    fake_tenant = _make_fake_tenant()
+    frames = _send_audio_and_collect(fake_tenant, settle=True)
+    assert frames[2]["type"] == "message"
+
+    expected_cost = round(1000 / 1000.0 * 0.0003, 6)
+    assert expected_cost > 0
+    async with sm() as db:
+        # .scalars().first(), ordered by id, not .scalar_one() -- the
+        # settle=True round trip (see _send_audio_and_collect) writes a
+        # SECOND agent ChatMessage row (its own trivial text reply); the
+        # audio turn under test always inserts first.
+        agent_row = (await db.execute(
+            select(ChatMessage).where(ChatMessage.session_id == "sess1", ChatMessage.role == "agent")
+            .order_by(ChatMessage.id)
+        )).scalars().first()
+        session_row = await db.get(ChatSession, "sess1")
+        metric_row = await db.get(ChatTurnMetric, turn_id)
+
+    assert agent_row.cost == pytest.approx(expected_cost)
+    assert session_row.cost == pytest.approx(expected_cost)
+    assert metric_row.stt_cost == pytest.approx(expected_cost)
+    assert metric_row.stt_audio_ms is None  # token-priced -- duration unknown/unused
+
+
+@pytest.mark.asyncio
+async def test_stt_cost_from_wav_duration_fallback_flows_into_cost_and_metrics_row(ws_ctx):
+    """When the transcriber reports no usage at all (a plain str, or a
+    provider that never reports usage), STT cost must fall back to the WAV
+    duration * per-minute rate path (`_inbound_audio_duration_ms`)."""
+    sm, media_store, fake_agent = ws_ctx
+    await _seed_provider_costs(sm, [
+        ProviderCost(kind="stt", provider="sarvam", model="", cost_per_min=0.02),
+    ])
+    turn_id = await _seed_chat_turn_metric_row(sm)
+    fake_agent.handle_message = AsyncMock(
+        return_value=_FakeTurnResult(
+            response=_FakeResp(response_text="answer", language="hi"),
+            metric_row_id=turn_id,
+        ))
+    fake_agent._llm_provider = "sarvam"
+    fake_agent.llm.transcribe_audio = AsyncMock(return_value="hello there")  # plain str, no usage
+    fake_agent.llm._default_model = None  # keep model "" -- provider-level fallback row
+
+    wav_bytes = _make_wav_bytes(num_samples=32000, sample_rate=16000)  # exactly 2000ms
+    fake_tenant = _make_fake_tenant()
+    frames = _send_audio_and_collect(fake_tenant, audio_bytes=wav_bytes, mime="audio/wav", settle=True)
+    assert frames[2]["type"] == "message"
+
+    # 2000ms @ $0.02/min -> 0.02 * 2000/60000 = 0.0006666...
+    expected_cost = round(0.02 * 2000 / 60_000.0, 6)
+    assert expected_cost > 0
+    async with sm() as db:
+        # .scalars().first(), ordered by id, not .scalar_one() -- the
+        # settle=True round trip (see _send_audio_and_collect) writes a
+        # SECOND agent ChatMessage row (its own trivial text reply); the
+        # audio turn under test always inserts first.
+        agent_row = (await db.execute(
+            select(ChatMessage).where(ChatMessage.session_id == "sess1", ChatMessage.role == "agent")
+            .order_by(ChatMessage.id)
+        )).scalars().first()
+        session_row = await db.get(ChatSession, "sess1")
+        metric_row = await db.get(ChatTurnMetric, turn_id)
+
+    assert agent_row.cost == pytest.approx(expected_cost)
+    assert session_row.cost == pytest.approx(expected_cost)
+    assert metric_row.stt_audio_ms == 2000
+    assert metric_row.stt_cost == pytest.approx(expected_cost)

@@ -9,7 +9,13 @@ import pytest_asyncio
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from src.api import chat_cost
-from src.api.chat_cost import compute_chat_turn_cost, token_rates
+from src.api.chat_cost import (
+    compute_chat_stt_cost,
+    compute_chat_tts_cost,
+    compute_chat_turn_cost,
+    minute_rate,
+    token_rates,
+)
 from src.auth.seed import seed_provider_costs
 from src.models.database import Base
 from src.models.tenant import ProviderCost
@@ -360,3 +366,119 @@ async def test_priced_row_emits_no_warning(sm, caplog) -> None:
             await token_rates(s, "gemini", "gemini-3.5-flash")
 
     assert caplog.records == []
+
+
+# --- Voice-note media cost: minute_rate / compute_chat_tts_cost /
+# compute_chat_stt_cost (Phase 1 of the chat-cost-widening plan) -----------
+
+
+@pytest_asyncio.fixture
+async def media_sm():
+    """Separate fixture (not `sm` above) so tts/stt rows don't collide with
+    the llm-kind rows the token-rate tests build their own expectations on."""
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:", future=True)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    async with maker() as s:
+        s.add_all([
+            ProviderCost(kind="tts", provider="sarvam", model="bulbul:v3", cost_per_min=0.006),
+            ProviderCost(kind="tts", provider="elevenlabs", model="", cost_per_min=0.10),
+            # Zero-rated row -- must fall back to $0 + a "zero_rated" warning,
+            # same as the llm-kind rows above.
+            ProviderCost(kind="tts", provider="freetts", model="model-a", cost_per_min=0.0),
+            ProviderCost(kind="stt", provider="sarvam", model="", cost_per_min=0.02),
+        ])
+        await s.commit()
+    yield maker
+    await engine.dispose()
+
+
+async def test_minute_rate_exact_row(media_sm):
+    async with media_sm() as s:
+        rate = await minute_rate(s, "tts", "sarvam", "bulbul:v3")
+    assert rate == pytest.approx(0.006)
+
+
+async def test_minute_rate_falls_back_to_provider_level(media_sm, caplog):
+    with caplog.at_level(logging.DEBUG, logger="src.api.chat_cost"):
+        async with media_sm() as s:
+            rate = await minute_rate(s, "tts", "elevenlabs", "eleven_flash_v2_5")
+    assert rate == pytest.approx(0.10)
+    debug_records = [r for r in caplog.records if r.levelno == logging.DEBUG]
+    assert any(
+        "minute_rate resolved" in r.getMessage() and getattr(r, "used_fallback", None) is True
+        for r in debug_records
+    )
+
+
+async def test_minute_rate_unknown_provider_returns_zero_and_warns_once(media_sm, caplog):
+    with caplog.at_level(logging.WARNING):
+        async with media_sm() as s:
+            rate1 = await minute_rate(s, "tts", "ghostprovider", "ghost-model")
+            rate2 = await minute_rate(s, "tts", "ghostprovider", "ghost-model")
+    assert rate1 == 0.0 and rate2 == 0.0
+    assert len(caplog.records) == 1
+    assert "kind=tts" in caplog.records[0].message
+    assert "provider=ghostprovider" in caplog.records[0].message
+
+
+async def test_minute_rate_zero_rated_row_returns_zero_and_warns(media_sm, caplog):
+    with caplog.at_level(logging.WARNING):
+        async with media_sm() as s:
+            rate = await minute_rate(s, "tts", "freetts", "model-a")
+    assert rate == 0.0
+    assert any("prices" in r.message and "cost_per_min" in r.message for r in caplog.records)
+
+
+async def test_compute_chat_tts_cost_math(media_sm):
+    async with media_sm() as s:
+        # 90 seconds = 90,000ms at $0.006/min -> 0.006 * 90000/60000 = 0.009
+        cost = await compute_chat_tts_cost(s, provider="sarvam", model="bulbul:v3", audio_ms=90_000)
+    assert cost == pytest.approx(0.009)
+
+
+async def test_compute_chat_tts_cost_zero_or_missing_inputs(media_sm):
+    async with media_sm() as s:
+        assert await compute_chat_tts_cost(s, provider="", model="x", audio_ms=1000) == 0.0
+        assert await compute_chat_tts_cost(s, provider="sarvam", model="bulbul:v3", audio_ms=0) == 0.0
+        assert await compute_chat_tts_cost(s, provider="sarvam", model="bulbul:v3", audio_ms=-5) == 0.0
+
+
+async def test_compute_chat_stt_cost_with_tokens_matches_turn_cost(sm):
+    """When token usage is available (Gemini), STT pricing must delegate to
+    the existing per-token compute_chat_turn_cost path exactly."""
+    async with sm() as s:
+        stt_cost = await compute_chat_stt_cost(
+            s, provider="gemini", model="gemini-3.5-flash",
+            input_tokens=1000, output_tokens=500,
+        )
+        turn_cost = await compute_chat_turn_cost(
+            s, provider="gemini", model="gemini-3.5-flash",
+            input_tokens=1000, output_tokens=500,
+        )
+    assert stt_cost == turn_cost == pytest.approx(0.00155)
+
+
+async def test_compute_chat_stt_cost_without_tokens_uses_audio_minute_rate(media_sm):
+    async with media_sm() as s:
+        # 30s at $0.02/min -> 0.02 * 30000/60000 = 0.01
+        cost = await compute_chat_stt_cost(
+            s, provider="sarvam", model="", audio_ms=30_000,
+        )
+    assert cost == pytest.approx(0.01)
+
+
+async def test_compute_chat_stt_cost_no_tokens_no_duration_warns_unpriced(media_sm, caplog):
+    with caplog.at_level(logging.WARNING):
+        async with media_sm() as s:
+            cost1 = await compute_chat_stt_cost(s, provider="sarvam", model="whatever")
+            cost2 = await compute_chat_stt_cost(s, provider="sarvam", model="whatever")
+    assert cost1 == 0.0 and cost2 == 0.0
+    unpriced = [r for r in caplog.records if "neither token usage nor a known audio duration" in r.message]
+    assert len(unpriced) == 1, "second call for the same combo must not re-warn"
+
+
+async def test_compute_chat_stt_cost_no_provider_returns_zero(media_sm):
+    async with media_sm() as s:
+        assert await compute_chat_stt_cost(s, provider="", model="x", audio_ms=1000) == 0.0

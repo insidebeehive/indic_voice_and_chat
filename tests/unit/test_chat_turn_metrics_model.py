@@ -4,6 +4,7 @@ test_turn_metrics_model.py's shape."""
 
 from __future__ import annotations
 
+import pytest
 import pytest_asyncio
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -302,3 +303,92 @@ async def test_chat_turn_metric_orm_defaults_token_counts_to_zero(sessionmaker) 
     assert fetched.input_tokens == 0
     assert fetched.output_tokens == 0
     assert fetched.cached_tokens == 0
+
+
+# --- record_chat_turn_metric's return value + the new tts_*/stt_* columns
+# (migration 0028, voice-note media cost) -----------------------------------
+
+
+async def test_record_chat_turn_metric_returns_the_new_row_id(sessionmaker, monkeypatch) -> None:
+    monkeypatch.setattr("src.models.chat_turn_metrics.get_sessionmaker", lambda: sessionmaker)
+
+    row_id = await record_chat_turn_metric(
+        tenant_id="dev", crm_id="betstudio", session_id="chat_ret1", trace_id=None,
+        path="tools", llm_provider="p", llm_model="m", action="continue",
+        metrics=_metrics_dict(), tools=_tools(),
+    )
+
+    assert isinstance(row_id, int)
+    async with sessionmaker() as db:
+        row = await db.get(ChatTurnMetric, row_id)
+    assert row is not None
+    assert row.session_id == "chat_ret1"
+
+
+async def test_record_chat_turn_metric_returns_none_on_db_failure(monkeypatch) -> None:
+    def _broken_sessionmaker():
+        raise RuntimeError("db unavailable")
+
+    monkeypatch.setattr("src.models.chat_turn_metrics.get_sessionmaker", _broken_sessionmaker)
+
+    rv = await record_chat_turn_metric(
+        tenant_id="dev", crm_id=None, session_id="chat_y", trace_id=None,
+        path="single_shot", llm_provider="p", llm_model="m", action="continue",
+        metrics=_metrics_dict(), tools=[],
+    )
+    assert rv is None
+
+
+async def test_new_tts_stt_columns_default_to_null(sessionmaker, monkeypatch) -> None:
+    """A row written via record_chat_turn_metric (which never sets these --
+    they're written by a later UPDATE from src/api/chat.py) must leave every
+    tts_*/stt_* column NULL, not 0 -- see migration 0028's NULL/0 semantics."""
+    monkeypatch.setattr("src.models.chat_turn_metrics.get_sessionmaker", lambda: sessionmaker)
+
+    row_id = await record_chat_turn_metric(
+        tenant_id="dev", crm_id=None, session_id="chat_media_null", trace_id=None,
+        path="single_shot", llm_provider="p", llm_model="m", action="continue",
+        metrics=_metrics_dict(), tools=[],
+    )
+    async with sessionmaker() as db:
+        row = await db.get(ChatTurnMetric, row_id)
+
+    assert row.tts_provider is None
+    assert row.tts_model is None
+    assert row.tts_audio_ms is None
+    assert row.tts_cost is None
+    assert row.stt_audio_ms is None
+    assert row.stt_cost is None
+
+
+async def test_tts_stt_columns_round_trip_when_set(sessionmaker) -> None:
+    """A direct UPDATE (mirroring src/api/chat.py's
+    _record_turn_media_metrics) must persist all six columns, including the
+    "billed unknown" (audio_ms=0, cost=0.0, provider/model set) shape."""
+    async with sessionmaker() as db:
+        row = ChatTurnMetric(**_TURN_DEFAULTS_NO_TOKENS)
+        db.add(row)
+        await db.flush()
+        row_id = row.id
+        await db.commit()
+
+    from sqlalchemy import update
+
+    async with sessionmaker() as db:
+        await db.execute(
+            update(ChatTurnMetric).where(ChatTurnMetric.id == row_id).values(
+                tts_provider="sarvam", tts_model="bulbul:v3", tts_audio_ms=0, tts_cost=0.0,
+                stt_audio_ms=1500, stt_cost=0.0006,
+            )
+        )
+        await db.commit()
+
+    async with sessionmaker() as db:
+        fetched = await db.get(ChatTurnMetric, row_id)
+
+    assert fetched.tts_provider == "sarvam"
+    assert fetched.tts_model == "bulbul:v3"
+    assert fetched.tts_audio_ms == 0
+    assert fetched.tts_cost == 0.0
+    assert fetched.stt_audio_ms == 1500
+    assert fetched.stt_cost == pytest.approx(0.0006)

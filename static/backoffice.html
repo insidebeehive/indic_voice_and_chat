@@ -314,6 +314,21 @@ async function loadAnalytics(id) {
       (ca.cache_metrics_since ? ` since ${escT(String(ca.cache_metrics_since).slice(0, 10))}` : "") + `)</span>`
     : `<span class="hint">no cache data yet</span>`;
 
+  // Voice-note TTS/STT cost is a breakdown of the Total cost stat above, not
+  // an addition to it -- see ChatAnalytics.total_tts_cost/total_stt_cost's
+  // own comment in src/api/tenants.py. Same coverage-hint shape as
+  // cacheHtml above (sourced from the same chat_turn_metrics table, with the
+  // same ~90-day retention window), so a zero-turn tenant reads as "no data
+  // yet" rather than a misleading "$0.0000".
+  const ttsHtml = ca && ca.media_cost_turns > 0
+    ? `${fmt(ca.total_tts_cost)} <span class="hint">(of which, based on ${ca.media_cost_turns} turn${ca.media_cost_turns === 1 ? "" : "s"}` +
+      (ca.media_cost_since ? ` since ${escT(String(ca.media_cost_since).slice(0, 10))}` : "") + `)</span>`
+    : `<span class="hint">no voice-note media cost data yet</span>`;
+  const sttHtml = ca && ca.media_cost_turns > 0
+    ? `${fmt(ca.total_stt_cost)} <span class="hint">(of which, based on ${ca.media_cost_turns} turn${ca.media_cost_turns === 1 ? "" : "s"}` +
+      (ca.media_cost_since ? ` since ${escT(String(ca.media_cost_since).slice(0, 10))}` : "") + `)</span>`
+    : `<span class="hint">no voice-note media cost data yet</span>`;
+
   const modelRows = ca && ca.by_model && ca.by_model.length
     ? `<div class="metrics-wrap"><table class="metrics">
         <thead><tr><th>Provider</th><th>Model</th><th class="n">Messages</th><th class="n">Input tokens</th>
@@ -361,6 +376,8 @@ async function loadAnalytics(id) {
       ${statBox("Total input tokens", ca.total_input_tokens)}
       ${statBox("Total output tokens", ca.total_output_tokens)}
       ${statBox("Total cost (est.)", fmt(ca.total_cost))}
+      ${statBox("of which voice-note TTS", ttsHtml)}
+      ${statBox("of which voice-note STT", sttHtml)}
       ${statBox("Cache-hit rate", cacheHtml)}
     </div>
     <div style="margin:.4rem 0 .2rem;">${coverageHtml}</div>
@@ -368,7 +385,9 @@ async function loadAnalytics(id) {
       rate table, not the provider's billing figure — it (and the token totals above) only reflect messages that
       carried token data (see coverage note above), so totals below full coverage are a floor, not the complete
       spend. Cache-hit rate is computed from a separate table (chat turn metrics) with its own, different coverage —
-      shown in its own stat above — which is not available for older history.</div>
+      shown in its own stat above — which is not available for older history. The voice-note TTS/STT stats above are
+      already included in Total cost (est.) — they are a breakdown, not an addition — and are sourced from that same
+      chat turn metrics table, so they only cover the trailing ~90 days of retained turns.</div>
     <h3 style="margin:1rem 0 .5rem;font-size:.85rem;color:#cbd5e1;">By model</h3>
     ${modelRows}` : "";
 

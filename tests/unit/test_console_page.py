@@ -109,6 +109,34 @@ async def test_backoffice_chat_analytics_shows_tokens_cost_and_cache_coverage() 
 
 
 @pytest.mark.asyncio
+async def test_backoffice_chat_analytics_shows_voice_note_media_cost_breakdown() -> None:
+    """The voice-note TTS/STT cost "of which" breakdown (Phase 1 of the
+    chat-cost-widening plan) must be wired into loadAnalytics' chatHtml
+    block, gated on media_cost_turns the same way the cache-hit rate is
+    gated on cache_metrics_turns above -- so a zero-turn tenant reads as "no
+    data yet", not a misleading $0.0000."""
+    transport = ASGITransport(app=_app())
+    async with AsyncClient(transport=transport, base_url="http://test") as c:
+        resp = await c.get("/admin/tenants")
+    body = resp.text
+
+    assert "ca.total_tts_cost" in body
+    assert "ca.total_stt_cost" in body
+    assert "ca.media_cost_turns" in body
+    assert "ca.media_cost_since" in body
+
+    import re
+    assert re.search(
+        r"ca\.media_cost_turns\s*>\s*0\s*\?\s*`\$\{fmt\(ca\.total_tts_cost\)\}.*?"
+        r":\s*`<span[^`]*no voice-note media cost data yet</span>`",
+        body, re.S,
+    ), "TTS cost must be gated on media_cost_turns, with an explicit no-data fallback"
+
+    # Already included in Total cost, not an addition -- stated explicitly.
+    assert "already included in Total cost" in body
+
+
+@pytest.mark.asyncio
 async def test_backoffice_voice_pickers_replace_free_text() -> None:
     """The three voice fields (chat TTS, call TTS, realtime) must be
     catalog-backed <select> pickers, not free-text inputs an operator has to

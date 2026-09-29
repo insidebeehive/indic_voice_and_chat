@@ -21,7 +21,7 @@ from typing import Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field, ValidationError
-from sqlalchemy import case, func, select
+from sqlalchemy import case, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.answer_paths import answer_url_for
@@ -1876,7 +1876,15 @@ class ChatModelCost(BaseModel):
     fields fall back to "unknown" rather than emitting a null key — a chat
     message written before ``llm_provider``/``llm_model`` were populated on
     every write path leaves both NULL, and a dict keyed by null would either
-    collide across tenants or force the frontend to special-case it."""
+    collide across tenants or force the frontend to special-case it.
+
+    ``cost`` now also includes platform-paid voice-note TTS/STT cost for
+    audio turns (``_persist_turn`` in src/api/chat.py adds it onto the same
+    ``chat_messages.cost`` this bucket sums) — this breakdown is keyed by the
+    turn's LLM provider/model, not the (possibly different) TTS/STT
+    provider, so it is not a pure LLM-token cost view for a tenant with audio
+    replies. See ``ChatAnalytics.total_tts_cost``/``total_stt_cost`` for the
+    voice-note-specific slice."""
     llm_provider: str
     llm_model: str
     input_tokens: int
@@ -1933,6 +1941,29 @@ class ChatAnalytics(BaseModel):
     cache_hit_rate_pct: float
     cache_metrics_turns: int
     cache_metrics_since: Optional[datetime]
+    # --- voice-note media cost (of which) --------------------------------
+    # An additive BREAKDOWN of total_cost above, not an extra cost on top of
+    # it: total_cost already includes voice-note TTS/STT cost, since
+    # _persist_turn (src/api/chat.py) adds it onto the same
+    # chat_messages.cost this endpoint sums into total_cost. Never render
+    # total_cost + total_tts_cost + total_stt_cost in the UI — that would
+    # double-count.
+    #
+    # Sourced from chat_turn_metrics (tts_cost/stt_cost, migration 0028), NOT
+    # chat_messages, for the same reason cache_hit_rate_pct above is:
+    # chat_turn_metrics is pruned after CHAT_METRICS_RETENTION_DAYS (default
+    # 90, src/config.py) while chat_messages is not, so this covers only the
+    # trailing ~90 days AND only turns whose metrics row was written (a turn
+    # that raised/timed out before ChatTurnMetric insert writes no row at
+    # all — see that module's own "known, accepted gap" docstring). Both
+    # gaps mean this can UNDERCOUNT the true voice-note share of total_cost.
+    # media_cost_turns/media_cost_since disambiguate "0" (no voice-note cost
+    # in the covered window) from "no data at all" — same
+    # cache_metrics_turns/cache_metrics_since pattern above.
+    total_tts_cost: float = 0.0
+    total_stt_cost: float = 0.0
+    media_cost_turns: int = 0
+    media_cost_since: Optional[datetime] = None
 
 
 @router.get("/{tenant_id}/chat-analytics", response_model=ChatAnalytics)
@@ -2051,6 +2082,20 @@ async def tenant_chat_analytics(
         round(turn_cached_sum * 100 / turn_input_sum, 1) if turn_input_sum else 0.0
     )
 
+    # Voice-note TTS/STT cost breakdown (migration 0028) — same single
+    # aggregate-row shape as the cache-metrics query above, filtered to rows
+    # that actually carry a media cost (either leg) rather than every turn,
+    # so media_cost_turns counts audio turns, not all turns.
+    tts_cost_sum, stt_cost_sum, media_turn_count, media_since = (await session.execute(
+        select(
+            func.sum(ChatTurnMetric.tts_cost), func.sum(ChatTurnMetric.stt_cost),
+            func.count(), func.min(ChatTurnMetric.created_at),
+        ).where(
+            ChatTurnMetric.tenant_id == tenant_id,
+            or_(ChatTurnMetric.tts_cost.isnot(None), ChatTurnMetric.stt_cost.isnot(None)),
+        )
+    )).one()
+
     return ChatAnalytics(
         tenant_id=tenant_id,
         total_sessions=n,
@@ -2070,6 +2115,10 @@ async def tenant_chat_analytics(
         cache_hit_rate_pct=cache_hit_rate_pct,
         cache_metrics_turns=turn_count,
         cache_metrics_since=turn_since,
+        total_tts_cost=round(float(tts_cost_sum or 0.0), 6),
+        total_stt_cost=round(float(stt_cost_sum or 0.0), 6),
+        media_cost_turns=int(media_turn_count or 0),
+        media_cost_since=media_since,
     )
 
 

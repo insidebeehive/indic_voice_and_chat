@@ -518,3 +518,93 @@ async def test_reply_length_survives_to_the_chat_turn_metrics_row(
     assert row.reply_chars is not None and row.reply_words is not None
     assert row.reply_chars == result.metrics.reply_chars
     assert row.reply_words == result.metrics.reply_words
+
+
+async def test_metric_row_id_flows_through_a_real_write(
+    retriever, chat_metrics_db, monkeypatch,
+) -> None:
+    """ChatTurnResult.metric_row_id must equal the ACTUAL inserted row's id
+    when record_metric is the real record_chat_turn_metric write path -- this
+    is what src/api/chat.py's _record_turn_media_metrics keys its post-turn
+    voice-note TTS/STT cost UPDATE on."""
+    monkeypatch.setattr(
+        "src.models.chat_turn_metrics.get_sessionmaker", lambda: chat_metrics_db,
+    )
+    llm = ScriptedLLM([LLMResult(text="Plan B has 500GB unlimited data.", finish_reason="stop")])
+    agent = ChatBotAgent(
+        session=AgentSession(session_id="cb-metric-row-id"), llm=llm, retriever=retriever,
+        company_name="Acme", language_default="en",
+        session_id="sess-metric-row-id",
+        record_metric=lambda payload: record_chat_turn_metric(
+            tenant_id="dev", crm_id="betstudio", **payload),
+    )
+    result = await agent.handle_message("Tell me about Plan B")
+
+    async with chat_metrics_db() as db:
+        rows = (await db.execute(select(ChatTurnMetric))).scalars().all()
+    assert len(rows) == 1
+    assert result.metric_row_id == rows[0].id
+
+
+async def test_metric_row_id_none_when_record_metric_not_injected(retriever) -> None:
+    """No record_metric callback at all (most unit tests, and any
+    deployment/tenant that never wires one) -- metric_row_id must be None,
+    not raise."""
+    llm = ScriptedLLM([LLMResult(text="ok", finish_reason="stop")])
+    agent = ChatBotAgent(
+        session=AgentSession(session_id="cb-no-metric"), llm=llm, retriever=retriever,
+        company_name="Acme", language_default="en", session_id="sess-no-metric",
+    )
+    result = await agent.handle_message("hi")
+    assert result.metric_row_id is None
+
+
+async def test_metric_row_id_none_when_record_metric_returns_non_int(retriever) -> None:
+    """A test double / misbehaving callback that returns something other
+    than a real int (None, a bool, a MagicMock) must come back as
+    metric_row_id=None from _emit_turn_metric, never surface that value
+    directly -- see _emit_turn_metric's isinstance(rv, int) and not
+    isinstance(rv, bool) guard."""
+    async def weird_record_metric(payload):
+        return True  # a bool IS an int in Python -- must still be rejected
+
+    llm = ScriptedLLM([LLMResult(text="ok", finish_reason="stop")])
+    agent = ChatBotAgent(
+        session=AgentSession(session_id="cb-weird-metric"), llm=llm, retriever=retriever,
+        company_name="Acme", language_default="en", session_id="sess-weird-metric",
+        record_metric=weird_record_metric,
+    )
+    result = await agent.handle_message("hi")
+    assert result.metric_row_id is None
+
+
+async def test_emit_turn_metric_returns_int_row_id_directly(retriever) -> None:
+    """Direct unit test of _emit_turn_metric's return value (not just via
+    ChatTurnResult): an int comes back unchanged."""
+    async def fake_record_metric(payload):
+        return 42
+
+    llm = ScriptedLLM([])
+    agent = _agent(llm, retriever, record_metric=fake_record_metric)
+    from src.agents.chatbot import ChatTurnMetrics
+
+    metrics = ChatTurnMetrics(
+        trace_id=None, path="single_shot", llm_provider="p", llm_model="m",
+        action="none", total_ms=1, llm_total_ms=1, llm_calls=1,
+        input_tokens=0, output_tokens=0, cached_tokens=0,
+        tool_total_ms=0, tool_calls=0, tool_failures=0, tool_timeouts=0,
+        tool_calls_skipped=0, kb_search_ms=0, kb_searches=0, retrieved_chunks=0,
+        rounds=0, rounds_exhausted=False, retry_fired=False,
+        failure_directive_fired=False, failure_directive_escalated=False,
+        guard_hallucination_fired=False, guard_no_grounding_fired=False,
+        guard_unverified_data_fired=False, escalated=False,
+        reply_chars=1, reply_words=1,
+    )
+    rv = await agent._emit_turn_metric(metrics)
+    assert rv == 42
+
+
+async def test_emit_turn_metric_returns_none_for_none_metrics(retriever) -> None:
+    llm = ScriptedLLM([])
+    agent = _agent(llm, retriever, record_metric=RecordingMetric())
+    assert await agent._emit_turn_metric(None) is None

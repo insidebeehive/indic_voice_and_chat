@@ -55,6 +55,80 @@ async def test_persist_turn_returns_customer_msg_id(db_session):
 
 
 @pytest.mark.asyncio
+async def test_persist_turn_tts_stt_cost_defaults_leave_behavior_unchanged(db_session):
+    """Every pre-existing call site passes neither tts_cost nor stt_cost --
+    must behave exactly as before this feature (agent_msg.cost/session.cost
+    stay at their LLM-token-cost value, 0.0 here since _FakeResult has no
+    llm_provider)."""
+    from sqlalchemy import select
+    from src.models.chat import ChatSession
+
+    await chat_api._persist_turn("s1", "hello", _FakeResult())
+    async with db_session() as db:
+        agent_row = (await db.execute(
+            select(ChatMessage).where(ChatMessage.session_id == "s1", ChatMessage.role == "agent")
+        )).scalar_one()
+        session_row = await db.get(ChatSession, "s1")
+    assert (agent_row.cost or 0.0) == 0.0
+    assert (session_row.cost or 0.0) == 0.0
+
+
+@pytest.mark.asyncio
+async def test_persist_turn_tts_stt_cost_add_additively_to_agent_and_session_cost(db_session):
+    """tts_cost/stt_cost must land on BOTH the agent ChatMessage.cost and the
+    ChatSession's running .cost, additively (on top of any LLM token cost --
+    _FakeResult reports none here, isolating the media-cost addition)."""
+    from sqlalchemy import select
+    from src.models.chat import ChatSession
+
+    persisted = await chat_api._persist_turn(
+        "s1", "hello", _FakeResult(), tts_cost=0.002, stt_cost=0.0015,
+    )
+    async with db_session() as db:
+        agent_row = await db.get(ChatMessage, persisted.agent_message_id)
+        session_row = await db.get(ChatSession, "s1")
+    assert agent_row.cost == pytest.approx(0.0035)
+    assert session_row.cost == pytest.approx(0.0035)
+
+
+@pytest.mark.asyncio
+async def test_persist_turn_media_cost_stamps_zero_tokens_when_llm_block_skipped(db_session):
+    """When the LLM cost block is skipped (no llm_provider / 0 tokens, as
+    _FakeResult here), input_tokens/output_tokens are left None by that block.
+    A priced voice-note media cost must stamp them to 0 (not leave them None)
+    so this row lands in ChatAnalytics.total_cost's `input_tokens IS NOT NULL`
+    filter -- see src/api/tenants.py's tenant_chat_analytics -- instead of
+    having its cost silently excluded from that sum."""
+    persisted = await chat_api._persist_turn(
+        "s1", "hello", _FakeResult(), tts_cost=0.01, stt_cost=0.0,
+    )
+    async with db_session() as db:
+        agent_row = await db.get(ChatMessage, persisted.agent_message_id)
+    assert agent_row.input_tokens is not None
+    assert agent_row.input_tokens == 0
+    assert agent_row.output_tokens == 0
+    assert agent_row.cost == pytest.approx(0.01)
+
+
+@pytest.mark.asyncio
+async def test_persist_turn_media_cost_adds_on_top_of_existing_session_cost(db_session):
+    """A session that already has a running .cost (from an earlier turn) must
+    see the new turn's tts_cost/stt_cost ADDED, not overwrite it."""
+    from sqlalchemy import select
+    from src.models.chat import ChatSession
+
+    async with db_session() as db:
+        row = await db.get(ChatSession, "s1")
+        row.cost = 0.01
+        await db.commit()
+
+    await chat_api._persist_turn("s1", "hello", _FakeResult(), tts_cost=0.003, stt_cost=0.0)
+    async with db_session() as db:
+        session_row = await db.get(ChatSession, "s1")
+    assert session_row.cost == pytest.approx(0.013)
+
+
+@pytest.mark.asyncio
 async def test_persist_turn_missing_session_logs_debug_and_writes_nothing(db_session, caplog):
     """A vanished/nonexistent chat_sessions row used to make an entire turn's
     transcript (both the customer's message and the reply) disappear with

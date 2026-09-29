@@ -906,6 +906,12 @@ class ChatTurnResult:
     # see _single_shot/_handle_with_tools). None only when metrics assembly
     # itself failed; a turn is never blocked on this.
     metrics: ChatTurnMetrics | None = None
+    # id of the chat_turn_metrics row this turn wrote (via _emit_turn_metric),
+    # so the caller (src/api/chat.py) can attach post-turn voice-note
+    # TTS/STT cost to it with an UPDATE once synthesis/transcription usage is
+    # known. None when no metrics row was written (record_metric not
+    # injected, metrics assembly failed, or the write itself failed).
+    metric_row_id: int | None = None
 
 
 class ChatBotAgent(BaseAgent):
@@ -1050,7 +1056,7 @@ class ChatBotAgent(BaseAgent):
         # failed on 2 turns running.
         self._consecutive_category_failures: dict[str, int] = {}
 
-    async def _emit_turn_metric(self, metrics: ChatTurnMetrics | None) -> None:
+    async def _emit_turn_metric(self, metrics: ChatTurnMetrics | None) -> int | None:
         """Persist ``metrics`` via the injected ``record_metric`` callback
         (turn-metrics plan §4), if one was supplied and turn-metrics assembly
         actually succeeded this turn. Two layers of protection against a
@@ -1076,11 +1082,18 @@ class ChatBotAgent(BaseAgent):
         computed reply cancelled and discarded, a failure mode that did not
         exist before this write path (``_persist_turn``'s own DB write runs
         strictly after that wrapper returns).
+
+        Returns the new ``chat_turn_metrics`` row's id (``ChatTurnResult.
+        metric_row_id``) when the write succeeded and the callback reported
+        one back, else ``None`` -- including when ``record_metric`` returns
+        something that isn't a real ``int`` (e.g. a ``MagicMock`` test
+        double), since ``isinstance(x, bool)`` is itself an ``int`` in Python
+        and must not be mistaken for a row id.
         """
         if self._record_metric is None or metrics is None:
-            return
+            return None
         try:
-            await asyncio.wait_for(self._record_metric({
+            rv = await asyncio.wait_for(self._record_metric({
                 "session_id": self._session_id or "",
                 "trace_id": metrics.trace_id,
                 "path": metrics.path,
@@ -1123,11 +1136,13 @@ class ChatBotAgent(BaseAgent):
                     for t in metrics.tools
                 ],
             }), timeout=_RECORD_METRIC_TIMEOUT_S)
+            return rv if isinstance(rv, int) and not isinstance(rv, bool) else None
         except Exception:  # noqa: BLE001 - never break a live turn on a metrics-write failure
             # Catches asyncio.TimeoutError (from the wait_for above) the same
             # way as any other metrics-write failure -- a slow/stalled DB
             # write degrades to "no row, one WARNING", never an errored turn.
             log.warning("record_metric failed; continuing without persistence", exc_info=True)
+            return None
 
     async def handle_message(self, user_text: str) -> ChatTurnResult:
         if not user_text or not user_text.strip():
@@ -1326,13 +1341,13 @@ class ChatBotAgent(BaseAgent):
                 "escalated": escalated_flag,
             },
         )
-        await self._emit_turn_metric(metrics)
+        metric_row_id = await self._emit_turn_metric(metrics)
         return ChatTurnResult(
             response=response, retrieved=retrieved, rag_context_chars=len(rag.text),
             escalation=escalation,
             input_tokens=in_tok, output_tokens=out_tok,
             llm_provider=self._llm_provider, llm_model=self._llm_model,
-            metrics=metrics)
+            metrics=metrics, metric_row_id=metric_row_id)
 
     # --- Tool-calling path (agentic) -----------------------------------
 
@@ -1945,13 +1960,13 @@ class ChatBotAgent(BaseAgent):
                 "action": response.action,
             },
         )
-        await self._emit_turn_metric(metrics)
+        metric_row_id = await self._emit_turn_metric(metrics)
         return ChatTurnResult(
             response=response, retrieved=retrieved_all, rag_context_chars=len(rag.text),
             escalation=escalation, call_offer=call_offer,
             input_tokens=in_tok, output_tokens=out_tok,
             llm_provider=self._llm_provider, llm_model=self._llm_model,
-            metrics=metrics)
+            metrics=metrics, metric_row_id=metric_row_id)
 
     async def _exec_tool(self, tc: ToolCall, timeout_s: float):
         """Bound a tool call's dispatch to its budget slice.

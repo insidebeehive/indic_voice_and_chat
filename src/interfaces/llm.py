@@ -108,6 +108,20 @@ class ILLMProvider(ABC):
         """Stream response tokens."""
 
 
+class TranscriptText(str):
+    """A transcript str that also carries provider-reported usage (for chat cost).
+
+    Every caller other than src/api/chat.py's voice-note STT cost computation
+    treats this as a plain str — do not rely on the extra attributes elsewhere.
+    """
+
+    def __new__(cls, text: str, *, usage: Optional[dict] = None, model: str = ""):
+        obj = super().__new__(cls, text)
+        obj.usage = dict(usage or {})
+        obj.model = model
+        return obj
+
+
 def is_llm_spending_cap_error(exc: Exception) -> bool:
     """True if ``exc`` is a 429 caused by a monthly *spending cap*, as opposed
     to an ordinary rate/quota-exhaustion 429.

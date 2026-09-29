@@ -645,6 +645,42 @@ async def test_transcribe_audio_returns_empty_on_failure() -> None:
     assert await adapter.transcribe_audio(b"x", "audio/mpeg") == ""
 
 
+@pytest.mark.asyncio
+async def test_transcribe_audio_success_returns_transcript_text_with_usage() -> None:
+    """The success path must return a `TranscriptText` (src/interfaces/llm.py)
+    -- a str subclass, so it still string-compares/concatenates like the
+    plain str every OTHER caller (telephony_hooks.py, calls.py) expects --
+    that also carries the provider's reported usage + model, for
+    src/api/chat.py's voice-note STT cost computation."""
+    from src.interfaces.llm import TranscriptText
+
+    client = _make_client(generate_return=_response(
+        "नमस्ते, transcript", prompt_tokens=42, completion_tokens=7, cached_tokens=3))
+    adapter = GeminiLLMAdapter({"client": client})
+    out = await adapter.transcribe_audio(b"\xff\xe3audio-bytes", "audio/mpeg")
+    assert isinstance(out, TranscriptText)
+    assert out == "नमस्ते, transcript"          # str-equality still holds
+    assert out.usage == {"prompt_tokens": 42, "completion_tokens": 7, "cached_tokens": 3}
+    assert out.model == adapter._default_model
+
+
+@pytest.mark.asyncio
+async def test_transcribe_audio_failure_returns_plain_empty_str() -> None:
+    """The failure path returns a plain "" (not a TranscriptText with empty
+    usage) -- `_stt_usage_from_transcript` in src/api/chat.py relies on
+    `getattr(transcript, "usage", None)` being absent here, same as any
+    other plain str."""
+    from unittest.mock import AsyncMock
+    from src.interfaces.llm import TranscriptText
+
+    client = _make_client()
+    client.aio.models.generate_content = AsyncMock(side_effect=RuntimeError("boom"))
+    adapter = GeminiLLMAdapter({"client": client})
+    out = await adapter.transcribe_audio(b"x", "audio/mpeg")
+    assert out == ""
+    assert not isinstance(out, TranscriptText)
+
+
 # --- Multimodal content (Phase 0) --------------------------------------
 
 

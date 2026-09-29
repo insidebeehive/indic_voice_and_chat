@@ -19,6 +19,7 @@ actually applies to a cache hit.
 from __future__ import annotations
 
 import logging
+from typing import Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -169,3 +170,116 @@ async def compute_chat_turn_cost(
         + (output_tokens / 1000.0 * out_rate)
     )
     return round(cost, 6)
+
+
+# --- Platform-paid voice-note media cost (Phase 1 of the chat-cost-widening
+# plan; Phase 2, KB embeddings, is out of scope here) -----------------------
+#
+# A voice-note reply's TTS synthesis and an inbound voice-note's STT
+# transcription are both platform-paid legs with no chat_messages.cost
+# entry today -- compute_chat_turn_cost only ever saw LLM tokens. These two
+# helpers price them:
+#   - TTS (voice-note replies): always per audio minute (``kind="tts"``) —
+#     there is no token concept for synthesized audio.
+#   - STT (inbound voice-note transcription): per token when the provider
+#     reports usage (Gemini does — delegates to compute_chat_turn_cost, the
+#     existing token-rate path), else per audio minute (``kind="stt"``) as a
+#     fallback for a provider/path that reports no usage at all.
+
+
+async def minute_rate(session: AsyncSession, kind: str, provider: str, model: str) -> float:
+    """``cost_per_min`` for ``(kind, provider, model)``; falls back to the
+    provider-level ("") row, same pattern as ``token_rates`` above (and
+    ``call_store._rate``). ``kind`` is "tts" or "stt".
+    """
+    row = await session.get(ProviderCost, (kind, provider, model or ""))
+    used_fallback = False
+    if model and (row is None or not row.cost_per_min):
+        fallback = await session.get(ProviderCost, (kind, provider, ""))
+        if fallback is not None:
+            row = fallback
+            used_fallback = True
+    if log.isEnabledFor(logging.DEBUG):
+        debug_event(
+            log, "chat_cost minute_rate resolved",
+            kind=kind, provider=provider, model=model, used_fallback=used_fallback,
+            row_found=row is not None,
+            rate=row.cost_per_min if row is not None else None,
+        )
+    if row is None:
+        key = (kind, provider, model)
+        if key not in _warned_rate_misses:
+            _warned_rate_misses.add(key)
+            log.warning(
+                "no ProviderCost row for kind=%s provider=%s model=%s (nor its "
+                "provider-level fallback) -- billing this voice-note leg at "
+                "$0.0 until a row is added (further warnings for this "
+                "combination suppressed for this process)",
+                kind, provider, model,
+            )
+        return 0.0
+    if not row.cost_per_min:
+        key = (kind, provider, model, "zero_rated")
+        if key not in _warned_rate_misses:
+            _warned_rate_misses.add(key)
+            log.warning(
+                "ProviderCost row for kind=%s provider=%s model=%s prices "
+                "cost_per_min at $0.0 -- correct only if this model is "
+                "genuinely free; otherwise the row was added without its "
+                "rate (further warnings for this combination suppressed for "
+                "this process)",
+                kind, provider, model,
+            )
+        return 0.0
+    return row.cost_per_min
+
+
+async def compute_chat_tts_cost(
+    session: AsyncSession, *, provider: str, model: str, audio_ms: int,
+) -> float:
+    """Platform-billed cost for one voice-note reply's TTS synthesis."""
+    if not provider or not audio_ms or audio_ms <= 0:
+        return 0.0
+    rate = await minute_rate(session, "tts", provider, model)
+    return round(rate * audio_ms / 60_000.0, 6)
+
+
+async def compute_chat_stt_cost(
+    session: AsyncSession,
+    *,
+    provider: str,
+    model: str,
+    audio_ms: Optional[int] = None,
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+    cached_tokens: int = 0,
+) -> float:
+    """Platform-billed cost for one inbound voice-note's STT transcription.
+
+    Prefers token-based pricing (Gemini reports usage on transcribe_audio —
+    see ``TranscriptText`` in ``src/interfaces/llm.py``), falling back to
+    per-audio-minute pricing when no token usage is available.
+    """
+    if not provider:
+        return 0.0
+    if input_tokens or output_tokens:
+        return await compute_chat_turn_cost(
+            session, provider=provider, model=model,
+            input_tokens=input_tokens, output_tokens=output_tokens,
+            cached_tokens=cached_tokens,
+        )
+    if audio_ms and audio_ms > 0:
+        rate = await minute_rate(session, "stt", provider, model)
+        return round(rate * audio_ms / 60_000.0, 6)
+    key = ("stt", provider, model, "unpriced")
+    if key not in _warned_rate_misses:
+        _warned_rate_misses.add(key)
+        log.warning(
+            "inbound voice-note transcription for provider=%s model=%s has "
+            "neither token usage nor a known audio duration -- billing this "
+            "leg at $0.0 (further warnings for this combination suppressed "
+            "for this process)",
+            provider, model,
+        )
+    debug_event(log, "chat_cost stt unpriced", provider=provider, model=model)
+    return 0.0

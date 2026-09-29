@@ -30,6 +30,7 @@ from src.interfaces.llm import (
     LLMMessage,
     LLMResult,
     ToolCall,
+    TranscriptText,
     is_llm_spending_cap_error,
 )
 from src.utils.logging import debug_event
@@ -796,7 +797,7 @@ class GeminiLLMAdapter(ILLMProvider):
                 what="transcribe")
             text = self._extract_text(response) or ""
             debug_event(log, "gemini transcribe_audio response", text=text)
-            return text
+            return TranscriptText(text, usage=self._extract_usage(response), model=self._default_model)
         except Exception:  # noqa: BLE001 - transcription failure must not crash finalize
             log.exception("gemini audio transcription failed")
             return ""

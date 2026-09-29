@@ -1155,6 +1155,118 @@ async def test_chat_analytics_pre_migration_turn_rows_dont_count_as_cache_covera
     assert ca["cached_tokens"] == 0
 
 
+async def test_chat_analytics_voice_note_media_cost_breakdown(ctx) -> None:
+    """total_tts_cost/total_stt_cost/media_cost_turns/media_cost_since (Phase
+    1 of the chat-cost-widening plan) must sum ChatTurnMetric.tts_cost/
+    stt_cost, scoped to the tenant, counting only rows with either cost set
+    -- and a second tenant's rows must never leak in."""
+    client, _, sm = ctx
+    tid = (await client.post("/tenants", json=_body(slug="acme"), headers=ADMIN_HEADERS)).json()["tenant_id"]
+    other_body = _body(slug="other")
+    other_body["telephony"]["from_number"] = "+15705255680"
+    other_body["telephony"]["phone_numbers"] = ["+15705255680"]
+    other_tid = (await client.post("/tenants", json=other_body, headers=ADMIN_HEADERS)).json()["tenant_id"]
+
+    from src.models.chat_turn_metrics import ChatTurnMetric
+
+    async with sm() as s:
+        # A TTS-only row.
+        s.add(ChatTurnMetric(
+            tenant_id=tid, session_id="cs1", path="single_shot", llm_provider="gemini",
+            llm_model="gemini-3.5-flash", action="reply",
+            tts_provider="sarvam", tts_model="bulbul:v3", tts_audio_ms=3000, tts_cost=0.0003,
+            created_at=datetime(2026, 9, 15, 10, 0, 0),
+        ))
+        # An STT-only row (token-priced -- stt_audio_ms left NULL).
+        s.add(ChatTurnMetric(
+            tenant_id=tid, session_id="cs2", path="single_shot", llm_provider="gemini",
+            llm_model="gemini-3.5-flash", action="reply",
+            stt_cost=0.00015,
+            created_at=datetime(2026, 9, 16, 10, 0, 0),
+        ))
+        # A row with neither -- must not count toward media_cost_turns.
+        s.add(ChatTurnMetric(
+            tenant_id=tid, session_id="cs3", path="single_shot", llm_provider="gemini",
+            llm_model="gemini-3.5-flash", action="reply",
+        ))
+        # Another tenant's media-cost row -- must never leak into tid's totals.
+        s.add(ChatTurnMetric(
+            tenant_id=other_tid, session_id="cs-other", path="single_shot",
+            llm_provider="gemini", llm_model="gemini-3.5-flash", action="reply",
+            tts_cost=99.0, stt_cost=99.0,
+        ))
+        await s.commit()
+
+    ca = (await client.get(f"/tenants/{tid}/chat-analytics", headers=ADMIN_HEADERS)).json()
+    assert ca["total_tts_cost"] == pytest.approx(0.0003)
+    assert ca["total_stt_cost"] == pytest.approx(0.00015)
+    assert ca["media_cost_turns"] == 2   # cs1 and cs2, not cs3
+    assert ca["media_cost_since"].startswith("2026-09-15")
+
+
+async def test_chat_analytics_total_cost_includes_zero_token_voice_note_row(ctx) -> None:
+    """A turn with no LLM tokens (llm_provider empty / 0 tokens) but a priced
+    voice-note TTS+STT cost: _persist_turn (src/api/chat.py) stamps
+    input_tokens/output_tokens to 0 (not leaving them NULL) precisely so this
+    ChatMessage row is included in total_cost's `input_tokens IS NOT NULL`
+    filter -- otherwise total_tts_cost + total_stt_cost (sourced from
+    chat_turn_metrics) could exceed total_cost (sourced from chat_messages),
+    breaking the documented "of which" relationship between the two. This
+    seeds both tables the way a real turn would post-fix and checks that
+    relationship end to end."""
+    client, _, sm = ctx
+    tid = (await client.post("/tenants", json=_body(slug="acme"), headers=ADMIN_HEADERS)).json()["tenant_id"]
+
+    from src.models.chat import ChatMessage, ChatSession
+    from src.models.chat_turn_metrics import ChatTurnMetric
+
+    async with sm() as s:
+        s.add(ChatSession(id="s1", tenant_id=tid, status="ended", message_count=2))
+        s.add(ChatMessage(session_id="s1", role="customer", type="audio", content="[audio]"))
+        # No llm_provider/tokens (LLM cost block skipped this turn) -- as
+        # _persist_turn's media-cost fix now stamps input_tokens/output_tokens
+        # to 0 rather than leaving them NULL, so this row is counted.
+        s.add(ChatMessage(
+            session_id="s1", role="agent", type="audio", content="reply",
+            input_tokens=0, output_tokens=0, cost=0.00045,
+        ))
+        s.add(ChatTurnMetric(
+            tenant_id=tid, session_id="s1", path="single_shot", llm_provider="gemini",
+            llm_model="gemini-3.5-flash", action="reply",
+            tts_provider="sarvam", tts_model="bulbul:v3", tts_audio_ms=3000, tts_cost=0.0003,
+            stt_cost=0.00015,
+        ))
+        await s.commit()
+
+    ca = (await client.get(f"/tenants/{tid}/chat-analytics", headers=ADMIN_HEADERS)).json()
+    assert ca["total_cost"] == pytest.approx(0.00045)
+    assert ca["total_tts_cost"] == pytest.approx(0.0003)
+    assert ca["total_stt_cost"] == pytest.approx(0.00015)
+    assert ca["total_cost"] >= ca["total_tts_cost"] + ca["total_stt_cost"]
+    assert ca["total_cost"] >= ca["total_tts_cost"]
+    assert ca["total_cost"] >= ca["total_stt_cost"]
+
+
+async def test_chat_analytics_media_cost_zero_when_no_data(ctx) -> None:
+    """No chat_turn_metrics rows with either cost set -- must report 0.0/0,
+    not raise, and media_cost_since must stay None (distinguishing "no
+    voice-note turns" from "$0 across some turns")."""
+    client, _, sm = ctx
+    tid = (await client.post("/tenants", json=_body(slug="acme"), headers=ADMIN_HEADERS)).json()["tenant_id"]
+
+    from src.models.chat import ChatSession
+
+    async with sm() as s:
+        s.add(ChatSession(id="s1", tenant_id=tid, status="ended", message_count=1))
+        await s.commit()
+
+    ca = (await client.get(f"/tenants/{tid}/chat-analytics", headers=ADMIN_HEADERS)).json()
+    assert ca["total_tts_cost"] == 0.0
+    assert ca["total_stt_cost"] == 0.0
+    assert ca["media_cost_turns"] == 0
+    assert ca["media_cost_since"] is None
+
+
 async def test_tenant_analytics_unknown_404(ctx) -> None:
     client, _, _ = ctx
     assert (await client.get("/tenants/nope/analytics", headers=ADMIN_HEADERS)).status_code == 404

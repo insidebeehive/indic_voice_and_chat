@@ -71,7 +71,7 @@ import logging
 from datetime import datetime
 from typing import Any, Optional
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, String, func
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, Integer, String, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from src.models.database import Base, get_sessionmaker
@@ -195,6 +195,27 @@ class ChatTurnMetric(Base):
     # while a NULL correctly doesn't.
     reply_chars: Mapped[Optional[int]] = mapped_column(Integer)
     reply_words: Mapped[Optional[int]] = mapped_column(Integer)
+    # Platform-paid voice-note media cost (migration 0028). Written by a
+    # post-turn UPDATE from src/api/chat.py's _record_turn_media_metrics --
+    # NOT by record_chat_turn_metric below, since TTS synthesis happens after
+    # this row is first inserted (chat.py threads the row's id back via
+    # ChatTurnResult.metric_row_id to make that UPDATE possible).
+    #
+    # NULL/0 semantics (see migration 0028's docstring for the full
+    # rationale): all four tts_* NULL means no TTS ran this turn (text-only
+    # reply, or TTS disabled/unconfigured) or the row predates this
+    # migration. tts_provider/tts_model set with tts_audio_ms=0 and
+    # tts_cost=0 means the TTS provider WAS called but synthesis didn't
+    # complete (timeout/raise) before a usable audio result came back -- the
+    # billed amount is unknown, not zero. stt_audio_ms NULL with stt_cost set
+    # means token-priced transcription (see src/api/chat_cost.py's
+    # compute_chat_stt_cost) whose audio duration was never measured.
+    tts_provider: Mapped[Optional[str]] = mapped_column(String(100))
+    tts_model: Mapped[Optional[str]] = mapped_column(String(100))
+    tts_audio_ms: Mapped[Optional[int]] = mapped_column(Integer)
+    tts_cost: Mapped[Optional[float]] = mapped_column(Float)
+    stt_audio_ms: Mapped[Optional[int]] = mapped_column(Integer)
+    stt_cost: Mapped[Optional[float]] = mapped_column(Float)
     # Indexed (both standalone, above via index=True on the column, and via
     # the composite in __table_args__) — see the class-level comment on why
     # both are required from day one.
@@ -261,13 +282,19 @@ async def record_chat_turn_metric(
     action: str,
     metrics: dict[str, Any],
     tools: list[dict[str, Any]] | tuple[dict[str, Any], ...] = (),
-) -> None:
+) -> Optional[int]:
     """Insert one ``chat_turn_metrics`` row and its ``chat_tool_metrics``
     children. Best-effort: never raises — a DB outage must degrade to
     no-persistence, not break a live chat turn (see ``ChatBotAgent``'s
     ``record_metric`` callback, the only caller, and
     ``src/models/turn_metrics.py::record_turn_metric``, whose contract this
     mirrors exactly).
+
+    Returns the new row's id on success, so a caller further up the stack
+    (``ChatBotAgent._emit_turn_metric`` -> ``ChatTurnResult.metric_row_id``)
+    can UPDATE it later with post-turn voice-note TTS/STT cost once
+    synthesis/transcription usage is known (see src/api/chat.py's
+    ``_record_turn_media_metrics``). Returns ``None`` on any failure.
 
     ``metrics`` holds the parent row's aggregate int/bool fields (as a plain
     dict, keyed by column name — read with ``.get(..., 0/False)`` so a
@@ -331,6 +358,7 @@ async def record_chat_turn_metric(
             # Flush (not commit) to allocate row.id without ending the
             # transaction, so the parent + all children commit atomically.
             await db.flush()
+            row_id = row.id
             child_rows = [
                 ChatToolMetricRow(
                     turn_id=row.id,
@@ -363,10 +391,11 @@ async def record_chat_turn_metric(
             # query to answer.
             debug_event(
                 log, "metrics chat_turn_metric_write response",
-                turn_id=row.id, tenant_id=tenant_id, session_id=session_id,
+                turn_id=row_id, tenant_id=tenant_id, session_id=session_id,
                 trace_id=trace_id, path=path, action=action,
                 tool_row_count=len(child_rows),
             )
+            return row_id
     except Exception:  # noqa: BLE001 - must never break a live chat turn
         log.warning(
             "record_chat_turn_metric failed; continuing without persistence", exc_info=True,
@@ -380,3 +409,4 @@ async def record_chat_turn_metric(
             tenant_id=tenant_id, session_id=session_id, trace_id=trace_id,
             path=path, action=action,
         )
+        return None
