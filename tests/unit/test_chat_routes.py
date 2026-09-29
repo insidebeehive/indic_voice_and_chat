@@ -83,7 +83,7 @@ async def app(tmp_faiss_index: str, fake_redis):
         async with sm() as session:
             yield session
 
-    async def factory(tenant: TenantContext, session_id: str, *, customer_id=None, ticket_id=None) -> ChatBotAgent:
+    async def factory(tenant: TenantContext, session_id: str, *, customer_id=None, ticket_id=None, bot_name=None, bot_gender=None) -> ChatBotAgent:
         return ChatBotAgent(
             session=AgentSession(session_id=session_id),
             llm=_FakeLLM({
@@ -96,6 +96,8 @@ async def app(tmp_faiss_index: str, fake_redis):
             retriever=retriever,
             company_name=tenant.settings.name,
             store=session_store,
+            bot_name=bot_name,
+            bot_gender=bot_gender,
         )
 
     chat.set_chatbot_factory(factory)
@@ -151,7 +153,7 @@ async def cost_app(tmp_faiss_index: str, fake_redis):
         async with sm() as session:
             yield session
 
-    async def factory(tenant: TenantContext, session_id: str, *, customer_id=None, ticket_id=None) -> ChatBotAgent:
+    async def factory(tenant: TenantContext, session_id: str, *, customer_id=None, ticket_id=None, bot_name=None, bot_gender=None) -> ChatBotAgent:
         return ChatBotAgent(
             session=AgentSession(session_id=session_id),
             llm=_FakeLLM({
@@ -247,6 +249,29 @@ def test_create_session_greeting_without_name(app: FastAPI) -> None:
     assert resp.json()["greeting"] == "नमस्ते, मैं आपकी कैसे मदद करूँ?"
 
 
+def test_create_session_greeting_introduces_bot_name(app: FastAPI) -> None:
+    """CreateSessionRequest.bot_name makes the greeting introduce the bot,
+    in the requested language."""
+    client = TestClient(app)
+    resp = client.post(
+        "/chat/sessions",
+        json={"customer_name": "Amit", "language": "hi", "bot_name": "Sandhya"},
+        headers=HEADERS,
+    )
+    assert resp.json()["greeting"] == "नमस्ते Amit, मैं Sandhya हूँ। मैं आपकी कैसे मदद करूँ?"
+
+
+def test_create_session_greeting_without_bot_name_unaffected(app: FastAPI) -> None:
+    """No bot_name -> greeting is byte-identical to before this feature."""
+    client = TestClient(app)
+    resp = client.post(
+        "/chat/sessions",
+        json={"customer_name": "Amit", "language": "hi"},
+        headers=HEADERS,
+    )
+    assert resp.json()["greeting"] == "नमस्ते Amit, मैं आपकी कैसे मदद करूँ?"
+
+
 def test_create_session_language_name_falls_back_to_tenant_default(app: FastAPI) -> None:
     """A spelled-out name ("Hindi") is not a code: fall back per the CRM contract,
     and don't persist the junk value on the session row."""
@@ -277,6 +302,53 @@ def test_greeting_map_covers_all_contract_languages() -> None:
     for code, template in chat._GREETINGS.items():
         assert "{who}" in template, code
         assert chat._greeting("Acme", "Raju", code).startswith(template.split("{")[0] + " Raju")
+
+
+def test_greeting_with_bot_name_introduces_bot_every_language() -> None:
+    """A bot_name at session creation makes EVERY language's greeting
+    introduce the bot by name, on top of the existing customer-name/help
+    clause -- _GREETINGS_WITH_NAME must cover every _GREETINGS key."""
+    from src.api import chat
+    assert set(chat._GREETINGS) <= set(chat._GREETINGS_WITH_NAME)
+    for code in chat._GREETINGS:
+        greeting = chat._greeting("Acme", "Raju", code, "Sandhya")
+        assert "Sandhya" in greeting, code
+        assert "Raju" in greeting, code
+
+
+def test_greeting_without_bot_name_is_unchanged() -> None:
+    """No bot_name -> identical to the pre-existing nameless greeting, in
+    every language, with or without a customer name."""
+    from src.api import chat
+    for code, template in chat._GREETINGS.items():
+        assert chat._greeting("Acme", "Raju", code) == template.format(who=" Raju")
+        assert chat._greeting("Acme", "Raju", code, None) == template.format(who=" Raju")
+        assert chat._greeting("Acme", None, code) == template.format(who="")
+
+
+# Speaker-gender-neutral first-person forms the introducing greeting must
+# never use -- same convention _INTERIM_WAIT_MESSAGES documents (Hindi,
+# Marathi, Gujarati, Punjabi grammatically mark the speaker's gender on
+# first-person verbs; the other _GREETINGS languages don't inflect at all).
+_GENDERED_FIRST_PERSON_GREETING_BLOCKLIST = [
+    # Hindi
+    "रहा हूँ", "रही हूँ", "करता हूँ", "करती हूँ", "करूँगा", "करूँगी",
+    "सकता हूँ", "सकती हूँ",
+    # Marathi
+    "करतो", "करते", "होतो", "होते", "झालो", "झाले", "गेलो", "गेले",
+    # Gujarati
+    "કરતો", "કરતી", "હતો", "હતી",
+    # Punjabi
+    "ਕਰਦਾ", "ਕਰਦੀ", "ਕਰਾਂਗਾ", "ਕਰਾਂਗੀ",
+]
+
+
+def test_greeting_with_bot_name_has_no_speaker_gendered_forms() -> None:
+    from src.api import chat
+    for code in chat._GREETINGS:
+        greeting = chat._greeting("Acme", "Raju", code, "Sandhya")
+        for bad in _GENDERED_FIRST_PERSON_GREETING_BLOCKLIST:
+            assert bad not in greeting, f"{code} has gendered form {bad!r}: {greeting}"
 
 
 def test_create_session_requires_auth(app: FastAPI) -> None:
@@ -405,7 +477,7 @@ def test_websocket_factory_failure_closes_cleanly(app: FastAPI) -> None:
     client = TestClient(app)
     sid = _create_session(client)
 
-    async def _broken_factory(tenant, session_id, *, customer_id=None, ticket_id=None):
+    async def _broken_factory(tenant, session_id, *, customer_id=None, ticket_id=None, bot_name=None, bot_gender=None):
         raise RuntimeError("DB connection pool exhausted")
 
     chat.set_chatbot_factory(_broken_factory)
@@ -425,7 +497,7 @@ def test_websocket_passes_customer_id_to_factory(app: FastAPI) -> None:
     seen: dict = {}
     orig_factory = chat._factory
 
-    async def _recording_factory(tenant, session_id, *, customer_id=None, ticket_id=None):
+    async def _recording_factory(tenant, session_id, *, customer_id=None, ticket_id=None, bot_name=None, bot_gender=None):
         seen["customer_id"] = customer_id
         return await orig_factory(tenant, session_id)
 
@@ -435,6 +507,79 @@ def test_websocket_passes_customer_id_to_factory(app: FastAPI) -> None:
         ws.receive_text()  # typing
         ws.receive_text()  # reply
     assert seen["customer_id"] == "cust-7"
+
+
+def test_websocket_bot_name_and_gender_reach_system_prompt(app: FastAPI) -> None:
+    """CreateSessionRequest.bot_name/bot_gender (stored on the session row's
+    extra_data by create_session) ride into ChatBotAgent via chat_websocket's
+    _factory call, and from there into build_chatbot_system_prompt's own
+    bot_name/bot_gender params."""
+    client = TestClient(app)
+    sid = _create_session(client, customer_name="Raju", bot_name="Sandhya", bot_gender="male")
+
+    captured: list = []
+    orig_factory = chat._factory
+
+    async def _capturing_factory(tenant, session_id, **kw):
+        agent = await orig_factory(tenant, session_id, **kw)
+        orig_generate = agent._llm.generate
+
+        async def _generate(messages, config):
+            captured.append(messages)
+            return await orig_generate(messages, config)
+
+        agent._llm.generate = _generate
+        return agent
+
+    chat.set_chatbot_factory(_capturing_factory)
+    with client.websocket_connect(f"/chat/ws/{sid}") as ws:
+        ws.send_text(json.dumps({"type": "message", "text": "hi"}))
+        ws.receive_text()  # typing
+        ws.receive_text()  # reply
+
+    system_prompts = [
+        m.content for msgs in captured for m in msgs if m.role == "system"
+    ]
+    assert system_prompts, "no system message captured"
+    assert any(
+        "You are Sandhya, the customer-support agent for" in p for p in system_prompts
+    )
+    assert any("You are male — use masculine" in p for p in system_prompts)
+
+
+def test_websocket_without_bot_name_uses_default_system_prompt(app: FastAPI) -> None:
+    """No bot_name/bot_gender at session creation -> the system prompt is
+    byte-identical to the nameless, female default (no drift for every
+    pre-existing session that never sends these fields)."""
+    client = TestClient(app)
+    sid = _create_session(client, customer_name="Raju")
+
+    captured: list = []
+    orig_factory = chat._factory
+
+    async def _capturing_factory(tenant, session_id, **kw):
+        agent = await orig_factory(tenant, session_id, **kw)
+        orig_generate = agent._llm.generate
+
+        async def _generate(messages, config):
+            captured.append(messages)
+            return await orig_generate(messages, config)
+
+        agent._llm.generate = _generate
+        return agent
+
+    chat.set_chatbot_factory(_capturing_factory)
+    with client.websocket_connect(f"/chat/ws/{sid}") as ws:
+        ws.send_text(json.dumps({"type": "message", "text": "hi"}))
+        ws.receive_text()  # typing
+        ws.receive_text()  # reply
+
+    system_prompt = next(
+        m.content for msgs in captured for m in msgs if m.role == "system"
+    )
+    assert "Sandhya" not in system_prompt
+    assert "You are the customer-support agent for Acme" in system_prompt
+    assert "You are female — use feminine" in system_prompt
 
 
 def test_websocket_turn_timeout_sends_error_keeps_socket(app: FastAPI, monkeypatch) -> None:
@@ -453,7 +598,7 @@ def test_websocket_turn_timeout_sends_error_keeps_socket(app: FastAPI, monkeypat
         async def summarize_session(self):
             return "summary"
 
-    async def _factory(tenant, session_id, *, customer_id=None, ticket_id=None):
+    async def _factory(tenant, session_id, *, customer_id=None, ticket_id=None, bot_name=None, bot_gender=None):
         return _HangingAgent()
 
     chat.set_chatbot_factory(_factory)
@@ -481,7 +626,7 @@ def test_websocket_quota_exhaustion_sends_high_demand_message(app: FastAPI) -> N
         async def handle_message(self, text):
             raise _QuotaError("429 RESOURCE_EXHAUSTED")
 
-    async def _factory(tenant, session_id, *, customer_id=None, ticket_id=None):
+    async def _factory(tenant, session_id, *, customer_id=None, ticket_id=None, bot_name=None, bot_gender=None):
         return _QuotaAgent()
 
     chat.set_chatbot_factory(_factory)
@@ -896,6 +1041,48 @@ def test_upload_endpoint_processes_and_persists(app: FastAPI) -> None:
     assert detail["messages"][0]["type"] == "image"
 
 
+def test_upload_endpoint_bot_name_and_gender_reach_system_prompt(app: FastAPI) -> None:
+    """CreateSessionRequest.bot_name/bot_gender (stored on the session row's
+    extra_data by create_session) ride into ChatBotAgent via upload_media's
+    own _factory call too, mirroring chat_websocket -- /upload is a CRM REST
+    path and must not fall back to the nameless default persona."""
+    import io
+
+    client = TestClient(app)
+    sid = _create_session(client, customer_name="Raju", bot_name="Sandhya", bot_gender="male")
+
+    captured: list = []
+    orig_factory = chat._factory
+
+    async def _capturing_factory(tenant, session_id, **kw):
+        agent = await orig_factory(tenant, session_id, **kw)
+        orig_generate = agent._llm.generate
+
+        async def _generate(messages, config):
+            captured.append(messages)
+            return await orig_generate(messages, config)
+
+        agent._llm.generate = _generate
+        return agent
+
+    chat.set_chatbot_factory(_capturing_factory)
+    resp = client.post(
+        f"/chat/{sid}/upload",
+        files={"file": ("err.jpg", io.BytesIO(b"imgbytes"), "image/jpeg")},
+        data={"text": "what is this error?"},
+    )
+    assert resp.status_code == 200, resp.text
+
+    system_prompts = [
+        m.content for msgs in captured for m in msgs if m.role == "system"
+    ]
+    assert system_prompts, "no system message captured"
+    assert any(
+        "You are Sandhya, the customer-support agent for" in p for p in system_prompts
+    )
+    assert any("You are male — use masculine" in p for p in system_prompts)
+
+
 def test_websocket_end_marks_session_ended(app: FastAPI) -> None:
     client = TestClient(app)
     sid = _create_session(client)
@@ -1149,7 +1336,7 @@ async def escalating_app(tmp_faiss_index: str, fake_redis, tmp_path):
         async with sm() as session:
             yield session
 
-    async def factory(tenant: TenantContext, session_id: str, *, customer_id=None, ticket_id=None) -> ChatBotAgent:
+    async def factory(tenant: TenantContext, session_id: str, *, customer_id=None, ticket_id=None, bot_name=None, bot_gender=None) -> ChatBotAgent:
         return ChatBotAgent(
             session=AgentSession(session_id=session_id),
             llm=_FakeLLMEscalating(),
@@ -1775,3 +1962,53 @@ def test_create_session_request_bot_name_is_one_short_line(bot_name, ok) -> None
     else:
         with pytest.raises(ValidationError):
             CreateSessionRequest(bot_name=bot_name)
+
+
+@pytest.mark.parametrize("bad_char", [
+    "\n", "\r", " ", " ", "\x85", "\v", "\f", "\x00", "‎",
+])
+def test_create_session_request_bot_name_rejects_control_and_separator_chars(bad_char) -> None:
+    """Beyond the bare \\r\\n the old regex pattern caught, bot_name must also
+    reject Unicode line/paragraph separators (U+2028/U+2029), NEL (\\x85), and
+    other control/format characters (e.g. \\v, \\f, NUL, the left-to-right
+    mark) that a regex of `^[^\\r\\n]*$` would silently admit."""
+    from pydantic import ValidationError
+    from src.api.chat import CreateSessionRequest
+    with pytest.raises(ValidationError):
+        CreateSessionRequest(bot_name=f"Sandhya{bad_char}")
+
+
+@pytest.mark.parametrize("good_name", [
+    "Sandhya", "Priya Sharma", "संध्या",
+    "क्‍ष",  # ZWJ (U+200D) forming a conjunct -- Cf category, but legitimate Indic text.
+    "क्‌ष",  # ZWNJ (U+200C) breaking a conjunct -- same category, same legitimacy.
+])
+def test_create_session_request_bot_name_accepts_ordinary_names(good_name) -> None:
+    """Ordinary letters (including non-Latin scripts), digits, punctuation,
+    and plain spaces are unaffected by the control/separator rejection. ZWJ
+    and ZWNJ are Cf (format) characters like the ones rejected above, but are
+    legitimate constituents of Indic script text (conjuncts, chillus) and are
+    explicitly exempted from the rejection."""
+    from src.api.chat import CreateSessionRequest
+    assert CreateSessionRequest(bot_name=good_name).bot_name == good_name
+
+
+def test_create_session_request_bot_name_strips_surrounding_whitespace() -> None:
+    """Leading/trailing whitespace is normalized away; a whitespace-only
+    name normalizes to None rather than being persisted as blank padding."""
+    from src.api.chat import CreateSessionRequest
+    assert CreateSessionRequest(bot_name="  Meera  ").bot_name == "Meera"
+    assert CreateSessionRequest(bot_name="   ").bot_name is None
+
+
+def test_create_session_bot_name_zero_width_space_is_rejected(app: FastAPI) -> None:
+    """A zero-width space (U+200B) visually resembles the plain space in
+    "a b" but is Cf (format), the same category as the rejected control
+    chars above -- and, unlike ZWNJ/ZWJ, it has no legitimate role in Indic
+    text, so it stays rejected. Exercised at the request level (not just
+    CreateSessionRequest directly) to confirm FastAPI surfaces the
+    validator's ValueError as a 422."""
+    client = TestClient(app)
+    resp = client.post(
+        "/chat/sessions", json={"bot_name": "a​b"}, headers=HEADERS)
+    assert resp.status_code == 422

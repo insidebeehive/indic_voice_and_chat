@@ -661,6 +661,8 @@ def make_chatbot_factory(registry, sessionmaker=None, crm_retrievers: "PerCrmRet
         tenant: TenantContext, session_id: str, *,
         customer_id: object = _CUSTOMER_ID_UNSET,
         ticket_id: str | None = None,
+        bot_name: str | None = None,
+        bot_gender: str | None = None,
     ) -> ChatBotAgent:
         # customer_id (= logged-in user/player ID) feeds CRM tool calls that
         # need player-specific context. The WS connect path passes it from the
@@ -861,6 +863,8 @@ def make_chatbot_factory(registry, sessionmaker=None, crm_retrievers: "PerCrmRet
             llm_model=_llm_defaults.get("model") or "",
             session_id=bare_session_id,
             ticket_id=ticket_id,
+            bot_name=bot_name,
+            bot_gender=bot_gender,
             # Turn-metrics plan §4: same inversion-of-control as the voice
             # record_metric sites above -- getattr-defensive since some tests
             # stub registry/tenant as a bare SimpleNamespace without a

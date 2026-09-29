@@ -956,6 +956,18 @@ class ChatBotAgent(BaseAgent):
         # cross-module read convention (_hydrate_agent_history) rather than
         # inventing a setter for one field.
         previous_conversation: str | None = None,
+        # CRM-supplied bot persona identity (CreateSessionRequest.bot_name /
+        # bot_gender, src/api/chat.py) -- threaded through to
+        # build_chatbot_system_prompt's own bot_name/bot_gender params at both
+        # call sites below. Both optional; None on every other construction
+        # site, which all get the nameless default identity: /message,
+        # process_message, and /history, all three via _get_agent (only
+        # /message and process_message produce a customer-facing reply among
+        # those three -- /history doesn't), plus request_call's summarizer
+        # agent, built directly via _factory rather than _get_agent, which is
+        # never customer-facing at all.
+        bot_name: str | None = None,
+        bot_gender: str | None = None,
     ) -> None:
         # ChatBot doesn't need slots — pass an empty schema so BaseAgent is happy.
         super().__init__(
@@ -1015,6 +1027,8 @@ class ChatBotAgent(BaseAgent):
         self._session_id = session_id
         self._ticket_id = ticket_id
         self._previous_conversation = previous_conversation
+        self._bot_name = bot_name
+        self._bot_gender = bot_gender
         # Phase 2 of the turn-metrics plan (docs/superpowers/plans/
         # 2026-09-08-chatbot-turn-metrics.md, §4): injected write-path
         # callback, mirroring VoiceBotAgent's record_metric inversion of
@@ -2313,6 +2327,8 @@ class ChatBotAgent(BaseAgent):
                 prompt_pack=self._prompt_pack,
                 include_variable_tail=False,
                 max_tool_rounds=self._max_tool_rounds,
+                bot_name=self._bot_name,
+                bot_gender=self._bot_gender,
             )
             messages: list[LLMMessage] = [LLMMessage(role="system", content=system_prompt)]
             # Replay the last MAX_HISTORY_TURNS exchanges (system is rebuilt
@@ -2349,6 +2365,8 @@ class ChatBotAgent(BaseAgent):
             tenant_timezone=self._tenant_timezone,
             prompt_pack=self._prompt_pack,
             max_tool_rounds=self._max_tool_rounds,
+            bot_name=self._bot_name,
+            bot_gender=self._bot_gender,
         )
         messages: list[LLMMessage] = [LLMMessage(role="system", content=system_prompt)]
         # Replay the last MAX_HISTORY_TURNS exchanges (system is rebuilt each

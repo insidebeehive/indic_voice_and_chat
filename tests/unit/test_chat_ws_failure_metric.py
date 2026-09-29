@@ -111,7 +111,7 @@ async def test_ws_turn_timeout_writes_failure_row(app: FastAPI, monkeypatch) -> 
     client = TestClient(app)
     sid = _create_session(client)
 
-    async def _factory(tenant, session_id, *, customer_id=None, ticket_id=None):
+    async def _factory(tenant, session_id, *, customer_id=None, ticket_id=None, bot_name=None, bot_gender=None):
         return _HangingAgent()
 
     chat.set_chatbot_factory(_factory)
@@ -158,7 +158,7 @@ async def test_ws_turn_exception_writes_failure_row_with_no_tool_children(
     client = TestClient(app)
     sid = _create_session(client)
 
-    async def _factory(tenant, session_id, *, customer_id=None, ticket_id=None):
+    async def _factory(tenant, session_id, *, customer_id=None, ticket_id=None, bot_name=None, bot_gender=None):
         return _ErrorAgent()
 
     chat.set_chatbot_factory(_factory)
@@ -192,7 +192,7 @@ async def test_ws_turn_failure_metric_write_is_best_effort(app: FastAPI, monkeyp
     client = TestClient(app)
     sid = _create_session(client)
 
-    async def _factory(tenant, session_id, *, customer_id=None, ticket_id=None):
+    async def _factory(tenant, session_id, *, customer_id=None, ticket_id=None, bot_name=None, bot_gender=None):
         return _ErrorAgent()
 
     chat.set_chatbot_factory(_factory)

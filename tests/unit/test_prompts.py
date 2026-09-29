@@ -996,3 +996,24 @@ def test_voicebot_identity_line_with_and_without_role_and_counterpart() -> None:
     p2 = build_voicebot_system_prompt(handoff, SlotSchema())
     assert ("You are the customer-support agent at Acme. You are on a phone call with a "
             "customer. Speak naturally as a human would on a call.") in p2
+
+
+def test_chatbot_identity_uses_bot_name_and_gender_when_given() -> None:
+    """CRM-supplied bot_name/bot_gender (session creation) set the chat
+    agent's identity; without them the identity block is the nameless,
+    female default."""
+    default = build_chatbot_system_prompt(company_name="Rama", prompt_pack="betting")
+    assert "You are the customer-support agent for Rama. YOU are the support" in default
+    assert "You are female — use feminine grammatical forms" in default
+    named = build_chatbot_system_prompt(company_name="Rama", prompt_pack="betting",
+                                        bot_name="Sandhya", bot_gender="male")
+    assert ("You are Sandhya, the customer-support agent for Rama. If the customer asks your "
+            "name, it's Sandhya — but don't introduce yourself by name in every reply. "
+            "YOU are the support") in named
+    assert "You are male — use masculine grammatical forms" in named
+    assert "You are female" not in named
+    female = build_chatbot_system_prompt(company_name="Rama", bot_name="Sandhya", bot_gender="female")
+    assert "You are female — use feminine grammatical forms" in female
+    # A blank name is treated as no name.
+    assert build_chatbot_system_prompt(company_name="Rama", bot_name="  ") == \
+        build_chatbot_system_prompt(company_name="Rama")

@@ -756,8 +756,14 @@ def build_chatbot_system_prompt(
     prompt_pack: str = "generic",
     include_variable_tail: bool = True,
     max_tool_rounds: int = 3,
+    bot_name: Optional[str] = None,
+    bot_gender: Optional[str] = None,
 ) -> str:
     """System prompt for the RAG-powered ChatBot agent (Phase 4).
+
+    ``bot_name`` / ``bot_gender`` are the AI agent's name and gender as the
+    CRM sent them at session creation (CreateSessionRequest). Both optional:
+    with neither, the identity block is exactly the nameless, female default.
 
     ``max_tool_rounds`` is the tool-loop cap the agent actually enforces
     (ChatBotAgent's ``max_tool_rounds``); TOOL USE states it so the model
@@ -792,11 +798,23 @@ def build_chatbot_system_prompt(
     parts: list[str] = []
 
     # ── Identity ──────────────────────────────────────────────────────────────
+    name = (bot_name or "").strip()
+    identity = (
+        f"You are {name}, the customer-support agent for {company_name}. If the customer "
+        f"asks your name, it's {name} — but don't introduce yourself by name in every reply. "
+        if name else
+        f"You are the customer-support agent for {company_name}. "
+    )
+    gender = (
+        "You are male — use masculine grammatical forms when the language requires it."
+        if (bot_gender or "").strip().lower() == "male" else
+        "You are female — use feminine grammatical forms when the language requires it."
+    )
     parts.append(
-        f"You are the customer-support agent for {company_name}. YOU are the support — "
+        identity
+        + "YOU are the support — "
         "resolve issues directly rather than telling the customer to 'contact support' or "
-        "'reach out to the team'. You are female — use feminine grammatical forms when the "
-        "language requires it.\n"
+        "'reach out to the team'. " + gender + "\n"
         "Keep internals internal — these are your internal identifiers, never disclosed "
         "regardless of framing: source names, filenames, tool/API names, endpoint paths, "
         "environment names (dev/stage/prod), and UUIDs/session IDs/email addresses from tool "

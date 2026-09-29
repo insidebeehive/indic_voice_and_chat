@@ -27,6 +27,7 @@ import json
 import logging
 import os
 import time
+import unicodedata
 import uuid
 import wave
 from dataclasses import dataclass, field
@@ -58,7 +59,7 @@ except ImportError:  # pragma: no cover - exercised only when the native ext is 
     # the MP3 encode path degrades (see `_pcm16_to_mp3`'s caller, which
     # falls back to WAV and logs it once).
     lameenc = None
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.websockets import WebSocketState
@@ -1400,17 +1401,53 @@ _GREETINGS: dict[str, str] = {
     "as": "নমস্কাৰ{who}, মই আপোনাক কেনেকৈ সহায় কৰিব পাৰোঁ?",
 }
 
+# Introducing variant of _GREETINGS, used when the CRM supplied a bot_name at
+# session creation (CreateSessionRequest.bot_name -- see create_session).
+# Same "{who}" convention, plus "{bot}" for the bot's name; each entry keeps
+# its language's existing help-question clause from _GREETINGS untouched and
+# only inserts a self-introduction ahead of it. Every self-introduction uses
+# a speaker-gender-neutral construction (nominal "I am X" with no gendered
+# first-person verb, or an invariant copula -- same requirement and rationale
+# as _INTERIM_WAIT_MESSAGES below, e.g. Hindi "मैं {bot} हूँ" -- "हूँ" doesn't
+# inflect for the speaker's gender, unlike "रहा/रही" would).
+_GREETINGS_WITH_NAME: dict[str, str] = {
+    "en": "Hello{who}, I'm {bot}. How can I help?",
+    "hi": "नमस्ते{who}, मैं {bot} हूँ। मैं आपकी कैसे मदद करूँ?",
+    "bn": "নমস্কার{who}, আমি {bot}। আমি আপনাকে কীভাবে সাহায্য করতে পারি?",
+    "gu": "નમસ્તે{who}, હું {bot} છું. હું તમને કેવી રીતે મદદ કરી શકું?",
+    "kn": "ನಮಸ್ಕಾರ{who}, ನಾನು {bot}. ನಾನು ನಿಮಗೆ ಹೇಗೆ ಸಹಾಯ ಮಾಡಬಹುದು?",
+    "ml": "നമസ്കാരം{who}, ഞാൻ {bot} ആണ്. ഞാൻ നിങ്ങളെ എങ്ങനെ സഹായിക്കാം?",
+    "mr": "नमस्कार{who}, मी {bot} आहे. मी तुमची कशी मदत करू?",
+    "od": "ନମସ୍କାର{who}, ମୁଁ {bot}। ମୁଁ ଆପଣଙ୍କୁ କିପରି ସାହାଯ୍ୟ କରିପାରିବି?",
+    "pa": "ਸਤ ਸ੍ਰੀ ਅਕਾਲ{who}, ਮੈਂ {bot} ਹਾਂ। ਮੈਂ ਤੁਹਾਡੀ ਕਿਵੇਂ ਮਦਦ ਕਰਾਂ?",
+    "ta": "வணக்கம்{who}, நான் {bot}. நான் உங்களுக்கு எப்படி உதவ முடியும்?",
+    "te": "నమస్కారం{who}, నేను {bot}. నేను మీకు ఎలా సహాయం చేయగలను?",
+    "as": "নমস্কাৰ{who}, মই {bot}। মই আপোনাক কেনেকৈ সহায় কৰিব পাৰোঁ?",
+}
 
-def _greeting(company: str, customer_name: Optional[str], language: str) -> str:
+
+def _greeting(
+    company: str, customer_name: Optional[str], language: str,
+    bot_name: Optional[str] = None,
+) -> str:
     """Opening line, in the session's language.
 
     ``language`` is already tenant-default-resolved by the caller, so an
     unmapped code falls back to English rather than to the tenant default --
     there is no better mapped candidate at this point.
+
+    ``bot_name`` (CreateSessionRequest.bot_name) is optional -- when given,
+    the greeting introduces the bot by name via _GREETINGS_WITH_NAME instead
+    of the nameless _GREETINGS default.
     """
     name = (customer_name or "").strip()
     who = f" {name}" if name else ""
-    template = _GREETINGS.get(normalize_lang(language)) or _GREETINGS["en"]
+    lang = normalize_lang(language)
+    bot = (bot_name or "").strip()
+    if bot:
+        template = _GREETINGS_WITH_NAME.get(lang) or _GREETINGS_WITH_NAME["en"]
+        return template.format(who=who, bot=bot)
+    template = _GREETINGS.get(lang) or _GREETINGS["en"]
     return template.format(who=who)
 
 
@@ -1648,8 +1685,30 @@ class CreateSessionRequest(BaseModel):
     # voice call can introduce itself the way the CRM's own chat bot does,
     # instead of a generic "the customer-support agent" fallback.
     # Goes into the voice agent's system prompt: one short line only.
-    bot_name: Optional[str] = Field(default=None, max_length=64, pattern=r"^[^\r\n]*$")
+    bot_name: Optional[str] = Field(default=None, max_length=64)
     bot_gender: Optional[Literal["female", "male"]] = None
+
+    @field_validator("bot_name")
+    @classmethod
+    def _reject_control_and_separator_chars(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        # ZWNJ (U+200C) and ZWJ (U+200D) are Cf (format) characters but are
+        # legitimate constituents of Indic script text -- e.g. the ZWJ in
+        # "क्‍ष" or a Malayalam chillu, and the ZWNJ that breaks a conjunct
+        # in Hindi/Urdu. Exempt exactly those two from the otherwise-blanket
+        # control/format/separator rejection below.
+        allowed_format_chars = {"‌", "‍"}
+        for c in v:
+            if c in allowed_format_chars:
+                continue
+            category = unicodedata.category(c)
+            if category.startswith("C") or category in ("Zl", "Zp"):
+                raise ValueError(
+                    "bot_name must not contain control, format, or line/paragraph "
+                    "separator characters"
+                )
+        return v.strip() or None
 
 
 class CreateSessionResponse(BaseModel):
@@ -1756,7 +1815,7 @@ async def create_session(
     }))
     return CreateSessionResponse(
         session_id=session_id,
-        greeting=_greeting(tenant.name, req.customer_name, language),
+        greeting=_greeting(tenant.name, req.customer_name, language, req.bot_name),
         ws_url=_ws_url(request, session_id),
     )
 
@@ -1880,7 +1939,9 @@ async def upload_media(
         raise HTTPException(status_code=400, detail="empty upload")
     mime = file.content_type or "application/octet-stream"
     ticket_id = _ticket_id_from_row(row)
-    agent = await _factory(tenant, _scoped_session(tenant, session_id), ticket_id=ticket_id)
+    _extra = row.extra_data or {}
+    agent = await _factory(tenant, _scoped_session(tenant, session_id), ticket_id=ticket_id,
+                           bot_name=_extra.get("bot_name"), bot_gender=_extra.get("bot_gender"))
     # Set directly on the built agent rather than threading a new kwarg
     # through the `_factory` callable's signature (bootstrap.py's factory
     # AND every test double that stands in for it across the suite would
@@ -2593,8 +2654,15 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
     try:
         # Pass customer_id from the row already fetched above so the factory
         # doesn't re-query the same ChatSession row on another pool checkout.
+        # bot_name/bot_gender ride in the same row's extra_data (see
+        # create_session, which is the only writer) -- threaded through so
+        # the agent's system prompt and greeting can introduce the CRM's own
+        # bot persona instead of the nameless default.
+        _extra = row.extra_data or {}
         agent = await _factory(tenant, _scoped_session(tenant, session_id),
-                               customer_id=row.customer_id, ticket_id=ticket_id)
+                               customer_id=row.customer_id, ticket_id=ticket_id,
+                               bot_name=_extra.get("bot_name"),
+                               bot_gender=_extra.get("bot_gender"))
     except Exception:
         # A failure here (e.g. a DB connection pool exhausted under a burst of
         # concurrent new sessions) must not leave the client waiting forever

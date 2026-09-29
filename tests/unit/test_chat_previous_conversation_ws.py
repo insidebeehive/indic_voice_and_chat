@@ -84,7 +84,7 @@ async def ws_pc_ctx():
         created_agents.append(agent)
         return agent
 
-    async def fake_factory(tenant, scoped_id, *, customer_id=None, ticket_id=None):
+    async def fake_factory(tenant, scoped_id, *, customer_id=None, ticket_id=None, bot_name=None, bot_gender=None):
         return _new_agent()
 
     chat_api.set_chatbot_factory(fake_factory)
