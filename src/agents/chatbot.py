@@ -2081,9 +2081,19 @@ class ChatBotAgent(BaseAgent):
             debug_event(log, "chatbot escalate requested", reason=esc["reason"], summary=esc["summary"])
             return {"status": "escalated", **esc}, [], esc, None
         if tc.name == OFFER_CALL:
-            off = {"reason": args.get("reason", "")}
-            debug_event(log, "chatbot offer_call requested", reason=off["reason"])
-            return {"status": "offered", **off}, [], None, off
+            # offer_voice_call is not in BUILTIN_TOOLS (see
+            # src/chatbot/tools.py) -- the chat LLM is never given this tool
+            # in normal operation, and a call request is instead handled as
+            # a request for a human (SCOPE rule 5 -> ESCALATION). This
+            # branch only fires if the model hallucinates the call anyway;
+            # when it does, refuse rather than build a call_offer -- a
+            # hallucinated call must never trigger an actual voice-call
+            # offer to the customer.
+            debug_event(log, "chatbot offer_call hallucinated", reason=args.get("reason", ""))
+            return {
+                "error": "offer_voice_call is not available; a call request is "
+                         "handled as a request for a human — see SCOPE rule 5"
+            }, [], None, None
         if tc.name == SUBMIT_DEPOSIT_VERIFICATION:
             if self._deposit_verification_executor is None:
                 # Should be unreachable in practice -- src/bootstrap.py only

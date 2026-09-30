@@ -138,7 +138,7 @@ CRM tools:
   CRM-tools cache): builtin tools, CRM tools, and the deposit-verification
   tool, in that order. Each entry's `kind` field is `"builtin"`,
   `"crm"`, or `"deposit_verification"`. Builtin tools
-  (`search_knowledge_base`, `escalate_to_human`, `offer_voice_call`) are
+  (`search_knowledge_base`, `escalate_to_human`) are
   unconditionally present on every tenant's every turn. CRM tools reflect
   the linked-`Crm`-catalog path too (`source: "crm_catalog"`), not just this
   tenant's own registered `chat_tools` rows (which is all `GET /chat/tools`
@@ -185,7 +185,7 @@ Voice handoff:
 ## The agent turn (agentic loop)
 
 `enable_tools=True` in the prod factory. Per turn the LLM may call:
-`search_knowledge_base` (RAG), `escalate_to_human`, `offer_voice_call`, or any
+`search_knowledge_base` (RAG), `escalate_to_human`, or any
 registered CRM tool. Loop: generate (with tools, text mode — Gemini rejects
 json+tools) → execute tool calls → feed results back → repeat → final text.
 Sources come from the search results; the hallucination guard runs only when a

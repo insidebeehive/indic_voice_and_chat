@@ -877,8 +877,8 @@ function chatVoiceHtml(id, cv) {
       Voice-note replies in the <b>chat</b> channel — a separate setting from the call TTS above.
       A tenant can run S2S for calls and still need a TTS here for chat voice notes. If left unset,
       chat voice falls back to the call TTS (pipeline.tts); if enabled with neither set, saving is
-      rejected. The same TTS is also used when the bot offers the customer a voice call from chat;
-      if unset here, that offered call falls back to the call TTS above.
+      rejected. The same TTS is also used for a voice call started from a chat session (the chat
+      widget's call button); if unset here, that call falls back to the call TTS above.
       <br /><small class="hint">current: ${escT(chatVoiceHint(cv))}</small>
     </div>
     <div class="creds" style="gap:.6rem;flex-wrap:wrap;">

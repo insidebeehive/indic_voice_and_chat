@@ -192,8 +192,11 @@ async def list_resolved_tools(
     Returns, in the order the chatbot factory assembles them:
 
     1. ``kind="builtin"`` — ``BUILTIN_TOOLS`` (search_knowledge_base,
-       escalate_to_human, offer_voice_call), unconditionally present on
-       every tenant's every chat turn (see src/agents/chatbot.py).
+       escalate_to_human), unconditionally present on every tenant's every
+       chat turn (see src/agents/chatbot.py). offer_voice_call is not a
+       builtin: the chat bot never offers a voice call (a call request is
+       handled as a request for a human, SCOPE rule 5 in
+       build_chatbot_system_prompt).
     2. ``kind="crm"`` — this tenant's resolved CRM tools. Unlike
        ``GET /tools`` — which only reads the tenant's own registered
        ``chat_tools`` rows — this reflects the full resolution priority:

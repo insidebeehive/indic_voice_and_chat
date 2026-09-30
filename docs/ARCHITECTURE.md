@@ -98,7 +98,7 @@ flowchart TB
   subgraph CHATAPP["Same FastAPI app · /api/v1/chat"]
     direction TB
     CHATAPI["Chat API<br/>POST /chat/sessions · WS /chat/ws/{id}<br/>POST /chat/message (async channels) · media upload"]
-    CHATAGENT["ChatBotAgent<br/>agentic tool loop: search_knowledge_base ·<br/>CRM tools · escalate_to_human · offer_voice_call"]
+    CHATAGENT["ChatBotAgent<br/>agentic tool loop: search_knowledge_base ·<br/>CRM tools · escalate_to_human"]
     KB["RAG / Knowledge base<br/>tenant KB + CRM-shared KB, merged (not tenant-wins)<br/>+ opt-in bundled pack / product-module KB"]
     TOOLRES["CRM tool resolution<br/>tenant's own chat_tools wins → else linked Crm's catalog"]
     GUARD["Reply guards<br/>hallucination · no-grounding · unverified-data (TOOL FAILURE)<br/>+ outbound PII redaction, runs last, every reply"]:::note
@@ -123,7 +123,7 @@ flowchart TB
    socket — `WS /chat/ws/{session_id}` needs no further auth.
 2. **Turn** — the customer's message (text, image, or video) reaches `ChatBotAgent`, which runs
    an agentic loop: generate (text mode, tools available) → execute any tool calls
-   (`search_knowledge_base`, a registered CRM tool, `escalate_to_human`, `offer_voice_call`) →
+   (`search_knowledge_base`, a registered CRM tool, `escalate_to_human`) →
    feed results back → repeat → final reply. Every turn's knowledge search mixes the tenant's
    own KB with its linked CRM's shared KB (never tenant-wins-outright, unlike tools below);
    every CRM tool call resolves to the tenant's own registered tool first, falling back to the
@@ -138,8 +138,9 @@ flowchart TB
    account number the reply states, dropping a suggested followup outright rather than
    redacting it in place, and downgrades confidence to `"low"` whenever it fires.
 4. **Escalate or hand off** — the agent can offer a human (`escalate_to_human`, a signed
-   webhook to the tenant's events endpoint) or a live voice call (`offer_voice_call` /
-   `POST /chat/{id}/call`, which stashes the chat's context under a short-lived Redis token and
+   webhook to the tenant's events endpoint); a customer's request for a call is handled as a
+   request for a human (SCOPE rule 5). A live voice call is started only from the chat
+   widget's call button (`POST /chat/{id}/call`, which stashes the chat's context under a short-lived Redis token and
    hands off into the *same* browser voice bridge the VoiceBot diagram uses — the voicebot
    greets with the chat's own context already loaded).
 5. **Persist** — every turn is written to `chat_sessions`/`chat_messages` in the same Postgres
@@ -225,7 +226,7 @@ sequenceDiagram
     else tool calls
       AG->>KB: search_knowledge_base → _exec_kb_tool → search_combined<br/>tenant + CRM retrievers merged by score, own _KB_SEARCH_TIMEOUT_S
       AG->>CRM: registered CRM tool → execute_crm_tool<br/>fair share of the per-turn _TOOL_BUDGET_S, capped at _TOOL_CALL_CEILING_S
-      AG->>AG: escalate_to_human / offer_voice_call — local builders, zero I/O, unbudgeted
+      AG->>AG: escalate_to_human — local builder, zero I/O, unbudgeted
       AG->>AG: append role="tool" results, update the failure directive
     end
   end

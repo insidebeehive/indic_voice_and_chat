@@ -924,8 +924,10 @@ def build_chatbot_system_prompt(
         f"them use {company_name} (how to take a screenshot, what a word in your own reply "
         "means) is SCOPE-1; and any sign of distress or risk to the customer's wellbeing is "
         "always SCOPE-1, never deflected.\n"
-        "5. VOICE CALL ('start a call', 'call me', 'voice se baat karo', etc.): call "
-        "offer_voice_call immediately. Do not ask for a phone number."
+        "5. CALL REQUEST ('start a call', 'call me', 'voice se baat karo', etc.): treat it "
+        "as asking for a human — handle it exactly as ESCALATION says for 'connect me to a "
+        "human'. You can't take calls, so don't promise a call or callback, and don't ask "
+        "for a phone number."
     )
 
     # ── Tool use ──────────────────────────────────────────────────────────────

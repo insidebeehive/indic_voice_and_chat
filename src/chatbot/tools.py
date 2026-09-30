@@ -1,8 +1,13 @@
 """Builtin ChatBot tools (PRD §5.2).
 
-These three are always available to the agent; tenant-registered CRM tools
+These two are always available to the agent; tenant-registered CRM tools
 (Phase 3b) are appended at runtime. The LLM sees all of them and decides which
 to call per turn. ``ToolSpec.parameters`` is a JSON-Schema-ish dict.
+
+The chat bot never offers a voice call (operator decision): a call request
+is handled as a request for a human (SCOPE rule 5 in
+build_chatbot_system_prompt, which points at its ESCALATION section). So
+``offer_voice_call`` has no ToolSpec here and the chat LLM is never given it.
 """
 
 from __future__ import annotations
@@ -14,6 +19,11 @@ ESCALATE = "escalate_to_human"
 OFFER_CALL = "offer_voice_call"
 SUBMIT_DEPOSIT_VERIFICATION = "submit_deposit_verification"
 
+# OFFER_CALL is in this set though it has no ToolSpec in BUILTIN_TOOLS: the
+# agent dispatcher (src/agents/chatbot.py's _dispatch_tool) still
+# special-cases the name, so it reads as reserved. Nothing in src/ reads this
+# set to gate CRM-tool registration; tests use it as the "is this a builtin"
+# set.
 BUILTIN_TOOL_NAMES = frozenset({SEARCH_KB, ESCALATE, OFFER_CALL})
 
 BUILTIN_TOOLS: list[ToolSpec] = [
@@ -46,21 +56,6 @@ BUILTIN_TOOLS: list[ToolSpec] = [
                             "description": "A short summary of the issue for the human agent"},
             },
             "required": ["reason", "summary"],
-        },
-    ),
-    ToolSpec(
-        name=OFFER_CALL,
-        description=(
-            "Offer the customer a browser-based voice call so they can speak with "
-            "you directly — no phone number needed. The system automatically opens "
-            "a web audio call in their browser. Use when the issue is complex enough "
-            "that talking would be faster than typing. Do NOT ask the customer for "
-            "a phone number; just call this tool with the reason."
-        ),
-        parameters={
-            "type": "object",
-            "properties": {"reason": {"type": "string"}},
-            "required": ["reason"],
         },
     ),
 ]

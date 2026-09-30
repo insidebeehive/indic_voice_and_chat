@@ -122,10 +122,12 @@ async def test_builtin_tools_always_present_even_with_no_crm_source(ctx) -> None
     # Asserted against the literal name set, not BUILTIN_TOOLS itself — a
     # comparison against a copy of the same source the endpoint reads from
     # would pass even if both were wrong together (e.g. a tool silently
-    # dropped from BUILTIN_TOOLS). These three are unconditionally added by
+    # dropped from BUILTIN_TOOLS). These two are unconditionally added by
     # the chatbot factory (src/agents/chatbot.py) regardless of CRM
     # resolution — the resolved endpoint must report them even when nothing
-    # else resolves (source == "none").
+    # else resolves (source == "none"). offer_voice_call is not a builtin:
+    # the chat bot never offers a voice call (a call request is handled as a
+    # request for a human), so it must NOT appear in this set.
     client, _sm = ctx
     resp = await client.get("/chat/tools/resolved")
     assert resp.status_code == 200, resp.text
@@ -133,7 +135,7 @@ async def test_builtin_tools_always_present_even_with_no_crm_source(ctx) -> None
     assert body["source"] == "none"
     builtin = [t for t in body["tools"] if t["kind"] == "builtin"]
     assert {t["name"] for t in builtin} == {
-        "search_knowledge_base", "escalate_to_human", "offer_voice_call",
+        "search_knowledge_base", "escalate_to_human",
     }
     assert all(t["endpoint"] == "" for t in builtin)
     assert all(t["auth_type"] is None for t in builtin)
@@ -243,7 +245,7 @@ async def test_resolved_tools_ordered_builtin_then_crm_then_dv(ctx) -> None:
     assert resp.status_code == 200, resp.text
     body = resp.json()
     kinds = [t["kind"] for t in body["tools"]]
-    assert kinds == ["builtin", "builtin", "builtin", "crm", "deposit_verification"]
+    assert kinds == ["builtin", "builtin", "crm", "deposit_verification"]
 
 
 async def test_endpoint_and_factory_agree_on_non_builtin_tool_names(ctx) -> None:

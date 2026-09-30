@@ -100,7 +100,7 @@ Both sides write to Postgres (`conversations`/`turns` for voice, `chat_sessions`
 - Read `docs/chatbot.md` first — it's accurate and dense.
 - `ChatBotAgent` runs plain-text tool-calling (Gemini can't do JSON+tools at once),
   max 2 tool rounds per turn, calling `search_knowledge_base`, `escalate_to_human`,
-  `offer_voice_call`, or per-tenant CRM tools (tenant's own tools always win over the
+  or per-tenant CRM tools (tenant's own tools always win over the
   shared CRM catalog).
 - A code-level hallucination guard prevents the bot from inventing player-specific
   data (balances, tx IDs) — not just a prompt instruction.

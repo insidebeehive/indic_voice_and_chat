@@ -134,7 +134,7 @@ Accepted content types per frame type:
 | `message` | `{"type":"message","session_id":...,"text":...,"sources":[...],"suggestions":[...],"action":...}` | the AI reply. May instead be an *interim* wait message — see below. May carry `audio_data`/`audio_mime`/`audio_url`/`audio_duration_ms` — see "Voice-note replies" below |
 | `audio_ack` | `{"type":"audio_ack","media_url":"/api/v1/chat/media/<id>"}` | voice note stored; URL serves the recording for transcript UIs |
 | `escalation` | `{"type":"escalation","reason":...,"context_summary":...}` | conversation escalated to a human |
-| `call_offer` | `{"type":"call_offer","reason":...,"call_url":...}` | AI offered a voice call; `call_url` is the WS the browser dials |
+| `call_offer` | `{"type":"call_offer","reason":...,"call_url":...}` | a voice call is ready for the customer to join (the AI never sends one; a call request is escalated to a human); `call_url` is the WS the browser dials |
 | `ended` | `{"type":"ended","summary":...,"reason":"customer_ended"\|"idle_timeout"}` | session closed |
 | `error` | `{"type":"error","message":...,"reason":...}` | that turn failed; **the socket stays open** — show the message, let the customer retry |
 

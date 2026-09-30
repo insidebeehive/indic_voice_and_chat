@@ -1,6 +1,6 @@
 """The Pipeline tab must show only the layered- or s2s-mode section relevant
 to a tenant's current mode, not both stacked at once, and the chat-voice
-heading must reflect that its TTS is now also used for bot-offered calls.
+heading must reflect that its TTS is also used for a call started from chat.
 
 Mirrors test_backoffice_events_webhook.py's style: reads static/backoffice.html
 as a plain text fixture and does substring/slice assertions — no browser/JS
@@ -116,16 +116,14 @@ def test_mode_select_and_chat_voice_section_sit_outside_both_panes() -> None:
         assert "chatVoiceHtml(" not in pane, f'chatVoiceHtml() call leaked into {pane_name}'
 
 
-def test_chat_voice_hint_mentions_offered_call_fallback() -> None:
-    """chatVoiceHtml()'s hint must explain that this same TTS also backs the
-    bot-offered voice call from chat, and where it falls back to when unset --
-    the sentence added alongside the Task A handoff-TTS change. Without this,
-    an operator has no way to know why changing "Chat voice replies/call"
-    settings also changes what a handed-off call sounds like."""
+def test_chat_voice_hint_mentions_chat_started_call_fallback() -> None:
+    """chatVoiceHtml()'s hint must explain that this same TTS also backs a
+    voice call started from a chat session, and where it falls back to when
+    unset. Without this, an operator has no way to know why changing "Chat
+    voice replies/call" settings also changes what that call sounds like. It
+    must not claim the bot offers the call -- the bot never does."""
     start = HTML.index("function chatVoiceHtml(")
     fn = HTML[start:HTML.index("\n}\n", start)]
-    assert (
-        "The same TTS is also used when the bot offers the customer a voice "
-        "call from chat;\n      if unset here, that offered call falls back "
-        "to the call TTS above."
-    ) in fn
+    assert "voice call started from a chat session" in fn
+    assert "that call falls back to the call TTS above" in fn
+    assert "bot offers" not in fn

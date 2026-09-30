@@ -331,15 +331,54 @@ async def test_forced_call_and_retry_both_fire_instruction_appears_once(
 
 
 @pytest.mark.asyncio
-async def test_offer_call_tool_sets_call_offer(retriever) -> None:
+async def test_builtin_tools_sent_to_llm_exclude_offer_voice_call(retriever) -> None:
+    """The chat LLM must never be offered offer_voice_call — a call request
+    is now handled as a request for a human (SCOPE rule 5 -> ESCALATION).
+    escalate_to_human and search_knowledge_base are still offered."""
+    llm = ScriptedLLM([LLMResult(text="Hello! How can I help?", finish_reason="stop")])
+    agent = _agent(llm, retriever)
+    await agent.handle_message("hi")
+    offered = {t.name for t in llm.calls[0][1].tools}
+    assert "offer_voice_call" not in offered
+    assert "escalate_to_human" in offered
+    assert "search_knowledge_base" in offered
+
+
+@pytest.mark.asyncio
+async def test_hallucinated_offer_voice_call_yields_no_call_offer(retriever) -> None:
+    """The model was never given offer_voice_call (it's not in
+    BUILTIN_TOOLS), but if it hallucinates the call anyway, the dispatcher
+    must refuse it -- no call_offer is built, and the tool result fed back
+    to the model is an error explaining the call is handled as an
+    escalation instead."""
     llm = ScriptedLLM([
         LLMResult(text="", finish_reason="tool_calls", tool_calls=[
             ToolCall(id="t1", name="offer_voice_call", arguments={"reason": "complex setup"})]),
-        LLMResult(text="Would a quick call help?", finish_reason="stop"),
+        LLMResult(text="Let me connect you to a human agent.", finish_reason="stop"),
     ])
     agent = _agent(llm, retriever)
     result = await agent.handle_message("this is confusing")
-    assert result.call_offer == {"reason": "complex setup"}
+    assert result.call_offer is None
+    second = llm.calls[1][0]
+    tool_msg = next(m for m in second if m.role == "tool" and m.name == "offer_voice_call")
+    payload = json.loads(tool_msg.content)
+    assert "error" in payload
+    assert "offer_voice_call is not available" in payload["error"]
+
+
+@pytest.mark.asyncio
+async def test_system_prompt_rule_5_references_escalation_not_offer_call(retriever) -> None:
+    """SCOPE rule 5 (call requests) must route to ESCALATION, not the
+    retired offer_voice_call tool."""
+    llm = ScriptedLLM([LLMResult(text="Hello! How can I help?", finish_reason="stop")])
+    agent = _agent(llm, retriever)
+    await agent.handle_message("hi")
+    system_msg = next(m for m in llm.calls[0][0] if m.role == "system")
+    assert "offer_voice_call" not in system_msg.content
+    idx = system_msg.content.index("CALL REQUEST")
+    rule5 = system_msg.content[idx:idx + 300]
+    assert "ESCALATION" in rule5
+    assert "offer_voice_call" not in rule5
 
 
 @pytest.mark.asyncio
