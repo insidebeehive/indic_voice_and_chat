@@ -755,6 +755,88 @@ def test_chatbot_static_body_is_identical_across_a_clock_tick_and_rag_change(mon
     assert static_a == static_c
 
 
+# ── Hot issues (src/chatbot/hot_issues.py) plumbing ─────────────────────────
+#
+# prompts.py never writes the hot-issues wording itself -- the block arrives
+# pre-rendered (see render_hot_issues) and these builders only place it. So
+# these tests only pin PLACEMENT and the None/absent no-op, never any
+# specific phrase from the block's own content.
+
+
+def test_chatbot_tail_places_hot_issues_after_rag_before_date_and_directives() -> None:
+    prompt = build_chatbot_system_prompt(
+        company_name="Acme",
+        rag_context="SENTINEL_RAG_TEXT",
+        extra_directives=["SENTINEL_DIRECTIVE"],
+        hot_issues="SENTINEL_HOT_ISSUES_BLOCK",
+    )
+    rag_idx = prompt.index("SENTINEL_RAG_TEXT")
+    hot_idx = prompt.index("SENTINEL_HOT_ISSUES_BLOCK")
+    date_idx = prompt.index("Current date (UTC)")
+    directives_idx = prompt.index("Additional directives:")
+    assert rag_idx < hot_idx < date_idx < directives_idx
+
+
+def test_chatbot_tail_hot_issues_absent_when_none() -> None:
+    prompt = build_chatbot_system_prompt(company_name="Acme", hot_issues=None)
+    assert "SENTINEL_HOT_ISSUES_BLOCK" not in prompt
+    prompt_default = build_chatbot_system_prompt(company_name="Acme")
+    assert prompt == prompt_default
+
+
+def test_chatbot_system_prompt_byte_identical_when_hot_issues_none_or_empty() -> None:
+    baseline = build_chatbot_system_prompt(company_name="Acme", rag_context="Doc 1")
+    with_none = build_chatbot_system_prompt(
+        company_name="Acme", rag_context="Doc 1", hot_issues=None)
+    with_empty = build_chatbot_system_prompt(
+        company_name="Acme", rag_context="Doc 1", hot_issues="")
+    assert baseline == with_none == with_empty
+
+
+def test_chatbot_variable_tail_places_hot_issues_after_rag_before_date() -> None:
+    tail = build_chatbot_variable_tail(
+        rag_context="SENTINEL_RAG_TEXT", hot_issues="SENTINEL_HOT_ISSUES_BLOCK")
+    rag_idx = tail.index("SENTINEL_RAG_TEXT")
+    hot_idx = tail.index("SENTINEL_HOT_ISSUES_BLOCK")
+    date_idx = tail.index("Current date (UTC)")
+    assert rag_idx < hot_idx < date_idx
+
+
+def test_voicebot_prompt_places_hot_issues_before_kb_context() -> None:
+    script = VoiceBotScript.from_campaign_yaml(SCRIPT)
+    schema = SlotSchema.from_campaign_yaml(yaml.safe_load(SLOT_YAML))
+    prompt = build_voicebot_system_prompt(
+        script, schema, kb_context="SENTINEL_KB_TEXT", hot_issues="SENTINEL_HOT_ISSUES_BLOCK")
+    assert prompt.index("SENTINEL_HOT_ISSUES_BLOCK") < prompt.index("SENTINEL_KB_TEXT")
+
+
+def test_voicebot_prompt_hot_issues_absent_when_none() -> None:
+    script = VoiceBotScript.from_campaign_yaml(SCRIPT)
+    schema = SlotSchema.from_campaign_yaml(yaml.safe_load(SLOT_YAML))
+    prompt = build_voicebot_system_prompt(script, schema, hot_issues=None)
+    baseline = build_voicebot_system_prompt(script, schema)
+    assert prompt == baseline
+    assert "SENTINEL_HOT_ISSUES_BLOCK" not in prompt
+
+
+def test_s2s_instruction_places_hot_issues_before_kb_context() -> None:
+    from src.dialogue.prompts import build_s2s_system_instruction
+    script = VoiceBotScript.from_campaign_yaml(SCRIPT)
+    schema = SlotSchema.from_campaign_yaml(yaml.safe_load(SLOT_YAML))
+    instr = build_s2s_system_instruction(
+        script, schema, kb_context="SENTINEL_KB_TEXT", hot_issues="SENTINEL_HOT_ISSUES_BLOCK")
+    assert instr.index("SENTINEL_HOT_ISSUES_BLOCK") < instr.index("SENTINEL_KB_TEXT")
+
+
+def test_s2s_instruction_hot_issues_absent_when_none() -> None:
+    from src.dialogue.prompts import build_s2s_system_instruction
+    script = VoiceBotScript.from_campaign_yaml(SCRIPT)
+    schema = SlotSchema.from_campaign_yaml(yaml.safe_load(SLOT_YAML))
+    instr = build_s2s_system_instruction(script, schema, hot_issues=None)
+    baseline = build_s2s_system_instruction(script, schema)
+    assert instr == baseline
+
+
 def test_deposit_verification_covers_pending_not_only_failed() -> None:
     """A deposit can be charged and left uncredited while its status still
     reads pending -- per the CRM contract a raw PGS_SUCCESS buckets as pending

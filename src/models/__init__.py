@@ -9,6 +9,7 @@ from src.models.crm import Crm, CrmKBDocument, CrmTool
 from src.models.database import Base, get_engine, get_sessionmaker
 from src.models.deposit_verification import DepositVerificationRequest
 from src.models.embedding_usage import EmbeddingUsage
+from src.models.hot_issue import HotIssue
 from src.models.tenant import (
     ProviderCost,
     Tenant,
@@ -35,6 +36,7 @@ __all__ = [
     "DepositVerificationRequest",
     "EmbeddingUsage",
     "Event",
+    "HotIssue",
     "KBDocument",
     "Lead",
     "ProviderCost",

@@ -298,12 +298,18 @@ def build_voicebot_system_prompt(
     lead_data: Optional[dict[str, Any]] = None,
     extra_directives: Optional[list[str]] = None,
     kb_context: Optional[str] = None,
+    hot_issues: Optional[str] = None,
 ) -> str:
     """Assemble the VoiceBotAgent system prompt.
 
     Campaign-agnostic: this builder only embeds what ``script`` and ``schema``
     declare. The customer-led policy is fixed (applies to every campaign);
     all campaign-specific content comes from the script fields.
+
+    ``hot_issues`` is the pre-rendered operator-notice block (see
+    src.chatbot.hot_issues.render_hot_issues, voice=True variant) — snapshotted
+    once at call start, not re-fetched per turn. Placed before ``kb_context``
+    below; empty/None adds nothing.
     """
     from datetime import UTC, datetime
     lead_data = lead_data or {}
@@ -478,6 +484,12 @@ def build_voicebot_system_prompt(
         "terminal action in that same turn — never continue after a farewell."
     )
 
+    # Hot issues before the KB block (plan order) — already fully rendered
+    # (its own lead + SOURCES markers + re-anchor, see render_hot_issues), so
+    # it's appended as-is rather than run through _sources_block again.
+    if hot_issues:
+        parts.append(hot_issues)
+
     # Position unchanged (already second-to-last, before extra_directives) — only
     # the injection boundary is new here: retrieved KB text is untrusted data
     # regardless of where in the prompt it lands.
@@ -515,6 +527,7 @@ def build_s2s_system_instruction(
     schema: SlotSchema,
     lead_data: Optional[dict[str, Any]] = None,
     kb_context: Optional[str] = None,
+    hot_issues: Optional[str] = None,
 ) -> str:
     """System instruction for a speech-to-speech (Gemini Live) session.
 
@@ -523,6 +536,11 @@ def build_s2s_system_instruction(
     reply directly (so natural Hinglish code-switching is wanted, not forbidden)
     and self-reports structured control via the ``record_turn_signal`` tool
     instead of a JSON field.
+
+    ``hot_issues`` is the pre-rendered operator-notice block (voice=True
+    variant — see src.chatbot.hot_issues.render_hot_issues), snapshotted once
+    at call start. Placed before ``kb_context``, which must stay LAST (its own
+    re-anchor assumes nothing untrusted follows it).
     """
     lead_data = lead_data or {}
     parts: list[str] = []
@@ -635,6 +653,11 @@ def build_s2s_system_instruction(
         "leave action=continue after a farewell."
     )
 
+    # Hot issues before the KB block — same ordering as build_voicebot_system_
+    # prompt. Already fully rendered, so appended as-is.
+    if hot_issues:
+        parts.append(hot_issues)
+
     # Sources placed last, after the static tool-control block, for the same
     # cacheable-prefix reason as build_chatbot_system_prompt; delimited because
     # retrieved KB text is untrusted data, not instructions.
@@ -663,6 +686,7 @@ def _variable_tail_parts(
     rag_context: Optional[str],
     extra_directives: Optional[list[str]],
     tenant_timezone: str,
+    hot_issues: Optional[str] = None,
 ) -> list[str]:
     """The per-turn variable tail of the chatbot system prompt: retrieved
     sources, current date/local-time (%H:%M granularity), and the per-turn
@@ -687,6 +711,15 @@ def _variable_tail_parts(
     # (see the language-handling bug history in chatbot.py).
     if rag_context:
         tail.append(_sources_block("Reference sources", "", rag_context))
+
+    # Hot issues (src/chatbot/hot_issues.py) go right after rag_context and
+    # before date/time: ``hot_issues`` already arrives fully rendered (its own
+    # lead + SOURCES markers + re-anchor — see render_hot_issues), so it's
+    # appended as-is rather than passed through _sources_block again. Per-turn
+    # content like rag_context, so it belongs in the variable tail, not the
+    # static body.
+    if hot_issues:
+        tail.append(hot_issues)
 
     # Current date/time MUST be built here, not at the top of this function: it
     # changes every minute (%H:%M), so anywhere upstream of it stops being a
@@ -737,6 +770,7 @@ def _variable_tail_parts(
         log, "prompts variable_tail built",
         rag_context_injected=bool(rag_context),
         rag_context_chars=len(rag_context) if rag_context else 0,
+        hot_issues_chars=len(hot_issues) if hot_issues else 0,
         tenant_timezone_requested=tenant_timezone, tenant_timezone_resolved=tz_label,
         extra_directives_count=len(extra_directives or []),
         tail_chars=sum(len(p) for p in tail),
@@ -758,6 +792,7 @@ def build_chatbot_system_prompt(
     max_tool_rounds: int = 3,
     bot_name: Optional[str] = None,
     bot_gender: Optional[str] = None,
+    hot_issues: Optional[str] = None,
 ) -> str:
     """System prompt for the RAG-powered ChatBot agent (Phase 4).
 
@@ -785,6 +820,12 @@ def build_chatbot_system_prompt(
     example to send it through some provider-side caching mechanism) needs a
     way to build the prompt without the tail, and to build that tail on its
     own — build_chatbot_variable_tail does the latter.
+
+    ``hot_issues`` is the pre-rendered operator-notice block from
+    ``src.chatbot.hot_issues.render_hot_issues`` (empty/None when there are no
+    active notices). Only used when ``include_variable_tail`` is True — it
+    rides in the variable tail (see _variable_tail_parts), since it's per-turn
+    content like rag_context, not part of the static body.
     """
     pack = PACKS.get(prompt_pack, _generic_pack)
     if prompt_pack not in PACKS:
@@ -1197,7 +1238,7 @@ def build_chatbot_system_prompt(
     )
 
     if include_variable_tail:
-        parts.extend(_variable_tail_parts(rag_context, extra_directives, tenant_timezone))
+        parts.extend(_variable_tail_parts(rag_context, extra_directives, tenant_timezone, hot_issues))
 
     prompt_text = "\n\n".join(parts)
     debug_event(
@@ -1208,6 +1249,7 @@ def build_chatbot_system_prompt(
         has_deposit_verification_tool=has_deposit_verification_tool,
         tenant_timezone=tenant_timezone, include_variable_tail=include_variable_tail,
         rag_context_chars=len(rag_context) if rag_context else 0,
+        hot_issues_chars=len(hot_issues) if hot_issues else 0,
         extra_directives_count=len(extra_directives or []), prompt_chars=len(prompt_text),
     )
     return prompt_text
@@ -1217,6 +1259,7 @@ def build_chatbot_variable_tail(
     rag_context: Optional[str] = None,
     extra_directives: Optional[list[str]] = None,
     tenant_timezone: str = "Asia/Kolkata",
+    hot_issues: Optional[str] = None,
 ) -> str:
     """The per-turn variable tail of the chatbot system prompt, standalone —
     see build_chatbot_system_prompt(include_variable_tail=...) and
@@ -1224,4 +1267,4 @@ def build_chatbot_variable_tail(
     Defaults mirror build_chatbot_system_prompt's so the two never disagree
     on e.g. the default timezone.
     """
-    return "\n\n".join(_variable_tail_parts(rag_context, extra_directives, tenant_timezone))
+    return "\n\n".join(_variable_tail_parts(rag_context, extra_directives, tenant_timezone, hot_issues))

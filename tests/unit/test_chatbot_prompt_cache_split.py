@@ -226,6 +226,57 @@ def test_split_multimodal_prepends_a_text_part_and_preserves_the_image() -> None
     assert user_msg.content[1] is image_part
 
 
+# --- 7. Hot issues ride in the tail, never poison the static system prompt -
+
+
+def test_split_system_prompt_is_byte_identical_with_and_without_hot_issues(retriever) -> None:
+    llm = FakeLLM()
+    agent = _make_agent(llm, retriever, cache_split_prompt=True)
+
+    user_msg = LLMMessage(role="user", content="hi")
+    without = agent._compose("rag text", user_msg, query_text="hi")
+    with_hot = agent._compose(
+        "rag text", user_msg, query_text="hi", hot_issues="SENTINEL_HOT_ISSUES_BLOCK")
+
+    # The system prompt (messages[0]) must stay byte-identical whether or not
+    # a notice is active -- hot issues are per-turn content (like rag_context/
+    # date-time) and must never poison the cacheable static body.
+    assert without[0].content == with_hot[0].content
+    assert "SENTINEL_HOT_ISSUES_BLOCK" not in with_hot[0].content
+    # ...but it DOES reach the tail (the framed user-turn message).
+    assert "SENTINEL_HOT_ISSUES_BLOCK" in with_hot[-1].content
+
+
+def test_split_hot_issues_appears_only_inside_turn_context_frame(retriever) -> None:
+    llm = FakeLLM()
+    agent = _make_agent(llm, retriever, cache_split_prompt=True)
+
+    user_msg = LLMMessage(role="user", content="hi")
+    messages = agent._compose(
+        "rag text", user_msg, query_text="hi", hot_issues="SENTINEL_HOT_ISSUES_BLOCK")
+
+    tail_msg = messages[-1]
+    open_idx = tail_msg.content.index(TURN_CONTEXT_OPEN)
+    close_idx = tail_msg.content.index(TURN_CONTEXT_CLOSE)
+    hot_idx = tail_msg.content.index("SENTINEL_HOT_ISSUES_BLOCK")
+    assert open_idx < hot_idx < close_idx
+
+
+def test_split_previous_conversation_precedes_hot_issues_in_tail(retriever) -> None:
+    llm = FakeLLM()
+    agent = _make_agent(
+        llm, retriever, cache_split_prompt=True, previous_conversation="SENTINEL_PREVIOUS_CONV")
+
+    user_msg = LLMMessage(role="user", content="hi")
+    messages = agent._compose(
+        "rag text", user_msg, query_text="hi", hot_issues="SENTINEL_HOT_ISSUES_BLOCK")
+
+    tail_msg = messages[-1]
+    prev_idx = tail_msg.content.index("SENTINEL_PREVIOUS_CONV")
+    hot_idx = tail_msg.content.index("SENTINEL_HOT_ISSUES_BLOCK")
+    assert prev_idx < hot_idx
+
+
 # --- 6. bootstrap._prompt_cache_split_enabled -------------------------------
 
 

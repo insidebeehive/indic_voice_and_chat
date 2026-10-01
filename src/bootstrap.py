@@ -653,6 +653,7 @@ def make_chatbot_factory(registry, sessionmaker=None, crm_retrievers: "PerCrmRet
     from src.agents.base import AgentSession
     from src.agents.chatbot import ChatBotAgent
     from src.auth.registry import _AsyncPerTenantRegistry
+    from src.chatbot import hot_issues as _hi
     from src.chatbot.deposit_verification import submit_deposit_verification
     from src.chatbot.tool_executor import execute_crm_tool
     from src.chatbot.tools import SUBMIT_DEPOSIT_VERIFICATION_TOOL_SPEC
@@ -905,6 +906,13 @@ def make_chatbot_factory(registry, sessionmaker=None, crm_retrievers: "PerCrmRet
             # the _llm_defaults comment).
             record_metric=lambda payload: record_chat_turn_metric(
                 tenant_id=tenant.id, crm_id=getattr(tenant.settings, "crm_id", None), **payload),
+            # Hot issues (src/chatbot/hot_issues.py): awaited once per turn by
+            # ChatBotAgent itself (_handle_with_tools), never here -- this
+            # closure only hands over the callable. `_hi.get_active_hot_issues`
+            # (attribute access on the module, not a bound function reference)
+            # is what lets tests monkeypatch it after this module is imported.
+            hot_issues_provider=lambda: _hi.get_active_hot_issues(
+                tenant.id, getattr(tenant.settings, "crm_id", None)),
         )
 
     return factory
@@ -944,7 +952,7 @@ def _build_s2s_agent_and_config(
     providers: TenantProviders, tenant: TenantContext, script: VoiceBotScript,
     slots: SlotSchema, session_store: SessionStore | None,
     *, voice_override: str | None = None, lead_data: dict | None = None,
-    kb_context: str | None = None,
+    kb_context: str | None = None, hot_issues: str | None = None,
 ):
     """Assemble everything a Gemini-Live S2S call needs EXCEPT the transport-
     specific bridge itself: the agent, the ``RealtimeConfig``, the session
@@ -1001,7 +1009,8 @@ def _build_s2s_agent_and_config(
     key = None
     config = RealtimeConfig(
         model=rt.model, voice=voice, language_code=rt.language_code,
-        system_instruction=build_s2s_system_instruction(script, slots, lead_data, kb_context=kb_context),
+        system_instruction=build_s2s_system_instruction(
+            script, slots, lead_data, kb_context=kb_context, hot_issues=hot_issues),
         tools=[RECORD_TURN_SIGNAL])
     debug_event(
         log, "bootstrap s2s_agent config_built", tenant_id=tenant.id, session_id=session_id,
@@ -1034,6 +1043,7 @@ async def _build_s2s_telephony_bridge(
     *, encoding: str, sid_field: str, supports_clear: bool,
     call_sid_field: str = "callSid", voice_override: str | None = None,
     lead_data: dict | None = None, kb_context: str | None = None,
+    hot_issues: str | None = None,
     transfer_webhook_url_override: str | None = None,
 ):
     """Build a TelephonyLiveBridge (Gemini Live over the media stream) for a call
@@ -1045,7 +1055,8 @@ async def _build_s2s_telephony_bridge(
 
     agent, config, connect, llm, tts, tenant_timezone = _build_s2s_agent_and_config(
         providers, tenant, script, slots, session_store,
-        voice_override=voice_override, lead_data=lead_data, kb_context=kb_context)
+        voice_override=voice_override, lead_data=lead_data, kb_context=kb_context,
+        hot_issues=hot_issues)
 
     log.info("s2s telephony bridge built call", extra={
         "tenant": tenant.slug, "voice": config.voice, "model": config.model, "encoding": encoding})
@@ -1177,10 +1188,14 @@ def make_livekit_bridge_factory(
 
         kb_ctx = await _build_kb_context(
             _crm_retriever_for(tenant, crm_retrievers), _tenant_retriever_for(tenant, registry))
+        from src.chatbot import hot_issues as _hi
+        hot = await _hi.get_active_hot_issues(
+            tenant.id, getattr(tenant.settings, "crm_id", None), voice=True)
 
         agent, config, connect_session, llm, tts, tenant_timezone = _build_s2s_agent_and_config(
             providers, tenant, cur_script, cur_slots, session_store,
-            voice_override=voice_override, lead_data=lead_data, kb_context=kb_ctx)
+            voice_override=voice_override, lead_data=lead_data, kb_context=kb_ctx,
+            hot_issues=hot.block)
 
         log.info("livekit bridge factory resolved call config", extra={
             "tenant": tenant.slug, "room_name": room_name, "voice": config.voice})
@@ -1272,12 +1287,16 @@ def make_bridge_factory(
         # over the Twilio media stream instead of the STT->LLM->TTS cascade.
         kb_ctx = await _build_kb_context(
             _crm_retriever_for(tenant, crm_retrievers), _tenant_retriever_for(tenant, registry))
+        from src.chatbot import hot_issues as _hi
+        hot = await _hi.get_active_hot_issues(
+            tenant.id, getattr(tenant.settings, "crm_id", None), voice=True)
         if mode == "s2s":
             return await _build_s2s_telephony_bridge(
                 providers, tenant, cur_script, cur_slots, websocket, session_store,
                 encoding="mulaw", sid_field="streamSid", supports_clear=True,
                 call_sid_field="callSid", voice_override=voice_override or None,
                 lead_data=_override_lead_data(override), kb_context=kb_ctx,
+                hot_issues=hot.block,
                 transfer_webhook_url_override=(override or {}).get("transfer_webhook_url") or None)
         # Build a fresh agent per call; provider clients are cached on the
         # registry so we don't pay reconstruction cost.
@@ -1337,6 +1356,7 @@ def make_bridge_factory(
             engine=engine,
             store=store,
             kb_context=kb_ctx or None,
+            hot_issues=hot.block or None,
             record_metric=lambda payload: record_turn_metric(tenant_id=tenant.id, **payload),
         )
 
@@ -1466,12 +1486,16 @@ def make_exotel_bridge_factory(
         # snake_case stream_sid, no `clear` frame) when the tenant is in s2s mode.
         kb_ctx = await _build_kb_context(
             _crm_retriever_for(tenant, crm_retrievers), _tenant_retriever_for(tenant, registry))
+        from src.chatbot import hot_issues as _hi
+        hot = await _hi.get_active_hot_issues(
+            tenant.id, getattr(tenant.settings, "crm_id", None), voice=True)
         if mode == "s2s":
             return await _build_s2s_telephony_bridge(
                 providers, tenant, cur_script, cur_slots, websocket, session_store,
                 encoding="pcm", sid_field="stream_sid", supports_clear=False,
                 call_sid_field="call_sid", voice_override=voice_override or None,
                 lead_data=_override_lead_data(override), kb_context=kb_ctx,
+                hot_issues=hot.block,
                 transfer_webhook_url_override=(override or {}).get("transfer_webhook_url") or None)
         stt = providers.get_stt(tenant)
         llm = providers.get_llm(tenant)
@@ -1525,6 +1549,7 @@ def make_exotel_bridge_factory(
             engine=engine,
             store=store,
             kb_context=kb_ctx or None,
+            hot_issues=hot.block or None,
             record_metric=lambda payload: record_turn_metric(tenant_id=tenant.id, **payload),
         )
 
@@ -1611,6 +1636,9 @@ def make_stringee_bridge_factory(
             _crm_retriever_for(tenant, crm_retrievers),
             _tenant_retriever_for(tenant, registry),
         )
+        from src.chatbot import hot_issues as _hi
+        hot = await _hi.get_active_hot_issues(
+            tenant.id, getattr(tenant.settings, "crm_id", None), voice=True)
         session_id = f"call_{uuid.uuid4().hex[:12]}"
         session = AgentSession(session_id=session_id)
         sm = AgentStateMachine()
@@ -1622,6 +1650,7 @@ def make_stringee_bridge_factory(
             engine=engine,
             store=None,
             kb_context=kb_ctx or None,
+            hot_issues=hot.block or None,
             record_metric=lambda payload: record_turn_metric(tenant_id=tenant.id, **payload),
         )
 

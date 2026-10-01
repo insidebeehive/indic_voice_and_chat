@@ -361,6 +361,35 @@ async def test_ungrounded_currency_figure_fires_unverified_data_guard(retriever)
     assert result.metrics.guard_unverified_data_fired is True
 
 
+async def test_hot_issues_block_counts_as_grounded_for_unverified_data_guard(retriever) -> None:
+    """A currency figure that originates in an active hot-issues notice (see
+    src/chatbot/hot_issues.py) must survive apply_unverified_data_guard: the
+    notice's rendered block is injected into _handle_with_tools's
+    grounded_text join specifically so a reply relaying it is never treated
+    as a fabricated figure. Mirrors
+    test_ungrounded_currency_figure_fires_unverified_data_guard's shape, with
+    the figure now backed by hot_issues_provider instead of being bare."""
+    from types import SimpleNamespace
+
+    hot_snapshot = SimpleNamespace(
+        block="Deposits delayed: refunds up to ₹50,000 may take 24h to settle.",
+        keys=("t:pg-delay",),
+    )
+
+    async def _hot_provider():
+        return hot_snapshot
+
+    llm = ScriptedLLM([
+        LLMResult(text="Refunds up to ₹50,000 may take 24h to settle.", finish_reason="stop"),
+    ])
+    agent = _agent(llm, retriever, hot_issues_provider=_hot_provider)
+    result = await agent.handle_message("why is my deposit refund delayed?")
+
+    assert result.metrics is not None
+    assert result.metrics.guard_unverified_data_fired is False
+    assert "₹50,000" in result.response.response_text
+
+
 async def test_single_shot_path_reports_path_and_zero_kb_searches(retriever) -> None:
     llm = ScriptedLLM([LLMResult(text="Plan B has 500GB unlimited data.", finish_reason="stop")])
     agent = ChatBotAgent(

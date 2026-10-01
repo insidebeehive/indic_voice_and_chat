@@ -1119,11 +1119,14 @@ def make_browser_bridge_factory(
             _crm_retriever_for,
             _tenant_retriever_for,
         )
+        from src.chatbot import hot_issues as _hi  # noqa: PLC0415
 
         kb_ctx = await _build_kb_context(
             _crm_retriever_for(tenant, crm_retrievers),
             _tenant_retriever_for(tenant, registry),
         ) or None
+        hot = await _hi.get_active_hot_issues(
+            tenant.id, getattr(tenant.settings, "crm_id", None), voice=True)
         agent = VoiceBotAgent(
             session=AgentSession(session_id=session_id, lead_data=lead_data),
             state_machine=AgentStateMachine(),
@@ -1133,6 +1136,7 @@ def make_browser_bridge_factory(
             store=None,
             extra_directives=extra_directives,
             kb_context=kb_ctx,
+            hot_issues=hot.block or None,
             record_metric=lambda payload: record_turn_metric(tenant_id=tenant.id, **payload),
         )
         log.info("dev console built call", extra={"tenant": tenant.slug, "session_id": session_id})
@@ -1226,15 +1230,21 @@ def make_live_bridge_factory(
             _crm_retriever_for,
             _tenant_retriever_for,
         )
+        from src.chatbot import hot_issues as _hi  # noqa: PLC0415
 
         kb_ctx = await _build_kb_context(
             _crm_retriever_for(tenant, crm_retrievers),
             _tenant_retriever_for(tenant, registry),
         ) or None
+        hot = await _hi.get_active_hot_issues(
+            tenant.id, getattr(tenant.settings, "crm_id", None), voice=True)
         agent = VoiceBotAgent(
             session=AgentSession(session_id=session_id, lead_data=lead_data),
             state_machine=AgentStateMachine(), slot_schema=cur_slots, script=cur_script,
             engine=engine, store=None, kb_context=kb_ctx,
+            # NOT hot_issues here -- this agent's own prompt is never used:
+            # S2S has no pre-TTS guard and the live session speaks from the
+            # build_s2s_system_instruction call below instead.
             record_metric=lambda payload: record_turn_metric(tenant_id=tenant.id, **payload),
         )
 
@@ -1243,7 +1253,7 @@ def make_live_bridge_factory(
         config = RealtimeConfig(
             model=rt.model, voice=voice, language_code=rt.language_code,
             system_instruction=build_s2s_system_instruction(
-                cur_script, cur_slots, lead_data, kb_context=kb_ctx),
+                cur_script, cur_slots, lead_data, kb_context=kb_ctx, hot_issues=hot.block),
             tools=[RECORD_TURN_SIGNAL],
         )
 

@@ -410,6 +410,7 @@ class VoiceBotAgent(BaseAgent):
         store=None,
         extra_directives: Optional[list[str]] = None,
         kb_context: Optional[str] = None,
+        hot_issues: Optional[str] = None,
         record_metric: Optional[Callable[[dict[str, Any]], Awaitable[None]]] = None,
     ) -> None:
         # Always recognise lead_gender so the LLM can infer and report it even
@@ -440,6 +441,12 @@ class VoiceBotAgent(BaseAgent):
             )
         self._extra_directives = extra_directives
         self._kb_context = kb_context
+        # Hot issues (src/chatbot/hot_issues.py): snapshotted once at call
+        # start by the caller (src/bootstrap.py / src/api/dev_console.py, via
+        # get_active_hot_issues(..., voice=True)) -- unlike chat, never
+        # re-fetched mid-call (see the module's documented "known limit": a
+        # notice cleared mid-call doesn't reach a call already in progress).
+        self._hot_issues = hot_issues
         self._record_metric = record_metric
         # The conversation's active language. Starts at the campaign default and
         # switches when the caller speaks/asks for another language (resolved each
@@ -452,6 +459,7 @@ class VoiceBotAgent(BaseAgent):
             lead_data=session.lead_data,
             extra_directives=extra_directives,
             kb_context=kb_context,
+            hot_issues=hot_issues,
         )
         self.session.turns.append(LLMMessage(role="system", content=self._system_prompt))
 
@@ -490,7 +498,8 @@ class VoiceBotAgent(BaseAgent):
         comment above _voice_sentence_guard for what it checks and why).
 
         Grounded material = self._kb_context (the one-shot KB dump from call
-        start) + the caller's own transcribed speech this call. The latter is
+        start) + self._hot_issues (the one-shot hot-issues snapshot, same call-
+        start timing) + the caller's own transcribed speech this call. The latter is
         session.turns' user messages plus, when the caller already has it in
         hand, ``current_user_text`` — the streaming-STT path
         (handle_turn_text) already knows this turn's transcript before
@@ -525,7 +534,9 @@ class VoiceBotAgent(BaseAgent):
         "grounded" means, which is the one thing this guard exists to avoid.
         """
         caller_speech = self._caller_speech_so_far()
-        grounded_text = "\n".join([self._kb_context or "", caller_speech, current_user_text])
+        grounded_text = "\n".join([
+            self._kb_context or "", self._hot_issues or "", caller_speech, current_user_text,
+        ])
         customer_text = "\n".join([caller_speech, current_user_text])
         is_hindi = (self._active_language or "").startswith("hi")
         session_id = self.session.session_id
@@ -1052,6 +1063,7 @@ class VoiceBotAgent(BaseAgent):
                 lead_data=self.session.lead_data,
                 extra_directives=self._extra_directives,
                 kb_context=self._kb_context,
+                hot_issues=self._hot_issues,
             )
             self._system_prompt = updated_prompt
             if self.session.turns:

@@ -15,6 +15,7 @@ from src.api import (
     crms,
     deposit_verification,
     external_chat,
+    hot_issues,
     knowledge,
     livekit_routes,
     sessions,
@@ -36,6 +37,8 @@ api_router.include_router(config_routes.router)
 api_router.include_router(conversations.router)
 api_router.include_router(crms.router)
 api_router.include_router(crm_kb.router)
+api_router.include_router(hot_issues.router)
+api_router.include_router(hot_issues.crm_router)
 api_router.include_router(knowledge.router)
 api_router.include_router(webhooks_routes.router)
 api_router.include_router(benchmarks.router)

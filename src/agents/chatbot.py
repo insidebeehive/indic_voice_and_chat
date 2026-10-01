@@ -1082,6 +1082,16 @@ class ChatBotAgent(BaseAgent):
         # never customer-facing at all.
         bot_name: str | None = None,
         bot_gender: str | None = None,
+        # Hot issues (src/chatbot/hot_issues.py): a zero-arg async callable
+        # returning a HotIssueSnapshot-shaped object (``.block``/``.keys``),
+        # awaited once per turn in _handle_with_tools only (see there for why
+        # _single_shot is excluded: its hallucination guard). None (every construction site that
+        # predates this feature, plus any test) means "no notices" -- this
+        # module must keep importing ZERO model/hot_issues modules, so the
+        # snapshot comes in pre-built via this callable rather than this file
+        # calling src.chatbot.hot_issues itself. make_chatbot_factory
+        # (src/bootstrap.py) is the one production caller.
+        hot_issues_provider: Callable[[], Awaitable[Any]] | None = None,
     ) -> None:
         # ChatBot doesn't need slots — pass an empty schema so BaseAgent is happy.
         super().__init__(
@@ -1143,6 +1153,7 @@ class ChatBotAgent(BaseAgent):
         self._previous_conversation = previous_conversation
         self._bot_name = bot_name
         self._bot_gender = bot_gender
+        self._hot_issues_provider = hot_issues_provider
         # Phase 2 of the turn-metrics plan (docs/superpowers/plans/
         # 2026-09-08-chatbot-turn-metrics.md, §4): injected write-path
         # callback, mirroring VoiceBotAgent's record_metric inversion of
@@ -1495,9 +1506,26 @@ class ChatBotAgent(BaseAgent):
         # one that would silently reset and double the real ceiling.
         tool_elapsed_s = 0.0
         tools = list(BUILTIN_TOOLS) + list(self._crm_tools)
+        # Hot issues (src/chatbot/hot_issues.py): awaited once per turn, here
+        # only -- never in _single_shot, whose apply_hallucination_guard
+        # replaces the whole reply when no KB chunk was retrieved (so a reply
+        # relaying a notice would be wiped), and production always runs
+        # enable_tools=True anyway. None provider or a provider that returns nothing
+        # snapshot-shaped both degrade to an empty block/keys via getattr,
+        # never raising the turn.
+        hot = None
+        if self._hot_issues_provider is not None:
+            hot = await self._hot_issues_provider()
+        hot_block = getattr(hot, "block", "") or ""
+        hot_keys = getattr(hot, "keys", ()) or ()
+        if hot_keys:
+            debug_event(
+                log, "chatbot hot_issues injected",
+                session_id=self._session_id, keys=list(hot_keys), chars=len(hot_block),
+            )
         # Tools fetch their own context (search_knowledge_base), so the system
         # prompt starts without a pre-built RAG block.
-        messages = self._compose("", user_msg, query_text=query_text)
+        messages = self._compose("", user_msg, query_text=query_text, hot_issues=hot_block or None)
         retrieved_all: list[RetrievedChunk] = []
         tool_calls_made: list[str] = []
         escalation: dict | None = None
@@ -1927,8 +1955,15 @@ class ChatBotAgent(BaseAgent):
             if m.role == "user" and isinstance(m.content, str)
         )
         kb_chunk_text = "\n".join(c.document.content for c in retrieved_all)
+        # hot_block (this turn's hot-issues block, fetched above) counts as
+        # grounded too -- every figure/date an operator posts in a notice is,
+        # by construction, something the bot is explicitly told to relay this
+        # turn (see HOT_ISSUES_LEAD), so a reply that echoes e.g. a ₹ figure
+        # from it must not trip the guard. NOT added to customer_text, which
+        # stays narrower (query + the customer's own prior turns only) -- see
+        # that variable's own comment above.
         grounded_text = "\n".join([
-            *grounded_tool_texts, kb_chunk_text, query_text, prior_turns_text,
+            *grounded_tool_texts, kb_chunk_text, query_text, prior_turns_text, hot_block,
         ])
         _guard_before_unverified = (response.response_text, response.confidence)
         response = apply_unverified_data_guard(
@@ -2369,6 +2404,7 @@ class ChatBotAgent(BaseAgent):
 
     def _compose(
         self, rag_text: str, user_msg: LLMMessage, query_text: str = "",
+        *, hot_issues: str | None = None,
     ) -> list[LLMMessage]:
         # Per-turn language directive. History of this logic (real bugs):
         # 1. All-Latin text was labeled "English" → romanized Hindi got forced
@@ -2484,6 +2520,7 @@ class ChatBotAgent(BaseAgent):
                 rag_context=rag_text,
                 extra_directives=extra,
                 tenant_timezone=self._tenant_timezone,
+                hot_issues=hot_issues,
             )
             # _fold_turn_context PREPENDS its frame ahead of whatever content
             # is already on the message, so applying it FIRST and folding
@@ -2510,6 +2547,7 @@ class ChatBotAgent(BaseAgent):
             max_tool_rounds=self._max_tool_rounds,
             bot_name=self._bot_name,
             bot_gender=self._bot_gender,
+            hot_issues=hot_issues,
         )
         messages: list[LLMMessage] = [LLMMessage(role="system", content=system_prompt)]
         # Replay the last MAX_HISTORY_TURNS exchanges (system is rebuilt each

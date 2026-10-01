@@ -163,6 +163,89 @@ async def test_factory_loads_crm_tools_and_enables_loop(monkeypatch) -> None:
     await engine.dispose()
 
 
+async def test_factory_threads_hot_issues_provider_with_tenant_id_and_crm_id(
+    monkeypatch,
+) -> None:
+    """make_chatbot_factory's hot_issues_provider closure must call
+    get_active_hot_issues with (tenant.id, tenant.settings.crm_id) -- awaiting
+    the provider the factory hands to ChatBotAgent, not just constructing
+    it, is what actually proves the attribute access/closure wiring."""
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from src.auth import TenantContext
+    from src.bootstrap import make_chatbot_factory
+    from src.chatbot import hot_issues as hi
+
+    monkeypatch.setenv("VOX_SECRET_KEY", crypto.generate_key())
+    crypto.reset_cache_for_tests()
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:", future=True)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    sm = async_sessionmaker(engine, expire_on_commit=False)
+    async with sm() as s:
+        s.add(Tenant(id="t1", slug="t1", name="T1"))
+        await s.commit()
+
+    registry = SimpleNamespace(
+        providers=SimpleNamespace(get_llm=lambda t: object(), get_platform_llm=lambda: object()),
+        retrievers=SimpleNamespace(get=lambda t: object()),
+        session_stores=SimpleNamespace(get=lambda t: None),
+        crm_tools=None,
+    )
+    factory = make_chatbot_factory(registry, sm)
+
+    mock_loader = AsyncMock(return_value=hi.HotIssueSnapshot("", ()))
+    monkeypatch.setattr(hi, "get_active_hot_issues", mock_loader)
+
+    tenant = TenantContext(
+        settings=TenantSettings(id="t1", slug="t1", name="T1", crm_id="crm_X"))
+    agent = await factory(tenant, "s1")
+    await agent._hot_issues_provider()
+    mock_loader.assert_called_once_with("t1", "crm_X")
+
+    await engine.dispose()
+
+
+async def test_factory_hot_issues_provider_passes_none_when_tenant_has_no_crm_id(
+    monkeypatch,
+) -> None:
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from src.auth import TenantContext
+    from src.bootstrap import make_chatbot_factory
+    from src.chatbot import hot_issues as hi
+
+    monkeypatch.setenv("VOX_SECRET_KEY", crypto.generate_key())
+    crypto.reset_cache_for_tests()
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:", future=True)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    sm = async_sessionmaker(engine, expire_on_commit=False)
+    async with sm() as s:
+        s.add(Tenant(id="t1", slug="t1", name="T1"))
+        await s.commit()
+
+    registry = SimpleNamespace(
+        providers=SimpleNamespace(get_llm=lambda t: object(), get_platform_llm=lambda: object()),
+        retrievers=SimpleNamespace(get=lambda t: object()),
+        session_stores=SimpleNamespace(get=lambda t: None),
+        crm_tools=None,
+    )
+    factory = make_chatbot_factory(registry, sm)
+
+    mock_loader = AsyncMock(return_value=hi.HotIssueSnapshot("", ()))
+    monkeypatch.setattr(hi, "get_active_hot_issues", mock_loader)
+
+    tenant = TenantContext(settings=TenantSettings(id="t1", slug="t1", name="T1"))
+    agent = await factory(tenant, "s1")
+    await agent._hot_issues_provider()
+    mock_loader.assert_called_once_with("t1", None)
+
+    await engine.dispose()
+
+
 async def test_factory_caches_crm_tools_across_sessions(monkeypatch) -> None:
     # New chat sessions used to re-run the (N+1-query) CRM tool load from
     # scratch every time (src/bootstrap.py _load_crm_tools) — under a burst of

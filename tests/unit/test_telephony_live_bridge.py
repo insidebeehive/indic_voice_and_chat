@@ -847,7 +847,87 @@ async def test_build_s2s_agent_and_config_matches_telephony_bridge_behavior():
     assert agent.session.lead_data.get("lead_name") == bridge._agent.session.lead_data.get("lead_name") == "Raju"
 
 
-@pytest.mark.asyncio
+# --- Hot issues (src/chatbot/hot_issues.py) threading through S2S ----------
+
+
+def test_build_s2s_agent_and_config_threads_hot_issues_into_system_instruction():
+    """_build_s2s_agent_and_config's keyword-only hot_issues must reach
+    build_s2s_system_instruction, i.e. the resulting RealtimeConfig's
+    system_instruction carries the pre-rendered block."""
+    from src.bootstrap import _build_s2s_agent_and_config
+
+    tenant = _livekit_tenant()
+    providers = _livekit_providers()
+    script = VoiceBotScript(agent_name="A", agent_role="s", company_name="X")
+
+    agent, config, connect_session, llm, tts, tenant_timezone = _build_s2s_agent_and_config(
+        providers, tenant, script, SlotSchema(), None,
+        hot_issues="SENTINEL_HOT_ISSUES_BLOCK")
+
+    assert "SENTINEL_HOT_ISSUES_BLOCK" in config.system_instruction
+
+
+async def test_build_s2s_telephony_bridge_threads_hot_issues():
+    """_build_s2s_telephony_bridge's keyword-only hot_issues must reach the
+    bridge's config.system_instruction via _build_s2s_agent_and_config."""
+    from types import SimpleNamespace
+
+    from src.bootstrap import _build_s2s_telephony_bridge
+
+    rt = SimpleNamespace(model="m", voice="Aoede", language_code="hi-IN", api_key_env="K")
+    tenant = SimpleNamespace(
+        id="t1", slug="dev",
+        settings=SimpleNamespace(pipeline=SimpleNamespace(mode="s2s", realtime=rt),
+                                 timezone="Asia/Kolkata"),
+        secret=lambda env: "k", secret_optional=lambda env: "k")
+    providers = SimpleNamespace(get_stt=lambda t: None, get_llm=lambda t: object(),
+                                get_tts=lambda t: None, get_chat_call_tts=lambda t: None)
+
+    bridge = await _build_s2s_telephony_bridge(
+        providers, tenant, VoiceBotScript(agent_name="A", agent_role="s", company_name="X"),
+        SlotSchema(), websocket=object(), session_store=None,
+        encoding="mulaw", sid_field="streamSid", supports_clear=True,
+        hot_issues="SENTINEL_HOT_ISSUES_BLOCK")
+
+    assert "SENTINEL_HOT_ISSUES_BLOCK" in bridge._config.system_instruction
+
+
+async def test_make_livekit_bridge_factory_threads_hot_issues(monkeypatch):
+    """The livekit factory's direct _build_s2s_agent_and_config call (the one
+    code path that doesn't go through _build_s2s_telephony_bridge) must also
+    fetch (voice=True) and thread the snapshot into the S2S config."""
+    from types import SimpleNamespace
+
+    from src.bootstrap import make_livekit_bridge_factory
+
+    async def _fake_get_active_hot_issues(tenant_id, crm_id=None, *, voice=False):
+        assert voice is True
+        return SimpleNamespace(block="SENTINEL_HOT_ISSUES_BLOCK", keys=("t:pg-delay",))
+
+    monkeypatch.setattr(
+        "src.chatbot.hot_issues.get_active_hot_issues", _fake_get_active_hot_issues)
+
+    factory = make_livekit_bridge_factory(_livekit_providers())
+    build = await factory(_livekit_tenant(), "room_123", {})
+    bridge = await build(audio_stream=object(), audio_source=object(),
+                         frame_factory=object(), on_hangup=None)
+
+    assert "SENTINEL_HOT_ISSUES_BLOCK" in bridge._config.system_instruction
+
+
+async def test_make_livekit_bridge_factory_hot_issues_defaults_empty():
+    """The conftest autouse stub (empty snapshot) must not inject anything --
+    confirms this path degrades cleanly with no active notices."""
+    from src.bootstrap import make_livekit_bridge_factory
+
+    factory = make_livekit_bridge_factory(_livekit_providers())
+    build = await factory(_livekit_tenant(), "room_123", {})
+    bridge = await build(audio_stream=object(), audio_source=object(),
+                         frame_factory=object(), on_hangup=None)
+
+    assert "SENTINEL_HOT_ISSUES_BLOCK" not in bridge._config.system_instruction
+
+
 async def test_make_livekit_bridge_factory_returns_builder():
     from src.api.livekit_bridge import LiveKitBridge
     from src.bootstrap import make_livekit_bridge_factory

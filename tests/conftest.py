@@ -84,3 +84,33 @@ def _reset_chat_turn_guards():
     chat_api._turn_guards.clear()
     yield
     chat_api._turn_guards.clear()
+
+
+@pytest.fixture(autouse=True)
+def _stub_hot_issues(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch):
+    """Hot issues (src/chatbot/hot_issues.py) are injected into every chat/
+    voice turn via a module-level in-process cache -- without this, one
+    test's cache entry (or a leftover real DB load) can leak into an
+    unrelated, later test's turn. Imported lazily (not at module import
+    time) so this fixture doesn't itself become the thing that pulls the
+    ORM/DB stack into every test module's collection.
+
+    Tests that actually exercise the real loader/API (the hot-issues loader
+    and API test modules) opt out with ``pytestmark =
+    pytest.mark.real_hot_issues``. Everything else gets
+    ``get_active_hot_issues`` stubbed to an always-empty snapshot, and a test
+    that needs a non-empty one monkeypatches the attribute itself.
+    """
+    from src.chatbot import hot_issues
+
+    hot_issues.clear_cache()
+    if request.node.get_closest_marker("real_hot_issues"):
+        yield
+        return
+    from unittest.mock import AsyncMock
+
+    monkeypatch.setattr(
+        hot_issues, "get_active_hot_issues",
+        AsyncMock(return_value=hot_issues.HotIssueSnapshot("", ())),
+    )
+    yield

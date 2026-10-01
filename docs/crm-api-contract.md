@@ -873,6 +873,72 @@ The customer receives an apology message and the AI bot resumes the conversation
 
 ---
 
+## Hot Issues
+
+Hot issues are short notices about a live incident, such as a payment gateway being down or withdrawals being delayed. While a notice is active, the bot sees it on every chat turn and at the start of every voice call. When a customer's problem matches, the bot acknowledges the incident and relays your guidance in the customer's language.
+
+You own the set. Each call replaces the whole set for the tenant, so you can add, edit or remove a notice at any moment. To clear everything, send an empty list.
+
+```
+PUT /api/v1/hot-issues
+Authorization: Bearer <tenant-token>
+Content-Type: application/json
+
+{
+  "issues": [
+    {
+      "key": "pg-delay",
+      "title": "UPI deposits delayed",
+      "body": "UPI deposits are delayed by up to 2 hours due to a gateway issue. Funds are safe and will be credited automatically. Expected fix by 18:00 IST.",
+      "expires_at": "2026-10-01T14:30:00Z"
+    }
+  ]
+}
+```
+
+**Response** (also returned by `GET /api/v1/hot-issues`, which lists the active set):
+```json
+{
+  "scope": "tenant",
+  "issues": [
+    {
+      "key": "pg-delay",
+      "title": "UPI deposits delayed",
+      "body": "UPI deposits are delayed by up to 2 hours ...",
+      "expires_at": "2026-10-01T14:30:00Z",
+      "updated_at": "2026-10-01T10:02:11.483920Z"
+    }
+  ]
+}
+```
+
+**Fields and limits:**
+- `key`: your stable identifier for the notice. Lowercase letters, digits, `.`, `_` and `-`, up to 64 characters, starting with a letter or digit. Keep the same key while the incident runs.
+- `title`: up to 80 characters, not empty.
+- `body`: up to 400 characters, not empty. Line breaks are shown to the bot as spaces.
+- **Total:** at most 5 notices, and at most 750 characters of title plus body across all of them.
+- `expires_at`: optional, an ISO 8601 timestamp. Include an offset (`Z` or `+05:30`); a timestamp with no offset is read as UTC, so IST wall-clock time without `+05:30` expires 5.5 hours late. It defaults to 24 hours from the call and can be at most 7 days ahead. Re-sending a notice without `expires_at` resets it to 24 hours, so a periodic push keeps a notice alive.
+- An expired notice stops being used automatically, even if you never remove it.
+
+**Writing a notice:**
+- Write amounts and times as digits (`₹50,000`, `18:00 IST`), not words (`2 lakh`). The bot only relays figures it can match to the notice.
+- Don't include URLs meant for voice; they are not read aloud.
+- State only what customers should be told: what is affected, what they should do, and an ETA if you have one. The bot never invents an ETA.
+
+**Errors:**
+- `401`/`403`: missing or invalid token.
+- `404`: the tenant is not registered with us.
+- `422`: a limit was exceeded, a key is malformed or duplicated, a title or body is empty, or `expires_at` is in the past or more than 7 days ahead.
+- `409`: rare; the replace could not be stored. Retry.
+
+Two replaces sent at the same time are applied one after the other, so the later one wins.
+
+**Timing:** a change normally appears on the next chat turn, and within about 30 seconds at most. In chat, a notice stops being used as soon as it expires. A voice call keeps the notices that were active when the call started, for the whole call, even if they expire or are removed meanwhile.
+
+Notices apply to one tenant. To cover several tenants, call once per tenant with that tenant's token. For a notice across a whole CRM, contact us; CRM-wide notices are set by our admins.
+
+---
+
 ## Onboarding
 
 Once your endpoints are live, register them with our platform in one call:

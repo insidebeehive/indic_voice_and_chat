@@ -268,6 +268,37 @@ async def test_apply_signal_records_transcript_slots_sentiment():
 
 
 @pytest.mark.asyncio
+async def test_apply_signal_lead_gender_rebuild_keeps_hot_issues_block():
+    """The lead_gender-learned system-prompt rebuild (apply_signal, when
+    updated_slots teaches lead_gender) must thread self._hot_issues into the
+    rebuilt prompt exactly like the initial build does -- a regression here
+    would silently drop an active hot-issues notice from every prompt sent
+    after the FIRST turn that learns the caller's gender."""
+    from src.agents.state_machine import Event
+
+    agent = VoiceBotAgent(
+        session=AgentSession(session_id="t1", lead_data={}),
+        state_machine=AgentStateMachine(),
+        slot_schema=SlotSchema(),
+        script=VoiceBotScript(agent_name="Anaaya", agent_role="sales", company_name="X"),
+        engine=_FakeEngine(None),
+        store=None,
+        hot_issues="SENTINEL_HOT_ISSUES_BLOCK",
+    )
+    assert "SENTINEL_HOT_ISSUES_BLOCK" in agent.system_prompt
+
+    await agent.start()
+    await agent.state.fire(Event.UTTERANCE_COMPLETE)
+    await agent.apply_signal(
+        user_text="main theek hoon", agent_text="accha!",
+        action="continue", updated_slots={"lead_gender": "female"})
+
+    assert "SENTINEL_HOT_ISSUES_BLOCK" in agent.system_prompt
+    # The rebuilt prompt also replaced turns[0] in place (existing behavior).
+    assert "SENTINEL_HOT_ISSUES_BLOCK" in agent.session.turns[0].content
+
+
+@pytest.mark.asyncio
 async def test_apply_signal_end_action_transitions_to_ended():
     from src.agents.state_machine import Event, State
     agent = _agent_with_slots(SlotSchema())

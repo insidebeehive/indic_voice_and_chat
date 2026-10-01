@@ -130,7 +130,8 @@ quiet.
 `build_chatbot_system_prompt` gained `include_variable_tail: bool = True`
 (default preserves today's output byte-for-byte) plus a standalone
 `build_chatbot_variable_tail()`, so the static body (cacheable) and the
-per-turn tail (sources / current time / language directive — minute-granular,
+per-turn tail (sources / active hot-issue notices / current time / language
+directive — minute-granular,
 would invalidate a cache every minute if left in `system_instruction`) can be
 built separately. `ChatBotAgent` only uses the split when `cache_split_prompt`
 is on (wired in `src/bootstrap.py`, gated on both the platform LLM being the

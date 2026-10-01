@@ -499,6 +499,182 @@ async def test_bridge_factory_kb_context_survives_cold_bm25(tmp_faiss_index) -> 
     assert "Casino games include slots" in bridge._agent._kb_context
 
 
+# --- Hot issues (src/chatbot/hot_issues.py) threading into the cascade agent
+
+
+async def test_bridge_factory_threads_hot_issues_into_cascade_agent(monkeypatch) -> None:
+    """make_bridge_factory (Twilio cascade) must fetch the voice=True variant
+    next to its _build_kb_context call and thread the rendered block into
+    VoiceBotAgent(hot_issues=...)."""
+
+    async def _fake_get_active_hot_issues(tenant_id, crm_id=None, *, voice=False):
+        assert voice is True  # voice call sites must request the voice variant
+        return SimpleNamespace(block="SENTINEL_HOT_ISSUES_BLOCK", keys=("t:pg-delay",))
+
+    monkeypatch.setattr(
+        "src.chatbot.hot_issues.get_active_hot_issues", _fake_get_active_hot_issues)
+
+    factory = make_bridge_factory(_providers())
+    bridge = await factory(websocket=object(), tenant=_tenant())
+
+    assert bridge._agent._hot_issues == "SENTINEL_HOT_ISSUES_BLOCK"
+
+
+async def test_exotel_factory_threads_hot_issues_into_cascade_agent(monkeypatch) -> None:
+    async def _fake_get_active_hot_issues(tenant_id, crm_id=None, *, voice=False):
+        assert voice is True
+        return SimpleNamespace(block="SENTINEL_HOT_ISSUES_BLOCK", keys=("t:pg-delay",))
+
+    monkeypatch.setattr(
+        "src.chatbot.hot_issues.get_active_hot_issues", _fake_get_active_hot_issues)
+
+    factory = make_exotel_bridge_factory(_providers())
+    bridge = await factory(websocket=object(), tenant=_tenant())
+
+    assert bridge._agent._hot_issues == "SENTINEL_HOT_ISSUES_BLOCK"
+
+
+async def test_browser_factory_threads_hot_issues_into_cascade_agent(monkeypatch) -> None:
+    async def _fake_get_active_hot_issues(tenant_id, crm_id=None, *, voice=False):
+        assert voice is True
+        return SimpleNamespace(block="SENTINEL_HOT_ISSUES_BLOCK", keys=("t:pg-delay",))
+
+    monkeypatch.setattr(
+        "src.chatbot.hot_issues.get_active_hot_issues", _fake_get_active_hot_issues)
+
+    factory = make_browser_bridge_factory(_providers())
+    bridge = await factory(websocket=object(), tenant=_tenant())
+
+    assert bridge._agent._hot_issues == "SENTINEL_HOT_ISSUES_BLOCK"
+
+
+async def test_bridge_factory_hot_issues_defaults_to_none_when_snapshot_empty() -> None:
+    """The conftest autouse stub (empty snapshot) is the default test
+    environment -- confirms the `hot.block or None` plumbing doesn't thread
+    an empty string into VoiceBotAgent (which would make `if self._hot_issues`
+    checks downstream behave differently than a genuine None)."""
+    factory = make_bridge_factory(_providers())
+    bridge = await factory(websocket=object(), tenant=_tenant())
+
+    assert bridge._agent._hot_issues is None
+
+
+async def test_stringee_factory_threads_hot_issues_into_cascade_agent(monkeypatch) -> None:
+    """make_stringee_bridge_factory has no s2s branch at all -- it only ever
+    builds the cascade VoiceBotAgent -- so this mirrors the Twilio/Exotel/
+    browser cascade tests above, just via the IVR (call_id/base_url/fetch)
+    calling convention instead of a websocket."""
+    from src.bootstrap import make_stringee_bridge_factory
+
+    async def _fake_get_active_hot_issues(tenant_id, crm_id=None, *, voice=False):
+        assert voice is True
+        return SimpleNamespace(block="SENTINEL_HOT_ISSUES_BLOCK", keys=("t:pg-delay",))
+
+    monkeypatch.setattr(
+        "src.chatbot.hot_issues.get_active_hot_issues", _fake_get_active_hot_issues)
+
+    factory = make_stringee_bridge_factory(providers=_providers())
+
+    async def _fetch(url):
+        return b""
+
+    bridge = await factory(
+        call_id="c-9", tenant=_tenant(),
+        base_url="https://h/api/v1/telephony/stringee", fetch=_fetch)
+
+    assert bridge._agent._hot_issues == "SENTINEL_HOT_ISSUES_BLOCK"
+
+
+def _s2s_tenant() -> SimpleNamespace:
+    """A tenant configured for s2s mode -- carries both the cascade-style
+    pipeline.tts.voice_id (make_bridge_factory/make_exotel_bridge_factory
+    compute tts_voice_id BEFORE branching on mode) and the realtime config
+    the s2s branch itself needs."""
+    rt = SimpleNamespace(model="gemini-x-live", voice="Aoede", allowed_voices=["Aoede"],
+                         language_code="hi-IN", api_key_env="K")
+    pipeline = SimpleNamespace(
+        stt=SimpleNamespace(language="hi-IN"),
+        llm=SimpleNamespace(temperature=0.5, max_tokens=256, response_format="json"),
+        tts=SimpleNamespace(language="hi-IN", voice_id=None),
+        mode="s2s", realtime=rt,
+    )
+    return SimpleNamespace(
+        slug="dev", id="t1",
+        settings=SimpleNamespace(
+            pipeline=pipeline, name="Acme", default_language="hi", prompt_pack="generic",
+            timezone="Asia/Kolkata"),
+        secret=lambda env: "fake-key", secret_optional=lambda env: "fake-key",
+    )
+
+
+async def test_twilio_factory_s2s_mode_threads_hot_issues_into_system_instruction(
+    monkeypatch,
+) -> None:
+    """make_bridge_factory's s2s branch (mode == "s2s") must fetch the
+    voice=True snapshot and thread hot.block all the way into the
+    TelephonyLiveBridge's RealtimeConfig.system_instruction via
+    _build_s2s_telephony_bridge."""
+    async def _fake_get_active_hot_issues(tenant_id, crm_id=None, *, voice=False):
+        assert voice is True
+        return SimpleNamespace(block="SENTINEL_HOT_ISSUES_BLOCK", keys=("t:pg-delay",))
+
+    monkeypatch.setattr(
+        "src.chatbot.hot_issues.get_active_hot_issues", _fake_get_active_hot_issues)
+
+    factory = make_bridge_factory(_providers())
+    bridge = await factory(websocket=object(), tenant=_s2s_tenant())
+
+    assert "SENTINEL_HOT_ISSUES_BLOCK" in bridge._config.system_instruction
+
+
+async def test_exotel_factory_s2s_mode_threads_hot_issues_into_system_instruction(
+    monkeypatch,
+) -> None:
+    async def _fake_get_active_hot_issues(tenant_id, crm_id=None, *, voice=False):
+        assert voice is True
+        return SimpleNamespace(block="SENTINEL_HOT_ISSUES_BLOCK", keys=("t:pg-delay",))
+
+    monkeypatch.setattr(
+        "src.chatbot.hot_issues.get_active_hot_issues", _fake_get_active_hot_issues)
+
+    factory = make_exotel_bridge_factory(_providers())
+    bridge = await factory(websocket=object(), tenant=_s2s_tenant())
+
+    assert "SENTINEL_HOT_ISSUES_BLOCK" in bridge._config.system_instruction
+
+
+async def test_dev_console_live_bridge_factory_threads_hot_issues_into_s2s_only(monkeypatch) -> None:
+    """make_live_bridge_factory (dev_console S2S) must fetch (voice=True) and
+    pass hot_issues into the direct build_s2s_system_instruction call, but
+    NOT into the VoiceBotAgent it also constructs -- that agent's own prompt
+    is never spoken for S2S (see the plan's dev_console S2S-agent note:
+    S2S has no pre-TTS guard and the live session speaks from the
+    RealtimeConfig.system_instruction instead)."""
+    from src.api.dev_console import make_live_bridge_factory
+
+    async def _fake_get_active_hot_issues(tenant_id, crm_id=None, *, voice=False):
+        assert voice is True
+        return SimpleNamespace(block="SENTINEL_HOT_ISSUES_BLOCK", keys=("t:pg-delay",))
+
+    monkeypatch.setattr(
+        "src.chatbot.hot_issues.get_active_hot_issues", _fake_get_active_hot_issues)
+
+    rt = SimpleNamespace(provider="gemini_live", model="m", voice="Aoede", language_code="hi-IN")
+    tenant = SimpleNamespace(
+        id="t1", slug="dev",
+        settings=SimpleNamespace(pipeline=SimpleNamespace(realtime=rt), timezone="Asia/Kolkata"),
+    )
+    providers = SimpleNamespace(
+        get_stt=lambda t: None, get_llm=lambda t: object(), get_tts=lambda t: object())
+    ws = SimpleNamespace(query_params={})
+
+    factory = make_live_bridge_factory(providers)
+    bridge = await factory(ws, tenant)
+
+    assert "SENTINEL_HOT_ISSUES_BLOCK" in bridge._config.system_instruction
+    assert bridge._agent._hot_issues is None  # S2S agent's own prompt is unused
+
+
 async def test_browser_factory_handoff_load_failure_logs_fingerprint_not_raw_token(fake_redis, caplog) -> None:
     """Fix 3: the handoff-context load-failure path
     (``make_browser_bridge_factory``'s ``except Exception`` around the Redis

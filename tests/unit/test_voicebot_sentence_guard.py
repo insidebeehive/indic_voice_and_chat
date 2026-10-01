@@ -213,7 +213,7 @@ def test_spelled_out_amount_is_a_documented_gap_not_caught():
 # --- VoiceBotAgent wiring ---------------------------------------------------
 
 
-def _agent(engine, kb_context: str = "") -> VoiceBotAgent:
+def _agent(engine, kb_context: str = "", hot_issues: str = "") -> VoiceBotAgent:
     return VoiceBotAgent(
         session=AgentSession(session_id="sess-1", campaign_id="camp-1", lead_data={}),
         state_machine=AgentStateMachine(),
@@ -222,6 +222,7 @@ def _agent(engine, kb_context: str = "") -> VoiceBotAgent:
         engine=engine,
         store=None,
         kb_context=kb_context,
+        hot_issues=hot_issues or None,
     )
 
 
@@ -291,6 +292,32 @@ async def test_sentence_guard_grounds_prior_turns_speech():
     await agent.handle_turn_text("did it go through", sink)
     guard = engine.captured_guard
     assert guard("Your Rs. 500 deposit is confirmed.") is None
+
+
+@pytest.mark.asyncio
+async def test_sentence_guard_grounds_hot_issues_snapshot():
+    """Mirrors test_handle_turn_text_passes_a_working_sentence_guard's KB
+    case: a figure from the call-start hot-issues snapshot (src/chatbot/
+    hot_issues.py, voice variant) is relayed by the model and must survive
+    the pre-TTS guard exactly like a KB-grounded figure, while an unrelated
+    ungrounded figure still trips it."""
+    engine = _CaptureEngine('{"response_text": "ok", "action": "continue"}')
+    agent = _agent(
+        engine, kb_context="",
+        hot_issues="Deposits delayed: refunds up to ₹50,000 may take 24h to settle.")
+    await agent.start()
+
+    async def sink(a):
+        pass
+
+    await agent.handle_turn_text("why is my refund delayed", sink)
+    guard = engine.captured_guard
+    assert guard is not None
+
+    # Grounded in the hot-issues snapshot injected at call start -> unchanged.
+    assert guard("Refunds up to ₹50,000 may take 24h to settle.") is None
+    # Not grounded anywhere -> replaced.
+    assert guard("You've won ₹99,999 in the jackpot.") is not None
 
 
 @pytest.mark.asyncio

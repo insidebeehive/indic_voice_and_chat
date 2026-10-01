@@ -83,6 +83,7 @@ filterwarnings = [
 ]
 markers = [
     "live: tests that hit real provider APIs (skipped unless VOX_LIVE_TESTS=1)",
+    "real_hot_issues: use the real hot-issues loader",
 ]
 # Live tests are explicitly opted into; default runs use mocks only.
 addopts = "-m 'not live'"

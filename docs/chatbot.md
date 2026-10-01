@@ -176,6 +176,19 @@ CRM tools:
   live CRM requires both headers together). Encrypted at rest exactly like
   `crm:api_token`.
 
+Hot issues (live incident notices):
+- `PUT/GET /hot-issues`: a tenant's own set, authenticated with `current_tenant`. That means the tenant's own token, or an admin token plus `X-Tenant-Slug`.
+- `PUT/GET /crms/{crm_id}/hot-issues`: a CRM-wide set, admin only (`require_admin`). Every tenant linked to that CRM sees it.
+- **Replace semantics:** a PUT replaces the scope's whole set in one transaction, and `{"issues": []}` clears it. A missing tenant or CRM row returns 404. The partner-facing contract (fields, limits, writing guidance) is in `docs/crm-api-contract.md` under "Hot Issues".
+- **Storage:** notices live in their own `hot_issues` table, not the KB. The KB is reached only through `search_knowledge_base`, and voice truncates it to a budget, so a notice stored there could go unseen.
+- **How the bot sees them:** `src/chatbot/hot_issues.py` loads the union of a tenant's own and its CRM's active notices, tenant first. It renders them as one delimited, defanged block that carries its own usage lead.
+  - **Chat:** the block goes into the per-turn tail on every tools-path turn, so a change applies mid-session.
+  - **Voice:** the block is added to the prompt once, at call start. A notice cleared mid-call still reaches the call already in progress.
+- **Freshness:** the loader caches each scope for 30 s, and a write clears its own scope's entry in the same process. With more than one worker or replica, a change takes up to 30 s to appear.
+- **Expiry:** `expires_at` resets to 24 h whenever a notice is re-sent without one.
+- **Failure behaviour:** the loader never fails a turn. A DB error or a load slower than 1 s gives an empty set, with a warning logged.
+- **Grounding:** figures in an active notice count as grounded for the unverified-data guard in chat and the sentence guard in voice. A figure the bot has relayed stays grounded through the conversation's prior turns even after the notice is cleared.
+
 Voice handoff:
 - `POST /chat/{session_id}/call` → summarizes the chat, stashes context under a
   10-min Redis token, returns `{call_url, call_id}`.

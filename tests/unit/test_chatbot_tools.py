@@ -1437,3 +1437,86 @@ async def test_deeply_nested_payment_config_payload_does_not_crash_the_turn(retr
     assert result.response.response_text
     assert "[redacted]" in result.response.response_text
     assert "50100234567890" not in result.response.response_text
+
+
+# --- Hot issues wiring (src/chatbot/hot_issues.py) ------------------------
+
+
+@pytest.mark.asyncio
+async def test_hot_issues_provider_awaited_once_per_turn_and_logged(retriever, caplog) -> None:
+    """hot_issues_provider is awaited exactly once per _handle_with_tools
+    turn, and a per-turn debug_event fires carrying the scope-qualified keys
+    and the block's char count -- this is the stand-in for analytics until
+    the deferred chat_turn_metrics.hot_issue_keys follow-up lands (see the
+    plan's "Deferred follow-up" section)."""
+    from types import SimpleNamespace
+
+    calls = []
+
+    async def _hot_provider():
+        calls.append(1)
+        return SimpleNamespace(block="NOTICEBLOCK", keys=("t:pg-delay", "c:kyc-outage"))
+
+    llm = ScriptedLLM([LLMResult(text="We're aware of the delay.", finish_reason="stop")])
+    agent = _agent(llm, retriever, hot_issues_provider=_hot_provider)
+    with caplog.at_level(logging.DEBUG, logger="src.agents.chatbot"):
+        await agent.handle_message("why is my withdrawal slow?")
+
+    assert len(calls) == 1
+    injected = [r for r in caplog.records if r.message == "chatbot hot_issues injected"]
+    assert len(injected) == 1
+    assert injected[0].keys == ["t:pg-delay", "c:kyc-outage"]
+    assert injected[0].chars == len("NOTICEBLOCK")
+
+
+@pytest.mark.asyncio
+async def test_hot_issues_not_logged_when_snapshot_empty(retriever, caplog) -> None:
+    """No active notices (the common case, and the conftest default stub)
+    must not emit the per-turn event at all -- it's keyed on keys being
+    non-empty, not on the provider having been called."""
+    from types import SimpleNamespace
+
+    async def _hot_provider():
+        return SimpleNamespace(block="", keys=())
+
+    llm = ScriptedLLM([LLMResult(text="ok", finish_reason="stop")])
+    agent = _agent(llm, retriever, hot_issues_provider=_hot_provider)
+    with caplog.at_level(logging.DEBUG, logger="src.agents.chatbot"):
+        await agent.handle_message("hi")
+
+    assert not [r for r in caplog.records if r.message == "chatbot hot_issues injected"]
+
+
+@pytest.mark.asyncio
+async def test_hot_issues_provider_not_awaited_in_single_shot_path(retriever) -> None:
+    """hot_issues_provider must be awaited only in _handle_with_tools, never
+    in _single_shot (enable_tools=False) -- production always runs with
+    tools enabled, and _single_shot's apply_hallucination_guard has a
+    different, incompatible no-retrieval fallback (see the plan)."""
+    calls = []
+
+    async def _hot_provider():
+        calls.append(1)
+        from types import SimpleNamespace
+        return SimpleNamespace(block="X", keys=("t:x",))
+
+    llm = ScriptedLLM([LLMResult(text="ok", finish_reason="stop")])
+    agent = ChatBotAgent(
+        session=AgentSession(session_id="cb-single-hot"), llm=llm, retriever=retriever,
+        company_name="Acme", language_default="en",  # enable_tools defaults False
+        hot_issues_provider=_hot_provider)
+    await agent.handle_message("hi")
+
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_hot_issues_provider_none_degrades_to_empty_snapshot(retriever) -> None:
+    """The default hot_issues_provider=None (every construction site that
+    predates this feature) must not raise and must compose exactly as
+    before -- getattr-defensive access on a None snapshot, not a None.block
+    AttributeError."""
+    llm = ScriptedLLM([LLMResult(text="ok", finish_reason="stop")])
+    agent = _agent(llm, retriever)  # hot_issues_provider left at its default None
+    result = await agent.handle_message("hi")
+    assert result.response.response_text == "ok"
