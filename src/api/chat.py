@@ -1768,7 +1768,7 @@ _SHARED_SCRIPT_PAIRS = {("hi", "mr"), ("bn", "as")}
 
 def _has_language_signal(text: str) -> bool:
     """Whether *text* says anything about its language: an Indic script, or
-    enough Roman words to tell Hinglish from English. "ok" and digits don't."""
+    Roman text that _latin_language_hint classifies. "ok" and digits don't."""
     return (_detect_script(text or "") in _SCRIPT_NAME_TO_INTERIM_LANG
             or _latin_language_hint(text or "") is not None)
 

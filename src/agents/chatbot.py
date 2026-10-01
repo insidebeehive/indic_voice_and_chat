@@ -503,7 +503,7 @@ def _detect_script(text: str) -> str | None:
 # both misread as English because none of their Hindi tokens were in this
 # set. Fix: "kiya" (past-tense "did") and "firse"/"kariye" ("again"/
 # imperative "do") below — each alone is enough to catch its message, so
-# that's the whole addition. Deliberately NOT adding "tha"/"maine"/"baar"/
+# that's the whole addition for that case. Deliberately NOT adding "tha"/"maine"/"baar"/
 # bare "fir", even though they appear in the same two messages: they're
 # redundant for fixing this bug (the messages already match via the tokens
 # above) and each carries a real collision risk that isn't worth it for zero
@@ -526,14 +526,110 @@ _HINGLISH_MARKERS = frozenset({
     "jaldi", "madad", "shukriya", "dhanyavaad", "haan", "theek", "thik",
     "accha", "acha", "bolo", "suno", "dekho", "milega", "milegi", "karna",
     "kahan", "kaun", "kaunsa", "toh", "abhi", "kardo", "krdo", "karde",
-    "kiya", "firse", "kariye",
+    "kiya", "firse", "kariye", "mujhe", "mujhko", "laga", "lagi", "lage",
+    # SMS / fast-typed spellings and common words (whole-word, no English
+    # collision): "nhi"/"nai" (nahi), "rha"/"rhi"/"rhe" (raha/rahi/rahe),
+    # "gya"/"gyi"/"gye"/"gaye"/"hogaya"/"hogya", "aya"/"aaya"/"ayega"/
+    # "aayega", "dala"/"dale"/"dali", "diya", "bahut"/"bohot", "kuch", "yaar",
+    # "wapas", "baad", "kr"/"kro"/"krna"/"karao"/"krao", "jayega", "baat".
+    "nhi", "nai", "rha", "rhi", "rhe", "hogaya", "hogya", "gya", "gyi", "gye",
+    "gaye", "aya", "aaya", "ayega", "aayega", "dala", "dale", "dali", "diya",
+    "bahut", "bohot", "kuch", "yaar", "wapas", "baad", "kr", "kro", "krna",
+    "jayega", "baat", "karao", "krao",
+    # Imperative / verb forms that Hinglish speakers attach to English nouns
+    # ("agent bhejo", "call lagao", "transfer krwa", "withdraw kese kre",
+    # "stuck hu", "transfer pending h"), whole-word, no English collision:
+    # "bhejo"/"bheja"/"bhej" (send), "bulao" (call), "lagao" (put/place),
+    # "dedo" (give), "krwa"/"krwao"/"karwa" (get done), "karu"/"kare"/"kre"
+    # (do), "kese" (how), "hu"/"hoon"/"hora"/"hori" (am / is going),
+    # and bare "h" (fast-typed "hai"; bare "h" is not English prose).
+    "bhejo", "bheja", "bhej", "bulao", "lagao", "dedo", "krwa", "krwao",
+    "karwa", "karu", "kese", "kre", "kare", "hu", "hoon", "hora",
+    "hori", "h",
+})
+
+# Common English function / support words, used as POSITIVE evidence of English
+# in _latin_language_hint. Absence of a Hinglish marker is not evidence of
+# English: "Mujhe ghata laga he" (Hinglish, "I feel I've lost") had no hit in
+# _HINGLISH_MARKERS, was classified English, and got a firm "MUST be in
+# English" directive. Curated from the other side: a hit here forces an English
+# reply, so tokens that are also romanized Hindi are excluded. Excluded on the
+# Hindi side: "the" (Hindi past plural: "maine 500 dale the"), "a" ("pesa a
+# gya"), "or" (= aur: "ek or baar"), "had" (= hadd), "to" (= toh), "is" ("is
+# baar"), "me" (= mein), "do" (two / give), "he" (= hai), "ho", "se", "par",
+# "kar", "in", "no". Excluded as shared code-switch vocabulary (same word in
+# both languages, so no signal; see _SHARED_CODE_SWITCH_WORDS): "check",
+# "but", "ok", "balance", "deposit", "withdrawal", "game", "account", "site",
+# "showing".
+# "i" is safe: Hindi has no bare "i".
+# Support vocabulary (failed, pending, blocked, credited, unable, cannot,
+# since, yesterday, ...) is included so ordinary English complaints are
+# classified. A few of those words are also used as-is by Hinglish speakers
+# (agent, human, call, login, money, amount, transfer, support, connect, send,
+# back, problem, issue, working, wrong, explain, verification): they are kept
+# because _latin_language_hint checks _HINGLISH_MARKERS FIRST (which carries
+# the SMS spellings nhi, rha, gya, ... and verb forms bhejo, lagao, krwa, ...
+# that mark code-switched messages such as "login nhi ho rha") and, for these
+# support words, decides English only when EVERY token of the message is a
+# known English word (see _ENGLISH_SUPPORT_MARKERS). Whole-word matched,
+# lowercase.
+_ENGLISH_MARKERS = frozenset({
+    "an", "i", "my", "you", "your", "it", "its", "we",
+    "are", "was", "were", "am", "be", "been", "have", "has", "did",
+    "does", "can", "could", "will", "would", "should", "not", "and",
+    "of", "for", "on", "at", "with", "from", "this", "that", "these", "those",
+    "what", "whats", "how", "why", "when", "where", "which", "who", "about",
+    "again", "long", "take", "made", "tell", "need", "want", "still",
+    "there", "here", "any", "some", "just", "get", "got", "let", "know",
+    "say", "said", "give", "yet", "than", "then", "after", "before",
+})
+
+# Support vocabulary (see the note above). Decides English for messages of two
+# or more words ONLY when every token is known English: a word in
+# _ENGLISH_MARKERS, _ENGLISH_SUPPORT_MARKERS or _SHARED_CODE_SWITCH_WORDS, and
+# at least one from _ENGLISH_SUPPORT_MARKERS ("cannot login", "deposit failed
+# yesterday"). One unknown token ("agent bhejo", "since kal se pending") leaves
+# the message undecided, because Hinglish speakers use these nouns/verbs as-is.
+# Function words alone don't decide a 2-word message ("thank you" stays None,
+# so a polite ack mid-conversation doesn't force a language switch).
+_ENGLISH_SUPPORT_MARKERS = frozenset({
+    "failed", "failing", "fail", "pending", "blocked", "block", "received",
+    "receive", "credited", "debited", "deducted", "unable", "cannot", "cant",
+    "can't", "since", "yesterday", "today", "tomorrow", "morning", "problem",
+    "issue", "working", "stuck", "waiting", "delayed", "wrong", "send", "sent",
+    "back", "call", "talk", "agent", "human", "support", "connect", "explain",
+    "verification", "crashed", "transfer", "money", "amount", "login",
+    "withdraw", "update", "happened", "rejected", "locked", "reset", "respond",
+    "crashing", "keeps", "bad", "service", "attached", "please", "pls", "plz",
+    "help",
+})
+
+# Words used identically in English and Hinglish: they let an otherwise
+# all-English message count as fully known ("payment failed but amount
+# deducted") but never count as English evidence themselves, so "balance
+# check" alone stays None. "please"/"pls"/"plz"/"help" are in
+# _ENGLISH_SUPPORT_MARKERS instead so "please help me" is decided.
+_SHARED_CODE_SWITCH_WORDS = frozenset({
+    "ok", "okay", "check", "balance", "deposit", "withdrawal", "account",
+    "refund", "payment", "bank", "upi", "bonus", "transaction", "id", "kyc",
+    "game", "site", "showing", "to", "me", "is", "in", "but", "app", "number",
+    "utr", "password", "otp", "very", "mid", "bet", "terms",
 })
 
 
 def _latin_language_hint(text: str) -> str | None:
     """Classify a Roman-script message as "Hinglish" or "English" — or None
-    when it's too short to carry a signal (bare "ok"/"thanks", which should
-    follow the conversation's existing language, not force a switch).
+    when it carries no positive signal (bare "ok"/"thanks", or a 3+ word
+    message with neither a Hinglish nor an English marker). On a mid-
+    conversation turn None means the reply follows the conversation's
+    language; on the opening message _compose instead applies its Hinglish-
+    opener branch.
+
+    "English" requires positive evidence, never just the absence of Hinglish
+    markers ("Mujhe ghata laga he" has no curated Hinglish marker and was
+    forced into English). Either a message of 3+ words containing a word in
+    _ENGLISH_MARKERS, or a message of 2+ words where every token is known
+    English and at least one is in _ENGLISH_SUPPORT_MARKERS.
 
     An advisory "pick whichever fits" directive proved too weak: with a
     Hinglish conversation history and default_language="hi", the model kept
@@ -558,9 +654,21 @@ def _latin_language_hint(text: str) -> str | None:
     # times it matches.
     if any(w in _HINGLISH_MARKERS for w in words):
         return "Hinglish"
-    if len(words) >= 3:
+    # English needs positive evidence: a marker-free message is as likely to be
+    # Hinglish with uncurated vocabulary ("Mujhe ghata laga he") as English,
+    # and a wrong firm directive is worse than none.
+    # Support words decide only when every token is known English (see
+    # _ENGLISH_SUPPORT_MARKERS): "agent bhejo" has an unknown token -> None.
+    known = _ENGLISH_MARKERS | _ENGLISH_SUPPORT_MARKERS | _SHARED_CODE_SWITCH_WORDS
+    if (
+        len(words) >= 2
+        and any(w in _ENGLISH_SUPPORT_MARKERS for w in words)
+        and all(w in known for w in words)
+    ):
         return "English"
-    return None  # short, marker-free ("ok", "yes") — no signal either way
+    if len(words) >= 3 and any(w in _ENGLISH_MARKERS for w in words):
+        return "English"
+    return None  # no positive signal ("ok", "yes", or unknown 3+ words)
 
 
 def _chunk_source(chunk: RetrievedChunk) -> str:
@@ -2262,7 +2370,7 @@ class ChatBotAgent(BaseAgent):
     def _compose(
         self, rag_text: str, user_msg: LLMMessage, query_text: str = "",
     ) -> list[LLMMessage]:
-        # Per-turn language directive. History of this logic (three real bugs):
+        # Per-turn language directive. History of this logic (real bugs):
         # 1. All-Latin text was labeled "English" → romanized Hindi got forced
         #    into English replies.
         # 2. Then Latin text got NO signal → the "Default language: hi"
@@ -2271,6 +2379,16 @@ class ChatBotAgent(BaseAgent):
         #    Hinglish history momentum kept answering plain English in
         #    Hinglish. Hence the deterministic marker-based classification:
         #    the directive must NAME the language, firmly, each turn.
+        # 4. "deposit kiya tha maine" / "ek baar firse check kariye" were
+        #    misread as English because none of their Hindi tokens were in
+        #    _HINGLISH_MARKERS.
+        # 5. "Mujhe ghata laga he" (Hinglish, no curated marker) was forced into
+        #    English because a marker-free 3+ word message counted as English.
+        #    English now needs positive evidence (a function word in a 3+ word
+        #    message, or a message made only of known English words that
+        #    includes a support word); otherwise no directive: mid-conversation
+        #    the reply follows the conversation's language, on the opening
+        #    message the Hinglish-opener branch applies.
         lang = _detect_script(query_text)
         if lang is None:
             lang = _latin_language_hint(query_text)
@@ -2307,7 +2425,7 @@ class ChatBotAgent(BaseAgent):
             ]
         else:
             extra = None  # no signal mid-conversation — follow the conversation
-        # This branch has a documented history of 3 prior production bugs (see
+        # This branch has a documented history of 5 prior production bugs (see
         # the comment above _detect_script/_latin_language_hint) and carried
         # zero telemetry before this event -- an operator diagnosing a 4th
         # recurrence had nothing but the final reply text to work from. Runs

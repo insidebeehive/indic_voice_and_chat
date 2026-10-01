@@ -344,6 +344,72 @@ def test_latin_language_hint_real_transcript_regression() -> None:
     assert _latin_language_hint("balance check karo fir se") == "Hinglish"
 
 
+def test_latin_language_hint_hinglish_without_curated_markers_is_not_english() -> None:
+    """Production ticket: "Mujhe ghata laga he" was answered in English
+    because a marker-free 3+ word Roman message used to count as English."""
+    assert _latin_language_hint("Mujhe ghata laga he") == "Hinglish"
+    assert _latin_language_hint("Aaj ke bad gem nahi khilaunga") == "Hinglish"
+    # "ghata bahut jyada laga" hits the Hinglish markers "bahut" and "laga".
+    assert _latin_language_hint("ghata bahut jyada laga") == "Hinglish"
+    # Hindi with no marker from either list: no positive evidence of English,
+    # so no verdict (the reply follows the conversation's language).
+    assert _latin_language_hint("ghata jyada hota") is None
+    assert _latin_language_hint("jyada ghata hota") is None
+
+
+_FAKE_PAYLOAD = {
+    "response_text": "Samajh gaya.",
+    "language": "hi",
+    "sources_used": [],
+    "confidence": "high",
+    "action": "none",
+}
+
+
+def _all_text(messages) -> str:
+    assert all(isinstance(m.content, str) for m in messages)
+    return "\n".join(m.content for m in messages)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("split", [False, True])
+async def test_unknown_roman_message_gets_no_english_directive(retriever, split) -> None:
+    llm = FakeLLM(dict(_FAKE_PAYLOAD))
+    agent = _make_agent(llm, retriever, cache_split_prompt=split)
+    await agent.handle_message("jyada ghata hota")
+    text = _all_text(llm.calls[-1])
+    assert "MUST be in English" not in text
+    assert "MUST be in Hinglish" not in text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("split", [False, True])
+async def test_unknown_roman_message_mid_conversation_gets_no_directive(
+    retriever, split,
+) -> None:
+    llm = FakeLLM(dict(_FAKE_PAYLOAD))
+    agent = _make_agent(llm, retriever, cache_split_prompt=split)
+    await agent.handle_message("mera withdrawal kahan hai")
+    await agent.handle_message("jyada ghata hota")
+    text = _all_text(llm.calls[-1])
+    assert "MUST be in" not in text
+    assert "very first message" not in text
+    assert "romanized Hindi (Hinglish)" not in text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("split", [False, True])
+async def test_plain_english_after_hinglish_history_gets_english_directive(
+    retriever, split,
+) -> None:
+    """Bug #3 guard: ordinary English support wording must still be named."""
+    llm = FakeLLM(dict(_FAKE_PAYLOAD))
+    agent = _make_agent(llm, retriever, cache_split_prompt=split)
+    await agent.handle_message("mera withdrawal kahan hai")
+    await agent.handle_message("deposit failed yesterday")
+    assert "MUST be in English" in _all_text(llm.calls[-1])
+
+
 @pytest.mark.parametrize(
     ("text", "expected"),
     [
@@ -382,6 +448,78 @@ def test_latin_language_hint_real_transcript_regression() -> None:
         ("ok", None),
         ("thanks", None),
         ("balance", None),  # single word, no marker — abstain, not "English"
+        # -- Ordinary English support wording (no Hinglish marker) --
+        ("deposit failed yesterday", "English"),
+        ("account blocked please help", "English"),
+        ("payment pending since morning", "English"),
+        ("cannot login", "English"),
+        ("unable to withdraw money", "English"),
+        ("please call me", "English"),
+        ("talk to agent", "English"),
+        ("human agent please", "English"),
+        ("connect me to support", "English"),
+        ("transaction id 12345 failed", "English"),
+        ("upi payment failed", "English"),
+        ("bank transfer pending", "English"),
+        ("wrong amount credited", "English"),
+        ("send money back", "English"),
+        ("game crashed mid bet", "English"),
+        ("kyc verification pending", "English"),
+        ("bonus terms explain", "English"),
+        # -- Hindi words that look like English function words must not
+        # produce English ("the" = were, "a" = aa, "or" = aur, "had" = hadd) --
+        ("mene 1000 dale the", "Hinglish"),
+        ("hum pehle khelte the", None),
+        ("pesa a gya", "Hinglish"),
+        ("ek or baar try", None),
+        ("had kar di yaar", "Hinglish"),
+        ("site pe login nhi ho rha", "Hinglish"),
+        ("balance showing nhi ho rha", "Hinglish"),
+        # -- SMS-spelled / common Hinglish --
+        ("deposit hogaya par balance nhi aya", "Hinglish"),
+        ("UPI se dala tha", "Hinglish"),
+        ("bas ek baar check kar lo", None),  # no marker in either language
+        ("game khelne ke baad loss", "Hinglish"),
+        ("ho jayega na", "Hinglish"),
+        ("agent se baat karao", "Hinglish"),
+        ("login nhi ho rha", "Hinglish"),
+        # -- Hinglish with English support nouns and uncurated/curated verbs:
+        # must never be forced to English --
+        ("agent bhejo", "Hinglish"),
+        ("money bhejo", "Hinglish"),
+        ("agent bulao", "Hinglish"),
+        ("agent lagao", "Hinglish"),
+        ("agent dedo", "Hinglish"),
+        ("call lagao", "Hinglish"),
+        ("stuck hu", "Hinglish"),
+        ("transfer krwa", "Hinglish"),
+        ("transfer pending h", "Hinglish"),
+        ("withdraw kese kre", "Hinglish"),
+        ("kese karu withdraw", "Hinglish"),
+        ("call krwa do", "Hinglish"),
+        ("Mujhe ghata laga he", "Hinglish"),
+        # unknown tokens (kar/do/kal/se/kara/tha) keep support words from
+        # deciding English; no Hinglish marker either -> abstain
+        ("back kar do", None),
+        ("since kal se pending", None),
+        ("yesterday deposit kara tha", None),
+        ("deposit our withdrawal dono", None),  # "our" = aur, not English
+        # all tokens known English, one support word -> English
+        ("login problem", "English"),
+        ("please help me", "English"),
+        ("app keeps crashing", "English"),
+        ("very bad service", "English"),
+        ("UTR number attached", "English"),
+        ("any update", "English"),
+        ("what happened", "English"),
+        ("account locked", "English"),
+        ("password reset", "English"),
+        ("withdrawal rejected", "English"),
+        ("please respond", "English"),
+        ("refund please", "English"),
+        ("call me back pls", "English"),
+        ("payment failed but amount deducted", "English"),
+        ("balance check", None),  # only shared words -> no evidence
     ],
 )
 def test_latin_language_hint_table(text: str, expected: str | None) -> None:
