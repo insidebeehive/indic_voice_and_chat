@@ -2702,3 +2702,29 @@ async def test_pipeline_patch_chat_voice_tts_voice_tuning(ctx) -> None:
 
     ctx1 = await resolver.resolve_by_slug("acme")
     assert ctx1.settings.pipeline.chat_voice.tts.stability == 0.6
+
+
+async def test_list_tenants_deposit_verification_reply_url_set_flips_after_rotation(ctx) -> None:
+    client, _, _ = ctx
+    tid = (await client.post(
+        "/tenants", json=_body(slug="acme"), headers=ADMIN_HEADERS)).json()["tenant_id"]
+
+    def _row(resp):
+        return next(t for t in resp.json()["tenants"] if t["tenant_id"] == tid)
+
+    before = await client.get("/tenants", headers=ADMIN_HEADERS)
+    assert _row(before)["deposit_verification_reply_url_set"] is False
+
+    rotate_resp = await client.post(
+        f"/tenants/{tid}/webhook-credentials/rotate",
+        json={"providers": ["deposit_verification"]}, headers=ADMIN_HEADERS)
+    assert rotate_resp.status_code == 200
+    body = rotate_resp.json()
+    token = body["credentials"]["deposit_verification:reply_token"]
+    url = body["urls"]["deposit_verification"]
+    assert url.endswith(f"/reply/{token}")
+    assert url in body["instructions"]["deposit_verification"]
+
+    after = await client.get("/tenants", headers=ADMIN_HEADERS)
+    assert _row(after)["deposit_verification_reply_url_set"] is True
+    assert token not in after.text

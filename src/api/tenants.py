@@ -1156,6 +1156,11 @@ class WebhookCredentialsRotateResponse(BaseModel):
     credentials: dict[str, str]
     # Human-readable, ready-to-paste guidance per rotated provider.
     instructions: dict[str, str]
+    # Bare ready-to-use URL per rotated provider, for providers whose
+    # credential is a URL (deposit_verification only today). Same one-time
+    # secrecy as `credentials`; lets the Back Office show/copy it without
+    # parsing `instructions`.
+    urls: dict[str, str] = Field(default_factory=dict)
 
 
 def _chatwoot_integrations_base_url(telephony_base: str) -> str:
@@ -1246,6 +1251,7 @@ async def rotate_webhook_credentials(
     rotated: list[str] = []
     credentials: dict[str, str] = {}
     instructions: dict[str, str] = {}
+    urls: dict[str, str] = {}
 
     if "stringee" in req.providers:
         token = pysecrets.token_urlsafe(32)
@@ -1310,9 +1316,10 @@ async def rotate_webhook_credentials(
         # — see src/api/__init__.py), a sibling of the telephony one `base` is
         # built for, same as the Chatwoot case above.
         dv_base = _deposit_verification_base_url(base)
+        urls["deposit_verification"] = f"{dv_base}/reply/{reply_token}"
         instructions["deposit_verification"] = (
             f"Configure the deposit-dispute-ticket vendor's reply webhook at "
-            f"{dv_base}/reply/{reply_token}"
+            f"{urls['deposit_verification']}"
         )
 
     await session.commit()
@@ -1330,7 +1337,7 @@ async def rotate_webhook_credentials(
         extra={"tenant_id": tenant_id, "providers": rotated})
     return WebhookCredentialsRotateResponse(
         tenant_id=t.id, slug=t.slug, rotated=rotated,
-        credentials=credentials, instructions=instructions,
+        credentials=credentials, instructions=instructions, urls=urls,
     )
 
 
@@ -1477,6 +1484,10 @@ class TenantSummary(BaseModel):
     # never the value itself, matching events_webhook_secret_set/
     # telephony_creds_configured's names/booleans-only convention.
     deposit_verification_secret_set: bool = False
+    # Whether a vendor reply URL has been minted (a `deposit_verification:reply_token`
+    # secret row exists). Presence only — the URL embeds the token, a capability
+    # secret shown once by the rotate endpoint and never returned by a read.
+    deposit_verification_reply_url_set: bool = False
     deposit_verification_contract: Optional[str] = None
     deposit_verification_timeout_minutes: Optional[int] = None
     # THE field this endpoint exists to add: whether the tool will actually be
@@ -1640,7 +1651,7 @@ async def list_tenants(
             TenantSecret.name.in_([
                 "webhook:stringee_path_token", "webhook:stringee_signing_secret",
                 "webhook:exotel_basic_user", "webhook:exotel_basic_password",
-                "chatwoot:webhook_id",
+                "chatwoot:webhook_id", "deposit_verification:reply_token",
             ])
         )
     )).all()
@@ -1746,6 +1757,7 @@ async def list_tenants(
             deposit_verification_enabled=dv.enabled,
             deposit_verification_webhook_url=dv.webhook_url,
             deposit_verification_secret_set=dv_secret_set,
+            deposit_verification_reply_url_set="deposit_verification:reply_token" in names,
             deposit_verification_contract=dv.contract,
             deposit_verification_timeout_minutes=dv.timeout_minutes,
             # Mirrors bootstrap.py's registration gate (~:558-566) exactly,

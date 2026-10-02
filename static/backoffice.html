@@ -1223,8 +1223,20 @@ function loadDepositVerification(id) {
       <div>Contract: ${t.deposit_verification_contract ? escT(t.deposit_verification_contract) : '<span class="hint">—</span>'}</div>
       <div>Timeout: ${t.deposit_verification_timeout_minutes != null ? t.deposit_verification_timeout_minutes + " min" : '<span class="hint">—</span>'}</div>
       <div>Shared webhook secret: <b>${t.deposit_verification_secret_set ? "configured" : "not configured"}</b></div>
+      <div>Vendor reply URL: <b>${t.deposit_verification_reply_url_set ? "configured" : "not set"}</b></div>
     </div>
     ${dvStateHtml(t)}
+    <h2 style="margin-top:1.1rem;">Vendor reply URL</h2>
+    <div class="hint" style="margin-bottom:.5rem;">
+      The URL the ticket vendor posts its reply to. Used by the <code>json_ticket_relay</code> contract only
+      (the reply route rejects other contracts with reason="wrong_contract"). The reply URL also requires
+      Enabled and the shared webhook secret (the vendor signs replies with it); otherwise the route returns 401.
+      The URL is shown <b>once</b>; generating a new one invalidates the previous URL (on other running
+      instances only after they restart — redeploy after regenerating if you run more than one), so the vendor must be updated.
+    </div>
+    <button id="dv_reply_btn" onclick="generateDvReplyUrl('${id}')">${t.deposit_verification_reply_url_set ? "Regenerate reply URL" : "Generate reply URL"}</button>
+    <span id="dv_reply_result" class="hint" style="margin-left:.6rem;"></span>
+    <div id="dv_reply_out" style="margin-top:.6rem;"></div>
     <h2 style="margin-top:1.1rem;">Edit</h2>
     <div class="creds" style="gap:.6rem;flex-wrap:wrap;">
       <label>Enabled <small class="hint">(current: ${t.deposit_verification_enabled ? "enabled" : "disabled"})</small>
@@ -1261,6 +1273,61 @@ function loadDepositVerification(id) {
       <span id="dv_result" class="hint" style="margin-left:.6rem;"></span>
     </div>
     <div id="dv_error" style="margin-top:.6rem;"></div>`;
+}
+
+async function generateDvReplyUrl(id) {
+  const t = (window.TENANTS || {})[id] || {};
+  if (t.deposit_verification_reply_url_set &&
+      !confirm("Regenerate the vendor reply URL? The current URL stops working immediately — the vendor must be updated with the new one.")) return;
+  const btn = $("dv_reply_btn");
+  btn.disabled = true;
+  $("dv_reply_result").textContent = "generating…";
+  $("dv_reply_out").innerHTML = "";
+  const r = await apiSend("POST", `/api/v1/tenants/${id}/webhook-credentials/rotate`, { providers: ["deposit_verification"] });
+  btn.disabled = false;
+  if (!r.ok) {
+    // Includes the 503 when VOX_SECRET_KEY is unset — the detail says so.
+    $("dv_reply_result").textContent = `✗ failed (${r.status})`;
+    $("dv_reply_out").innerHTML = `<div class="warnbox">
+      <div style="font-weight:700;color:#fca5a5;margin-bottom:.4rem;">Rejected — no URL was generated</div>
+      <pre style="white-space:pre-wrap;word-break:break-word;margin:0;">${escT(formatApiError(r.json))}</pre>
+    </div>`;
+    return;
+  }
+  const url = (r.json.urls || {}).deposit_verification || "";
+  await loadTenants();          // refresh window.TENANTS so the status line flips
+  loadDepositVerification(id);  // re-render first; the URL box is drawn after so it isn't wiped
+  if (!url) {
+    $("dv_reply_result").textContent = "✗ no URL returned";
+    $("dv_reply_out").innerHTML = `<div class="warnbox">
+      <div style="font-weight:700;color:#fca5a5;margin-bottom:.4rem;">The server accepted the request but returned no reply URL</div>
+      <div>The previous URL may already be invalidated. Click Regenerate to try again.</div>
+    </div>`;
+    return;
+  }
+  $("dv_reply_result").textContent = "✓ generated";
+  const placeholderWarn = (url.includes("<your-webhook-base-url>") || url.includes("your-domain.example.com"))
+    ? `<div class="warnbox" style="margin-bottom:.5rem;">The platform webhook base URL isn't configured
+        (<code>WEBHOOK_BASE_URL</code> env), so the URL below has a placeholder host
+        (<code>&lt;your-webhook-base-url&gt;</code> or <code>your-domain.example.com</code>) — replace it with this deployment's public base URL before giving it to the vendor.</div>`
+    : "";
+  $("dv_reply_out").innerHTML = `${placeholderWarn}
+    <div style="display:flex;gap:.4rem;align-items:center;flex-wrap:wrap;">
+      <input id="dv_reply_url" readonly style="width:36rem;max-width:100%;" value="" />
+      <button type="button" onclick="copyDvReplyUrl()">Copy</button>
+      <span id="dv_reply_copied" class="hint"></span>
+    </div>
+    <div class="hint" style="margin-top:.3rem;">Shown once — copy it now. It can't be retrieved later, only regenerated.</div>`;
+  $("dv_reply_url").value = url;
+}
+
+async function copyDvReplyUrl() {
+  const el = $("dv_reply_url");
+  el.select();
+  let ok = false;
+  try { await navigator.clipboard.writeText(el.value); ok = true; }
+  catch (e) { try { ok = document.execCommand("copy"); } catch (e2) { /* leave selected for manual copy */ } }
+  $("dv_reply_copied").textContent = ok ? "copied" : "press Ctrl/Cmd+C to copy";
 }
 
 async function saveDepositVerification(id) {
