@@ -38,7 +38,7 @@ from src.api.call_store import insert_call
 # bootstrap import here would reintroduce the cycle fixed for
 # LiveKitModeNotSupported (see src.exceptions / src.defaults docstrings).
 from src.defaults import DEFAULT_DEMO_SCRIPT
-from src.config_tenant import platform_webhook_base_url, resolve_chat_tts_config
+from src.config_tenant import platform_webhook_base_url, resolve_chat_tts_config, resolve_gender_voice
 from src.models.database import get_sessionmaker
 from src.models.turn_metrics import record_turn_metric
 from src.dialogue.prompts import PACKS, VoiceBotScript, build_s2s_system_instruction
@@ -898,6 +898,46 @@ def make_browser_bridge_factory(
 
         llm = get_llm_provider({"provider": llm_sel}) if llm_sel in LLM_PROVIDERS else providers.get_llm(tenant)
 
+        # Chat→voice handoff: a ?handoff=<token> resolves a short-lived Redis blob
+        # (chat summary + customer context) so the voice agent continues the chat.
+        # /chat/voice hands this factory an ALREADY resolved `handoff_ctx`
+        # (chat.py's `_claim_chat_handoff` -- the token itself is NOT consumed,
+        # only validated), so this must not re-fetch it. Only when
+        # `handoff_ctx` arrives as None (the dev console's /dev/voice, which never
+        # passes one) does this fall back to its own best-effort, non-destructive
+        # lookup -- kept so an admin can re-test the same handoff token repeatedly.
+        # Resolved HERE, before TTS source selection below, so a handoff call's
+        # gender-matching (handoff_ctx["bot_gender"]) has something to match
+        # against -- resolving it after TTS selection (as this used to) meant
+        # /dev/voice handoffs always fell through to the ungendered default,
+        # even when a pair was configured, because handoff_ctx was still None
+        # at that point.
+        handoff_token = (query_params.get("handoff") or "").strip()
+        if handoff_ctx is None and handoff_token and handoff_store is not None:
+            from src.auth.audit import token_fingerprint
+            from src.utils.logging import debug_event
+            try:
+                import json as _json
+                raw = await handoff_store.redis.get(f"chat_handoff:{handoff_token}")
+                if raw:
+                    handoff_ctx = _json.loads(raw)
+                    debug_event(log, "dev_console chat_handoff resolved",
+                                token_fp=token_fingerprint(handoff_token),
+                                customer_name=(handoff_ctx.get("customer_name") or None),
+                                customer_id=handoff_ctx.get("customer_id"),
+                                has_chat_summary=bool(handoff_ctx.get("chat_summary")),
+                                language=handoff_ctx.get("language"))
+                else:
+                    # The blob expired or the token was never valid -- from
+                    # outside this is indistinguishable from a normal call with
+                    # no handoff at all; the customer just never gets continuity.
+                    debug_event(log, "dev_console chat_handoff resolve_failed",
+                                reason="token_not_found",
+                                token_fp=token_fingerprint(handoff_token))
+            except Exception:  # noqa: BLE001 — a bad handoff blob must not block the call
+                log.warning("chat handoff context load failed",
+                            extra={"token_fp": token_fingerprint(handoff_token)})
+
         # TTS source, in priority order:
         #   1. explicit ?tts= override (dev console) — always wins, handoff or not.
         #   2. a chat->voice handoff call — speak in the SAME voice chat already
@@ -922,18 +962,54 @@ def make_browser_bridge_factory(
             tts = chat_call_tts
             resolved = resolve_chat_tts_config(tenant.settings.pipeline)
             tts_language = resolved.language or tenant.settings.pipeline.tts.language or "hi-IN"
-            tts_voice = resolved.voice_id
+            # Gender-match the handoff voice to handoff_ctx["bot_gender"] when
+            # the resolved TTS config has a pair for it (resolve_gender_voice,
+            # src/config_tenant.py); falls back to the plain voice_id, exactly
+            # as before this existed, when there's no pair or no gender was
+            # requested at all.
+            _handoff_gender = ((handoff_ctx or {}).get("bot_gender") or "").strip().lower() or None
+            tts_voice, _gender_matched = resolve_gender_voice(resolved, _handoff_gender)
+            if _handoff_gender in ("female", "male") and not _gender_matched:
+                if resolved is not None and getattr(resolved, "voices", None):
+                    # Real misconfiguration: a pair IS configured, just not
+                    # for this gender.
+                    log.warning("handoff call voice gender not configured; using tenant default",
+                                extra={"tenant_id": tenant.id, "bot_gender": _handoff_gender})
+                else:
+                    # Ordinary: no pair configured at all.
+                    debug_event(log, "dev_console browser_bridge gender_voice_unconfigured",
+                                tenant_id=tenant.id, bot_gender=_handoff_gender,
+                                source="chat_voice")
             debug_event(log, "dev_console browser_bridge handoff_tts_source",
                         source="chat_voice", tts_provider=resolved.provider)
         else:
             tts = providers.get_tts(tenant)
             tts_language = tenant.settings.pipeline.tts.language or "hi-IN"
-            tts_voice = tenant.settings.pipeline.tts.voice_id
             if is_handoff_call:
                 from src.utils.logging import debug_event
+                # Same gender-matching as the chat_voice branch above, off the
+                # call cascade's own pipeline.tts this time -- a handoff call
+                # that fell all the way through to this fallback still speaks
+                # in the gender the CRM asked for when a pair is configured.
+                _handoff_gender = ((handoff_ctx or {}).get("bot_gender") or "").strip().lower() or None
+                _pipeline_tts = tenant.settings.pipeline.tts
+                tts_voice, _gender_matched = resolve_gender_voice(_pipeline_tts, _handoff_gender)
+                if _handoff_gender in ("female", "male") and not _gender_matched:
+                    if _pipeline_tts is not None and getattr(_pipeline_tts, "voices", None):
+                        # Real misconfiguration: a pair IS configured, just
+                        # not for this gender.
+                        log.warning("handoff call voice gender not configured; using tenant default",
+                                    extra={"tenant_id": tenant.id, "bot_gender": _handoff_gender})
+                    else:
+                        # Ordinary: no pair configured at all.
+                        debug_event(log, "dev_console browser_bridge gender_voice_unconfigured",
+                                    tenant_id=tenant.id, bot_gender=_handoff_gender,
+                                    source="pipeline_tts_fallback")
                 debug_event(log, "dev_console browser_bridge handoff_tts_source",
                             source="pipeline_tts_fallback",
                             tts_provider=getattr(tenant.settings.pipeline.tts, "provider", None) or None)
+            else:
+                tts_voice = tenant.settings.pipeline.tts.voice_id
 
         # Voice: ?voice= overrides the configured default (validated against the
         # TTS provider's roster), so the console's Voice dropdown applies in
@@ -996,40 +1072,6 @@ def make_browser_bridge_factory(
             lead_data["name"] = lead_name
         if lead_gender:
             lead_data["lead_gender"] = lead_gender
-        # Chat→voice handoff: a ?handoff=<token> resolves a short-lived Redis blob
-        # (chat summary + customer context) so the voice agent continues the chat.
-        # /chat/voice hands this factory an ALREADY resolved `handoff_ctx`
-        # (chat.py's `_claim_chat_handoff` -- the token itself is NOT consumed,
-        # only validated), so this must not re-fetch it. Only when
-        # `handoff_ctx` arrives as None (the dev console's /dev/voice, which never
-        # passes one) does this fall back to its own best-effort, non-destructive
-        # lookup -- kept so an admin can re-test the same handoff token repeatedly.
-        handoff_token = (query_params.get("handoff") or "").strip()
-        if handoff_ctx is None and handoff_token and handoff_store is not None:
-            from src.auth.audit import token_fingerprint
-            from src.utils.logging import debug_event
-            try:
-                import json as _json
-                raw = await handoff_store.redis.get(f"chat_handoff:{handoff_token}")
-                if raw:
-                    handoff_ctx = _json.loads(raw)
-                    debug_event(log, "dev_console chat_handoff resolved",
-                                token_fp=token_fingerprint(handoff_token),
-                                customer_name=(handoff_ctx.get("customer_name") or None),
-                                customer_id=handoff_ctx.get("customer_id"),
-                                has_chat_summary=bool(handoff_ctx.get("chat_summary")),
-                                language=handoff_ctx.get("language"))
-                else:
-                    # The blob expired or the token was never valid -- from
-                    # outside this is indistinguishable from a normal call with
-                    # no handoff at all; the customer just never gets continuity.
-                    debug_event(log, "dev_console chat_handoff resolve_failed",
-                                reason="token_not_found",
-                                token_fp=token_fingerprint(handoff_token))
-            except Exception:  # noqa: BLE001 — a bad handoff blob must not block the call
-                log.warning("chat handoff context load failed",
-                            extra={"token_fp": token_fingerprint(handoff_token)})
-
         if handoff_ctx is not None:
             name = (handoff_ctx.get("customer_name") or "").strip()
             if name:

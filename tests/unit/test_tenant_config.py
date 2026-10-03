@@ -862,3 +862,107 @@ def test_merge_provider_config_omits_unset_voice_tuning_fields() -> None:
     assert "similarity_boost" not in merged
     assert "style" not in merged
     assert "use_speaker_boost" not in merged
+
+
+# --- TenantTTSConfig.voices / resolve_gender_voice -----------------------
+
+
+def test_tenant_tts_config_voices_defaults_to_none() -> None:
+    assert TenantTTSConfig(provider="sarvam").voices is None
+
+
+def test_tenant_tts_config_rejects_unknown_gender_key() -> None:
+    with pytest.raises(ValidationError):
+        TenantTTSConfig(voices={"robot": "r2d2"})
+
+
+def test_tenant_tts_config_drops_empty_string_voice_ids() -> None:
+    """An empty string for a gender means "not configured", not "speak with
+    an empty voice id" -- normalised to absent, same as a tenant that never
+    set the key at all."""
+    cfg = TenantTTSConfig(voices={"female": "meera", "male": ""})
+    assert cfg.voices == {"female": "meera"}
+
+
+def test_tenant_tts_config_all_empty_voices_normalises_to_none() -> None:
+    cfg = TenantTTSConfig(voices={"female": "", "male": ""})
+    assert cfg.voices is None
+
+
+def test_tenant_tts_config_literal_empty_dict_normalises_to_none() -> None:
+    """A bare `{}` (not just a dict of empty strings) must also normalise to
+    None -- the validator used to short-circuit on `if not v` and hand back
+    `{}` unchanged here, contradicting its own docstring."""
+    cfg = TenantTTSConfig(voices={})
+    assert cfg.voices is None
+
+
+def test_resolve_gender_voice_matched_female() -> None:
+    from src.config_tenant import resolve_gender_voice
+
+    cfg = TenantTTSConfig(voice_id="default-voice", voices={"female": "meera", "male": "aditya"})
+    assert resolve_gender_voice(cfg, "female") == ("meera", True)
+
+
+def test_resolve_gender_voice_matched_male() -> None:
+    from src.config_tenant import resolve_gender_voice
+
+    cfg = TenantTTSConfig(voice_id="default-voice", voices={"female": "meera", "male": "aditya"})
+    assert resolve_gender_voice(cfg, "male") == ("aditya", True)
+
+
+def test_resolve_gender_voice_falls_back_when_gender_not_configured() -> None:
+    """Male requested, only female configured -> the plain voice_id, with
+    matched=False so the caller knows to warn."""
+    from src.config_tenant import resolve_gender_voice
+
+    cfg = TenantTTSConfig(voice_id="default-voice", voices={"female": "meera"})
+    assert resolve_gender_voice(cfg, "male") == ("default-voice", False)
+
+
+def test_resolve_gender_voice_none_gender_no_warning_signal() -> None:
+    from src.config_tenant import resolve_gender_voice
+
+    cfg = TenantTTSConfig(voice_id="default-voice", voices={"female": "meera", "male": "aditya"})
+    assert resolve_gender_voice(cfg, None) == ("default-voice", False)
+
+
+def test_resolve_gender_voice_unknown_gender_string() -> None:
+    from src.config_tenant import resolve_gender_voice
+
+    cfg = TenantTTSConfig(voice_id="default-voice", voices={"female": "meera", "male": "aditya"})
+    assert resolve_gender_voice(cfg, "nonbinary") == ("default-voice", False)
+
+
+def test_resolve_gender_voice_no_voices_configured() -> None:
+    from src.config_tenant import resolve_gender_voice
+
+    cfg = TenantTTSConfig(voice_id="default-voice")
+    assert resolve_gender_voice(cfg, "female") == ("default-voice", False)
+
+
+def test_resolve_gender_voice_none_tts_cfg() -> None:
+    """resolve_chat_tts_config can return None (nothing resolvable) --
+    callers must not have to guard this call themselves."""
+    from src.config_tenant import resolve_gender_voice
+
+    assert resolve_gender_voice(None, "female") == (None, False)
+
+
+def test_merge_provider_config_drops_voices_on_tts_provider_switch() -> None:
+    """Same cross-provider guard as voice_id/model -- a voice id from the OLD
+    provider's catalog must not reach the NEW provider's adapter."""
+    tenant = TenantTTSConfig(provider="elevenlabs")
+    global_layer = {"provider": "sarvam", "voice_id": "meera",
+                     "voices": {"female": "meera", "male": "aditya"}}
+    merged = merge_provider_config(tenant, global_layer)
+    assert merged["provider"] == "elevenlabs"
+    assert "voice_id" not in merged
+    assert "voices" not in merged
+
+
+def test_merge_provider_config_same_provider_keeps_voices() -> None:
+    tenant = TenantTTSConfig(provider="Sarvam")
+    global_layer = {"provider": "sarvam", "voices": {"female": "meera", "male": "aditya"}}
+    merged = merge_provider_config(tenant, global_layer)
+    assert merged["voices"] == {"female": "meera", "male": "aditya"}

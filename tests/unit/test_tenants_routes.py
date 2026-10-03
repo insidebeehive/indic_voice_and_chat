@@ -2704,6 +2704,240 @@ async def test_pipeline_patch_chat_voice_tts_voice_tuning(ctx) -> None:
     assert ctx1.settings.pipeline.chat_voice.tts.stability == 0.6
 
 
+# --- Per-gender voice override (TenantTTSConfig.voices) --------------------
+
+
+async def test_register_tenant_accepts_voices_field(ctx) -> None:
+    client, resolver, _ = ctx
+    body = _body(slug="acme", tts={
+        "provider": "sarvam", "model": "bulbul:v3", "voice_id": "anushka",
+        "voices": {"female": "meera", "male": "arjun"},
+    })
+    resp = await client.post("/tenants", json=body, headers=ADMIN_HEADERS)
+    assert resp.status_code == 201, resp.text
+
+    ctx1 = await resolver.resolve_by_slug("acme")
+    assert ctx1.settings.pipeline.tts.voices == {"female": "meera", "male": "arjun"}
+
+
+async def test_register_tenant_rejects_bad_voices_key(ctx) -> None:
+    client, _, _ = ctx
+    body = _body(slug="acme", tts={"provider": "sarvam", "voices": {"robot": "r2d2"}})
+    resp = await client.post("/tenants", json=body, headers=ADMIN_HEADERS)
+    assert resp.status_code == 422, resp.text
+
+
+async def test_pipeline_patch_rejects_bad_voices_key(ctx) -> None:
+    client, resolver, _ = ctx
+    tid = (await client.post(
+        "/tenants", json=_body(slug="acme"), headers=ADMIN_HEADERS)).json()["tenant_id"]
+
+    resp = await client.patch(
+        f"/tenants/{tid}",
+        json={"pipeline": {"tts": {"voices": {"robot": "r2d2"}}}},
+        headers=ADMIN_HEADERS)
+    assert resp.status_code == 422, resp.text
+
+    ctx1 = await resolver.resolve_by_slug("acme")
+    assert ctx1.settings.pipeline.tts.voices is None   # rejected -> untouched
+
+
+async def test_pipeline_patch_sets_voices_for_pipeline_tts_and_get_returns_them(ctx) -> None:
+    client, resolver, _ = ctx
+    tid = (await client.post(
+        "/tenants", json=_body(slug="acme", mode="layered"), headers=ADMIN_HEADERS)).json()["tenant_id"]
+
+    resp = await client.patch(
+        f"/tenants/{tid}",
+        json={"pipeline": {"tts": {"voices": {"female": "meera", "male": "arjun"}}}},
+        headers=ADMIN_HEADERS)
+    assert resp.status_code == 200, resp.text
+
+    get_resp = await client.get("/tenants", headers=ADMIN_HEADERS)
+    t = next(x for x in get_resp.json()["tenants"] if x["slug"] == "acme")
+    # Raw stored override, same read-back shape as voice_id above it.
+    assert t["tts"]["voices"] == {"female": "meera", "male": "arjun"}
+
+    ctx1 = await resolver.resolve_by_slug("acme")
+    assert ctx1.settings.pipeline.tts.voices == {"female": "meera", "male": "arjun"}
+
+
+async def test_pipeline_patch_sets_voices_for_chat_voice_tts_and_get_returns_effective(ctx) -> None:
+    """Same field on chat_voice.tts (the chat voice-note override) -- read
+    back as ChatVoiceInfo.effective_voices, same shape as effective_voice_id."""
+    client, resolver, _ = ctx
+    tid = (await client.post(
+        "/tenants", json=_body(slug="acme", mode="layered"), headers=ADMIN_HEADERS)).json()["tenant_id"]
+
+    resp = await client.patch(
+        f"/tenants/{tid}",
+        json={"pipeline": {"chat_voice": {
+            "enabled": True,
+            "tts": {"provider": "elevenlabs", "voice_id": "cloned-cv",
+                     "voices": {"female": "cloned-cv-f", "male": "cloned-cv-m"}},
+        }}},
+        headers=ADMIN_HEADERS)
+    assert resp.status_code == 200, resp.text
+
+    get_resp = await client.get("/tenants", headers=ADMIN_HEADERS)
+    t = next(x for x in get_resp.json()["tenants"] if x["slug"] == "acme")
+    assert t["chat_voice"]["source"] == "own"
+    assert t["chat_voice"]["effective_voices"] == {"female": "cloned-cv-f", "male": "cloned-cv-m"}
+
+    ctx1 = await resolver.resolve_by_slug("acme")
+    assert ctx1.settings.pipeline.chat_voice.tts.voices == {"female": "cloned-cv-f", "male": "cloned-cv-m"}
+
+
+async def test_pipeline_patch_voices_cross_provider_switch_drops_them(ctx) -> None:
+    """Same cross-provider clear as voice_id/model -- a voice id from the OLD
+    provider's catalog must not reach the NEW provider's adapter."""
+    client, resolver, _ = ctx
+    body = _body(slug="acme", mode="layered", tts={
+        "provider": "sarvam", "model": "bulbul:v3", "voice_id": "anushka",
+        "voices": {"female": "meera", "male": "arjun"},
+    })
+    tid = (await client.post("/tenants", json=body, headers=ADMIN_HEADERS)).json()["tenant_id"]
+
+    resp = await client.patch(
+        f"/tenants/{tid}",
+        json={"pipeline": {"tts": {"provider": "elevenlabs"}}},
+        headers=ADMIN_HEADERS)
+    assert resp.status_code == 200, resp.text
+
+    ctx1 = await resolver.resolve_by_slug("acme")
+    p = ctx1.settings.pipeline
+    assert p.tts.provider == "elevenlabs"
+    assert p.tts.voices is None                      # cleared, not the stale sarvam pair
+    assert p.tts.voice_id is None                     # cleared alongside it, as before
+
+
+async def test_pipeline_patch_voices_partial_update_keeps_the_rest(ctx) -> None:
+    """Setting voice_id alone on a second PATCH must not wipe a prior PATCH's
+    voices -- same partial-override guarantee as every other field here."""
+    client, resolver, _ = ctx
+    tid = (await client.post(
+        "/tenants", json=_body(slug="acme", mode="layered"), headers=ADMIN_HEADERS)).json()["tenant_id"]
+
+    await client.patch(
+        f"/tenants/{tid}",
+        json={"pipeline": {"tts": {"voices": {"female": "meera", "male": "arjun"}}}},
+        headers=ADMIN_HEADERS)
+    resp = await client.patch(
+        f"/tenants/{tid}",
+        json={"pipeline": {"tts": {"voice_id": "new-default"}}},
+        headers=ADMIN_HEADERS)
+    assert resp.status_code == 200, resp.text
+
+    ctx1 = await resolver.resolve_by_slug("acme")
+    assert ctx1.settings.pipeline.tts.voice_id == "new-default"
+    assert ctx1.settings.pipeline.tts.voices == {"female": "meera", "male": "arjun"}  # untouched
+
+
+async def test_pipeline_patch_voices_omitted_does_not_clear_stored_pair(ctx) -> None:
+    """Clearing semantics mirror voice_id: there is no way to wipe `voices`
+    back to unset through this PATCH by omitting it (or sending it as JSON
+    null, which the request body parses identically to omitted) -- only
+    sending a replacement dict overwrites it."""
+    client, resolver, _ = ctx
+    tid = (await client.post(
+        "/tenants", json=_body(slug="acme", mode="layered"), headers=ADMIN_HEADERS)).json()["tenant_id"]
+
+    await client.patch(
+        f"/tenants/{tid}",
+        json={"pipeline": {"tts": {"voices": {"female": "meera", "male": "arjun"}}}},
+        headers=ADMIN_HEADERS)
+    resp = await client.patch(
+        f"/tenants/{tid}",
+        json={"pipeline": {"tts": {"voices": None}}},
+        headers=ADMIN_HEADERS)
+    assert resp.status_code == 200, resp.text
+
+    ctx1 = await resolver.resolve_by_slug("acme")
+    assert ctx1.settings.pipeline.tts.voices == {"female": "meera", "male": "arjun"}  # unchanged
+
+
+async def test_pipeline_patch_voices_empty_string_drops_just_that_gender(ctx) -> None:
+    """Unlike the dict as a whole, an individual gender CAN be dropped, and
+    `voices` merges key by key (unlike every other field in this shape) --
+    `{"male": ""}` clears just the male override and the female one from the
+    earlier PATCH is kept."""
+    client, resolver, _ = ctx
+    tid = (await client.post(
+        "/tenants", json=_body(slug="acme", mode="layered"), headers=ADMIN_HEADERS)).json()["tenant_id"]
+
+    await client.patch(
+        f"/tenants/{tid}",
+        json={"pipeline": {"tts": {"voices": {"female": "meera", "male": "arjun"}}}},
+        headers=ADMIN_HEADERS)
+    resp = await client.patch(
+        f"/tenants/{tid}",
+        json={"pipeline": {"tts": {"voices": {"male": ""}}}},
+        headers=ADMIN_HEADERS)
+    assert resp.status_code == 200, resp.text
+
+    ctx1 = await resolver.resolve_by_slug("acme")
+    # Key-by-key merge: male dropped, female kept from the earlier PATCH.
+    assert ctx1.settings.pipeline.tts.voices == {"female": "meera"}
+
+    get_resp = await client.get("/tenants", headers=ADMIN_HEADERS)
+    t = next(x for x in get_resp.json()["tenants"] if x["slug"] == "acme")
+    # Read-back never shows the dropped "" entry.
+    assert t["tts"]["voices"] == {"female": "meera"}
+
+
+async def test_pipeline_patch_voices_all_empty_clears_to_none(ctx) -> None:
+    """Sending every configured gender as "" in one PATCH empties the dict,
+    and an empty dict is stored as None (unset), not `{}`."""
+    client, resolver, _ = ctx
+    tid = (await client.post(
+        "/tenants", json=_body(slug="acme", mode="layered"), headers=ADMIN_HEADERS)).json()["tenant_id"]
+
+    await client.patch(
+        f"/tenants/{tid}",
+        json={"pipeline": {"tts": {"voices": {"female": "meera", "male": "arjun"}}}},
+        headers=ADMIN_HEADERS)
+    resp = await client.patch(
+        f"/tenants/{tid}",
+        json={"pipeline": {"tts": {"voices": {"female": "", "male": ""}}}},
+        headers=ADMIN_HEADERS)
+    assert resp.status_code == 200, resp.text
+
+    ctx1 = await resolver.resolve_by_slug("acme")
+    assert ctx1.settings.pipeline.tts.voices is None
+
+    get_resp = await client.get("/tenants", headers=ADMIN_HEADERS)
+    t = next(x for x in get_resp.json()["tenants"] if x["slug"] == "acme")
+    assert t["tts"]["voices"] is None
+
+
+async def test_pipeline_patch_voices_provider_switch_with_new_voices_uses_only_new_ones(ctx) -> None:
+    """A PATCH that both switches provider AND sends new `voices` in the same
+    request must not merge the new voices onto the OLD provider's leftover
+    pair -- the old provider's voices are dropped first (same as voice_id),
+    and the result is exactly what this PATCH sent."""
+    client, resolver, _ = ctx
+    body = _body(slug="acme", mode="layered", tts={
+        "provider": "sarvam", "model": "bulbul:v3", "voice_id": "anushka",
+        "voices": {"female": "meera", "male": "arjun"},
+    })
+    tid = (await client.post("/tenants", json=body, headers=ADMIN_HEADERS)).json()["tenant_id"]
+
+    resp = await client.patch(
+        f"/tenants/{tid}",
+        json={"pipeline": {"tts": {
+            "provider": "elevenlabs",
+            "voices": {"female": "el-female"},
+        }}},
+        headers=ADMIN_HEADERS)
+    assert resp.status_code == 200, resp.text
+
+    ctx1 = await resolver.resolve_by_slug("acme")
+    p = ctx1.settings.pipeline
+    assert p.tts.provider == "elevenlabs"
+    # Exactly the new voices -- no leftover "male": "arjun" from sarvam.
+    assert p.tts.voices == {"female": "el-female"}
+
+
 async def test_list_tenants_deposit_verification_reply_url_set_flips_after_rotation(ctx) -> None:
     client, _, _ = ctx
     tid = (await client.post(

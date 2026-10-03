@@ -799,6 +799,49 @@ GET /operators/{operator_id}/matka/holiday-schedule?market={name}&date={YYYY-MM-
 
 ---
 
+## Starting a Chat Session
+
+You create a session when a player opens the support chat. This call also sets the bot's name and gender for that session.
+
+```
+POST /api/v1/chat/sessions
+Authorization: Bearer <tenant-token>
+Content-Type: application/json
+
+{
+  "user_id": "player-42",
+  "customer_name": "Rahul",
+  "language": "hi",
+  "bot_name": "Priya",
+  "bot_gender": "female",
+  "metadata": {}
+}
+```
+
+**Response** (`201`):
+```json
+{
+  "session_id": "cs_a1b2c3d4",
+  "greeting": "...",
+  "ws_url": "wss://.../api/v1/chat/ws/cs_a1b2c3d4"
+}
+```
+
+**Fields** (all optional):
+- `user_id`: your player id.
+- `customer_name`: the player's name, used in the greeting.
+- `language`: the default reply language, e.g. `hi` or `en`. If you leave it out, the tenant's default is used. The bot still follows the language the player actually writes in.
+- `bot_name`: the name the bot uses for itself, up to 64 characters. If you leave it out, the bot calls itself the support agent for your brand.
+- `bot_gender`: `"female"` or `"male"`, exactly as written in **lowercase**. This sets the grammatical gender the bot uses for itself (for example "sakti hoon" or "sakta hoon" in Hindi). It also picks the voice for voice-note replies and for a voice call started from the chat, as long as we have configured a voice of that gender for your tenant; otherwise those use your tenant's default voice. If you leave it out, the bot is **female** in both grammar and voice, where a female voice is configured for your tenant.
+- `metadata`: any extra key/value data you want stored on the session.
+
+**Things to watch for:**
+- The field name must be exactly `bot_gender`. Fields with other names, such as `gender` or `botGender`, are ignored without an error, and the bot falls back to female.
+- Any other value for `bot_gender`, such as `"Male"` or `"M"`, rejects the whole request with `422`.
+- `bot_name` and `bot_gender` are fixed when the session is created. If you change the bot persona in your settings, the change applies to new sessions only, not to ones already open.
+
+---
+
 ## Escalation
 
 The following query types are **not handled by API lookups** — the chatbot escalates to a human agent via the built-in escalation flow:

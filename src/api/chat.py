@@ -73,7 +73,7 @@ from src.agents.chatbot import (
     truncate_previous_conversation,
 )
 from src.api.chat_cost import compute_chat_stt_cost, compute_chat_tts_cost, compute_chat_turn_cost
-from src.config_tenant import resolve_chat_tts_config
+from src.config_tenant import resolve_chat_tts_config, resolve_gender_voice
 from src.interfaces.media_storage import IMediaStorage
 from src.api.deps import get_db_session
 from src.auth import TenantContext, current_tenant
@@ -408,7 +408,7 @@ def _chat_tts_identity(tenant: TenantContext, tts: Any) -> tuple[str, str]:
 
 
 async def _synthesize_reply_audio(
-    tenant: TenantContext, text: str, language: str,
+    tenant: TenantContext, text: str, language: str, *, bot_gender: Optional[str] = None,
 ) -> tuple[Optional[tuple[bytes, str, int]], Optional[_ReplyTTSUsage]]:
     """Synthesize a voice-note reply's audio. Returns a
     ``(audio_result, usage)`` pair: ``audio_result`` is
@@ -419,6 +419,21 @@ async def _synthesize_reply_audio(
     `None` due to a timeout/failure -- see `billed_unknown` below), or
     `None` when TTS was never attempted at all (disabled/no provider/
     empty or over-cap text).
+
+    ``bot_gender`` (the CRM-supplied ``ChatSession.extra_data["bot_gender"]``,
+    see the WS caller) picks which of the tenant's configured
+    ``TenantTTSConfig.voices`` speaks the reply, via `resolve_gender_voice`
+    (src/config_tenant.py). An unset/unrecognized ``bot_gender`` matches
+    voice as "female", mirroring the prompt's own default grammar (see
+    prompts.py) -- so a session that never set ``bot_gender`` gets female
+    grammar AND a female voice, where one is configured, instead of
+    female-grammar text read out in whatever `voice_id` happens to be. No
+    match for an explicitly requested gender (requested but not configured)
+    logs a warning; no match for the defaulted gender does the same at DEBUG
+    only -- see the call site below. This is also what fixes the pre-existing
+    bug where no `voice_id` at all
+    reached `TTSConfig` below, so every non-ElevenLabs adapter spoke its
+    built-in default regardless of what the tenant configured.
 
     ``audio_result=None`` covers every non-fatal reason, all handled
     identically here (log-and-skip) precisely because none of them should
@@ -486,8 +501,42 @@ async def _synthesize_reply_audio(
         if tts is None:
             return None, None
         identity = _chat_tts_identity(tenant, tts)
+        chat_tts_cfg = resolve_chat_tts_config(tenant.settings.pipeline)
+        # Voice matching mirrors the prompt's own default exactly (see
+        # prompts.py's gender block): no bot_gender means "female" grammar,
+        # so an unrequested gender must mean "female" voice too -- otherwise
+        # a tenant with a male voice_id but a configured voices pair would
+        # speak female-grammar text in its male voice for every session that
+        # never set bot_gender.
+        # Normalised the same way as the prompt: a free-form metadata value
+        # such as "Male " must pick the same gender for voice and grammar.
+        norm_gender = (bot_gender or "").strip().lower()
+        explicit_gender = norm_gender in ("female", "male")
+        effective_gender = "male" if norm_gender == "male" else "female"
+        voice_id, gender_matched = resolve_gender_voice(chat_tts_cfg, effective_gender)
+        if explicit_gender and not gender_matched:
+            if chat_tts_cfg is not None and chat_tts_cfg.voices:
+                # A real misconfiguration: the tenant HAS a gender-voice pair,
+                # just not for the gender this session requested.
+                log.warning(
+                    "tts reply gender voice not configured; using tenant default",
+                    extra={"tenant_id": tenant.id, "bot_gender": bot_gender})
+            else:
+                # Ordinary and common: this tenant never set up a
+                # female/male pair at all, so there was nothing to match
+                # against — not worth an operator's attention.
+                debug_event(log, "chat tts_reply gender_voice_unconfigured",
+                            tenant_id=tenant.id, bot_gender=bot_gender)
+        elif not explicit_gender and not gender_matched and chat_tts_cfg is not None and chat_tts_cfg.voices:
+            # No gender was requested, so the session got the DEFAULTED
+            # "female" for voice matching, same as the prompt defaults to
+            # female grammar. A pair that only covers "male" isn't a
+            # misconfiguration an operator needs to see -- nobody asked for
+            # female -- but it's worth a DEBUG breadcrumb.
+            debug_event(log, "chat tts_reply gender_voice_default_unmatched",
+                        tenant_id=tenant.id, effective_gender=effective_gender)
         result = await asyncio.wait_for(
-            _synthesize_reply_audio_uncapped(tenant, text, language, tts),
+            _synthesize_reply_audio_uncapped(tenant, text, language, tts, voice_id),
             timeout=_TTS_SYNTH_TIMEOUT_S,
         )
         # Success is logged too, not only the skips. Without this the ONLY
@@ -502,7 +551,8 @@ async def _synthesize_reply_audio(
                     audio_bytes=len(result[0]) if result else 0,
                     audio_mime=result[1] if result else None,
                     audio_duration_ms=result[2] if result else None,
-                    tts_provider=identity[0], tts_model=identity[1])
+                    tts_provider=identity[0], tts_model=identity[1],
+                    voice_id=voice_id, gender_matched=gender_matched)
         return result, _ReplyTTSUsage(identity[0], identity[1], int(result[2]), False)
     except asyncio.CancelledError:
         raise
@@ -609,14 +659,15 @@ def _pcm16_to_mp3(pcm: bytes, sample_rate: int, bitrate_kbps: int) -> bytes:
 
 
 async def _synthesize_reply_audio_uncapped(
-    tenant: TenantContext, text: str, language: str, tts: Any,
+    tenant: TenantContext, text: str, language: str, tts: Any, voice_id: Optional[str] = None,
 ) -> tuple[bytes, str, int]:
     """The actual synthesis call, unwrapped — split out so the timeout/except
     handling above has a single coroutine to bound. The TTS client is passed
     in by the caller, which owns the opt-in/resolution gate (`get_chat_tts`);
     this function no longer looks up a provider itself, which is also what
     lets tests patch just that lookup without re-implementing the timeout
-    wrapper."""
+    wrapper. ``voice_id`` is the caller's already gender-resolved choice
+    (`resolve_gender_voice`) — this function doesn't re-derive it."""
     overrides = getattr(tenant.settings, "pronunciation_overrides", None)
     # Currency amounts and tenant/brand pronunciation overrides get rewritten
     # to how they should be SPOKEN, not just displayed. This does NOT mirror
@@ -641,6 +692,7 @@ async def _synthesize_reply_audio_uncapped(
     normalized = normalize_for_tts(text, language, extra=overrides)
     config = TTSConfig(
         language=to_bcp47(language),
+        voice_id=voice_id,
         # Deliberately no `extra_pronunciations=overrides`: they're already
         # applied to `normalized` above. Forwarding them here would make
         # sarvam/indicf5 (the two providers that internally re-run
@@ -3264,7 +3316,8 @@ async def chat_websocket(websocket: WebSocket, session_id: str) -> None:
                                 reply_audio_mime: Optional[str] = None
                                 reply_audio_duration_ms: Optional[int] = None
                                 synthesized, tts_usage = await _synthesize_reply_audio(
-                                    tenant, result.response.response_text, result.response.language)
+                                    tenant, result.response.response_text, result.response.language,
+                                    bot_gender=_extra.get("bot_gender"))
                                 if synthesized is not None:
                                     reply_audio_bytes, reply_mime, reply_duration_ms = synthesized
                                     # Base64'd and noted immediately, BEFORE the upload

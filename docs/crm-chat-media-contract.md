@@ -184,6 +184,7 @@ delivered inline as base64 on the same frame:
   also plays the clip. A genuinely new frame type would need every existing
   integration to add a case for it before it did anything at all — adding
   fields to a frame type they already handle needs no such rollout.
+- **The voice matches the bot's gender.** The `bot_gender` you set when creating the session (`"female"` or `"male"`, see `docs/crm-api-contract.md`, "Starting a Chat Session") picks a female or male voice, as long as we have configured a voice of that gender for the tenant. Otherwise the reply uses the tenant's default voice.
 - **Only inbound `audio` turns can produce these fields.** A `type:"message"`
   (text) turn never gets a synthesized reply — the AI mirrors whatever
   modality the customer used.

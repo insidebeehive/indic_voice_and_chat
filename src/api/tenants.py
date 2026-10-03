@@ -93,6 +93,11 @@ class LayerChoice(BaseModel):
     similarity_boost: Optional[float] = Field(default=None, ge=0.0, le=1.0)   # tts only
     style: Optional[float] = Field(default=None, ge=0.0, le=1.0)              # tts only
     use_speaker_boost: Optional[bool] = None                                  # tts only
+    # Per-gender voice override — tts only (TenantTTSConfig.voices,
+    # src/config_tenant.py). The dict's key type IS the validation: a key
+    # outside "female"/"male" fails FastAPI's own request-body validation
+    # with a 422 before register_tenant ever constructs TenantTTSConfig.
+    voices: Optional[dict[Literal["female", "male"], str]] = None            # tts only
 
 
 class RealtimeChoice(BaseModel):
@@ -269,6 +274,7 @@ async def register_tenant(
             similarity_boost=req.tts.similarity_boost if req.tts else None,
             style=req.tts.style if req.tts else None,
             use_speaker_boost=req.tts.use_speaker_boost if req.tts else None,
+            voices=req.tts.voices if req.tts else None,
         ),
         realtime=TenantRealtimeConfig(
             provider=req.realtime.provider,
@@ -460,7 +466,21 @@ class LayerUpdateIn(BaseModel):
     voice_id/speed there is no way to clear one of these back to "unset"
     through this PATCH once set — only overwrite with a new value. Editing
     the tenant's YAML/row directly is the only way back to None, same as
-    voice_id/speed today."""
+    voice_id/speed today.
+
+    ``voices`` (per-gender voice override, TenantTTSConfig.voices) is the one
+    field that merges KEY BY KEY instead of overwriting wholesale: a gender
+    sent in the dict replaces just that gender's voice; a gender sent as
+    ``""`` removes just that gender; a gender not mentioned is kept from the
+    stored dict. Omitting ``voices`` entirely, or sending it as ``null``,
+    leaves the whole dict untouched — same as every other field here. If the
+    merge leaves nothing behind (e.g. every gender sent as ``""``), the
+    stored value becomes ``None`` (unset), not ``{}``. A PATCH that also
+    switches ``provider`` still drops the OLD provider's ``voices`` first,
+    same as voice_id/the ElevenLabs tuning knobs below — any new ``voices``
+    this same PATCH sends are applied on top of that empty base, not merged
+    onto the old provider's leftovers, so the result is exactly the new
+    voices sent."""
     provider: Optional[str] = None
     model: Optional[str] = None
     language: Optional[str] = None
@@ -470,6 +490,7 @@ class LayerUpdateIn(BaseModel):
     similarity_boost: Optional[float] = Field(default=None, ge=0.0, le=1.0)   # tts only
     style: Optional[float] = Field(default=None, ge=0.0, le=1.0)              # tts only
     use_speaker_boost: Optional[bool] = None                                  # tts only
+    voices: Optional[dict[Literal["female", "male"], str]] = None            # tts only
 
 
 class RealtimeUpdateIn(BaseModel):
@@ -566,7 +587,7 @@ _STT_UPDATE_FIELDS = ("provider", "model", "language")
 _LLM_UPDATE_FIELDS = ("provider", "model")
 _TTS_UPDATE_FIELDS = (
     "provider", "model", "language", "voice_id", "speed",
-    "stability", "similarity_boost", "style", "use_speaker_boost",
+    "stability", "similarity_boost", "style", "use_speaker_boost", "voices",
 )
 
 
@@ -592,14 +613,18 @@ def _merge_layer_fields(
     itself, is unaffected."""
     out = dict(cfg)
     ignored: list[str] = []
+    new_provider = getattr(upd, "provider", None)
+    old_provider = cfg.get("provider")   # pre-merge, from the ORIGINAL stored cfg
+    provider_switched = bool(
+        new_provider and old_provider
+        and str(new_provider).strip().lower() != str(old_provider).strip().lower()
+    )
     for f in ("provider", "model", "language", "voice_id", "speed",
-              "stability", "similarity_boost", "style", "use_speaker_boost"):
+              "stability", "similarity_boost", "style", "use_speaker_boost", "voices"):
         v = getattr(upd, f, None)
         if v is None:
             continue
-        if f in fields:
-            out[f] = v
-        else:
+        if f not in fields:
             # Discarded input, not a bug in the usual sense: LayerUpdateIn is
             # one shared shape for stt/llm/tts (docstring), so a caller CAN
             # send voice_id/speed for an stt/llm layer -- `fields` is what
@@ -607,17 +632,30 @@ def _merge_layer_fields(
             # docstring. An admin who set it expecting an effect gets a 200
             # with no error and no change; this is the only trace of that.
             ignored.append(f)
+        elif f == "voices":
+            # Key-by-key merge, not a wholesale replace (LayerUpdateIn
+            # docstring): each gender `v` names replaces/removes just that
+            # gender; a gender it doesn't mention is kept from the stored
+            # dict. A provider switch is the one case that does NOT merge
+            # onto the stored dict -- the old provider's voice ids are
+            # dropped first (same as voice_id/the tuning knobs below), so `v`
+            # lands on an empty base and the result is exactly what this
+            # PATCH sent.
+            base = {} if provider_switched else dict(cfg.get("voices") or {})
+            for gender, voice_id in v.items():
+                if voice_id:
+                    base[gender] = voice_id
+                else:
+                    base.pop(gender, None)
+            out[f] = base or None
+        else:
+            out[f] = v
     if ignored:
         debug_event(
             log, "tenants pipeline_layer_update field_discarded",
             fields_not_applicable_to_layer=ignored, layer_fields=list(fields),
         )
-    new_provider = getattr(upd, "provider", None)
-    old_provider = cfg.get("provider")   # pre-merge, from the ORIGINAL stored cfg
-    if (
-        new_provider and old_provider
-        and str(new_provider).strip().lower() != str(old_provider).strip().lower()
-    ):
+    if provider_switched:
         cleared: list[str] = []
         for field_name in provider_specific:
             # Only clear a field this layer actually stores (`fields`) and
@@ -1362,6 +1400,9 @@ class LayerInfo(BaseModel):
     similarity_boost: Optional[float] = None
     style: Optional[float] = None
     use_speaker_boost: Optional[bool] = None
+    # Per-gender voice override (TenantTTSConfig.voices) — RAW stored
+    # override, same as voice_id above. Always None for stt/llm/realtime.
+    voices: Optional[dict[str, str]] = None
     # Additive (Task: backoffice "(current: —)" fix). `provider`/`model` above
     # are the RAW stored override — None on a tenant that never set this
     # layer, which is exactly the "—" that made 3 of 6 live tenants look
@@ -1418,6 +1459,9 @@ class ChatVoiceInfo(BaseModel):
     # one picker only.
     effective_language: Optional[str] = None
     effective_voice_id: Optional[str] = None
+    # Per-gender voice override off the SAME resolved TenantTTSConfig as
+    # effective_voice_id above.
+    effective_voices: Optional[dict[str, str]] = None
     # ElevenLabs cloned-voice tuning off the SAME resolved TenantTTSConfig as
     # effective_voice_id above (whichever of chat_voice.tts/pipeline.tts
     # `source` names) — not merged against a platform default, same reasoning
@@ -1569,6 +1613,7 @@ def _layer(pc: dict, key: str, global_defaults: dict[str, dict]) -> LayerInfo:
         # stt/llm/realtime, whose config blocks never carry these keys.
         stability=d.get("stability"), similarity_boost=d.get("similarity_boost"),
         style=d.get("style"), use_speaker_boost=d.get("use_speaker_boost"),
+        voices=d.get("voices"),
         effective_provider=merged.get("provider"), effective_model=merged.get("model"),
         provider_source=_source("provider"), model_source=_source("model"),
     )
@@ -1601,6 +1646,7 @@ def _chat_voice_info(pc: dict) -> ChatVoiceInfo:
         effective_model=resolved.model if resolved else None,
         effective_language=resolved.language if resolved else None,
         effective_voice_id=resolved.voice_id if resolved else None,
+        effective_voices=resolved.voices if resolved else None,
         effective_stability=resolved.stability if resolved else None,
         effective_similarity_boost=resolved.similarity_boost if resolved else None,
         effective_style=resolved.style if resolved else None,

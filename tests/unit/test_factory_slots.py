@@ -837,6 +837,163 @@ async def test_handoff_call_voice_override_wins_over_chat_call_tts_resolution() 
     assert bridge._agent._engine._config.tts.voice_id == "override-voice"
 
 
+async def test_handoff_call_bot_gender_picks_matching_chat_voice() -> None:
+    """A handoff call with a CRM-supplied bot_gender (handoff_ctx, passed by
+    /chat/voice -- see chat.py's _claim_chat_handoff) picks the matching
+    voice from the resolved chat TTS config's `voices` pair
+    (resolve_gender_voice, src/config_tenant.py), not just whatever
+    `voice_id` it already had. The script's gender agrees too."""
+    chat_sentinel = Mock()
+    providers = _providers()
+    providers.get_chat_call_tts = lambda t: chat_sentinel
+    ws = SimpleNamespace(query_params={"handoff": "tok1"})
+    tenant = _tenant()
+    tenant.settings.pipeline.tts.provider = None
+    tenant.settings.pipeline.chat_voice = SimpleNamespace(
+        enabled=False,  # must be ignored entirely for handoff calls
+        tts=SimpleNamespace(
+            provider="elevenlabs", model=None, language="en-IN", voice_id="chat-voice-1",
+            voices={"male": "chat-voice-male", "female": "chat-voice-female"}),
+    )
+    factory = make_browser_bridge_factory(providers, slots=SlotSchema())
+    bridge = await factory(websocket=ws, tenant=tenant, handoff_ctx={"bot_gender": "male"})
+    assert bridge._agent._engine._config.tts.voice_id == "chat-voice-male"
+    assert bridge._agent._script.gender == "male"
+
+
+async def test_dev_voice_handoff_lookup_feeds_gender_match_before_tts_selection(fake_redis) -> None:
+    """Regression test for the ordering bug this round fixes: the dev
+    console's own ?handoff= Redis lookup (only reached by /dev/voice, which
+    never receives an already-resolved handoff_ctx -- /chat/voice always
+    does, see test_handoff_call_bot_gender_picks_matching_chat_voice above)
+    used to run AFTER TTS source selection, so bot_gender from that blob was
+    always None at match time and a configured pair never got used on
+    /dev/voice. Moving the lookup above TTS selection in
+    make_browser_bridge_factory fixes this."""
+    import json
+
+    await fake_redis.set("chat_handoff:tok1", json.dumps({
+        "customer_name": "Raju", "chat_summary": "asked about billing",
+        "bot_gender": "male",
+    }))
+    chat_sentinel = Mock()
+    providers = _providers()
+    providers.get_chat_call_tts = lambda t: chat_sentinel
+    tenant = _tenant()
+    tenant.settings.pipeline.tts.provider = None
+    tenant.settings.pipeline.chat_voice = SimpleNamespace(
+        enabled=False,  # must be ignored entirely for handoff calls
+        tts=SimpleNamespace(
+            provider="elevenlabs", model=None, language="en-IN", voice_id="chat-voice-1",
+            voices={"male": "chat-voice-male", "female": "chat-voice-female"}),
+    )
+    factory = make_browser_bridge_factory(
+        providers, handoff_store=SimpleNamespace(redis=fake_redis))
+    ws = SimpleNamespace(query_params={"handoff": "tok1"})
+    bridge = await factory(websocket=ws, tenant=tenant)
+    assert bridge._agent._engine._config.tts.voice_id == "chat-voice-male"
+    assert bridge._agent._script.gender == "male"
+
+
+async def test_handoff_ctx_supplied_by_caller_skips_redis_lookup(fake_redis) -> None:
+    """/chat/voice hands this factory an ALREADY resolved handoff_ctx
+    (chat.py's _claim_chat_handoff) -- even when a handoff_store IS also
+    wired and Redis has a blob under the same token, the caller-supplied
+    handoff_ctx must win untouched, not get overwritten by a fresh lookup.
+    Conflicting bot_gender values on each side make a silent overwrite
+    observable."""
+    import json
+
+    await fake_redis.set("chat_handoff:tok1", json.dumps({
+        "customer_name": "Redis Name", "bot_gender": "female",
+    }))
+    providers = _providers()
+    tenant = _tenant()
+    factory = make_browser_bridge_factory(
+        providers, handoff_store=SimpleNamespace(redis=fake_redis))
+    ws = SimpleNamespace(query_params={"handoff": "tok1"})
+    bridge = await factory(
+        websocket=ws, tenant=tenant,
+        handoff_ctx={"customer_name": "Caller Name", "bot_gender": "male"})
+    assert bridge._agent._script.gender == "male"
+    assert bridge._agent.session.lead_data.get("name") == "Caller Name"
+
+
+async def test_handoff_call_gender_fallback_warns_when_not_configured(caplog) -> None:
+    """A handoff call requesting a gender the tenant hasn't configured a
+    voice for (here, via the pipeline.tts fallback branch) falls back to the
+    plain `voice_id` and logs a warning -- resolve_gender_voice's documented
+    no-match contract, not a hard failure."""
+    import logging
+
+    pipeline_sentinel = Mock()
+    providers = _providers()
+    providers.get_tts = lambda t: pipeline_sentinel
+    providers.get_chat_call_tts = lambda t: None
+    ws = SimpleNamespace(query_params={"handoff": "tok1"})
+    tenant = _tenant()
+    tenant.settings.pipeline.tts = SimpleNamespace(
+        language="hi-IN", voice_id="pipeline-voice", voices={"female": "pipeline-voice-f"})
+    factory = make_browser_bridge_factory(providers, slots=SlotSchema())
+    with caplog.at_level(logging.WARNING, logger="src.api.dev_console"):
+        bridge = await factory(websocket=ws, tenant=tenant, handoff_ctx={"bot_gender": "male"})
+    assert bridge._agent._engine._config.tts.voice_id == "pipeline-voice"
+    assert any(r.levelno == logging.WARNING and "gender" in r.getMessage().lower()
+               for r in caplog.records)
+
+
+async def test_handoff_call_gender_requested_with_no_pair_at_all_does_not_warn(caplog) -> None:
+    """A tenant with NO female/male pair configured at all is the ordinary
+    case, not a misconfiguration (see the test above, which has a pair
+    missing just one gender and DOES warn) -- this logs a debug_event
+    instead of a WARNING."""
+    import logging
+
+    pipeline_sentinel = Mock()
+    providers = _providers()
+    providers.get_tts = lambda t: pipeline_sentinel
+    providers.get_chat_call_tts = lambda t: None
+    ws = SimpleNamespace(query_params={"handoff": "tok1"})
+    tenant = _tenant()
+    tenant.settings.pipeline.tts = SimpleNamespace(
+        language="hi-IN", voice_id="pipeline-voice", voices=None)
+    factory = make_browser_bridge_factory(providers, slots=SlotSchema())
+    with caplog.at_level(logging.DEBUG, logger="src.api.dev_console"):
+        bridge = await factory(websocket=ws, tenant=tenant, handoff_ctx={"bot_gender": "male"})
+    assert bridge._agent._engine._config.tts.voice_id == "pipeline-voice"
+    assert not any(r.levelno == logging.WARNING for r in caplog.records)
+    assert any(
+        r.getMessage() == "dev_console browser_bridge gender_voice_unconfigured"
+        for r in caplog.records
+    )
+
+
+async def test_handoff_call_voice_override_wins_over_bot_gender() -> None:
+    """An explicit ?voice= override still wins even when bot_gender would
+    otherwise pick a different, gender-matched voice -- precedence is
+    unchanged by gender-matching."""
+    class _FakeChatTTS:
+        def get_available_voices(self, language):
+            return [{"voice_id": "chat-voice-male"}, {"voice_id": "override-voice"}]
+
+    fake_tts = _FakeChatTTS()
+    providers = _providers()
+    providers.get_chat_call_tts = lambda t: fake_tts
+    ws = SimpleNamespace(query_params={"handoff": "tok1", "voice": "override-voice"})
+    tenant = _tenant()
+    tenant.settings.pipeline.tts.provider = None
+    tenant.settings.pipeline.chat_voice = SimpleNamespace(
+        enabled=False,
+        tts=SimpleNamespace(
+            provider="elevenlabs", model=None, language="en-IN", voice_id="chat-voice-1",
+            voices={"male": "chat-voice-male"}),
+    )
+    factory = make_browser_bridge_factory(providers, slots=SlotSchema())
+    bridge = await factory(
+        websocket=ws, tenant=tenant, allow_overrides=True, handoff_ctx={"bot_gender": "male"})
+    assert bridge._agent._engine._config.tts.voice_id == "override-voice"
+
+
 async def test_handoff_call_missing_chat_tts_language_falls_back_to_pipeline_language() -> None:
     """Fix 1: the language cascade for a handoff call resolved via
     get_chat_call_tts must be resolved.language or pipeline.tts.language or

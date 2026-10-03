@@ -189,6 +189,17 @@ Hot issues (live incident notices):
 - **Failure behaviour:** the loader never fails a turn. A DB error or a load slower than 1 s gives an empty set, with a warning logged.
 - **Grounding:** figures in an active notice count as grounded for the unverified-data guard in chat and the sentence guard in voice. A figure the bot has relayed stays grounded through the conversation's prior turns even after the notice is cleared.
 
+Bot voice by gender:
+- **Config:** `TenantTTSConfig.voices` (`{"female": <voice id>, "male": <voice id>}`) holds an optional per-gender voice on `pipeline.chat_voice.tts` and `pipeline.tts`. It is set through `PATCH /tenants/{id}` (`pipeline.tts.voices`, `pipeline.chat_voice.tts.voices`), and `POST /tenants` (`tts.voices`) for `pipeline.tts`.
+  - **Merging:** a PATCH merges per gender. Sending `""` for a gender removes it, and sending all genders as `""` clears the pair.
+  - **Provider switch:** switching provider drops the pair, the same as `voice_id`.
+- **Read-back:** `tts.voices` (raw) and `chat_voice.effective_voices`.
+- **Selection:** the session's `bot_gender` (from `POST /chat/sessions`) picks the voice through `resolve_gender_voice` (`src/config_tenant.py`). This covers both chat voice-note replies and the chat-to-voice handoff call. With no voice for that gender, the existing `voice_id` is used.
+  - **Logging:** a WARNING is logged when a pair is configured but lacks the requested gender. When there is no pair at all, it is a debug event only.
+- **Precedence:** an explicit `?voice=` on the handoff still wins.
+- **Script gender:** the handoff call's script gender stays `bot_gender`, so voice and grammar agree once a pair is set.
+- Voice-note replies pass the resolved `voice_id` to every TTS provider.
+
 Voice handoff:
 - `POST /chat/{session_id}/call` → summarizes the chat, stashes context under a
   10-min Redis token, returns `{call_url, call_id}`.
