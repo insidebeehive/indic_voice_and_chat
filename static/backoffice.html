@@ -642,6 +642,14 @@ function onPipeProviderChange(kind) {
   // provider change usually means a different roster entirely (see
   // resolveVoiceQuery/refreshVoiceOptions below).
   if (kind === "tts" || kind === "cv_tts" || kind === "realtime") refreshVoiceOptions(kind);
+  // A call TTS OR Chat TTS provider pick can decide which pipeline layer a
+  // saved `voices` pair lands on (see chatVoicesTargetsChatLayer) and
+  // whether the gender pickers are usable at all (source "none" — see
+  // chatVoicesGenderPickersEnabled) -- the hint/disabled-state under the
+  // gender pickers must track that live, not just the pre-save stored state.
+  // (The gender pickers' rosters are refreshed as part of
+  // refreshVoiceOptions("tts"/"cv_tts") above -- see its own cascade.)
+  if (kind === "tts" || kind === "cv_tts") updateChatVoicesLayerHint();
 }
 
 // --- Voice picker (catalog-backed, GET /api/v1/voices) --------------------
@@ -663,6 +671,13 @@ let PIPE_CURRENT = {};
 // it's a separate function from loadPipeline and can't read `t` directly.
 let PIPE_TENANT_MODE = "";
 
+// The tenant's ChatVoiceInfo (GET /api/v1/tenants' chat_voice block), set
+// fresh by loadPipeline() on every tenant selection/reload — chatVoiceHtml
+// already gets `cv` as a render-time argument, but chatVoicesTargetsChatLayer
+// (the save-time and hint-time layer-choice logic) is called from
+// onPipeProviderChange/savePipeline, neither of which has `cv` in scope.
+let PIPE_CHAT_VOICE_INFO = null;
+
 // voice roster cache: "<provider>|<language>" -> voices array, so flipping
 // back and forth between two languages/providers for the same layer — or
 // across the three pickers sharing a provider — doesn't re-fetch the
@@ -671,13 +686,43 @@ let PIPE_TENANT_MODE = "";
 // recover from a transient error instead of being stuck on it.
 let VOICE_ROSTER_CACHE = {};
 
+// The gender voice pickers (cv_tts_female/cv_tts_male) aren't independent
+// provider layers -- their roster always comes from whichever TTS layer a
+// saved `voices` pair would actually land on (see chatVoicesTargetsChatLayer,
+// savePipeline), queried again for a different voice slot. That's
+// pipeline.chat_voice.tts (cv_tts) when the operator is picking/has a Chat
+// TTS provider of its own, otherwise pipeline.tts (tts) -- a fallback tenant
+// whose gender pair would save to pipeline.tts must see pipeline.tts's own
+// roster, not the (different-provider) call-TTS-irrelevant chat layer's.
+// This resolves which base layer's provider/language (and PIPE_CURRENT
+// entry) backs a given picker kind, so voicePickerFieldIds and
+// resolveVoiceQuery only need to special-case the gender kinds once instead
+// of each one duplicating the target layer's own logic.
+function voicePickerBaseKind(kind) {
+  if (kind !== "cv_tts_female" && kind !== "cv_tts_male") return kind;
+  return chatVoicesTargetsChatLayer(PIPE_CHAT_VOICE_INFO) ? "cv_tts" : "tts";
+}
+
+// Gender pickers get an explicit "remove this gender's voice" option
+// (alongside "leave unchanged" and "custom") that the plain per-layer
+// pickers (tts/cv_tts/realtime) don't -- there's no equivalent of "clear the
+// whole layer's voice_id back to unset" for those today.
+function isGenderVoiceKind(kind) {
+  return kind === "cv_tts_female" || kind === "cv_tts_male";
+}
+
 function voicePickerFieldIds(kind) {
   // Realtime stores its language under `language_code` (TenantRealtimeConfig)
   // — a different input id than the `language` field tts/cv_tts use
   // (TenantTTSConfig) — everything else follows the `p_${kind}_*` convention.
+  // provider/language resolve off voicePickerBaseKind(kind), not `kind`
+  // itself, so the gender pickers share cv_tts's inputs; select/customWrap/
+  // custom/msg stay keyed on `kind` so the three pickers (base + 2 genders)
+  // don't collide in the DOM.
+  const baseKind = voicePickerBaseKind(kind);
   return {
-    provider: `p_${kind}_provider`,
-    language: kind === "realtime" ? "p_realtime_language_code" : `p_${kind}_language`,
+    provider: `p_${baseKind}_provider`,
+    language: baseKind === "realtime" ? "p_realtime_language_code" : `p_${baseKind}_language`,
     select: `p_${kind}_voice_select`,
     customWrap: `p_${kind}_voice_custom_wrap`,
     custom: `p_${kind}_voice_custom`,
@@ -687,7 +732,7 @@ function voicePickerFieldIds(kind) {
 
 function resolveVoiceQuery(kind) {
   const ids = voicePickerFieldIds(kind);
-  const current = PIPE_CURRENT[kind] || {};
+  const current = PIPE_CURRENT[voicePickerBaseKind(kind)] || {};
   // Provider to query: the newly picked provider, or — the common case of an
   // operator changing only the voice — the tenant's current stored provider.
   // Keying off the dropdown alone would leave the list empty in exactly that
@@ -716,6 +761,25 @@ function voiceFieldValue(kind) {
   return sel;
 }
 
+// Gender-picker variant of voiceFieldValue(): a gender slot has THREE
+// distinct outcomes a plain voiceFieldValue() can't tell apart -- leave
+// unchanged (omit the gender's key entirely), remove (send "" so
+// _merge_layer_fields' per-gender merge clears it), or set a real voice id --
+// whereas the non-gender pickers only ever have two (omit, or send a value)
+// and already use "" to mean the first. Returns null for "omit this gender",
+// a string (possibly "") otherwise.
+function genderVoiceFieldValue(kind) {
+  const ids = voicePickerFieldIds(kind);
+  const sel = ($(ids.select) || {}).value || "";
+  if (sel === "") return null;
+  if (sel === "__remove__") return "";
+  if (sel === "__custom__") {
+    const custom = (($(ids.custom) || {}).value || "").trim();
+    return custom || null;   // blank custom = leave unchanged, same convention as voiceFieldValue
+  }
+  return sel;
+}
+
 function voicePickerHtml(kind, label, currentVoiceId) {
   // cv_tts used to need a special-cased "isn't exposed by any GET" message
   // here (list_tenants had no chat_voice field at all — TenantSummary,
@@ -723,10 +787,20 @@ function voicePickerHtml(kind, label, currentVoiceId) {
   // same way get_chat_tts picks a TTS at runtime), cv_tts's current voice
   // reads exactly like every other layer's.
   const hint = currentVoiceId ? `current: ${escT(currentVoiceId)}` : "current: —";
+  const removeOption = isGenderVoiceKind(kind)
+    ? `<option value="__remove__">— remove this gender's voice —</option>`
+    : "";
+  // Only the gender pickers' "current" hint is live-updated after render
+  // (updateChatVoicesLayerHint, below — it can flip between chat_voice.tts
+  // and pipeline.tts's own stored pair as the operator picks a provider) so
+  // only they get an id to re-target via $(). The other pickers' hint is
+  // set once at render time and never needs one.
+  const hintId = isGenderVoiceKind(kind) ? ` id="p_${kind}_voice_current_hint"` : "";
   return `
-    <label>${label} voice <small class="hint">(${hint})</small>
+    <label>${label} voice <small class="hint"><span${hintId}>(${hint})</span></small>
       <select id="p_${kind}_voice_select" onchange="onVoiceSelectChange('${kind}')">
         <option value="">— leave unchanged —</option>
+        ${removeOption}
         <option value="__custom__">custom / other…</option>
       </select>
     </label>
@@ -779,12 +853,21 @@ async function refreshVoiceOptions(kind) {
   // itself uses around its own await, see the SELECTED check there).
   const tenantAtStart = SELECTED;
   const { provider, language } = resolveVoiceQuery(kind);
-  const keepValue = select.value;   // preserve the pick (incl. "__custom__") across a language-only edit
+  const keepValue = select.value;   // preserve the pick (incl. "__custom__"/"__remove__") across a language-only edit
+  const removable = isGenderVoiceKind(kind);
+  const removeOption = removable ? `<option value="__remove__">— remove this gender's voice —</option>` : "";
   if (!provider) {
-    select.innerHTML = `<option value="">— leave unchanged —</option><option value="__custom__">custom / other…</option>`;
-    if (keepValue === "__custom__") select.value = "__custom__";
+    select.innerHTML = `<option value="">— leave unchanged —</option>${removeOption}<option value="__custom__">custom / other…</option>`;
+    if (keepValue === "__custom__" || keepValue === "__remove__") select.value = keepValue;
     onVoiceSelectChange(kind);   // keep the custom-input wrapper's visibility in sync with the restored value
     if (msg) msg.textContent = "pick a provider above (or leave the tenant's current one) to list voices";
+    // Both base layers the gender pickers can target (voicePickerBaseKind)
+    // re-roster them here -- see the cascade at the end of this function for
+    // why both, not just "cv_tts".
+    if (kind === "cv_tts" || kind === "tts") {
+      refreshVoiceOptions("cv_tts_female"); refreshVoiceOptions("cv_tts_male");
+      updateChatVoicesLayerHint();
+    }
     return;
   }
   const cacheKey = `${provider}|${language}`;
@@ -805,6 +888,7 @@ async function refreshVoiceOptions(kind) {
     }
   }
   const opts = [`<option value="">— leave unchanged —</option>`];
+  if (removable) opts.push(removeOption);
   if (voices && voices.length) {
     voices.forEach(v => {
       // Gender in the label, not just the id: the voicebot prompt selects
@@ -827,7 +911,8 @@ async function refreshVoiceOptions(kind) {
   }
   opts.push(`<option value="__custom__">custom / other…</option>`);
   select.innerHTML = opts.join("");
-  const keepValueSelectable = keepValue === "__custom__" || (voices && voices.some(v => v.voice_id === keepValue));
+  const keepValueSelectable = keepValue === "__custom__" || keepValue === "__remove__" ||
+    (voices && voices.some(v => v.voice_id === keepValue));
   if (keepValueSelectable) select.value = keepValue;
   // A non-empty prior pick that the new roster no longer offers (a
   // provider/language switch with no overlapping voice ids) MUST be called
@@ -835,7 +920,7 @@ async function refreshVoiceOptions(kind) {
   // exactly how a tenant ends up with a saved voice_id that doesn't match
   // its saved language (see savePipeline: only the touched fields PATCH).
   // This branch always wins over the generic empty/success messages below.
-  if (keepValue && keepValue !== "__custom__" && !keepValueSelectable && voices !== null) {
+  if (keepValue && keepValue !== "__custom__" && keepValue !== "__remove__" && !keepValueSelectable && voices !== null) {
     if (msg) msg.textContent = `previously selected voice "${keepValue}" isn't offered for ${provider}/${language} — selection cleared, pick a new voice or use custom`;
   } else if (voices && voices.length) {
     if (msg) msg.textContent = "";
@@ -847,6 +932,22 @@ async function refreshVoiceOptions(kind) {
     if (msg) msg.textContent = `no voices published for ${provider}/${language} — use custom`;
   }
   onVoiceSelectChange(kind);   // re-sync the custom-input wrapper for whichever value ended up selected
+  // The gender pickers (cv_tts_female/cv_tts_male) share whichever base
+  // layer's provider/language inputs they currently target (voicePickerBaseKind
+  // -- "cv_tts" or "tts", per chatVoicesTargetsChatLayer) -- re-querying
+  // EITHER base layer must re-query both genders too, or a provider/language
+  // change on the layer they're actually reading from leaves them stuck on
+  // the OLD roster. This cascades from every refreshVoiceOptions("tts"/
+  // "cv_tts") call site (loadPipeline's initial render, both layers'
+  // onPipeProviderChange, and both layers' language input onchange) rather
+  // than needing each of those call sites to remember to refresh the genders
+  // separately. updateChatVoicesLayerHint() rides along here too -- a
+  // provider/language change on either layer is exactly when the gender
+  // pickers' "saves to"/"current"/disabled state can go stale.
+  if (kind === "cv_tts" || kind === "tts") {
+    refreshVoiceOptions("cv_tts_female"); refreshVoiceOptions("cv_tts_male");
+    updateChatVoicesLayerHint();
+  }
 }
 
 function pipeLayerHtml(kind, label, current, extraHtml) {
@@ -869,8 +970,117 @@ function pipeLayerHtml(kind, label, current, extraHtml) {
     </div>`;
 }
 
+// Decides which pipeline layer a Chat-TTS gender `voices` pair should be
+// saved to. resolve_chat_tts_config (src/config_tenant.py) only reads
+// pipeline.chat_voice.tts when THAT block declares its OWN provider -- a
+// `voices` pair saved there while it has no provider of its own is silently
+// never used at runtime (neither for chat voice-note replies nor for a call
+// started from chat). So a gender pair targets chat_voice.tts only when
+// chat_voice.tts is -- or is about to become, via THIS save -- a real,
+// provider-bearing block: either the operator is picking a Chat TTS provider
+// in this same save (`$("p_cv_tts_provider")`'s live value, not `cv`, since
+// that reflects the pre-save stored state), or the tenant already has its
+// own (`cv.source === "own"`). Otherwise the pair targets pipeline.tts,
+// which is exactly what chat voice actually falls back to.
+function chatVoicesTargetsChatLayer(cv) {
+  const pickedProvider = (($("p_cv_tts_provider") || {}).value || "").trim();
+  return !!pickedProvider || !!(cv && cv.source === "own");
+}
+
+// Whether the gender pickers may be used AT ALL this save. source "none"
+// (ChatVoiceInfo, src/api/tenants.py) means neither chat_voice.tts nor
+// pipeline.tts resolves to a provider right now -- resolve_chat_tts_config
+// returns None, so a `voices` pair saved on EITHER layer has nowhere to be
+// read from at runtime, and the save would still report "✓ saved" with no
+// effect. The one way out is this very save also picking a provider on
+// either layer (chatVoicesTargetsChatLayer then routes the pair to whichever
+// one gained it) -- so, unlike chatVoicesTargetsChatLayer, this checks BOTH
+// layers' live picks, not just Chat TTS's. Any other source ("own",
+// "cascade") already has a resolvable layer regardless of today's picks. A
+// missing `cv` (defensive -- TenantSummary always sends one) is treated the
+// same as "none": no known-resolvable layer to fall back on.
+function chatVoicesGenderPickersEnabled(cv) {
+  if (cv && cv.source !== "none") return true;
+  const pickedCvProvider = (($("p_cv_tts_provider") || {}).value || "").trim();
+  const pickedTtsProvider = (($("p_tts_provider") || {}).value || "").trim();
+  return !!(pickedCvProvider || pickedTtsProvider);
+}
+
+// Shared wording for both the server-rendered initial hint (chatVoiceHtml)
+// and the live update (updateChatVoicesLayerHint) so the two can't drift.
+function chatVoicesSavesToText(targetsChatLayer) {
+  return targetsChatLayer
+    ? "This pair saves to this tenant's own Chat TTS (pipeline.chat_voice.tts)."
+    : "This pair saves to the call TTS above (pipeline.tts) — Chat TTS has no provider of its own in this save.";
+}
+
+// As chatVoicesSavesToText, but first checks whether the pickers are even
+// usable (chatVoicesGenderPickersEnabled) -- disabled trumps the "saves to"
+// wording, since there is nowhere for the pair to be saved to yet.
+function chatVoicesHintText(enabled, targetsChatLayer) {
+  if (enabled) return chatVoicesSavesToText(targetsChatLayer);
+  // On an s2s tenant the call TTS picker (pane_pipe_s2s's sibling pane) is
+  // hidden, so pointing the operator at "call TTS" names a control they
+  // can't see on this tenant. Effective mode follows the same chosen-or-
+  // stored fallback as onPipeModeChange(): #p_mode's live pick, else the
+  // tenant's stored PIPE_TENANT_MODE.
+  const mode = ($("p_mode") || {}).value || PIPE_TENANT_MODE || "";
+  return mode === "s2s" ? "set a Chat TTS provider first" : "set a Chat TTS or call TTS provider first";
+}
+
+// Re-evaluates chatVoicesTargetsChatLayer()/chatVoicesGenderPickersEnabled()
+// against the operator's current provider picks and refreshes everything
+// under the gender pickers that depends on them: the "saves to"/"disabled"
+// hint text, the pickers' disabled state, and their "(current: ...)" hints
+// (which must follow the SAME target -- chat_voice.tts's own effective_voices
+// only once it's a real provider-bearing block (source "own"); a provider
+// newly picked on a cascade/none tenant targets an as-yet-empty chat_voice.tts,
+// so there's nothing of ITS OWN to show yet, not the stale pipeline.tts pair
+// it's about to stop reading; otherwise pipeline.tts's own raw stored pair).
+// Called on load and whenever a call TTS or Chat TTS provider/language
+// changes (onPipeProviderChange('tts'/'cv_tts'), refreshVoiceOptions('tts'/
+// 'cv_tts')'s own cascade) -- any of those can flip which layer the pair
+// targets, or whether it's usable at all.
+function updateChatVoicesLayerHint() {
+  const cv = PIPE_CHAT_VOICE_INFO;
+  const targetsChatLayer = chatVoicesTargetsChatLayer(cv);
+  const enabled = chatVoicesGenderPickersEnabled(cv);
+  const hintEl = $("p_cv_voices_layer_hint");
+  if (hintEl) hintEl.textContent = chatVoicesHintText(enabled, targetsChatLayer);
+  const currentVoices = targetsChatLayer
+    ? ((cv && cv.source === "own" && cv.effective_voices) || {})
+    : ((PIPE_CURRENT.tts && PIPE_CURRENT.tts.voices) || {});
+  for (const kind of ["cv_tts_female", "cv_tts_male"]) {
+    const gender = kind === "cv_tts_female" ? "female" : "male";
+    const currentEl = $(`p_${kind}_voice_current_hint`);
+    if (currentEl) currentEl.textContent = currentVoices[gender] ? `(current: ${currentVoices[gender]})` : "(current: —)";
+    const ids = voicePickerFieldIds(kind);
+    const sel = $(ids.select);
+    if (sel) sel.disabled = !enabled;
+    const custom = $(ids.custom);
+    if (custom) custom.disabled = !enabled;
+  }
+}
+
 function chatVoiceHtml(id, cv) {
   const providers = Object.keys(MODELS.tts || {});
+  // No live provider pick exists yet at render time, so chatVoicesTargetsChatLayer
+  // reduces to plain `cv.source === "own"` here -- same reasoning as the
+  // layer-hint text below. updateChatVoicesLayerHint() (called right after
+  // this HTML is inserted, see loadPipeline) immediately re-derives both from
+  // the real DOM and overwrites this initial render if a stale previous
+  // tenant's pick somehow lingered.
+  // Likewise, chatVoicesGenderPickersEnabled() queries live provider-select
+  // DOM -- not yet meaningful (or not yet existing) pre-insertion -- so this
+  // mirrors its "no picks yet" case directly instead of calling it here.
+  const targetsChatLayerAtRender = cv && cv.source === "own";
+  const gendersEnabledAtRender = !cv || cv.source !== "none";
+  // pipeline.tts's own raw stored `voices` pair, off PIPE_CURRENT (set by
+  // loadPipeline just before this call, same as every other picker's seed
+  // here) rather than a parameter -- needed when NOT targeting chat_voice.tts
+  // (see updateChatVoicesLayerHint, which recomputes this same thing live).
+  const ttsVoices = (PIPE_CURRENT.tts && PIPE_CURRENT.tts.voices) || null;
+  const genderCurrentVoices = targetsChatLayerAtRender ? ((cv && cv.effective_voices) || {}) : (ttsVoices || {});
   return `
     <h2 style="margin-top:1.2rem;">Chat voice replies/call</h2>
     <div class="hint" style="margin-bottom:.5rem;">
@@ -909,6 +1119,14 @@ function chatVoiceHtml(id, cv) {
         stability: cv.effective_stability, similarity_boost: cv.effective_similarity_boost,
         style: cv.effective_style, use_speaker_boost: cv.effective_use_speaker_boost,
       } : null)}
+      <div class="hint" style="flex-basis:100%;margin-top:.6rem;">
+        <b>Per-gender voice.</b> The CRM's bot_gender (set per chat session) picks between these
+        for voice-note replies and calls started from chat. If a gender has no voice here, the
+        Chat TTS voice above is used.
+        <br /><span id="p_cv_voices_layer_hint">${escT(chatVoicesHintText(gendersEnabledAtRender, targetsChatLayerAtRender))}</span>
+      </div>
+      ${voicePickerHtml("cv_tts_female", "Female", genderCurrentVoices.female || null)}
+      ${voicePickerHtml("cv_tts_male", "Male", genderCurrentVoices.male || null)}
     </div>`;
 }
 
@@ -929,7 +1147,12 @@ async function loadPipeline(id) {
   // no separate approximation is needed here the way there was before
   // ChatVoiceInfo existed.
   PIPE_CURRENT = {
-    tts: { provider: tts.provider || "", language: tts.language || "" },
+    // `voices` (TenantTTSConfig.voices' raw stored pair) rides along here,
+    // not just provider/language -- updateChatVoicesLayerHint() needs it to
+    // show the gender pickers' "current" hint when a `voices` pair targets
+    // pipeline.tts (chatVoicesTargetsChatLayer false) rather than
+    // chat_voice.tts.
+    tts: { provider: tts.provider || "", language: tts.language || "", voices: tts.voices || null },
     realtime: { provider: realtime.provider || "", language: realtime.language || "" },
     cv_tts: {
       provider: (chatVoice && chatVoice.effective_provider) || "",
@@ -937,6 +1160,7 @@ async function loadPipeline(id) {
     },
   };
   PIPE_TENANT_MODE = t.mode || "";
+  PIPE_CHAT_VOICE_INFO = chatVoice;
   $("pane_pipe").innerHTML = `
     <div class="hint" style="margin-bottom:.6rem;">
       Change this tenant's mode and provider/model choices. PATCHes <code>/api/v1/tenants/${id}</code>
@@ -984,7 +1208,8 @@ async function loadPipeline(id) {
   // render their own "loading"/error state via refreshVoiceOptions' msg line.
   refreshVoiceOptions("tts");
   refreshVoiceOptions("realtime");
-  refreshVoiceOptions("cv_tts");
+  refreshVoiceOptions("cv_tts");   // also cascades to cv_tts_female/cv_tts_male, see refreshVoiceOptions
+  updateChatVoicesLayerHint();
   onPipeModeChange();   // set initial pane visibility from the tenant's stored mode
 }
 
@@ -1057,10 +1282,12 @@ async function savePipeline(id) {
   // a plain input, so they're merged in separately from `layer()`'s `fields`
   // list — but must still be checked, since a bare voice pick with provider
   // and language both left unchanged should still produce a non-null layer.
+  // NOTE: `tts` is not assigned to pipeline.tts yet here -- the gender
+  // `voices` pair below may still need to land on it (chatVoicesTargetsChatLayer),
+  // so that assignment is deferred until after that decision is made, below.
   const tts = layer("tts", ["language", "speed", ...VOICE_TUNING_FIELDS]) || {};
   const ttsVoice = voiceFieldValue("tts");
   if (ttsVoice) tts.voice_id = ttsVoice;
-  if (Object.keys(tts).length) pipeline.tts = tts;
 
   const realtime = layer("realtime", ["language_code"]) || {};
   const realtimeVoice = voiceFieldValue("realtime");
@@ -1071,6 +1298,43 @@ async function savePipeline(id) {
   const cvTts = layer("cv_tts", ["language", "speed", ...VOICE_TUNING_FIELDS]) || {};
   const cvVoice = voiceFieldValue("cv_tts");
   if (cvVoice) cvTts.voice_id = cvVoice;
+
+  // Per-gender voice pair (TenantTTSConfig.voices) -- built once (only the
+  // genders the operator actually touched: "leave unchanged" is omitted,
+  // "remove" sends ""), then routed to whichever TTS layer is ACTUALLY in
+  // effect for chat, per chatVoicesTargetsChatLayer's docstring: pipeline.
+  // chat_voice.tts only when it has (or is gaining, this same save) its own
+  // provider, else pipeline.tts -- the layer resolve_chat_tts_config falls
+  // back to. Landing it on an inert chat_voice.tts (a `voices` key with no
+  // provider) would silently never take effect at runtime.
+  //
+  // source "none" (chatVoicesGenderPickersEnabled false) means NEITHER layer
+  // resolves right now -- skip reading the gender fields entirely unless this
+  // save is also picking a provider on one of them, or a stray pick left over
+  // from before the pickers were disabled would otherwise still produce a
+  // `voices` pair with nowhere to be read from at runtime (same gap as the
+  // layer-choice one above, just for the "neither layer exists yet" case).
+  const genderVoices = {};
+  if (chatVoicesGenderPickersEnabled(PIPE_CHAT_VOICE_INFO)) {
+    const femaleVoice = genderVoiceFieldValue("cv_tts_female");
+    if (femaleVoice !== null) genderVoices.female = femaleVoice;
+    const maleVoice = genderVoiceFieldValue("cv_tts_male");
+    if (maleVoice !== null) genderVoices.male = maleVoice;
+  }
+  if (Object.keys(genderVoices).length) {
+    if (chatVoicesTargetsChatLayer(PIPE_CHAT_VOICE_INFO)) {
+      cvTts.voices = genderVoices;
+    } else {
+      tts.voices = genderVoices;
+    }
+  }
+
+  // Deferred from above: `tts`/`cvTts` may now carry ONLY a `voices` key
+  // (no provider/model) when the operator touched nothing else on that
+  // layer -- that's still a real, non-empty object to send (a provider-less
+  // `{voices: {...}}` PATCH body), not the "nothing changed" empty-layer
+  // case layer() already collapses to null for.
+  if (Object.keys(tts).length) pipeline.tts = tts;
   const chatVoice = {};
   if (cvEnabled) chatVoice.enabled = cvEnabled === "true";
   if (Object.keys(cvTts).length) chatVoice.tts = cvTts;
