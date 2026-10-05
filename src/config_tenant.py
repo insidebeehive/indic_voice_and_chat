@@ -161,54 +161,42 @@ class TenantTTSConfig(BaseModel):
     similarity_boost: Optional[float] = Field(default=None, ge=0.0, le=1.0)
     style: Optional[float] = Field(default=None, ge=0.0, le=1.0)
     use_speaker_boost: Optional[bool] = None
-    # Per-gender voice override (gender-matched chat voice-notes + handoff
-    # calls — see resolve_gender_voice below). Keyed by the same "female"/
-    # "male" values CreateSessionRequest.bot_gender accepts (src/api/chat.py);
-    # a gender with no entry here falls back to `voice_id` above, same as a
-    # tenant that never set this field at all. Applies wherever a
-    # TenantTTSConfig is used — chat_voice.tts and pipeline.tts alike.
-    voices: Optional[dict[Literal["female", "male"], str]] = None
+    # The male voice for gender-matched chat voice-notes + handoff calls (see
+    # resolve_gender_voice below). `voice_id` above is the female/default
+    # voice — a bot_gender of "male" picks this one instead; anything else
+    # (including a male bot with no male_voice_id set) uses `voice_id`.
+    # Applies wherever a TenantTTSConfig is used — chat_voice.tts and
+    # pipeline.tts alike.
+    male_voice_id: Optional[str] = None
 
-    @field_validator("voices")
+    @field_validator("male_voice_id")
     @classmethod
-    def _drop_empty_voice_ids(
-        cls, v: Optional[dict[str, str]],
-    ) -> Optional[dict[str, str]]:
-        """An empty string for a gender means "not configured", not "speak
-        with an empty voice id" — normalise it to absent so resolve_gender_voice
-        doesn't have to special-case it, same as how a tenant simply omitting
-        the key behaves. A dict left with nothing after that becomes None, not
-        `{}`, so `if tts_cfg.voices:` reads the same either way."""
-        if v is None:
-            return v
-        cleaned = {gender: voice_id for gender, voice_id in v.items() if voice_id}
-        return cleaned or None
+    def _empty_male_voice_id_is_unset(cls, v: Optional[str]) -> Optional[str]:
+        return v or None
 
 
 def resolve_gender_voice(
     tts_cfg: Optional[TenantTTSConfig], bot_gender: Optional[str],
 ) -> tuple[Optional[str], bool]:
-    """Pick the TTS voice for a requested ``bot_gender``, from a resolved TTS
-    config's ``voices`` pair.
+    """Pick the TTS voice for a requested ``bot_gender``.
 
-    Returns ``(voice_id, matched)``. ``matched`` is True only when
-    ``bot_gender`` is a known gender ("female"/"male") AND ``tts_cfg.voices``
-    has an entry for it — callers use this to decide whether the fallback
-    deserves a warning. A ``None``/unknown ``bot_gender``, or a ``tts_cfg``
-    with no ``voices`` pair at all, falls back to ``tts_cfg.voice_id`` with
-    ``matched=False`` and no warning — that's the ordinary "no gender was
-    requested" case, not a misconfiguration. ``tts_cfg`` itself may be
-    ``None`` (e.g. ``resolve_chat_tts_config`` found nothing resolvable) — the
-    caller gets ``(None, False)`` rather than having to guard this call.
+    Returns ``(voice_id, matched)``. ``bot_gender`` is normalised the same
+    way as the prompt's own gender grammar (``(x or "").strip().lower()``).
+    "male" with a configured ``male_voice_id`` returns that voice with
+    ``matched=True``; everything else — female, unset, or male with no
+    ``male_voice_id`` — falls back to ``tts_cfg.voice_id``, matched only when
+    the gender wasn't "male" (female/unset are never a misconfiguration; male
+    with no male voice is, and callers use ``matched`` to decide whether that
+    deserves a warning). ``tts_cfg`` itself may be ``None`` (e.g.
+    ``resolve_chat_tts_config`` found nothing resolvable) — the caller gets
+    ``(None, False)`` rather than having to guard this call.
     """
     if tts_cfg is None:
         return None, False
-    voices = getattr(tts_cfg, "voices", None)
-    if bot_gender in ("female", "male") and voices:
-        matched_voice = voices.get(bot_gender)
-        if matched_voice:
-            return matched_voice, True
-    return tts_cfg.voice_id, False
+    gender = (bot_gender or "").strip().lower()
+    if gender == "male" and tts_cfg.male_voice_id:
+        return tts_cfg.male_voice_id, True
+    return tts_cfg.voice_id, gender != "male"
 
 
 class ChatVoiceConfig(BaseModel):
@@ -923,11 +911,11 @@ _PROVIDER_SPECIFIC_FIELDS: dict[str, frozenset[str]] = {
         # provider switch matches the documented ownership rather than
         # relying on every future adapter to keep ignoring unknown keys.
         "stability", "similarity_boost", "style", "use_speaker_boost",
-        # Per-gender voice ids are exactly as provider-specific as voice_id
-        # itself (a voice id from the OLD provider's catalog) -- a provider
-        # switch must drop them too, not hand the new adapter a voice id it
-        # doesn't recognise.
-        "voices",
+        # male_voice_id is exactly as provider-specific as voice_id itself (a
+        # voice id from the OLD provider's catalog) -- a provider switch must
+        # drop it too, not hand the new adapter a voice id it doesn't
+        # recognise.
+        "male_voice_id",
     }),
     "TenantRealtimeConfig": frozenset({"model", "voice", "allowed_voices"}),
 }

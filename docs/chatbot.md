@@ -190,15 +190,20 @@ Hot issues (live incident notices):
 - **Grounding:** figures in an active notice count as grounded for the unverified-data guard in chat and the sentence guard in voice. A figure the bot has relayed stays grounded through the conversation's prior turns even after the notice is cleared.
 
 Bot voice by gender:
-- **Config:** `TenantTTSConfig.voices` (`{"female": <voice id>, "male": <voice id>}`) holds an optional per-gender voice on `pipeline.chat_voice.tts` and `pipeline.tts`. It is set through `PATCH /tenants/{id}` (`pipeline.tts.voices`, `pipeline.chat_voice.tts.voices`), and `POST /tenants` (`tts.voices`) for `pipeline.tts`.
-  - **Merging:** a PATCH merges per gender. Sending `""` for a gender removes it, and sending all genders as `""` clears the pair.
-  - **Provider switch:** switching provider drops the pair, the same as `voice_id`.
-- **Read-back:** `tts.voices` (raw) and `chat_voice.effective_voices`.
-- **Selection:** the session's `bot_gender` (from `POST /chat/sessions`) picks the voice through `resolve_gender_voice` (`src/config_tenant.py`). This covers both chat voice-note replies and the chat-to-voice handoff call. With no voice for that gender, the existing `voice_id` is used.
-  - **Logging:** a WARNING is logged when a pair is configured but lacks the requested gender. When there is no pair at all, it is a debug event only.
+- **Config:** a TTS layer has two voices.
+  - `voice_id` is the **Female voice**, and the default.
+  - `male_voice_id` is the **Male voice**, and is optional.
+  - Both can be set on `pipeline.chat_voice.tts` and on `pipeline.tts`, through `PATCH /tenants/{id}` or `POST /tenants` (`tts.male_voice_id`).
+  - In the back office, both are set in the Pipeline tab under "Chat voice replies/call". They list voices for the same Chat TTS provider.
+  - `male_voice_id` behaves like `voice_id`: omitting it leaves it unchanged, and switching provider clears it.
+- **Read-back:** `tts.male_voice_id` (raw) and `chat_voice.effective_male_voice_id`.
+- **Selection:** a session whose `bot_gender` (from `POST /chat/sessions`, compared case-insensitively) is `male` uses `male_voice_id` when it is set. Everything else uses `voice_id`.
+  - Selection happens in `resolve_gender_voice` (`src/config_tenant.py`).
+  - It covers chat voice-note replies and the chat-to-voice handoff call.
+  - A male session with no Male voice set uses `voice_id`, and logs a WARNING when the tenant has a `voice_id` configured.
 - **Precedence:** an explicit `?voice=` on the handoff still wins.
-- **Script gender:** the handoff call's script gender stays `bot_gender`, so voice and grammar agree once a pair is set.
-- Voice-note replies pass the resolved `voice_id` to every TTS provider.
+- **Script gender:** the handoff call's script gender follows `bot_gender`, so voice and grammar agree once a Male voice is set.
+- **Voice-note replies:** the resolved voice id is passed to every TTS provider.
 
 Voice handoff:
 - `POST /chat/{session_id}/call` → summarizes the chat, stashes context under a

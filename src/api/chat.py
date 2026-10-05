@@ -421,19 +421,13 @@ async def _synthesize_reply_audio(
     empty or over-cap text).
 
     ``bot_gender`` (the CRM-supplied ``ChatSession.extra_data["bot_gender"]``,
-    see the WS caller) picks which of the tenant's configured
-    ``TenantTTSConfig.voices`` speaks the reply, via `resolve_gender_voice`
-    (src/config_tenant.py). An unset/unrecognized ``bot_gender`` matches
-    voice as "female", mirroring the prompt's own default grammar (see
-    prompts.py) -- so a session that never set ``bot_gender`` gets female
-    grammar AND a female voice, where one is configured, instead of
-    female-grammar text read out in whatever `voice_id` happens to be. No
-    match for an explicitly requested gender (requested but not configured)
-    logs a warning; no match for the defaulted gender does the same at DEBUG
-    only -- see the call site below. This is also what fixes the pre-existing
-    bug where no `voice_id` at all
-    reached `TTSConfig` below, so every non-ElevenLabs adapter spoke its
-    built-in default regardless of what the tenant configured.
+    see the WS caller) picks the tenant's ``TenantTTSConfig.male_voice_id``
+    for the reply when it's "male" and one is configured, via
+    `resolve_gender_voice` (src/config_tenant.py); everything else uses the
+    plain `voice_id`. This is also what fixes the pre-existing bug where no
+    `voice_id` at all reached `TTSConfig` below, so every non-ElevenLabs
+    adapter spoke its built-in default regardless of what the tenant
+    configured.
 
     ``audio_result=None`` covers every non-fatal reason, all handled
     identically here (log-and-skip) precisely because none of them should
@@ -502,39 +496,15 @@ async def _synthesize_reply_audio(
             return None, None
         identity = _chat_tts_identity(tenant, tts)
         chat_tts_cfg = resolve_chat_tts_config(tenant.settings.pipeline)
-        # Voice matching mirrors the prompt's own default exactly (see
-        # prompts.py's gender block): no bot_gender means "female" grammar,
-        # so an unrequested gender must mean "female" voice too -- otherwise
-        # a tenant with a male voice_id but a configured voices pair would
-        # speak female-grammar text in its male voice for every session that
-        # never set bot_gender.
-        # Normalised the same way as the prompt: a free-form metadata value
-        # such as "Male " must pick the same gender for voice and grammar.
+        voice_id, gender_matched = resolve_gender_voice(chat_tts_cfg, bot_gender)
         norm_gender = (bot_gender or "").strip().lower()
-        explicit_gender = norm_gender in ("female", "male")
-        effective_gender = "male" if norm_gender == "male" else "female"
-        voice_id, gender_matched = resolve_gender_voice(chat_tts_cfg, effective_gender)
-        if explicit_gender and not gender_matched:
-            if chat_tts_cfg is not None and chat_tts_cfg.voices:
-                # A real misconfiguration: the tenant HAS a gender-voice pair,
-                # just not for the gender this session requested.
-                log.warning(
-                    "tts reply gender voice not configured; using tenant default",
-                    extra={"tenant_id": tenant.id, "bot_gender": bot_gender})
-            else:
-                # Ordinary and common: this tenant never set up a
-                # female/male pair at all, so there was nothing to match
-                # against — not worth an operator's attention.
-                debug_event(log, "chat tts_reply gender_voice_unconfigured",
-                            tenant_id=tenant.id, bot_gender=bot_gender)
-        elif not explicit_gender and not gender_matched and chat_tts_cfg is not None and chat_tts_cfg.voices:
-            # No gender was requested, so the session got the DEFAULTED
-            # "female" for voice matching, same as the prompt defaults to
-            # female grammar. A pair that only covers "male" isn't a
-            # misconfiguration an operator needs to see -- nobody asked for
-            # female -- but it's worth a DEBUG breadcrumb.
-            debug_event(log, "chat tts_reply gender_voice_default_unmatched",
-                        tenant_id=tenant.id, effective_gender=effective_gender)
+        if norm_gender == "male" and not gender_matched and chat_tts_cfg is not None and chat_tts_cfg.voice_id:
+            # The misconfiguration: a male bot was requested and the tenant
+            # has a voice configured, just not a male one -- falls back to
+            # the plain voice_id below.
+            log.warning(
+                "tts reply gender voice not configured; using tenant default",
+                extra={"tenant_id": tenant.id, "bot_gender": bot_gender})
         result = await asyncio.wait_for(
             _synthesize_reply_audio_uncapped(tenant, text, language, tts, voice_id),
             timeout=_TTS_SYNTH_TIMEOUT_S,

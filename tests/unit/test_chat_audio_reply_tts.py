@@ -160,7 +160,7 @@ class _FakeTTSProviders:
 
 def _make_fake_tenant(
     *, pronunciation_overrides=None, tts_provider=None, tts_model=None,
-    tts_voice_id=None, tts_voices=None,
+    tts_voice_id=None, tts_male_voice_id=None,
 ):
     tenant = MagicMock()
     tenant.id = "t1"
@@ -182,19 +182,16 @@ def _make_fake_tenant(
     if tts_model is not None:
         tenant.settings.pipeline.chat_voice.tts.model = tts_model
     # Same reasoning as tts_provider/tts_model above: resolve_gender_voice
-    # reads `.voice_id`/`.voices` off whatever resolve_chat_tts_config
+    # reads `.voice_id`/`.male_voice_id` off whatever resolve_chat_tts_config
     # returns, and a bare MagicMock attribute is truthy but not a usable
-    # string/dict -- tests exercising voice selection must set these.
+    # string -- tests exercising voice selection must set these.
     if tts_voice_id is not None:
         tenant.settings.pipeline.chat_voice.tts.voice_id = tts_voice_id
-    # Always set, defaulting to None (TenantTTSConfig.voices' real pydantic
-    # default -- see src/config_tenant.py) rather than leaving a bare
-    # MagicMock attribute. Gender-voice matching now runs on every call, not
-    # only when bot_gender is explicit (it defaults to "female" -- see
-    # _synthesize_reply_audio in src/api/chat.py), so an unset MagicMock
-    # `.voices` would be truthy with a truthy `.get()` return and silently
-    # "match" every test that isn't exercising voices at all.
-    tenant.settings.pipeline.chat_voice.tts.voices = tts_voices
+    # Always set, defaulting to None (TenantTTSConfig.male_voice_id's real
+    # pydantic default -- see src/config_tenant.py) rather than leaving a
+    # bare MagicMock attribute, which would be truthy and silently "match"
+    # every test that isn't exercising male_voice_id at all.
+    tenant.settings.pipeline.chat_voice.tts.male_voice_id = tts_male_voice_id
     return tenant
 
 
@@ -394,11 +391,11 @@ async def test_configured_voice_id_reaches_tts_config(ws_ctx):
 
 
 @pytest.mark.asyncio
-async def test_bot_gender_male_with_configured_pair_uses_male_voice(ws_ctx):
+async def test_bot_gender_male_with_configured_male_voice_uses_it(ws_ctx):
     """ChatSession.extra_data["bot_gender"] (CRM-supplied at session creation)
-    picks the matching voice from TenantTTSConfig.voices — proves both
-    resolve_gender_voice's matching AND the WS branch threading the
-    session's bot_gender through to `_synthesize_reply_audio`."""
+    picks the tenant's male_voice_id — proves both resolve_gender_voice's
+    matching AND the WS branch threading the session's bot_gender through to
+    `_synthesize_reply_audio`."""
     sm, media_store, fake_agent = ws_ctx
     fake_agent.handle_message = AsyncMock(
         return_value=_FakeTurnResult(response=_FakeResp(response_text="yahan hai", language="hi")))
@@ -412,8 +409,7 @@ async def test_bot_gender_male_with_configured_pair_uses_male_voice(ws_ctx):
         await db.commit()
 
     fake_tenant = _make_fake_tenant(
-        tts_provider="sarvam", tts_voice_id="meera",
-        tts_voices={"female": "priya", "male": "aditya"})
+        tts_provider="sarvam", tts_voice_id="meera", tts_male_voice_id="aditya")
     _send_audio_and_collect(fake_tenant)
     assert provider.calls
     _, config = provider.calls[0]
@@ -437,8 +433,7 @@ async def test_bot_gender_unnormalised_value_picks_same_gender_as_prompt(ws_ctx)
         await db.commit()
 
     fake_tenant = _make_fake_tenant(
-        tts_provider="sarvam", tts_voice_id="meera",
-        tts_voices={"female": "priya", "male": "aditya"})
+        tts_provider="sarvam", tts_voice_id="meera", tts_male_voice_id="aditya")
     _send_audio_and_collect(fake_tenant)
     assert provider.calls
     _, config = provider.calls[0]
@@ -447,6 +442,8 @@ async def test_bot_gender_unnormalised_value_picks_same_gender_as_prompt(ws_ctx)
 
 @pytest.mark.asyncio
 async def test_bot_gender_male_with_no_male_voice_falls_back_and_warns(ws_ctx, caplog):
+    """Male requested but the tenant has no male_voice_id -- the
+    misconfiguration resolve_gender_voice's `matched=False` exists to flag."""
     sm, media_store, fake_agent = ws_ctx
     fake_agent.handle_message = AsyncMock(
         return_value=_FakeTurnResult(response=_FakeResp(response_text="yahan hai", language="hi")))
@@ -459,8 +456,7 @@ async def test_bot_gender_male_with_no_male_voice_falls_back_and_warns(ws_ctx, c
         row.extra_data = {"bot_gender": "male"}
         await db.commit()
 
-    fake_tenant = _make_fake_tenant(
-        tts_provider="sarvam", tts_voice_id="meera", tts_voices={"female": "priya"})
+    fake_tenant = _make_fake_tenant(tts_provider="sarvam", tts_voice_id="meera")
     with caplog.at_level("WARNING", logger="src.api.chat"):
         _send_audio_and_collect(fake_tenant)
     assert provider.calls
@@ -470,11 +466,7 @@ async def test_bot_gender_male_with_no_male_voice_falls_back_and_warns(ws_ctx, c
 
 
 @pytest.mark.asyncio
-async def test_bot_gender_requested_with_no_pair_at_all_does_not_warn(ws_ctx, caplog):
-    """A tenant that never configured ANY female/male pair is the ordinary
-    case (resolve_gender_voice's own docstring), not a misconfiguration --
-    only a tenant with a pair that's missing the requested gender (the test
-    above) deserves a WARNING. This one gets a debug_event instead."""
+async def test_bot_gender_female_uses_voice_id_no_warning(ws_ctx, caplog):
     sm, media_store, fake_agent = ws_ctx
     fake_agent.handle_message = AsyncMock(
         return_value=_FakeTurnResult(response=_FakeResp(response_text="yahan hai", language="hi")))
@@ -484,12 +476,11 @@ async def test_bot_gender_requested_with_no_pair_at_all_does_not_warn(ws_ctx, ca
 
     async with sm() as db:
         row = await db.get(ChatSession, "sess1")
-        row.extra_data = {"bot_gender": "male"}
+        row.extra_data = {"bot_gender": "female"}
         await db.commit()
 
-    # No tts_voices passed -- _make_fake_tenant defaults .voices to None,
-    # matching a tenant with no gender-voice pair configured at all.
-    fake_tenant = _make_fake_tenant(tts_provider="sarvam", tts_voice_id="meera")
+    fake_tenant = _make_fake_tenant(
+        tts_provider="sarvam", tts_voice_id="meera", tts_male_voice_id="aditya")
     with caplog.at_level("WARNING", logger="src.api.chat"):
         _send_audio_and_collect(fake_tenant)
     assert provider.calls
@@ -499,12 +490,7 @@ async def test_bot_gender_requested_with_no_pair_at_all_does_not_warn(ws_ctx, ca
 
 
 @pytest.mark.asyncio
-async def test_no_bot_gender_with_configured_pair_uses_female_voice(ws_ctx):
-    """No `bot_gender` on the session must match voice as "female", mirroring
-    the chat prompt's own default grammar (src/dialogue/prompts.py) -- not
-    the tenant's plain `voice_id`. Without this, a tenant with a male
-    `voice_id` but a configured voices pair would speak female-grammar text
-    in a male voice for every session that never set `bot_gender`."""
+async def test_no_bot_gender_uses_voice_id_no_warning(ws_ctx, caplog):
     sm, media_store, fake_agent = ws_ctx
     fake_agent.handle_message = AsyncMock(
         return_value=_FakeTurnResult(response=_FakeResp(response_text="yahan hai", language="hi")))
@@ -513,35 +499,12 @@ async def test_no_bot_gender_with_configured_pair_uses_female_voice(ws_ctx):
     chat_api.set_tts_providers(_FakeTTSProviders(provider))
 
     fake_tenant = _make_fake_tenant(
-        tts_provider="sarvam", tts_voice_id="rahul",
-        tts_voices={"female": "priya", "male": "rahul"})
-    _send_audio_and_collect(fake_tenant)
-    assert provider.calls
-    _, config = provider.calls[0]
-    assert config.voice_id == "priya"
-
-
-@pytest.mark.asyncio
-async def test_no_bot_gender_with_only_male_voice_falls_back_and_does_not_warn(ws_ctx, caplog):
-    """No `bot_gender` means the defaulted gender is "female" (see above), so
-    a pair that only configures "male" is a miss against that default -- but
-    since no gender was explicitly requested, this is the ordinary case, not
-    a misconfiguration, and must not warn (contrast with the explicit-gender
-    miss in test_bot_gender_male_with_no_male_voice_falls_back_and_warns)."""
-    sm, media_store, fake_agent = ws_ctx
-    fake_agent.handle_message = AsyncMock(
-        return_value=_FakeTurnResult(response=_FakeResp(response_text="yahan hai", language="hi")))
-
-    provider = _FakeTTSProvider()
-    chat_api.set_tts_providers(_FakeTTSProviders(provider))
-
-    fake_tenant = _make_fake_tenant(
-        tts_provider="sarvam", tts_voice_id="meera", tts_voices={"male": "rahul"})
+        tts_provider="sarvam", tts_voice_id="meera", tts_male_voice_id="aditya")
     with caplog.at_level("WARNING", logger="src.api.chat"):
         _send_audio_and_collect(fake_tenant)
     assert provider.calls
     _, config = provider.calls[0]
-    assert config.voice_id == "meera"  # falls back to the plain voice_id
+    assert config.voice_id == "meera"
     assert not any(rec.levelname == "WARNING" for rec in caplog.records)
 
 

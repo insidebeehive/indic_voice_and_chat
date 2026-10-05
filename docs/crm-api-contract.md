@@ -832,7 +832,7 @@ Content-Type: application/json
 - `customer_name`: the player's name, used in the greeting.
 - `language`: the default reply language, e.g. `hi` or `en`. If you leave it out, the tenant's default is used. The bot still follows the language the player actually writes in.
 - `bot_name`: the name the bot uses for itself, up to 64 characters. If you leave it out, the bot calls itself the support agent for your brand.
-- `bot_gender`: `"female"` or `"male"`, exactly as written in **lowercase**. This sets the grammatical gender the bot uses for itself (for example "sakti hoon" or "sakta hoon" in Hindi). It also picks the voice for voice-note replies and for a voice call started from the chat, as long as we have configured a voice of that gender for your tenant; otherwise those use your tenant's default voice. If you leave it out, the bot is **female** in both grammar and voice, where a female voice is configured for your tenant.
+- `bot_gender`: `"female"` or `"male"`, exactly as written in **lowercase**. This sets the grammatical gender the bot uses for itself (for example "sakti hoon" or "sakta hoon" in Hindi). It also picks the voice for voice-note replies and for a voice call started from the chat: `"male"` uses your tenant's male voice when we have one configured, and everything else uses the female voice. If you leave it out, the bot is **female**.
 - `metadata`: any extra key/value data you want stored on the session.
 
 **Things to watch for:**

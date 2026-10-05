@@ -31,7 +31,10 @@ def _tenant() -> SimpleNamespace:
     pipeline = SimpleNamespace(
         stt=SimpleNamespace(language="hi-IN"),
         llm=SimpleNamespace(temperature=0.5, max_tokens=256, response_format="json"),
-        tts=SimpleNamespace(language="hi-IN", voice_id=None),
+        # male_voice_id defaults to None, same as the real TenantTTSConfig
+        # (src/config_tenant.py) -- resolve_gender_voice reads it whenever a
+        # handoff call requests a male bot.
+        tts=SimpleNamespace(language="hi-IN", voice_id=None, male_voice_id=None),
     )
     return SimpleNamespace(
         slug="dev", id="t1",
@@ -839,10 +842,10 @@ async def test_handoff_call_voice_override_wins_over_chat_call_tts_resolution() 
 
 async def test_handoff_call_bot_gender_picks_matching_chat_voice() -> None:
     """A handoff call with a CRM-supplied bot_gender (handoff_ctx, passed by
-    /chat/voice -- see chat.py's _claim_chat_handoff) picks the matching
-    voice from the resolved chat TTS config's `voices` pair
-    (resolve_gender_voice, src/config_tenant.py), not just whatever
-    `voice_id` it already had. The script's gender agrees too."""
+    /chat/voice -- see chat.py's _claim_chat_handoff) picks the resolved chat
+    TTS config's `male_voice_id` (resolve_gender_voice, src/config_tenant.py),
+    not just whatever `voice_id` it already had. The script's gender agrees
+    too."""
     chat_sentinel = Mock()
     providers = _providers()
     providers.get_chat_call_tts = lambda t: chat_sentinel
@@ -852,8 +855,8 @@ async def test_handoff_call_bot_gender_picks_matching_chat_voice() -> None:
     tenant.settings.pipeline.chat_voice = SimpleNamespace(
         enabled=False,  # must be ignored entirely for handoff calls
         tts=SimpleNamespace(
-            provider="elevenlabs", model=None, language="en-IN", voice_id="chat-voice-1",
-            voices={"male": "chat-voice-male", "female": "chat-voice-female"}),
+            provider="elevenlabs", model=None, language="en-IN", voice_id="chat-voice-female",
+            male_voice_id="chat-voice-male"),
     )
     factory = make_browser_bridge_factory(providers, slots=SlotSchema())
     bridge = await factory(websocket=ws, tenant=tenant, handoff_ctx={"bot_gender": "male"})
@@ -884,8 +887,8 @@ async def test_dev_voice_handoff_lookup_feeds_gender_match_before_tts_selection(
     tenant.settings.pipeline.chat_voice = SimpleNamespace(
         enabled=False,  # must be ignored entirely for handoff calls
         tts=SimpleNamespace(
-            provider="elevenlabs", model=None, language="en-IN", voice_id="chat-voice-1",
-            voices={"male": "chat-voice-male", "female": "chat-voice-female"}),
+            provider="elevenlabs", model=None, language="en-IN", voice_id="chat-voice-female",
+            male_voice_id="chat-voice-male"),
     )
     factory = make_browser_bridge_factory(
         providers, handoff_store=SimpleNamespace(redis=fake_redis))
@@ -933,39 +936,13 @@ async def test_handoff_call_gender_fallback_warns_when_not_configured(caplog) ->
     ws = SimpleNamespace(query_params={"handoff": "tok1"})
     tenant = _tenant()
     tenant.settings.pipeline.tts = SimpleNamespace(
-        language="hi-IN", voice_id="pipeline-voice", voices={"female": "pipeline-voice-f"})
+        language="hi-IN", voice_id="pipeline-voice", male_voice_id=None)
     factory = make_browser_bridge_factory(providers, slots=SlotSchema())
     with caplog.at_level(logging.WARNING, logger="src.api.dev_console"):
         bridge = await factory(websocket=ws, tenant=tenant, handoff_ctx={"bot_gender": "male"})
     assert bridge._agent._engine._config.tts.voice_id == "pipeline-voice"
     assert any(r.levelno == logging.WARNING and "gender" in r.getMessage().lower()
                for r in caplog.records)
-
-
-async def test_handoff_call_gender_requested_with_no_pair_at_all_does_not_warn(caplog) -> None:
-    """A tenant with NO female/male pair configured at all is the ordinary
-    case, not a misconfiguration (see the test above, which has a pair
-    missing just one gender and DOES warn) -- this logs a debug_event
-    instead of a WARNING."""
-    import logging
-
-    pipeline_sentinel = Mock()
-    providers = _providers()
-    providers.get_tts = lambda t: pipeline_sentinel
-    providers.get_chat_call_tts = lambda t: None
-    ws = SimpleNamespace(query_params={"handoff": "tok1"})
-    tenant = _tenant()
-    tenant.settings.pipeline.tts = SimpleNamespace(
-        language="hi-IN", voice_id="pipeline-voice", voices=None)
-    factory = make_browser_bridge_factory(providers, slots=SlotSchema())
-    with caplog.at_level(logging.DEBUG, logger="src.api.dev_console"):
-        bridge = await factory(websocket=ws, tenant=tenant, handoff_ctx={"bot_gender": "male"})
-    assert bridge._agent._engine._config.tts.voice_id == "pipeline-voice"
-    assert not any(r.levelno == logging.WARNING for r in caplog.records)
-    assert any(
-        r.getMessage() == "dev_console browser_bridge gender_voice_unconfigured"
-        for r in caplog.records
-    )
 
 
 async def test_handoff_call_voice_override_wins_over_bot_gender() -> None:
@@ -985,8 +962,8 @@ async def test_handoff_call_voice_override_wins_over_bot_gender() -> None:
     tenant.settings.pipeline.chat_voice = SimpleNamespace(
         enabled=False,
         tts=SimpleNamespace(
-            provider="elevenlabs", model=None, language="en-IN", voice_id="chat-voice-1",
-            voices={"male": "chat-voice-male"}),
+            provider="elevenlabs", model=None, language="en-IN", voice_id="chat-voice-female",
+            male_voice_id="chat-voice-male"),
     )
     factory = make_browser_bridge_factory(providers, slots=SlotSchema())
     bridge = await factory(

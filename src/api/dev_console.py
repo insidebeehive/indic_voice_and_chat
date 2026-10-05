@@ -962,24 +962,18 @@ def make_browser_bridge_factory(
             tts = chat_call_tts
             resolved = resolve_chat_tts_config(tenant.settings.pipeline)
             tts_language = resolved.language or tenant.settings.pipeline.tts.language or "hi-IN"
-            # Gender-match the handoff voice to handoff_ctx["bot_gender"] when
-            # the resolved TTS config has a pair for it (resolve_gender_voice,
-            # src/config_tenant.py); falls back to the plain voice_id, exactly
-            # as before this existed, when there's no pair or no gender was
-            # requested at all.
-            _handoff_gender = ((handoff_ctx or {}).get("bot_gender") or "").strip().lower() or None
+            # Gender-match the handoff voice to handoff_ctx["bot_gender"]
+            # (resolve_gender_voice, src/config_tenant.py) — falls back to
+            # the plain voice_id when the gender isn't "male" or no male
+            # voice is configured.
+            _handoff_gender = (handoff_ctx or {}).get("bot_gender")
             tts_voice, _gender_matched = resolve_gender_voice(resolved, _handoff_gender)
-            if _handoff_gender in ("female", "male") and not _gender_matched:
-                if resolved is not None and getattr(resolved, "voices", None):
-                    # Real misconfiguration: a pair IS configured, just not
-                    # for this gender.
-                    log.warning("handoff call voice gender not configured; using tenant default",
-                                extra={"tenant_id": tenant.id, "bot_gender": _handoff_gender})
-                else:
-                    # Ordinary: no pair configured at all.
-                    debug_event(log, "dev_console browser_bridge gender_voice_unconfigured",
-                                tenant_id=tenant.id, bot_gender=_handoff_gender,
-                                source="chat_voice")
+            _norm_handoff_gender = (_handoff_gender or "").strip().lower()
+            if _norm_handoff_gender == "male" and not _gender_matched and resolved is not None and resolved.voice_id:
+                # The misconfiguration: a male bot was requested and the
+                # tenant has a voice configured, just not a male one.
+                log.warning("handoff call voice gender not configured; using tenant default",
+                            extra={"tenant_id": tenant.id, "bot_gender": _handoff_gender})
             debug_event(log, "dev_console browser_bridge handoff_tts_source",
                         source="chat_voice", tts_provider=resolved.provider)
         else:
@@ -990,21 +984,17 @@ def make_browser_bridge_factory(
                 # Same gender-matching as the chat_voice branch above, off the
                 # call cascade's own pipeline.tts this time -- a handoff call
                 # that fell all the way through to this fallback still speaks
-                # in the gender the CRM asked for when a pair is configured.
-                _handoff_gender = ((handoff_ctx or {}).get("bot_gender") or "").strip().lower() or None
+                # in the gender the CRM asked for when a male voice is set.
+                _handoff_gender = (handoff_ctx or {}).get("bot_gender")
                 _pipeline_tts = tenant.settings.pipeline.tts
                 tts_voice, _gender_matched = resolve_gender_voice(_pipeline_tts, _handoff_gender)
-                if _handoff_gender in ("female", "male") and not _gender_matched:
-                    if _pipeline_tts is not None and getattr(_pipeline_tts, "voices", None):
-                        # Real misconfiguration: a pair IS configured, just
-                        # not for this gender.
-                        log.warning("handoff call voice gender not configured; using tenant default",
-                                    extra={"tenant_id": tenant.id, "bot_gender": _handoff_gender})
-                    else:
-                        # Ordinary: no pair configured at all.
-                        debug_event(log, "dev_console browser_bridge gender_voice_unconfigured",
-                                    tenant_id=tenant.id, bot_gender=_handoff_gender,
-                                    source="pipeline_tts_fallback")
+                _norm_handoff_gender = (_handoff_gender or "").strip().lower()
+                if (_norm_handoff_gender == "male" and not _gender_matched
+                        and _pipeline_tts is not None and _pipeline_tts.voice_id):
+                    # The misconfiguration: a male bot was requested and the
+                    # tenant has a voice configured, just not a male one.
+                    log.warning("handoff call voice gender not configured; using tenant default",
+                                extra={"tenant_id": tenant.id, "bot_gender": _handoff_gender})
                 debug_event(log, "dev_console browser_bridge handoff_tts_source",
                             source="pipeline_tts_fallback",
                             tts_provider=getattr(tenant.settings.pipeline.tts, "provider", None) or None)

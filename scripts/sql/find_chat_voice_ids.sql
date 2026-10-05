@@ -11,10 +11,10 @@
 -- Lists every chat-voice-enabled tenant's effective chat TTS layer
 -- (chat_voice.tts when it declares a provider, else pipeline.tts -- the same
 -- rule as src/config_tenant.py resolve_chat_tts_config), with voice_id and
--- the per-gender voices pair. `sarvam_v3_ok` checks voice_id and both
--- voices entries of Sarvam tenants against the bulbul:v3 roster in
--- src/providers/tts/sarvam.py (_BULBUL_V3_SPEAKERS);
--- it is NULL for other providers, so check those by eye.
+-- male_voice_id. `sarvam_v3_ok` checks both of a Sarvam tenant's voice ids
+-- against the bulbul:v3 roster in src/providers/tts/sarvam.py
+-- (_BULBUL_V3_SPEAKERS); it is NULL for other providers, so check those by
+-- eye.
 --
 -- Schema: voicebot (see find_mismatched_provider_models.sql for the
 -- VOX_DB_SCHEMA note).
@@ -42,15 +42,12 @@ SELECT id, slug, name, layer,
        cfg ->> 'provider'                AS provider,
        cfg ->> 'model'                   AS model,
        cfg ->> 'voice_id'                AS voice_id,
-       cfg -> 'voices' ->> 'female'      AS voice_female,
-       cfg -> 'voices' ->> 'male'        AS voice_male,
+       cfg ->> 'male_voice_id'           AS male_voice_id,
        CASE WHEN lower(cfg ->> 'provider') = 'sarvam'
             THEN (cfg ->> 'voice_id' IS NULL
                   OR lower(cfg ->> 'voice_id') IN (SELECT v FROM roster))
-             AND (cfg -> 'voices' ->> 'female' IS NULL
-                  OR lower(cfg -> 'voices' ->> 'female') IN (SELECT v FROM roster))
-             AND (cfg -> 'voices' ->> 'male' IS NULL
-                  OR lower(cfg -> 'voices' ->> 'male') IN (SELECT v FROM roster))
+             AND (cfg ->> 'male_voice_id' IS NULL
+                  OR lower(cfg ->> 'male_voice_id') IN (SELECT v FROM roster))
        END                               AS sarvam_v3_ok
 FROM effective
 WHERE NULLIF(cfg ->> 'provider', '') IS NOT NULL

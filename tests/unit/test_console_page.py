@@ -371,9 +371,11 @@ async def test_backoffice_chat_voice_hint_shows_effective_config_and_source() ->
     assert 'cv.source === "none"' in ch
     assert 'cv.source === "own"' in ch
 
-    # The chat-voice voice picker must now be seeded from the resolved
-    # voice id (ChatVoiceInfo.effective_voice_id) instead of a literal null.
-    assert 'voicePickerHtml("cv_tts", "Chat TTS", cv ? cv.effective_voice_id : null)' in body
+    # The chat-voice voice picker (labelled "Female" -- the CRM's bot_gender
+    # picks the separate Male picker for a male bot) must be seeded from the
+    # resolved voice id (ChatVoiceInfo.effective_voice_id) instead of a
+    # literal null.
+    assert 'voicePickerHtml("cv_tts", "Female", cv ? cv.effective_voice_id : null)' in body
 
     # Editing semantics untouched: the sentinel and provider-change wiring
     # for the chat-voice controls specifically (not just elsewhere on the
