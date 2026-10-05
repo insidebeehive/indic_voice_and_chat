@@ -113,6 +113,11 @@ _REDACTED_KEYS_NORMALIZED = {k.replace("_", "") for k in _REDACTED_RESPONSE_KEYS
 # these exact (normalized) keys must reach the LLM as-is instead of being
 # redacted. Normalized the same way as _REDACTED_KEYS_NORMALIZED above
 # (lowercased, underscores stripped).
+# String params whose value is safe to log on the "crm tool call" line (see
+# filter_params there): fixed filter words, never customer data.
+_LOGGABLE_FILTER_PARAMS = ("type",)
+_FILTER_VALUE_RE = re.compile(r"[A-Za-z_]{1,20}")
+
 _ORDER_ID_EXEMPT_KEYS_NORMALIZED = {"pgsorderid", "orderid", "externaltransactionid"}
 
 # Belt-and-suspenders value-level scrub: a UUID can leak through a key name
@@ -340,9 +345,20 @@ async def execute_crm_tool(
         k: v for k, v in sorted(rest.items())
         if isinstance(v, (int, float)) and not isinstance(v, bool)
     }
+    # The one string param whose VALUE is logged: `type` is a fixed filter
+    # word (deposit | withdrawal | casino | sports | all) that decides which
+    # records the CRM returns, so it is needed to read result_chars and the
+    # model's answer against what was actually asked for. Logged only when it
+    # looks like a short filter word -- anything else (a model stuffing free
+    # text into it) stays keys-only like every other string.
+    filter_params = {
+        k: rest[k] for k in _LOGGABLE_FILTER_PARAMS
+        if isinstance(rest.get(k), str) and _FILTER_VALUE_RE.fullmatch(rest[k])
+    }
     log.info("crm tool call", extra={
         "ticket_id": ticket_id, "session_id": session_id,
         "url": _redact_url(url), "method": method,
+        "filter_params": filter_params,
         # keys only — resolved param VALUES can be customer PII (mobile,
         # email) or a player id; same rule as header_keys below.
         "param_keys": sorted(rest.keys()),

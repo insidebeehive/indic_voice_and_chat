@@ -1198,3 +1198,49 @@ async def test_catalog_get_market_holiday_schedule_date_is_optional() -> None:
     method, url, params, headers = client.calls[0]
     assert url == "https://crm.example.com/operators/op1/matka/holiday-schedule"
     assert params == {"market": "Kalyan"}
+
+
+@pytest.mark.asyncio
+async def test_crm_tool_call_log_logs_type_filter_value(caplog) -> None:
+    """`type` is a fixed filter word that decides which records come back, so
+    its value is logged; any other string param stays keys-only."""
+    client = _FakeClient({"ok": True})
+    mobile = "+919876543210"
+
+    with caplog.at_level(logging.INFO, logger="src.chatbot.tool_executor"):
+        await execute_crm_tool(
+            endpoint="https://crm.example.com/api/players/p1/transactions",
+            method="GET",
+            parameters={
+                "type": {"type": "string", "source": "llm"},
+                "mobile": {"type": "string", "source": "llm"},
+                "limit": {"type": "number", "source": "llm"},
+            },
+            auth_type=None, token=None,
+            args={"type": "deposit", "mobile": mobile, "limit": 10},
+            http_client=client,
+        )
+
+    record = [r for r in caplog.records if r.getMessage() == "crm tool call"][0]
+    assert record.__dict__.get("filter_params") == {"type": "deposit"}
+    assert mobile not in repr(record.__dict__)
+
+
+@pytest.mark.asyncio
+async def test_crm_tool_call_log_drops_type_value_that_is_not_a_filter_word(caplog) -> None:
+    client = _FakeClient({"ok": True})
+    junk = "deposit of 500 from +919876543210"
+
+    with caplog.at_level(logging.INFO, logger="src.chatbot.tool_executor"):
+        await execute_crm_tool(
+            endpoint="https://crm.example.com/api/players/p1/transactions",
+            method="GET",
+            parameters={"type": {"type": "string", "source": "llm"}},
+            auth_type=None, token=None,
+            args={"type": junk},
+            http_client=client,
+        )
+
+    record = [r for r in caplog.records if r.getMessage() == "crm tool call"][0]
+    assert record.__dict__.get("filter_params") == {}
+    assert junk not in repr(record.__dict__)
