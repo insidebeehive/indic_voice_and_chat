@@ -773,6 +773,10 @@ function voiceTuningHtml(kind, cur) {
     </label>`;
 }
 
+// Gender filter per picker kind: the chat-voice Female picker is the cv_tts
+// voice itself, the Male picker is cv_tts_male. Other pickers list everything.
+const PICKER_GENDER = { cv_tts: "female", cv_tts_male: "male" };
+
 async function refreshVoiceOptions(kind) {
   const ids = voicePickerFieldIds(kind);
   const select = $(ids.select);
@@ -813,6 +817,11 @@ async function refreshVoiceOptions(kind) {
       VOICE_ROSTER_CACHE[cacheKey] = voices;
     }
   }
+  // The chat-voice Female/Male pickers list only voices of their own gender.
+  // A voice with no gender in the roster (e.g. an unlabelled clone) is left
+  // out of both; "custom / other…" still takes its id.
+  const gender = PICKER_GENDER[kind] || "";
+  if (voices && gender) voices = voices.filter(v => (v.gender || "").toLowerCase() === gender);
   const opts = [`<option value="">— leave unchanged —</option>`];
   if (voices && voices.length) {
     voices.forEach(v => {
@@ -853,7 +862,7 @@ async function refreshVoiceOptions(kind) {
     // per-language provider — the catalog deliberately does not fall back to
     // hi-IN here, see src/providers/voice_catalog.py) — not a fetch failure.
     // An empty <select> alone can't be told apart from one, so say so.
-    if (msg) msg.textContent = `no voices published for ${provider}/${language} — use custom`;
+    if (msg) msg.textContent = `no ${gender ? gender + " " : ""}voices published for ${provider}/${language} — use custom`;
   }
   onVoiceSelectChange(kind);   // re-sync the custom-input wrapper for whichever value ended up selected
   // The Male picker shares the Chat TTS provider/language inputs (see
@@ -917,8 +926,12 @@ function chatVoiceHtml(id, cv) {
       </label>
       <label>Chat TTS language <input id="p_cv_tts_language" placeholder="blank = leave unchanged" onchange="refreshVoiceOptions('cv_tts')" /></label>
       <label>Chat TTS speed <input id="p_cv_tts_speed" type="number" step="0.05" placeholder="blank = leave unchanged" /></label>
-      ${voicePickerHtml("cv_tts", "Female", cv ? cv.effective_voice_id : null)}
-      ${voicePickerHtml("cv_tts_male", "Male", cv ? cv.effective_male_voice_id : null)}
+      <!-- Female and Male side by side: each picker keeps its own custom-id
+           input and message line underneath it, in its own column. -->
+      <div style="display:flex;gap:1.2rem;flex-wrap:wrap;flex-basis:100%;">
+        <div>${voicePickerHtml("cv_tts", "Female", cv ? cv.effective_voice_id : null)}</div>
+        <div>${voicePickerHtml("cv_tts_male", "Male", cv ? cv.effective_male_voice_id : null)}</div>
+      </div>
       <div class="hint" style="flex-basis:100%;">
         The CRM's bot_gender picks Male voice for male bots; everything else uses Female voice.
       </div>

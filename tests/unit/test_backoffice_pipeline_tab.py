@@ -372,3 +372,39 @@ def test_resolve_voice_query_male_kind_uses_cv_tts_provider_and_language() -> No
     before, after = result
     assert before == {"provider": "cv-tts-provider", "language": "en-IN"}
     assert after == {"provider": "elevenlabs", "language": "hi-IN"}
+
+
+@needs_node
+def test_female_and_male_pickers_list_only_their_own_gender() -> None:
+    """The Female picker (cv_tts) lists only female voices and the Male picker
+    (cv_tts_male) only male ones; a voice with no gender is in neither. The
+    call TTS picker is unfiltered."""
+    result = _run_node(
+        """
+  SELECTED = "t1";
+  PIPE_CURRENT.cv_tts = {provider: "sarvam", language: "hi-IN"};
+  PIPE_CURRENT.tts = {provider: "sarvam", language: "hi-IN"};
+  VOICE_ROSTER_CACHE["sarvam|hi-IN"] = [
+    {voice_id: "priya", gender: "female"},
+    {voice_id: "aditya", gender: "male"},
+    {voice_id: "mystery", gender: ""},
+  ];
+  await refreshVoiceOptions("cv_tts");
+  await refreshVoiceOptions("cv_tts_male");
+  await refreshVoiceOptions("tts");
+  RESULT = {
+    female: $("p_cv_tts_voice_select").innerHTML,
+    male: $("p_cv_tts_male_voice_select").innerHTML,
+    call: $("p_tts_voice_select").innerHTML,
+  };
+""",
+        capture="result",
+    )
+    assert 'value="priya"' in result["female"]
+    assert 'value="aditya"' not in result["female"]
+    assert 'value="mystery"' not in result["female"]
+    assert 'value="aditya"' in result["male"]
+    assert 'value="priya"' not in result["male"]
+    assert 'value="mystery"' not in result["male"]
+    for v in ("priya", "aditya", "mystery"):
+        assert f'value="{v}"' in result["call"]
