@@ -990,24 +990,21 @@ async def test_hit_passes_cached_content_and_omits_system_and_tools(monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_tool_mode_none_call_skips_cache_but_keeps_registry(monkeypatch) -> None:
-    """A request needing tool_config (tool_mode="none") must never combine it
-    with cached_content -- the Developer API 400s on "CachedContent can not
-    be used with GenerateContent request setting system_instruction, tools or
-    tool_config". google-genai's CreateCachedContentConfig can technically
-    accept a tool_config, but arming a second, NONE-mode cache variant purely
-    for this rare forced-final-answer call would roughly double cache
-    storage/creation traffic for a call that isn't the hot path -- so this
-    call deliberately falls back to an uncached, full request
-    (system_instruction + tools + tool_config) rather than either building a
-    second cache or silently dropping tool_config (which would let the model
-    call a tool we explicitly told it not to). The registry itself keeps
-    tracking sightings/arming normally -- only the decision to USE cache_name
-    on this one request is skipped -- so a LATER call without tool_config can
-    still hit the already-armed cache."""
+async def test_tool_mode_none_with_cache_hit_sends_cached_content_without_tool_config(
+    monkeypatch, caplog,
+) -> None:
+    """A forced-final call (tool_mode="none") that lands on an armed cache
+    sends `cached_content` and drops `tool_config` from the wire request --
+    the Developer API 400s on combining the two, but the forced-final
+    instruction already appended to the message history is what's actually
+    supposed to keep the model from calling a tool here, not `tool_config`
+    (see chatbot.py's _FORCED_FINAL_ANSWER_INSTRUCTION). Which path a call
+    took is recorded via its own debug_event so cost dashboards can tell a
+    cached forced-final turn apart from one that fell back uncached."""
     from src.interfaces.llm import ToolSpec
     monkeypatch.setenv("GEMINI_EXPLICIT_CACHE", "1")
-    client = _make_client(generate_return=_response("ok"))
+    caplog.set_level("DEBUG", logger="src.providers.llm.gemini")
+    client = _make_client(generate_return=_response("ok", prompt_tokens=20, completion_tokens=5))
     adapter = GeminiLLMAdapter({"client": client})
     tools = [ToolSpec(name="search_kb", description="search the KB",
                        parameters={"type": "object", "properties": {}})]
@@ -1017,31 +1014,221 @@ async def test_tool_mode_none_call_skips_cache_but_keeps_registry(monkeypatch) -
     await adapter.generate(_msgs(_BIG_SYSTEM), config)  # sighting 2 -> schedules creation
     await asyncio.gather(*gemini_module._inflight_cache_tasks)
 
-    # Only one registry key is ever produced in this test (one model/system/
-    # tools combination), so grab its entry directly rather than
-    # reconstructing the tools-as-dicts shape _cache_key expects.
-    assert len(adapter._cache_entries) == 1
-    entry = next(iter(adapter._cache_entries.values()))
-    sightings_before = entry.sightings
-
-    # Would normally be a hit (sighting 3) -- but this call also needs
-    # tool_config, so it must bypass the cache instead of dropping it.
+    # Would normally be a hit (sighting 3) -- now it stays a hit even though
+    # this call also wants tool_config.
     forced_config = LLMConfig(tools=tools, tool_mode="none")
-    await adapter.generate(_msgs(_BIG_SYSTEM), forced_config)
+    result = await adapter.generate(_msgs(_BIG_SYSTEM), forced_config)
+
+    cfg = client.aio.models.generate_content.await_args.kwargs["config"]
+    assert cfg.get("cached_content") == "cachedContents/fake123"
+    assert "tool_config" not in cfg
+    assert "tools" not in cfg
+    assert "system_instruction" not in cfg
+    assert result.text == "ok"
+    assert result.usage["prompt_tokens"] == 20
+
+    # Exactly 3 calls total (sighting 1, sighting 2, this hit) -- no extra
+    # fallback call was made.
+    assert client.aio.models.generate_content.await_count == 3
+    assert any(
+        r.getMessage() == "gemini cache forced_final_cached" for r in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_tool_mode_none_cache_hit_with_function_call_falls_back_uncached(
+    monkeypatch, caplog,
+) -> None:
+    """If the cached attempt still comes back with a function call -- the
+    forced-final instruction in the history didn't stick -- the response is
+    discarded and the SAME request is re-issued exactly as it would have
+    gone out before caching existed: uncached, with `tool_config` mode NONE,
+    which the Developer API enforces server-side. Usage from BOTH calls is
+    summed in the result so cost metrics reflect what was actually billed,
+    not just the discarded first attempt."""
+    from src.interfaces.llm import ToolSpec
+    monkeypatch.setenv("GEMINI_EXPLICIT_CACHE", "1")
+    caplog.set_level("DEBUG", logger="src.providers.llm.gemini")
+    tools = [ToolSpec(name="search_kb", description="search the KB",
+                       parameters={"type": "object", "properties": {}})]
+    config = LLMConfig(tools=tools)
+    client = _make_client(generate_return=_response("ok"))
+    adapter = GeminiLLMAdapter({"client": client})
+
+    await adapter.generate(_msgs(_BIG_SYSTEM), config)  # sighting 1
+    await adapter.generate(_msgs(_BIG_SYSTEM), config)  # sighting 2 -> schedules creation
+    await asyncio.gather(*gemini_module._inflight_cache_tasks)
+
+    client.aio.models.generate_content = AsyncMock(side_effect=[
+        _tool_call_response("search_kb", {"q": "refund"}),  # cached attempt, ignores the nudge
+        _response("final answer", prompt_tokens=30, completion_tokens=10),  # hard-forced fallback
+    ])
+    forced_config = LLMConfig(tools=tools, tool_mode="none")
+    result = await adapter.generate(_msgs(_BIG_SYSTEM), forced_config)
+
+    assert result.text == "final answer"
+    assert result.tool_calls == []
+    # Summed: the discarded cached attempt (1 prompt/1 completion, per
+    # _tool_call_response) plus the fallback (30/10).
+    assert result.usage["prompt_tokens"] == 31
+    assert result.usage["completion_tokens"] == 11
+
+    first_cfg = client.aio.models.generate_content.await_args_list[0].kwargs["config"]
+    assert first_cfg.get("cached_content") == "cachedContents/fake123"
+    assert "tool_config" not in first_cfg
+
+    second_cfg = client.aio.models.generate_content.await_args_list[1].kwargs["config"]
+    assert "cached_content" not in second_cfg
+    assert second_cfg["system_instruction"] == _BIG_SYSTEM
+    assert second_cfg["tools"]
+    assert second_cfg["tool_config"] == {"function_calling_config": {"mode": "NONE"}}
+
+    assert any(
+        r.getMessage() == "gemini cache forced_final_fallback" for r in caplog.records
+    )
+
+
+def _empty_malformed_response(finish_reason: str = "MALFORMED_FUNCTION_CALL") -> SimpleNamespace:
+    """A cache-hit response with no usable text and no tool call at all --
+    Gemini can return this (finish_reason MALFORMED_FUNCTION_CALL or
+    UNEXPECTED_TOOL_CALL, content.parts empty) when the cached request ran
+    without `tool_config`. Neither of `tool_calls` nor a non-blank `text`
+    exists here, so the "called a tool anyway" branch alone wouldn't catch
+    it."""
+    candidate = SimpleNamespace(
+        content=SimpleNamespace(parts=[]),
+        finish_reason=SimpleNamespace(name=finish_reason),
+    )
+    return SimpleNamespace(
+        text=None, candidates=[candidate],
+        usage_metadata=SimpleNamespace(prompt_token_count=1, candidates_token_count=0),
+    )
+
+
+@pytest.mark.asyncio
+async def test_tool_mode_none_cache_hit_with_empty_response_falls_back_uncached(
+    monkeypatch, caplog,
+) -> None:
+    """A cached forced-final attempt that comes back with no tool call AND
+    no usable text (MALFORMED_FUNCTION_CALL/UNEXPECTED_TOOL_CALL, empty
+    parts) must fall back the same way a stray tool call does -- otherwise
+    the customer gets a blank reply. Usage from both calls is still
+    summed."""
+    from src.interfaces.llm import ToolSpec
+    monkeypatch.setenv("GEMINI_EXPLICIT_CACHE", "1")
+    caplog.set_level("DEBUG", logger="src.providers.llm.gemini")
+    tools = [ToolSpec(name="search_kb", description="search the KB",
+                       parameters={"type": "object", "properties": {}})]
+    config = LLMConfig(tools=tools)
+    client = _make_client(generate_return=_response("ok"))
+    adapter = GeminiLLMAdapter({"client": client})
+
+    await adapter.generate(_msgs(_BIG_SYSTEM), config)  # sighting 1
+    await adapter.generate(_msgs(_BIG_SYSTEM), config)  # sighting 2 -> schedules creation
+    await asyncio.gather(*gemini_module._inflight_cache_tasks)
+
+    client.aio.models.generate_content = AsyncMock(side_effect=[
+        _empty_malformed_response(),  # cached attempt, empty/malformed
+        _response("final answer", prompt_tokens=30, completion_tokens=10),  # hard-forced fallback
+    ])
+    forced_config = LLMConfig(tools=tools, tool_mode="none")
+    result = await adapter.generate(_msgs(_BIG_SYSTEM), forced_config)
+
+    assert result.text == "final answer"
+    assert result.tool_calls == []
+    # Summed: the discarded cached attempt (1 prompt/0 completion) plus the
+    # fallback (30/10).
+    assert result.usage["prompt_tokens"] == 31
+    assert result.usage["completion_tokens"] == 10
+
+    first_cfg = client.aio.models.generate_content.await_args_list[0].kwargs["config"]
+    assert first_cfg.get("cached_content") == "cachedContents/fake123"
+    assert "tool_config" not in first_cfg
+
+    second_cfg = client.aio.models.generate_content.await_args_list[1].kwargs["config"]
+    assert "cached_content" not in second_cfg
+    assert second_cfg["tool_config"] == {"function_calling_config": {"mode": "NONE"}}
+
+    assert any(
+        r.getMessage() == "gemini cache forced_final_fallback" for r in caplog.records
+    )
+    assert any(
+        "gemini forced_final fallback" in r.getMessage() and "reason=empty" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_tool_mode_none_cache_hit_with_whitespace_only_text_falls_back_uncached(
+    monkeypatch, caplog,
+) -> None:
+    """A cached forced-final attempt whose text is whitespace-only (not
+    None, not "", just spaces) is just as unusable to the customer as a
+    truly empty one -- the fallback_reason check (`not text or not
+    text.strip()`) must catch it the same way, not treat whitespace as
+    "has an answer"."""
+    from src.interfaces.llm import ToolSpec
+    monkeypatch.setenv("GEMINI_EXPLICIT_CACHE", "1")
+    caplog.set_level("DEBUG", logger="src.providers.llm.gemini")
+    tools = [ToolSpec(name="search_kb", description="search the KB",
+                       parameters={"type": "object", "properties": {}})]
+    config = LLMConfig(tools=tools)
+    client = _make_client(generate_return=_response("ok"))
+    adapter = GeminiLLMAdapter({"client": client})
+
+    await adapter.generate(_msgs(_BIG_SYSTEM), config)  # sighting 1
+    await adapter.generate(_msgs(_BIG_SYSTEM), config)  # sighting 2 -> schedules creation
+    await asyncio.gather(*gemini_module._inflight_cache_tasks)
+
+    client.aio.models.generate_content = AsyncMock(side_effect=[
+        _response("   \n  ", prompt_tokens=1, completion_tokens=0),  # cached, whitespace-only
+        _response("final answer", prompt_tokens=30, completion_tokens=10),  # hard-forced fallback
+    ])
+    forced_config = LLMConfig(tools=tools, tool_mode="none")
+    result = await adapter.generate(_msgs(_BIG_SYSTEM), forced_config)
+
+    assert result.text == "final answer"
+    assert result.tool_calls == []
+    # Summed: the discarded whitespace-only cached attempt (1/0) plus the
+    # fallback (30/10).
+    assert result.usage["prompt_tokens"] == 31
+    assert result.usage["completion_tokens"] == 10
+
+    second_cfg = client.aio.models.generate_content.await_args_list[1].kwargs["config"]
+    assert "cached_content" not in second_cfg
+    assert second_cfg["tool_config"] == {"function_calling_config": {"mode": "NONE"}}
+
+    assert any(
+        r.getMessage() == "gemini cache forced_final_fallback" for r in caplog.records
+    )
+    assert any(
+        "gemini forced_final fallback" in r.getMessage() and "reason=empty" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_tool_mode_none_with_no_armed_cache_is_unchanged(monkeypatch) -> None:
+    """No cache exists yet (first sighting, even with caching turned on) --
+    behavior is exactly the pre-cache request: full system_instruction +
+    tools + tool_config, uncached, in a single call."""
+    from src.interfaces.llm import ToolSpec
+    monkeypatch.setenv("GEMINI_EXPLICIT_CACHE", "1")
+    client = _make_client(generate_return=_response("ok"))
+    adapter = GeminiLLMAdapter({"client": client})
+    tools = [ToolSpec(name="search_kb", description="search the KB",
+                       parameters={"type": "object", "properties": {}})]
+    forced_config = LLMConfig(tools=tools, tool_mode="none")
+
+    result = await adapter.generate(_msgs(_BIG_SYSTEM), forced_config)
 
     cfg = client.aio.models.generate_content.await_args.kwargs["config"]
     assert "cached_content" not in cfg
     assert cfg["system_instruction"] == _BIG_SYSTEM
     assert cfg["tools"]
     assert cfg["tool_config"] == {"function_calling_config": {"mode": "NONE"}}
-
-    # The registry keeps tracking normally -- sighting 3's own lookup still
-    # incremented `sightings`, only the decision to USE this cache was
-    # skipped -- and a later call WITHOUT tool_config still hits it.
-    assert entry.sightings == sightings_before + 1
-    await adapter.generate(_msgs(_BIG_SYSTEM), config)
-    cfg2 = client.aio.models.generate_content.await_args.kwargs["config"]
-    assert cfg2.get("cached_content") == "cachedContents/fake123"
+    assert result.text == "ok"
+    assert client.aio.models.generate_content.await_count == 1
 
 
 @pytest.mark.asyncio

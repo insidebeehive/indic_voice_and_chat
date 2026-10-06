@@ -1191,9 +1191,9 @@ def test_turn_timeout_leaves_room_for_llm_overhead_beyond_the_tool_budget() -> N
     assert chatbot._TOOL_CALL_CEILING_S < chatbot._TOOL_BUDGET_S
     # 40.0s is a documented floor for the realistic LLM-side worst case within
     # a turn: up to 3 generate() calls (2 tool rounds + 1 final synthesis, or
-    # the forced-final path) plus one _CHAT_RETRY_TIMEOUT_S-bounded (12s)
-    # retry -- ~5-8s per call x 3 (~15-24s) + 12s retry (~27-36s realistic),
-    # comfortably under 40s of margin.
+    # the forced-final path) plus one _CHAT_RETRY_TIMEOUT_S-bounded (20s)
+    # retry -- ~5-8s per call x 3 (~15-24s) + 20s retry (~35-44s realistic),
+    # under the 45.0s of margin this leaves (_TURN_TIMEOUT_S - _TOOL_BUDGET_S).
     assert chat_api._TURN_TIMEOUT_S - chatbot._TOOL_BUDGET_S >= 40.0
 
     # KB search (chatbot._KB_SEARCH_TIMEOUT_S) deliberately sits OUTSIDE

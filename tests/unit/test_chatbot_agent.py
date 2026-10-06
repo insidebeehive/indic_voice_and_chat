@@ -725,6 +725,44 @@ def test_has_player_tools_false_when_only_operator_tools_registered(retriever) -
     assert "Call the operator tool" in system_prompt
 
 
+def test_has_common_lookup_tools_true_when_all_three_registered(retriever) -> None:
+    # has_common_lookup_tools gates betting.py's COMMON_LOOKUPS_BLOCK, and must
+    # only fire when ALL THREE of the named tools exist for this turn -- not
+    # just any player tool (see _COMMON_LOOKUP_TOOL_NAMES in chatbot.py).
+    from src.interfaces.llm import ToolSpec
+
+    agent = _make_agent(
+        FakeLLM({"response_text": "ok", "language": "en", "confidence": "high", "action": "none"}),
+        retriever,
+        prompt_pack="betting",
+        crm_tools=[
+            ToolSpec(name="get_player_transactions", description="", parameters={}),
+            ToolSpec(name="get_player_latest_deposit_order", description="", parameters={}),
+            ToolSpec(name="get_player_wallet", description="", parameters={}),
+        ],
+    )
+    messages = agent._compose("", LLMMessage(role="user", content="hi"), query_text="hi")
+    system_prompt = messages[0].content
+    assert "COMMON LOOKUPS" in system_prompt
+
+
+def test_has_common_lookup_tools_false_when_only_two_registered(retriever) -> None:
+    from src.interfaces.llm import ToolSpec
+
+    agent = _make_agent(
+        FakeLLM({"response_text": "ok", "language": "en", "confidence": "high", "action": "none"}),
+        retriever,
+        prompt_pack="betting",
+        crm_tools=[
+            ToolSpec(name="get_player_transactions", description="", parameters={}),
+            ToolSpec(name="get_player_latest_deposit_order", description="", parameters={}),
+        ],
+    )
+    messages = agent._compose("", LLMMessage(role="user", content="hi"), query_text="hi")
+    system_prompt = messages[0].content
+    assert "COMMON LOOKUPS" not in system_prompt
+
+
 @pytest.mark.asyncio
 async def test_persists_to_redis(retriever, fake_redis) -> None:
     llm = FakeLLM({

@@ -23,6 +23,7 @@ from src.rag.context_builder import (
     build_voicebot_kb_context,
     defang_trusted_frames,
     neutralize_sources_markers,
+    truncate_chunk_text,
 )
 from src.rag.retriever import RetrievedChunk
 
@@ -1633,3 +1634,30 @@ def test_pii_guard_devanagari_digit_account_number_is_matched() -> None:
     assert "९८७६५४३२१०१२" not in out.response_text
     assert "[redacted]" in out.response_text
     assert out.confidence == "low"
+
+
+# --- truncate_chunk_text (search_knowledge_base tool result cap) ---------
+
+
+def test_truncate_chunk_text_is_noop_under_the_cap() -> None:
+    text = "Plan B has 500GB unlimited data."
+    assert truncate_chunk_text(text, 1300) == text
+
+
+def test_truncate_chunk_text_cuts_on_word_boundary() -> None:
+    text = "one two three four five six seven eight nine ten"
+    out = truncate_chunk_text(text, 20)
+    assert len(out) <= 20
+    assert out.endswith("...")
+    # Never splits a word in half -- the text before "..." is a prefix of
+    # the original ending exactly on a space, not mid-word.
+    stripped = out[: -len("...")].rstrip()
+    assert text.startswith(stripped)
+    assert not stripped or text[len(stripped)] in (" ",)
+
+
+def test_truncate_chunk_text_never_exceeds_cap_even_with_no_spaces() -> None:
+    text = "a" * 50
+    out = truncate_chunk_text(text, 10)
+    assert len(out) <= 10
+    assert out.endswith("...")

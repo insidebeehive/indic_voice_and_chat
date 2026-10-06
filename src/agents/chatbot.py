@@ -67,6 +67,7 @@ from src.rag.context_builder import (
     defang_trusted_frames,
     neutralize_sources_markers,
     search_combined,
+    truncate_chunk_text,
 )
 from src.rag.retriever import HybridRetriever, RetrievedChunk
 from src.utils.logging import debug_event
@@ -92,7 +93,17 @@ MAX_HISTORY_TURNS = 10
 # answer into a hard timeout — worse than not retrying. Mirrors the voicebot's
 # _RETRY_HARD_TIMEOUT_S pattern (src/agents/voicebot.py), scaled for a text
 # chat turn rather than a spoken one.
-_CHAT_RETRY_TIMEOUT_S = 12.0
+#
+# This retry calls generate() with tool_mode="none" (a forced-final call),
+# which src/providers/llm/gemini.py can now turn into TWO serial requests
+# under one logical call: a cached attempt, and — only when that cached
+# attempt calls a tool anyway or comes back empty/whitespace-only (the
+# `forced_final` fallback path, ~gemini.py:770-818) — an uncached retry with
+# `tool_config` mode NONE enforced server-side. 12.0s was sized for a single
+# call; it's raised to 20.0s so the budget covers that cache-first-then-
+# fallback pair without needing to special-case which path a given retry
+# will take.
+_CHAT_RETRY_TIMEOUT_S = 20.0
 
 # Shown, with action="escalate", when the model produced nothing usable even
 # after its one retry. The parser's canned lines ("could you rephrase?", "could
@@ -257,6 +268,16 @@ _GENERIC_CATEGORY_LABEL = "some of your account details"
 # uses above. This is the actual runtime tool-call name apply_pii_guard's
 # safe_to_state exemption keys off of below.
 _PAYMENT_CONFIG_TOOL_NAME = "get_payment_config"
+
+# The three catalog tool names src/dialogue/packs/betting.py's
+# COMMON_LOOKUPS_BLOCK names by name ("call these together in your FIRST
+# round"). has_player_tools (below) is true if ANY player tool is declared,
+# which isn't enough to license that block — it must only appear when all
+# three of these specific tools actually exist for the turn, or the model is
+# told to call tools that aren't there.
+_COMMON_LOOKUP_TOOL_NAMES = frozenset((
+    "get_player_transactions", "get_player_latest_deposit_order", "get_player_wallet",
+))
 
 
 def _category_label(tool_name: str) -> str:
@@ -1038,6 +1059,16 @@ class ChatBotAgent(BaseAgent):
         store: SessionStore | None = None,
         guard_config: GuardConfig | None = None,
         max_context_chars: int = 2000,
+        # search_knowledge_base TOOL result caps (the production tools path --
+        # see KBToolResultConfig in src/config.py for the prod-cost numbers
+        # that motivated these). Independent of max_context_chars above,
+        # which only bounds the single-shot build_rag_context path.
+        # Defaults mirror KBToolResultConfig's own defaults so a construction
+        # site that doesn't thread these through from settings (e.g. this
+        # file's own unit tests) still gets a bounded tool result rather than
+        # an unbounded one.
+        kb_tool_top_k: int = 3,
+        kb_tool_chunk_max_chars: int = 1300,
         enable_tools: bool = False,
         crm_tools: list[ToolSpec] | None = None,
         crm_executor: CrmExecutor | None = None,
@@ -1130,6 +1161,8 @@ class ChatBotAgent(BaseAgent):
         self._cache_split_prompt = cache_split_prompt
         self._guard = guard_config
         self._max_context_chars = max_context_chars
+        self._kb_tool_top_k = kb_tool_top_k
+        self._kb_tool_chunk_max_chars = kb_tool_chunk_max_chars
         # Agentic tool-calling (opt-in): builtin tools (search KB / escalate /
         # offer call) + any tenant CRM tools. Off by default so the single-shot
         # RAG path is unchanged.
@@ -1810,7 +1843,9 @@ class ChatBotAgent(BaseAgent):
         # events build_rag_context logs, so an operator investigating a
         # hallucination via those events doesn't conclude a chunk named in a
         # "dropped for budget" event never reached the model -- it did, via
-        # the (untruncated) tool JSON, just not via this text.
+        # the tool JSON, just not via this text. (The tool JSON applies its
+        # OWN, separate caps -- kb_tool_top_k/kb_tool_chunk_max_chars, see
+        # _dispatch_tool's SEARCH_KB branch -- not this function's max_chars.)
         rag = build_rag_context(
             retrieved_all, max_chars=self._max_context_chars, purpose="citation_scope_only",
         )
@@ -1930,12 +1965,20 @@ class ChatBotAgent(BaseAgent):
         # Step 5 (ticket #1762): deterministic, model-independent check — runs
         # unconditionally, regardless of which branch above fired. Grounded
         # text = successful CRM/deposit-verification tool results + the FULL
-        # (untruncated) content of every KB chunk the model actually saw in a
-        # search_knowledge_base tool result — NOT rag.text, which
+        # retrieved content of every KB chunk in retrieved_all (i.e. every
+        # chunk search_combined returned for a search_knowledge_base call
+        # this turn, at most kb_tool_top_k per call) — NOT rag.text, which
         # build_rag_context separately truncates to max_context_chars (review
         # Fix 3: a real figure in a chunk truncated out of rag.text must still
-        # count as grounded, since the model itself read the full chunk in
-        # its own tool-result message) — + the customer's current query +
+        # count as grounded, since the model itself read the chunk in its own
+        # tool-result message). The SAME reasoning now also covers
+        # kb_tool_chunk_max_chars: a chunk's tool-result content can itself be
+        # cut (truncate_chunk_text, a word-boundary cut — see
+        # _dispatch_tool's SEARCH_KB branch), so "the model actually saw"
+        # this full text is no longer literally true for a long chunk —
+        # deliberately treated as grounded anyway, same as the rag.text case,
+        # rather than narrowing this guard to the model's own possibly-cut
+        # view of each chunk — + the customer's current query +
         # EVERY prior turn's content, both customer AND assistant (review Fix
         # 2: a number the bot already legitimately stated in an earlier turn,
         # e.g. "your balance is ₹2,075", must remain sayable in a later
@@ -2160,7 +2203,14 @@ class ChatBotAgent(BaseAgent):
         args = tc.arguments or {}
         if tc.name == SEARCH_KB:
             try:
-                chunks = await search_combined(args.get("query", ""), self._retrievers)
+                # top_k=self._kb_tool_top_k (not search_combined's own
+                # default of 5): this result is re-sent uncached on every
+                # later round of the turn, so fewer, higher-ranked chunks is
+                # the first cost lever -- see KBToolResultConfig in
+                # src/config.py. The highest-scoring chunks win regardless
+                # (search_combined sorts by score before slicing to top_k).
+                chunks = await search_combined(
+                    args.get("query", ""), self._retrievers, top_k=self._kb_tool_top_k)
             except Exception:  # noqa: BLE001 — a search failure (e.g. embedder
                 # unavailable) must not kill the turn; the model answers without RAG.
                 log.exception("knowledge search failed", extra={
@@ -2181,7 +2231,14 @@ class ChatBotAgent(BaseAgent):
             # chunk can't taint the others' framing. Deliberately NOT
             # restructured beyond that — same "results" list shape, same
             # content/source/score keys, just each content wrapped and a
-            # top-level warning note added once.
+            # top-level warning note added once. Each chunk's content is also
+            # capped at self._kb_tool_chunk_max_chars (truncate_chunk_text,
+            # a word-boundary cut — see src/rag/context_builder.py) before
+            # wrapping: a single long chunk would otherwise still dominate
+            # the result size even with top_k already trimmed above. The
+            # chunk's source tag (used for sources_used/citations) is
+            # unaffected — it comes from the chunk's metadata, not its
+            # content, so a truncated chunk still cites correctly.
             #
             # The wrapping decision itself (how many chunks, which tags) is
             # the thing built here -- the marker-neutralisation ALREADY logs
@@ -2204,7 +2261,7 @@ class ChatBotAgent(BaseAgent):
                         {
                             "content": (
                                 f"{SOURCES_OPEN_MARKER}\n"
-                                f"{neutralize_sources_markers(c.document.content, source=_chunk_source(c))}\n"
+                                f"{neutralize_sources_markers(truncate_chunk_text(c.document.content, self._kb_tool_chunk_max_chars), source=_chunk_source(c))}\n"
                                 f"{SOURCES_CLOSE_MARKER}"
                             ),
                             "source": _chunk_source(c),
@@ -2499,6 +2556,7 @@ class ChatBotAgent(BaseAgent):
                 extra_directives=extra,
                 has_player_tools=any(t.name in PLAYER_TOOLS for t in self._crm_tools),
                 has_operator_tools=any(t.name in OPERATOR_TOOLS for t in self._crm_tools),
+                has_common_lookup_tools=_COMMON_LOOKUP_TOOL_NAMES <= {t.name for t in self._crm_tools},
                 has_deposit_verification_tool=any(
                     t.name == SUBMIT_DEPOSIT_VERIFICATION for t in self._crm_tools
                 ),
@@ -2541,6 +2599,7 @@ class ChatBotAgent(BaseAgent):
             extra_directives=extra,
             has_player_tools=any(t.name in PLAYER_TOOLS for t in self._crm_tools),
             has_operator_tools=any(t.name in OPERATOR_TOOLS for t in self._crm_tools),
+            has_common_lookup_tools=_COMMON_LOOKUP_TOOL_NAMES <= {t.name for t in self._crm_tools},
             has_deposit_verification_tool=any(t.name == SUBMIT_DEPOSIT_VERIFICATION for t in self._crm_tools),
             tenant_timezone=self._tenant_timezone,
             prompt_pack=self._prompt_pack,

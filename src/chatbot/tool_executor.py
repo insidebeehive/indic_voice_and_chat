@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from datetime import datetime
 from typing import Optional
 from urllib.parse import quote
 
@@ -200,6 +201,168 @@ def _redact_url(url: str) -> str:
     """
     return _UUID_RE.sub(REDACTED_PLACEHOLDER, url or "")
 
+
+def _iter_list_locations(node: object):
+    """Yield ``(container, key)`` for every list value found anywhere in
+    *node*, however deeply nested — ``container[key]`` is that list, so
+    assigning ``container[key] = ...`` replaces it in place.
+
+    Walks into dict values and list items alike, so a list nested inside
+    another list's items (e.g. a per-market ``bet_types`` list, one level
+    inside the top-level ``markets`` list) is found too, not just top-level
+    lists — see _apply_result_size_budget's "nested lists" handling.
+    ``container`` is always a dict: a list value is only ever reachable
+    through the dict key that holds it, which is also what lets
+    _apply_result_size_budget attach a same-key-scoped truncation marker
+    next to it.
+    """
+    if isinstance(node, dict):
+        for k, v in node.items():
+            if isinstance(v, list):
+                yield (node, k)
+            yield from _iter_list_locations(v)
+    elif isinstance(node, list):
+        for item in node:
+            yield from _iter_list_locations(item)
+
+
+# Field names a CRM list item carries its own timestamp under, tried in this
+# order (see docs/crm-api-contract.md: "timestamp" on transactions,
+# "placed_at" on bets/matka bids, "created_at" on a deposit order, ...). Not
+# every list shape in the contract is sorted the same way — the transactions
+# example is oldest-first — so a budget cut can't assume "the head is the
+# newest" and must actually look at the data.
+_TIMESTAMP_KEYS = ("timestamp", "created_at", "placed_at", "date", "updated_at", "approved_at")
+
+
+def _parse_timestamp(value: object) -> Optional[float]:
+    """Parse *value* to a comparable epoch float, or None if it isn't a
+    recognisable timestamp.
+
+    Accepts an ISO 8601 string (``fromisoformat`` handles an offset like
+    ``+05:30``; a trailing ``Z`` is normalised to ``+00:00`` first, since
+    ``fromisoformat`` on the Python versions this runs under doesn't accept
+    ``Z`` itself) or an epoch number (int/float, or a numeric string).
+    Anything else — unparseable text, None, a bool, a nested structure —
+    returns None so the caller can fall back to keeping the head rather than
+    sorting on a guess.
+    """
+    if isinstance(value, bool):
+        return None  # bool is an int subclass; never treat True/False as an epoch
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return None
+        iso = s[:-1] + "+00:00" if s.endswith("Z") else s
+        try:
+            return datetime.fromisoformat(iso).timestamp()
+        except ValueError:
+            pass
+        try:
+            return float(s)
+        except ValueError:
+            return None
+    return None
+
+
+def _newest_first(items: list) -> Optional[list]:
+    """Rank *items* newest-first, for choosing which ones to KEEP when
+    trimming a list, using a timestamp field every item shares -- or None
+    if no such ordering can be trusted.
+
+    Returns a list of ``(original_index, item)`` pairs ranked by
+    ``(timestamp, original_index)`` descending -- newest first, ties
+    preferring the item later in the original list. This ranking picks
+    WHICH items survive a trim; it is deliberately not the output order.
+    The caller takes the first N pairs to keep, then sorts THOSE by
+    original_index to restore the list's original relative order before
+    writing it back — a trimmed list must come out in the same order as an
+    untrimmed one, just shorter.
+
+    Returns None (caller falls back to keeping the head, as for a list with
+    no timestamp at all) when: the items aren't all dicts, no single
+    _TIMESTAMP_KEYS field is present on every item, or any one item's value
+    under that field fails to parse — a partial/best-effort sort here would
+    risk silently keeping the WRONG items, which is worse than the old
+    behavior this replaces.
+    """
+    if not items or not all(isinstance(it, dict) for it in items):
+        return None
+    ts_key = next((k for k in _TIMESTAMP_KEYS if all(k in it for it in items)), None)
+    if ts_key is None:
+        return None
+    parsed = []
+    for idx, it in enumerate(items):
+        ts = _parse_timestamp(it.get(ts_key))
+        if ts is None:
+            return None
+        parsed.append((idx, ts, it))
+    parsed.sort(key=lambda triple: (triple[1], triple[0]), reverse=True)
+    return [(idx, it) for idx, _ts, it in parsed]
+
+
+def _apply_result_size_budget(result: dict, max_chars: int) -> dict:
+    """Shrink *result*'s longest list(s) until its JSON serialization fits
+    within *max_chars* — never cutting through an object, only ever
+    dropping whole trailing items; a result already under budget is
+    returned byte-identical (no mutation at all).
+
+    A shrunk list isn't always safe to cut from the head: docs/crm-api-
+    contract.md's own get_player_transactions example is oldest-first, so
+    keeping the head there would drop the newest item — the one a dispute
+    is usually about. So when a shrunk list's items are dicts that all carry
+    one of a small set of recognised timestamp fields (_TIMESTAMP_KEYS), the
+    kept items are the N NEWEST (see _newest_first), but written back out
+    in their ORIGINAL relative order — a trimmed list looks like the same
+    list with items missing, not reshuffled. Otherwise (no recognisable/
+    consistent timestamp field, or a value that fails to parse) the HEAD is
+    kept, same as before — the only ordering available without guessing,
+    and fine where order isn't meaningful anyway (e.g. matka markets
+    config).
+
+    Candidate lists (see _iter_list_locations — this covers nested lists
+    too) are tried largest-serialized-size first, since trimming the
+    biggest list makes the most progress per item dropped. Each one gets a
+    same-key-scoped marker, e.g. ``_bids_truncated``, so the model can tell
+    the customer there's more instead of silently seeing a partial list.
+    At least one item is always kept per shrunk list — this budget is
+    allowed to overshoot *max_chars* on a single huge item/list, but it
+    must never look like "no data" when there is some.
+    """
+    if len(json.dumps(result)) <= max_chars:
+        return result
+    candidates = sorted(
+        _iter_list_locations(result),
+        key=lambda c: len(json.dumps(c[0][c[1]])), reverse=True,
+    )
+    for container, key in candidates:
+        if len(json.dumps(result)) <= max_chars:
+            break
+        items = container[key]
+        original_len = len(items)
+        if original_len <= 1:
+            continue  # nothing to cut without emptying the one item it has
+        ranked = _newest_first(items)  # (original_index, item) pairs, newest first
+        marker_key = f"_{key}_truncated"
+        for keep_n in range(original_len - 1, 0, -1):
+            if ranked is not None:
+                # Keep the N newest, then restore original relative order.
+                kept = sorted(ranked[:keep_n], key=lambda pair: pair[0])
+                container[key] = [it for _idx, it in kept]
+            else:
+                container[key] = items[:keep_n]  # no trustworthy ordering -- keep the head
+            container[marker_key] = (
+                f"showing {keep_n} of {original_len} items; if what you need "
+                f"isn't here, call this tool again with a narrower filter "
+                f"(e.g. market_name, type or a smaller limit)"
+            )
+            if len(json.dumps(result)) <= max_chars:
+                break
+    return result
+
+
 # Read timeout for one CRM HTTP call. Was tightened to 10s during the 2026-08
 # relay-timeout incident fix, on the theory that a short timeout would keep
 # the chat WS from going quiet long enough for the CRM's downstream relay to
@@ -231,6 +394,16 @@ def _redact_url(url: str) -> str:
 # _TURN_TIMEOUT_S (src/api/chat.py) the way it previously was.
 _DEFAULT_CRM_TOOL_TIMEOUT_S = 35.0
 
+# Fallback default for callers (e.g. a direct/manual call to
+# execute_crm_tool) that don't pass an explicit per-tenant budget — mirrors
+# _DEFAULT_CRM_TOOL_TIMEOUT_S's role just above. The real, settings-driven
+# value is ChatToolsConfig.crm_result_max_chars (src/config.py), threaded
+# through by src/bootstrap.py's crm_executor on every production call.
+# Prod data (2026-09) showed get_matka_bids alone averaging ~10KB/call with
+# a p95 of ~32KB across 682 calls/15d, re-sent uncached on every later round
+# of the same turn — see _apply_result_size_budget below.
+_DEFAULT_CRM_RESULT_MAX_CHARS = 6000
+
 
 async def execute_crm_tool(
     *,
@@ -247,6 +420,7 @@ async def execute_crm_tool(
     extra_headers: Optional[dict] = None,
     http_client: object = None,
     timeout_s: float = _DEFAULT_CRM_TOOL_TIMEOUT_S,
+    result_max_chars: int = _DEFAULT_CRM_RESULT_MAX_CHARS,
 ) -> dict:
     context = context or {}
     values: dict = {}
@@ -386,15 +560,23 @@ async def execute_crm_tool(
             # at all and was invisible to any failure check downstream.
             result["failure"] = "http_error"
             result["error"] = f"The upstream service returned an error (HTTP {resp.status_code})."
+        # Size budget, AFTER redaction so the budget is spent on real content
+        # rather than on ids this result never sends anyway, and BEFORE the
+        # result_chars log below so that number (and
+        # src/agents/chatbot.py's out_json/chat_tool_metrics.result_chars,
+        # which re-serializes this same returned dict) both measure what the
+        # model actually receives, not the pre-trim size.
+        result = _apply_result_size_budget(result, result_max_chars)
         log.info("crm tool response", extra={
             "ticket_id": ticket_id, "session_id": session_id,
             "url": _redact_url(url), "status_code": resp.status_code,
             # Measures the same dict that becomes the tool message content
             # sent to the model (src/agents/chatbot.py's out_json), i.e.
-            # this result AFTER _redact_internal_ids and the failure-key
-            # additions above -- not the raw wire body -- so it's directly
-            # comparable to chat_tool_metrics.result_chars. The body itself
-            # is still never logged, only its length.
+            # this result AFTER _redact_internal_ids, the failure-key
+            # additions above, AND the size-budget trim just above -- not the
+            # raw wire body -- so it's directly comparable to
+            # chat_tool_metrics.result_chars. The body itself is still never
+            # logged, only its length.
             "result_chars": len(json.dumps(result)),
         })
         return result

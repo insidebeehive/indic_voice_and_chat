@@ -39,6 +39,8 @@ PLAYER_SCOPE_NO_TOOLS = (
 
 WITHDRAWAL_STATUS_BLOCK = ""
 
+COMMON_LOOKUPS_BLOCK = ""
+
 OPERATOR_SCOPE_WITH_TOOLS = (
     "3. BUSINESS/PLATFORM — any fact about how THIS business is configured or run, not "
     "just the customer's own account. Examples only, not the full list: pricing, plans, "

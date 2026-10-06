@@ -653,30 +653,31 @@ class GeminiLLMAdapter(ILLMProvider):
             cache_name, cache_key = self._cache_lookup_and_arm(
                 model, system, gen_config.get("tools"),
             )
-            if cache_name and gen_config.get("tool_config"):
-                # Same restriction as system_instruction/tools below —
-                # "CachedContent can not be used with GenerateContent request
-                # setting system_instruction, tools or tool_config" — applies
-                # to tool_config too. google-genai's CreateCachedContentConfig
-                # DOES accept a tool_config (as of 2.2.0) — _create_cache
-                # above just never passes one, since building AND arming a
-                # second, NONE-mode cache variant purely for this rare
-                # forced-final-answer call (see tool_mode="none" in
-                # chatbot.py) would roughly double cache storage/creation
-                # traffic for a call that isn't the hot path. Skipping the
-                # cache here instead is a deliberate tradeoff, not a
-                # technical impossibility. Silently dropping tool_config to
-                # keep the cache, though, would defeat the whole point of
-                # tool_mode="none" (the model could still call a tool we
-                # explicitly forbade) — so this call goes uncached instead.
-                # The lookup above (_cache_lookup_and_arm) already ran and
-                # updated sightings/last_used/creation-scheduling normally —
-                # only the DECISION to use cache_name on THIS request is
-                # skipped, so the registry stays consistent and a later call
-                # without tool_config can still hit the cache.
-                debug_event(log, "gemini cache skipped: tool_config incompatible",
-                            model=model, cache_key=cache_key)
-                cache_name = None
+
+        # `tool_config` (tool_mode="none") used to mean an automatic, silent
+        # cache skip right here: the Developer API 400s on `cached_content`
+        # combined with `tool_config`, so this call always went out as a
+        # full uncached request instead. That was costed as "rare" but
+        # measured wrong — in production ~20% of chat turns hit
+        # tool_mode="none" (chatbot.py's forced-final-answer call after
+        # max_tool_rounds, plus its unusable-response retry — see
+        # _retry_if_unusable), and together they ran ~43% of LLM cost by
+        # going out uncached at ~11k prompt tokens apiece, every time.
+        #
+        # So instead: when a cache is armed, try it WITHOUT `tool_config` —
+        # the forced-final instruction already appended to the message
+        # history (_FORCED_FINAL_ANSWER_INSTRUCTION /
+        # _UNUSABLE_RETRY_ANSWER_INSTRUCTION in chatbot.py) tells the model
+        # to answer now, so `tool_config` is usually belt-and-braces, not
+        # load-bearing. If the model ignores that and calls a tool anyway,
+        # the cached response is discarded and the SAME request is
+        # re-issued exactly as before this change: uncached, with
+        # `tool_config` mode NONE, which the API enforces server-side and
+        # can't be talked out of. See the `tool_calls` check below, after
+        # the response comes back, for where that fallback happens — this
+        # trades a cache-incompatible call for an occasional second call,
+        # not for an uncached one on every single forced-final turn.
+        forced_final = bool(gen_config.get("tool_config"))
 
         if cache_name:
             # A request carrying `cached_content` must not ALSO carry
@@ -685,8 +686,10 @@ class GeminiLLMAdapter(ILLMProvider):
             # with "CachedContent can not be used with GenerateContent
             # request setting system_instruction, tools or tool_config."
             # Whatever the cache holds is implicitly part of the prompt
-            # already. (tool_config is additionally excluded above, before
-            # this branch is even reached, whenever it's set — see there.)
+            # already — true whether or not this call also wanted
+            # `tool_config` (`forced_final` above): `tool_config` is simply
+            # dropped from the wire request here, not used as a reason to
+            # skip the cache.
             gen = {k: v for k, v in gen_config.items() if k not in ("tools", "tool_config")}
             gen["cached_content"] = cache_name
         else:
@@ -752,14 +755,76 @@ class GeminiLLMAdapter(ILLMProvider):
                 ),
                 what="generate",
             )
+            # `fallback` already carries `tool_config` as-is (whatever
+            # gen_config held), so this response can't come back with a
+            # function call when forced_final is set — nothing left to
+            # reconcile below, and the cache was never actually used for
+            # this response (hence clearing it, not just leaving it set).
+            cache_name = None
+
         text = self._extract_text(response)
         usage = self._extract_usage(response)
         finish_reason = self._extract_finish_reason(response)
         tool_calls = self._extract_tool_calls(response)
+
+        if cache_name and forced_final:
+            # Fall back whenever the cached attempt either (a) called a tool
+            # anyway, or (b) came back with nothing usable to say -- the
+            # latter covers Gemini returning finish_reason
+            # MALFORMED_FUNCTION_CALL/UNEXPECTED_TOOL_CALL with no parts at
+            # all: empty text AND no tool_calls, which the cached request
+            # (no `tool_config` -- see the comment above `forced_final`) can
+            # provoke just as the "called a tool anyway" case can. Either way
+            # the customer must not see a blank reply, so the same uncached,
+            # `tool_config`-NONE retry handles both.
+            fallback_reason = "tool_calls" if tool_calls else (
+                "empty" if not text or not text.strip() else None
+            )
+            if fallback_reason:
+                # The forced-final instruction in the message history didn't
+                # stick — the model called a tool anyway even though this
+                # (cached) request carried no `tool_config` telling it not
+                # to (or it returned nothing usable at all). Discard the
+                # response entirely and re-issue the exact request this call
+                # would have sent before the cache existed: uncached, with
+                # `tool_config` mode NONE, which the Developer API enforces
+                # server-side. Costs a second call, but only on the minority
+                # of forced-final turns where the soft nudge wasn't enough —
+                # see the comment above `forced_final`.
+                debug_event(log, "gemini cache forced_final_fallback", model=model,
+                            cache_key=cache_key, reason=fallback_reason,
+                            tool_call_names=[t.name for t in tool_calls])
+                log.info(
+                    "gemini forced_final fallback: model=%s reason=%s",
+                    model, fallback_reason,
+                )
+                fallback = {k: v for k, v in gen_config.items() if k != "cached_content"}
+                if system:
+                    fallback["system_instruction"] = system
+                response = await self._call_with_retry(
+                    lambda: self._client.aio.models.generate_content(
+                        model=model,
+                        contents=contents,
+                        config=fallback,
+                    ),
+                    what="generate",
+                )
+                # Both calls were real spend against this one logical turn —
+                # summed so cost metrics reflect what was actually billed,
+                # not just the (discarded) first attempt's usage.
+                usage = self._sum_usage(usage, self._extract_usage(response))
+                text = self._extract_text(response)
+                finish_reason = self._extract_finish_reason(response)
+                tool_calls = self._extract_tool_calls(response)
+            else:
+                debug_event(log, "gemini cache forced_final_cached", model=model,
+                            cache_key=cache_key)
+
         raw = _dump(response)
-        # Covers both the cache-hit and the stale-cache-fallback path above —
-        # both flow through this one return, so one log line here is the
-        # complete response boundary regardless of which branch produced it.
+        # Covers the cache-hit, forced-final (cached or fallen-back), and
+        # stale-cache-fallback paths above — all flow through this one
+        # return, so one log line here is the complete response boundary
+        # regardless of which branch produced it.
         debug_event(log, "gemini generate response", model=model, text=text,
                     finish_reason=finish_reason, usage=usage,
                     tool_calls=tool_calls, raw_response=raw)
@@ -933,6 +998,17 @@ class GeminiLLMAdapter(ILLMProvider):
             # Optional — absent on older SDK responses or when nothing was cached.
             "cached_tokens": getattr(u, "cached_content_token_count", 0) or 0,
         }
+
+    @staticmethod
+    def _sum_usage(first: dict, second: dict) -> dict:
+        """Add two ``_extract_usage`` dicts together — used by the
+        forced-final cache fallback, where a discarded cached call and the
+        uncached call that replaced it are both real spend against the same
+        logical turn. Either side can be ``{}`` (e.g. a response with no
+        ``usage_metadata``); missing keys count as 0 rather than dropping
+        the whole total."""
+        keys = {"prompt_tokens", "completion_tokens", "cached_tokens"}
+        return {k: first.get(k, 0) + second.get(k, 0) for k in keys}
 
     @staticmethod
     def _extract_finish_reason(response: Any) -> str:

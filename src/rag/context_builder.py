@@ -315,12 +315,15 @@ def build_rag_context(
     while ``ChatBot._handle_with_tools`` (the production tools-enabled path)
     only uses the returned ``.source_tags``/``.chunk_count`` for
     ``apply_hallucination_guard`` — ``.text`` itself is discarded there, and
-    the model instead receives the KB content, untruncated, via a
-    ``role="tool"`` message (see the call site's own comment). Without this,
-    an operator who greps ``rag context chunk_dropped_for_budget`` on the
-    tools path and sees a chunk named there wrongly concludes the model never
-    saw it — it did, via the tool JSON, just not via this budget-limited
-    text. Log the value; do not use it to change what this function does.
+    the model instead receives the KB content via a ``role="tool"`` message
+    (see the call site's own comment), capped independently there by
+    ``kb_tool_top_k``/``kb_tool_chunk_max_chars`` (``truncate_chunk_text``
+    below), NOT by this function's ``max_chars`` budget. Without this, an
+    operator who greps ``rag context chunk_dropped_for_budget`` on the tools
+    path and sees a chunk named there wrongly concludes the model never saw
+    it — it did (at least in part — see ``truncate_chunk_text``), via the
+    tool JSON, just not via this budget-limited text. Log the value; do not
+    use it to change what this function does.
     """
     if not chunks:
         # Empty retrieval feeding an otherwise-normal turn is exactly the
@@ -375,6 +378,31 @@ def build_rag_context(
         source_tags=tags,
         chunk_count=len(parts),
     )
+
+
+def truncate_chunk_text(text: str, max_chars: int) -> str:
+    """Cut *text* to at most *max_chars*, breaking on a word boundary rather
+    than mid-word.
+
+    Used by ``ChatBot._dispatch_tool``'s SEARCH_KB branch to cap each kept
+    chunk's content before it goes into the search_knowledge_base tool
+    result (``kb_tool_chunk_max_chars`` -- see ``KBToolResultConfig`` in
+    src/config.py). Unlike ``build_rag_context`` above, which only ever cuts
+    on CHUNK boundaries and leaves each kept chunk's content whole, this cuts
+    WITHIN a chunk -- the tool path sends every one of its (now few) chunks
+    in full on every later round of the turn, uncached, so a single long
+    chunk still dominates the result size even after ``kb_tool_top_k`` trims
+    the chunk count.
+
+    A trailing ``"..."`` marks a cut; the whole return value (ellipsis
+    included) never exceeds ``max_chars``. No-op when *text* already fits.
+    """
+    if len(text) <= max_chars:
+        return text
+    limit = max(0, max_chars - 3)  # room for the trailing "..."
+    cut = text.rfind(" ", 0, limit)
+    head = text[:cut] if cut > 0 else text[:limit]
+    return head.rstrip() + "..."
 
 
 def _source_tag(chunk: RetrievedChunk) -> str:

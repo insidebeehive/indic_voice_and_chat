@@ -156,6 +156,50 @@ async def test_search_tool_result_neutralizes_marker_reopen_escape(retriever) ->
 
 
 @pytest.mark.asyncio
+async def test_search_tool_result_respects_chunk_cap_and_keeps_top_ranked_sources(
+    tmp_faiss_index: str,
+) -> None:
+    """kb_tool_chunk_max_chars caps each kept chunk's content (word-boundary
+    cut, src.rag.context_builder.truncate_chunk_text); kb_tool_top_k caps how
+    many chunks are kept. A chunk's source tag (used for sources_used /
+    citations) comes from its metadata, not its content, so it still
+    resolves correctly even when the content itself was cut."""
+    store = FAISSAdapter({"embedding_dim": 64, "index_path": tmp_faiss_index})
+    r = HybridRetriever(
+        embedder=HashEmbedder(dim=64), vector_store=store,
+        config=RetrievalConfig(strategy="hybrid", top_k=5, oversample_k=8,
+                               similarity_threshold=0.0))
+    long_text = "Plan B has 500GB unlimited data. " + ("Extra detail. " * 50)
+    await r.index([
+        Document(id="c1", content=long_text,
+                 metadata={"filename": "plans.pdf", "page": 2}),
+        Document(id="c2", content="Plan A is 100GB for Rs 199.",
+                 metadata={"filename": "plans.pdf", "page": 1}),
+        Document(id="c3", content="Biryani recipe.", metadata={"filename": "cookbook.md"}),
+    ])
+
+    llm = ScriptedLLM([
+        LLMResult(text="", finish_reason="tool_calls", tool_calls=[
+            ToolCall(id="t1", name="search_knowledge_base", arguments={"query": "Plan B"})]),
+        LLMResult(text="Plan B has 500GB unlimited data.", finish_reason="stop"),
+    ])
+    agent = _agent(llm, r, kb_tool_top_k=2, kb_tool_chunk_max_chars=100)
+    await agent.handle_message("Tell me about Plan B")
+
+    second = llm.calls[1][0]
+    tool_msg = next(m for m in second if m.role == "tool" and m.name == "search_knowledge_base")
+    payload = json.loads(tool_msg.content)
+    assert len(payload["results"]) <= 2  # kb_tool_top_k
+    for entry in payload["results"]:
+        # Strip the SOURCES_OPEN_MARKER/SOURCES_CLOSE_MARKER wrapper to get
+        # at the capped body itself.
+        body = entry["content"].split("\n", 1)[1].rsplit("\n", 1)[0]
+        assert len(body) <= 100
+    # The long chunk's content was cut, but its source tag still resolves.
+    assert any(entry["source"] == "plans.pdf:2" for entry in payload["results"])
+
+
+@pytest.mark.asyncio
 async def test_tool_loop_sums_usage_across_rounds(retriever) -> None:
     """A turn with a tool round + a final answer round must sum usage from
     BOTH generate() calls — a chat turn is not one LLM call."""

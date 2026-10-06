@@ -180,7 +180,7 @@ Hot issues (live incident notices):
 - `PUT/GET /hot-issues`: a tenant's own set, authenticated with `current_tenant`. That means the tenant's own token, or an admin token plus `X-Tenant-Slug`.
 - `PUT/GET /crms/{crm_id}/hot-issues`: a CRM-wide set, admin only (`require_admin`). Every tenant linked to that CRM sees it.
 - **Replace semantics:** a PUT replaces the scope's whole set in one transaction, and `{"issues": []}` clears it. A missing tenant or CRM row returns 404. The partner-facing contract (fields, limits, writing guidance) is in `docs/crm-api-contract.md` under "Hot Issues".
-- **Storage:** notices live in their own `hot_issues` table, not the KB. The KB is reached only through `search_knowledge_base`, and voice truncates it to a budget, so a notice stored there could go unseen.
+- **Storage:** notices live in their own `hot_issues` table, not the KB. The KB is reached only through `search_knowledge_base`, and both voice and chat cap it to a budget (chat: `kb_tool_top_k` chunks, each capped at `kb_tool_chunk_max_chars`), so a notice stored there could go unseen.
 - **How the bot sees them:** `src/chatbot/hot_issues.py` loads the union of a tenant's own and its CRM's active notices, tenant first. It renders them as one delimited, defanged block that carries its own usage lead.
   - **Chat:** the block goes into the per-turn tail on every tools-path turn, so a change applies mid-session.
   - **Voice:** the block is added to the prompt once, at call start. A notice cleared mid-call still reaches the call already in progress.

@@ -785,6 +785,7 @@ def build_chatbot_system_prompt(
     extra_directives: Optional[list[str]] = None,
     has_player_tools: bool = False,
     has_operator_tools: bool = False,
+    has_common_lookup_tools: bool = False,
     has_deposit_verification_tool: bool = False,
     tenant_timezone: str = "Asia/Kolkata",
     prompt_pack: str = "generic",
@@ -795,6 +796,13 @@ def build_chatbot_system_prompt(
     hot_issues: Optional[str] = None,
 ) -> str:
     """System prompt for the RAG-powered ChatBot agent (Phase 4).
+
+    ``has_common_lookup_tools`` gates COMMON_LOOKUPS_BLOCK, which names
+    ``get_player_transactions``, ``get_player_latest_deposit_order`` and
+    ``get_player_wallet`` by name — so, unlike ``has_player_tools`` (true if
+    ANY player tool is declared), this must be true only when all three of
+    those specific tools are actually registered for the turn; otherwise the
+    block would tell the model to call tools that aren't there.
 
     ``bot_name`` / ``bot_gender`` are the AI agent's name and gender as the
     CRM sent them at session creation (CreateSessionRequest). Both optional:
@@ -952,6 +960,7 @@ def build_chatbot_system_prompt(
         + pack.TIER1_GENERAL.format(company_name=company_name)
         + player_scope
         + pack.WITHDRAWAL_STATUS_BLOCK
+        + (pack.COMMON_LOOKUPS_BLOCK if has_common_lookup_tools else "")
         + operator_scope
         + f"4. UNRELATED to {company_name} — you are not a general assistant. A greeting or "
         f"small talk ('hi', 'kaise ho', 'thank you') gets one warm line plus an offer to help "
@@ -977,6 +986,11 @@ def build_chatbot_system_prompt(
         "Before every reply, reason about what the customer is actually asking given the full "
         "conversation context. Short or vague messages ('which ones?', 'list all', 'more', '?', "
         "'tell me', 'what variety') carry intent from the conversation — infer it and act on it. "
+        "A message that only acknowledges or thanks ('ok', 'ok sir', 'thanks', 'tq', 'k', 'hmm') "
+        "is not a new request: reply in one short line from the conversation without calling any "
+        "tool, unless they say the problem is still there or ask something new. A 'yes'/'haan' "
+        "answering a question you asked is different — act on what you asked (e.g. connect them "
+        "if you offered). "
         "If any available tool could give real, specific data relevant to the current topic, call "
         "it. Pick the tool that gives the deepest answer for the inferred intent — not necessarily "
         "the same tool as before; a follow-up may warrant a different tool that goes deeper. "
@@ -1246,6 +1260,7 @@ def build_chatbot_system_prompt(
         company_name=company_name, language_default=language_default,
         prompt_pack=prompt_pack, has_player_tools=has_player_tools,
         has_operator_tools=has_operator_tools,
+        has_common_lookup_tools=has_common_lookup_tools,
         has_deposit_verification_tool=has_deposit_verification_tool,
         tenant_timezone=tenant_timezone, include_variable_tail=include_variable_tail,
         rag_context_chars=len(rag_context) if rag_context else 0,

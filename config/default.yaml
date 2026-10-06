@@ -119,6 +119,23 @@ rag:
     # same apply_hallucination_guard hazard the paragraph above already
     # describes.
     similarity_threshold: 0.0
+  # Caps on the search_knowledge_base TOOL result (the production chat path,
+  # src/agents/chatbot.py's _handle_with_tools) -- distinct from top_k above,
+  # which only bounds the single-shot build_rag_context path. This content
+  # is re-sent uncached on every later round of the same turn, so it is the
+  # dominant per-turn cost driver measured in prod (see KBToolResultConfig
+  # in src/config.py for the numbers). top_k: how many chunks that branch
+  # asks for; chunk_max_chars: a per-chunk, word-boundary cap applied before
+  # the chunk goes in the tool result.
+  kb_tool_result:
+    top_k: 3
+    chunk_max_chars: 1300
+
+# Caps on tenant CRM tool results sent to the chat LLM (see ChatToolsConfig
+# in src/config.py). Applied after PII/internal-id redaction, in
+# src/chatbot/tool_executor.py's execute_crm_tool.
+chat_tools:
+  crm_result_max_chars: 6000
 
 compliance:
   calling_hours:

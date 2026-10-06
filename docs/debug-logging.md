@@ -242,8 +242,10 @@ on production, wrong.
 `build_rag_context` has two callers. `_single_shot` composes its `text` into
 the system prompt. `_handle_with_tools` — the production chat path, per
 `bootstrap.py` — does not: there `rag.text` is discarded and KB content reaches
-the model as a `role="tool"` message instead, untruncated. The built context
-survives only to give `apply_hallucination_guard` its citation scope.
+the model as a `role="tool"` message instead, capped independently there
+(`kb_tool_top_k`/`kb_tool_chunk_max_chars`, not this function's `max_chars`).
+The built context survives only to give `apply_hallucination_guard` its
+citation scope.
 
 So on production the event fired for a truncation that did not affect what the
 model saw. An operator investigating a hallucination would read

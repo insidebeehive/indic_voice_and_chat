@@ -66,6 +66,14 @@ WITHDRAWAL_STATUS_BLOCK = (
     "all without having retrieved the status first.\n"
 )
 
+COMMON_LOOKUPS_BLOCK = (
+    "COMMON LOOKUPS — call these together in your FIRST round, not one after another:\n"
+    "  - Deposit not credited / deposit status: get_player_transactions (type deposit) + get_player_latest_deposit_order + get_player_wallet.\n"
+    "  - Withdrawal status / not received: get_player_transactions (type withdrawal) + get_player_wallet.\n"
+    "  - Balance or \"where is my money\": get_player_wallet + get_player_transactions.\n"
+    "  If a result shows you need something else, a second round is fine; a third should be rare.\n"
+)
+
 OPERATOR_SCOPE_WITH_TOOLS = (
     "3. OPERATOR/PLATFORM — any fact about how THIS operator/tenant is configured or "
     "run, not just the customer's own account. Examples only, not the full list: "

@@ -283,9 +283,33 @@ class RetrievalSettings(BaseModel):
         return self
 
 
+class KBToolResultConfig(BaseModel):
+    """Caps on the ``search_knowledge_base`` TOOL result (``rag.kb_tool_result``
+    in config/default.yaml) -- distinct from ``retrieval.top_k`` above, which
+    only bounds the single-shot ``build_rag_context`` path
+    (``ChatBot._single_shot``).
+
+    The agentic tools path (``ChatBot._handle_with_tools``, the production
+    chat path per ``src/bootstrap.py``) sends each retrieved chunk's content
+    straight into a ``role="tool"`` message, and that message is re-sent
+    uncached on every later round of the same turn (see
+    ``src/agents/chatbot.py``'s ``_dispatch_tool`` SEARCH_KB branch). Prod
+    data (2026-09) showed this averaging ~10KB/call across 6.4k calls/15d --
+    ``top_k`` bounds how many chunks that branch asks ``search_combined`` for,
+    ``chunk_max_chars`` bounds each kept chunk's content (word-boundary cut,
+    not a mid-word truncation) before it goes in the tool result. Citations
+    are unaffected: each chunk's source tag travels with its (possibly
+    shortened) content, so ``sources_used`` still resolves correctly.
+    """
+
+    top_k: int = 3
+    chunk_max_chars: int = 1300
+
+
 class RAGConfig(BaseModel):
     chunking: ChunkingConfig = Field(default_factory=ChunkingConfig)
     retrieval: RetrievalSettings = Field(default_factory=RetrievalSettings)
+    kb_tool_result: KBToolResultConfig = Field(default_factory=KBToolResultConfig)
 
 
 class CallingHours(BaseModel):
@@ -308,6 +332,26 @@ class MediaStorageConfig(BaseModel):
     bucket: str = "chat-media"
     region: str = "auto"
     signed_url_ttl_seconds: int = 3600
+
+
+class ChatToolsConfig(BaseModel):
+    """Caps on tenant CRM tool results sent to the chat LLM (``chat_tools``
+    in config/default.yaml).
+
+    ``src/chatbot/tool_executor.py``'s ``execute_crm_tool`` applies this
+    budget to the JSON result AFTER ``_redact_internal_ids`` -- same
+    uncached-every-round cost shape as the KB tool result above (see
+    ``KBToolResultConfig``): prod data (2026-09) showed ``get_matka_bids``
+    alone averaging ~10KB/call with a p95 of ~32KB across 682 calls/15d.
+    A result already under budget is returned byte-identical; an
+    over-budget result has its longest list(s) cut to N items (never through
+    an object): the N newest when every item carries a parseable timestamp,
+    otherwise the first N, kept in their original order. A
+    ``_<list_key>_truncated`` marker is added alongside so the model knows
+    the list is partial and can call the tool again with a narrower filter.
+    """
+
+    crm_result_max_chars: int = 6000
 
 
 # --- Top-level settings ---------------------------------------------------
@@ -414,6 +458,7 @@ class Settings(BaseModel):
     rag: RAGConfig
     compliance: ComplianceConfig
     media_storage: Optional[MediaStorageConfig] = None
+    chat_tools: ChatToolsConfig = Field(default_factory=ChatToolsConfig)
 
     secrets: Secrets
 

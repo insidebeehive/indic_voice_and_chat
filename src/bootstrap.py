@@ -657,6 +657,7 @@ def make_chatbot_factory(registry, sessionmaker=None, crm_retrievers: "PerCrmRet
     from src.chatbot.deposit_verification import submit_deposit_verification
     from src.chatbot.tool_executor import execute_crm_tool
     from src.chatbot.tools import SUBMIT_DEPOSIT_VERIFICATION_TOOL_SPEC
+    from src.config import get_settings
 
     async def _load_crm_tools_uncached(tenant: TenantContext):
         """Return (tool_specs, {name: exec_spec}) for the tenant's CRM tools.
@@ -769,7 +770,8 @@ def make_chatbot_factory(registry, sessionmaker=None, crm_retrievers: "PerCrmRet
                 x_api_key=spec.get("x_api_key"),
                 extra_headers=spec.get("extra_headers"),
                 session_id=bare_session_id, ticket_id=ticket_id,
-                timeout_s=timeout_s)
+                timeout_s=timeout_s,
+                result_max_chars=get_settings().chat_tools.crm_result_max_chars)
 
         tool_specs = list(crm_specs)
         dv_config = getattr(tenant.settings, "deposit_verification", None)
@@ -889,6 +891,8 @@ def make_chatbot_factory(registry, sessionmaker=None, crm_retrievers: "PerCrmRet
             # existed.
             cache_split_prompt=cache_split_prompt,
             store=registry.session_stores.get(tenant),
+            kb_tool_top_k=get_settings().rag.kb_tool_result.top_k,
+            kb_tool_chunk_max_chars=get_settings().rag.kb_tool_result.chunk_max_chars,
             enable_tools=True,
             crm_tools=tool_specs,
             crm_executor=crm_executor,

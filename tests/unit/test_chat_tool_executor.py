@@ -1244,3 +1244,183 @@ async def test_crm_tool_call_log_drops_type_value_that_is_not_a_filter_word(capl
     record = [r for r in caplog.records if r.getMessage() == "crm tool call"][0]
     assert record.__dict__.get("filter_params") == {}
     assert junk not in repr(record.__dict__)
+
+
+# --- CRM result size budget (_apply_result_size_budget) ------------------
+
+
+@pytest.mark.asyncio
+async def test_crm_result_under_budget_is_byte_identical() -> None:
+    payload = {
+        "transactions": [
+            {"id": "txn_001", "type": "deposit", "amount": 2000.0, "status": "success"},
+            {"id": "txn_002", "type": "casino", "amount": -350.0, "status": "settled"},
+        ],
+        "total": 2,
+    }
+    client = _FakeClient(payload)
+    out = await execute_crm_tool(
+        endpoint="https://crm.example.com/api/players/p1/transactions",
+        method="GET", parameters={}, auth_type=None, token=None, args={},
+        http_client=client, result_max_chars=6000,
+    )
+    assert out == {"status_code": 200, "data": payload}
+    assert "_transactions_truncated" not in out["data"]
+
+
+@pytest.mark.asyncio
+async def test_crm_result_over_budget_oldest_first_list_keeps_newest_items() -> None:
+    """docs/crm-api-contract.md's get_player_transactions example is
+    oldest-first, so a budget cut must not just keep the head -- that would
+    drop the newest item, which is the one a dispute is usually about. The
+    kept items must still come out in the list's original (oldest-first)
+    order -- only WHICH items survive is decided by recency, not the order
+    they're written back in."""
+    items = [
+        {"id": f"txn_{i:03d}", "amount": i, "status": "settled",
+         "timestamp": f"2026-06-01T00:00:{i:02d}Z"}
+        for i in range(1, 51)  # strictly increasing -- oldest (i=1) first
+    ]
+    payload = {"transactions": items, "total": 50}
+    client = _FakeClient(payload)
+    out = await execute_crm_tool(
+        endpoint="https://crm.example.com/api/players/p1/transactions",
+        method="GET", parameters={}, auth_type=None, token=None, args={},
+        http_client=client, result_max_chars=1000,
+    )
+    data = out["data"]
+    kept = data["transactions"]
+    assert 0 < len(kept) < 50
+    # The surviving items are the newest N (the tail of the oldest-first
+    # original list) -- but kept in their ORIGINAL relative order, not
+    # reversed/newest-first.
+    assert kept == items[-len(kept):]
+    assert data["_transactions_truncated"] == (
+        f"showing {len(kept)} of 50 items; if what you need isn't here, call this "
+        f"tool again with a narrower filter (e.g. market_name, type or a smaller limit)"
+    )
+    assert len(json.dumps(out)) <= 1000
+
+
+@pytest.mark.asyncio
+async def test_crm_result_under_budget_with_timestamps_is_byte_identical() -> None:
+    """An under-budget list that DOES carry a recognised timestamp field
+    must still come back unreordered -- the newest-first ranking only ever
+    kicks in to decide what to DROP, never to reorder a list that fits."""
+    items = [
+        {"id": f"txn_{i:03d}", "amount": i, "status": "settled",
+         "timestamp": f"2026-06-01T00:00:{i:02d}Z"}
+        for i in range(1, 4)  # oldest-first, well under budget
+    ]
+    payload = {"transactions": items, "total": 3}
+    client = _FakeClient(payload)
+    out = await execute_crm_tool(
+        endpoint="https://crm.example.com/api/players/p1/transactions",
+        method="GET", parameters={}, auth_type=None, token=None, args={},
+        http_client=client, result_max_chars=6000,
+    )
+    assert out == {"status_code": 200, "data": payload}
+    assert "_transactions_truncated" not in out["data"]
+
+
+@pytest.mark.asyncio
+async def test_crm_result_over_budget_list_with_no_timestamp_keeps_head() -> None:
+    """No recognisable timestamp field on the items -- the old head-keeping
+    behavior, since there's no ordering the code can trust."""
+    items = [{"id": f"txn_{i:03d}", "amount": i, "status": "settled"} for i in range(1, 51)]
+    payload = {"transactions": items, "total": 50}
+    client = _FakeClient(payload)
+    out = await execute_crm_tool(
+        endpoint="https://crm.example.com/api/players/p1/transactions",
+        method="GET", parameters={}, auth_type=None, token=None, args={},
+        http_client=client, result_max_chars=1000,
+    )
+    data = out["data"]
+    kept = data["transactions"]
+    assert 0 < len(kept) < 50
+    assert kept == items[: len(kept)]
+    assert data["_transactions_truncated"] == (
+        f"showing {len(kept)} of 50 items; if what you need isn't here, call this "
+        f"tool again with a narrower filter (e.g. market_name, type or a smaller limit)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_crm_result_over_budget_list_with_unparseable_timestamp_keeps_head() -> None:
+    """One item's timestamp doesn't parse -- the whole list falls back to
+    head-keeping rather than risk sorting on a guess."""
+    items = [
+        {"id": f"txn_{i:03d}", "amount": i, "status": "settled",
+         "timestamp": "not-a-date" if i == 25 else f"2026-06-01T00:00:{i:02d}Z"}
+        for i in range(1, 51)
+    ]
+    payload = {"transactions": items, "total": 50}
+    client = _FakeClient(payload)
+    out = await execute_crm_tool(
+        endpoint="https://crm.example.com/api/players/p1/transactions",
+        method="GET", parameters={}, auth_type=None, token=None, args={},
+        http_client=client, result_max_chars=1000,
+    )
+    data = out["data"]
+    kept = data["transactions"]
+    assert 0 < len(kept) < 50
+    assert kept == items[: len(kept)]
+
+
+@pytest.mark.asyncio
+async def test_crm_result_nested_lists_are_handled() -> None:
+    """A list nested one level inside another list's items (markets[i].
+    bet_types) is itself a trim candidate, not just the outer list -- here
+    the outer "markets" list can only shrink to 1 item (no more left to
+    drop), so getting under budget also requires shrinking the surviving
+    market's own nested "bet_types" list."""
+    def market(name: str) -> dict:
+        return {
+            "name": name,
+            "bet_types": [f"Type{i}" for i in range(100)],
+            "payout_odds": {"Single": 9.5, "Jodi": 95},
+        }
+
+    payload = {"markets": [market("Kalyan"), market("Milan Day")], "starline_enabled": True}
+    client = _FakeClient(payload)
+    out = await execute_crm_tool(
+        endpoint="https://crm.example.com/api/operators/op1/matka-config",
+        method="GET", parameters={}, auth_type=None, token=None, args={},
+        http_client=client, result_max_chars=600,
+    )
+    data = out["data"]
+    assert len(data["markets"]) == 1
+    assert "_markets_truncated" in data
+    surviving = data["markets"][0]
+    assert 0 < len(surviving["bet_types"]) < 100
+    assert "_bet_types_truncated" in surviving
+    # Never cut through an object: payout_odds (a dict, not a list) is whole.
+    assert surviving["payout_odds"] == {"Single": 9.5, "Jodi": 95}
+    assert len(json.dumps(out)) <= 600
+
+
+@pytest.mark.asyncio
+async def test_crm_result_budget_never_touches_small_deposit_order_result() -> None:
+    """get_player_latest_deposit_order's response has no list anywhere --
+    the budget algorithm has nothing to trim, so order_id (what deposit
+    verification depends on) survives even under a deliberately tiny
+    budget that the result itself still exceeds."""
+    payload = {
+        "operator_id": "op-123", "user_id": "user-456", "status": "found",
+        "lookback_days": 7,
+        "order": {
+            "order_id": "a1b2c3d4-e29b-41d4-a716-446655440000",
+            "external_transaction_id": None,
+            "amount": 1500.0, "currency": "INR",
+            "pgs_status": "PGS_FAILED", "status_bucket": "failed",
+            "created_at": "2026-06-21T14:30:00+05:30",
+        },
+    }
+    client = _FakeClient(payload)
+    out = await execute_crm_tool(
+        endpoint="https://crm.example.com/api/players/p1/latest-deposit-order",
+        method="GET", parameters={}, auth_type=None, token=None, args={},
+        http_client=client, result_max_chars=50,
+    )
+    assert out["data"]["order"]["order_id"] == "a1b2c3d4-e29b-41d4-a716-446655440000"
+    assert out["data"]["order"]["amount"] == 1500.0

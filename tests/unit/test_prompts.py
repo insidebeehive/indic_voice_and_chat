@@ -1033,6 +1033,55 @@ def test_chatbot_prompt_tool_use_asks_for_batched_lookups_with_real_cap() -> Non
     assert "at most 1 round per reply" in one
 
 
+def test_chatbot_prompt_betting_pack_with_all_three_lookup_tools_has_common_lookups_block() -> None:
+    # COMMON LOOKUPS must appear, and must land after WITHDRAWAL STATUS (it's
+    # concatenated directly after pack.WITHDRAWAL_STATUS_BLOCK in SCOPE).
+    # has_common_lookup_tools is the real gate -- not has_player_tools, which
+    # is true for ANY player tool and isn't enough on its own (see below).
+    prompt = build_chatbot_system_prompt(
+        company_name="Acme", has_player_tools=True, has_common_lookup_tools=True,
+        prompt_pack="betting")
+    assert "COMMON LOOKUPS" in prompt
+    assert prompt.index("WITHDRAWAL STATUS") < prompt.index("COMMON LOOKUPS")
+
+
+def test_chatbot_prompt_betting_pack_missing_one_lookup_tool_has_no_common_lookups_block() -> None:
+    """COMMON_LOOKUPS_BLOCK names get_player_transactions,
+    get_player_latest_deposit_order and get_player_wallet by name -- it must
+    not appear unless all three are actually registered for the turn, even
+    when has_player_tools is true because some OTHER player tool exists."""
+    prompt = build_chatbot_system_prompt(
+        company_name="Acme", has_player_tools=True, has_common_lookup_tools=False,
+        prompt_pack="betting")
+    assert "COMMON LOOKUPS" not in prompt
+
+
+def test_chatbot_prompt_betting_pack_without_player_tools_has_no_common_lookups_block() -> None:
+    prompt = build_chatbot_system_prompt(
+        company_name="Acme", has_player_tools=False, has_common_lookup_tools=False,
+        prompt_pack="betting")
+    assert "COMMON LOOKUPS" not in prompt
+
+
+def test_chatbot_prompt_generic_pack_never_has_common_lookups_block() -> None:
+    for has_common_lookup_tools in (False, True):
+        prompt = build_chatbot_system_prompt(
+            company_name="Acme", has_common_lookup_tools=has_common_lookup_tools,
+            prompt_pack="generic")
+        assert "COMMON LOOKUPS" not in prompt
+
+
+def test_chatbot_prompt_tool_use_has_acknowledgement_sentence_after_infer_it() -> None:
+    prompt = build_chatbot_system_prompt(company_name="Acme")
+    assert "is not a new request" in prompt
+    marker = "carry intent from the conversation — infer it and act on it. "
+    idx = prompt.index(marker) + len(marker)
+    assert prompt[idx:].startswith(
+        "A message that only acknowledges or thanks ('ok', 'ok sir', 'thanks', 'tq', 'k', "
+        "'hmm') is not a new request:"
+    )
+
+
 def test_chatbot_agent_passes_its_max_tool_rounds_to_the_prompt() -> None:
     import inspect
     from src.agents import chatbot as chatbot_mod
