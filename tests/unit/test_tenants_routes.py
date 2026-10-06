@@ -653,7 +653,7 @@ async def test_list_tenants_inherited_layer_reports_platform_default(ctx) -> Non
     assert t["stt"]["model_source"] == "platform_default"
 
     assert t["llm"]["effective_provider"] == "gemini"
-    assert t["llm"]["effective_model"] == "gemini-3.5-flash"
+    assert t["llm"]["effective_model"] == "gemini-3.8-flash"
     assert t["llm"]["provider_source"] == "platform_default"
     assert t["llm"]["model_source"] == "platform_default"
 
@@ -716,14 +716,14 @@ async def test_list_tenants_partial_layer_override_merges_per_field(ctx) -> None
 
     assert t["llm"]["effective_provider"] == "gemini"
     assert t["llm"]["provider_source"] == "tenant"
-    assert t["llm"]["effective_model"] == "gemini-3.5-flash"   # inherited
+    assert t["llm"]["effective_model"] == "gemini-3.8-flash"   # inherited
     assert t["llm"]["model_source"] == "platform_default"
 
 
 async def test_list_tenants_cross_provider_override_does_not_leak_default_model(ctx) -> None:
     """Fix 1: a tenant that switches provider (groq, vs. the platform
     default's gemini) and leaves `model` unset must NOT show the platform
-    default's `model` as inherited -- gemini-3.5-flash is meaningless (and
+    default's `model` as inherited -- gemini-3.8-flash is meaningless (and
     for TTS, actively rejected) as a different provider's model id. This is
     the backoffice-visible half of the same production incident described in
     config_tenant.merge_provider_config's docstring (there for TTS:
