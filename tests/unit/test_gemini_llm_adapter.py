@@ -1455,3 +1455,500 @@ async def test_expired_entry_stops_being_used_and_recreates(monkeypatch) -> None
     # And a new creation is scheduled (this was another sighting of the key).
     await asyncio.gather(*gemini_module._inflight_cache_tasks)
     assert create_mock.await_count == 2
+
+
+# --- gemini-3.8-flash opt-in config (thinking_level, no temperature) ----
+
+
+def test_build_config_3_5_is_pinned_unchanged() -> None:
+    # Today's exact dict, pinned so a future change to this method can't
+    # silently alter 3.5 (or any other non-3.8) request shape.
+    client = _make_client()
+    adapter = GeminiLLMAdapter({"client": client})
+    cfg = adapter._build_config(
+        LLMConfig(model="gemini-3.5-flash", temperature=0.7, max_tokens=4096, response_format="text"),
+        "gemini-3.5-flash",
+    )
+    assert cfg == {
+        "temperature": 0.7,
+        "max_output_tokens": 4096,
+        "thinking_config": {"thinking_budget": 0},
+    }
+
+
+def test_build_config_default_model_is_unchanged() -> None:
+    # Same pin for an unset/other model (e.g. "" or a 2.x model) -- only a
+    # name starting "gemini-3.8" takes the new branch.
+    client = _make_client()
+    adapter = GeminiLLMAdapter({"client": client})
+    cfg = adapter._build_config(
+        LLMConfig(temperature=0.4, max_tokens=512, response_format="text"), "gemini-2.5-flash")
+    assert cfg == {
+        "temperature": 0.4,
+        "max_output_tokens": 512,
+        "thinking_config": {"thinking_budget": 0},
+    }
+
+
+def test_build_config_3_8_uses_thinking_level_and_omits_temperature() -> None:
+    client = _make_client()
+    adapter = GeminiLLMAdapter({"client": client})
+    cfg = adapter._build_config(
+        LLMConfig(model="gemini-3.8-flash", temperature=0.9, max_tokens=4096, response_format="text"),
+        "gemini-3.8-flash",
+    )
+    # 4096 + _THINKING_HEADROOM_TOKENS (1024) -- see test_build_config_3_8_adds_thinking_headroom
+    # below for the dedicated headroom test.
+    assert cfg == {
+        "max_output_tokens": 4096 + gemini_module._THINKING_HEADROOM_TOKENS,
+        "thinking_config": {"thinking_level": "low"},
+    }
+    assert "temperature" not in cfg
+    assert "top_p" not in cfg and "top_k" not in cfg and "candidate_count" not in cfg
+
+
+@pytest.mark.asyncio
+async def test_generate_3_8_model_sends_thinking_level_not_budget() -> None:
+    client = _make_client(generate_return=_response("ok"))
+    adapter = GeminiLLMAdapter({"client": client})
+    await adapter.generate(
+        [LLMMessage(role="user", content="hi")],
+        LLMConfig(model="gemini-3.8-flash", temperature=0.5),
+    )
+    cfg = client.aio.models.generate_content.await_args.kwargs["config"]
+    assert cfg["thinking_config"] == {"thinking_level": "low"}
+    assert "temperature" not in cfg
+
+
+@pytest.mark.asyncio
+async def test_generate_3_5_model_still_sends_thinking_budget_and_temperature() -> None:
+    # Regression: the 3.8 branch must not leak into any other model.
+    client = _make_client(generate_return=_response("ok"))
+    adapter = GeminiLLMAdapter({"client": client})
+    await adapter.generate(
+        [LLMMessage(role="user", content="hi")],
+        LLMConfig(model="gemini-3.5-flash", temperature=0.5),
+    )
+    cfg = client.aio.models.generate_content.await_args.kwargs["config"]
+    assert cfg["thinking_config"] == {"thinking_budget": 0}
+    assert cfg["temperature"] == 0.5
+
+
+# --- Function response id (gemini-3.8 only) ------------------------------
+
+
+@pytest.mark.asyncio
+async def test_function_response_carries_id_for_3_8() -> None:
+    from src.interfaces.llm import ToolCall
+    client = _make_client(generate_return=_response("ok"))
+    adapter = GeminiLLMAdapter({"client": client})
+    msgs = [
+        LLMMessage(role="user", content="status?"),
+        LLMMessage(role="assistant", content="",
+                   tool_calls=[ToolCall(id="c1", name="search_kb", arguments={"q": "x"})]),
+        LLMMessage(role="tool", name="search_kb", tool_call_id="c1", content='{"results": []}'),
+    ]
+    await adapter.generate(msgs, LLMConfig(model="gemini-3.8-flash", response_format="text"))
+    contents = client.aio.models.generate_content.await_args.kwargs["contents"]
+    fr = [p["function_response"] for c in contents for p in c["parts"] if "function_response" in p]
+    assert fr and fr[0]["id"] == "c1" and fr[0]["name"] == "search_kb"
+
+
+@pytest.mark.asyncio
+async def test_function_response_omits_id_for_3_5() -> None:
+    # 3.5 has no documented requirement for this -- the request must stay
+    # byte-for-byte identical to before this change.
+    from src.interfaces.llm import ToolCall
+    client = _make_client(generate_return=_response("ok"))
+    adapter = GeminiLLMAdapter({"client": client})
+    msgs = [
+        LLMMessage(role="user", content="status?"),
+        LLMMessage(role="assistant", content="",
+                   tool_calls=[ToolCall(id="c1", name="search_kb", arguments={"q": "x"})]),
+        LLMMessage(role="tool", name="search_kb", tool_call_id="c1", content='{"results": []}'),
+    ]
+    await adapter.generate(msgs, LLMConfig(model="gemini-3.5-flash", response_format="text"))
+    contents = client.aio.models.generate_content.await_args.kwargs["contents"]
+    fr = [p["function_response"] for c in contents for p in c["parts"] if "function_response" in p]
+    assert fr and "id" not in fr[0] and fr[0]["name"] == "search_kb"
+
+
+# --- Thought signature: full 2-round tool turn + no-signature no-op ------
+
+
+@pytest.mark.asyncio
+async def test_thought_signature_sent_on_round_2_wire_request() -> None:
+    # End-to-end, not just the message-conversion unit test above: round 1
+    # returns a function_call part carrying a thought_signature; round 2's
+    # actual generate_content call (after the tool result is appended) must
+    # replay that exact signature on the function_call part, or Gemini 3.x
+    # 400s with "missing a thought_signature".
+    from src.interfaces.llm import ToolSpec
+
+    part = SimpleNamespace(
+        text=None,
+        function_call=SimpleNamespace(name="search_kb", args={"q": "x"}),
+        thought_signature=b"sig-round-1",
+    )
+    candidate = SimpleNamespace(
+        content=SimpleNamespace(parts=[part]), finish_reason=SimpleNamespace(name="STOP"))
+    round1_response = SimpleNamespace(
+        text=None, candidates=[candidate],
+        usage_metadata=SimpleNamespace(prompt_token_count=1, candidates_token_count=1))
+    client = _make_client(generate_return=round1_response)
+    adapter = GeminiLLMAdapter({"client": client})
+    tools = [ToolSpec("search_kb", "s", {"type": "object"})]
+
+    round1 = await adapter.generate(
+        [LLMMessage(role="user", content="hi")], LLMConfig(tools=tools))
+    assert round1.tool_calls[0].thought_signature == b"sig-round-1"
+
+    client.aio.models.generate_content = AsyncMock(return_value=_response("final answer"))
+    round2_msgs = [
+        LLMMessage(role="user", content="hi"),
+        LLMMessage(role="assistant", content="", tool_calls=round1.tool_calls),
+        LLMMessage(role="tool", name="search_kb", tool_call_id=round1.tool_calls[0].id,
+                   content='{"results": []}'),
+    ]
+    round2 = await adapter.generate(round2_msgs, LLMConfig(tools=tools))
+    assert round2.text == "final answer"
+
+    contents = client.aio.models.generate_content.await_args.kwargs["contents"]
+    fc_parts = [p for c in contents for p in c["parts"] if "function_call" in p]
+    assert fc_parts[0]["thought_signature"] == b"sig-round-1"
+
+
+@pytest.mark.asyncio
+async def test_no_thought_signature_is_a_noop() -> None:
+    # A response with no thought_signature at all (older model, or a model
+    # that never attaches one) must change nothing: no key added to the
+    # tool call, and no "thought_signature" key on the replayed part.
+    from src.interfaces.llm import ToolSpec
+
+    part = SimpleNamespace(text=None, function_call=SimpleNamespace(name="search_kb", args={"q": "x"}))
+    # No `thought_signature` attribute at all on this fake part.
+    candidate = SimpleNamespace(
+        content=SimpleNamespace(parts=[part]), finish_reason=SimpleNamespace(name="STOP"))
+    resp = SimpleNamespace(
+        text=None, candidates=[candidate],
+        usage_metadata=SimpleNamespace(prompt_token_count=1, candidates_token_count=1))
+    client = _make_client(generate_return=resp)
+    adapter = GeminiLLMAdapter({"client": client})
+    result = await adapter.generate(
+        [LLMMessage(role="user", content="hi")],
+        LLMConfig(tools=[ToolSpec("search_kb", "s", {"type": "object"})]))
+    assert result.tool_calls[0].thought_signature is None
+
+    msgs = [
+        LLMMessage(role="user", content="hi"),
+        LLMMessage(role="assistant", content="", tool_calls=result.tool_calls),
+        LLMMessage(role="tool", name="search_kb", tool_call_id=result.tool_calls[0].id,
+                   content='{"results": []}'),
+    ]
+    _, contents = GeminiLLMAdapter._to_gemini_contents(msgs)
+    fc_parts = [p for c in contents for p in c["parts"] if "function_call" in p]
+    assert "thought_signature" not in fc_parts[0]
+
+
+# --- F1: thinking tokens counted in completion_tokens --------------------
+
+
+def test_extract_usage_adds_thoughts_token_count() -> None:
+    resp = SimpleNamespace(usage_metadata=SimpleNamespace(
+        prompt_token_count=10, candidates_token_count=5, thoughts_token_count=50))
+    usage = GeminiLLMAdapter._extract_usage(resp)
+    assert usage["completion_tokens"] == 55
+    assert usage["prompt_tokens"] == 10
+
+
+def test_extract_usage_thoughts_token_count_none_adds_nothing() -> None:
+    # 3.5 (thinking_budget=0): Google reports this as None (or omits the
+    # field) -- `or 0` must make this a no-op, not a crash on None + int.
+    resp = SimpleNamespace(usage_metadata=SimpleNamespace(
+        prompt_token_count=10, candidates_token_count=5, thoughts_token_count=None))
+    usage = GeminiLLMAdapter._extract_usage(resp)
+    assert usage["completion_tokens"] == 5
+
+
+def test_extract_usage_missing_thoughts_token_count_attr_adds_nothing() -> None:
+    # Older SDK response shape with no `thoughts_token_count` attribute at
+    # all (every pre-existing test's fake usage_metadata looks like this).
+    resp = SimpleNamespace(usage_metadata=SimpleNamespace(
+        prompt_token_count=10, candidates_token_count=5))
+    usage = GeminiLLMAdapter._extract_usage(resp)
+    assert usage["completion_tokens"] == 5
+
+
+@pytest.mark.asyncio
+async def test_generate_folds_thoughts_token_count_into_completion_tokens() -> None:
+    resp = _response("ok", prompt_tokens=10, completion_tokens=5)
+    resp.usage_metadata.thoughts_token_count = 50
+    client = _make_client(generate_return=resp)
+    adapter = GeminiLLMAdapter({"client": client})
+    result = await adapter.generate(
+        [LLMMessage(role="user", content="hi")], LLMConfig(model="gemini-3.8-flash"))
+    assert result.usage["completion_tokens"] == 55
+
+
+# --- F2: function-call / function-response ids (gemini-3.8 only) ---------
+
+
+def test_function_call_part_carries_id_for_3_8_when_server_issued() -> None:
+    from src.interfaces.llm import ToolCall
+    msgs = [
+        LLMMessage(role="user", content="hi"),
+        LLMMessage(role="assistant", content="", tool_calls=[
+            ToolCall(id="srv-1", name="search_kb", arguments={}, id_is_synthetic=False)]),
+    ]
+    _, contents = GeminiLLMAdapter._to_gemini_contents(msgs, "gemini-3.8-flash")
+    fc = [p["function_call"] for c in contents for p in c["parts"] if "function_call" in p]
+    assert fc[0]["id"] == "srv-1"
+
+
+def test_function_call_part_omits_synthetic_id_for_3_8() -> None:
+    # The adapter's own internally-invented id (id_is_synthetic=True, the
+    # `_extract_tool_calls` fallback) must never be sent to Gemini as if it
+    # were a real, provider-issued id.
+    from src.interfaces.llm import ToolCall
+    msgs = [
+        LLMMessage(role="user", content="hi"),
+        LLMMessage(role="assistant", content="", tool_calls=[
+            ToolCall(id="search_kb-0", name="search_kb", arguments={}, id_is_synthetic=True)]),
+    ]
+    _, contents = GeminiLLMAdapter._to_gemini_contents(msgs, "gemini-3.8-flash")
+    fc = [p["function_call"] for c in contents for p in c["parts"] if "function_call" in p]
+    assert "id" not in fc[0]
+
+
+def test_function_call_part_omits_id_for_3_5_even_when_server_issued() -> None:
+    # 3.5 must stay byte-for-byte unchanged regardless of id_is_synthetic --
+    # the `id` field is gated on the model, not just on the flag.
+    from src.interfaces.llm import ToolCall
+    msgs = [
+        LLMMessage(role="user", content="hi"),
+        LLMMessage(role="assistant", content="", tool_calls=[
+            ToolCall(id="srv-1", name="search_kb", arguments={}, id_is_synthetic=False)]),
+    ]
+    _, contents = GeminiLLMAdapter._to_gemini_contents(msgs, "gemini-3.5-flash")
+    fc = [p["function_call"] for c in contents for p in c["parts"] if "function_call" in p]
+    assert "id" not in fc[0]
+
+
+def test_function_response_omits_synthetic_id_for_3_8() -> None:
+    # Companion to test_function_response_carries_id_for_3_8 above: when the
+    # tool_call_id being echoed is this adapter's own synthetic fallback
+    # (tool_call_id_is_synthetic=True), it must not be echoed as `id` even
+    # on 3.8.
+    msgs = [
+        LLMMessage(role="tool", name="search_kb", tool_call_id="search_kb-0",
+                   tool_call_id_is_synthetic=True, content='{"results": []}'),
+    ]
+    _, contents = GeminiLLMAdapter._to_gemini_contents(msgs, "gemini-3.8-flash")
+    fr = [p["function_response"] for c in contents for p in c["parts"] if "function_response" in p]
+    assert "id" not in fr[0]
+
+
+@pytest.mark.asyncio
+async def test_extract_tool_calls_marks_server_issued_id_not_synthetic() -> None:
+    from src.interfaces.llm import ToolSpec
+    part = SimpleNamespace(
+        text=None, function_call=SimpleNamespace(name="search_kb", args={"q": "x"}, id="srv-42"),
+        thought_signature=b"sig")
+    candidate = SimpleNamespace(
+        content=SimpleNamespace(parts=[part]), finish_reason=SimpleNamespace(name="STOP"))
+    resp = SimpleNamespace(
+        text=None, candidates=[candidate],
+        usage_metadata=SimpleNamespace(prompt_token_count=1, candidates_token_count=1))
+    client = _make_client(generate_return=resp)
+    adapter = GeminiLLMAdapter({"client": client})
+    result = await adapter.generate(
+        [LLMMessage(role="user", content="hi")],
+        LLMConfig(model="gemini-3.8-flash", tools=[ToolSpec("search_kb", "s", {"type": "object"})]))
+    assert result.tool_calls[0].id == "srv-42"
+    assert result.tool_calls[0].id_is_synthetic is False
+
+
+@pytest.mark.asyncio
+async def test_extract_tool_calls_marks_missing_id_synthetic() -> None:
+    from src.interfaces.llm import ToolSpec
+    part = SimpleNamespace(
+        text=None, function_call=SimpleNamespace(name="search_kb", args={"q": "x"}),
+        thought_signature=b"sig")
+    candidate = SimpleNamespace(
+        content=SimpleNamespace(parts=[part]), finish_reason=SimpleNamespace(name="STOP"))
+    resp = SimpleNamespace(
+        text=None, candidates=[candidate],
+        usage_metadata=SimpleNamespace(prompt_token_count=1, candidates_token_count=1))
+    client = _make_client(generate_return=resp)
+    adapter = GeminiLLMAdapter({"client": client})
+    result = await adapter.generate(
+        [LLMMessage(role="user", content="hi")],
+        LLMConfig(model="gemini-3.8-flash", tools=[ToolSpec("search_kb", "s", {"type": "object"})]))
+    assert result.tool_calls[0].id == "search_kb-0"
+    assert result.tool_calls[0].id_is_synthetic is True
+
+
+@pytest.mark.asyncio
+async def test_3_8_two_round_tool_turn_with_server_ids_round_trips_id_and_signature() -> None:
+    # Full round-trip: round 1 returns a server-issued function_call id plus
+    # a thought_signature; round 2's actual wire request must carry the id
+    # on BOTH the replayed function_call and the function_response, and the
+    # signature on the function_call.
+    from src.interfaces.llm import ToolSpec
+
+    part = SimpleNamespace(
+        text=None, function_call=SimpleNamespace(name="search_kb", args={"q": "x"}, id="srv-7"),
+        thought_signature=b"sig-round-1")
+    candidate = SimpleNamespace(
+        content=SimpleNamespace(parts=[part]), finish_reason=SimpleNamespace(name="STOP"))
+    round1_response = SimpleNamespace(
+        text=None, candidates=[candidate],
+        usage_metadata=SimpleNamespace(prompt_token_count=1, candidates_token_count=1))
+    client = _make_client(generate_return=round1_response)
+    adapter = GeminiLLMAdapter({"client": client})
+    tools = [ToolSpec("search_kb", "s", {"type": "object"})]
+    cfg = LLMConfig(model="gemini-3.8-flash", tools=tools)
+
+    round1 = await adapter.generate([LLMMessage(role="user", content="hi")], cfg)
+    assert round1.tool_calls[0].id == "srv-7"
+    assert round1.tool_calls[0].id_is_synthetic is False
+
+    client.aio.models.generate_content = AsyncMock(return_value=_response("final answer"))
+    round2_msgs = [
+        LLMMessage(role="user", content="hi"),
+        LLMMessage(role="assistant", content="", tool_calls=round1.tool_calls),
+        LLMMessage(role="tool", name="search_kb", tool_call_id=round1.tool_calls[0].id,
+                   tool_call_id_is_synthetic=round1.tool_calls[0].id_is_synthetic,
+                   content='{"results": []}'),
+    ]
+    round2 = await adapter.generate(round2_msgs, cfg)
+    assert round2.text == "final answer"
+
+    contents = client.aio.models.generate_content.await_args.kwargs["contents"]
+    fc_whole_parts = [p for c in contents for p in c["parts"] if "function_call" in p]
+    fr_parts = [p["function_response"] for c in contents for p in c["parts"] if "function_response" in p]
+    assert fc_whole_parts[0]["function_call"]["id"] == "srv-7"
+    assert fc_whole_parts[0]["thought_signature"] == b"sig-round-1"
+    assert fr_parts[0]["id"] == "srv-7"
+
+
+@pytest.mark.asyncio
+async def test_3_8_two_round_tool_turn_with_no_server_id_carries_no_id() -> None:
+    # Same shape, but Gemini supplied no id on round 1 -- neither the
+    # replayed function_call nor the function_response may carry an `id`.
+    from src.interfaces.llm import ToolSpec
+
+    part = SimpleNamespace(
+        text=None, function_call=SimpleNamespace(name="search_kb", args={"q": "x"}),
+        thought_signature=b"sig-round-1")
+    candidate = SimpleNamespace(
+        content=SimpleNamespace(parts=[part]), finish_reason=SimpleNamespace(name="STOP"))
+    round1_response = SimpleNamespace(
+        text=None, candidates=[candidate],
+        usage_metadata=SimpleNamespace(prompt_token_count=1, candidates_token_count=1))
+    client = _make_client(generate_return=round1_response)
+    adapter = GeminiLLMAdapter({"client": client})
+    tools = [ToolSpec("search_kb", "s", {"type": "object"})]
+    cfg = LLMConfig(model="gemini-3.8-flash", tools=tools)
+
+    round1 = await adapter.generate([LLMMessage(role="user", content="hi")], cfg)
+    assert round1.tool_calls[0].id_is_synthetic is True
+
+    client.aio.models.generate_content = AsyncMock(return_value=_response("final answer"))
+    round2_msgs = [
+        LLMMessage(role="user", content="hi"),
+        LLMMessage(role="assistant", content="", tool_calls=round1.tool_calls),
+        LLMMessage(role="tool", name="search_kb", tool_call_id=round1.tool_calls[0].id,
+                   tool_call_id_is_synthetic=round1.tool_calls[0].id_is_synthetic,
+                   content='{"results": []}'),
+    ]
+    await adapter.generate(round2_msgs, cfg)
+
+    contents = client.aio.models.generate_content.await_args.kwargs["contents"]
+    fc_parts = [p["function_call"] for c in contents for p in c["parts"] if "function_call" in p]
+    fr_parts = [p["function_response"] for c in contents for p in c["parts"] if "function_response" in p]
+    assert "id" not in fc_parts[0]
+    assert "id" not in fr_parts[0]
+
+
+@pytest.mark.asyncio
+async def test_3_5_two_round_tool_turn_unaffected_by_server_id() -> None:
+    # Regression: even if some future SDK response somehow carried an `id`
+    # on 3.5, this adapter must not put it on the wire for 3.5 -- 3.5 stays
+    # byte-for-byte unchanged (the `id` field is gated on model, not on
+    # whether Gemini happened to send one).
+    from src.interfaces.llm import ToolSpec
+
+    part = SimpleNamespace(
+        text=None, function_call=SimpleNamespace(name="search_kb", args={"q": "x"}, id="srv-9"),
+        thought_signature=b"sig-round-1")
+    candidate = SimpleNamespace(
+        content=SimpleNamespace(parts=[part]), finish_reason=SimpleNamespace(name="STOP"))
+    round1_response = SimpleNamespace(
+        text=None, candidates=[candidate],
+        usage_metadata=SimpleNamespace(prompt_token_count=1, candidates_token_count=1))
+    client = _make_client(generate_return=round1_response)
+    adapter = GeminiLLMAdapter({"client": client})
+    tools = [ToolSpec("search_kb", "s", {"type": "object"})]
+    cfg = LLMConfig(model="gemini-3.5-flash", tools=tools)
+
+    round1 = await adapter.generate([LLMMessage(role="user", content="hi")], cfg)
+    client.aio.models.generate_content = AsyncMock(return_value=_response("final answer"))
+    round2_msgs = [
+        LLMMessage(role="user", content="hi"),
+        LLMMessage(role="assistant", content="", tool_calls=round1.tool_calls),
+        LLMMessage(role="tool", name="search_kb", tool_call_id=round1.tool_calls[0].id,
+                   tool_call_id_is_synthetic=round1.tool_calls[0].id_is_synthetic,
+                   content='{"results": []}'),
+    ]
+    await adapter.generate(round2_msgs, cfg)
+
+    contents = client.aio.models.generate_content.await_args.kwargs["contents"]
+    fc_parts = [p["function_call"] for c in contents for p in c["parts"] if "function_call" in p]
+    fr_parts = [p["function_response"] for c in contents for p in c["parts"] if "function_response" in p]
+    assert "id" not in fc_parts[0]
+    assert "id" not in fr_parts[0]
+
+
+# --- F4: max_output_tokens headroom for 3.8 only --------------------------
+
+
+def test_build_config_3_8_adds_thinking_headroom() -> None:
+    client = _make_client()
+    adapter = GeminiLLMAdapter({"client": client})
+    cfg = adapter._build_config(
+        LLMConfig(model="gemini-3.8-flash", max_tokens=256, response_format="text"),
+        "gemini-3.8-flash",
+    )
+    assert cfg["max_output_tokens"] == 256 + gemini_module._THINKING_HEADROOM_TOKENS
+
+
+def test_build_config_3_5_adds_no_headroom() -> None:
+    client = _make_client()
+    adapter = GeminiLLMAdapter({"client": client})
+    cfg = adapter._build_config(
+        LLMConfig(model="gemini-3.5-flash", max_tokens=256, response_format="text"),
+        "gemini-3.5-flash",
+    )
+    assert cfg["max_output_tokens"] == 256
+
+
+# --- F5: transcribe_audio thinking_config for 3.8 only --------------------
+
+
+@pytest.mark.asyncio
+async def test_transcribe_audio_3_8_sends_thinking_level_low() -> None:
+    client = _make_client(generate_return=_response("hello"))
+    adapter = GeminiLLMAdapter({"client": client, "model": "gemini-3.8-flash"})
+    await adapter.transcribe_audio(b"\xff\xe3audio-bytes", "audio/mpeg")
+    kwargs = client.aio.models.generate_content.await_args.kwargs
+    assert kwargs["config"] == {"thinking_config": {"thinking_level": "low"}}
+
+
+@pytest.mark.asyncio
+async def test_transcribe_audio_3_5_sends_no_config() -> None:
+    client = _make_client(generate_return=_response("hello"))
+    adapter = GeminiLLMAdapter({"client": client, "model": "gemini-3.5-flash"})
+    await adapter.transcribe_audio(b"\xff\xe3audio-bytes", "audio/mpeg")
+    kwargs = client.aio.models.generate_content.await_args.kwargs
+    assert "config" not in kwargs

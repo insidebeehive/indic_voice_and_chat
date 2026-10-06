@@ -102,7 +102,31 @@ def test_to_tool_builds_function_declaration():
         parameters={"type": "OBJECT",
                     "properties": {"action": {"type": "STRING", "enum": ["continue", "send_info"]},
                                    "updated_slots": {"type": "OBJECT"}},
-                    "required": ["action"]}))
+                    "required": ["action"]}), "gemini-3.1-flash-live-preview")
     fd = tool.function_declarations[0]
     assert fd.name == "record_turn_signal"
     assert "action" in fd.parameters.properties
+
+
+def test_to_tool_3_1_live_tools_are_unchanged():
+    # 3.1 Live defaults to BLOCKING server-side already; this codebase must
+    # not set `behavior` at all for it (today's exact wire shape).
+    from google.genai import types
+    tool = _to_tool(types, RealtimeTool(
+        name="escalate", description="hand off to a human",
+        parameters={"type": "OBJECT", "properties": {}}), "gemini-3.1-flash-live-preview")
+    fd = tool.function_declarations[0]
+    assert fd.behavior is None or fd.behavior == types.Behavior.UNSPECIFIED
+
+
+def test_to_tool_3_8_live_tools_are_blocking():
+    # gemini-3.8-live defaults function calling to async NON_BLOCKING; this
+    # codebase's realtime tool loop (today just record_turn_signal, answered
+    # immediately by live_bridge_base.py) was built on 3.1/2.5's BLOCKING
+    # wait-for-result default, so BLOCKING must be set explicitly for 3.8.
+    from google.genai import types
+    tool = _to_tool(types, RealtimeTool(
+        name="escalate", description="hand off to a human",
+        parameters={"type": "OBJECT", "properties": {}}), "gemini-3.8-live")
+    fd = tool.function_declarations[0]
+    assert fd.behavior == types.Behavior.BLOCKING

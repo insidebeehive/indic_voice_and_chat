@@ -1763,7 +1763,8 @@ class ChatBotAgent(BaseAgent):
                 escalation = esc or escalation
                 call_offer = off or call_offer
                 messages.append(LLMMessage(
-                    role="tool", name=tc.name, tool_call_id=tc.id, content=out_json))
+                    role="tool", name=tc.name, tool_call_id=tc.id,
+                    tool_call_id_is_synthetic=tc.id_is_synthetic, content=out_json))
             # A category that recovers this round must be cleared, not flagged
             # (success always wins within the round it happens in).
             failed_category_names -= round_succeeded_names

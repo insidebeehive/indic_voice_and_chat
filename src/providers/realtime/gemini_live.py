@@ -46,9 +46,33 @@ def _schema(types, d: dict[str, Any] | None):
     return types.Schema(**kwargs)
 
 
-def _to_tool(types, tool: RealtimeTool):
-    return types.Tool(function_declarations=[types.FunctionDeclaration(
-        name=tool.name, description=tool.description, parameters=_schema(types, tool.parameters))])
+def _is_38_live_model(model: str) -> bool:
+    """True for ``gemini-3.8-live`` (and any future 3.8.x Live variant).
+
+    Per Google's 3.1 -> 3.8 Live migration notes, function calling on 3.8
+    defaults to async NON_BLOCKING -- the model can keep talking while a tool
+    runs and gets the result later -- whereas 3.1/2.5 Live default to
+    BLOCKING (wait for the result before continuing). The only Live tool
+    declared today is ``record_turn_signal`` (``RECORD_TURN_SIGNAL`` in
+    ``src/api/live_bridge_base.py``), and that handler answers it
+    immediately and synchronously right after the tool_call event -- no
+    actual async work happens on either side of it today. Setting BLOCKING
+    here isn't about that one tool specifically: it's keeping the server's
+    pre-3.8 wait-for-result semantics unchanged for whatever tools this
+    codebase declares, so swapping the model to 3.8 can't silently change
+    calling semantics underneath a tool loop that was never written to
+    expect async NON_BLOCKING. 3.1/2.5 need no change at all -- BLOCKING is
+    already their default.
+    """
+    return (model or "").startswith("gemini-3.8")
+
+
+def _to_tool(types, tool: RealtimeTool, model: str):
+    kwargs: dict[str, Any] = dict(
+        name=tool.name, description=tool.description, parameters=_schema(types, tool.parameters))
+    if _is_38_live_model(model):
+        kwargs["behavior"] = types.Behavior.BLOCKING
+    return types.Tool(function_declarations=[types.FunctionDeclaration(**kwargs)])
 
 
 def _build_activity_detection(types):
@@ -101,13 +125,18 @@ class GeminiLiveSession(IRealtimeSession):
 
         client = genai.Client(api_key=api_key)
         speech = _build_speech_config(types, config.language_code, config.voice)
+        # gemini-3.8-live removes thinking config and affective dialog from the
+        # Live API entirely, and always runs proactive audio -- none of the
+        # three are set here (no ``thinking_config``, no ``proactivity``/
+        # affective-dialog field, no opt-in proactive-audio flag below), so
+        # this request shape needs no change for either model generation.
         live_config = types.LiveConnectConfig(
             response_modalities=["AUDIO"],
             system_instruction=config.system_instruction or None,
             speech_config=speech,
             input_audio_transcription=types.AudioTranscriptionConfig(),
             output_audio_transcription=types.AudioTranscriptionConfig(),
-            tools=[_to_tool(types, t) for t in config.tools] or None,
+            tools=[_to_tool(types, t, config.model) for t in config.tools] or None,
             max_output_tokens=config.max_output_tokens,
             # Explicit realtime-input/VAD so multi-turn works: auto speech detection,
             # caller speech interrupts the agent (native barge-in), and a turn is

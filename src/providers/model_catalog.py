@@ -42,6 +42,14 @@ MODELS: dict[str, dict[str, list[str]]] = {
         "vllm": ["Qwen/Qwen2.5-14B-Instruct-AWQ"],
         "gemini": [
             "gemini-3.5-flash",
+            # Opt-in only — NOT the recommended default (the first entry
+            # above still is, and DEFAULT_MODEL in src/providers/llm/gemini.py
+            # is unchanged). Breaking vs 3.5: thinking_config uses
+            # thinking_level (not thinking_budget) and can't be disabled,
+            # temperature/top_p/top_k/candidate_count are omitted, and
+            # function responses carry the call id. See
+            # src/providers/llm/gemini.py's _is_gemini_38_generation.
+            "gemini-3.8-flash",
             # 2.x models still work on older Gemini projects but 404 on
             # projects created after mid-2026 ("no longer available to new
             # users") — kept for tenants pinned to an old key.
@@ -106,6 +114,15 @@ MODELS: dict[str, dict[str, list[str]]] = {
     "s2s": {
         "gemini_live": [
             "gemini-3.1-flash-live-preview",
+            # Opt-in only — not the recommended default (first entry above
+            # still is, and no tenant config is changed by adding this).
+            # Breaking vs 3.1 Live: thinking config and affective dialog are
+            # removed, proactive audio is always on, and function calling
+            # defaults to async NON_BLOCKING — this codebase sets
+            # behavior=BLOCKING explicitly for this model (see
+            # src/providers/realtime/gemini_live.py's _is_38_live_model) to
+            # keep today's wait-for-result tool semantics.
+            "gemini-3.8-live",
             "gemini-2.5-flash-live-preview",
         ],
     },

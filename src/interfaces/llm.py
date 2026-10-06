@@ -37,6 +37,18 @@ class ToolCall:
     # (400 INVALID_ARGUMENT "missing a thought_signature" otherwise). Opaque
     # provider bytes — carried, never inspected.
     thought_signature: Any = None
+    # True when `id` was invented by the adapter (e.g. Gemini's
+    # `_extract_tool_calls` falling back to f"{name}-{n}" because the
+    # provider sent no id) rather than issued by the provider itself. The
+    # chatbot still needs *some* unique id internally, to pair a call with
+    # its result, regardless of which case this is — that's what `id` is
+    # for. This flag is the only way a caller can tell those two cases
+    # apart afterwards, which matters because a provider (gemini-3.8) that
+    # requires its own id to be echoed back must never be handed one this
+    # adapter made up. Default False: every existing construction site
+    # (openai_compat.py's own synthesize-on-missing-id, and every test that
+    # builds a ToolCall directly) means "a real id", unchanged.
+    id_is_synthetic: bool = False
 
 
 @dataclass
@@ -48,6 +60,11 @@ class LLMMessage:
     tool_calls: Optional[list[ToolCall]] = None
     # Set on a "tool" message carrying a tool result back to the model.
     tool_call_id: Optional[str] = None
+    # Mirrors the originating ToolCall.id_is_synthetic for this tool_call_id —
+    # set by the caller that built this message from a ToolCall (chatbot.py).
+    # Gemini-3.8 echoes `id` on the function_response; a synthetic id must
+    # never be sent back as if the provider had issued it.
+    tool_call_id_is_synthetic: bool = False
     name: Optional[str] = None  # tool name (on a "tool" result message)
 
 

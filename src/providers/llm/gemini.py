@@ -42,6 +42,32 @@ log = logging.getLogger(__name__)
 # projects created after mid-2026 — the staging key swap broke on it.
 DEFAULT_MODEL = "gemini-3.5-flash"
 
+
+def _is_gemini_38_generation(model: str) -> bool:
+    """True for gemini-3.8-flash (and any future gemini-3.8.x text model).
+
+    3.8 breaks the request shape vs every earlier generation this adapter
+    has ever sent: ``thinking_budget`` is deprecated for ``thinking_level``
+    and thinking can no longer be disabled at all ("minimal" errors, default
+    is "medium"), and ``temperature``/``top_p``/``top_k``/``candidate_count``
+    are rejected outright. Matched by prefix, not an exact-match allowlist,
+    so a later gemini-3.8-pro etc. gets the same treatment without a code
+    change. gemini-3.5-flash (today's default) and every 2.x model fail this
+    check and are completely unaffected by anything gated on it.
+    """
+    return (model or "").startswith("gemini-3.8")
+
+
+# Thinking tokens count against max_output_tokens on 3.8, and unlike
+# 2.5/3.5 (thinking_budget=0, see _build_config) 3.8 can never disable
+# thinking entirely — some tokens are always spent on it before the first
+# visible output token. A caller's requested budget (chatbot.py's 120-token
+# summary turn, the voice cascade's 256-token default) was sized assuming
+# ~0 thinking spend; on 3.8 that spend alone could exhaust it, leaving
+# nothing for visible text. This is added on TOP of the caller's request
+# (3.8 only — see _build_config), not a replacement for it.
+_THINKING_HEADROOM_TOKENS = 1024
+
 # Gemini intermittently returns transient backend errors — most notably
 # ``500 INTERNAL`` ("An internal error has occurred. Please retry...") — even
 # for well-formed requests. Google's own error body tells callers to retry, so
@@ -276,7 +302,9 @@ class GeminiLLMAdapter(ILLMProvider):
     # --- Message conversion ---------------------------------------------
 
     @staticmethod
-    def _to_gemini_contents(messages: list[LLMMessage]) -> tuple[Optional[str], list[dict]]:
+    def _to_gemini_contents(
+        messages: list[LLMMessage], model: str = "",
+    ) -> tuple[Optional[str], list[dict]]:
         """Split our (role, content) messages into Gemini's shape.
 
         Gemini takes a separate ``system_instruction`` plus a list of
@@ -284,7 +312,12 @@ class GeminiLLMAdapter(ILLMProvider):
             our "system"    -> system_instruction (concatenated if many)
             our "user"      -> {role: "user", parts: [{text: ...}]}
             our "assistant" -> {role: "model", parts: [{text: ...}]}
+
+        ``model`` defaults to "" (never a 3.8 model) so every pre-existing
+        caller/test that calls this without a model keeps today's exact
+        output.
         """
+        is_38 = _is_gemini_38_generation(model)
         system_parts: list[str] = []
         contents: list[dict] = []
         for m in messages:
@@ -300,8 +333,20 @@ class GeminiLLMAdapter(ILLMProvider):
                     response = {"result": m.content}
                 if not isinstance(response, dict):
                     response = {"result": response}
+                function_response: dict[str, Any] = {"name": m.name or "", "response": response}
+                if is_38 and m.tool_call_id and not m.tool_call_id_is_synthetic:
+                    # gemini-3.8 requires every FunctionResponse to carry the
+                    # originating call's id, not just its name. Scoped to 3.8
+                    # only — 3.5 has no such requirement, and adding it there
+                    # too is unverified, so 3.5 requests stay byte-for-byte
+                    # unchanged. Only a server-issued id is echoed — when
+                    # Gemini sent no id for the original call, `tool_call_id`
+                    # here is this adapter's own synthetic fallback (see
+                    # `_extract_tool_calls`), and sending that back as if the
+                    # provider had issued it would be a lie on the wire.
+                    function_response["id"] = m.tool_call_id
                 contents.append({"role": "user", "parts": [
-                    {"function_response": {"name": m.name or "", "response": response}}]})
+                    {"function_response": function_response}]})
                 continue
             role = "model" if m.role == "assistant" else "user"
             # Assistant message that emitted tool calls → function_call parts.
@@ -310,7 +355,15 @@ class GeminiLLMAdapter(ILLMProvider):
             if m.tool_calls:
                 parts = []
                 for tc in m.tool_calls:
-                    part: dict[str, Any] = {"function_call": {"name": tc.name, "args": tc.arguments}}
+                    function_call: dict[str, Any] = {"name": tc.name, "args": tc.arguments}
+                    if is_38 and not tc.id_is_synthetic:
+                        # Gemini 3.8 only, and only a server-issued id — this
+                        # adapter's own synthetic fallback id (ToolCall built
+                        # by _extract_tool_calls when Gemini sent none) is
+                        # for internal call/result pairing only and must
+                        # never be sent back to Gemini as if it were real.
+                        function_call["id"] = tc.id
+                    part: dict[str, Any] = {"function_call": function_call}
                     if tc.thought_signature is not None:
                         part["thought_signature"] = tc.thought_signature
                     parts.append(part)
@@ -320,15 +373,45 @@ class GeminiLLMAdapter(ILLMProvider):
         system = "\n\n".join(system_parts) if system_parts else None
         return system, contents
 
-    def _build_config(self, config: LLMConfig) -> dict[str, Any]:
+    def _build_config(self, config: LLMConfig, model: str) -> dict[str, Any]:
+        # max_output_tokens is shared by both branches below: thinking tokens
+        # count against it on EITHER generation (2.5/3.5 via thinking_budget=0
+        # already disabling thinking so none are spent; 3.8 via
+        # thinking_level, where thinking can't be disabled and always spends
+        # some).
+        is_38 = _is_gemini_38_generation(model)
+        max_output_tokens = config.max_tokens
+        if is_38:
+            # 3.8 can never zero out thinking (see the branch below), so a
+            # budget sized for 2.5/3.5's "all of it goes to visible text"
+            # isn't big enough on 3.8 — some of it is always spent on
+            # thinking first. Two real callers would otherwise starve on
+            # 3.8: the voice cascade's `max_tokens or 256` default
+            # (bootstrap.py) and chatbot.py's 120-token summary turn
+            # (_summarize, chatbot.py) — both sized with ~0 thinking spend in
+            # mind. Add a flat headroom on top of the caller's request so
+            # that request is still available for visible output; 3.5 is
+            # untouched (this is the `is_38` branch only).
+            max_output_tokens = (config.max_tokens or 0) + _THINKING_HEADROOM_TOKENS
         cfg: dict[str, Any] = {
-            "temperature": config.temperature,
-            "max_output_tokens": config.max_tokens,
-            # Gemini 2.5 Flash thinking tokens count against max_output_tokens.
-            # Disable thinking (budget=0) so all output tokens go to visible text;
-            # thinking mode can be re-enabled per-call if deep reasoning is needed.
-            "thinking_config": {"thinking_budget": 0},
+            "max_output_tokens": max_output_tokens,
         }
+        if is_38:
+            # thinking_budget is deprecated on 3.8; thinking_level replaces
+            # it and thinking cannot be disabled at all ("minimal" errors,
+            # default is "medium") — "low" is the closest equivalent to
+            # 3.5's budget=0 "spend as little as possible on thinking".
+            # temperature/top_p/top_k/candidate_count are rejected by 3.8 on
+            # the wire, so none are set here (top_p/top_k/candidate_count
+            # were never set by this adapter to begin with).
+            cfg["thinking_config"] = {"thinking_level": "low"}
+        else:
+            cfg["temperature"] = config.temperature
+            # Gemini 2.5/3.5 Flash thinking tokens count against
+            # max_output_tokens. Disable thinking (budget=0) so all output
+            # tokens go to visible text; thinking mode can be re-enabled
+            # per-call if deep reasoning is needed.
+            cfg["thinking_config"] = {"thinking_budget": 0}
         if config.tools:
             # Function declarations as plain dicts — the SDK coerces them.
             cfg["tools"] = [{"function_declarations": [{
@@ -638,9 +721,9 @@ class GeminiLLMAdapter(ILLMProvider):
         messages: list[LLMMessage],
         config: LLMConfig,
     ) -> LLMResult:
-        system, contents = self._to_gemini_contents(messages)
-        gen_config = self._build_config(config)
         model = config.model or self._default_model
+        system, contents = self._to_gemini_contents(messages, model)
+        gen_config = self._build_config(config, model)
 
         # Cache lookup is entirely optional plumbing bolted onto the request
         # this method already builds — `cache_name` stays None (identical to
@@ -855,10 +938,18 @@ class GeminiLLMAdapter(ILLMProvider):
         # its content, is what's useful here.
         debug_event(log, "gemini transcribe_audio request", model=self._default_model,
                     mime_type=mime_type, audio_bytes=len(audio), prompt=prompt)
+        # thinking_level is required on 3.8 (see _build_config) -- thinking
+        # can't be disabled there at all, so "low" is sent to keep this
+        # single-shot transcription call from spending its max_output_tokens
+        # on thinking first. 3.5/2.x get no `config` kwarg at all here, same
+        # as before this change -- the SDK's own default is what today's
+        # (already working) transcription relies on.
+        gen_kwargs: dict[str, Any] = {"model": self._default_model, "contents": contents}
+        if _is_gemini_38_generation(self._default_model):
+            gen_kwargs["config"] = {"thinking_config": {"thinking_level": "low"}}
         try:
             response = await self._call_with_retry(
-                lambda: self._client.aio.models.generate_content(
-                    model=self._default_model, contents=contents),
+                lambda: self._client.aio.models.generate_content(**gen_kwargs),
                 what="transcribe")
             text = self._extract_text(response) or ""
             debug_event(log, "gemini transcribe_audio response", text=text)
@@ -882,11 +973,11 @@ class GeminiLLMAdapter(ILLMProvider):
         # would sit here doing hash work and dict lookups on every turn for
         # zero hits, ever. Skipping it here is not a missed optimization,
         # it's the correct outcome of the same rule `generate()` uses.
-        system, contents = self._to_gemini_contents(messages)
-        gen_config = self._build_config(config)
+        model = config.model or self._default_model
+        system, contents = self._to_gemini_contents(messages, model)
+        gen_config = self._build_config(config, model)
         if system:
             gen_config["system_instruction"] = system
-        model = config.model or self._default_model
         debug_event(log, "gemini generate_stream request", model=model, system=system,
                     contents=contents, config=gen_config)
 
@@ -943,7 +1034,16 @@ class GeminiLLMAdapter(ILLMProvider):
     @staticmethod
     def _extract_tool_calls(response: Any) -> list[ToolCall]:
         """Pull ``function_call`` parts out of the response into ToolCalls.
-        Gemini calls carry no id, so we synthesize one from name + index."""
+
+        Pre-3.8 Gemini calls carry no id at all; 3.8 may send one. Either
+        way this adapter needs SOME unique id internally, to pair a call
+        with its result (chatbot.py's tool loop, _to_gemini_contents'
+        function_response above) — so a missing id is synthesized from
+        name + index exactly as before. ``id_is_synthetic`` records which
+        case this was, so a synthetic id (internal-only) is never echoed
+        back to Gemini as if the provider had issued it — see
+        ``_to_gemini_contents``.
+        """
         candidates = getattr(response, "candidates", None) or []
         if not candidates:
             return []
@@ -956,13 +1056,15 @@ class GeminiLLMAdapter(ILLMProvider):
                 continue
             name = getattr(fc, "name", "") or ""
             args = getattr(fc, "args", None) or {}
+            server_id = getattr(fc, "id", None)
             calls.append(ToolCall(
-                id=getattr(fc, "id", None) or f"{name}-{len(calls)}",
+                id=server_id or f"{name}-{len(calls)}",
                 name=name,
                 arguments=dict(args),
                 # Signature lives on the PART, not the function_call — must be
                 # replayed with the call on the next round (Gemini 3.x).
                 thought_signature=getattr(p, "thought_signature", None),
+                id_is_synthetic=not server_id,
             ))
         return calls
 
@@ -992,9 +1094,20 @@ class GeminiLLMAdapter(ILLMProvider):
         u = getattr(response, "usage_metadata", None)
         if u is None:
             return {}
+        # thoughts_token_count (google-genai 2.2.0, confirmed against
+        # google/genai/types.py's UsageMetadata) is Google's billed thinking
+        # spend — real on 3.8 (thinking can't be disabled there, see
+        # _build_config) and folded into completion_tokens here so cost
+        # tracking reflects what's actually billed, not just visible output.
+        # On 3.5 (thinking_budget=0) this is 0 or absent, so `or 0` makes it
+        # a no-op addition and completion_tokens is unchanged.
+        completion_tokens = (
+            (getattr(u, "candidates_token_count", 0) or 0)
+            + (getattr(u, "thoughts_token_count", 0) or 0)
+        )
         return {
             "prompt_tokens": getattr(u, "prompt_token_count", 0) or 0,
-            "completion_tokens": getattr(u, "candidates_token_count", 0) or 0,
+            "completion_tokens": completion_tokens,
             # Optional — absent on older SDK responses or when nothing was cached.
             "cached_tokens": getattr(u, "cached_content_token_count", 0) or 0,
         }

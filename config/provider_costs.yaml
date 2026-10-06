@@ -24,6 +24,10 @@ llm:
     # TODO verify against Google's published 3.5-flash pricing; seeded at the
     # 2.5-flash rate so billing keeps producing a figure after the model swap.
     gemini-3.5-flash: 0.002
+    # TODO same caveat as gemini-3.5-flash above — mirrors its per-minute
+    # estimate rather than a verified voice-minute figure of its own. Opt-in
+    # model (see model_catalog.py); not selected by any tenant today.
+    gemini-3.8-flash: 0.002
     gemini-2.5-flash: 0.002
     gemini-2.5-flash-lite: 0.0008
     gemini-2.5-pro: 0.012
@@ -62,6 +66,15 @@ tts:
 s2s:
   gemini_live:
     gemini-3.1-flash-live-preview: 0.03
+    # gemini-3.8-live carries forward the SAME 0.03 blended per-minute
+    # estimate already used for gemini-3.1-flash-live-preview above, not a
+    # fresh calculation — Google's published per-minute audio rates are
+    # identical for both models ($0.005/min audio in, $0.018/min audio out),
+    # confirmed 2026-10-06. Note those two figures alone sum to $0.023, not
+    # $0.03; 0.03 is reused as-is because that's what's already carried for
+    # 3.1 above, not because it's derived from this pair. Opt-in model; not
+    # selected by any tenant today.
+    gemini-3.8-live: 0.03
     gemini-2.5-flash-live-preview: 0.03
 telephony:
   twilio: 0.014
@@ -102,6 +115,22 @@ llm_token_rates:
     # over the same period — so real spend was at least ~4x what this file
     # was reporting. $300 is a floor, not the uncapped total.
     gemini-3.5-flash: {input_per_1k: 0.0015, output_per_1k: 0.009, cached_per_1k: 0.00015}
+    # gemini-3.8-flash, verified against Google's published pricing
+    # 2026-10-06: $0.75/$3.75/$0.075 per 1M tokens (standard tier) through
+    # 2026-12-31. These are INTRODUCTORY rates — they rise to $1.50/$7.50/
+    # $0.15 per 1M (0.0015/0.0075/0.00015 per 1k) on 2027-01-01; update this
+    # row then. Opt-in model (see model_catalog.py); not selected by any
+    # tenant today.
+    #
+    # Updating it means an actual YAML edit (this file) plus a deploy, not a
+    # live admin-console/PUT /api/v1/providers edit alone: unlike the
+    # per-minute rows above (inserted only when missing, so an admin edit
+    # sticks), seed_provider_costs (src/auth/seed.py) unconditionally
+    # overwrites input_per_1k/output_per_1k on every boot from this file
+    # (called on every app start, src/main.py) — a live-edited rate here
+    # would just get reverted back to whatever this YAML says at the next
+    # restart.
+    gemini-3.8-flash: {input_per_1k: 0.00075, output_per_1k: 0.00375, cached_per_1k: 0.000075}
     # Provider-level fallback (model="") used by token_rates() in
     # src/api/chat_cost.py when pipeline.llm.model is swapped to a gemini
     # model with no dedicated row above — keeps chat cost tracking from
