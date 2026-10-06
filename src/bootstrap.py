@@ -364,6 +364,8 @@ def _crm_params_to_schema(params: dict) -> dict:
         prop = {"type": spec.get("type", "string")}
         if spec.get("description"):
             prop["description"] = spec["description"]
+        if isinstance(spec.get("enum"), list) and spec["enum"]:
+            prop["enum"] = list(spec["enum"])
         props[name] = prop
         if spec.get("source", "llm") == "llm" and spec.get("required", True):
             required.append(name)

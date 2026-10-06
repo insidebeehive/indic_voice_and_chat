@@ -29,9 +29,13 @@ PLAYER_TOOLS: dict[str, dict] = {
     "get_player_transactions": {
         "description": (
             "Get the player's transaction history: deposits, withdrawals, casino "
-            "credits/debits, sports credits/debits. Supports filtering by type and "
-            "date range via query params. Use to answer questions like 'did my "
-            "deposit go through?' or 'show my recent withdrawals'. "
+            "credits/debits, sports credits/debits. Most questions are about a "
+            "deposit or a withdrawal: work out which, then filter with type "
+            "(deposit or withdraw). If the message does not make clear whether it "
+            "is a deposit or a withdrawal, ask the customer one short question "
+            "before calling this. Use casino or sports only when the customer "
+            "clearly asks about those; omit type only for a general request "
+            "like 'show my recent transactions'. "
             "NOTE: for a deposit DISPUTE, prefer get_player_latest_deposit_order "
             "instead: it targets the specific recent attempt in one call and "
             "exposes the pending/failed status detail a dispute needs."
@@ -39,8 +43,13 @@ PLAYER_TOOLS: dict[str, dict] = {
         "parameters": {
             "user_id": {"type": "string", "source": "session",
                         "description": "Player identifier"},
-            "type":    {"type": "string", "source": "llm",
-                        "description": "Filter: deposit | withdrawal | casino | sports | all (default: all)"},
+            "type":    {"type": "string", "source": "llm", "required": False,
+                        "enum": ["deposit", "withdraw", "casino", "sports"],
+                        "description": (
+                            "deposit for deposit questions, withdraw for withdrawal "
+                            "questions, casino or sports only when the customer clearly "
+                            "asks about those. Omit for a general request; never send 'all'."
+                        )},
             "limit":   {"type": "integer", "source": "llm",
                         "description": "Max records to return (default: 20)"},
         },

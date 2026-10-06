@@ -39,7 +39,7 @@ PLAYERS: dict[str, dict] = {
             {"id": "txn_001", "type": "deposit",    "amount": 2000.00, "status": "success",    "timestamp": "2026-06-20T10:30:00Z", "method": "UPI"},
             {"id": "txn_002", "type": "casino",     "amount": -350.00, "status": "settled",    "timestamp": "2026-06-20T11:15:00Z", "game": "Teen Patti"},
             {"id": "txn_003", "type": "sports",     "amount": 600.00,  "status": "settled",    "timestamp": "2026-06-20T14:00:00Z", "description": "IPL bet win"},
-            {"id": "txn_004", "type": "withdrawal", "amount": 1000.00, "status": "processing", "timestamp": "2026-06-20T16:00:00Z", "method": "Bank Transfer"},
+            {"id": "txn_004", "type": "withdraw",   "amount": 1000.00, "status": "processing", "timestamp": "2026-06-20T16:00:00Z", "method": "Bank Transfer"},
         ],
         "latest_deposit_order": {
             "order_id": "a1b2c3d4-e29b-41d4-a716-446655440000",

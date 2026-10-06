@@ -58,7 +58,7 @@ GET /players/{user_id}/transactions?operator_id={operator_id}&type={type}&limit=
 **When called:** Player asks about recent transactions, deposit status, withdrawal history, game history.
 
 **Query params set by AI:**
-- `type` — `deposit` | `withdrawal` | `casino` | `sports` | `all` (default: `all`)
+- `type` — `deposit` | `withdraw` | `casino` | `sports` (omit for all types)
 - `limit` — integer, default `10`
 
 **Expected response:**
