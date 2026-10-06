@@ -11,8 +11,6 @@ import sqlalchemy as sa
 from alembic.operations import Operations
 from alembic.runtime.migration import MigrationContext
 
-from src.chatbot.catalog import PLAYER_TOOLS
-
 _PATH = (Path(__file__).resolve().parents[2] / "alembic" / "versions"
          / "0031_txn_type_filter_enum.py")
 
@@ -45,6 +43,29 @@ V_495DA20 = (
 OLD_TYPE = {
     "type": "string", "source": "llm",
     "description": "Filter: deposit | withdrawal | casino | sports | all (default: all)",
+}
+
+V_0031_NEW = (
+    "Get the player's transaction history: deposits, withdrawals, casino "
+    "credits/debits, sports credits/debits. Most questions are about a "
+    "deposit or a withdrawal: work out which, then filter with type "
+    "(deposit or withdraw). If the message does not make clear whether it "
+    "is a deposit or a withdrawal, ask the customer one short question "
+    "before calling this. Use casino or sports only when the customer "
+    "clearly asks about those; omit type only for a general request "
+    "like 'show my recent transactions'. "
+    "NOTE: for a deposit DISPUTE, prefer get_player_latest_deposit_order "
+    "instead: it targets the specific recent attempt in one call and "
+    "exposes the pending/failed status detail a dispute needs."
+)
+NEW_TYPE_0031 = {
+    "type": "string", "source": "llm", "required": False,
+    "enum": ["deposit", "withdraw", "casino", "sports"],
+    "description": (
+        "deposit for deposit questions, withdraw for withdrawal "
+        "questions, casino or sports only when the customer clearly "
+        "asks about those. Omit for a general request; never send 'all'."
+    ),
 }
 
 
@@ -90,11 +111,12 @@ def test_known_old_variants_are_pinned():
     assert m.OLD_DESCRIPTION == V_495DA20
 
 
-def test_new_texts_match_catalog():
+def test_new_texts_are_pinned_withdraw_era():
+    # 0031 is checked against its own literals, not the live catalog (which
+    # moved on to "withdrawal" in 0032).
     m = _mod()
-    spec = PLAYER_TOOLS["get_player_transactions"]
-    assert spec["description"] == m.NEW_DESCRIPTION
-    assert spec["parameters"]["type"] == m.NEW_TYPE_SPEC
+    assert m.NEW_DESCRIPTION == V_0031_NEW
+    assert m.NEW_TYPE_SPEC == NEW_TYPE_0031
 
 
 def test_upgrade_and_downgrade_roundtrip():

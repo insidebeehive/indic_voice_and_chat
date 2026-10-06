@@ -520,7 +520,7 @@ async def execute_crm_tool(
         if isinstance(v, (int, float)) and not isinstance(v, bool)
     }
     # The one string param whose VALUE is logged: `type` is a fixed filter
-    # word (deposit | withdraw | casino | sports) that decides which
+    # word (deposit | withdrawal | casino | sports) that decides which
     # records the CRM returns, so it is needed to read result_chars and the
     # model's answer against what was actually asked for. Logged only when it
     # looks like a short filter word -- anything else (a model stuffing free

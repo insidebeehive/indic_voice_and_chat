@@ -69,9 +69,9 @@ WITHDRAWAL_STATUS_BLOCK = (
 COMMON_LOOKUPS_BLOCK = (
     "COMMON LOOKUPS — call these together in your FIRST round, not one after another (except where a line below says to ask first):\n"
     "  - Deposit not credited / deposit status: get_player_transactions (type deposit) + get_player_latest_deposit_order + get_player_wallet.\n"
-    "  - Withdrawal status / not received: get_player_transactions (type withdraw) + get_player_wallet.\n"
+    "  - Withdrawal status / not received: get_player_transactions (type withdrawal) + get_player_wallet.\n"
     "  - Balance: get_player_wallet. \"Where is my money\" and similar, with no clue whether it is a deposit or a withdrawal: get_player_wallet is fine, but ask one short question (deposit or withdrawal?) before get_player_transactions.\n"
-    "  get_player_transactions type: decide deposit vs withdraw first, and if the message does not make it clear, ask one short question before calling it. "
+    "  get_player_transactions type: decide deposit vs withdrawal first, and if the message does not make it clear, ask one short question before calling it. "
     "Use casino or sports only when the customer explicitly asks about those. Omit type only for a general history request. Never send \"all\".\n"
     "  If a result shows you need something else, a second round is fine; a third should be rare.\n"
 )
