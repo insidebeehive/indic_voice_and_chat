@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import csv
 import io
 import json
 import logging
-from datetime import datetime
+from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -14,18 +15,23 @@ import pytest_asyncio
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from src.api import tenants
+from src.api.billing import previous_local_month, snapshot_previous_month_all_tenants, snapshot_tenant_month
 from src.api.deps import get_db_session
 from src.auth import secrets as crypto
 from src.auth.audit import reset_suppression_state
 from src.auth.context import hash_api_token
 from src.auth.db_resolver import DbTenantResolver
-from src.auth.middleware import set_admin_tokens, set_tenant_resolver
+from src.auth.middleware import admin_label_for_token, set_admin_tokens, set_tenant_resolver
 from src.config_tenant import platform_webhook_base_url
+from src.models.billing_snapshot import TenantBillingSnapshot
+from src.models.chat import ChatSession
+from src.models.conversation import Conversation
 from src.models.database import Base
-from src.models.tenant import Tenant, TenantSecret
+from src.models.tenant import ProviderCost, Tenant, TenantSecret
 from src.utils.logging import configure_logging
 
 ADMIN_HEADERS = {"Authorization": "Bearer admin-token"}
@@ -2883,3 +2889,889 @@ async def test_list_tenants_deposit_verification_reply_url_set_flips_after_rotat
     after = await client.get("/tenants", headers=ADMIN_HEADERS)
     assert _row(after)["deposit_verification_reply_url_set"] is True
     assert token not in after.text
+
+
+# --- Billing: date range + immutable monthly snapshots --------------------
+# Explicit-range tests below use fixed historical dates (compute_tenant_billing
+# only cares about the timestamps it's given, never real "now"), so they are
+# never flaky. Only the "default range" tests below actually depend on real
+# "now" (no from/to passed) -- those seed data at day 15 of "this"/"last"
+# month, which exists in every month and is never near a boundary, so they
+# can't flip months regardless of which real day the suite runs on.
+
+def _last_two_utc_months() -> tuple[date, date, date, date]:
+    """(this_month_start, last_month_start, last_month_end, two_months_ago_start)
+    computed from the real current UTC date."""
+    today = datetime.now(timezone.utc).date()
+    this_month_start = today.replace(day=1)
+    last_month_end = this_month_start - timedelta(days=1)
+    last_month_start = last_month_end.replace(day=1)
+    two_months_ago_start = (last_month_start - timedelta(days=1)).replace(day=1)
+    return this_month_start, last_month_start, last_month_end, two_months_ago_start
+
+
+async def _set_tenant_created_at(sm, tid: str, when: datetime) -> None:
+    """Overwrite ``Tenant.created_at`` (normally stamped at registration-time
+    "now") to ``when``. Needed by every billing-snapshot test below that
+    freezes a month in the past: ``create_tenant_billing_snapshot`` now 422s
+    a month the tenant didn't exist in yet (``tenant_existed_in_month``), and
+    a tenant registered "just now" by the test didn't exist during a month
+    from the real past -- so these tests must explicitly backdate
+    ``created_at`` to keep testing what they actually test (grace periods,
+    aggregation, sorting, CSV rendering, ...) rather than this unrelated
+    gate."""
+    async with sm() as s:
+        t = await s.get(Tenant, tid)
+        t.created_at = when
+        await s.commit()
+
+
+async def test_billing_default_range_is_current_month_and_explicit_range_works(ctx) -> None:
+    client, _, sm = ctx
+    tid = (await client.post(
+        "/tenants", json=_body(slug="acme-range", timezone="UTC"), headers=ADMIN_HEADERS,
+    )).json()["tenant_id"]
+
+    today = datetime.now(timezone.utc).date()
+    this_month_start, last_month_start, last_month_end, _ = _last_two_utc_months()
+    last_month_mid = last_month_start.replace(day=15)
+
+    async with sm() as s:
+        s.add(Conversation(
+            id="r_last", tenant_id=tid, agent_type="voicebot", channel="voice", status="ended",
+            pipeline_config={}, provider_call_sid="rl",
+            cost=0.11, duration_ms=60_000,
+            started_at=datetime.combine(last_month_mid, datetime.min.time()),
+        ))
+        # "today" (not day 15) -- day 15 of the current month can be in the
+        # future relative to the real run date (e.g. the suite runs on the
+        # 7th), which the default range (month start..today) would exclude.
+        # "today" is always within [this_month_start, today] by construction.
+        s.add(Conversation(
+            id="r_this", tenant_id=tid, agent_type="voicebot", channel="voice", status="ended",
+            pipeline_config={}, provider_call_sid="rt",
+            cost=0.13, duration_ms=90_000,
+            started_at=datetime.combine(today, datetime.min.time()),
+        ))
+        await s.commit()
+
+    # No from/to -> defaults to the current UTC-local month -> only r_this.
+    bill = (await client.get(f"/tenants/{tid}/billing", headers=ADMIN_HEADERS)).json()
+    assert bill["total_calls"] == 1
+    assert bill["platform_cost"] == pytest.approx(0.13)
+    assert bill["period_from"] == this_month_start.isoformat()
+    assert bill["period_to"] == today.isoformat()
+    assert bill["timezone"] == "UTC"
+
+    # Explicit from/to covering last month -> only r_last.
+    explicit = (await client.get(
+        f"/tenants/{tid}/billing?from={last_month_start.isoformat()}&to={last_month_end.isoformat()}",
+        headers=ADMIN_HEADERS,
+    )).json()
+    assert explicit["total_calls"] == 1
+    assert explicit["platform_cost"] == pytest.approx(0.11)
+    assert explicit["period_from"] == last_month_start.isoformat()
+    assert explicit["period_to"] == last_month_end.isoformat()
+
+
+async def test_billing_range_boundaries_month_start_and_to_inclusive(ctx) -> None:
+    """A row at exactly local midnight on the 1st belongs to that month, not
+    the previous one, and `to` is inclusive -- a row anytime on the `to` date
+    still counts."""
+    client, _, sm = ctx
+    tid = (await client.post(
+        "/tenants", json=_body(slug="acme-boundary", timezone="UTC"), headers=ADMIN_HEADERS,
+    )).json()["tenant_id"]
+
+    async with sm() as s:
+        s.add(Conversation(
+            id="b_mar1", tenant_id=tid, agent_type="voicebot", channel="voice", status="ended",
+            pipeline_config={}, provider_call_sid="bm1",
+            cost=0.20, duration_ms=60_000, started_at=datetime(2024, 3, 1, 0, 0, 0),
+        ))
+        s.add(Conversation(
+            id="b_feb29", tenant_id=tid, agent_type="voicebot", channel="voice", status="ended",
+            pipeline_config={}, provider_call_sid="bf29",
+            cost=0.30, duration_ms=60_000, started_at=datetime(2024, 2, 29, 23, 59, 59),
+        ))
+        s.add(Conversation(
+            id="b_mar31", tenant_id=tid, agent_type="voicebot", channel="voice", status="ended",
+            pipeline_config={}, provider_call_sid="bm31",
+            cost=0.40, duration_ms=60_000, started_at=datetime(2024, 3, 31, 23, 59, 59),
+        ))
+        await s.commit()
+
+    feb = (await client.get(
+        f"/tenants/{tid}/billing?from=2024-02-01&to=2024-02-29", headers=ADMIN_HEADERS,
+    )).json()
+    assert feb["total_calls"] == 1
+    assert feb["platform_cost"] == pytest.approx(0.30)
+
+    mar = (await client.get(
+        f"/tenants/{tid}/billing?from=2024-03-01&to=2024-03-31", headers=ADMIN_HEADERS,
+    )).json()
+    assert mar["total_calls"] == 2  # Mar 1 00:00:00 + Mar 31 23:59:59 (`to` inclusive)
+    assert mar["platform_cost"] == pytest.approx(0.60)
+
+
+async def test_billing_from_after_to_is_422(ctx) -> None:
+    client, _, _ = ctx
+    tid = (await client.post(
+        "/tenants", json=_body(slug="acme-bad-range"), headers=ADMIN_HEADERS,
+    )).json()["tenant_id"]
+    resp = await client.get(
+        f"/tenants/{tid}/billing?from=2024-05-10&to=2024-05-01", headers=ADMIN_HEADERS,
+    )
+    assert resp.status_code == 422
+
+
+async def test_billing_tenant_timezone_month_boundary(ctx) -> None:
+    """A call at 2026-08-31 19:00 UTC is 2026-09-01 00:30 IST -- counts in
+    September. A call at 2026-08-31 18:00 UTC is 2026-08-31 23:30 IST --
+    counts in August."""
+    client, _, sm = ctx
+    tid = (await client.post(
+        "/tenants", json=_body(slug="acme-ist", timezone="Asia/Kolkata"), headers=ADMIN_HEADERS,
+    )).json()["tenant_id"]
+
+    async with sm() as s:
+        s.add(Conversation(
+            id="ist_sep", tenant_id=tid, agent_type="voicebot", channel="voice", status="ended",
+            pipeline_config={}, provider_call_sid="is1",
+            cost=0.50, duration_ms=60_000, started_at=datetime(2026, 8, 31, 19, 0, 0),
+        ))
+        s.add(Conversation(
+            id="ist_aug", tenant_id=tid, agent_type="voicebot", channel="voice", status="ended",
+            pipeline_config={}, provider_call_sid="is2",
+            cost=0.60, duration_ms=60_000, started_at=datetime(2026, 8, 31, 18, 0, 0),
+        ))
+        await s.commit()
+
+    aug = (await client.get(
+        f"/tenants/{tid}/billing?from=2026-08-01&to=2026-08-31", headers=ADMIN_HEADERS,
+    )).json()
+    assert aug["total_calls"] == 1
+    assert aug["platform_cost"] == pytest.approx(0.60)
+    assert aug["timezone"] == "Asia/Kolkata"
+
+    sep = (await client.get(
+        f"/tenants/{tid}/billing?from=2026-09-01&to=2026-09-30", headers=ADMIN_HEADERS,
+    )).json()
+    assert sep["total_calls"] == 1
+    assert sep["platform_cost"] == pytest.approx(0.50)
+
+
+async def test_create_billing_snapshot_computes_totals_and_rejects_duplicates(ctx) -> None:
+    client, _, sm = ctx
+    tid = (await client.post(
+        "/tenants", json=_body(slug="acme-snap", name="Acme Snap", timezone="UTC"),
+        headers=ADMIN_HEADERS,
+    )).json()["tenant_id"]
+
+    # Deliberately "two months ago" (the helper's 4th field), not literally
+    # last calendar month: a POST freeze is only accepted once the month has
+    # cleared SNAPSHOT_GRACE_DAYS (src/api/billing.py), and "last month" can
+    # still be within that grace window if the suite happens to run on the
+    # local 1st/2nd. Two months ago has always cleared it regardless of
+    # today's date -- see test_create_billing_snapshot_respects_grace_period
+    # /test_snapshot_previous_month_all_tenants_respects_grace_period for the
+    # grace behavior itself.
+    this_month_start, _, _, last_month_start = _last_two_utc_months()
+    last_month_mid = last_month_start.replace(day=15)
+    # The tenant was just registered "now" by the POST above -- backdate it
+    # so it already existed during last_month_start (tenant_existed_in_month).
+    await _set_tenant_created_at(sm, tid, datetime.combine(last_month_start, datetime.min.time()))
+
+    async with sm() as s:
+        s.add(ProviderCost(kind="telephony", provider="twilio", model="", cost_per_min=0.10))
+        s.add(Conversation(
+            id="snap_c1", tenant_id=tid, agent_type="voicebot", channel="voice", status="ended",
+            pipeline_config={}, provider_call_sid="snapc1", telephony_provider="twilio",
+            cost=0.10, duration_ms=120_000,
+            started_at=datetime.combine(last_month_mid, datetime.min.time()),
+        ))
+        s.add(ChatSession(
+            id="snap_chs1", tenant_id=tid, status="ended", cost=0.05,
+            input_tokens=100, output_tokens=40,
+            started_at=datetime.combine(last_month_mid, datetime.min.time()),
+        ))
+        await s.commit()
+
+    month_str = f"{last_month_start.year:04d}-{last_month_start.month:02d}"
+    resp = await client.post(
+        f"/tenants/{tid}/billing/snapshots", json={"month": month_str}, headers=ADMIN_HEADERS,
+    )
+    assert resp.status_code == 201, resp.text
+    body = resp.json()
+    assert body["tenant_id"] == tid
+    assert body["tenant_name"] == "Acme Snap"
+    assert body["period_month"] == last_month_start.isoformat()
+    assert body["total_calls"] == 1
+    assert body["platform_cost"] == pytest.approx(0.15)                # 0.10 voice + 0.05 chat
+    assert body["billable_minutes"] == pytest.approx(2.0)
+    assert body["tentative_telephony_cost"] == pytest.approx(0.20)     # 0.10/min * 2 min
+    assert body["chat_sessions"] == 1
+    assert body["chat_cost"] == pytest.approx(0.05)
+    assert body["timezone"] == "UTC"
+    assert body["created_by"] == admin_label_for_token("admin-token")
+
+    # Duplicate month for the same tenant -> 409.
+    dup = await client.post(
+        f"/tenants/{tid}/billing/snapshots", json={"month": month_str}, headers=ADMIN_HEADERS,
+    )
+    assert dup.status_code == 409
+
+    # Bad format -> 422.
+    bad = await client.post(
+        f"/tenants/{tid}/billing/snapshots", json={"month": "2024/03"}, headers=ADMIN_HEADERS,
+    )
+    assert bad.status_code == 422
+
+    # A single-digit month with no leading zero -> 422. strptime("%Y-%m")
+    # alone would happily accept this (lenient parsing), which is why the
+    # route validates against a strict regex BEFORE calling strptime.
+    bad_single_digit = await client.post(
+        f"/tenants/{tid}/billing/snapshots", json={"month": "2024-3"}, headers=ADMIN_HEADERS,
+    )
+    assert bad_single_digit.status_code == 422
+
+    # Current (incomplete) month -> 422.
+    current_str = f"{this_month_start.year:04d}-{this_month_start.month:02d}"
+    cur = await client.post(
+        f"/tenants/{tid}/billing/snapshots", json={"month": current_str}, headers=ADMIN_HEADERS,
+    )
+    assert cur.status_code == 422
+
+    listing = (await client.get(f"/tenants/{tid}/billing/snapshots", headers=ADMIN_HEADERS)).json()
+    assert len(listing) == 1
+    assert listing[0]["period_month"] == last_month_start.isoformat()
+
+
+async def test_list_billing_snapshots_newest_month_first(ctx) -> None:
+    client, _, sm = ctx
+    tid = (await client.post(
+        "/tenants", json=_body(slug="acme-snap-order", timezone="UTC"), headers=ADMIN_HEADERS,
+    )).json()["tenant_id"]
+
+    # Both months must already have cleared SNAPSHOT_GRACE_DAYS regardless of
+    # today's real date -- "two months ago" and "three months ago" always
+    # have (see test_create_billing_snapshot_computes_totals_and_rejects_duplicates).
+    _, _, _, m1_start = _last_two_utc_months()
+    m2_start = (m1_start - timedelta(days=1)).replace(day=1)
+    # Backdate past the EARLIER of the two months (tenant_existed_in_month).
+    await _set_tenant_created_at(sm, tid, datetime.combine(m2_start, datetime.min.time()))
+
+    for ms in (m1_start, m2_start):
+        resp = await client.post(
+            f"/tenants/{tid}/billing/snapshots",
+            json={"month": f"{ms.year:04d}-{ms.month:02d}"}, headers=ADMIN_HEADERS,
+        )
+        assert resp.status_code == 201, resp.text
+
+    listing = (await client.get(f"/tenants/{tid}/billing/snapshots", headers=ADMIN_HEADERS)).json()
+    assert [row["period_month"] for row in listing] == [m1_start.isoformat(), m2_start.isoformat()]
+
+
+async def test_billing_snapshot_frozen_after_data_and_rate_change_and_tenant_deletion(ctx) -> None:
+    client, _, sm = ctx
+    tid = (await client.post(
+        "/tenants", json=_body(slug="acme-frozen", timezone="UTC"), headers=ADMIN_HEADERS,
+    )).json()["tenant_id"]
+
+    # "Two months ago" -- always past SNAPSHOT_GRACE_DAYS regardless of
+    # today's real date (see test_create_billing_snapshot_computes_totals_and_rejects_duplicates).
+    _, _, _, last_month_start = _last_two_utc_months()
+    last_month_mid = last_month_start.replace(day=15)
+    await _set_tenant_created_at(sm, tid, datetime.combine(last_month_start, datetime.min.time()))
+
+    async with sm() as s:
+        s.add(ProviderCost(kind="telephony", provider="twilio", model="", cost_per_min=0.10))
+        s.add(Conversation(
+            id="frz_c1", tenant_id=tid, agent_type="voicebot", channel="voice", status="ended",
+            pipeline_config={}, provider_call_sid="frzc1", telephony_provider="twilio",
+            cost=0.20, duration_ms=60_000,
+            started_at=datetime.combine(last_month_mid, datetime.min.time()),
+        ))
+        await s.commit()
+
+    month_str = f"{last_month_start.year:04d}-{last_month_start.month:02d}"
+    resp = await client.post(
+        f"/tenants/{tid}/billing/snapshots", json={"month": month_str}, headers=ADMIN_HEADERS,
+    )
+    assert resp.status_code == 201, resp.text
+    frozen = resp.json()
+    assert frozen["platform_cost"] == pytest.approx(0.20)
+    assert frozen["tentative_telephony_cost"] == pytest.approx(0.10)   # 0.10/min * 1 min
+    assert frozen["telephony_rates"] == {"twilio": 0.10}
+
+    # Mutate the underlying data AND the telephony rate after the snapshot --
+    # the frozen row must not move.
+    async with sm() as s:
+        conv = await s.get(Conversation, "frz_c1")
+        await s.delete(conv)
+        rate = (await s.execute(
+            select(ProviderCost).where(
+                ProviderCost.kind == "telephony", ProviderCost.provider == "twilio",
+            )
+        )).scalar_one()
+        rate.cost_per_min = 999.0
+        await s.commit()
+
+    listing = (await client.get(f"/tenants/{tid}/billing/snapshots", headers=ADMIN_HEADERS)).json()
+    assert len(listing) == 1
+    assert listing[0]["platform_cost"] == pytest.approx(0.20)
+    assert listing[0]["tentative_telephony_cost"] == pytest.approx(0.10)
+    assert listing[0]["telephony_rates"] == {"twilio": 0.10}
+
+    # Delete the Tenant row itself -- GET snapshots must still work: snapshots
+    # are deliberately not foreign-keyed to tenants.id.
+    async with sm() as s:
+        tenant_row = await s.get(Tenant, tid)
+        await s.delete(tenant_row)
+        await s.commit()
+
+    after_delete = await client.get(f"/tenants/{tid}/billing/snapshots", headers=ADMIN_HEADERS)
+    assert after_delete.status_code == 200
+    rows = after_delete.json()
+    assert len(rows) == 1
+    assert rows[0]["platform_cost"] == pytest.approx(0.20)
+
+
+async def test_snapshot_previous_month_all_tenants_creates_one_per_tenant(ctx) -> None:
+    client, _, sm = ctx
+    tid1 = (await client.post(
+        "/tenants", json=_body(slug="acme-auto1", timezone="UTC"), headers=ADMIN_HEADERS,
+    )).json()["tenant_id"]
+    tid2 = (await client.post(
+        "/tenants", json=_body(
+            slug="acme-auto2", timezone="Asia/Kolkata", telephony={"provider": "none"},
+        ), headers=ADMIN_HEADERS,
+    )).json()["tenant_id"]
+
+    # now_utc is injected (not the real wall clock), so this test's outcome
+    # doesn't depend on which real calendar day the suite happens to run on
+    # -- SNAPSHOT_GRACE_DAYS means "previous local month" is only actually
+    # frozen once that many days into the NEXT month. +400 days is also
+    # safely after both tenants' real (wall-clock) created_at, so the
+    # Tenant.created_at >= month-end skip doesn't fire for either of them.
+    now_utc = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(days=400)
+    utc_prev_month = previous_local_month("UTC", now_utc)
+    ist_prev_month = previous_local_month("Asia/Kolkata", now_utc)
+
+    created_first = await snapshot_previous_month_all_tenants(sm, now_utc=now_utc)
+    assert created_first == 2
+
+    listing1 = (await client.get(f"/tenants/{tid1}/billing/snapshots", headers=ADMIN_HEADERS)).json()
+    listing2 = (await client.get(f"/tenants/{tid2}/billing/snapshots", headers=ADMIN_HEADERS)).json()
+    assert len(listing1) == 1
+    assert listing1[0]["period_month"] == utc_prev_month.isoformat()
+    assert listing1[0]["created_by"] == "auto"
+    assert len(listing2) == 1
+    assert listing2[0]["period_month"] == ist_prev_month.isoformat()
+    assert listing2[0]["timezone"] == "Asia/Kolkata"
+
+    # Second run skips both -- already snapshotted.
+    created_second = await snapshot_previous_month_all_tenants(sm, now_utc=now_utc)
+    assert created_second == 0
+
+
+async def test_snapshot_previous_month_all_tenants_respects_grace_period(ctx) -> None:
+    """On the local 1st/2nd, the previous month hasn't cleared
+    SNAPSHOT_GRACE_DAYS yet -- the auto job does nothing for that tenant. On
+    the 3rd, it does. All driven by injected now_utc so this doesn't depend
+    on the real wall clock."""
+    client, _, sm = ctx
+    tid = (await client.post(
+        "/tenants", json=_body(slug="acme-grace-auto", timezone="UTC"), headers=ADMIN_HEADERS,
+    )).json()["tenant_id"]
+
+    # Anchor +400 days out so "this calendar month" (whose 1st/2nd/3rd we
+    # probe) is safely after the tenant's real created_at -- otherwise the
+    # Tenant.created_at >= month-end skip (not the grace check) would be
+    # what's actually suppressing creation below.
+    anchor = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(days=400)
+    this_month_start = anchor.date().replace(day=1)
+    prev_month_start = (this_month_start - timedelta(days=1)).replace(day=1)
+
+    def _now_on(day: int) -> datetime:
+        return datetime.combine(this_month_start.replace(day=day), datetime.min.time())
+
+    created_1st = await snapshot_previous_month_all_tenants(sm, now_utc=_now_on(1))
+    assert created_1st == 0
+    created_2nd = await snapshot_previous_month_all_tenants(sm, now_utc=_now_on(2))
+    assert created_2nd == 0
+
+    listing_before = (await client.get(f"/tenants/{tid}/billing/snapshots", headers=ADMIN_HEADERS)).json()
+    assert listing_before == []
+
+    created_3rd = await snapshot_previous_month_all_tenants(sm, now_utc=_now_on(3))
+    assert created_3rd == 1
+
+    listing = (await client.get(f"/tenants/{tid}/billing/snapshots", headers=ADMIN_HEADERS)).json()
+    assert len(listing) == 1
+    assert listing[0]["period_month"] == prev_month_start.isoformat()
+
+
+async def test_snapshot_previous_month_all_tenants_skips_tenant_created_after_month(ctx) -> None:
+    """A tenant created AFTER the month being frozen already ended didn't
+    exist yet during that month -- the auto job must not manufacture a
+    zero-activity snapshot for it."""
+    client, _, sm = ctx
+    tid = (await client.post(
+        "/tenants", json=_body(slug="acme-too-new", timezone="UTC"), headers=ADMIN_HEADERS,
+    )).json()["tenant_id"]
+
+    # now_utc BEFORE the tenant's real (wall-clock) created_at -- so the
+    # month being frozen ends before the tenant existed.
+    now_utc = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=400)
+    created = await snapshot_previous_month_all_tenants(sm, now_utc=now_utc)
+    assert created == 0
+
+    listing = (await client.get(f"/tenants/{tid}/billing/snapshots", headers=ADMIN_HEADERS)).json()
+    assert listing == []
+
+
+async def test_snapshot_tenant_month_reraises_non_duplicate_integrity_error(ctx, monkeypatch) -> None:
+    """An IntegrityError NOT caused by the (tenant_id, period_month) race
+    must propagate (so the auto job logs it, and a direct POST would 500)
+    rather than being silently treated as "someone already froze this"."""
+    client, _, sm = ctx
+    tid = (await client.post(
+        "/tenants", json=_body(slug="acme-ie", timezone="UTC"), headers=ADMIN_HEADERS,
+    )).json()["tenant_id"]
+
+    async with sm() as s:
+        tenant = await s.get(Tenant, tid)
+        month_start = date(2024, 1, 1)
+
+        async def _boom():
+            # Simulate some OTHER constraint failing on commit -- the row
+            # for (tenant_id, month_start) was never actually inserted, so
+            # the post-rollback re-check must find nothing and re-raise.
+            await s.rollback()
+            raise IntegrityError("INSERT", {}, Exception("some other constraint"))
+
+        monkeypatch.setattr(s, "commit", _boom)
+
+        with pytest.raises(IntegrityError):
+            await snapshot_tenant_month(s, tenant, month_start, created_by="test")
+
+    # No snapshot was left behind by the failed attempt.
+    listing = (await client.get(f"/tenants/{tid}/billing/snapshots", headers=ADMIN_HEADERS)).json()
+    assert listing == []
+
+
+def _freeze_tenants_clock(monkeypatch, when: datetime) -> None:
+    """Freeze ``datetime.datetime.now()`` as seen by ``src.api.tenants``
+    (which does ``from datetime import ... datetime`` at module level, so
+    ``datetime.now(...)`` resolves via that module-bound name) to ``when``.
+    Used only for the manual POST /billing/snapshots grace-period test
+    below: unlike the auto job, the route has no injectable ``now_utc``
+    parameter (accepting a caller-supplied "now" would let a caller bypass
+    the grace check entirely), so the wall clock itself has to be frozen --
+    same technique ``tests/unit/test_prompts.py`` uses to freeze prompt
+    timestamps."""
+    class _Frozen(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return when if tz is None else when.astimezone(tz)
+
+    monkeypatch.setattr(tenants, "datetime", _Frozen)
+
+
+async def test_create_billing_snapshot_respects_grace_period(ctx, monkeypatch) -> None:
+    """POST .../billing/snapshots rejects a month that hasn't cleared
+    SNAPSHOT_GRACE_DAYS yet (422, with a date/timezone in the detail) and
+    accepts it once it has (201)."""
+    client, _, _ = ctx
+    tid = (await client.post(
+        "/tenants", json=_body(slug="acme-grace-http", timezone="UTC"), headers=ADMIN_HEADERS,
+    )).json()["tenant_id"]
+
+    # Anchor +400 days out so "this calendar month" (whose 2nd/3rd we probe)
+    # is safely after the tenant's real created_at.
+    anchor = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(days=400)
+    this_month_start = anchor.date().replace(day=1)
+    prev_month_start = (this_month_start - timedelta(days=1)).replace(day=1)
+    month_str = f"{prev_month_start.year:04d}-{prev_month_start.month:02d}"
+
+    _freeze_tenants_clock(
+        monkeypatch,
+        datetime(this_month_start.year, this_month_start.month, 2, 9, 0, 0, tzinfo=timezone.utc),
+    )
+    resp_2nd = await client.post(
+        f"/tenants/{tid}/billing/snapshots", json={"month": month_str}, headers=ADMIN_HEADERS,
+    )
+    assert resp_2nd.status_code == 422
+    assert "can be frozen from" in resp_2nd.json()["detail"]
+
+    _freeze_tenants_clock(
+        monkeypatch,
+        datetime(this_month_start.year, this_month_start.month, 3, 9, 0, 0, tzinfo=timezone.utc),
+    )
+    resp_3rd = await client.post(
+        f"/tenants/{tid}/billing/snapshots", json={"month": month_str}, headers=ADMIN_HEADERS,
+    )
+    assert resp_3rd.status_code == 201, resp_3rd.text
+
+
+async def test_create_billing_snapshot_before_tenant_existed_is_422(ctx) -> None:
+    """A month the tenant didn't exist in yet (created_at on/after that
+    month's local end) is rejected with a 422 naming the month -- checked
+    BEFORE the grace-period check, so this doesn't depend on how recent the
+    month is."""
+    client, _, sm = ctx
+    tid = (await client.post(
+        "/tenants", json=_body(slug="acme-too-new-post", timezone="UTC"), headers=ADMIN_HEADERS,
+    )).json()["tenant_id"]
+
+    # "Two months ago" -- always past SNAPSHOT_GRACE_DAYS regardless of
+    # today's real date (see test_create_billing_snapshot_computes_totals_and_rejects_duplicates),
+    # so a 422 here can only be the existed-in-month check, not the grace one.
+    _, _, last_month_end, last_month_start = _last_two_utc_months()
+    month_str = f"{last_month_start.year:04d}-{last_month_start.month:02d}"
+
+    async with sm() as s:
+        t = await s.get(Tenant, tid)
+        # One day after the month's local end -- definitely didn't exist yet.
+        t.created_at = datetime.combine(last_month_end, datetime.min.time()) + timedelta(days=2)
+        await s.commit()
+
+    resp = await client.post(
+        f"/tenants/{tid}/billing/snapshots", json={"month": month_str}, headers=ADMIN_HEADERS,
+    )
+    assert resp.status_code == 422
+    assert resp.json()["detail"] == f"tenant did not exist in {month_str}"
+
+    listing = (await client.get(f"/tenants/{tid}/billing/snapshots", headers=ADMIN_HEADERS)).json()
+    assert listing == []
+
+
+# --- Platform-wide billing snapshots (GET /tenants/billing-snapshots) -----
+
+async def test_platform_billing_snapshots_not_shadowed_by_tenant_id_route(ctx) -> None:
+    """`/tenants/billing-snapshots` must resolve to the platform-wide handler
+    registered ahead of `/{tenant_id}...`, not get swallowed by a route that
+    would otherwise treat "billing-snapshots" as a tenant_id."""
+    client, _, _ = ctx
+    resp = await client.get("/tenants/billing-snapshots?month=2024-01", headers=ADMIN_HEADERS)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["month"] == "2024-01"
+    assert body["snapshots"] == []
+    assert body["not_frozen"] == []
+    assert body["totals"] == {
+        "platform_cost": 0.0, "chat_cost": 0.0, "total_calls": 0,
+        "billable_minutes": 0.0, "chat_sessions": 0, "tentative_telephony_cost": 0.0,
+    }
+
+
+async def test_platform_billing_snapshots_requires_admin(ctx) -> None:
+    client, _, _ = ctx
+    resp = await client.get("/tenants/billing-snapshots?month=2024-01")
+    assert resp.status_code == 401
+
+
+async def test_platform_billing_snapshots_bad_month_is_422(ctx) -> None:
+    client, _, _ = ctx
+    resp = await client.get("/tenants/billing-snapshots?month=2024/01", headers=ADMIN_HEADERS)
+    assert resp.status_code == 422
+
+    # A single-digit month with no leading zero -> 422 here too (strict
+    # regex before strptime -- see the POST endpoint's equivalent test).
+    resp2 = await client.get("/tenants/billing-snapshots?month=2024-3", headers=ADMIN_HEADERS)
+    assert resp2.status_code == 422
+
+
+async def test_platform_billing_snapshots_aggregates_and_lists_not_frozen(ctx) -> None:
+    client, _, sm = ctx
+    tid_a = (await client.post(
+        "/tenants", json=_body(slug="plat-a", name="Tenant A", timezone="UTC"),
+        headers=ADMIN_HEADERS,
+    )).json()["tenant_id"]
+    tid_b = (await client.post(
+        "/tenants", json=_body(
+            slug="plat-b", name="Tenant B", timezone="UTC", telephony={"provider": "none"},
+        ), headers=ADMIN_HEADERS,
+    )).json()["tenant_id"]
+    tid_c = (await client.post(
+        "/tenants", json=_body(
+            slug="plat-c", name="Tenant C", timezone="UTC", telephony={"provider": "none"},
+        ), headers=ADMIN_HEADERS,
+    )).json()["tenant_id"]
+
+    # "Two months ago" -- always past SNAPSHOT_GRACE_DAYS regardless of
+    # today's real date (see test_create_billing_snapshot_computes_totals_and_rejects_duplicates).
+    _, _, _, last_month_start = _last_two_utc_months()
+    last_month_mid = last_month_start.replace(day=15)
+    month_str = f"{last_month_start.year:04d}-{last_month_start.month:02d}"
+    # All three (including tid_c, which must still show up as "not frozen"
+    # rather than being excluded as too-new) must have existed that month.
+    for tid in (tid_a, tid_b, tid_c):
+        await _set_tenant_created_at(sm, tid, datetime.combine(last_month_start, datetime.min.time()))
+
+    async with sm() as s:
+        s.add(Conversation(
+            id="plat_a1", tenant_id=tid_a, agent_type="voicebot", channel="voice", status="ended",
+            pipeline_config={}, provider_call_sid="pa1",
+            cost=0.50, duration_ms=60_000,
+            started_at=datetime.combine(last_month_mid, datetime.min.time()),
+        ))
+        s.add(ChatSession(
+            id="plat_b1", tenant_id=tid_b, status="ended", cost=0.20,
+            input_tokens=10, output_tokens=5,
+            started_at=datetime.combine(last_month_mid, datetime.min.time()),
+        ))
+        await s.commit()
+
+    for tid in (tid_a, tid_b):
+        resp = await client.post(
+            f"/tenants/{tid}/billing/snapshots", json={"month": month_str}, headers=ADMIN_HEADERS,
+        )
+        assert resp.status_code == 201, resp.text
+    # tid_c is deliberately left un-frozen for this month.
+
+    plat = (await client.get(
+        f"/tenants/billing-snapshots?month={month_str}", headers=ADMIN_HEADERS,
+    )).json()
+    assert plat["month"] == month_str
+    # Sorted by platform_cost desc: tid_a (0.50) before tid_b (0.20).
+    assert [row["tenant_id"] for row in plat["snapshots"]] == [tid_a, tid_b]
+    assert plat["totals"]["platform_cost"] == pytest.approx(0.70)
+    assert plat["totals"]["chat_cost"] == pytest.approx(0.20)
+    assert plat["totals"]["total_calls"] == 1
+    assert plat["totals"]["chat_sessions"] == 1
+    assert {row["tenant_id"] for row in plat["not_frozen"]} == {tid_c}
+
+
+async def test_platform_billing_snapshots_not_frozen_excludes_tenant_created_after_month(ctx) -> None:
+    """``not_frozen`` is for tenants that COULD have a snapshot for this
+    month but don't yet -- a tenant created after the month already ended
+    never qualifies (tenant_existed_in_month), so it must not appear there
+    even though it also has no snapshot. A tenant created before the month
+    ended is unaffected and still shows up as not frozen."""
+    client, _, sm = ctx
+    tid_old = (await client.post(
+        "/tenants", json=_body(slug="plat-old", name="Old Co", timezone="UTC"),
+        headers=ADMIN_HEADERS,
+    )).json()["tenant_id"]
+    tid_new = (await client.post(
+        "/tenants", json=_body(
+            slug="plat-new", name="New Co", timezone="UTC", telephony={"provider": "none"},
+        ), headers=ADMIN_HEADERS,
+    )).json()["tenant_id"]
+
+    _, _, last_month_end, last_month_start = _last_two_utc_months()
+    month_str = f"{last_month_start.year:04d}-{last_month_start.month:02d}"
+
+    async with sm() as s:
+        old = await s.get(Tenant, tid_old)
+        old.created_at = datetime.combine(last_month_start, datetime.min.time())
+        new = await s.get(Tenant, tid_new)
+        # One day after the month's local end -- definitely didn't exist
+        # during it.
+        new.created_at = datetime.combine(last_month_end, datetime.min.time()) + timedelta(days=2)
+        await s.commit()
+
+    plat = (await client.get(
+        f"/tenants/billing-snapshots?month={month_str}", headers=ADMIN_HEADERS,
+    )).json()
+    assert plat["snapshots"] == []
+    assert {row["tenant_id"] for row in plat["not_frozen"]} == {tid_old}
+
+
+async def test_platform_billing_snapshots_tie_break_sorts_by_tenant_name_then_id(ctx) -> None:
+    """Two tenants tied on platform_cost must come back in a deterministic
+    order (tenant_name asc, then id asc) instead of whatever order the DB
+    happens to return them in."""
+    client, _, sm = ctx
+    tid_z = (await client.post(
+        "/tenants", json=_body(slug="tie-z", name="Zeta Co", timezone="UTC"),
+        headers=ADMIN_HEADERS,
+    )).json()["tenant_id"]
+    tid_a = (await client.post(
+        "/tenants", json=_body(
+            slug="tie-a", name="Alpha Co", timezone="UTC", telephony={"provider": "none"},
+        ), headers=ADMIN_HEADERS,
+    )).json()["tenant_id"]
+
+    _, _, _, month_start = _last_two_utc_months()
+    month_mid = month_start.replace(day=15)
+    month_str = f"{month_start.year:04d}-{month_start.month:02d}"
+    for tid in (tid_z, tid_a):
+        await _set_tenant_created_at(sm, tid, datetime.combine(month_start, datetime.min.time()))
+
+    async with sm() as s:
+        for tid, cid in ((tid_z, "tie_z1"), (tid_a, "tie_a1")):
+            s.add(Conversation(
+                id=cid, tenant_id=tid, agent_type="voicebot", channel="voice", status="ended",
+                pipeline_config={}, provider_call_sid=cid,
+                cost=0.25, duration_ms=60_000,
+                started_at=datetime.combine(month_mid, datetime.min.time()),
+            ))
+        await s.commit()
+
+    for tid in (tid_z, tid_a):
+        resp = await client.post(
+            f"/tenants/{tid}/billing/snapshots", json={"month": month_str}, headers=ADMIN_HEADERS,
+        )
+        assert resp.status_code == 201, resp.text
+
+    plat = (await client.get(
+        f"/tenants/billing-snapshots?month={month_str}", headers=ADMIN_HEADERS,
+    )).json()
+    # Both tied at platform_cost=0.25 -- "Alpha Co" (tid_a) must sort before
+    # "Zeta Co" (tid_z) despite tid_z having been created (and frozen) first.
+    assert [row["tenant_name"] for row in plat["snapshots"]] == ["Alpha Co", "Zeta Co"]
+
+    csv_resp = await client.get(
+        f"/tenants/billing-snapshots?month={month_str}&format=csv", headers=ADMIN_HEADERS,
+    )
+    rows = list(csv.reader(io.StringIO(csv_resp.text)))
+    data_rows = rows[1:-1]
+    assert [r[2] for r in data_rows] == ["Alpha Co", "Zeta Co"]
+
+
+async def test_platform_billing_snapshots_includes_deleted_tenant(ctx) -> None:
+    client, _, sm = ctx
+    tid = (await client.post(
+        "/tenants", json=_body(slug="plat-del", name="Deleted Co", timezone="UTC"),
+        headers=ADMIN_HEADERS,
+    )).json()["tenant_id"]
+
+    # "Two months ago" -- always past SNAPSHOT_GRACE_DAYS regardless of
+    # today's real date (see test_create_billing_snapshot_computes_totals_and_rejects_duplicates).
+    _, _, _, last_month_start = _last_two_utc_months()
+    month_str = f"{last_month_start.year:04d}-{last_month_start.month:02d}"
+    await _set_tenant_created_at(sm, tid, datetime.combine(last_month_start, datetime.min.time()))
+    resp = await client.post(
+        f"/tenants/{tid}/billing/snapshots", json={"month": month_str}, headers=ADMIN_HEADERS,
+    )
+    assert resp.status_code == 201, resp.text
+
+    async with sm() as s:
+        t = await s.get(Tenant, tid)
+        await s.delete(t)
+        await s.commit()
+
+    plat = (await client.get(
+        f"/tenants/billing-snapshots?month={month_str}", headers=ADMIN_HEADERS,
+    )).json()
+    assert len(plat["snapshots"]) == 1
+    assert plat["snapshots"][0]["tenant_id"] == tid
+    assert plat["snapshots"][0]["tenant_name"] == "Deleted Co"
+    assert plat["snapshots"][0]["tenant_exists"] is False
+    assert plat["not_frozen"] == []  # a deleted tenant is never "not frozen"
+
+
+async def test_platform_billing_snapshots_csv_content_type_and_filename(ctx) -> None:
+    client, _, _ = ctx
+    resp = await client.get(
+        "/tenants/billing-snapshots?month=2024-01&format=csv", headers=ADMIN_HEADERS,
+    )
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("text/csv")
+    assert resp.headers["content-disposition"] == 'attachment; filename="billing-2024-01.csv"'
+
+
+async def test_platform_billing_snapshots_csv_rows_and_total_row(ctx) -> None:
+    client, _, sm = ctx
+    tid_a = (await client.post(
+        "/tenants", json=_body(slug="csv-a", name="CSV A", timezone="UTC"),
+        headers=ADMIN_HEADERS,
+    )).json()["tenant_id"]
+    tid_b = (await client.post(
+        "/tenants", json=_body(
+            slug="csv-b", name="CSV B", timezone="UTC", telephony={"provider": "none"},
+        ), headers=ADMIN_HEADERS,
+    )).json()["tenant_id"]
+
+    # "Two months ago" -- always past SNAPSHOT_GRACE_DAYS regardless of
+    # today's real date (see test_create_billing_snapshot_computes_totals_and_rejects_duplicates).
+    _, _, _, last_month_start = _last_two_utc_months()
+    last_month_mid = last_month_start.replace(day=15)
+    month_str = f"{last_month_start.year:04d}-{last_month_start.month:02d}"
+    for tid in (tid_a, tid_b):
+        await _set_tenant_created_at(sm, tid, datetime.combine(last_month_start, datetime.min.time()))
+
+    async with sm() as s:
+        s.add(ProviderCost(kind="telephony", provider="twilio", model="", cost_per_min=0.10))
+        s.add(Conversation(
+            id="csv_a1", tenant_id=tid_a, agent_type="voicebot", channel="voice", status="ended",
+            pipeline_config={}, provider_call_sid="csva1", telephony_provider="twilio",
+            cost=0.30, duration_ms=120_000,
+            started_at=datetime.combine(last_month_mid, datetime.min.time()),
+        ))
+        s.add(ChatSession(
+            id="csv_b1", tenant_id=tid_b, status="ended", cost=0.40,
+            input_tokens=10, output_tokens=5,
+            started_at=datetime.combine(last_month_mid, datetime.min.time()),
+        ))
+        await s.commit()
+
+    for tid in (tid_a, tid_b):
+        resp = await client.post(
+            f"/tenants/{tid}/billing/snapshots", json={"month": month_str}, headers=ADMIN_HEADERS,
+        )
+        assert resp.status_code == 201, resp.text
+
+    resp = await client.get(
+        f"/tenants/billing-snapshots?month={month_str}&format=csv", headers=ADMIN_HEADERS,
+    )
+    assert resp.status_code == 200
+    rows = list(csv.reader(io.StringIO(resp.text)))
+    assert rows[0] == [
+        "month", "tenant_id", "tenant_name", "tenant_exists", "timezone", "currency",
+        "platform_cost", "chat_cost", "total_calls", "billable_minutes", "chat_sessions",
+        "chat_input_tokens", "chat_output_tokens", "avg_cost_per_call",
+        "tentative_telephony_cost", "created_at", "created_by",
+    ]
+    data_rows, total_row = rows[1:-1], rows[-1]
+    assert len(data_rows) == 2
+    by_tenant = {r[1]: r for r in data_rows}
+    assert float(by_tenant[tid_a][6]) == pytest.approx(0.30)   # platform_cost (voice only)
+    assert float(by_tenant[tid_b][7]) == pytest.approx(0.40)   # chat_cost
+
+    assert total_row[2] == "TOTAL"
+    assert total_row[0] == "" and total_row[1] == "" and total_row[3] == ""
+    assert total_row[13] == ""  # avg_cost_per_call -- not a meaningful sum, left blank
+    assert float(total_row[6]) == pytest.approx(0.70)           # platform_cost sum
+    assert float(total_row[7]) == pytest.approx(0.40)           # chat_cost sum
+    assert total_row[8] == "1"                                  # total_calls sum
+    assert total_row[10] == "1"                                 # chat_sessions sum
+
+
+async def test_platform_billing_snapshots_csv_escapes_formula_injection(ctx) -> None:
+    client, _, sm = ctx
+    tid = (await client.post(
+        "/tenants", json=_body(slug="csv-inject", name='=HYPERLINK("x")', timezone="UTC"),
+        headers=ADMIN_HEADERS,
+    )).json()["tenant_id"]
+
+    # "Two months ago" -- always past SNAPSHOT_GRACE_DAYS regardless of
+    # today's real date (see test_create_billing_snapshot_computes_totals_and_rejects_duplicates).
+    _, _, _, last_month_start = _last_two_utc_months()
+    month_str = f"{last_month_start.year:04d}-{last_month_start.month:02d}"
+    await _set_tenant_created_at(sm, tid, datetime.combine(last_month_start, datetime.min.time()))
+    resp = await client.post(
+        f"/tenants/{tid}/billing/snapshots", json={"month": month_str}, headers=ADMIN_HEADERS,
+    )
+    assert resp.status_code == 201, resp.text
+
+    csv_resp = await client.get(
+        f"/tenants/billing-snapshots?month={month_str}&format=csv", headers=ADMIN_HEADERS,
+    )
+    rows = list(csv.reader(io.StringIO(csv_resp.text)))
+    assert rows[1][2] == '\'=HYPERLINK("x")'
+
+
+async def test_platform_billing_snapshots_csv_empty_month_is_header_and_zero_total(ctx) -> None:
+    client, _, _ = ctx
+    resp = await client.get(
+        "/tenants/billing-snapshots?month=2024-01&format=csv", headers=ADMIN_HEADERS,
+    )
+    rows = list(csv.reader(io.StringIO(resp.text)))
+    assert len(rows) == 2  # header + TOTAL, no snapshot rows
+    assert rows[1] == [
+        "", "", "TOTAL", "", "", "", "0.0", "0.0", "0", "0.0", "0", "0", "0", "", "0.0", "", "",
+    ]

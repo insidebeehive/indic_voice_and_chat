@@ -1,6 +1,7 @@
 """Database models (SQLAlchemy 2.x async)."""
 
 from src.models.benchmark import BenchmarkRun, KBDocument
+from src.models.billing_snapshot import TenantBillingSnapshot
 from src.models.campaign import Campaign, Lead
 from src.models.chat import ChatMessage, ChatSession, ChatTool
 from src.models.chat_turn_metrics import ChatToolMetricRow, ChatTurnMetric
@@ -44,6 +45,7 @@ __all__ = [
     "ProviderCost",
     "Tenant",
     "TenantApiKey",
+    "TenantBillingSnapshot",
     "TenantPhoneNumber",
     "TenantSecret",
     "Turn",

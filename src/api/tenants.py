@@ -11,23 +11,35 @@ token (returned once, stored only as a hash), and refresh the live resolver.
 
 from __future__ import annotations
 
+import csv
+import io
 import logging
 import re
 import secrets as pysecrets
 import uuid
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Literal, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy import case, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.answer_paths import answer_url_for
+from src.api.billing import (
+    compute_tenant_billing,
+    current_local_month,
+    freezable_from,
+    local_period_to_utc,
+    month_freezable,
+    resolve_timezone_name,
+    snapshot_tenant_month,
+    tenant_existed_in_month,
+)
 from src.api.deps import get_db_session
 from src.auth import secrets as crypto
-from src.auth.audit import log_denied
+from src.auth.audit import current_admin_label, log_denied
 from src.auth.context import hash_api_token
 from src.auth.middleware import require_admin
 from src.config_tenant import (
@@ -58,6 +70,7 @@ from src.config_tenant import (
 from src.config_tenant import _PROVIDER_SPECIFIC_FIELDS
 from src.config_tenant import TenantLLMConfig as _LLM
 from src.dialogue.campaign_loader import parse_campaign_yaml
+from src.models.billing_snapshot import TenantBillingSnapshot
 from src.models.campaign import Campaign
 from src.models.conversation import Conversation
 from src.models.tenant import ProviderCost, Tenant, TenantApiKey, TenantPhoneNumber, TenantSecret
@@ -653,6 +666,230 @@ async def _refresh_resolver(request: Request, tenant_id: str) -> None:
     providers = getattr(request.app.state, "providers", None)
     if providers is not None and hasattr(providers, "evict"):
         providers.evict(tenant_id)
+
+
+# --- Platform-wide billing snapshots view ----------------------------------
+# Registered here, ahead of every `/{tenant_id}...` route below (the first of
+# which is the very next route, `PATCH /{tenant_id}`), so the literal path
+# segment `billing-snapshots` can never be captured as a `tenant_id` path
+# parameter by an earlier-registered `/{tenant_id}` route. FastAPI/Starlette
+# matches routes in registration order, so position here is load-bearing, not
+# cosmetic -- see test_platform_billing_snapshots_not_shadowed_by_tenant_id_route.
+
+class PlatformBillingSnapshotRow(BaseModel):
+    id: int
+    tenant_id: str
+    tenant_name: str
+    tenant_exists: bool          # False when the tenant row has since been deleted
+    period_month: date
+    total_calls: int
+    billable_minutes: float
+    platform_cost: float
+    avg_cost_per_call: float
+    tentative_telephony_cost: float
+    telephony_rates: dict
+    chat_sessions: int
+    chat_input_tokens: int
+    chat_output_tokens: int
+    chat_cost: float
+    currency: str
+    timezone: str
+    created_at: datetime
+    created_by: str
+
+
+class PlatformBillingTotals(BaseModel):
+    platform_cost: float
+    chat_cost: float
+    total_calls: int
+    billable_minutes: float
+    chat_sessions: int
+    tentative_telephony_cost: float
+
+
+class PlatformBillingNotFrozen(BaseModel):
+    tenant_id: str
+    name: str
+
+
+class PlatformBillingResponse(BaseModel):
+    month: str
+    snapshots: list[PlatformBillingSnapshotRow]
+    totals: PlatformBillingTotals
+    not_frozen: list[PlatformBillingNotFrozen]
+
+
+# Strict "YYYY-MM" -- checked BEFORE strptime("%Y-%m") below, which on its
+# own is too lenient (e.g. strptime("2024-3", "%Y-%m") happily parses as
+# March 2024, a single-digit month that should be rejected as a bad request
+# instead of silently accepted).
+_MONTH_RE = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
+
+
+def _parse_billing_month(month: str) -> date:
+    """Parse a strict ``"YYYY-MM"`` string into the first day of that month,
+    or raise a 422. Shared by the manual snapshot POST and the platform-wide
+    billing-snapshots GET so both reject the same malformed input the same
+    way."""
+    month = month.strip()
+    if not _MONTH_RE.match(month):
+        raise HTTPException(status_code=422, detail="month must be formatted YYYY-MM")
+    return datetime.strptime(month, "%Y-%m").date()
+
+
+# CSV-injection guard (Excel/Sheets/LibreOffice all treat a cell starting
+# with one of these as a formula/macro trigger when the file is opened) --
+# any string cell gets a literal leading apostrophe prepended so it's always
+# read back as plain text. Numbers are never routed through this.
+_CSV_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _csv_safe(value) -> str:
+    s = "" if value is None else str(value)
+    if s.startswith(_CSV_FORMULA_PREFIXES):
+        return "'" + s
+    return s
+
+
+_PLATFORM_BILLING_CSV_COLUMNS = [
+    "month", "tenant_id", "tenant_name", "tenant_exists", "timezone", "currency",
+    "platform_cost", "chat_cost", "total_calls", "billable_minutes", "chat_sessions",
+    "chat_input_tokens", "chat_output_tokens", "avg_cost_per_call",
+    "tentative_telephony_cost", "created_at", "created_by",
+]
+
+
+def _platform_billing_csv(month_start: date, rows: list[TenantBillingSnapshot], existing_ids: set[str]) -> str:
+    """Render the same snapshot rows ``platform_billing_snapshots`` would
+    return as JSON into a CSV: one row per snapshot (``not_frozen`` tenants
+    are never included), same sort order, plus a final ``TOTAL`` row. Uses
+    the stdlib ``csv`` module (never hand-joined strings) so quoting/escaping
+    of any stray comma or quote in a tenant name is handled correctly."""
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(_PLATFORM_BILLING_CSV_COLUMNS)
+    month_str = month_start.strftime("%Y-%m")
+
+    sums = {
+        "platform_cost": 0.0, "chat_cost": 0.0, "total_calls": 0, "billable_minutes": 0.0,
+        "chat_sessions": 0, "chat_input_tokens": 0, "chat_output_tokens": 0,
+        "tentative_telephony_cost": 0.0,
+    }
+    for r in rows:
+        writer.writerow([
+            month_str, _csv_safe(r.tenant_id), _csv_safe(r.tenant_name), r.tenant_id in existing_ids,
+            _csv_safe(r.timezone), _csv_safe(r.currency),
+            r.platform_cost, r.chat_cost, r.total_calls, r.billable_minutes, r.chat_sessions,
+            r.chat_input_tokens, r.chat_output_tokens, r.avg_cost_per_call,
+            r.tentative_telephony_cost, _csv_safe(r.created_at.isoformat()), _csv_safe(r.created_by),
+        ])
+        sums["platform_cost"] += r.platform_cost
+        sums["chat_cost"] += r.chat_cost
+        sums["total_calls"] += r.total_calls
+        sums["billable_minutes"] += r.billable_minutes
+        sums["chat_sessions"] += r.chat_sessions
+        sums["chat_input_tokens"] += r.chat_input_tokens
+        sums["chat_output_tokens"] += r.chat_output_tokens
+        sums["tentative_telephony_cost"] += r.tentative_telephony_cost
+
+    # avg_cost_per_call is a per-row ratio -- summing/averaging it here would
+    # be a made-up number, so it's left blank like the other non-numeric
+    # cells rather than silently fabricated.
+    writer.writerow([
+        "", "", "TOTAL", "", "", "",
+        round(sums["platform_cost"], 6), round(sums["chat_cost"], 6), sums["total_calls"],
+        round(sums["billable_minutes"], 4), sums["chat_sessions"], sums["chat_input_tokens"],
+        sums["chat_output_tokens"], "", round(sums["tentative_telephony_cost"], 6), "", "",
+    ])
+    return buf.getvalue()
+
+
+@router.get("/billing-snapshots", response_model=PlatformBillingResponse)
+async def platform_billing_snapshots(
+    month: str = Query(...),
+    format: str = Query("json", pattern="^(json|csv)$"),
+    session: AsyncSession = Depends(get_db_session),
+    _: None = Depends(require_admin),
+):
+    """Every tenant's FROZEN bill for one calendar month (``month``,
+    ``"YYYY-MM"``), platform-wide -- sorted by ``platform_cost`` descending,
+    then ``tenant_name``/``id`` ascending as a deterministic tie-break.
+
+    Includes snapshots for tenants that no longer exist (``tenant_exists``
+    is False; the row's own frozen ``tenant_name`` is used since the live
+    ``Tenant`` row is gone -- see ``TenantBillingSnapshot``'s docstring).
+    ``not_frozen`` separately lists currently-existing tenants with no
+    snapshot for this month yet. ``format=csv`` returns the same snapshot
+    rows (never ``not_frozen``) as a CSV download instead of JSON."""
+    month_start = _parse_billing_month(month)
+
+    rows = (await session.execute(
+        select(TenantBillingSnapshot)
+        .where(TenantBillingSnapshot.period_month == month_start)
+        # platform_cost desc, then a deterministic tie-break (tenant_name,
+        # then id) so two tenants tied on cost always come back in the same
+        # order across requests/pages instead of whatever the DB feels like.
+        .order_by(
+            TenantBillingSnapshot.platform_cost.desc(),
+            TenantBillingSnapshot.tenant_name.asc(),
+            TenantBillingSnapshot.id.asc(),
+        )
+    )).scalars().all()
+
+    tenant_rows = (await session.execute(
+        select(Tenant.id, Tenant.name, Tenant.created_at, Tenant.timezone)
+    )).all()
+    existing_ids = {tid for tid, _, _, _ in tenant_rows}
+
+    if format == "csv":
+        csv_text = _platform_billing_csv(month_start, rows, existing_ids)
+        filename = f"billing-{month_start.strftime('%Y-%m')}.csv"
+        return Response(
+            content=csv_text,
+            media_type="text/csv; charset=utf-8",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+
+    snapshot_tenant_ids = {r.tenant_id for r in rows}
+    # A tenant that didn't exist yet during this month (same rule the auto
+    # job and the manual POST use -- tenant_existed_in_month) was never
+    # offered a chance to have a snapshot and isn't "not frozen" either; it's
+    # simply out of scope for this month. Each tenant's OWN timezone decides
+    # its own local month boundary (tenant counts are small -- a per-tenant
+    # Python-side check here is fine, no need to push this into SQL).
+    not_frozen = [
+        PlatformBillingNotFrozen(tenant_id=tid, name=name)
+        for tid, name, created_at, tz in tenant_rows
+        if tid not in snapshot_tenant_ids
+        and tenant_existed_in_month(created_at, resolve_timezone_name(tz), month_start)
+    ]
+    snapshots_out = [
+        PlatformBillingSnapshotRow(
+            id=r.id, tenant_id=r.tenant_id, tenant_name=r.tenant_name,
+            tenant_exists=r.tenant_id in existing_ids,
+            period_month=r.period_month, total_calls=r.total_calls,
+            billable_minutes=r.billable_minutes, platform_cost=r.platform_cost,
+            avg_cost_per_call=r.avg_cost_per_call,
+            tentative_telephony_cost=r.tentative_telephony_cost,
+            telephony_rates=r.telephony_rates or {}, chat_sessions=r.chat_sessions,
+            chat_input_tokens=r.chat_input_tokens, chat_output_tokens=r.chat_output_tokens,
+            chat_cost=r.chat_cost, currency=r.currency, timezone=r.timezone,
+            created_at=r.created_at, created_by=r.created_by,
+        )
+        for r in rows
+    ]
+    totals = PlatformBillingTotals(
+        platform_cost=round(sum(r.platform_cost for r in rows), 6),
+        chat_cost=round(sum(r.chat_cost for r in rows), 6),
+        total_calls=sum(r.total_calls for r in rows),
+        billable_minutes=round(sum(r.billable_minutes for r in rows), 4),
+        chat_sessions=sum(r.chat_sessions for r in rows),
+        tentative_telephony_cost=round(sum(r.tentative_telephony_cost for r in rows), 6),
+    )
+    return PlatformBillingResponse(
+        month=month_start.strftime("%Y-%m"), snapshots=snapshots_out, totals=totals,
+        not_frozen=not_frozen,
+    )
 
 
 @router.patch("/{tenant_id}", response_model=UpdateTenantResponse)
@@ -2253,6 +2490,9 @@ async def tenant_chat_analytics(
 
 class TenantBilling(BaseModel):
     tenant_id: str
+    period_from: date
+    period_to: date                      # inclusive
+    timezone: str                        # IANA zone the period was resolved in (Tenant.timezone, or "UTC" fallback)
     total_calls: int
     billable_minutes: float
     platform_cost: float                 # combined voice + chat: what we charge
@@ -2269,55 +2509,139 @@ class TenantBilling(BaseModel):
 @router.get("/{tenant_id}/billing", response_model=TenantBilling)
 async def tenant_billing(
     tenant_id: str,
+    from_: Optional[date] = Query(None, alias="from"),
+    to: Optional[date] = Query(None),
     session: AsyncSession = Depends(get_db_session),
     _: None = Depends(require_admin),
 ) -> TenantBilling:
     """Billing summary: platform cost (voice + chat combined, telephony excluded)
-    + a tentative telephony figure computed from the tenant's telephony provider rate."""
-    from src.models.chat import ChatSession
+    + a tentative telephony figure computed from the tenant's telephony provider rate.
 
-    await _require_tenant(session, tenant_id)
-    rows = (await session.execute(
-        select(Conversation.cost, Conversation.duration_ms, Conversation.telephony_provider)
-        .where(Conversation.tenant_id == tenant_id)
-    )).all()
-    # telephony rates (model="") for the tentative figure
-    tel_rates = dict((p, c) for p, c in (await session.execute(
-        select(ProviderCost.provider, ProviderCost.cost_per_min)
-        .where(ProviderCost.kind == "telephony", ProviderCost.model == "")
-    )).all())
+    Date range is a calendar range in the TENANT's own timezone (``Tenant.timezone``),
+    defaulting to the current local month (1st of this month through today). ``to`` is
+    inclusive. See ``src/api/billing.py`` for the actual computation
+    (``compute_tenant_billing``) and the local-timezone-to-UTC conversion."""
+    t = await _require_tenant(session, tenant_id)
+    tz_name = resolve_timezone_name(t.timezone)
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    default_from, today_local = current_local_month(tz_name, now)
+    period_from = from_ or default_from
+    period_to = to or today_local
+    if period_from > period_to:
+        raise HTTPException(status_code=422, detail="'from' must not be after 'to'")
 
-    voice_cost = 0.0
-    tentative_tel = 0.0
-    total_ms = 0
-    for cost, dur, tel in rows:
-        voice_cost += float(cost or 0.0)
-        total_ms += int(dur or 0)
-        if tel and dur:
-            tentative_tel += tel_rates.get(tel, 0.0) * (int(dur) / 60_000.0)
-    n = len(rows)
+    start, end = local_period_to_utc(tz_name, period_from, period_to)
+    data = await compute_tenant_billing(session, tenant_id, start, end)
+    data.pop("telephony_rates", None)
 
-    chat_row = (await session.execute(
-        select(
-            func.count(ChatSession.id), func.coalesce(func.sum(ChatSession.cost), 0.0),
-            func.coalesce(func.sum(ChatSession.input_tokens), 0),
-            func.coalesce(func.sum(ChatSession.output_tokens), 0),
-        ).where(ChatSession.tenant_id == tenant_id)
-    )).one()
-    chat_sessions, chat_cost, chat_in_tok, chat_out_tok = chat_row
-
-    platform = voice_cost + float(chat_cost or 0.0)
     return TenantBilling(
-        tenant_id=tenant_id, total_calls=n,
-        billable_minutes=round(total_ms / 60_000.0, 4),
-        platform_cost=round(platform, 6),
-        avg_cost_per_call=round(voice_cost / n, 6) if n else 0.0,
-        tentative_telephony_cost=round(tentative_tel, 6),
-        chat_sessions=int(chat_sessions or 0),
-        chat_input_tokens=int(chat_in_tok or 0),
-        chat_output_tokens=int(chat_out_tok or 0),
-        chat_cost=round(float(chat_cost or 0.0), 6),
+        tenant_id=tenant_id, period_from=period_from, period_to=period_to, timezone=tz_name,
+        **data,
     )
+
+
+class SnapshotMonthIn(BaseModel):
+    month: str  # "YYYY-MM"
+
+
+class TenantBillingSnapshotOut(BaseModel):
+    id: int
+    tenant_id: str
+    tenant_name: str
+    period_month: date
+    total_calls: int
+    billable_minutes: float
+    platform_cost: float
+    avg_cost_per_call: float
+    tentative_telephony_cost: float
+    telephony_rates: dict
+    chat_sessions: int
+    chat_input_tokens: int
+    chat_output_tokens: int
+    chat_cost: float
+    currency: str
+    timezone: str
+    created_at: datetime
+    created_by: str
+
+    model_config = {"from_attributes": True}
+
+
+@router.get("/{tenant_id}/billing/snapshots", response_model=list[TenantBillingSnapshotOut])
+async def list_tenant_billing_snapshots(
+    tenant_id: str,
+    session: AsyncSession = Depends(get_db_session),
+    _: None = Depends(require_admin),
+) -> list[TenantBillingSnapshot]:
+    """Frozen monthly bills, newest month first. Deliberately does NOT require
+    the tenant to still exist (``_require_tenant`` is not called) -- that's
+    the whole point of a snapshot surviving tenant deletion; an empty list is
+    a perfectly normal answer."""
+    rows = (await session.execute(
+        select(TenantBillingSnapshot)
+        .where(TenantBillingSnapshot.tenant_id == tenant_id)
+        .order_by(TenantBillingSnapshot.period_month.desc())
+    )).scalars().all()
+    return list(rows)
+
+
+@router.post(
+    "/{tenant_id}/billing/snapshots", response_model=TenantBillingSnapshotOut, status_code=201,
+)
+async def create_tenant_billing_snapshot(
+    tenant_id: str,
+    body: SnapshotMonthIn,
+    session: AsyncSession = Depends(get_db_session),
+    _: None = Depends(require_admin),
+) -> TenantBillingSnapshot:
+    """Freeze one calendar month (``body.month``, ``"YYYY-MM"``) of this
+    tenant's billing. The month is interpreted in the tenant's OWN timezone
+    and must already be past its grace period (``SNAPSHOT_GRACE_DAYS`` days
+    after it ends, in that timezone -- see ``src/api/billing.py``'s
+    ``month_freezable``) -- freezing the current month, a future month, or a
+    just-completed month whose late costs may still be settling is rejected,
+    since the figure would only have to be silently wrong or re-taken.
+
+    Checks run in this order: month format -> tenant exists -> tenant
+    existed during that month -> grace period cleared -> no snapshot already
+    frozen for it -- each one a precondition for the next, cheapest/most
+    fundamental first."""
+    month_start = _parse_billing_month(body.month)
+    t = await _require_tenant(session, tenant_id)
+
+    tz_name = resolve_timezone_name(t.timezone)
+    if not tenant_existed_in_month(t.created_at, tz_name, month_start):
+        raise HTTPException(
+            status_code=422,
+            detail=f"tenant did not exist in {month_start.strftime('%Y-%m')}",
+        )
+
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    if not month_freezable(tz_name, month_start, now):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"month can be frozen from {freezable_from(month_start).isoformat()} "
+                f"({tz_name}) once late costs have settled"
+            ),
+        )
+
+    existing = (await session.execute(
+        select(TenantBillingSnapshot.id).where(
+            TenantBillingSnapshot.tenant_id == tenant_id,
+            TenantBillingSnapshot.period_month == month_start,
+        )
+    )).scalar_one_or_none()
+    if existing is not None:
+        raise HTTPException(status_code=409, detail="a snapshot already exists for this tenant and month")
+
+    actor = current_admin_label() or "admin"
+    snap = await snapshot_tenant_month(session, t, month_start, created_by=actor)
+    if snap is None:
+        # Lost the race against a concurrent snapshot between the check above
+        # and the insert inside snapshot_tenant_month.
+        raise HTTPException(status_code=409, detail="a snapshot already exists for this tenant and month")
+    return snap
 
 
 class ChatTurnMetricsTurns(BaseModel):

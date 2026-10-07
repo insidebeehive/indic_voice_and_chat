@@ -73,6 +73,22 @@
     <div id="tlist"><span class="hint">Enter your admin token + Save to load tenants.</span></div>
   </div>
 
+  <div class="card">
+    <div style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:.5rem;">
+      <h2 style="margin:0;">Platform billing <span class="hint">— every tenant's frozen bill for one month</span></h2>
+      <button class="ghost sm" id="platBillToggle" onclick="togglePlatformBilling()">Show</button>
+    </div>
+    <div id="platBillBody" hidden>
+      <div style="display:flex; gap:.5rem; align-items:center; flex-wrap:wrap; margin-top:.6rem;">
+        <label>Month <input type="month" id="platBillMonth"></label>
+        <button class="btn-sm" onclick="loadPlatformBilling()">Load</button>
+        <button class="btn-sm" onclick="exportPlatformBillingCsv()">Export CSV</button>
+        <span id="platBillError" class="hint"></span>
+      </div>
+      <div id="platBillContent" style="margin-top:.8rem;"></div>
+    </div>
+  </div>
+
   <div class="card" id="detail" hidden>
     <div style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:.5rem;">
       <h2 id="detailTitle" style="margin:0;">Tenant</h2>
@@ -210,6 +226,10 @@ function chatVoiceHint(cv) {
 }
 let SELECTED = null;
 let CHAT_WINDOW_H = 24;
+// Tenant timezone (IANA name) returned by the last GET .../billing response,
+// keyed by tenant_id -- used by billingPreset() to compute "This month" /
+// "Last month" in the TENANT's own timezone rather than the browser's.
+let BILLING_TZ = {};
 
 async function loadTenants() {
   const r = await api("/api/v1/tenants");
@@ -584,11 +604,28 @@ async function loadAnalytics(id) {
     </div>${voiceTurnHtml}${chatHtml}${chatPerfHtml}`;
 }
 
-async function loadBilling(id) {
-  const r = await api(`/api/v1/tenants/${id}/billing`);
+async function loadBilling(id, from, to) {
+  let path = `/api/v1/tenants/${id}/billing`;
+  const qs = [];
+  if (from) qs.push(`from=${encodeURIComponent(from)}`);
+  if (to) qs.push(`to=${encodeURIComponent(to)}`);
+  if (qs.length) path += `?${qs.join("&")}`;
+  const r = await api(path);
   if (!r.ok) { $("pane_bill").innerHTML = `<span class="hint">billing error ${r.status}</span>`; return; }
   const b = r.json;
+  BILLING_TZ[id] = b.timezone;
+
   $("pane_bill").innerHTML = `
+    <div class="card" style="margin-bottom:1rem;">
+      <div style="display:flex; gap:.6rem; align-items:center; flex-wrap:wrap;">
+        <label>From <input type="date" id="bill_from" value="${escAttr(b.period_from)}"></label>
+        <label>To <input type="date" id="bill_to" value="${escAttr(b.period_to)}"></label>
+        <button class="btn-sm" data-tid="${escAttr(id)}" onclick="billingPreset(this.dataset.tid,'this')">This month</button>
+        <button class="btn-sm" data-tid="${escAttr(id)}" onclick="billingPreset(this.dataset.tid,'last')">Last month</button>
+        <button class="btn-sm" data-tid="${escAttr(id)}" onclick="loadBilling(this.dataset.tid, $('bill_from').value, $('bill_to').value)">Apply</button>
+      </div>
+      <div class="hint" style="margin-top:.4rem;">Billing for ${escT(b.period_from)} – ${escT(b.period_to)} (${escT(b.timezone)})</div>
+    </div>
     <div class="stats">
       ${statBox("Platform cost (voice + chat)", fmt(b.platform_cost))}
       ${statBox("Total calls", b.total_calls)}
@@ -605,7 +642,198 @@ async function loadBilling(id) {
     </div>
     <div class="hint" style="margin-top:.6rem;">Platform cost = voice (STT/LLM/TTS or S2S) + chat (LLM tokens) combined —
       what we bill. Telephony runs on the tenant's own provider key, so it's shown as a tentative figure and is
-      <b>not</b> in the platform cost.</div>`;
+      <b>not</b> in the platform cost.</div>
+
+    <h2 style="margin:1.4rem 0 .6rem;">Frozen monthly bills</h2>
+    <div id="bill_snapshots"><span class="hint">loading…</span></div>
+    <div style="display:flex; gap:.5rem; align-items:center; margin-top:.6rem;">
+      <input type="month" id="bill_freeze_month">
+      <button class="btn-sm" data-tid="${escAttr(id)}" onclick="freezeBillingMonth(this.dataset.tid)">Freeze month</button>
+      <span id="bill_freeze_result" class="hint"></span>
+    </div>
+    <div class="hint" style="margin-top:.4rem;">Months freeze automatically on the 3rd (tenant's own timezone) of the
+      following month, so late costs have time to settle, and never change afterward even if the tenant or rates
+      change later.</div>`;
+
+  loadBillingSnapshots(id);
+}
+
+// "This month"/"Last month" presets, computed in the TENANT's own timezone
+// (from the last billing response, BILLING_TZ) rather than the browser's --
+// Intl.DateTimeFormat with timeZone gives us "today in that zone" without a
+// date-math library.
+function billingPreset(id, which) {
+  const tz = BILLING_TZ[id] || "UTC";
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit",
+  }).format(new Date());  // en-CA formats as YYYY-MM-DD
+  const [y, m] = parts.split("-").map(Number);
+  const pad = (n) => String(n).padStart(2, "0");
+  let from, to;
+  if (which === "last") {
+    let fy = y, fm = m - 1;
+    if (fm === 0) { fm = 12; fy = y - 1; }
+    const lastDay = new Date(fy, fm, 0).getDate();  // day 0 of next month = last day of fm
+    from = `${fy}-${pad(fm)}-01`;
+    to = `${fy}-${pad(fm)}-${pad(lastDay)}`;
+  } else {
+    from = `${y}-${pad(m)}-01`;
+    to = parts;
+  }
+  loadBilling(id, from, to);
+}
+
+async function loadBillingSnapshots(id) {
+  const r = await api(`/api/v1/tenants/${id}/billing/snapshots`);
+  const el = $("bill_snapshots");
+  if (!el) return;
+  if (!r.ok) { el.innerHTML = `<span class="hint">could not load snapshots (${r.status})</span>`; return; }
+  const rowsData = r.json || [];
+  if (!rowsData.length) { el.innerHTML = `<span class="hint">No frozen bills yet.</span>`; return; }
+  el.innerHTML = `<table><thead><tr>
+      <th>Month</th><th>Platform cost</th><th>Calls</th><th>Minutes</th>
+      <th>Chat sessions</th><th>Chat cost</th><th>Telephony (tentative)</th>
+      <th>Frozen at</th><th>By</th></tr></thead>
+    <tbody>${rowsData.map(s => `<tr>
+      <td>${escT(s.period_month)}</td><td>${fmt(s.platform_cost)}</td><td>${s.total_calls}</td>
+      <td>${s.billable_minutes}</td><td>${s.chat_sessions}</td><td>${fmt(s.chat_cost)}</td>
+      <td>~${fmt(s.tentative_telephony_cost)}</td><td>${escT(s.created_at)}</td><td>${escT(s.created_by)}</td>
+    </tr>`).join("")}</tbody></table>`;
+}
+
+async function freezeBillingMonth(id) {
+  const month = ($("bill_freeze_month") || {}).value;
+  const resEl = $("bill_freeze_result");
+  if (!month) { resEl.textContent = "pick a month first"; return; }
+  resEl.textContent = "freezing…";
+  const r = await apiSend("POST", `/api/v1/tenants/${id}/billing/snapshots`, { month });
+  if (r.ok) {
+    resEl.textContent = "frozen";
+    loadBillingSnapshots(id);
+  } else {
+    const detail = (r.json || {}).detail;
+    // FastAPI validation errors (422) come back as an array of
+    // {msg, loc, ...} objects, not a string -- without this, the array
+    // rendered as "[object Object]" via string interpolation below.
+    const msg = Array.isArray(detail)
+      ? detail.map((d) => (d && d.msg) || JSON.stringify(d)).join("; ")
+      : (detail || (r.json || {}).error || "error");
+    // textContent (not innerHTML) -- the browser renders this as plain
+    // text regardless of what it contains, so no separate escaping step
+    // is needed (and escaping before a textContent assignment would
+    // instead corrupt the text by literally showing "&lt;" etc).
+    resEl.textContent = `✗ ${r.status}: ${msg}`;
+  }
+}
+
+// --- Platform billing (GET /tenants/billing-snapshots) --------------------
+function togglePlatformBilling() {
+  const body = $("platBillBody");
+  const willShow = body.hidden;
+  body.hidden = !willShow;
+  $("platBillToggle").textContent = willShow ? "Hide" : "Show";
+  if (willShow && !$("platBillMonth").value) {
+    const now = new Date();
+    const d = new Date(now.getFullYear(), now.getMonth() - 1, 1);  // previous calendar month, browser-local
+    $("platBillMonth").value = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+    loadPlatformBilling();
+  }
+}
+
+async function loadPlatformBilling() {
+  const month = ($("platBillMonth") || {}).value;
+  $("platBillError").textContent = "";
+  if (!month) { $("platBillError").textContent = "pick a month"; return; }
+  const r = await api(`/api/v1/tenants/billing-snapshots?month=${encodeURIComponent(month)}`);
+  if (!r.ok) {
+    const detail = (r.json || {}).detail;
+    // Same FastAPI 422-array handling as freezeBillingMonth: `detail` can be
+    // an array of {msg, loc, ...} objects, not a string -- without this it
+    // would render as "[object Object]" via string interpolation below.
+    const msg = Array.isArray(detail)
+      ? detail.map((d) => (d && d.msg) || JSON.stringify(d)).join("; ")
+      : (detail || (r.json || {}).error || "error");
+    // textContent (not innerHTML) -- rendered as plain text regardless of
+    // content, same reasoning as freezeBillingMonth's resEl.textContent.
+    $("platBillError").textContent = `✗ ${r.status}: ${msg}`;
+    $("platBillContent").innerHTML = "";
+    return;
+  }
+  const d = r.json;
+  const snaps = d.snapshots || [];
+  const totals = d.totals || {};
+  const notFrozen = d.not_frozen || [];
+
+  const rowsHtml = snaps.map(s => `<tr>
+      <td>${escT(s.tenant_name)}${s.tenant_exists ? "" : ` <span class="hint">(deleted)</span>`}</td>
+      <td>${escT(s.timezone)}</td>
+      <td>${fmt(s.platform_cost)}</td>
+      <td>${s.total_calls}</td>
+      <td>${s.billable_minutes}</td>
+      <td>${s.chat_sessions}</td>
+      <td>${fmt(s.chat_cost)}</td>
+      <td>~${fmt(s.tentative_telephony_cost)}</td>
+      <td>${escT(s.created_at)}</td>
+      <td>${escT(s.created_by)}</td>
+    </tr>`).join("");
+  const totalsHtml = `<tr style="font-weight:700;">
+      <td>TOTAL</td><td></td>
+      <td>${fmt(totals.platform_cost)}</td>
+      <td>${totals.total_calls}</td>
+      <td>${totals.billable_minutes}</td>
+      <td>${totals.chat_sessions}</td>
+      <td>${fmt(totals.chat_cost)}</td>
+      <td>~${fmt(totals.tentative_telephony_cost)}</td>
+      <td></td><td></td>
+    </tr>`;
+  const notFrozenHtml = notFrozen.length
+    ? `<ul>${notFrozen.map(t => `<li><a href="#" data-tid="${escAttr(t.tenant_id)}" onclick="jumpToTenantBilling(this.dataset.tid); return false;">${escT(t.name)}</a></li>`).join("")}</ul>`
+    : `<span class="hint">All existing tenants are frozen for this month.</span>`;
+
+  $("platBillContent").innerHTML = `
+    <table><thead><tr>
+      <th>Tenant</th><th>Timezone</th><th>Platform cost</th><th>Calls</th><th>Minutes</th>
+      <th>Chat sessions</th><th>Chat cost</th><th>Telephony (tentative)</th><th>Frozen at</th><th>By</th>
+    </tr></thead><tbody>${rowsHtml || `<tr><td colspan="10"><span class="hint">No frozen bills for this month.</span></td></tr>`}${totalsHtml}</tbody></table>
+    <h2 style="margin:1.2rem 0 .4rem;">Not frozen for this month</h2>
+    ${notFrozenHtml}`;
+}
+
+function jumpToTenantBilling(tenantId) {
+  const t = (window.TENANTS || {})[tenantId];
+  if (!t) return;
+  Promise.resolve(selectTenant(tenantId, t.slug)).then(() => showTab("bill"));
+}
+
+async function exportPlatformBillingCsv() {
+  const month = ($("platBillMonth") || {}).value;
+  $("platBillError").textContent = "";
+  if (!month) { $("platBillError").textContent = "pick a month"; return; }
+  const headers = {};
+  const tok = $("adminToken").value.trim();
+  if (tok) headers["Authorization"] = "Bearer " + tok;
+  try {
+    const res = await fetch(
+      base() + `/api/v1/tenants/billing-snapshots?month=${encodeURIComponent(month)}&format=csv`,
+      { headers },
+    );
+    if (!res.ok) {
+      const j = await res.json().catch(() => ({}));
+      $("platBillError").textContent = `✗ ${res.status}: ${j.detail || j.error || "error"}`;
+      return;
+    }
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `billing-${month}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  } catch (e) {
+    $("platBillError").textContent = `✗ ${String(e)}`;
+  }
 }
 
 // --- Pipeline editor ------------------------------------------------------

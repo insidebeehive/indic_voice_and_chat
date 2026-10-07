@@ -63,6 +63,7 @@ from src.api.dev_console import (
 )
 from src.api.bridge_console import page_router as bridge_page_router
 from src.api.bridge_console import router as bridge_router
+from src.api.billing import snapshot_previous_month_all_tenants
 from src.api.call_store import (
     record_outcome,
     set_call_outcome_persister,
@@ -442,6 +443,31 @@ async def _prune_chat_turn_metrics_loop(retention_days: float) -> None:
         except Exception:  # noqa: BLE001 - the prune loop must never die (CancelledError still propagates)
             log.exception("embedding-usage prune failed")
         await asyncio.sleep(_CHAT_METRICS_PRUNE_INTERVAL_S)
+
+
+# How often the billing-snapshot loop wakes up to check for tenants whose
+# local calendar month just turned over. 6h (not daily) so a tenant in a
+# timezone far from UTC still gets its previous-month snapshot within a few
+# hours of midnight, not up to a day later -- mirrors
+# _CHAT_METRICS_PRUNE_INTERVAL_S's hardcoded-constant convention above.
+_BILLING_SNAPSHOT_INTERVAL_S = 6 * 3600
+
+
+async def _billing_snapshot_loop() -> None:
+    """Periodically run ``snapshot_previous_month_all_tenants`` (freezes each
+    tenant's previous LOCAL calendar month once it's over -- see
+    ``src/api/billing.py``). Runs once at startup, then every
+    ``_BILLING_SNAPSHOT_INTERVAL_S``. Best-effort like every other background
+    loop here: never dies (``CancelledError`` still propagates)."""
+    sm = get_sessionmaker()
+    while True:
+        try:
+            n = await snapshot_previous_month_all_tenants(sm)
+            if n:
+                log.info("created tenant billing snapshots", extra={"count": n})
+        except Exception:  # noqa: BLE001 - the snapshot loop must never die (CancelledError still propagates)
+            log.exception("billing snapshot loop failed")
+        await asyncio.sleep(_BILLING_SNAPSHOT_INTERVAL_S)
 
 
 # How often the webhook-outbox retry loop wakes up to claim due rows. Kept
@@ -1541,6 +1567,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         settings.secrets.CHAT_METRICS_RETENTION_DAYS,
     ))
     webhook_outbox_task = asyncio.create_task(_webhook_outbox_loop())
+    billing_snapshot_task = asyncio.create_task(_billing_snapshot_loop())
 
     try:
         yield
@@ -1551,13 +1578,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         metrics_push_task.cancel()
         chat_metrics_prune_task.cancel()
         webhook_outbox_task.cancel()
-        # None of the five are awaited after cancel() -- a task that ignores
+        billing_snapshot_task.cancel()
+        # None of the six are awaited after cancel() -- a task that ignores
         # or is slow to honor cancellation would leave this event as the only
         # trace that teardown even asked it to stop.
         debug_event(
             log, "shutdown background_tasks cancel_requested",
             tasks=["reap_stale_calls", "seed_crm_kb", "push_turn_metrics",
-                   "prune_chat_turn_metrics", "webhook_outbox"],
+                   "prune_chat_turn_metrics", "webhook_outbox", "billing_snapshot"],
         )
         telephony_hooks.set_bridge_factory(None)
         telephony_hooks.set_exotel_bridge_factory(None)
