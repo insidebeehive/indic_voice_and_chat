@@ -207,6 +207,69 @@
       </details>
     </div>
 
+    <!-- ── Platform pipeline defaults (collapsible) ──────────────────── -->
+    <div class="card">
+      <details>
+        <summary>Platform pipeline defaults <span class="hint">(STT/LLM/TTS provider+model — applies immediately, platform-wide)</span></summary>
+        <div style="margin-top:.6rem">
+
+          <div class="grid">
+            <label>STT provider
+              <select id="pd_prov_stt" onchange="onPipelineProvider('stt')"></select>
+            </label>
+            <label>STT model
+              <select id="pd_model_stt"></select>
+            </label>
+            <label>Current <span class="hint" style="display:inline" id="pd_current_stt">—</span></label>
+            <label>&nbsp;
+              <span>
+                <button class="sm" onclick="savePipelineDefault('stt')">Save</button>
+                <button class="ghost sm" onclick="resetPipelineDefault('stt')">Reset to file default</button>
+              </span>
+            </label>
+          </div>
+
+          <div class="grid">
+            <label>LLM provider
+              <select id="pd_prov_llm" onchange="onPipelineProvider('llm')"></select>
+            </label>
+            <label>LLM model
+              <select id="pd_model_llm"></select>
+            </label>
+            <label>Current <span class="hint" style="display:inline" id="pd_current_llm">—</span></label>
+            <label>&nbsp;
+              <span>
+                <button class="sm" onclick="savePipelineDefault('llm')">Save</button>
+                <button class="ghost sm" onclick="resetPipelineDefault('llm')">Reset to file default</button>
+              </span>
+            </label>
+          </div>
+
+          <div class="grid">
+            <label>TTS provider
+              <select id="pd_prov_tts" onchange="onPipelineProvider('tts')"></select>
+            </label>
+            <label>TTS model
+              <select id="pd_model_tts"></select>
+            </label>
+            <label>Current <span class="hint" style="display:inline" id="pd_current_tts">—</span></label>
+            <label>&nbsp;
+              <span>
+                <button class="sm" onclick="savePipelineDefault('tts')">Save</button>
+                <button class="ghost sm" onclick="resetPipelineDefault('tts')">Reset to file default</button>
+              </span>
+            </label>
+          </div>
+
+          <div class="hint" style="margin-top:.4rem">
+            The LLM here is used by all chat, and by voice for any tenant without its own model.<br>
+            An already-open chat WebSocket session or an in-progress call keeps using its already-built client until the next reconnect/call — this changes what NEW clients get built with, not what's already running.
+          </div>
+          <div id="pipeline_out" class="out" hidden></div>
+        </div>
+      </details>
+    </div>
+
   </div><!-- /cards -->
 
   <div class="log">
@@ -231,6 +294,7 @@ function saveCreds() {
   $("credsHint").textContent = "saved";
   setTimeout(() => $("credsHint").textContent = "", 1500);
   loadCosts();
+  loadPipelineDefaults();
 }
 const base = () => ($("baseUrl").value.trim() || window.location.origin).replace(/\/$/, "");
 const fmt  = (c) => "$" + (Number(c) || 0).toFixed(4) + "/min";
@@ -335,6 +399,68 @@ async function updateCost(kind, provider, model) {
   const v = Number($(`pc_${rowKey(kind, provider, model)}`).value);
   const r = await api("PUT", `/api/v1/providers/${kind}/${provider}`, { body: { cost_per_min: v, model } });
   if (r.ok) loadCosts();
+}
+
+// ── Platform pipeline defaults ──────────────────────────────────────────────
+const PIPELINE_LAYERS = ["stt", "llm", "tts"];
+// Streaming-only STT providers: valid catalog entries (MODELS.stt lists them),
+// but the platform pipeline's stt_factory only builds from STT_PROVIDERS, a
+// genuinely separate registry from streaming STT -- offering one here always
+// 422s on save, so it's excluded from this card's dropdown specifically.
+const STREAMING_ONLY_STT_PROVIDERS = ["deepgram"];
+let PIPELINE_DEFAULTS = {};
+
+// Like setOptions, but when `current` isn't one of `values` (e.g. this
+// layer's effective provider/model was set before the catalog listed it, or
+// isn't catalog-selectable at all) it's added as an extra, clearly-labeled
+// option and selected -- so opening the card and hitting Save can't silently
+// switch a tenant-affecting platform default to whatever the first catalog
+// entry happens to be.
+function setOptionsKeepingCurrent(sel, values, current) {
+  if (!sel) return;
+  setOptions(sel, values, current);
+  if (current && !values.includes(current)) {
+    const o = document.createElement("option");
+    o.value = current; o.textContent = `${current} (current, not in catalog)`;
+    o.selected = true;
+    sel.appendChild(o);
+  }
+}
+
+function onPipelineProvider(layer, selectedModel) {
+  const prov = $(`pd_prov_${layer}`).value;
+  setOptionsKeepingCurrent($(`pd_model_${layer}`), (MODELS[layer] && MODELS[layer][prov]) || [], selectedModel || null);
+}
+
+async function loadPipelineDefaults() {
+  const r = await api("GET", "/api/v1/platform/pipeline");
+  if (!r.ok) { show("pipeline_out", r.json); return; }
+  PIPELINE_DEFAULTS = {};
+  for (const row of (r.json.layers || [])) PIPELINE_DEFAULTS[row.layer] = row;
+  for (const layer of PIPELINE_LAYERS) {
+    const row = PIPELINE_DEFAULTS[layer];
+    if (!row) continue;
+    const provOptions = Object.keys(MODELS[layer] || {}).filter(
+      p => !(layer === "stt" && STREAMING_ONLY_STT_PROVIDERS.includes(p))
+    );
+    setOptionsKeepingCurrent($(`pd_prov_${layer}`), provOptions, row.effective.provider);
+    onPipelineProvider(layer, row.effective.model);
+    const who = row.updated_by ? `, by ${row.updated_by}` : "";
+    $(`pd_current_${layer}`).textContent =
+      `${row.effective.provider || "—"}${row.effective.model ? " / " + row.effective.model : ""} (${row.source}${who})`;
+  }
+}
+
+async function savePipelineDefault(layer) {
+  const provider = $(`pd_prov_${layer}`).value;
+  const model = $(`pd_model_${layer}`).value || null;
+  const r = await api("PUT", `/api/v1/platform/pipeline/${layer}`, { body: { provider, model } });
+  if (r.ok) loadPipelineDefaults(); else show("pipeline_out", r.json);
+}
+
+async function resetPipelineDefault(layer) {
+  const r = await api("DELETE", `/api/v1/platform/pipeline/${layer}`);
+  if (r.ok) loadPipelineDefaults(); else show("pipeline_out", r.json);
 }
 
 async function loadCrmOptions() {
@@ -580,7 +706,10 @@ async function registerTenant() {
 
 // ── Init ────────────────────────────────────────────────────────────────────
 loadCreds();
-loadCatalog();
+// loadPipelineDefaults() reads the shared MODELS dict that loadCatalog()
+// populates -- chained (not fired in parallel) so the pipeline card's
+// provider/model dropdowns don't race an empty MODELS on first load.
+loadCatalog().then(loadPipelineDefaults);
 loadCosts();
 loadCrmOptions();
 </script>

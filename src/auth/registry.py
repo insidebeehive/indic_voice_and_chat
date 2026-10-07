@@ -93,6 +93,35 @@ class TenantProviders:
             self._platform_llm = self.llm_factory(self.global_defaults.get("llm", {}))
         return self._platform_llm
 
+    def reset_platform_defaults(self, layer: str, cfg: dict[str, Any]) -> None:
+        """Apply a new platform-level pipeline default for `layer` so every
+        NEW client built from here on uses it (already-cached ones are a
+        separate step -- see `evict`/`TenantRuntimeRegistry.evict_all`, which
+        the caller combines this with for a full live-apply).
+
+        Updates `global_defaults[layer]` IN PLACE: this is the same dict
+        object shared by reference with every bridge factory, the softphone
+        and chat TTS (src/main.py's startup builds one `TenantProviders` and
+        hands it to all of them) -- mutating the dict's contents, rather than
+        rebinding `self.global_defaults`, is what makes every holder of that
+        reference see the change without re-wiring anything.
+
+        `layer == "llm"` additionally drops the cached `_platform_llm` (built
+        lazily by `get_platform_llm`): unlike `evict`, which only clears the
+        PER-TENANT `_cache`, nothing today resets this platform-wide
+        singleton, so chat (which always runs on `get_platform_llm`, never a
+        tenant-merged client) would otherwise keep talking to the old model
+        until a process restart.
+        """
+        self.global_defaults[layer] = cfg
+        if layer == "llm":
+            self._platform_llm = None
+        from src.utils.logging import debug_event
+        debug_event(
+            log, "registry platform_defaults reset", layer=layer,
+            provider=cfg.get("provider"), model=cfg.get("model"),
+        )
+
     def get_stt(self, tenant: TenantContext) -> Any:
         return self._get_or_build(tenant, "stt", self.stt_factory)
 

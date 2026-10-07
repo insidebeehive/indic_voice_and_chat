@@ -117,3 +117,47 @@ async def test_health_reports_tenants(monkeypatch) -> None:
     assert body["tenants"][0]["providers"]["llm"] == "gemini"
     # Falls back to platform default for unspecified layers
     assert body["tenants"][0]["providers"]["telephony"] == "twilio"
+
+
+@pytest.mark.asyncio
+async def test_health_reflects_a_live_platform_pipeline_override(monkeypatch) -> None:
+    """When app.state.providers is wired (the real lifespan always sets it),
+    an admin override applied via src/api/platform.py shows up in both
+    platform_defaults and any tenant that doesn't set its own llm -- this is
+    the live-apply half of the platform pipeline defaults feature; the two
+    tests above (which seed no app.state.providers at all) must keep passing
+    with their original yaml-sourced assertions unchanged."""
+    from types import SimpleNamespace as _SimpleNamespace
+
+    from src import main as main_module
+
+    monkeypatch.setattr(main_module, "lifespan", _no_lifespan)
+    from fastapi import FastAPI
+    test_app = FastAPI(lifespan=_no_lifespan)
+    test_app.add_api_route("/health", main_module.health, methods=["GET"])
+    main_module.app = test_app
+
+    test_app.state.redis = SimpleNamespace(ping=AsyncMock(return_value=True))
+    test_app.state.settings = main_module.get_settings()
+    test_app.state.providers = _SimpleNamespace(
+        global_defaults={"llm": {"provider": "groq", "model": "llama-3.3-70b-versatile"}},
+    )
+
+    fake_session = MagicMock()
+    fake_session.execute = AsyncMock(return_value=None)
+
+    @asynccontextmanager
+    async def fake_session_cm(*a, **kw):
+        yield fake_session
+
+    monkeypatch.setattr(main_module, "get_sessionmaker", lambda: MagicMock(side_effect=fake_session_cm))
+
+    transport = ASGITransport(app=test_app)
+    async with AsyncClient(transport=transport, base_url="http://test") as c:
+        body = (await c.get("/health")).json()
+
+    assert body["platform_defaults"]["llm"] == "groq"
+    # Untouched layer (no "stt" key in the stub's global_defaults) still
+    # falls back to the yaml value -- the override is per-layer, not all-or-
+    # nothing.
+    assert body["platform_defaults"]["stt"] == "sarvam"

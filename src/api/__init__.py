@@ -18,6 +18,7 @@ from src.api import (
     hot_issues,
     knowledge,
     livekit_routes,
+    platform,
     sessions,
     softphone,
     telephony_crm,
@@ -30,6 +31,7 @@ api_router = APIRouter(prefix="/api/v1")
 api_router.include_router(sessions.router)
 api_router.include_router(tenants.router)
 api_router.include_router(catalog.router)
+api_router.include_router(platform.router)
 api_router.include_router(campaigns.router)
 api_router.include_router(calls.router)
 api_router.include_router(softphone.router)

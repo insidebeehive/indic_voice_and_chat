@@ -1636,6 +1636,7 @@ def _configured_creds(tel_cfg: dict) -> list[str]:
 
 @router.get("", response_model=TenantListResponse)
 async def list_tenants(
+    request: Request,
     session: AsyncSession = Depends(get_db_session),
     _: None = Depends(require_admin),
 ) -> TenantListResponse:
@@ -1650,10 +1651,21 @@ async def list_tenants(
     # times for no reason.
     from src.config import get_settings
     platform_pipeline = get_settings().pipeline
-    global_defaults = {
+    yaml_defaults = {
         "stt": platform_pipeline.stt.model_dump(),
         "llm": platform_pipeline.llm.model_dump(),
         "tts": platform_pipeline.tts.model_dump(),
+    }
+    # Read from the LIVE registry so an admin override (src/api/platform.py)
+    # shows up here immediately -- getattr-safe: some tests stub `providers`
+    # as a SimpleNamespace with no `global_defaults`, and a bare app with no
+    # registry wired at all must fall back to the yaml value exactly as
+    # before.
+    providers = getattr(request.app.state, "providers", None)
+    live_defaults = getattr(providers, "global_defaults", None) if providers is not None else None
+    global_defaults = {
+        layer: (live_defaults.get(layer, yaml_defaults[layer]) if live_defaults else yaml_defaults[layer])
+        for layer in ("stt", "llm", "tts")
     }
 
     # Webhook-credential secret names, per tenant — a dedicated query instead

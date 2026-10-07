@@ -999,3 +999,57 @@ def merge_provider_config(
             api_key_set=api_key is not None,
         )
     return out
+
+
+# --- Platform-level pipeline-default overrides ---------------------------
+
+# Mirrors _PROVIDER_SPECIFIC_FIELDS above, but for the PLATFORM pipeline
+# defaults overlay (src/api/platform.py's `PUT /api/v1/platform/pipeline/
+# {layer}`) rather than a per-tenant override: there is no Tenant*Config
+# instance here, just a bare (layer, provider, model) triple from the admin
+# API, so this is keyed directly by layer name instead of by pydantic class
+# name. TTS's "model" is included even though `TTSConfig` (src/config.py)
+# has no `model` field at all -- see apply_platform_pipeline_override's own
+# docstring for why a model key still needs dropping/setting on this dict.
+_PLATFORM_PIPELINE_PROVIDER_SPECIFIC_FIELDS: dict[str, frozenset[str]] = {
+    "stt": frozenset({"model"}),
+    "llm": frozenset({"model"}),
+    "tts": frozenset({"model", "voice_id"}),
+}
+
+
+def apply_platform_pipeline_override(
+    layer: str, yaml_layer: dict[str, Any], provider: str, model: Optional[str],
+) -> dict[str, Any]:
+    """Overlay an admin-set platform pipeline-default (provider/model) onto
+    `yaml_layer` (config/default.yaml's own dict for this layer), with the
+    same cross-provider guard as `merge_provider_config`: when `provider`
+    differs from the yaml layer's own provider, provider-specific fields are
+    dropped first so a provider switch with no model falls through to the
+    NEW provider's adapter-level default, never the old one's.
+
+    `layer` is one of "stt"/"llm"/"tts" (the only layers the platform
+    pipeline-defaults page edits). Always call this with the ORIGINAL yaml
+    dict as `yaml_layer` -- never with a previously-applied override's dict
+    -- so repeated edits never stack (src/api/platform.py and src/main.py's
+    startup both re-derive `yaml_layer` fresh from `settings.pipeline` every
+    time rather than reusing the live, possibly-already-overridden
+    `providers.global_defaults[layer]`).
+
+    TTS has no `model` field on `TTSConfig` (src/config.py) -- `model` is set
+    straight into the returned dict regardless, since `global_defaults["tts"]`
+    is a plain dict (not validated against `TTSConfig`) and the TTS adapters
+    that read a model (sarvam/gemini/elevenlabs) read it via
+    `config.get("model")`, not through a pydantic field.
+    """
+    out = dict(yaml_layer)
+    default_provider = yaml_layer.get("provider")
+    if default_provider and str(provider).strip().lower() != str(default_provider).strip().lower():
+        for field_name in _PLATFORM_PIPELINE_PROVIDER_SPECIFIC_FIELDS.get(layer, frozenset()):
+            out.pop(field_name, None)
+    out["provider"] = provider
+    if model is not None:
+        out["model"] = model
+    else:
+        out.pop("model", None)
+    return out

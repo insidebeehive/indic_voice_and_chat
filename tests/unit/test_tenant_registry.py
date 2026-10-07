@@ -190,6 +190,84 @@ def test_provider_evict_drops_cached_clients(tmp_path, env) -> None:
     assert len(calls["llm"]) == 2
 
 
+# --- reset_platform_defaults (platform pipeline-default admin override) --
+
+
+def test_reset_platform_defaults_replaces_in_place_for_llm_only(tmp_path, env) -> None:
+    """Updates global_defaults["llm"] in place (same dict identity other
+    layers still reference) -- never rebinds self.global_defaults itself."""
+    providers, _ = _providers(tmp_path)
+    original_dict_obj = providers.global_defaults
+    other_layer_tts = providers.global_defaults["tts"]
+
+    providers.reset_platform_defaults("llm", {"provider": "groq", "model": "llama-3.3-70b-versatile"})
+
+    assert providers.global_defaults is original_dict_obj  # not rebound
+    assert providers.global_defaults["llm"] == {"provider": "groq", "model": "llama-3.3-70b-versatile"}
+    assert providers.global_defaults["tts"] is other_layer_tts  # untouched
+
+
+def test_reset_platform_defaults_llm_clears_platform_llm_cache(tmp_path, env) -> None:
+    providers, calls = _providers(tmp_path)
+    first = providers.get_platform_llm()
+    assert len(calls["llm"]) == 1
+
+    providers.reset_platform_defaults("llm", {"provider": "groq", "model": "llama-3.3-70b-versatile"})
+
+    second = providers.get_platform_llm()
+    assert len(calls["llm"]) == 2  # rebuilt, not reused
+    assert second is not first
+    assert calls["llm"][1]["provider"] == "groq"
+
+
+def test_reset_platform_defaults_non_llm_layer_does_not_touch_platform_llm(tmp_path, env) -> None:
+    providers, calls = _providers(tmp_path)
+    first = providers.get_platform_llm()
+    assert len(calls["llm"]) == 1
+
+    providers.reset_platform_defaults("stt", {"provider": "groq", "model": "whisper-large-v3"})
+
+    second = providers.get_platform_llm()
+    assert second is first  # unchanged -- cached singleton survives
+    assert len(calls["llm"]) == 1
+
+
+def test_reset_platform_defaults_combined_with_evict_all_clears_per_tenant_cache(tmp_path, env) -> None:
+    """A full live-apply is reset_platform_defaults (new clients) PLUS
+    TenantRuntimeRegistry.evict_all (drop already-cached clients so they
+    rebuild against the new default)."""
+    providers, calls = _providers(tmp_path)
+    retrievers = make_per_tenant_registry(lambda t: object())
+    runtime = TenantRuntimeRegistry(
+        providers=providers,
+        retrievers=retrievers,
+        dnd=make_per_tenant_registry(lambda t: object()),
+        schedulers=make_per_tenant_registry(lambda t: object()),
+        webhooks=make_per_tenant_registry(lambda t: object()),
+        chat_channels=make_per_tenant_registry(lambda t: object()),
+        session_stores=make_per_tenant_registry(lambda t: object()),
+        crms=make_per_tenant_registry(lambda t: object()),
+    )
+    # No tenant-level llm override -- so the tenant inherits whatever
+    # global_defaults["llm"] currently says, letting the platform-default
+    # change below actually be observable through get_llm.
+    s = TenantSettings(
+        id="t_acme2", slug="acme2", name="Acme2",
+        pipeline=TenantPipelineConfig(stt=TenantSTTConfig(provider="sarvam", api_key_env="K1")),
+    )
+    acme = TenantContext(settings=s)
+    runtime.providers.get_llm(acme)  # arms the per-tenant cache
+    assert len(calls["llm"]) == 1
+    assert calls["llm"][0].get("provider") != "groq"  # the un-overridden platform default
+
+    runtime.providers.reset_platform_defaults("llm", {"provider": "groq", "model": "llama-3.3-70b-versatile"})
+    runtime.evict_all()
+
+    runtime.providers.get_llm(acme)  # must rebuild against the new default
+    assert len(calls["llm"]) == 2
+    assert calls["llm"][1]["provider"] == "groq"
+
+
 # --- _PerTenantRegistry -------------------------------------------------
 
 

@@ -54,6 +54,19 @@ async def test_admin_console_served() -> None:
     assert "/api/v1/models" in body
     assert "/api/v1/providers/" in body
     assert 'href="/console"' in body        # cross-link to the tenant page
+    # Platform pipeline defaults card (STT/LLM/TTS provider+model editor).
+    assert "/api/v1/platform/pipeline" in body
+    assert "Platform pipeline defaults" in body
+    # Deepgram is streaming-only (its platform stt_factory can't build it --
+    # a save always 422s), so this card's STT provider dropdown filters it
+    # out via a named constant rather than an inline magic string; the
+    # filter only applies when building that dropdown's options, not to the
+    # "(current, not in catalog)" fallback that still shows a value already
+    # saved as deepgram (setOptionsKeepingCurrent, unconditional on layer).
+    assert "STREAMING_ONLY_STT_PROVIDERS" in body
+    assert '["deepgram"]' in body
+    assert "STREAMING_ONLY_STT_PROVIDERS.includes" in body  # constant is actually applied as a filter
+    assert "current, not in catalog" in body
 
 
 @pytest.mark.asyncio

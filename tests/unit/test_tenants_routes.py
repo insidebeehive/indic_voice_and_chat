@@ -7,6 +7,7 @@ import io
 import json
 import logging
 from datetime import datetime
+from types import SimpleNamespace
 
 import pytest
 import pytest_asyncio
@@ -673,6 +674,30 @@ async def test_list_tenants_inherited_layer_reports_platform_default(ctx) -> Non
     # what TenantProviders._config_for actually hands the tts_factory.
     assert t["tts"]["effective_model"] is None
     assert t["tts"]["model_source"] == "unset"
+
+
+async def test_list_tenants_reflects_a_live_platform_pipeline_override(ctx) -> None:
+    """A platform pipeline-default override (src/api/platform.py) applied to
+    the live registry must show up here immediately for a tenant with no own
+    llm override -- same SOURCE semantics as before (still
+    "platform_default", since this tenant still didn't set its own llm), only
+    the DEFAULT'S value changed from yaml to the admin-set one."""
+    client, _, _ = ctx
+    app = client._transport.app
+    app.state.providers = SimpleNamespace(
+        global_defaults={"llm": {"provider": "groq", "model": "llama-3.3-70b-versatile"}},
+    )
+
+    body = _body(slug="no-overrides-2", mode="layered", stt=None, llm=None, tts=None)
+    await client.post("/tenants", json=body, headers=ADMIN_HEADERS)
+    resp = await client.get("/tenants", headers=ADMIN_HEADERS)
+    assert resp.status_code == 200
+    t = next(x for x in resp.json()["tenants"] if x["slug"] == "no-overrides-2")
+
+    assert t["llm"]["effective_provider"] == "groq"
+    assert t["llm"]["effective_model"] == "llama-3.3-70b-versatile"
+    assert t["llm"]["provider_source"] == "platform_default"
+    assert t["llm"]["model_source"] == "platform_default"
 
 
 async def test_list_tenants_full_layer_override_reports_tenant_source(ctx) -> None:

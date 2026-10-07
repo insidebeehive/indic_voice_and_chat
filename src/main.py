@@ -84,7 +84,7 @@ from src.bootstrap import (
     make_stringee_bridge_factory,
 )
 from src.config import Settings, drain_load_diagnostics, get_settings
-from src.config_tenant import TenantSettings
+from src.config_tenant import TenantSettings, apply_platform_pipeline_override
 from src.dialogue.campaign_resolver import DbCampaignResolver
 from src.dialogue.context import SessionStore
 from src.models.database import dispose_engine, ensure_schema, get_engine, get_sessionmaker
@@ -100,6 +100,50 @@ def _admin_tokens_from_env() -> list[str]:
     """Comma-separated admin tokens in ``VOX_ADMIN_TOKENS``. Empty if unset."""
     raw = os.environ.get("VOX_ADMIN_TOKENS", "")
     return [t.strip() for t in raw.split(",") if t.strip()]
+
+
+async def _load_platform_pipeline_overrides(sessionmaker) -> dict[str, dict]:
+    """Every `platform_pipeline_defaults` row, as `{layer: {"provider":..,
+    "model":..}}` -- the admin-set overrides applied on top of
+    `config/default.yaml` at every boot (see `lifespan`, below, and
+    `src/api/platform.py`, which is where a row gets written live). Returns
+    `{}` (no overrides) on any failure reading the table -- e.g. a fresh DB
+    the very first time this ships, before 0033 has run, or a transient
+    error -- so this never blocks startup; the pipeline just runs on the
+    yaml value, same as always.
+    """
+    from sqlalchemy import select
+    from src.models.platform_pipeline import PlatformPipelineDefault
+    try:
+        async with sessionmaker() as session:
+            rows = (await session.execute(select(PlatformPipelineDefault))).scalars().all()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("platform pipeline overrides not loaded (table missing or DB error)")
+        debug_event(
+            log, "startup platform_pipeline_overrides load_failed",
+            exc_type=type(exc).__name__, exc_message=str(exc),
+        )
+        return {}
+    return {row.layer: {"provider": row.provider, "model": row.model} for row in rows}
+
+
+def _overlay_platform_pipeline_overrides(
+    global_defaults: dict, overrides: dict[str, dict],
+) -> dict:
+    """Apply every `{layer: {"provider":.., "model":..}}` override from
+    `_load_platform_pipeline_overrides` onto `global_defaults` (already built
+    from `config/default.yaml`), one layer at a time, using the same overlay
+    (`apply_platform_pipeline_override`) `src/api/platform.py`'s PUT/DELETE
+    apply live -- so an admin-set platform default is already in effect the
+    moment this process boots, not just the moment someone edits it after a
+    cold start. Mutates `global_defaults` in place and returns it, for
+    convenient chaining at the `lifespan` call site below.
+    """
+    for layer, override in overrides.items():
+        global_defaults[layer] = apply_platform_pipeline_override(
+            layer, global_defaults[layer], override["provider"], override.get("model"),
+        )
+    return global_defaults
 
 
 def _kb_auto_prune_enabled() -> bool:
@@ -1311,22 +1355,26 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     set_tenant_event_notifier(_notify_tenant_event)
 
     # --- Bridge factory: turn an inbound Twilio WS into a live agent ----
-    providers = build_provider_registry(
-        global_defaults={
-            "stt": settings.pipeline.stt.model_dump(),
-            "llm": settings.pipeline.llm.model_dump(),
-            "tts": settings.pipeline.tts.model_dump(),
-            "telephony": settings.pipeline.telephony.model_dump(),
-            "vector_store": settings.pipeline.vector_store.model_dump(),
-        },
-    )
+    global_defaults = {
+        "stt": settings.pipeline.stt.model_dump(),
+        "llm": settings.pipeline.llm.model_dump(),
+        "tts": settings.pipeline.tts.model_dump(),
+        "telephony": settings.pipeline.telephony.model_dump(),
+        "vector_store": settings.pipeline.vector_store.model_dump(),
+    }
+    # Platform pipeline-default overrides (src/api/platform.py) are applied on
+    # top of the yaml value at every boot, the same way they're applied live.
+    platform_pipeline_overrides = await _load_platform_pipeline_overrides(sessionmaker)
+    _overlay_platform_pipeline_overrides(global_defaults, platform_pipeline_overrides)
+    providers = build_provider_registry(global_defaults=global_defaults)
     debug_event(
         log, "startup provider_registry built",
-        stt_provider=settings.pipeline.stt.provider, stt_model=settings.pipeline.stt.model,
-        llm_provider=settings.pipeline.llm.provider, llm_model=settings.pipeline.llm.model,
-        tts_provider=settings.pipeline.tts.provider,
-        telephony_provider=settings.pipeline.telephony.provider,
-        vector_store_provider=settings.pipeline.vector_store.provider,
+        stt_provider=global_defaults["stt"].get("provider"), stt_model=global_defaults["stt"].get("model"),
+        llm_provider=global_defaults["llm"].get("provider"), llm_model=global_defaults["llm"].get("model"),
+        tts_provider=global_defaults["tts"].get("provider"), tts_model=global_defaults["tts"].get("model"),
+        telephony_provider=global_defaults["telephony"].get("provider"),
+        vector_store_provider=global_defaults["vector_store"].get("provider"),
+        platform_pipeline_overrides=sorted(platform_pipeline_overrides),
     )
     base_session_store = SessionStore(
         redis=redis_client, ttl_seconds=settings.redis.session_ttl_seconds
@@ -1682,6 +1730,20 @@ async def health() -> dict:
 
     redis_status, db_status = await _probe_dependencies(app)
 
+    providers = getattr(app.state, "providers", None)
+    live_defaults = getattr(providers, "global_defaults", None) if providers is not None else None
+
+    def _provider_for(layer: str) -> str:
+        """This layer's EFFECTIVE provider: the live registry's value
+        (reflects any admin override from src/api/platform.py) when wired,
+        else config/default.yaml's own value -- so this can never regress
+        telephony/vector_store (never overridable here) or a test harness
+        that doesn't seed app.state.providers."""
+        yaml_value = getattr(settings.pipeline, layer).provider
+        if live_defaults is None:
+            return yaml_value
+        return live_defaults.get(layer, {}).get("provider") or yaml_value
+
     tenants_summary = []
     tenants: dict[str, TenantSettings] = getattr(app.state, "tenants", {})
     for slug, t in tenants.items():
@@ -1690,11 +1752,11 @@ async def health() -> dict:
             "name": t.name,
             "status": t.status,
             "providers": {
-                "stt": t.pipeline.stt.provider or settings.pipeline.stt.provider,
-                "llm": t.pipeline.llm.provider or settings.pipeline.llm.provider,
-                "tts": t.pipeline.tts.provider or settings.pipeline.tts.provider,
-                "telephony": t.pipeline.telephony.provider or settings.pipeline.telephony.provider,
-                "vector_store": t.pipeline.vector_store.provider or settings.pipeline.vector_store.provider,
+                "stt": t.pipeline.stt.provider or _provider_for("stt"),
+                "llm": t.pipeline.llm.provider or _provider_for("llm"),
+                "tts": t.pipeline.tts.provider or _provider_for("tts"),
+                "telephony": t.pipeline.telephony.provider or _provider_for("telephony"),
+                "vector_store": t.pipeline.vector_store.provider or _provider_for("vector_store"),
             },
         })
 
@@ -1703,11 +1765,11 @@ async def health() -> dict:
         "status": overall,
         "version": settings.app.version,
         "platform_defaults": {
-            "stt": settings.pipeline.stt.provider,
-            "llm": settings.pipeline.llm.provider,
-            "tts": settings.pipeline.tts.provider,
-            "telephony": settings.pipeline.telephony.provider,
-            "vector_store": settings.pipeline.vector_store.provider,
+            "stt": _provider_for("stt"),
+            "llm": _provider_for("llm"),
+            "tts": _provider_for("tts"),
+            "telephony": _provider_for("telephony"),
+            "vector_store": _provider_for("vector_store"),
         },
         "tenants": tenants_summary,
         "tenant_count": len(tenants_summary),
