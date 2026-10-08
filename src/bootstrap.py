@@ -60,6 +60,14 @@ from src.utils.logging import debug_event
 
 log = logging.getLogger(__name__)
 
+# Dedup key set for the "non-Gemini platform LLM, screenshot extractor
+# disabled" WARNING below (one entry per (tenant_id, provider) seen this
+# process) -- make_chatbot_factory's inner factory runs on every agent build
+# (i.e. every chat turn for a tenant with deposit_verification enabled on a
+# non-Gemini platform default), so without this the same WARNING would fire
+# once per turn forever instead of once per distinct (tenant, provider) pair.
+_dv_extractor_not_wired_warned: set[tuple[str, str]] = set()
+
 
 # --- Demo script -------------------------------------------------------
 
@@ -657,6 +665,7 @@ def make_chatbot_factory(registry, sessionmaker=None, crm_retrievers: "PerCrmRet
     from src.auth.registry import _AsyncPerTenantRegistry
     from src.chatbot import hot_issues as _hi
     from src.chatbot.deposit_verification import submit_deposit_verification
+    from src.chatbot.screenshot_extract import make_gemini_screenshot_extractor
     from src.chatbot.tool_executor import execute_crm_tool
     from src.chatbot.tools import SUBMIT_DEPOSIT_VERIFICATION_TOOL_SPEC
     from src.config import get_settings
@@ -745,10 +754,10 @@ def make_chatbot_factory(registry, sessionmaker=None, crm_retrievers: "PerCrmRet
             ),
         )
 
-        async def crm_executor(tc, *, timeout_s: float) -> dict:
-            spec = crm_execs.get(tc.name)
+        async def _call_crm_tool(tool_name: str, args: dict, *, timeout_s: float) -> dict:
+            spec = crm_execs.get(tool_name)
             if spec is None:
-                return {"error": f"unknown tool {tc.name}"}
+                return {"error": f"unknown tool {tool_name}"}
             # Follow-up to C1/W1: a tenant-registered tool's (chat_tools row,
             # resolve_crm_tools source="tenant") "operatorid" header comes
             # from auth_config.extra_headers, baked in at registration time
@@ -768,12 +777,44 @@ def make_chatbot_factory(registry, sessionmaker=None, crm_retrievers: "PerCrmRet
             return await execute_crm_tool(
                 endpoint=spec["endpoint"], method=spec["method"],
                 parameters=spec["parameters"], auth_type=spec["auth_type"],
-                token=spec["token"], args=tc.arguments or {}, context=tool_context,
+                token=spec["token"], args=args or {}, context=tool_context,
                 x_api_key=spec.get("x_api_key"),
                 extra_headers=spec.get("extra_headers"),
                 session_id=bare_session_id, ticket_id=ticket_id,
                 timeout_s=timeout_s,
                 result_max_chars=get_settings().chat_tools.crm_result_max_chars)
+
+        async def crm_executor(tc, *, timeout_s: float) -> dict:
+            return await _call_crm_tool(tc.name, tc.arguments or {}, timeout_s=timeout_s)
+
+        # Pre-submission deposit-verification cross-check (src/chatbot/
+        # deposit_verification.py's _cross_check_screenshot): looks up the
+        # same two CRM tools a chat turn would, via the SAME per-tenant
+        # tool set (crm_execs) and session context (_crm_context) as every
+        # other CRM tool call in this turn -- an unregistered tool name
+        # (tenant has no get_player_transactions/get_player_latest_deposit_order
+        # configured) comes back as the "unknown tool" error dict above,
+        # which the cross-check already treats as could_not_check.
+        # `timeout_s` is threaded straight through from the caller, which
+        # passes its own remaining time-budget (see
+        # deposit_verification._cross_check_screenshot) -- never a fixed
+        # value here, since this runs twice, concurrently, inside a tool call
+        # that has its own shrinking budget.
+        async def _deposit_verification_crm_lookup(tool_name: str, args: dict, *, timeout_s: float) -> dict:
+            return await _call_crm_tool(tool_name, args, timeout_s=timeout_s)
+
+        # Platform-level LLM identity (provider + model) — same global default
+        # dict get_platform_llm() itself builds the client from — threaded
+        # into the agent below for src/api/chat_cost.py's per-turn cost
+        # lookup, and reused (moved up from just before the ChatBotAgent
+        # construction) by the deposit-verification screenshot extractor
+        # just below: the pre-submission cross-check's vision call runs on
+        # this SAME platform-default client, never a separately-configured
+        # one, so there is nothing new to provision keys/model ids for.
+        # getattr-defensive: some tests stub registry.providers as a bare
+        # SimpleNamespace(get_platform_llm=...) without global_defaults.
+        _llm_defaults = getattr(registry.providers, "global_defaults", {}).get("llm", {})
+        platform_llm = registry.providers.get_platform_llm()
 
         tool_specs = list(crm_specs)
         dv_config = getattr(tenant.settings, "deposit_verification", None)
@@ -789,6 +830,43 @@ def make_chatbot_factory(registry, sessionmaker=None, crm_retrievers: "PerCrmRet
                 log, "chatbot_factory deposit_verification tool_registered",
                 tenant_id=tenant.id, webhook_url=dv_config.webhook_url,
             )
+
+            # Bound to the platform-default LLM client (`platform_llm`,
+            # resolved above) and its identity (`_llm_defaults`) -- the
+            # pre-submission cross-check's vision call runs on exactly the
+            # client/model every other chat turn does, so there is no
+            # separate credential or model id to provision for it. See
+            # src/chatbot/screenshot_extract.py.
+            #
+            # Provider guard: `make_gemini_screenshot_extractor` sends a
+            # Gemini-shaped multimodal request (inline image data +
+            # response_mime_type=application/json) straight to whatever
+            # `platform_llm` is -- only safe when the platform default LLM
+            # actually IS Gemini. If an operator switches the platform
+            # default to a different provider, wire no extractor at all
+            # rather than silently sending a Gemini-shaped request to it:
+            # `extractor=None` makes `_cross_check_screenshot` fail closed as
+            # could_not_check (visibly, via the WARNING below), instead of
+            # the tool erroring open or behaving unpredictably.
+            _llm_provider_name = (_llm_defaults.get("provider") or "").strip().lower()
+            if _llm_provider_name == "gemini":
+                _screenshot_extractor = make_gemini_screenshot_extractor(
+                    platform_llm,
+                    provider_name=_llm_defaults.get("provider") or "",
+                    model=_llm_defaults.get("model") or "",
+                )
+            else:
+                _screenshot_extractor = None
+                _dv_warn_key = (tenant.id, _llm_defaults.get("provider") or "")
+                if _dv_warn_key not in _dv_extractor_not_wired_warned:
+                    _dv_extractor_not_wired_warned.add(_dv_warn_key)
+                    log.warning(
+                        "deposit verification: platform LLM provider is not gemini — the "
+                        "screenshot cross-check extractor is NOT wired, so "
+                        "submit_deposit_verification will fail closed as could_not_check for "
+                        "every submission until the platform default LLM is gemini",
+                        extra={"tenant_id": tenant.id, "provider": _llm_defaults.get("provider")},
+                    )
 
             async def deposit_verification_executor(tc, *, timeout_s: float) -> dict:
                 # Lazy per-call lookup of the module-level media store injected
@@ -810,6 +888,8 @@ def make_chatbot_factory(registry, sessionmaker=None, crm_retrievers: "PerCrmRet
                     media_store=_chat_api._media_store,
                     timeout_s=timeout_s,
                     ticket_id=ticket_id,
+                    extractor=_screenshot_extractor,
+                    crm_lookup=_deposit_verification_crm_lookup,
                 )
 
         elif dv_config is not None and dv_config.enabled and dv_config.webhook_url and not dv_secret:
@@ -849,13 +929,6 @@ def make_chatbot_factory(registry, sessionmaker=None, crm_retrievers: "PerCrmRet
                 sessionmaker_available=sessionmaker is not None,
             )
 
-        # Platform-level LLM identity (provider + model) — same global default
-        # dict get_platform_llm() itself builds the client from — threaded
-        # into the agent for src/api/chat_cost.py's per-turn cost lookup.
-        # getattr-defensive: some tests stub registry.providers as a bare
-        # SimpleNamespace(get_platform_llm=...) without global_defaults.
-        _llm_defaults = getattr(registry.providers, "global_defaults", {}).get("llm", {})
-        platform_llm = registry.providers.get_platform_llm()
         tenant_retriever = registry.retrievers.get(tenant)
         crm_retriever = _crm_retriever_for(tenant, crm_retrievers)
         cache_split_prompt = _prompt_cache_split_enabled(platform_llm)

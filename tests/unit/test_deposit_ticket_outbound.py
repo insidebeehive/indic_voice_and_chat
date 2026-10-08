@@ -6,8 +6,10 @@ the proof the multipart extraction was behavior-preserving)."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+from unittest.mock import patch
 
 import httpx
 import pytest
@@ -17,6 +19,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 import src.api.chat as chat_api
+import src.chatbot.deposit_verification as dv_module
 from src.auth.context import TenantContext
 from src.chatbot.deposit_verification import submit_deposit_verification
 from src.config_tenant import DepositVerificationConfig, TenantSettings
@@ -24,6 +27,7 @@ from src.integration.tenant_events import sign_body_hex
 from src.models.chat import ChatMessage, ChatSession
 from src.models.database import Base
 from src.models.deposit_verification import DepositVerificationRequest
+from src.utils import http_fetch
 
 WEBHOOK_URL = "https://vendor.example.com/ticket"
 WEBHOOK_SECRET_ENV = "DV_JSON_WEBHOOK_SECRET"
@@ -48,6 +52,55 @@ def _tenant(dv_config: DepositVerificationConfig | None = None, secret: str | No
     )
     secrets_resolved = {WEBHOOK_SECRET_ENV: secret} if secret is not None else {}
     return TenantContext(settings=settings, secrets_resolved=secrets_resolved)
+
+
+# --- Pre-submission cross-check stubs ---------------------------------------
+#
+# This file is about the json_ticket_relay vendor-call contract, not the
+# cross-check (see test_deposit_verification_cross_check.py for that) — every
+# call site that must clear the cross-check to reach the vendor/error logic
+# under test gets a stub extractor + crm_lookup that AGREE with each other by
+# construction, never a real Gemini/CRM call.
+
+_MATCH_AMOUNT = 1000.0
+_MATCH_DATE = "2026-06-20"
+_MATCH_TIMESTAMP = "2026-06-20T10:30:00Z"
+
+
+def _matching_extractor(amount: float = _MATCH_AMOUNT, date: str = _MATCH_DATE):
+    async def extract(data: bytes, mime: str) -> dict:
+        return {"readable": True, "amount": amount, "currency": "INR", "date": date}
+    return extract
+
+
+def _matching_crm_lookup(amount: float = _MATCH_AMOUNT, timestamp: str = _MATCH_TIMESTAMP):
+    async def lookup(tool_name: str, args: dict, *, timeout_s: float = 10.0) -> dict:
+        if tool_name == "get_player_transactions":
+            return {
+                "status_code": 200,
+                "data": {
+                    "transactions": [
+                        {"id": "txn_1", "type": "deposit", "amount": amount,
+                         "status": "success", "timestamp": timestamp},
+                    ],
+                    "total": 1,
+                },
+            }
+        if tool_name == "get_player_latest_deposit_order":
+            return {
+                "status_code": 200,
+                "data": {
+                    "status": "found",
+                    "order": {
+                        "order_id": "pgs-1", "external_transaction_id": None,
+                        "amount": amount, "currency": "INR",
+                        "pgs_status": "PGS_SUCCESS", "status_bucket": "pending",
+                        "created_at": timestamp,
+                    },
+                },
+            }
+        raise AssertionError(f"unexpected crm tool {tool_name!r}")
+    return lookup
 
 
 class _FakeMediaStore:
@@ -143,7 +196,8 @@ async def test_happy_path_posts_plain_json_with_bare_hex_signature(sm, monkeypat
 
     out = await submit_deposit_verification(
         tenant=_tenant(), session_id=session_id, order_id="ORD-1",
-        sessionmaker=sm, media_store=store, timeout_s=10.0)
+        sessionmaker=sm, media_store=store, timeout_s=10.0,
+        extractor=_matching_extractor(), crm_lookup=_matching_crm_lookup())
     assert out["status"] == "submitted"
 
     assert route.call_count == 1
@@ -181,7 +235,8 @@ async def test_happy_path_omits_mobile_key_when_it_cannot_be_resolved(sm, monkey
 
     out = await submit_deposit_verification(
         tenant=_tenant(), session_id=session_id, order_id="ORD-2",
-        sessionmaker=sm, media_store=_FakeMediaStore(), timeout_s=10.0)
+        sessionmaker=sm, media_store=_FakeMediaStore(), timeout_s=10.0,
+        extractor=_matching_extractor(), crm_lookup=_matching_crm_lookup())
     assert out["status"] == "submitted"
 
     body = json.loads(route.calls.last.request.content)
@@ -197,7 +252,8 @@ async def test_request_is_not_multipart(sm, monkeypatch) -> None:
 
     await submit_deposit_verification(
         tenant=_tenant(), session_id=session_id, order_id="ORD-3",
-        sessionmaker=sm, media_store=_FakeMediaStore(), timeout_s=10.0)
+        sessionmaker=sm, media_store=_FakeMediaStore(), timeout_s=10.0,
+        extractor=_matching_extractor(), crm_lookup=_matching_crm_lookup())
     request = route.calls.last.request
     assert "multipart" not in request.headers["content-type"]
 
@@ -212,7 +268,8 @@ async def test_signed_url_called_with_configured_ttl(sm, monkeypatch) -> None:
 
     await submit_deposit_verification(
         tenant=_tenant(_dv_config(screenshot_url_ttl_seconds=7200)), session_id=session_id,
-        order_id="ORD-4", sessionmaker=sm, media_store=store, timeout_s=10.0)
+        order_id="ORD-4", sessionmaker=sm, media_store=store, timeout_s=10.0,
+        extractor=_matching_extractor(), crm_lookup=_matching_crm_lookup())
     assert store.signed_url_calls == [("media/key-4", 7200)]
 
 
@@ -228,7 +285,8 @@ async def test_relative_signed_url_is_refused_before_any_vendor_call(sm) -> None
 
     out = await submit_deposit_verification(
         tenant=_tenant(), session_id=session_id, order_id="ORD-5",
-        sessionmaker=sm, media_store=store, timeout_s=10.0)
+        sessionmaker=sm, media_store=store, timeout_s=10.0,
+        extractor=_matching_extractor(), crm_lookup=_matching_crm_lookup())
     assert out["status"] == "error"
     assert route.call_count == 0
     rows = await _rows(sm)
@@ -245,7 +303,8 @@ async def test_signed_url_exception_is_refused_before_any_vendor_call(sm) -> Non
 
     out = await submit_deposit_verification(
         tenant=_tenant(), session_id=session_id, order_id="ORD-6",
-        sessionmaker=sm, media_store=store, timeout_s=10.0)
+        sessionmaker=sm, media_store=store, timeout_s=10.0,
+        extractor=_matching_extractor(), crm_lookup=_matching_crm_lookup())
     assert out["status"] == "error"
     assert route.call_count == 0
     rows = await _rows(sm)
@@ -265,12 +324,59 @@ async def test_http_webhook_url_is_refused_before_any_vendor_call(sm) -> None:
 
     out = await submit_deposit_verification(
         tenant=_tenant(_dv_config(webhook_url=http_url)), session_id=session_id,
-        order_id="ORD-http", sessionmaker=sm, media_store=_FakeMediaStore(), timeout_s=10.0)
+        order_id="ORD-http", sessionmaker=sm, media_store=_FakeMediaStore(), timeout_s=10.0,
+        extractor=_matching_extractor(), crm_lookup=_matching_crm_lookup())
     assert out["status"] == "error"
     assert route.call_count == 0
     rows = await _rows(sm)
     assert len(rows) == 1
     assert rows[0].status == "error"
+
+
+# --- Vendor-POST time budget (computed immediately before the POST) -------
+
+
+async def test_slow_signed_url_consumes_budget_so_vendor_post_is_skipped_and_row_marked_error(
+    sm, monkeypatch,
+) -> None:
+    """Fix (risk): the vendor POST's own timeout used to be computed ONCE, up
+    front, before `media_store.signed_url()` (and the ChatSession DB read)
+    had a chance to spend any of the budget -- so a slow `signed_url()` call
+    could eat the whole remaining budget and the POST would still be
+    attempted with whatever (near-zero, or even negative-before-clamping)
+    timeout was computed earlier. It's now recomputed from
+    `_remaining()` immediately before the POST, and if that leaves less than
+    `_MIN_POST_BUDGET_S`, the POST is never attempted at all -- the row (which
+    already exists by this point) is marked 'error' instead.
+
+    `_MIN_VENDOR_BUDGET_S`/`_MIN_POST_BUDGET_S` are patched down so this test
+    doesn't need a multi-second real sleep to exercise the gate."""
+    monkeypatch.setattr(dv_module, "_MIN_VENDOR_BUDGET_S", 0.05)
+    monkeypatch.setattr(dv_module, "_MIN_POST_BUDGET_S", 0.1)
+    recorder: list = []
+    monkeypatch.setattr(chat_api, "schedule_verification_timeout", lambda *a: recorder.append(a))
+
+    class _SlowSignedUrlStore(_FakeMediaStore):
+        async def signed_url(self, key: str, ttl_seconds: int) -> str:
+            await asyncio.sleep(0.45)
+            return await super().signed_url(key, ttl_seconds)
+
+    session_id = "s-slow-signed-url"
+    await _add_image_message(sm, session_id, media_url="media/key-slow")
+    store = _SlowSignedUrlStore()
+    route = respx.post(WEBHOOK_URL).mock(return_value=httpx.Response(200))
+
+    out = await submit_deposit_verification(
+        tenant=_tenant(), session_id=session_id, order_id="ORD-slow",
+        sessionmaker=sm, media_store=store, timeout_s=0.5,
+        extractor=_matching_extractor(), crm_lookup=_matching_crm_lookup())
+
+    assert out["status"] == "error"
+    assert route.call_count == 0
+    rows = await _rows(sm)
+    assert len(rows) == 1
+    assert rows[0].status == "error"
+    assert recorder == []
 
 
 # --- Screenshot resolution (must still hold on this new branch) -----------
@@ -282,7 +388,8 @@ async def test_no_screenshot_returns_no_screenshot_and_makes_no_vendor_call(sm) 
     route = respx.post(WEBHOOK_URL).mock(return_value=httpx.Response(200))
     out = await submit_deposit_verification(
         tenant=_tenant(), session_id="s-none", order_id="ORD-7",
-        sessionmaker=sm, media_store=store, timeout_s=10.0)
+        sessionmaker=sm, media_store=store, timeout_s=10.0,
+        extractor=_matching_extractor(), crm_lookup=_matching_crm_lookup())
     assert out["status"] == "no_screenshot"
     assert await _rows(sm) == []
     assert route.call_count == 0
@@ -303,7 +410,8 @@ async def test_vendor_duplicate_ignored_is_still_treated_as_submitted(sm, monkey
 
     out = await submit_deposit_verification(
         tenant=_tenant(), session_id=session_id, order_id="ORD-8",
-        sessionmaker=sm, media_store=_FakeMediaStore(), timeout_s=10.0)
+        sessionmaker=sm, media_store=_FakeMediaStore(), timeout_s=10.0,
+        extractor=_matching_extractor(), crm_lookup=_matching_crm_lookup())
     assert out["status"] == "submitted"
     rows = await _rows(sm)
     assert rows[0].status == "pending"
@@ -322,7 +430,8 @@ async def test_vendor_error_status_marks_row_error_and_skips_timeout_scheduling(
 
     out = await submit_deposit_verification(
         tenant=_tenant(), session_id=session_id, order_id="ORD-9",
-        sessionmaker=sm, media_store=_FakeMediaStore(), timeout_s=10.0)
+        sessionmaker=sm, media_store=_FakeMediaStore(), timeout_s=10.0,
+        extractor=_matching_extractor(), crm_lookup=_matching_crm_lookup())
     assert out["status"] == "error"
     rows = await _rows(sm)
     assert rows[0].status == "error"
@@ -340,7 +449,8 @@ async def test_vendor_transport_exception_marks_row_error_and_skips_timeout_sche
 
     out = await submit_deposit_verification(
         tenant=_tenant(), session_id=session_id, order_id="ORD-10",
-        sessionmaker=sm, media_store=_FakeMediaStore(), timeout_s=10.0)
+        sessionmaker=sm, media_store=_FakeMediaStore(), timeout_s=10.0,
+        extractor=_matching_extractor(), crm_lookup=_matching_crm_lookup())
     assert out["status"] == "error"
     rows = await _rows(sm)
     assert rows[0].status == "error"
@@ -361,7 +471,8 @@ async def test_mobile_resolved_from_extra_data_mobile_key(sm, monkeypatch) -> No
 
     await submit_deposit_verification(
         tenant=_tenant(), session_id=session_id, order_id="ORD-11",
-        sessionmaker=sm, media_store=_FakeMediaStore(), timeout_s=10.0)
+        sessionmaker=sm, media_store=_FakeMediaStore(), timeout_s=10.0,
+        extractor=_matching_extractor(), crm_lookup=_matching_crm_lookup())
     body = json.loads(route.calls.last.request.content)
     assert body["mobile"] == "9998887770"
 
@@ -376,7 +487,8 @@ async def test_mobile_resolved_from_extra_data_phone_key_when_mobile_absent(sm, 
 
     await submit_deposit_verification(
         tenant=_tenant(), session_id=session_id, order_id="ORD-12",
-        sessionmaker=sm, media_store=_FakeMediaStore(), timeout_s=10.0)
+        sessionmaker=sm, media_store=_FakeMediaStore(), timeout_s=10.0,
+        extractor=_matching_extractor(), crm_lookup=_matching_crm_lookup())
     body = json.loads(route.calls.last.request.content)
     assert body["mobile"] == "9998887771"
 
@@ -391,7 +503,8 @@ async def test_mobile_resolved_from_all_digit_customer_id_when_extra_data_empty(
 
     await submit_deposit_verification(
         tenant=_tenant(), session_id=session_id, order_id="ORD-13",
-        sessionmaker=sm, media_store=_FakeMediaStore(), timeout_s=10.0)
+        sessionmaker=sm, media_store=_FakeMediaStore(), timeout_s=10.0,
+        extractor=_matching_extractor(), crm_lookup=_matching_crm_lookup())
     body = json.loads(route.calls.last.request.content)
     assert body["mobile"] == "919998887772"
 
@@ -406,7 +519,8 @@ async def test_mobile_key_absent_when_customer_id_is_not_all_digits(sm, monkeypa
 
     await submit_deposit_verification(
         tenant=_tenant(), session_id=session_id, order_id="ORD-14",
-        sessionmaker=sm, media_store=_FakeMediaStore(), timeout_s=10.0)
+        sessionmaker=sm, media_store=_FakeMediaStore(), timeout_s=10.0,
+        extractor=_matching_extractor(), crm_lookup=_matching_crm_lookup())
     body = json.loads(route.calls.last.request.content)
     assert "mobile" not in body
 
@@ -426,7 +540,8 @@ async def test_non_numeric_extra_data_mobile_is_rejected_not_forwarded(sm, monke
 
     await submit_deposit_verification(
         tenant=_tenant(), session_id=session_id, order_id="ORD-17",
-        sessionmaker=sm, media_store=_FakeMediaStore(), timeout_s=10.0)
+        sessionmaker=sm, media_store=_FakeMediaStore(), timeout_s=10.0,
+        extractor=_matching_extractor(), crm_lookup=_matching_crm_lookup())
     body = json.loads(route.calls.last.request.content)
     assert "mobile" not in body
 
@@ -442,7 +557,8 @@ async def test_overly_long_extra_data_mobile_is_rejected_not_forwarded(sm, monke
 
     await submit_deposit_verification(
         tenant=_tenant(), session_id=session_id, order_id="ORD-18",
-        sessionmaker=sm, media_store=_FakeMediaStore(), timeout_s=10.0)
+        sessionmaker=sm, media_store=_FakeMediaStore(), timeout_s=10.0,
+        extractor=_matching_extractor(), crm_lookup=_matching_crm_lookup())
     body = json.loads(route.calls.last.request.content)
     assert "mobile" not in body
 
@@ -461,7 +577,8 @@ async def test_invalid_extra_data_mobile_falls_through_to_valid_customer_id(sm, 
 
     await submit_deposit_verification(
         tenant=_tenant(), session_id=session_id, order_id="ORD-19",
-        sessionmaker=sm, media_store=_FakeMediaStore(), timeout_s=10.0)
+        sessionmaker=sm, media_store=_FakeMediaStore(), timeout_s=10.0,
+        extractor=_matching_extractor(), crm_lookup=_matching_crm_lookup())
     body = json.loads(route.calls.last.request.content)
     assert body["mobile"] == "9998887773"
 
@@ -493,7 +610,8 @@ async def test_punctuated_extra_data_mobile_is_normalized_then_forwarded(
 
     await submit_deposit_verification(
         tenant=_tenant(), session_id=session_id, order_id=f"ORD-punct-{expected}",
-        sessionmaker=sm, media_store=_FakeMediaStore(), timeout_s=10.0)
+        sessionmaker=sm, media_store=_FakeMediaStore(), timeout_s=10.0,
+        extractor=_matching_extractor(), crm_lookup=_matching_crm_lookup())
     body = json.loads(route.calls.last.request.content)
     assert body["mobile"] == expected
 
@@ -514,7 +632,8 @@ async def test_unicode_digit_mobile_is_rejected_not_forwarded(sm, monkeypatch) -
 
     await submit_deposit_verification(
         tenant=_tenant(), session_id=session_id, order_id="ORD-unicode",
-        sessionmaker=sm, media_store=_FakeMediaStore(), timeout_s=10.0)
+        sessionmaker=sm, media_store=_FakeMediaStore(), timeout_s=10.0,
+        extractor=_matching_extractor(), crm_lookup=_matching_crm_lookup())
     body = json.loads(route.calls.last.request.content)
     assert "mobile" not in body
 
@@ -528,7 +647,8 @@ async def test_mobile_key_absent_when_no_chat_session_row_exists(sm, monkeypatch
 
     await submit_deposit_verification(
         tenant=_tenant(), session_id=session_id, order_id="ORD-15",
-        sessionmaker=sm, media_store=_FakeMediaStore(), timeout_s=10.0)
+        sessionmaker=sm, media_store=_FakeMediaStore(), timeout_s=10.0,
+        extractor=_matching_extractor(), crm_lookup=_matching_crm_lookup())
     body = json.loads(route.calls.last.request.content)
     assert "mobile" not in body
 
@@ -552,7 +672,8 @@ async def test_default_contract_unset_still_uses_old_multipart_path(sm, monkeypa
 
     out = await submit_deposit_verification(
         tenant=_tenant(default_config), session_id=session_id, order_id="ORD-16",
-        sessionmaker=sm, media_store=store, timeout_s=10.0)
+        sessionmaker=sm, media_store=store, timeout_s=10.0,
+        extractor=_matching_extractor(), crm_lookup=_matching_crm_lookup())
     assert out["status"] == "submitted"
 
     request = route.calls.last.request
@@ -566,12 +687,20 @@ async def test_default_contract_unset_still_uses_old_multipart_path(sm, monkeypa
 
 
 @respx.mock
-async def test_source_media_url_is_forwarded_and_media_store_is_untouched(sm, monkeypatch) -> None:
+async def test_source_media_url_is_forwarded_and_signed_url_is_untouched(sm, monkeypatch) -> None:
     """The whole point of `source_media_url`: when the CRM's own inbound URL
     was persisted on the screenshot row, `json_ticket_relay` forwards it
-    directly and never touches the media store — this is what keeps the
-    contract working even when our object storage is down (the stage bug
-    this change fixes)."""
+    directly to the VENDOR and never mints a signed URL from our media store
+    -- this is what keeps the contract working even when our object storage
+    is down (the stage bug this change fixes).
+
+    Fix: the pre-submission cross-check now prefers the media store's own
+    bytes for ITS OWN reading when a row has both `media_url` and
+    `source_media_url` (see _cross_check_screenshot's media-store-first
+    fallback) -- so `store.downloads` is no longer empty on this path the
+    way it was before that fix; `store.signed_url_calls` staying empty is
+    the property that actually matters here (the vendor never needs a
+    signed URL on this path)."""
     monkeypatch.setattr(chat_api, "schedule_verification_timeout", lambda *a: None)
     session_id = "s-source-url"
     crm_url = "https://crm.example.com/uploads/shot-1.jpg?sig=abc"
@@ -581,15 +710,17 @@ async def test_source_media_url_is_forwarded_and_media_store_is_untouched(sm, mo
 
     out = await submit_deposit_verification(
         tenant=_tenant(), session_id=session_id, order_id="ORD-src-1",
-        sessionmaker=sm, media_store=store, timeout_s=10.0)
+        sessionmaker=sm, media_store=store, timeout_s=10.0,
+        extractor=_matching_extractor(), crm_lookup=_matching_crm_lookup())
     assert out["status"] == "submitted"
 
     body = json.loads(route.calls.last.request.content)
     assert body["screenshot_url"] == crm_url
 
-    # Neither the existence-probe download nor signed_url minting happens on
-    # this path — the CRM's URL is used as-is.
-    assert store.downloads == []
+    # The cross-check reads the media store's own bytes (media_url is set on
+    # this row), but the vendor call itself never mints a signed URL -- the
+    # CRM's URL is forwarded to the vendor as-is.
+    assert store.downloads == ["media/key-src-1"]
     assert store.signed_url_calls == []
 
     rows = await _rows(sm)
@@ -599,26 +730,65 @@ async def test_source_media_url_is_forwarded_and_media_store_is_untouched(sm, mo
 
 @respx.mock
 async def test_http_source_media_url_is_refused_before_any_vendor_call(sm) -> None:
-    """A non-https CRM URL must be refused by the same scheme gate that
-    guards a bad signed URL — the gate runs against whichever URL ends up
-    selected, source or signed."""
+    """Fix (nit): a row that has BOTH `media_url` and an insecure
+    `source_media_url` would otherwise clear the cross-check using the media
+    store's own bytes (paying for a screenshot vision/Gemini call) only to
+    fail the https gate on the vendor's own URL afterwards -- a doomed
+    submission regardless, since `source_media_url` is what gets forwarded to
+    the vendor. The https check on `source_media_url` now runs BEFORE the
+    cross-check for this exact shape, so neither the screenshot extractor nor
+    the media store is ever touched, and -- since this is before the request
+    row is created -- no row is written at all. Still the same "error"
+    result the (now-earlier) gate always returned."""
     session_id = "s-source-url-http"
     crm_url = "http://crm.example.com/uploads/shot-2.jpg"
     await _add_image_message(sm, session_id, media_url="media/key-src-2", source_media_url=crm_url)
     store = _FakeMediaStore()
     route = respx.post(WEBHOOK_URL).mock(return_value=httpx.Response(200))
 
+    extractor_calls: list = []
+
+    async def _tracking_extractor(data: bytes, mime: str) -> dict:
+        extractor_calls.append((data, mime))
+        return {"readable": True, "amount": _MATCH_AMOUNT, "currency": "INR", "date": _MATCH_DATE}
+
     out = await submit_deposit_verification(
         tenant=_tenant(), session_id=session_id, order_id="ORD-src-2",
-        sessionmaker=sm, media_store=store, timeout_s=10.0)
+        sessionmaker=sm, media_store=store, timeout_s=10.0,
+        extractor=_tracking_extractor, crm_lookup=_matching_crm_lookup())
     assert out["status"] == "error"
+    assert route.call_count == 0
+    assert extractor_calls == []
+    assert store.downloads == []
+    assert store.signed_url_calls == []
+    assert await _rows(sm) == []
+
+
+@respx.mock
+async def test_http_source_media_url_with_no_media_url_is_rejected_by_cross_check_as_could_not_check(sm) -> None:
+    """Companion to the above: when the row has NO `media_url` at all, the
+    media-store-first fallback doesn't apply, so the cross-check itself
+    fetches `source_media_url` directly -- and its https-only gate
+    (src.utils.http_fetch.fetch_capped, via _fetch_source_media_for_cross_check)
+    refuses the insecure URL before the row is ever created. This is the
+    scenario the now-renamed could_not_check mapping fix covers (see
+    test_deposit_verification_cross_check.py's
+    test_source_media_url_http_scheme_is_rejected)."""
+    session_id = "s-source-url-http-no-media-url"
+    crm_url = "http://crm.example.com/uploads/shot-2b.jpg"
+    await _add_image_message(sm, session_id, media_url=None, source_media_url=crm_url)
+    store = _FakeMediaStore()
+    route = respx.post(WEBHOOK_URL).mock(return_value=httpx.Response(200))
+
+    out = await submit_deposit_verification(
+        tenant=_tenant(), session_id=session_id, order_id="ORD-src-2b",
+        sessionmaker=sm, media_store=store, timeout_s=10.0,
+        extractor=_matching_extractor(), crm_lookup=_matching_crm_lookup())
+    assert out["status"] == "could_not_check"
     assert route.call_count == 0
     assert store.downloads == []
     assert store.signed_url_calls == []
-
-    rows = await _rows(sm)
-    assert len(rows) == 1
-    assert rows[0].status == "error"
+    assert await _rows(sm) == []
 
 
 @respx.mock
@@ -634,7 +804,8 @@ async def test_null_source_media_url_keeps_using_signed_url_path(sm, monkeypatch
 
     out = await submit_deposit_verification(
         tenant=_tenant(), session_id=session_id, order_id="ORD-src-3",
-        sessionmaker=sm, media_store=store, timeout_s=10.0)
+        sessionmaker=sm, media_store=store, timeout_s=10.0,
+        extractor=_matching_extractor(), crm_lookup=_matching_crm_lookup())
     assert out["status"] == "submitted"
 
     body = json.loads(route.calls.last.request.content)
@@ -658,7 +829,8 @@ async def test_multipart_contract_ignores_source_media_url_and_still_downloads(s
 
     out = await submit_deposit_verification(
         tenant=_tenant(_dv_config(contract="multipart_verdict")), session_id=session_id,
-        order_id="ORD-src-4", sessionmaker=sm, media_store=store, timeout_s=10.0)
+        order_id="ORD-src-4", sessionmaker=sm, media_store=store, timeout_s=10.0,
+        extractor=_matching_extractor(), crm_lookup=_matching_crm_lookup())
     assert out["status"] == "submitted"
 
     request = route.calls.last.request
@@ -687,10 +859,14 @@ async def test_null_media_url_with_source_url_is_still_selected_and_forwarded(sm
     await _add_image_message(sm, session_id, media_url=None, source_media_url=crm_url)
     store = _FakeMediaStore()
     route = respx.post(WEBHOOK_URL).mock(return_value=httpx.Response(200))
+    respx.get(crm_url).mock(
+        return_value=httpx.Response(200, content=b"img-bytes", headers={"content-type": "image/jpeg"}))
 
-    out = await submit_deposit_verification(
-        tenant=_tenant(), session_id=session_id, order_id="ORD-src-5",
-        sessionmaker=sm, media_store=store, timeout_s=10.0)
+    with patch.object(http_fetch, "is_public_host", return_value=True):
+        out = await submit_deposit_verification(
+            tenant=_tenant(), session_id=session_id, order_id="ORD-src-5",
+            sessionmaker=sm, media_store=store, timeout_s=10.0,
+            extractor=_matching_extractor(), crm_lookup=_matching_crm_lookup())
     assert out["status"] != "no_screenshot"
     assert out["status"] == "submitted"
 
@@ -718,7 +894,8 @@ async def test_multipart_contract_ignores_source_only_row_and_reports_no_screens
 
     out = await submit_deposit_verification(
         tenant=_tenant(_dv_config(contract="multipart_verdict")), session_id=session_id,
-        order_id="ORD-src-6", sessionmaker=sm, media_store=store, timeout_s=10.0)
+        order_id="ORD-src-6", sessionmaker=sm, media_store=store, timeout_s=10.0,
+        extractor=_matching_extractor(), crm_lookup=_matching_crm_lookup())
     assert out["status"] == "no_screenshot"
     assert route.call_count == 0
     assert await _rows(sm) == []
@@ -741,7 +918,8 @@ async def test_empty_string_source_media_url_falls_back_to_signed_url_path(sm, m
 
     out = await submit_deposit_verification(
         tenant=_tenant(), session_id=session_id, order_id="ORD-src-7",
-        sessionmaker=sm, media_store=store, timeout_s=10.0)
+        sessionmaker=sm, media_store=store, timeout_s=10.0,
+        extractor=_matching_extractor(), crm_lookup=_matching_crm_lookup())
     assert out["status"] == "submitted"
 
     body = json.loads(route.calls.last.request.content)
@@ -764,10 +942,14 @@ async def test_newer_source_only_row_wins_over_older_media_url_row(sm, monkeypat
         sm, session_id, media_url=None, source_media_url=newer_crm_url)
     store = _FakeMediaStore()
     route = respx.post(WEBHOOK_URL).mock(return_value=httpx.Response(200))
+    respx.get(newer_crm_url).mock(
+        return_value=httpx.Response(200, content=b"img-bytes", headers={"content-type": "image/jpeg"}))
 
-    out = await submit_deposit_verification(
-        tenant=_tenant(), session_id=session_id, order_id="ORD-ordering",
-        sessionmaker=sm, media_store=store, timeout_s=10.0)
+    with patch.object(http_fetch, "is_public_host", return_value=True):
+        out = await submit_deposit_verification(
+            tenant=_tenant(), session_id=session_id, order_id="ORD-ordering",
+            sessionmaker=sm, media_store=store, timeout_s=10.0,
+            extractor=_matching_extractor(), crm_lookup=_matching_crm_lookup())
     assert out["status"] == "submitted"
 
     body = json.loads(route.calls.last.request.content)

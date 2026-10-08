@@ -88,7 +88,10 @@ SUBMIT_DEPOSIT_VERIFICATION_TOOL_SPEC = ToolSpec(
         "before the customer has sent one, ask them to upload it first. This takes "
         "a few minutes; the result will be delivered later in this same chat, not "
         "immediately — do not call this tool again while a submission is already "
-        "pending."
+        "pending. Before submitting, the tool checks the screenshot's amount and "
+        "date against the customer's deposits and may return no_matching_transaction, "
+        "screenshot_unreadable or could_not_check instead — follow the message it "
+        "returns."
     ),
     parameters={
         "type": "object",

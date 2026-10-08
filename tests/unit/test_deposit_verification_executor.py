@@ -63,13 +63,72 @@ def _tenant(dv_config: DepositVerificationConfig | None = None, secret: str | No
     return TenantContext(settings=settings, secrets_resolved=secrets_resolved)
 
 
-def _registry():
+def _registry(llm_provider: str = "gemini", llm_model: str = "gemini-3.8-flash"):
+    # `global_defaults["llm"]` defaults to gemini since that's the real
+    # platform default (src/main.py) -- the screenshot cross-check extractor
+    # is only wired when this is gemini (src/bootstrap.py's provider guard),
+    # so most tests here want it wired. Pass llm_provider="something-else"
+    # to exercise the not-wired branch.
     return SimpleNamespace(
-        providers=SimpleNamespace(get_llm=lambda t: object(), get_platform_llm=lambda: object()),
+        providers=SimpleNamespace(
+            get_llm=lambda t: object(), get_platform_llm=lambda: object(),
+            global_defaults={"llm": {"provider": llm_provider, "model": llm_model}},
+        ),
         retrievers=SimpleNamespace(get=lambda t: object()),
         session_stores=SimpleNamespace(get=lambda t: None),
         crm_tools=None,
     )
+
+
+# --- Pre-submission cross-check stubs ---------------------------------------
+#
+# Everything below submits to the vendor must now clear the cross-check
+# (src.chatbot.deposit_verification._cross_check_screenshot) first. These
+# tests are about the pre-existing screenshot/dedup/vendor-call/timeout
+# behavior, not the cross-check itself (see test_deposit_verification_cross_check.py
+# for that) -- so every call site that reaches the vendor is given a stub
+# extractor + crm_lookup that AGREE with each other by construction, never a
+# real Gemini/CRM call.
+
+_MATCH_AMOUNT = 1000.0
+_MATCH_DATE = "2026-06-20"
+_MATCH_TIMESTAMP = "2026-06-20T10:30:00Z"
+
+
+def _matching_extractor(amount: float = _MATCH_AMOUNT, date: str = _MATCH_DATE):
+    async def extract(data: bytes, mime: str) -> dict:
+        return {"readable": True, "amount": amount, "currency": "INR", "date": date}
+    return extract
+
+
+def _matching_crm_lookup(amount: float = _MATCH_AMOUNT, timestamp: str = _MATCH_TIMESTAMP):
+    async def lookup(tool_name: str, args: dict, *, timeout_s: float = 10.0) -> dict:
+        if tool_name == "get_player_transactions":
+            return {
+                "status_code": 200,
+                "data": {
+                    "transactions": [
+                        {"id": "txn_1", "type": "deposit", "amount": amount,
+                         "status": "success", "timestamp": timestamp},
+                    ],
+                    "total": 1,
+                },
+            }
+        if tool_name == "get_player_latest_deposit_order":
+            return {
+                "status_code": 200,
+                "data": {
+                    "status": "found",
+                    "order": {
+                        "order_id": "pgs-1", "external_transaction_id": None,
+                        "amount": amount, "currency": "INR",
+                        "pgs_status": "PGS_SUCCESS", "status_bucket": "pending",
+                        "created_at": timestamp,
+                    },
+                },
+            }
+        raise AssertionError(f"unexpected crm tool {tool_name!r}")
+    return lookup
 
 
 class _FakeMediaStore:
@@ -169,7 +228,8 @@ async def test_picks_most_recent_screenshot_message(sm, monkeypatch) -> None:
     store = _FakeMediaStore()
     out = await submit_deposit_verification(
         tenant=_tenant(), session_id=session_id, order_id="ORD-7",
-        sessionmaker=sm, media_store=store, timeout_s=10.0)
+        sessionmaker=sm, media_store=store, timeout_s=10.0,
+        extractor=_matching_extractor(), crm_lookup=_matching_crm_lookup())
     assert out["status"] == "submitted"
     rows = await _rows(sm)
     assert rows[0].screenshot_message_id == newest_id
@@ -223,7 +283,8 @@ async def test_happy_path_persists_pending_row_and_posts_signed_multipart(sm, mo
     before = datetime.utcnow()
     out = await submit_deposit_verification(
         tenant=tenant, session_id=session_id, order_id="ORD-9",
-        sessionmaker=sm, media_store=store, timeout_s=30.0)
+        sessionmaker=sm, media_store=store, timeout_s=30.0,
+        extractor=_matching_extractor(), crm_lookup=_matching_crm_lookup())
     assert out["status"] == "submitted"
 
     rows = await _rows(sm)
@@ -285,7 +346,8 @@ async def test_no_platform_base_url_falls_back_to_relative_callback_url(sm, monk
 
     out = await submit_deposit_verification(
         tenant=_tenant(), session_id=session_id, order_id="ORD-2",
-        sessionmaker=sm, media_store=_FakeMediaStore(), timeout_s=10.0)
+        sessionmaker=sm, media_store=_FakeMediaStore(), timeout_s=10.0,
+        extractor=_matching_extractor(), crm_lookup=_matching_crm_lookup())
     assert out["status"] == "submitted"
 
     rows = await _rows(sm)
@@ -328,7 +390,8 @@ async def test_previously_resolved_request_does_not_block_a_new_submission(sm, m
 
     out = await submit_deposit_verification(
         tenant=_tenant(), session_id=session_id, order_id="ORD-4",
-        sessionmaker=sm, media_store=_FakeMediaStore(), timeout_s=10.0)
+        sessionmaker=sm, media_store=_FakeMediaStore(), timeout_s=10.0,
+        extractor=_matching_extractor(), crm_lookup=_matching_crm_lookup())
     assert out["status"] == "submitted"
     assert len(await _rows(sm)) == 2
 
@@ -387,7 +450,8 @@ async def test_order_id_is_stripped_before_persisting(sm, monkeypatch) -> None:
 
     out = await submit_deposit_verification(
         tenant=_tenant(), session_id=session_id, order_id="  ORD-9  ",
-        sessionmaker=sm, media_store=_FakeMediaStore(), timeout_s=10.0)
+        sessionmaker=sm, media_store=_FakeMediaStore(), timeout_s=10.0,
+        extractor=_matching_extractor(), crm_lookup=_matching_crm_lookup())
     assert out["status"] == "submitted"
     rows = await _rows(sm)
     assert rows[0].order_id == "ORD-9"
@@ -406,7 +470,8 @@ async def test_vendor_non_2xx_marks_row_error_and_returns_error(sm, monkeypatch)
 
     out = await submit_deposit_verification(
         tenant=_tenant(), session_id=session_id, order_id="ORD-5",
-        sessionmaker=sm, media_store=_FakeMediaStore(), timeout_s=10.0)
+        sessionmaker=sm, media_store=_FakeMediaStore(), timeout_s=10.0,
+        extractor=_matching_extractor(), crm_lookup=_matching_crm_lookup())
     assert out["status"] == "error"
     rows = await _rows(sm)
     assert len(rows) == 1
@@ -425,7 +490,8 @@ async def test_vendor_transport_exception_marks_row_error(sm, monkeypatch, caplo
 
     out = await submit_deposit_verification(
         tenant=_tenant(), session_id=session_id, order_id="ORD-6",
-        sessionmaker=sm, media_store=_FakeMediaStore(), timeout_s=10.0)
+        sessionmaker=sm, media_store=_FakeMediaStore(), timeout_s=10.0,
+        extractor=_matching_extractor(), crm_lookup=_matching_crm_lookup())
     assert out["status"] == "error"
     rows = await _rows(sm)
     assert rows[0].status == "error"
@@ -499,34 +565,117 @@ def test_max_timeout_constant_is_15s() -> None:
     assert _MAX_TIMEOUT_S == 15.0
 
 
-@pytest.mark.parametrize("timeout_s, expected", [(60.0, 15.0), (3.0, 3.0)])
-async def test_vendor_post_timeout_is_clamped_to_max_timeout(sm, monkeypatch, timeout_s, expected) -> None:
+class _FakeAsyncClient:
+    """Captures the `timeout` httpx.AsyncClient was constructed with,
+    standing in for the real vendor POST client."""
+
+    def __init__(self, timeout=None):
+        _CAPTURED_CLIENT_TIMEOUT["timeout"] = timeout
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    async def post(self, url, data=None, files=None, headers=None):
+        return SimpleNamespace(status_code=200)
+
+
+_CAPTURED_CLIENT_TIMEOUT: dict = {}
+
+
+async def test_vendor_post_timeout_is_clamped_to_max_timeout(sm, monkeypatch) -> None:
+    """A generous budget (60s) still clamps the vendor POST's own timeout to
+    _MAX_TIMEOUT_S -- unaffected by the time-budget fix below, since the cap
+    is well below anything the remaining-time computation would produce for
+    a budget this large."""
     monkeypatch.setattr(chat_api, "schedule_verification_timeout", lambda *a: None)
-    captured: dict = {}
-
-    class _FakeAsyncClient:
-        def __init__(self, timeout=None):
-            captured["timeout"] = timeout
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, tb):
-            return False
-
-        async def post(self, url, data=None, files=None, headers=None):
-            return SimpleNamespace(status_code=200)
-
+    _CAPTURED_CLIENT_TIMEOUT.clear()
     monkeypatch.setattr(httpx, "AsyncClient", _FakeAsyncClient)
 
-    session_id = "s-timeout"
+    session_id = "s-timeout-cap"
     await _add_image_message(sm, session_id)
     out = await submit_deposit_verification(
         tenant=_tenant(), session_id=session_id, order_id="ORD-1",
-        sessionmaker=sm, media_store=_FakeMediaStore(), timeout_s=timeout_s)
+        sessionmaker=sm, media_store=_FakeMediaStore(), timeout_s=60.0,
+        extractor=_matching_extractor(), crm_lookup=_matching_crm_lookup())
     assert out["status"] == "submitted"
-    assert captured["timeout"] == expected
-    assert expected <= _MAX_TIMEOUT_S
+    assert _CAPTURED_CLIENT_TIMEOUT["timeout"] == _MAX_TIMEOUT_S
+
+
+async def test_vendor_post_timeout_uses_remaining_time_minus_margin(sm, monkeypatch) -> None:
+    """Fix (time budget): the vendor POST no longer gets the raw `timeout_s`
+    the caller passed in -- it gets what's actually LEFT of that budget
+    (after the cross-check ran) minus a small margin, still capped at
+    _MAX_TIMEOUT_S. With a 10.0s budget and a near-instant stub
+    extractor/crm_lookup, ~9.0s should remain for the vendor POST."""
+    monkeypatch.setattr(chat_api, "schedule_verification_timeout", lambda *a: None)
+    _CAPTURED_CLIENT_TIMEOUT.clear()
+    monkeypatch.setattr(httpx, "AsyncClient", _FakeAsyncClient)
+
+    session_id = "s-timeout-remaining"
+    await _add_image_message(sm, session_id)
+    out = await submit_deposit_verification(
+        tenant=_tenant(), session_id=session_id, order_id="ORD-2",
+        sessionmaker=sm, media_store=_FakeMediaStore(), timeout_s=10.0,
+        extractor=_matching_extractor(), crm_lookup=_matching_crm_lookup())
+    assert out["status"] == "submitted"
+    assert _CAPTURED_CLIENT_TIMEOUT["timeout"] == pytest.approx(9.0, abs=0.5)
+    assert _CAPTURED_CLIENT_TIMEOUT["timeout"] < _MAX_TIMEOUT_S
+
+
+@respx.mock
+async def test_insufficient_remaining_budget_before_vendor_step_returns_could_not_check_without_row(sm) -> None:
+    """Fix (time budget): a `timeout_s` too small to plausibly leave
+    _MIN_VENDOR_BUDGET_S (8.0s) after the cross-check fails closed as
+    could_not_check WITHOUT ever creating a request row or calling the
+    vendor -- rather than racing the vendor POST against an almost-certain
+    outer timeout."""
+    session_id = "s-budget-too-small"
+    await _add_image_message(sm, session_id)
+    route = respx.post(WEBHOOK_URL).mock(return_value=httpx.Response(200))
+
+    out = await submit_deposit_verification(
+        tenant=_tenant(), session_id=session_id, order_id="ORD-3",
+        sessionmaker=sm, media_store=_FakeMediaStore(), timeout_s=5.0,
+        extractor=_matching_extractor(), crm_lookup=_matching_crm_lookup())
+    assert out["status"] == "could_not_check"
+    assert route.call_count == 0
+    assert await _rows(sm) == []
+
+
+@respx.mock
+async def test_insufficient_budget_at_entry_never_calls_extractor_or_crm_lookup(sm) -> None:
+    """Fix (nit): the early entry-point budget gate -- checked right after
+    the cheap missing_order_id/screenshot/already_pending checks, before the
+    cross-check even starts -- must fail closed as could_not_check WITHOUT
+    ever calling the extractor or crm_lookup, not just without creating a
+    row. A `timeout_s` of 5.0 is already below `_MIN_VENDOR_BUDGET_S` (8.0),
+    so there's no point paying for a Gemini call or a CRM round trip that
+    can never lead to a vendor submission anyway."""
+    session_id = "s-budget-entry"
+    await _add_image_message(sm, session_id)
+
+    extractor_calls: list = []
+    crm_calls: list = []
+
+    async def _tracking_extractor(data: bytes, mime: str) -> dict:
+        extractor_calls.append((data, mime))
+        return {"readable": True, "amount": _MATCH_AMOUNT, "currency": "INR", "date": _MATCH_DATE}
+
+    async def _tracking_crm_lookup(tool_name: str, args: dict, *, timeout_s: float = 10.0) -> dict:
+        crm_calls.append(tool_name)
+        raise AssertionError("crm_lookup must not be called when the entry budget gate fires")
+
+    out = await submit_deposit_verification(
+        tenant=_tenant(), session_id=session_id, order_id="ORD-entry",
+        sessionmaker=sm, media_store=_FakeMediaStore(), timeout_s=5.0,
+        extractor=_tracking_extractor, crm_lookup=_tracking_crm_lookup)
+    assert out["status"] == "could_not_check"
+    assert extractor_calls == []
+    assert crm_calls == []
+    assert await _rows(sm) == []
 
 
 # --- Bootstrap-level gating ---------------------------------------------------
@@ -581,10 +730,10 @@ async def test_registered_executor_passes_bare_session_id_and_current_media_stor
     captured: dict = {}
 
     async def _fake_submit(*, tenant, session_id, order_id, sessionmaker, media_store, timeout_s,
-                            ticket_id=None):
+                            ticket_id=None, extractor=None, crm_lookup=None):
         captured.update(tenant=tenant, session_id=session_id, order_id=order_id,
                          sessionmaker=sessionmaker, media_store=media_store, timeout_s=timeout_s,
-                         ticket_id=ticket_id)
+                         ticket_id=ticket_id, extractor=extractor, crm_lookup=crm_lookup)
         return {"status": "submitted", "message": "ok"}
 
     import src.chatbot.deposit_verification as dv_module
@@ -609,13 +758,15 @@ async def test_registered_executor_passes_bare_session_id_and_current_media_stor
     assert captured["sessionmaker"] is sm
     assert captured["media_store"] is fake_store
     assert captured["timeout_s"] == 10.0
+    assert callable(captured["extractor"])
+    assert callable(captured["crm_lookup"])
 
 
 async def test_registered_executor_defaults_missing_order_id_argument_to_empty_string(sm, monkeypatch) -> None:
     captured: dict = {}
 
     async def _fake_submit(*, tenant, session_id, order_id, sessionmaker, media_store, timeout_s,
-                            ticket_id=None):
+                            ticket_id=None, extractor=None, crm_lookup=None):
         captured["order_id"] = order_id
         return {"status": "missing_order_id"}
 
@@ -634,6 +785,209 @@ async def test_registered_executor_defaults_missing_order_id_argument_to_empty_s
         chat_api.set_media_store(None)
 
     assert captured["order_id"] == ""
+
+
+# --- Provider guard (src/bootstrap.py) ---------------------------------------
+
+
+async def test_screenshot_extractor_not_wired_when_platform_llm_is_not_gemini(sm, monkeypatch, caplog) -> None:
+    """Fix: the Gemini-shaped screenshot extractor must not be wired when
+    the platform default LLM is some other provider -- wiring it anyway
+    would send a Gemini-shaped multimodal request to whatever client
+    `platform_llm` actually is. `extractor=None` makes the cross-check fail
+    closed as could_not_check (visibly, via the WARNING asserted below)."""
+    caplog.set_level(logging.WARNING, logger="src.bootstrap")
+    captured: dict = {}
+
+    async def _fake_submit(*, tenant, session_id, order_id, sessionmaker, media_store, timeout_s,
+                            ticket_id=None, extractor=None, crm_lookup=None):
+        captured["extractor"] = extractor
+        return {"status": "could_not_check", "message": "x"}
+
+    import src.bootstrap as bootstrap_module
+    import src.chatbot.deposit_verification as dv_module
+    monkeypatch.setattr(dv_module, "submit_deposit_verification", _fake_submit)
+    # Fix (log dedup): the WARNING below is only logged once per (tenant_id,
+    # provider) per PROCESS now (see bootstrap.py's `_dv_extractor_not_wired_warned`)
+    # -- reset that module-level set so this test's outcome doesn't depend on
+    # whether some earlier test already warned for this exact (tenant, provider).
+    monkeypatch.setattr(bootstrap_module, "_dv_extractor_not_wired_warned", set())
+
+    chat_api.set_media_store(_FakeMediaStore())
+    try:
+        registry = _registry(llm_provider="groq")
+        factory = make_chatbot_factory(registry, sm)
+        tenant = _tenant()
+        agent = await factory(tenant, "t1:cs_notgemini")
+        tc = ToolCall(id="call_1", name=SUBMIT_DEPOSIT_VERIFICATION, arguments={"order_id": "ORD-1"})
+        await agent._deposit_verification_executor(tc, timeout_s=10.0)
+    finally:
+        chat_api.set_media_store(None)
+
+    assert captured["extractor"] is None
+    warnings = [r for r in caplog.records if "screenshot cross-check extractor is NOT wired" in r.message]
+    assert len(warnings) == 1
+    assert warnings[0].tenant_id == "t1"
+    assert warnings[0].provider == "groq"
+
+
+async def test_screenshot_extractor_not_wired_warning_fires_once_per_tenant_and_provider(
+    sm, monkeypatch, caplog,
+) -> None:
+    """Fix (nit): make_chatbot_factory's inner factory runs on every agent
+    build -- i.e. every chat turn for a tenant stuck on a non-gemini platform
+    default -- so the WARNING must fire at most once per (tenant_id,
+    provider) per process, not once per turn. A different tenant (or a
+    different provider for the same tenant) still gets its own warning."""
+    caplog.set_level(logging.WARNING, logger="src.bootstrap")
+
+    async def _fake_submit(*, tenant, session_id, order_id, sessionmaker, media_store, timeout_s,
+                            ticket_id=None, extractor=None, crm_lookup=None):
+        return {"status": "could_not_check", "message": "x"}
+
+    import src.bootstrap as bootstrap_module
+    import src.chatbot.deposit_verification as dv_module
+    monkeypatch.setattr(dv_module, "submit_deposit_verification", _fake_submit)
+    monkeypatch.setattr(bootstrap_module, "_dv_extractor_not_wired_warned", set())
+
+    def _count_warnings():
+        return len([
+            r for r in caplog.records if "screenshot cross-check extractor is NOT wired" in r.message
+        ])
+
+    chat_api.set_media_store(_FakeMediaStore())
+    try:
+        registry = _registry(llm_provider="groq")
+        factory = make_chatbot_factory(registry, sm)
+        tenant = _tenant()
+        tc = ToolCall(id="call_1", name=SUBMIT_DEPOSIT_VERIFICATION, arguments={"order_id": "ORD-1"})
+
+        agent1 = await factory(tenant, "t1:cs_a")
+        await agent1._deposit_verification_executor(tc, timeout_s=10.0)
+        assert _count_warnings() == 1
+
+        # Same tenant, same provider, a second turn (a fresh agent build,
+        # same as every chat turn produces) -- no additional warning.
+        agent2 = await factory(tenant, "t1:cs_b")
+        await agent2._deposit_verification_executor(tc, timeout_s=10.0)
+        assert _count_warnings() == 1
+
+        # A different tenant gets its own warning.
+        other_tenant = _tenant()
+        other_tenant.settings.id = "t2"
+        agent3 = await factory(other_tenant, "t2:cs_c")
+        await agent3._deposit_verification_executor(tc, timeout_s=10.0)
+        assert _count_warnings() == 2
+    finally:
+        chat_api.set_media_store(None)
+
+
+async def test_screenshot_extractor_wired_when_platform_llm_is_gemini(sm, monkeypatch) -> None:
+    captured: dict = {}
+
+    async def _fake_submit(*, tenant, session_id, order_id, sessionmaker, media_store, timeout_s,
+                            ticket_id=None, extractor=None, crm_lookup=None):
+        captured["extractor"] = extractor
+        return {"status": "could_not_check", "message": "x"}
+
+    import src.chatbot.deposit_verification as dv_module
+    monkeypatch.setattr(dv_module, "submit_deposit_verification", _fake_submit)
+
+    chat_api.set_media_store(_FakeMediaStore())
+    try:
+        registry = _registry(llm_provider="gemini")
+        factory = make_chatbot_factory(registry, sm)
+        tenant = _tenant()
+        agent = await factory(tenant, "t1:cs_gemini")
+        tc = ToolCall(id="call_1", name=SUBMIT_DEPOSIT_VERIFICATION, arguments={"order_id": "ORD-1"})
+        await agent._deposit_verification_executor(tc, timeout_s=10.0)
+    finally:
+        chat_api.set_media_store(None)
+
+    assert callable(captured["extractor"])
+
+
+# --- Pre-submission cross-check CRM routing (src/bootstrap.py) --------------
+
+
+async def test_deposit_verification_crm_lookup_routes_to_crm_tool_executors(sm, monkeypatch) -> None:
+    """The cross-check's crm_lookup (wired in make_chatbot_factory as
+    `_deposit_verification_crm_lookup`) must route through the SAME
+    per-tenant CRM tool executors (`crm_execs`) every other CRM tool call
+    uses, with the exact args the cross-check's decision table depends on:
+    {"type": "deposit", "limit": 20} for transactions, {} for the latest
+    order."""
+    import src.bootstrap as bootstrap_module
+    import src.chatbot.deposit_verification as dv_module
+    import src.chatbot.tool_executor as tool_executor_module
+    from src.interfaces.llm import ToolSpec
+
+    calls: list = []
+
+    async def _fake_execute_crm_tool(*, endpoint, method, parameters, auth_type, token, args,
+                                      context, x_api_key, extra_headers, session_id, ticket_id,
+                                      timeout_s, result_max_chars):
+        calls.append({"endpoint": endpoint, "args": args, "timeout_s": timeout_s})
+        return {"status_code": 200, "data": {}}
+
+    # `make_chatbot_factory` does `from src.chatbot.tool_executor import
+    # execute_crm_tool` INSIDE itself (not at bootstrap's module level), so
+    # this must patch the function at its source -- it's re-imported fresh
+    # every time `make_chatbot_factory(...)` runs, which happens below.
+    monkeypatch.setattr(tool_executor_module, "execute_crm_tool", _fake_execute_crm_tool)
+
+    async def _fake_resolve_crm_tools(tenant, sessionmaker):
+        specs = [
+            ToolSpec(name="get_player_transactions", description="", parameters={}),
+            ToolSpec(name="get_player_latest_deposit_order", description="", parameters={}),
+        ]
+        execs = {
+            "get_player_transactions": {
+                "endpoint": "https://crm.example/transactions", "method": "GET",
+                "parameters": [], "auth_type": "none", "token": None,
+            },
+            "get_player_latest_deposit_order": {
+                "endpoint": "https://crm.example/latest-order", "method": "GET",
+                "parameters": [], "auth_type": "none", "token": None,
+            },
+        }
+        return specs, execs, "tenant"
+
+    monkeypatch.setattr(bootstrap_module, "resolve_crm_tools", _fake_resolve_crm_tools)
+
+    captured_crm_lookup: dict = {}
+
+    async def _fake_submit(*, tenant, session_id, order_id, sessionmaker, media_store, timeout_s,
+                            ticket_id=None, extractor=None, crm_lookup=None):
+        captured_crm_lookup["crm_lookup"] = crm_lookup
+        return {"status": "could_not_check", "message": "x"}
+
+    monkeypatch.setattr(dv_module, "submit_deposit_verification", _fake_submit)
+
+    chat_api.set_media_store(_FakeMediaStore())
+    try:
+        registry = _registry()
+        factory = make_chatbot_factory(registry, sm)
+        tenant = _tenant()
+        agent = await factory(tenant, "t1:cs_routing")
+        tc = ToolCall(id="call_1", name=SUBMIT_DEPOSIT_VERIFICATION, arguments={"order_id": "ORD-1"})
+        await agent._deposit_verification_executor(tc, timeout_s=10.0)
+
+        crm_lookup = captured_crm_lookup["crm_lookup"]
+        txns_result = await crm_lookup("get_player_transactions", {"type": "deposit", "limit": 20}, timeout_s=5.0)
+        order_result = await crm_lookup("get_player_latest_deposit_order", {}, timeout_s=5.0)
+    finally:
+        chat_api.set_media_store(None)
+
+    assert txns_result == {"status_code": 200, "data": {}}
+    assert order_result == {"status_code": 200, "data": {}}
+    assert len(calls) == 2
+    txns_call = next(c for c in calls if c["endpoint"] == "https://crm.example/transactions")
+    order_call = next(c for c in calls if c["endpoint"] == "https://crm.example/latest-order")
+    assert txns_call["args"] == {"type": "deposit", "limit": 20}
+    assert txns_call["timeout_s"] == 5.0
+    assert order_call["args"] == {}
+    assert order_call["timeout_s"] == 5.0
 
 
 def test_submit_deposit_verification_is_not_a_builtin_tool() -> None:

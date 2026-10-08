@@ -30,28 +30,46 @@ Two vendor contracts, selected by ``DepositVerificationConfig.contract``:
 
 Called from ``ChatBotAgent._dispatch_tool``'s ``SUBMIT_DEPOSIT_VERIFICATION``
 branch via the executor closure built in ``src/bootstrap.py``.
+
+Pre-submission cross-check: before any of the above (vendor call, DB row),
+``_cross_check_screenshot`` reads the screenshot with a separate vision call
+(``src/chatbot/screenshot_extract.py`` — the chat model itself is not trusted
+for this) and compares the amount/date it reports against the tenant's own
+CRM (``get_player_transactions`` + ``get_player_latest_deposit_order``,
+called via the ``crm_lookup`` callable wired in from ``src/bootstrap.py``,
+the same path tenant-registered CRM tools use). A mismatch, an unreadable
+screenshot, or a CRM lookup that can't be trusted all short-circuit before
+the vendor is ever called — see that function's docstring for the full
+decision table.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
+from typing import Awaitable, Callable, Optional
 from urllib.parse import urlsplit
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 from sqlalchemy import and_, or_, select
 
+from src.api.chat_cost import compute_chat_turn_cost
 from src.auth.context import TenantContext
 from src.campaign.dnd_filter import normalize_phone
+from src.chatbot.screenshot_extract import ScreenshotExtractor
 from src.chatbot.tool_executor import REDACTED_PLACEHOLDER
 from src.config_tenant import DepositVerificationConfig, platform_webhook_base_url
 from src.integration.tenant_events import sign_body, sign_body_hex
 from src.interfaces.media_storage import IMediaStorage
 from src.models.chat import ChatMessage, ChatSession
 from src.models.deposit_verification import DepositVerificationRequest
+from src.utils.http_fetch import fetch_capped
 from src.utils.logging import debug_event
 
 log = logging.getLogger(__name__)
@@ -65,6 +83,538 @@ _MAX_TIMEOUT_S = 15.0
 # expects and that outbound tenant-event webhooks already send.
 _SIGNATURE_HEADER = "X-Signature"
 
+# CrmLookup(tool_name, args, *, timeout_s) -> the tenant's CRM tool result,
+# same shape execute_crm_tool returns (src/chatbot/tool_executor.py): a
+# successful call is {"status_code": int, "data": {...}}; a failure (unknown
+# tool name, HTTP error, timeout, transport error) always carries an "error"
+# key -- that is the single signal _cross_check_screenshot treats as "could
+# not check". `timeout_s` is the REMAINING time budget at the point of the
+# call (see the time-budget constants above), not a fixed per-call value --
+# callers (src/bootstrap.py) must thread it through to whatever bounds the
+# underlying HTTP call, not hardcode one.
+CrmLookup = Callable[..., Awaitable[dict]]
+
+# Pre-submission cross-check: fetching the screenshot bytes over https (for
+# the json_ticket_relay source-URL path -- see _cross_check_screenshot) is
+# bounded by whatever's left of submit_deposit_verification's own `timeout_s`
+# budget at that point (see the time-budget constants below), capped at this
+# ceiling regardless -- a screenshot fetch has no business taking longer than
+# this even when the budget would otherwise allow it.
+_CROSS_CHECK_FETCH_TIMEOUT_S = 10.0
+_CROSS_CHECK_FETCH_MAX_BYTES = 10 * 1024 * 1024
+
+# Time-budget management: `submit_deposit_verification` receives `timeout_s`
+# as its share of the turn's cumulative tool budget (src/agents/chatbot.py's
+# _exec_tool already wraps the whole call in asyncio.wait_for(timeout_s) as a
+# backstop) -- everything below is this module being a good citizen WITHIN
+# that budget rather than relying solely on the outer backstop, so a
+# cross-check step that's about to blow the budget fails closed as
+# could_not_check instead of being cut off mid-vendor-call by the outer
+# wait_for (which would leave a "pending" row with no vendor call ever
+# having been attempted, stuck until schedule_verification_timeout fires).
+#
+# Minimum time that must remain AFTER the cross-check passes before the
+# vendor POST is even attempted -- below this, the row is never created and
+# the vendor is never called; the submission fails closed as could_not_check
+# instead of attempting a POST that's unlikely to complete in time.
+_MIN_VENDOR_BUDGET_S = 8.0
+# Margin subtracted from the remaining budget when computing the vendor
+# POST's own timeout, so the POST itself doesn't get handed the exact full
+# remaining slice with zero slack for the bookkeeping around it (building
+# the callback URL, resolving `mobile`, the final DB round trip).
+_VENDOR_TIMEOUT_MARGIN_S = 1.0
+
+# Floor checked IMMEDIATELY before each vendor POST (after the row has
+# already been created, and after whatever's left of the budget was spent on
+# signed_url/ChatSession lookups/etc. since the _MIN_VENDOR_BUDGET_S gate
+# ran) -- below this, the POST is not attempted at all, since a timeout this
+# small wouldn't plausibly complete a real HTTP call. Deliberately smaller
+# than _MIN_VENDOR_BUDGET_S: that gate runs BEFORE the row exists and before
+# any of the per-contract bookkeeping below it has had a chance to consume
+# more of the budget, so re-applying the same 8s floor here would rarely
+# trigger on its own merits -- this is a last-resort check right at the POST
+# call site, not a restatement of the earlier gate.
+_MIN_POST_BUDGET_S = 3.0
+
+SCREENSHOT_UNREADABLE_MESSAGE = (
+    "The deposit amount and date could not be read from the screenshot. Do NOT "
+    "submit. Ask the customer for a clearer screenshot showing the payment amount "
+    "and date."
+)
+
+COULD_NOT_CHECK_MESSAGE = (
+    "The customer's deposits could not be looked up to check against the "
+    "screenshot. Do NOT submit. Apologise and offer to connect them to a human agent."
+)
+
+_NO_MATCHING_TRANSACTION_MESSAGE_TEMPLATE = (
+    "The screenshot shows {amount} on {date}, but no deposit on the customer's "
+    "account matches that amount and date. Do NOT submit for verification. Tell the "
+    "customer we could not find a matching transaction for verification, mention the "
+    "amount and date we read, and ask them to check they sent the right screenshot."
+)
+
+
+def _format_amount_for_message(value) -> str:
+    """Human-friendly rendering of an extracted amount for the
+    no_matching_transaction message -- ``1000.0`` reads as "1000", not
+    "1000.0", while a genuinely fractional amount keeps its decimals."""
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value)
+
+
+# A comma is only treated as a thousands-separator (and stripped) when it's
+# immediately followed by exactly three digits and then a non-digit or the
+# string's end -- "1,000.50" strips to "1000.50", but "1.000,50" (comma used
+# as a DECIMAL separator, European-style) is left alone, so its one dot +
+# leftover comma combination fails _AMOUNT_SHAPE_RE below instead of being
+# silently misread as 1.00050.
+_THOUSANDS_COMMA_RE = re.compile(r",(?=\d{3}(?:\D|$))")
+# A leading currency token this module accepts on a string amount, matched
+# case-insensitively with an optional following space, and stripped before
+# the shape check below. Deliberately a closed set -- an unrecognized prefix
+# (any other currency, or stray text) is left in place so it fails the shape
+# check and normalizes to None rather than being silently chopped off.
+_CURRENCY_PREFIX_RE = re.compile(r"^(?:₹|rs\.?|inr|\$|usd)\s*", re.IGNORECASE)
+_AMOUNT_SHAPE_RE = re.compile(r"^-?\d+(\.\d+)?$")
+
+
+def _normalize_amount(value: object) -> Optional[Decimal]:
+    """Parse an amount from any of the shapes this module sees it in
+    (extraction JSON numbers, CRM JSON numbers, or -- defensively -- a
+    CRM/extraction-supplied string like ``"Rs. 500"``, ``"₹1,000.50"``,
+    or ``"INR 500"``) into a ``Decimal``, or ``None`` if it can't be parsed
+    as one. ``bool`` is rejected even though ``isinstance(True, int)`` is
+    true in Python -- a flag is never an amount.
+
+    Numbers (``int``/``float``) go through ``Decimal(str(x))`` unchanged.
+    Strings are stripped of whitespace, thousands-separator commas, and one
+    recognized leading currency token, then the remainder must match
+    ``^-?\\d+(\\.\\d+)?$`` exactly -- anything else (an unrecognized currency
+    token, stray text, an ambiguous format like ``"1.000,50"``) normalizes to
+    ``None`` rather than being guessed at.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        try:
+            return Decimal(str(value))
+        except (InvalidOperation, ValueError):
+            return None
+    if isinstance(value, str):
+        cleaned = _THOUSANDS_COMMA_RE.sub("", value.strip())
+        cleaned = _CURRENCY_PREFIX_RE.sub("", cleaned).strip()
+        if not _AMOUNT_SHAPE_RE.fullmatch(cleaned):
+            return None
+        try:
+            return Decimal(cleaned)
+        except InvalidOperation:
+            return None
+    return None
+
+
+def _amounts_match(a: Decimal, b: Decimal) -> bool:
+    # Deposits are positive; a transaction row's sign convention is not part
+    # of the contract this compares against (see docs/crm-api-contract.md
+    # §2 -- only casino/sports debits are documented as negative), so compare
+    # magnitudes rather than trust either side's sign.
+    return abs(a) == abs(b)
+
+
+def _dates_within_one_day(a: date, b: date) -> bool:
+    return abs((a - b).days) <= 1
+
+
+def _parse_screenshot_date(value: object) -> Optional[date]:
+    if not isinstance(value, str):
+        return None
+    try:
+        return date.fromisoformat(value.strip())
+    except ValueError:
+        return None
+
+
+def _resolve_tenant_zone(tenant: TenantContext) -> ZoneInfo:
+    tz_name = getattr(tenant.settings, "timezone", None) or "UTC"
+    try:
+        return ZoneInfo(tz_name)
+    except (ZoneInfoNotFoundError, ValueError):
+        return ZoneInfo("UTC")
+
+
+# Above this, a numeric CRM timestamp is treated as epoch MILLIseconds
+# rather than seconds -- a seconds-since-epoch value for any date in this
+# system's lifetime is comfortably below this (year ~33658 in seconds), so
+# this cleanly separates the two without needing a units flag from the CRM.
+_EPOCH_MS_THRESHOLD = 1e12
+
+
+def _crm_timestamp_to_tenant_date(value: object, tz: ZoneInfo) -> Optional[date]:
+    """Parse a CRM timestamp and return its calendar date IN THE TENANT'S
+    TIMEZONE -- the whole point of the ±1-day window is to compare against
+    the date the customer actually saw on their screen, which a server
+    rendering a UTC timestamp's raw date would get wrong by a day near
+    midnight IST (see the module's tests for the boundary case this guards).
+
+    Accepts:
+    - A numeric epoch timestamp (``int``/``float``) -- always UTC, seconds
+      unless it exceeds ``_EPOCH_MS_THRESHOLD`` (then milliseconds).
+    - An ISO-8601 string with an explicit offset/``Z`` -- parsed as that
+      instant and converted to the tenant's timezone for the date.
+    - An ISO-8601 string with NO timezone info (a naive CRM timestamp, e.g.
+      ``"2026-06-20T10:30:00"``) -- CRM naive times are local, so this is
+      interpreted as already being in the TENANT's timezone, not UTC.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        try:
+            epoch_seconds = value / 1000.0 if abs(value) > _EPOCH_MS_THRESHOLD else value
+            dt = datetime.fromtimestamp(epoch_seconds, tz=timezone.utc)
+        except (ValueError, OverflowError, OSError):
+            return None
+        return dt.astimezone(tz).date()
+    if not isinstance(value, str):
+        return None
+    try:
+        dt = datetime.fromisoformat(value.strip())
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        # Naive CRM timestamp (including a date-only value, which parses as
+        # midnight naive): interpret it as already being in the tenant's own
+        # timezone rather than UTC.
+        dt = dt.replace(tzinfo=tz)
+    return dt.astimezone(tz).date()
+
+
+def _deposit_transaction_matches(
+    txn: object, shot_amount: Decimal, shot_date: date, tz: ZoneInfo,
+) -> bool:
+    if not isinstance(txn, dict) or (txn.get("type") or "").strip().lower() != "deposit":
+        return False
+    amount = _normalize_amount(txn.get("amount"))
+    txn_date = _crm_timestamp_to_tenant_date(txn.get("timestamp"), tz)
+    if amount is None or txn_date is None:
+        return False
+    return _amounts_match(amount, shot_amount) and _dates_within_one_day(shot_date, txn_date)
+
+
+def _latest_order_matches(
+    order: object, shot_amount: Decimal, shot_date: date, tz: ZoneInfo,
+) -> bool:
+    if not isinstance(order, dict):
+        return False
+    amount = _normalize_amount(order.get("amount"))
+    order_date = _crm_timestamp_to_tenant_date(order.get("created_at"), tz)
+    if amount is None or order_date is None:
+        return False
+    return _amounts_match(amount, shot_amount) and _dates_within_one_day(shot_date, order_date)
+
+
+def _crm_call_ok(result: object) -> bool:
+    """True for a CRM lookup that actually succeeded. Every failure shape
+    execute_crm_tool / the crm_lookup wrapper can produce -- an unknown tool
+    name, an HTTP error, a timeout, a transport error, a non-dict return --
+    carries an "error" key (see CrmLookup's docstring above); this is the
+    single check that covers all of them."""
+    return isinstance(result, dict) and "error" not in result
+
+
+async def _fetch_source_media_for_cross_check(url: str, *, timeout_s: float) -> tuple[bytes, str]:
+    """https-only, size-capped, image-only fetch of a CRM-supplied
+    ``source_media_url`` for the vision extraction call. Delegates to
+    ``src.utils.http_fetch.fetch_capped``, the same SSRF-safe helper
+    ``src/api/chat.py`` uses for caller-supplied media URLs: no redirects are
+    followed, the host must resolve to a public address, and a non-https URL
+    is rejected outright (``fetch_capped``'s ``assert_safe_url`` always
+    requires https).
+
+    ``timeout_s`` is the caller's remaining time budget -- this fetch never
+    gets more than ``_CROSS_CHECK_FETCH_TIMEOUT_S`` regardless (its own
+    independent ceiling, sized for a screenshot fetch, not the whole tool
+    call), but it can get less when the budget is already tight."""
+    bounded = max(0.1, min(_CROSS_CHECK_FETCH_TIMEOUT_S, timeout_s))
+    data, content_type = await fetch_capped(
+        url,
+        max_bytes=_CROSS_CHECK_FETCH_MAX_BYTES,
+        accept_content_types=("image/",),
+        timeout=httpx.Timeout(bounded, connect=min(5.0, bounded)),
+    )
+    return data, content_type
+
+
+async def _record_screenshot_extraction_cost(
+    sessionmaker, session_id: str, extraction: dict, *, ticket_id: Optional[str],
+) -> None:
+    """Best-effort: bills the vision-extraction call's tokens onto the
+    session's running cost total, the same mechanism src/api/chat.py's
+    _persist_turn uses for the main chat turn's LLM cost. Runs on its own
+    DB session (never the caller's) and never raises -- a billing
+    bookkeeping failure must not block, or fail, the cross-check it is
+    reporting the cost of."""
+    usage = extraction.get("usage") or {}
+    provider = extraction.get("provider")
+    model = extraction.get("model")
+    input_tokens = int(usage.get("prompt_tokens") or 0)
+    output_tokens = int(usage.get("completion_tokens") or 0)
+    cached_tokens = int(usage.get("cached_tokens") or 0)
+    if not provider or (not input_tokens and not output_tokens):
+        return
+    try:
+        async with sessionmaker() as cost_db:
+            cost = await compute_chat_turn_cost(
+                cost_db, provider=provider, model=model,
+                input_tokens=input_tokens, output_tokens=output_tokens,
+                cached_tokens=cached_tokens,
+            )
+            if not cost:
+                return
+            chat_session = await cost_db.get(ChatSession, session_id)
+            if chat_session is None:
+                return
+            chat_session.cost = (chat_session.cost or 0.0) + cost
+            chat_session.input_tokens = (chat_session.input_tokens or 0) + input_tokens
+            chat_session.output_tokens = (chat_session.output_tokens or 0) + output_tokens
+            await cost_db.commit()
+    except Exception:  # noqa: BLE001 — billing bookkeeping must never break the cross-check
+        log.exception(
+            "deposit verification: failed to record screenshot extraction cost",
+            extra={"ticket_id": ticket_id, "session_id": session_id},
+        )
+
+
+async def _cross_check_screenshot(
+    *,
+    tenant: TenantContext,
+    sessionmaker,
+    session_id: str,
+    data: bytes,
+    mime: str,
+    extractor: Optional[ScreenshotExtractor],
+    crm_lookup: Optional[CrmLookup],
+    ticket_id: Optional[str],
+    remaining: Callable[[], float],
+) -> Optional[dict]:
+    """Pre-submission cross-check. Returns a result dict (status != "submitted")
+    when the caller must stop and return that to the LLM instead of
+    proceeding; ``None`` when the screenshot and the CRM agree and the
+    caller should continue exactly as before (insert the row, call the
+    vendor).
+
+    Decision table:
+      - no extractor wired, the extraction call raises (including an
+        unparseable/empty/safety-blocked LLM response -- see
+        ``screenshot_extract.UnparseableExtractionResponse``), or it times
+        out against ``remaining()`` -> could_not_check (fail CLOSED: all of
+        these are system/infrastructure failures, not a judgement about the
+        screenshot's readability, so none of them get the
+        screenshot_unreadable message)
+      - extraction SUCCEEDED (parsed) but reports unreadable, or missing
+        amount/date -> screenshot_unreadable (the only path that reaches
+        this status)
+      - no crm_lookup wired, either CRM call errors/times out/returns
+        non-JSON, or the latest-order lookup itself failed
+        (status=lookup_unavailable) -> could_not_check (fail CLOSED: no
+        vendor call either way)
+      - CRM reachable but nothing matches (no deposit transaction row AND
+        the latest order both matching on amount + date within ±1 calendar
+        day in the tenant's timezone, including latest order
+        status=no_recent_deposit) -> no_matching_transaction
+      - both match -> None (proceed)
+
+    ``remaining`` is the caller's time-budget callable (see the module's
+    time-budget constants) -- the extraction call and the two CRM calls are
+    each bounded by it so a slow extractor/CRM can't eat the whole tool
+    budget; exhausting it is just another "could not check" failure.
+
+    ``extractor``/``crm_lookup`` are optional only so unit tests that never
+    reach past an earlier check (no_screenshot, already_pending,
+    missing_order_id, ...) don't need to stub them — src/bootstrap.py's
+    production wiring always supplies both.
+    """
+    if extractor is None:
+        log.error(
+            "deposit verification cross-check: no screenshot extractor wired — "
+            "failing closed instead of submitting unchecked",
+            extra={"ticket_id": ticket_id, "session_id": session_id},
+        )
+        return {"status": "could_not_check", "message": COULD_NOT_CHECK_MESSAGE}
+
+    try:
+        extraction = await asyncio.wait_for(extractor(data, mime), timeout=remaining())
+    except Exception:  # noqa: BLE001 — an extraction-call failure (incl. a budget
+        # timeout, or an unparseable LLM response) must not kill the turn,
+        # and is an infrastructure failure, not a judgement about the
+        # screenshot -- so it fails closed as could_not_check, never
+        # screenshot_unreadable.
+        log.exception(
+            "deposit verification: screenshot extraction call failed",
+            extra={"ticket_id": ticket_id, "session_id": session_id},
+        )
+        return {"status": "could_not_check", "message": COULD_NOT_CHECK_MESSAGE}
+
+    await _record_screenshot_extraction_cost(sessionmaker, session_id, extraction, ticket_id=ticket_id)
+
+    shot_amount = _normalize_amount(extraction.get("amount")) if extraction.get("readable") else None
+    shot_date = _parse_screenshot_date(extraction.get("date")) if extraction.get("readable") else None
+    if not extraction.get("readable") or shot_amount is None or shot_date is None:
+        log.info(
+            "deposit verification cross-check: screenshot_unreadable",
+            extra={
+                "ticket_id": ticket_id, "session_id": session_id,
+                "reason": "extraction_unreadable_or_missing_fields",
+            },
+        )
+        if log.isEnabledFor(logging.DEBUG):
+            debug_event(
+                log, "deposit_verification_tool cross_check screenshot_unreadable",
+                ticket_id=ticket_id, session_id=session_id, extraction=extraction,
+            )
+        return {"status": "screenshot_unreadable", "message": SCREENSHOT_UNREADABLE_MESSAGE}
+
+    if crm_lookup is None:
+        log.info(
+            "deposit verification cross-check: could_not_check",
+            extra={"ticket_id": ticket_id, "session_id": session_id, "reason": "no_crm_lookup"},
+        )
+        return {"status": "could_not_check", "message": COULD_NOT_CHECK_MESSAGE}
+
+    try:
+        # Both CRM calls run concurrently (not back-to-back) since they're
+        # independent reads needed for the same decision -- and the whole
+        # pair is bounded by the remaining time budget as a backstop, on top
+        # of the per-call `timeout_s` threaded through `crm_lookup` itself
+        # (src/bootstrap.py passes it to execute_crm_tool's own httpx
+        # timeout), in case a lookup implementation doesn't fully respect
+        # that parameter.
+        txns_result, order_result = await asyncio.wait_for(
+            asyncio.gather(
+                crm_lookup("get_player_transactions", {"type": "deposit", "limit": 20}, timeout_s=remaining()),
+                crm_lookup("get_player_latest_deposit_order", {}, timeout_s=remaining()),
+            ),
+            timeout=remaining(),
+        )
+    except Exception:  # noqa: BLE001 — a raising or budget-exhausting CRM call must not kill the turn
+        log.exception(
+            "deposit verification cross-check: crm lookup raised",
+            extra={"ticket_id": ticket_id, "session_id": session_id},
+        )
+        return {"status": "could_not_check", "message": COULD_NOT_CHECK_MESSAGE}
+
+    if not _crm_call_ok(txns_result) or not _crm_call_ok(order_result):
+        log.info(
+            "deposit verification cross-check: could_not_check",
+            extra={
+                "ticket_id": ticket_id, "session_id": session_id,
+                "reason": "crm_call_failed",
+                "transactions_ok": _crm_call_ok(txns_result),
+                "order_ok": _crm_call_ok(order_result),
+            },
+        )
+        return {"status": "could_not_check", "message": COULD_NOT_CHECK_MESSAGE}
+
+    txns_data = txns_result.get("data")
+    order_data = order_result.get("data")
+    transactions = txns_data.get("transactions") if isinstance(txns_data, dict) else None
+    order_status = order_data.get("status") if isinstance(order_data, dict) else None
+
+    if (
+        not isinstance(transactions, list)
+        or order_status not in ("found", "no_recent_deposit", "lookup_unavailable")
+    ):
+        log.info(
+            "deposit verification cross-check: could_not_check",
+            extra={
+                "ticket_id": ticket_id, "session_id": session_id,
+                "reason": "unexpected_crm_response_shape",
+            },
+        )
+        return {"status": "could_not_check", "message": COULD_NOT_CHECK_MESSAGE}
+
+    if order_status == "lookup_unavailable":
+        log.info(
+            "deposit verification cross-check: could_not_check",
+            extra={"ticket_id": ticket_id, "session_id": session_id, "reason": "lookup_unavailable"},
+        )
+        return {"status": "could_not_check", "message": COULD_NOT_CHECK_MESSAGE}
+
+    tz = _resolve_tenant_zone(tenant)
+    transactions_match = any(
+        _deposit_transaction_matches(t, shot_amount, shot_date, tz) for t in transactions
+    )
+    order = order_data.get("order") if order_status == "found" else None
+    order_match = _latest_order_matches(order, shot_amount, shot_date, tz)
+
+    if log.isEnabledFor(logging.DEBUG):
+        debug_event(
+            log, "deposit_verification_tool cross_check evaluated",
+            ticket_id=ticket_id, session_id=session_id,
+            shot_amount=str(shot_amount), shot_date=shot_date.isoformat(),
+            transactions_match=transactions_match, order_match=order_match,
+            order_status=order_status, tenant_timezone=str(tz),
+        )
+
+    if transactions_match and order_match:
+        log.info(
+            "deposit verification cross-check: matched",
+            extra={"ticket_id": ticket_id, "session_id": session_id},
+        )
+        return None
+
+    log.info(
+        "deposit verification cross-check: no_matching_transaction",
+        extra={
+            "ticket_id": ticket_id, "session_id": session_id,
+            "reason": (
+                "transactions_mismatch" if not transactions_match else "latest_order_mismatch"
+            ),
+        },
+    )
+    message = _NO_MATCHING_TRANSACTION_MESSAGE_TEMPLATE.format(
+        amount=_format_amount_for_message(extraction.get("amount")),
+        date=extraction.get("date"),
+    )
+    return {"status": "no_matching_transaction", "message": message}
+
+
+_SUBMISSION_FAILED_RESULT = {
+    "status": "error",
+    "message": (
+        "Could not submit the verification request right now. Let the customer "
+        "know you're having trouble and offer to escalate to a human agent."
+    ),
+}
+
+
+async def _vendor_timeout_or_mark_error(
+    remaining: Callable[[], float], sessionmaker, request_id: str, *, ticket_id: Optional[str], session_id: str,
+) -> Optional[float]:
+    """Computed immediately before a vendor POST (never earlier -- see the
+    module's time-budget constants): the POST's own timeout, derived from
+    whatever's ACTUALLY left of the budget at THIS point, not a value
+    computed before the signed_url/ChatSession lookups that precede it.
+
+    Returns None -- after marking the already-created row as 'error' -- when
+    less than _MIN_POST_BUDGET_S remains, in which case the caller must not
+    attempt the POST at all. Otherwise returns the POST's timeout (remaining
+    minus the bookkeeping margin; still capped at _MAX_TIMEOUT_S inside
+    _post_json_ticket_vendor/_post_multipart_vendor, exactly as before)."""
+    remaining_s = remaining()
+    if remaining_s < _MIN_POST_BUDGET_S:
+        log.warning(
+            "deposit verification: insufficient time budget remaining immediately "
+            "before the vendor POST — failing the submission without attempting it",
+            extra={
+                "ticket_id": ticket_id, "session_id": session_id, "request_id": request_id,
+                "remaining_s": remaining_s, "min_post_budget_s": _MIN_POST_BUDGET_S,
+            },
+        )
+        await _mark_error(sessionmaker, request_id)
+        return None
+    return max(0.0, remaining_s - _VENDOR_TIMEOUT_MARGIN_S)
+
 
 async def submit_deposit_verification(
     *,
@@ -75,7 +625,23 @@ async def submit_deposit_verification(
     media_store: IMediaStorage,
     timeout_s: float,
     ticket_id: str | None = None,
+    extractor: ScreenshotExtractor | None = None,
+    crm_lookup: CrmLookup | None = None,
 ) -> dict:
+    # Time-budget deadline, computed at entry from the caller's `timeout_s`
+    # (this call's share of the turn's cumulative tool budget -- see the
+    # module's time-budget constants above). `_remaining()` is threaded
+    # through every cross-check step and the final vendor POST below so each
+    # one gets a timeout derived from what's ACTUALLY left, not a fixed
+    # guess, and the vendor step can be skipped outright (see
+    # _MIN_VENDOR_BUDGET_S below) rather than attempted with too little time
+    # to plausibly complete.
+    _loop = asyncio.get_running_loop()
+    _deadline = _loop.time() + timeout_s
+
+    def _remaining() -> float:
+        return max(0.0, _deadline - _loop.time())
+
     dv_config = tenant.settings.deposit_verification
     secret = tenant.secret_optional(dv_config.webhook_secret_env)
     if not dv_config.enabled or not dv_config.webhook_url or media_store is None or not secret:
@@ -195,6 +761,25 @@ async def submit_deposit_verification(
                 ),
             }
 
+        # Early budget gate: if there isn't even enough of the budget left to
+        # plausibly clear _MIN_VENDOR_BUDGET_S by the time the (much heavier)
+        # post-cross-check gate below would run, fail closed right here —
+        # before the media-store round trip, the extraction (Gemini) call, or
+        # either CRM lookup are ever attempted. The gate below (after the
+        # cross-check) still exists and still matters: it catches the budget
+        # being exhausted BY the cross-check, which this entry check can't see.
+        if _remaining() < _MIN_VENDOR_BUDGET_S:
+            log.warning(
+                "deposit verification: insufficient time budget remaining at entry "
+                "for the cross-check and vendor submission — failing closed as "
+                "could_not_check without reading the screenshot or calling the CRM",
+                extra={
+                    "ticket_id": ticket_id, "session_id": session_id,
+                    "remaining_s": _remaining(), "min_vendor_budget_s": _MIN_VENDOR_BUDGET_S,
+                },
+            )
+            return {"status": "could_not_check", "message": COULD_NOT_CHECK_MESSAGE}
+
         # `json_ticket_relay` rows that carry the CRM's own inbound URL
         # (`source_media_url` — see src/api/chat.py's _persist_turn) never
         # need the screenshot bytes: that URL gets forwarded to the vendor
@@ -238,6 +823,139 @@ async def submit_deposit_verification(
                     ),
                 }
 
+        # Fix: when this row ALSO has a `media_url` (the cross-check's
+        # media-store-first fallback below would use THOSE bytes, reach the
+        # extractor, and only fail the https gate on `source_media_url` much
+        # later, after the vendor-call section's own `urlsplit(url).scheme`
+        # check), run that same https check on `source_media_url` here,
+        # before the cross-check -- a submission that's doomed either way
+        # shouldn't pay for a screenshot vision call first. Scoped to this
+        # shape specifically: without a `media_url` fallback, the cross-check
+        # already fails fast on its own https-only fetch of `source_media_url`
+        # (`_fetch_source_media_for_cross_check` / `fetch_capped`) before ever
+        # reaching the extractor, so there is nothing to pre-empt there.
+        if (
+            use_source_url
+            and screenshot_row.media_url
+            and urlsplit(screenshot_row.source_media_url).scheme != "https"
+        ):
+            log.error(
+                "deposit verification: source_media_url is not https — refusing to send "
+                "it to an external vendor (checked before the cross-check so a doomed "
+                "submission doesn't pay for a screenshot vision call)",
+                extra={"ticket_id": ticket_id, "session_id": session_id},
+            )
+            return _SUBMISSION_FAILED_RESULT
+
+        # Pre-submission cross-check (see _cross_check_screenshot's docstring
+        # for the full decision table): runs before the DepositVerificationRequest
+        # row is ever created and before any vendor call. Needs the actual
+        # screenshot bytes regardless of contract, unlike the vendor-call
+        # logic below -- `data`/`mime` above are already populated except on
+        # the json_ticket_relay source-URL path (`use_source_url`), which
+        # skipped that download on purpose (see its comment) to avoid a
+        # dependency on our own object storage.
+        #
+        # Deliberately still inside this `async with sessionmaker() as db:`
+        # block (holding the DB session open across the extraction + CRM
+        # network calls below) rather than splitting into two sessions --
+        # the simpler shape, at the cost of a connection held a bit longer
+        # per submission. Revisit if that becomes a measured pool pressure
+        # problem.
+        if use_source_url:
+            cross_check_data = None
+            cross_check_mime = None
+            # Prefer our own media store's bytes when this row ALSO has a
+            # `media_url` (object storage was reachable at upload time -- see
+            # src/api/chat.py's _persist_turn, which can populate both
+            # columns on the same row) -- only fall back to fetching the
+            # CRM's `source_media_url` over the network when that's
+            # unavailable or fails. This keeps the cross-check off an extra
+            # external dependency whenever a known-good copy already exists
+            # in our own store. Does NOT change which URL is sent to the
+            # VENDOR below -- `use_source_url` still forwards
+            # `source_media_url` as-is for that; this only affects which
+            # bytes the cross-check reads.
+            if screenshot_row.media_url:
+                try:
+                    cross_check_data, cross_check_mime = await asyncio.wait_for(
+                        media_store.download(screenshot_row.media_url), timeout=_remaining(),
+                    )
+                except Exception as e:  # noqa: BLE001 — fall back to source_media_url below
+                    log.warning(
+                        "deposit verification cross-check: media_store download failed for "
+                        "cross-check bytes, falling back to source_media_url",
+                        extra={
+                            "ticket_id": ticket_id, "session_id": session_id,
+                            "exc_type": type(e).__name__,
+                        },
+                    )
+                    log.debug(
+                        "deposit verification cross-check: media_store download failure detail",
+                        exc_info=True,
+                        extra={"ticket_id": ticket_id, "session_id": session_id},
+                    )
+                    cross_check_data = None
+            if cross_check_data is None:
+                try:
+                    cross_check_data, cross_check_mime = await asyncio.wait_for(
+                        _fetch_source_media_for_cross_check(
+                            screenshot_row.source_media_url, timeout_s=_remaining(),
+                        ),
+                        timeout=_remaining(),
+                    )
+                except Exception as e:  # noqa: BLE001 — an unreachable/invalid source URL, or an
+                    # exhausted time budget, must not kill the turn -- this is
+                    # an infrastructure failure (ours or the CRM's), not a
+                    # judgement about the screenshot's readability, so it
+                    # fails closed as could_not_check rather than
+                    # screenshot_unreadable. Logged at WARNING by exception
+                    # type only (not str(e)), which may embed the signed
+                    # screenshot URL -- full detail goes to DEBUG only.
+                    log.warning(
+                        "deposit verification cross-check: source_media_url fetch failed",
+                        extra={
+                            "ticket_id": ticket_id, "session_id": session_id,
+                            "exc_type": type(e).__name__,
+                        },
+                    )
+                    log.debug(
+                        "deposit verification cross-check: source_media_url fetch failure detail",
+                        exc_info=True,
+                        extra={"ticket_id": ticket_id, "session_id": session_id},
+                    )
+                    return {"status": "could_not_check", "message": COULD_NOT_CHECK_MESSAGE}
+        else:
+            cross_check_data, cross_check_mime = data, mime
+
+        cross_check_result = await _cross_check_screenshot(
+            tenant=tenant, sessionmaker=sessionmaker, session_id=session_id,
+            data=cross_check_data, mime=cross_check_mime,
+            extractor=extractor, crm_lookup=crm_lookup, ticket_id=ticket_id,
+            remaining=_remaining,
+        )
+        if cross_check_result is not None:
+            return cross_check_result
+
+        if _remaining() < _MIN_VENDOR_BUDGET_S:
+            # Not enough of the tool-call budget is left to plausibly
+            # complete the vendor POST -- fail closed as could_not_check
+            # WITHOUT creating a request row at all, rather than racing the
+            # outer per-tool asyncio.wait_for (src/agents/chatbot.py's
+            # _exec_tool) to a row that would be stuck "pending" with no
+            # vendor call ever attempted, until the timeout-to-human
+            # escalation eventually catches it.
+            log.warning(
+                "deposit verification: insufficient time budget remaining after cross-check "
+                "for the vendor submission — failing closed as could_not_check without "
+                "creating a request row",
+                extra={
+                    "ticket_id": ticket_id, "session_id": session_id,
+                    "remaining_s": _remaining(), "min_vendor_budget_s": _MIN_VENDOR_BUDGET_S,
+                },
+            )
+            return {"status": "could_not_check", "message": COULD_NOT_CHECK_MESSAGE}
+
         request_id = f"dvr_{uuid.uuid4().hex}"
         timeout_minutes = dv_config.timeout_minutes
         now = datetime.now(timezone.utc).replace(tzinfo=None)
@@ -264,6 +982,12 @@ async def submit_deposit_verification(
             timeout_at=timeout_at.isoformat(),
         )
 
+    # The vendor POST's own timeout is no longer computed once, up front,
+    # here -- it's computed immediately before each `_post_*_vendor` call
+    # below (via `_vendor_timeout_or_mark_error`), from whatever's ACTUALLY
+    # left of the budget at that point. Computing it here (as before) would
+    # count time the signed_url/ChatSession lookups below are about to spend
+    # as if it were still available to the POST.
     if dv_config.contract == "json_ticket_relay":
         if use_source_url:
             # Forward the CRM's own URL straight through instead of minting a
@@ -296,13 +1020,7 @@ async def submit_deposit_verification(
                     extra={"ticket_id": ticket_id, "session_id": session_id, "request_id": request_id},
                 )
                 await _mark_error(sessionmaker, request_id)
-                return {
-                    "status": "error",
-                    "message": (
-                        "Could not submit the verification request right now. Let the customer "
-                        "know you're having trouble and offer to escalate to a human agent."
-                    ),
-                }
+                return _SUBMISSION_FAILED_RESULT
         if urlsplit(url).scheme != "https":
             # Critical security gate: LocalMediaStorage.signed_url() happily
             # returns a relative, unsigned, non-expiring path — that must
@@ -319,13 +1037,7 @@ async def submit_deposit_verification(
                 extra={"ticket_id": ticket_id, "session_id": session_id, "request_id": request_id},
             )
             await _mark_error(sessionmaker, request_id)
-            return {
-                "status": "error",
-                "message": (
-                    "Could not submit the verification request right now. Let the customer "
-                    "know you're having trouble and offer to escalate to a human agent."
-                ),
-            }
+            return _SUBMISSION_FAILED_RESULT
 
         if urlsplit(dv_config.webhook_url).scheme != "https":
             # Same gate as the signed-URL check above, applied to the vendor
@@ -340,17 +1052,17 @@ async def submit_deposit_verification(
                 extra={"ticket_id": ticket_id, "session_id": session_id, "request_id": request_id},
             )
             await _mark_error(sessionmaker, request_id)
-            return {
-                "status": "error",
-                "message": (
-                    "Could not submit the verification request right now. Let the customer "
-                    "know you're having trouble and offer to escalate to a human agent."
-                ),
-            }
+            return _SUBMISSION_FAILED_RESULT
 
         async with sessionmaker() as db:
             chat_session = await db.get(ChatSession, session_id)
         mobile = _resolve_mobile(chat_session, dv_config) if chat_session is not None else None
+
+        vendor_timeout_s = await _vendor_timeout_or_mark_error(
+            _remaining, sessionmaker, request_id, ticket_id=ticket_id, session_id=session_id,
+        )
+        if vendor_timeout_s is None:
+            return _SUBMISSION_FAILED_RESULT
 
         ok = await _post_json_ticket_vendor(
             dv_config=dv_config,
@@ -358,7 +1070,7 @@ async def submit_deposit_verification(
             order_id=order_id,
             screenshot_url=url,
             mobile=mobile,
-            timeout_s=timeout_s,
+            timeout_s=vendor_timeout_s,
             ticket_id=ticket_id,
             session_id=session_id,
         )
@@ -374,6 +1086,12 @@ async def submit_deposit_verification(
             "unreachable: multipart_verdict never sets use_source_url, so the "
             "download() above always ran for this branch"
         )
+        vendor_timeout_s = await _vendor_timeout_or_mark_error(
+            _remaining, sessionmaker, request_id, ticket_id=ticket_id, session_id=session_id,
+        )
+        if vendor_timeout_s is None:
+            return _SUBMISSION_FAILED_RESULT
+
         ok = await _post_multipart_vendor(
             dv_config=dv_config,
             secret=secret,
@@ -382,20 +1100,14 @@ async def submit_deposit_verification(
             tenant_id=tenant.id,
             data=data,
             mime=mime,
-            timeout_s=timeout_s,
+            timeout_s=vendor_timeout_s,
             ticket_id=ticket_id,
             session_id=session_id,
         )
 
     if not ok:
         await _mark_error(sessionmaker, request_id)
-        return {
-            "status": "error",
-            "message": (
-                "Could not submit the verification request right now. Let the customer "
-                "know you're having trouble and offer to escalate to a human agent."
-            ),
-        }
+        return _SUBMISSION_FAILED_RESULT
 
     from src.api.chat import schedule_verification_timeout
 
